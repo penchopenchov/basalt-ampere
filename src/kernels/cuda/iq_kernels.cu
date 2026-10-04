@@ -17,6 +17,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -2224,6 +2225,8 @@ bool gu_mma_usable(const NativeExpertLayout& L) {
 // STRATA_MMVQ_MMA=1: iq_mmvq's IQ3_S calls of 2..8 columns with n_in % 512 == 0 on mmvq_iq3s_mma_kernel where the
 // device runs it (the same bits; not with STRATA_OLD_IQ_MMVQ).  iq_set_mmvq_mma overrides it (tests).
 bool g_mmvq_mma = env_on("STRATA_MMVQ_MMA");
+// STRATA_MMVQ_MMA_MIN_T: as native_mmvq's (the fewest columns that take it)
+int g_mmvq_mma_min_t = [] { const char* v = std::getenv("STRATA_MMVQ_MMA_MIN_T"); return v ? std::atoi(v) : 4; }();
 std::atomic<long> g_mmvq_mma_launches{0};
 // The current device's SM count if it runs mmvq_iq3s_mma_kernel (sm_80+, the card's or STRATA_EMULATE_CC's, with
 // sm_80+ device code in this build), else 0; per device
@@ -2258,7 +2261,8 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
                  cudaStream_t s) {
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     if constexpr (TY == 21) {
-        if (g_mmvq_mma && !g_old_kernels && ncols >= 2 && ncols <= kGmCols && n_in % 512 == 0) {
+        if (g_mmvq_mma && !g_old_kernels && ncols >= std::max(2, g_mmvq_mma_min_t + (n_in > n_out ? 1 : 0)) && ncols <= kGmCols &&
+            n_in % 512 == 0) {
             if (const int sms = mmvq_mma_sms()) {   // 32 rows per block while that gives every SM one, else 16
                 if ((n_out + 31) / 32 >= sms)
                     launch_pdl(mmvq_iq3s_mma_kernel<2>, dim3((unsigned) ((n_out + 31) / 32)), dim3(256), 0, s, W, rb, X,
@@ -2350,7 +2354,7 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; }
+void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 2; }   // tests: every column count
 bool iq_mmvq_mma() { return g_mmvq_mma; }
 bool iq_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
 long iq_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }

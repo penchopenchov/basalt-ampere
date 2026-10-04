@@ -214,14 +214,14 @@ void check_mmvq_mma(cudaStream_t s, std::mt19937& rng) {
             ck(cudaMemcpy(y_new.data(), dy_new, y_new.size() * 4, cudaMemcpyDeviceToHost), "y_new");
             size_t diff = 0;
             bool finite = true;
-            for (size_t i = 0; i < y_old.size(); ++i) {
+            for (size_t i = 0; i < (size_t) nc * sh.n_out; ++i) {   // the columns written (the rest keep their fills)
                 diff += y_old[i] != y_new[i];
-                if (i < (size_t) nc * sh.n_out) {
-                    float f;
-                    std::memcpy(&f, &y_new[i], 4);
-                    finite = finite && std::isfinite(f);
-                }
+                float f;
+                std::memcpy(&f, &y_new[i], 4);
+                finite = finite && std::isfinite(f);
             }
+            for (size_t i = (size_t) nc * sh.n_out; i < y_new.size(); ++i)   // and nothing past them
+                diff += y_new[i] != 0xFEFEFEFEu;
             if (diff != 0 || !finite || launches != 1) {
                 std::printf("  IQ3_S    %5d x %5d  ncols %d%s: %zu outputs differ from the old kernel%s%s  FAIL\n",
                             sh.n_out, sh.n_in, nc, sh.w_off || sh.x_off ? " (off-aligned)" : "", diff,

@@ -1354,6 +1354,9 @@ bool g_mmvq_mma = [] {
     const char* v = std::getenv("STRATA_MMVQ_MMA");
     return v != nullptr && v[0] != '\0' && v[0] != '0';
 }();
+// STRATA_MMVQ_MMA_MIN_T: the fewest columns that take it (one more where the projection narrows its input); below,
+// the dp4a kernel is faster
+int g_mmvq_mma_min_t = [] { const char* v = std::getenv("STRATA_MMVQ_MMA_MIN_T"); return v ? std::atoi(v) : 4; }();
 std::atomic<long> g_mmvq_mma_launches{0};
 // The current device's SM count if it runs native_iq4_xs_mma_kernel (sm_80+, the card's or STRATA_EMULATE_CC's, with
 // sm_80+ device code in this build), else 0; per device
@@ -1532,7 +1535,7 @@ void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-void native_mmvq_set_mma(bool on) { g_mmvq_mma = on; }
+void native_mmvq_set_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 2; }   // tests: every column count
 bool native_mmvq_mma() { return g_mmvq_mma; }
 bool native_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
 long native_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }
@@ -1709,7 +1712,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     STRATA_WAVE_MMVQ(IQ4XSTraits)
     if (ncols > 1) {
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-        if (g_multi_exact && g_mmvq_mma) {
+        if (g_multi_exact && g_mmvq_mma && ncols >= g_mmvq_mma_min_t + (n_in > n_out ? 1 : 0)) {
             if (const int sms = mmvq_mma_sms()) {
                 launch_iq4_xs_mma(weights, x_q8_1, y, n_in, n_out, ncols, sms, static_cast<cudaStream_t>(stream));
                 launch_check();
