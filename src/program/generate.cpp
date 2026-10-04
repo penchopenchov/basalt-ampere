@@ -5485,6 +5485,7 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        std::vector<std::array<int32_t, 3>> promoted;   // STRATA_PEER_PROMOTE: (layer, in, out) of swaps from the peer
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
@@ -5516,6 +5517,13 @@ int main(int argc, char** argv) {
             }
             pending.clear();
             res_upload();
+            // a promoted expert is CUDA0's now: its peer slot takes the expert CUDA0 gave up (in RAM since the commit)
+            for (const auto& p : promoted) {
+                std::string perr;
+                if (!peer.reassign(p[0], p[1], p[2], srcp->blob(p[0], p[2]), perr))
+                    std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
+            }
+            promoted.clear();
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         // STRATA_PEER_PROMOTE=1: the peer's experts are candidates too, so the ones a workload routes most move to
@@ -5578,6 +5586,7 @@ int main(int argc, char** argv) {
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                if (peer_promote && peer.valid() && peer.has(s.layer, s.in)) promoted.push_back({s.layer, s.in, s.out});
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             (void) main_live;

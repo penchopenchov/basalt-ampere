@@ -329,6 +329,24 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
 }
 
+bool PeerExperts::reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err) {
+    const size_t i_in = (size_t) (layer * n_expert_ + in), i_out = (size_t) (layer * n_expert_ + out);
+    const int32_t slot = res_[i_in];
+    if (slot < 0) return true;
+    res_[i_in] = kNotResident;                 // the primary computes it from now on
+    if (res_[i_out] >= 0 || blob == nullptr) return true;
+    for (const auto& p : pending_)
+        if (p.second == slot) return true;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    On on(device_);
+    if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(layer), cudaMemcpyHostToDevice,
+                            refill_), "reassign", err))
+        return false;
+    pending_.emplace_back((int32_t) i_out, slot);
+    ++swaps_;
+    return ck(cudaEventRecord(refill_ev_, refill_), "reassign event", err);
+}
+
 void PeerExperts::apply_pending(bool wait) {
     if (pending_.empty()) return;
     {

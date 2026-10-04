@@ -77,6 +77,9 @@ public:
     /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
     void apply_pending(bool wait);
+    /// STRATA_PEER_PROMOTE: `in` moved to the primary, which gave up `out` (`blob`: its bytes in host memory).  The
+    /// slot `in` held takes `out`, resident at `apply_pending`.  Call only between verify windows.
+    bool reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err);
 
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
