@@ -45,6 +45,8 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    /// The rows MMQ sizes its tile against (it takes its smallest tile of at least this many); 0: max_rows.
+    int64_t opt_rows = 0;
 };
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.

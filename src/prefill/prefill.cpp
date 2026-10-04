@@ -688,6 +688,45 @@ const MmqPlan& mmq_plan() {
     }();
     return plan;
 }
+// STRATA_PF_MMQ_J: MMQ's tile width along the routed rows.  Unset: MMQ's choice (the largest expert); 8-128: fixed;
+// auto[:C]: per group, the width minimizing sum(tiles * (C + width)), C a tile's fixed cost in rows (default 64).
+struct MmqTileJ {
+    int fixed = 0, cost = 0;
+};
+const MmqTileJ& mmq_tile_j() {
+    static const MmqTileJ v = [] {
+        MmqTileJ r;
+        const char* e = std::getenv("STRATA_PF_MMQ_J");
+        if (e == nullptr) return r;
+        if (std::strncmp(e, "auto", 4) == 0) {
+            r.cost = e[4] == ':' ? std::max(1, std::atoi(e + 5)) : 64;
+        } else if (const int j = std::atoi(e); j > 0) {
+            r.fixed = std::clamp((j + 7) / 8 * 8, 8, 128);
+        }
+        if (r.fixed > 0 || r.cost > 0)
+            std::fprintf(stderr, "strata: prompt experts: MMQ tile width %s%d (STRATA_PF_MMQ_J)\n",
+                         r.cost > 0 ? "auto, tile cost " : "", r.cost > 0 ? r.cost : r.fixed);
+        return r;
+    }();
+    return v;
+}
+// Product::opt_rows for the group order[j0..j1]; 0: MMQ's choice
+int64_t mmq_opt_rows(const std::vector<int32_t>& cnt, const std::vector<int32_t>& order, size_t j0, size_t j1,
+                     int64_t maxr) {
+    const MmqTileJ& c = mmq_tile_j();
+    if (c.fixed > 0) return std::min<int64_t>(c.fixed, maxr);
+    if (c.cost <= 0) return 0;
+    static constexpr int kWidths[] = {128, 112, 96, 80, 64, 48, 40, 32, 24, 16, 8};
+    int best = 128;
+    int64_t best_cost = -1;
+    for (const int w : kWidths) {
+        int64_t tiles = 0;
+        for (size_t i = j0; i <= j1; ++i) tiles += ((int64_t) cnt[(size_t) order[i]] + w - 1) / w;
+        const int64_t cost = tiles * (c.cost + w);
+        if (best_cost < 0 || cost < best_cost) { best_cost = cost; best = w; }
+    }
+    return std::min<int64_t>(best, maxr);
+}
 // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
 // stream_all_min() tokens or more).  Its GU, H and Xq hold only the fused path's grouping tables, int8 H and per-token
 // int8 activations, and Hq nothing: ~100 KB a token less than MMQ's FP32 GU / H and per-slot q8_1 rows, which is what
@@ -2756,6 +2795,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                                 int64_t maxr = 0;
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                                const int64_t optr = mmq_opt_rows(m.cnt, order, j0, j, maxr);
                                 pt.mark(kPfGemmGU, cs);
                                 // the zeroed tail after the group's last expert (see MMQ_TAIL)
                                 cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
@@ -2764,6 +2804,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                gu.opt_rows = optr;
                                 m.mmq_ctx->run(gu, m.cs);
                                 mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
                                 pt.mark(kPfGemmD, cs);
@@ -2772,7 +2813,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
-                                dn.ld_dst = N;
+                                dn.ld_dst = N; dn.opt_rows = optr;
                                 m.mmq_ctx->run(dn, m.cs);
                                 return true;
                             }
