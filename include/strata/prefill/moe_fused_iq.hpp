@@ -38,4 +38,12 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream);
 
+/// STRATA_PF_FUSED_V2=1 (opt-in, read once): experts_native() runs IQ3_XXS gate/up and IQ4_NL down on the v2 kernels
+/// (raw weight bytes by cp.async, decoded straight into the mma fragments, a work item over up to 128 routed rows);
+/// the other formats keep the kernels above.  Same math, rounded in another order.
+/// Tests: native_v2_override(1 / 0) forces v2 on / off, -1 returns to the variable.
+void native_v2_override(int mode);
+/// v2 is wanted (the variable or the override) and its kernels run on the current device.
+bool native_v2_ready();
+
 }  // namespace strata::prefill::fused

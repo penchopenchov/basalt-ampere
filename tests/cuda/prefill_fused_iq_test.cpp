@@ -12,7 +12,9 @@
 // several 64-row tiles - an all-zero token, per-expert blobs at unrelated (2-byte aligned) addresses, three launches of
 // different expert ranges.  Part 2 (timing): one layer at the engine's chunks (2048, 3584, 8192 tokens; 512 experts,
 // top 10) on both paths and on MMQ's products alone (no gathers), for the IQ2_XS, IQ3_XXS and IQ3_S packs' most
-// common layers, with the grouping checked and a sample of rows against the reference.  --no-ref, --no-timing,
+// common layers, with the grouping checked and a sample of rows against the reference.  The v2 kernels
+// (STRATA_PF_FUSED_V2: IQ3_XXS gate/up, IQ4_NL down) in both parts where a pair has them: against the reference as
+// above, within a tenth of the fused path's own error of its outputs, and timed next to it.  --no-ref, --no-timing,
 // --only=NAME, --chunks=A,B.  Exit 77 without a CUDA device of sm_80 or newer.
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -370,6 +372,39 @@ void reference_part(const Pair& p, cudaStream_t s) {
     if (zmax != 0) throw std::runtime_error(std::string(p.name) + ": the all-zero token's outputs are not zero");
     if (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst)
         throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's");
+
+    // v2 (STRATA_PF_FUSED_V2: IQ3_XXS gate/up, IQ4_NL down): against the reference as above, and next to the kernels
+    // above it differs only in the rounding order (H's int8 codes may move by one)
+    if (p.gu == GGML_TYPE_IQ3_XXS || p.d == GGML_TYPE_IQ4_NL) {
+        fused::native_v2_override(1);
+        if (!fused::native_v2_ready()) {
+            std::printf("  v2: does not run on this device - skipped\n");
+        } else {
+            ck(cudaMemset(fb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");
+            ck(cudaDeviceSynchronize(), "sentinel");
+            run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, 20, E}, blob, s);
+            ck(cudaStreamSynchronize(s), "sync");
+            const std::vector<float> y_2 = download(fb.dm, (size_t) rows * N);
+            const std::vector<int32_t> slot2 = download_i(fb.slot, (size_t) rows);
+            auto frow2 = [&](size_t i) { return (int64_t) slot2[i]; };
+            const Err e2 = compare(y_2, frow2, ref, pair, (size_t) rows);
+            const Err e21 = compare(y_2, frow2, y_f, frow, (size_t) rows);
+            std::printf("  v2    vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", e2.rms, e2.worst);
+            std::printf("  v2    vs fused         : rel RMS %.3e  worst row max rel %.3e\n", e21.rms, e21.worst);
+            double z2 = 0;
+            for (int k = 0; k < K; ++k)
+                for (int o = 0; o < N; ++o)
+                    z2 = std::max(z2, (double) std::fabs(y_2[(size_t) slot2[(size_t) (ZERO * K + k)] * N + o]));
+            fused::native_v2_override(-1);
+            if (z2 != 0)
+                throw std::runtime_error(std::string(p.name) + ": v2: the all-zero token's outputs are not zero");
+            if (e2.rms > 1.5 * em.rms || e2.worst > 2.0 * em.worst)
+                throw std::runtime_error(std::string(p.name) + ": v2's error is not comparable to MMQ's");
+            if (e21.rms > 0.1 * ef.rms)
+                throw std::runtime_error(std::string(p.name) + ": v2 and the fused kernels disagree");
+        }
+        fused::native_v2_override(-1);
+    }
 }
 
 // part 2: one layer at a real chunk, timed
@@ -569,6 +604,26 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
                     "%.3e\n", pick.size(), em.rms, em.worst, ef.rms, ef.worst);
         if (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst)
             throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's (timing)");
+    }
+    // v2 at the real shape: timed back to back, and against the fused kernels' outputs above
+    if (p.gu == GGML_TYPE_IQ3_XXS || p.d == GGML_TYPE_IQ4_NL) {
+        fused::native_v2_override(1);
+        if (fused::native_v2_ready()) {
+            for (float spent = 0; spent < 300.0f;) spent += once(fused_run);
+            std::vector<float> t2;
+            for (int rep = 0; rep < 8; ++rep) t2.push_back(once(fused_run));
+            std::sort(t2.begin(), t2.end());
+            const std::vector<float> y_2 = download(fb.dm, (size_t) rows * N);
+            const std::vector<int32_t> slot2 = download_i(fb.slot, (size_t) rows);
+            const Err e21 = compare(y_2, [&](size_t i) { return (int64_t) slot2[i]; }, y_f,
+                                    [&](size_t i) { return (int64_t) slot[i]; }, (size_t) rows);
+            std::printf("  v2: median %.3f ms, min %.3f (fused back to back %.3f: %.2fx); v2 vs fused rel RMS %.3e "
+                        "worst row %.3e\n", t2[4], t2[0], tf2[4], tf2[4] / t2[4], e21.rms, e21.worst);
+            fused::native_v2_override(-1);
+            if (e21.rms > 0.01)
+                throw std::runtime_error(std::string(p.name) + ": v2 and the fused kernels disagree (timing)");
+        }
+        fused::native_v2_override(-1);
     }
     cudaEventDestroy(a);
     cudaEventDestroy(b);
