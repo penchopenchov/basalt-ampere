@@ -24,6 +24,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -560,6 +561,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    // STRATA_PDL=1 (pdl.hpp): the dense chain's kernels may start during the previous kernel's tail.  Only where
+    // that previous kernel is one of them or another plain kernel; never with the profile's or trace's stamps.
+    const bool pdl = pdl_rec_ && !prof_on_ && trace_m_ == nullptr && !batch_rec_;
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
@@ -693,7 +697,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
-        gr_read_group(0, pending, inj2_, inj_);
+        {
+            PdlScope ps(pdl, true);   // the read's first kernel follows a combine, copy or wait: a plain launch
+            gr_read_group(0, pending, inj2_, inj_);
+        }
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
         try {
@@ -715,6 +722,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
+                PdlScope ps(pdl);   // the layer's GDN kernels, after the hc read
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
@@ -773,13 +781,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
-                native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
-                else for (int t = tb; t < te; ++t)
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
-                stamp(l, 7, grp);
-                native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                {
+                    PdlScope ps(pdl);   // after the hc read, up to the K/V norms
+                    native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                    if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
+                    else for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                    stamp(l, 7, grp);
+                    native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                    native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -891,6 +902,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 stamp(l, 14, grp);
+                PdlScope ps(pdl);   // after the gate kernel
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
             }
@@ -899,7 +911,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
-        gr_read_group(1, true, inj_, inj2_);
+        {
+            PdlScope ps(pdl);   // after the out projection's kernel
+            gr_read_group(1, true, inj_, inj2_);
+        }
         static const bool sh_stream_env = [] {
             const char* e = std::getenv("STRATA_SH_STREAM");
             return !e || e[0] != '0';
@@ -915,6 +930,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
+                PdlScope ps(pdl);   // after the hc read's last kernel (the fork adds no node on this stream)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
@@ -1201,20 +1217,36 @@ std::string Verifier::profile_report() {
 
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr) return true;
+    const bool pdl_try = strata::kernels::pdl_requested() && !pdl_off_;
+    // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
+    auto retry_plain = [&](const std::string& why) {
+        std::fprintf(stderr, "strata verify: the %d-token window failed with STRATA_PDL=1 (%s): capturing it without\n", T,
+                     why.c_str());
+        (void) cudaGetLastError();
+        pdl_off_ = true;
+        exec_[T] = nullptr;
+        return capture(T, err);
+    };
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
     }
     std::string rerr;
+    pdl_rec_ = pdl_try;
+    strata::kernels::pdl_count() = 0;
     const bool ok = record_window(T, cs_, rerr);
+    pdl_rec_ = false;
+    const long pdl_n = strata::kernels::pdl_count();
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
+        if (pdl_try) return retry_plain(rerr);
         err = rerr;
         return false;
     }
     if (ce != cudaSuccess) {
+        if (pdl_try) return retry_plain(cudaGetErrorString(ce));
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
@@ -1252,13 +1284,18 @@ bool Verifier::capture(int T, std::string& err) {
     const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
+        if (pdl_try) return retry_plain(cudaGetErrorString(ie));
         err = std::string("verify: instantiate: ") + cudaGetErrorString(ie);
         return false;
     }
     const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
-    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-                 cudaGetErrorString(ue), cudaGetErrorString(us));
+    if (pdl_try)
+        std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s), %ld programmatic "
+                             "dependent launches\n", T, cudaGetErrorString(ue), cudaGetErrorString(us), pdl_n);
+    else
+        std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
+                     cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
 }
 

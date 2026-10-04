@@ -7,6 +7,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -548,6 +549,7 @@ template<int TY>
 __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                    const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in,
                                                    int n_out, int ncols) {
+    pdl_wait();
     const int row = blockIdx.x * 4 + threadIdx.y;
     if (row >= n_out) return;
     const int lane = threadIdx.x;
@@ -1046,6 +1048,7 @@ __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restri
                                                          int n_in, int n_out, int ncols) {
     __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TY, STAGE_GRID>::value];
     const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    pdl_wait();   // the grid table above is constant
     const int row = blockIdx.x * 4 + threadIdx.y;
     if (row >= n_out) return;
     const int lane = threadIdx.x;
@@ -1801,28 +1804,29 @@ template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
                  cudaStream_t s) {
     const dim3 grid((unsigned) ((n_out + 3) / 4)), block(32, 4);
-    if constexpr (!kSplit<TY>) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-    else if (g_old_kernels) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+    auto go = [&](auto kernel) { launch_pdl(kernel, grid, block, 0, s, W, rb, X, y, n_in, n_out, ncols); };
+    if constexpr (!kSplit<TY>) go(mmvq_kernel<TY>);
+    else if (g_old_kernels) go(mmvq_kernel<TY>);
     else if constexpr (kStageIqGrid<TY>) {
         if (!g_stage_grid_mmvq) {
-            if (ncols <= 1) mmvq_multi_kernel<TY, 1, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-            else if (ncols == 2) mmvq_multi_kernel<TY, 2, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-            else if (ncols <= 4) mmvq_multi_kernel<TY, 4, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-            else if (ncols <= 6 && g_nc6) mmvq_multi_kernel<TY, 6, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-            else mmvq_multi_kernel<TY, 8, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+            if (ncols <= 1) go(mmvq_multi_kernel<TY, 1, false>);
+            else if (ncols == 2) go(mmvq_multi_kernel<TY, 2, false>);
+            else if (ncols <= 4) go(mmvq_multi_kernel<TY, 4, false>);
+            else if (ncols <= 6 && g_nc6) go(mmvq_multi_kernel<TY, 6, false>);
+            else go(mmvq_multi_kernel<TY, 8, false>);
             return;
         }
-        if (ncols <= 1) mmvq_multi_kernel<TY, 1><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-        else if (ncols == 2) mmvq_multi_kernel<TY, 2><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-        else if (ncols <= 4) mmvq_multi_kernel<TY, 4><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-        else if (ncols <= 6 && g_nc6) mmvq_multi_kernel<TY, 6><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-        else mmvq_multi_kernel<TY, 8><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+        if (ncols <= 1) go(mmvq_multi_kernel<TY, 1>);
+        else if (ncols == 2) go(mmvq_multi_kernel<TY, 2>);
+        else if (ncols <= 4) go(mmvq_multi_kernel<TY, 4>);
+        else if (ncols <= 6 && g_nc6) go(mmvq_multi_kernel<TY, 6>);
+        else go(mmvq_multi_kernel<TY, 8>);
     } else {
-        if (ncols <= 1) mmvq_multi_kernel<TY, 1><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-        else if (ncols == 2) mmvq_multi_kernel<TY, 2><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-        else if (ncols <= 4) mmvq_multi_kernel<TY, 4><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-        else if (ncols <= 6 && g_nc6) mmvq_multi_kernel<TY, 6><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
-        else mmvq_multi_kernel<TY, 8><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);   // 8 at a time past 8
+        if (ncols <= 1) go(mmvq_multi_kernel<TY, 1>);
+        else if (ncols == 2) go(mmvq_multi_kernel<TY, 2>);
+        else if (ncols <= 4) go(mmvq_multi_kernel<TY, 4>);
+        else if (ncols <= 6 && g_nc6) go(mmvq_multi_kernel<TY, 6>);
+        else go(mmvq_multi_kernel<TY, 8>);   // 8 at a time past 8
     }
 }
 

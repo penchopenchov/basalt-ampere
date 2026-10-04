@@ -4,6 +4,7 @@
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
 
@@ -26,6 +27,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __res
                                                               const float* __restrict__ qkv,
                                                               const float* __restrict__ w, float* __restrict__ h,
                                                               int C, int qk_heads, float eps, int t_begin) {
+    pdl_wait();
     __shared__ float part[S / 32];
     const int t = t_begin + blockIdx.y;
     const int c = blockIdx.x * S + threadIdx.x;
@@ -73,6 +75,7 @@ __global__ void __launch_bounds__(64) gdn_ab_multi_kernel(const float* __restric
                                                           const float* __restrict__ dt,
                                                           const float* __restrict__ ssm_a, float* __restrict__ gate,
                                                           float* __restrict__ beta, int n, int h_v, int T) {
+    pdl_wait();
     const int row = blockIdx.x * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= 2 * h_v) return;
     const bool is_beta = row >= h_v;
@@ -122,13 +125,15 @@ __global__ void __launch_bounds__(64) gdn_ab_multi_unrolled_kernel(const float* 
                                                                    const float* __restrict__ ssm_a, float* __restrict__ gate,
                                                                    float* __restrict__ beta, int n, int h_v, int T) {
     const int row = blockIdx.x * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (row >= 2 * h_v) return;
+    const bool valid = row < 2 * h_v;
     const bool is_beta = row >= h_v;
     const int r = is_beta ? row - h_v : row;
-    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
+    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) (valid ? r : 0) * n);
     uint4 wv[NJ];
 #pragma unroll
     for (int q = 0; q < NJ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    pdl_wait();   // the weights above are constant; x is the previous kernel's
+    if (!valid) return;
     float acc[MAX_T];
 #pragma unroll
     for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
@@ -218,6 +223,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
                                                                      const float* __restrict__ gamma, float eps,
                                                                      float* __restrict__ y, int h_k, int h_v, int T,
                                                                      const int32_t* __restrict__ n_keep, int t_out_begin) {
+    pdl_wait();
     __shared__ float sk[S], sq[S];
     __shared__ float red[RG][S];
     __shared__ float wsum[S * RG / 32];
@@ -495,8 +501,8 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
         std::fprintf(stderr, "gdn_conv_l2_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_conv_l2_multi_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
-        history, qkv, conv_w, h, channels, qk_heads, eps, t_begin);
+    launch_pdl(gdn_conv_l2_multi_kernel, dim3((unsigned) (channels / S), (unsigned) n_tok), dim3(S), 0,
+               (cudaStream_t) stream, history, qkv, conv_w, h, channels, qk_heads, eps, t_begin);
     check("gdn_conv_l2_multi");
 }
 
@@ -517,20 +523,20 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     static const bool unroll = [] { const char* v = std::getenv("STRATA_GDN_AB_UNROLL"); return v && std::atoi(v) != 0; }();
     if (unroll && n_embd == 32 * 8 * 10) {
         if (n_tok <= 4)
-            gdn_ab_multi_unrolled_kernel<4, 10><<<blocks, 64, 0, (cudaStream_t) stream>>>(
-                x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+            launch_pdl(gdn_ab_multi_unrolled_kernel<4, 10>, dim3(blocks), dim3(64), 0, (cudaStream_t) stream,
+                       x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
         else if (n_tok <= 6)
-            gdn_ab_multi_unrolled_kernel<6, 10><<<blocks, 64, 0, (cudaStream_t) stream>>>(
-                x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+            launch_pdl(gdn_ab_multi_unrolled_kernel<6, 10>, dim3(blocks), dim3(64), 0, (cudaStream_t) stream,
+                       x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
         else
-            gdn_ab_multi_unrolled_kernel<kVerifyMaxT, 10><<<blocks, 64, 0, (cudaStream_t) stream>>>(
-                x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+            launch_pdl(gdn_ab_multi_unrolled_kernel<kVerifyMaxT, 10>, dim3(blocks), dim3(64), 0, (cudaStream_t) stream,
+                       x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     } else if (n_tok <= 4) {
-        gdn_ab_multi_kernel<4><<<blocks, 64, 0, (cudaStream_t) stream>>>(
-            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+        launch_pdl(gdn_ab_multi_kernel<4>, dim3(blocks), dim3(64), 0, (cudaStream_t) stream,
+                   x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     } else {
-        gdn_ab_multi_kernel<kVerifyMaxT><<<blocks, 64, 0, (cudaStream_t) stream>>>(
-            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+        launch_pdl(gdn_ab_multi_kernel<kVerifyMaxT>, dim3(blocks), dim3(64), 0, (cudaStream_t) stream,
+                   x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     }
     check("gdn_ab_multi");
 }
@@ -551,8 +557,8 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         gdn_step_commit_kernel<<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, h_k, h_v, n_keep);
     } else {
-        gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+        launch_pdl(gdn_step_norm_multi_kernel, dim3((unsigned) h_v), dim3(S, RG), 0, (cudaStream_t) stream,
+                   state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
     }
     check("gdn_step_norm_multi");
 }

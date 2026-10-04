@@ -2,6 +2,7 @@
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -147,6 +148,7 @@ struct GrMulti {
 
 // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
 __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
+    pdl_wait();
     __shared__ float part[WARPS][HC];
     __shared__ float s_rs[HC];
     const FusedGrArgs& a = m.a[blockIdx.x];
@@ -199,6 +201,7 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
 // of four tokens instead of one on sm_75.
 template <int TILEV, int MAX_T = kFusedGrMaxT>
 __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
+    pdl_wait();
     constexpr int TQ = TILEV / 8 / 32;      // uint4 weight chunks per lane per tile
     extern __shared__ __align__(16) float tile[];   // [T][TILEV]
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -257,6 +260,7 @@ constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
 // `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
 // sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
 __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
+    pdl_wait();
     __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
     __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -515,6 +519,7 @@ static_assert(N % H_TILE == 0, "a staged tile never straddles two streams");
 static_assert(H_TILE % 256 == 0, "a staged tile holds whole rounds of 32 chunks: the plain read's lane order");
 
 __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
+    pdl_wait();
     __shared__ float part[WARPS];
     __shared__ float s_rs;
     const FusedGrArgs& a = m.a[blockIdx.x];
@@ -630,6 +635,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
 #pragma unroll
         for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
     }
+    pdl_wait();   // the weights above are constant; the activations below are the previous kernel's
     stage_htile(m, T, 0, hbuf, t);
     cp_async_commit();
     stage_htile(m, T, 1, hbuf + buf_f4, t);
@@ -707,6 +713,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_deep_kernel(GrMulti m)
 #pragma unroll
             for (int q = 0; q < HQ; ++q) w[p][q] = __ldg(w4 + p * (H_TILE / 8) + lane + 32 * q);
     }
+    pdl_wait();   // the weights above are constant; the activations below are the previous kernel's
     stage_htile(m, T, 0, hbuf, t);
     cp_async_commit();
     stage_htile(m, T, 1, hbuf + buf_f4, t);
@@ -757,11 +764,12 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_deep_kernel(GrMulti m)
 
 template <int MT>
 void launch_staged(int depth, const GrMulti& c, dim3 grid, size_t smem, cudaStream_t st) {
-    if (depth >= 5) gr_down_staged_deep_kernel<MT, 5><<<grid, THREADS, smem, st>>>(c);
-    else if (depth == 4) gr_down_staged_deep_kernel<MT, 4><<<grid, THREADS, smem, st>>>(c);
-    else if (depth == 3) gr_down_staged_deep_kernel<MT, 3><<<grid, THREADS, smem, st>>>(c);
-    else if (depth == 2) gr_down_staged_deep_kernel<MT, 2><<<grid, THREADS, smem, st>>>(c);
-    else gr_down_staged_kernel<MT><<<grid, THREADS, smem, st>>>(c);
+    const dim3 block(THREADS);
+    if (depth >= 5) launch_pdl(gr_down_staged_deep_kernel<MT, 5>, grid, block, smem, st, c);
+    else if (depth == 4) launch_pdl(gr_down_staged_deep_kernel<MT, 4>, grid, block, smem, st, c);
+    else if (depth == 3) launch_pdl(gr_down_staged_deep_kernel<MT, 3>, grid, block, smem, st, c);
+    else if (depth == 2) launch_pdl(gr_down_staged_deep_kernel<MT, 2>, grid, block, smem, st, c);
+    else launch_pdl(gr_down_staged_kernel<MT>, grid, block, smem, st, c);
 }
 
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
@@ -866,8 +874,8 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     else if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
     else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
 #else
-    if (variant >= kHcSplit) gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
-    else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+    if (variant >= kHcSplit) launch_pdl(gr_norm_split_kernel, dim3((unsigned) n_tok, HC), dim3(THREADS), 0, st, m);
+    else launch_pdl(gr_norm_multi_kernel, dim3((unsigned) n_tok), dim3(THREADS), 0, st, m);
 #endif
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     const bool staged = variant >= kHcStaged;
@@ -890,6 +898,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // (read once: this runs per layer when decode is not captured)
         static const bool max4_on = [] { const char* v = std::getenv("STRATA_GR_DOWN_MAX4"); return v && std::atoi(v) != 0; }();
         const bool max4 = max4_on && ct <= 4;
+        const dim3 dg(DOWN_BLOCKS + 1), db(THREADS);
         if (staged) {
             // STRATA_GR_DEPTH: weight tiles in flight per warp (1 = the earlier kernel; the same bits at every depth).
             // STRATA_GR_DOWN_FIT=1: the smallest of 2 / 4 / 6 sums per thread that holds the launch's tokens, as
@@ -899,17 +908,16 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             const bool ref = g_gr_fast == 0;
             const int depth = ref ? 1 : depth_env;
             const bool fit = !ref && fit_env;
-            const dim3 grid(DOWN_BLOCKS + 1);
-            if (fit && ct <= 2) launch_staged<2>(depth, c, grid, smem, st);
-            else if ((fit || (max4 && !ref)) && ct <= 4) launch_staged<4>(depth, c, grid, smem, st);
-            else if (fit && ct <= 6) launch_staged<6>(depth, c, grid, smem, st);
-            else launch_staged<kFusedGrMaxT>(depth, c, grid, smem, st);
+            if (fit && ct <= 2) launch_staged<2>(depth, c, dg, smem, st);
+            else if ((fit || (max4 && !ref)) && ct <= 4) launch_staged<4>(depth, c, dg, smem, st);
+            else if (fit && ct <= 6) launch_staged<6>(depth, c, dg, smem, st);
+            else launch_staged<kFusedGrMaxT>(depth, c, dg, smem, st);
         } else if (tv == 1280) {
-            if (max4) gr_down_multi_kernel<1280, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else gr_down_multi_kernel<1280><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            if (max4) launch_pdl(gr_down_multi_kernel<1280, 4>, dg, db, smem, st, c);
+            else launch_pdl(gr_down_multi_kernel<1280>, dg, db, smem, st, c);
         } else {
-            if (max4) gr_down_multi_kernel<2560, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else gr_down_multi_kernel<2560><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            if (max4) launch_pdl(gr_down_multi_kernel<2560, 4>, dg, db, smem, st, c);
+            else launch_pdl(gr_down_multi_kernel<2560>, dg, db, smem, st, c);
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
@@ -917,7 +925,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
 #endif
-    gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    launch_pdl(gr_up_multi_kernel, dim3(UPM_BLOCKS), dim3(THREADS), 0, st, m);
 }
 
 /// STRATA_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read

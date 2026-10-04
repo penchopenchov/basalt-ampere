@@ -1,5 +1,6 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
 #include <limits>
@@ -43,6 +44,7 @@ __device__ __forceinline__ float mmvf_warp_sum(float value) {
 template <int BLOCK_SIZE>
 __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
                                     float* __restrict__ y, int n_in) {
+    pdl_wait();
     const int t = threadIdx.x;
     const uint16_t* row = w + (size_t) blockIdx.x * n_in;
     const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
@@ -76,6 +78,7 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
 template <int BLOCK_SIZE, int NT>
 __global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
                                           float* __restrict__ y, int64_t ldy, int n_in, int n_tok) {
+    pdl_wait();
     const int t = threadIdx.x;
     const uint16_t* row = w + (size_t) blockIdx.x * n_in;
     const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
@@ -141,8 +144,11 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
     const cudaStream_t st = (cudaStream_t) stream;
 #define STRATA_MMVF_M(N) case N: \
-    if (n_tok <= 4) bf16_f32_mmvf_multi_kernel<N, 4><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); \
-    else bf16_f32_mmvf_multi_kernel<N, 8><<<(unsigned) n_out, N, 0, st>>>(x, ldx, w, y, ldy, (int) n_in, n_tok); break
+    if (n_tok <= 4) launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, \
+                               ldy, (int) n_in, n_tok); \
+    else launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, \
+                    (int) n_in, n_tok); \
+    break
     switch (mmvf_block_size(n_in)) {
         STRATA_MMVF_M(32); STRATA_MMVF_M(64); STRATA_MMVF_M(96); STRATA_MMVF_M(128);
         STRATA_MMVF_M(160); STRATA_MMVF_M(192); STRATA_MMVF_M(224); STRATA_MMVF_M(256);
@@ -165,7 +171,7 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     const cudaStream_t st = (cudaStream_t) stream;
 #define STRATA_MMVF_CASE(N) case N: \
-    bf16_f32_mmvf_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in); break
+    launch_pdl(bf16_f32_mmvf_kernel<N>, dim3((unsigned) n_out), dim3(N), 0, st, x, w, y, (int) n_in); break
     switch (mmvf_block_size(n_in)) {
         STRATA_MMVF_CASE(32);
         STRATA_MMVF_CASE(64);
