@@ -5518,6 +5518,9 @@ int main(int argc, char** argv) {
             res_upload();
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        // STRATA_PEER_PROMOTE=1: the peer's experts are candidates too, so the ones a workload routes most move to
+        // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
+        static const bool peer_promote = [] { const char* v = std::getenv("STRATA_PEER_PROMOTE"); return v && std::atoi(v) != 0; }();
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
@@ -5530,7 +5533,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e))) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e) && !peer_promote) && !(remote_opt && remote_opt->owns(l, e))) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
