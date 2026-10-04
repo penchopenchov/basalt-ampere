@@ -10,6 +10,9 @@
 // scattered destinations, stale scratch, grid_groups 0 (= cap), 1, 2, 3, 4 and above cap: the output must be BITWISE
 // equal to v1's, the rows the call must not write included (both start from the same NaN pattern).
 //
+// With STRATA_GU_MMA=1 the new launches take IQ3_XXS gate/up on the tensor-core kernel (sm_80+ CUDA) while v1 keeps
+// the dp4a one, so the IQ3_XXS rows check it against the dp4a kernel, bitwise as well (and --bench times the two).
+//
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
 #include "strata/kernels/iq_kernels.hpp"
@@ -200,8 +203,21 @@ struct Setup {
     }
 };
 
-void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
-    Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);   // 6 tokens x 4 experts: cap 24 entries
+// the largest |got - ref| / |ref| over the floats both have finite (ref != 0), to tell rounding from a wrong result
+double max_rel(const std::vector<uint32_t>& ref, const std::vector<uint32_t>& got) {
+    double m = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        float a, b;
+        std::memcpy(&a, &ref[i], 4);
+        std::memcpy(&b, &got[i], 4);
+        if (!std::isfinite(a) || !std::isfinite(b) || a == 0.0f) continue;
+        m = std::max(m, std::fabs((double) b - (double) a) / std::fabs((double) a));
+    }
+    return m;
+}
+
+void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng, int tokens = 6) {
+    Setup S(gu, dt, H, FF, tokens, 4, 9, rng, s);   // T tokens x 4 experts: cap 4T entries, groups of 1..T
     int calls = 0, bad = 0;
     size_t written = 0;
     for (const int base : {0, 7}) {
@@ -217,15 +233,16 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
                 size_t diff = 0;
                 for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
                 if (diff) {
-                    std::printf("  %-8s/%-7s base %d, %d groups, grid_groups %lld: %zu of %zu floats differ  FAIL\n",
-                                name_of(gu), name_of(dt), base, ng, (long long) gy, diff, ref.size());
+                    std::printf("  %-8s/%-7s base %d, %d groups, grid_groups %lld: %zu of %zu floats differ (max rel "
+                                "%.3g)  FAIL\n", name_of(gu), name_of(dt), base, ng, (long long) gy, diff, ref.size(),
+                                max_rel(ref, got));
                     ++bad;
                 }
             }
         }
     }
-    std::printf("%-8s/%-7s %5lld x %4lld  %d calls: %s (%zu output floats written in all)\n", name_of(gu), name_of(dt),
-                (long long) H, (long long) FF, calls, bad ? "FAIL" : "bitwise equal to v1", written);
+    std::printf("%-8s/%-7s %5lld x %4lld  T %2d  %d calls: %s (%zu output floats written in all)\n", name_of(gu),
+                name_of(dt), (long long) H, (long long) FF, S.T, calls, bad ? "FAIL" : "bitwise equal to v1", written);
     if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }
     g_fail += bad;
 }
@@ -347,10 +364,19 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
+    {
+        const char* m = std::getenv("STRATA_GU_MMA");
+        const bool mma = m != nullptr && m[0] != '\0' && m[0] != '0';
+        std::printf("gate/up: %s\n", mma ? "STRATA_GU_MMA=1 - IQ3_XXS on the tensor-core kernel where the device "
+                                          "has it (sm_80+ CUDA), v1 on dp4a: checked bitwise"
+                                        : "the dp4a kernels (STRATA_GU_MMA=1 checks the tensor-core one)");
+    }
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 8})        // STRATA_GU_FMTS
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
+    check(18, 20, 2560, 640, s, rng);
+    check(18, 20, 512, 256, s, rng, 12);                                // groups of more than 8 entries
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

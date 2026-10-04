@@ -64,8 +64,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
-/// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
-/// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.
+/// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries, and gate/up on the dp4a
+/// kernels even with STRATA_GU_MMA=1.  Bitwise the same results (native_grouped_parity checks it); kept for A/B
+/// timing.  Set before graph capture; captured graphs keep theirs.
 void native_grouped_set_v1(bool v1);
 
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase

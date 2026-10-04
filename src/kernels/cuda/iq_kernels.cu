@@ -8,6 +8,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/pdl.hpp"
+#include "strata/core/emulate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1220,6 +1221,221 @@ __global__ void __launch_bounds__(256) native_gu_multi_sx_kernel(const unsigned 
     }
 }
 
+// ---------------------------------------------------------------- IQ3_XXS gate/up on int8 tensor cores (STRATA_GU_MMA)
+// Per 32-value sub-block k the integer dot of a weight row and an entry's q8_1 block is exact in int32 whichever
+// instruction computes it, so mma.sync m16n8k32 s8 takes it for 16 rows x 8 entries at once (A: the signed grid
+// values, decoded once per row and sub-block straight into fragments; B: the entries' q8_1 codes; C starts at 0).
+// The rest is Split<18>::apply's arithmetic on that integer, and the float terms are summed in row_dot_multi's
+// order: the reference's lane L adds the terms k = L, L + 32, L + 64 in turn and the warp butterfly then adds the
+// lanes' sums.  Here warp w holds lanes L = w, w + 8, w + 16, w + 24 (the sub-blocks k with k % 8 == w), adds each
+// lane's terms in the same order with the same expression, and does the butterfly's first two steps; the block does
+// the last three.  So the output is BITWISE native_gu_multi_kernel's (native_grouped_parity checks it).
+//
+// A block owns 32 consecutive gate or up rows of one group at a time and walks K in chunks of two 256-value blocks
+// (196 bytes per row), cp.async'd kGmStages - 1 chunks ahead; the group's entries are staged 8 at a time with each
+// q8_1 scale already a float.
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+constexpr int kGmRows = 32;                           // gate or up rows per block: two m16 tiles
+constexpr int kGmCols = 8;                            // entries per pass: the mma's n8
+constexpr int kGmStages = 3;                          // weight chunks in the ring
+constexpr int kGmSeg = 2 * 98;                        // bytes of a row per chunk: two IQ3_XXS blocks
+constexpr int kGmChunk = kGmRows * kGmSeg;            // bytes per ring slot
+static_assert(sizeof(block_iq3_xxs) == 98, "the IQ3_XXS block this decodes");
+static_assert(kGmCols * kGmRows * 9 * 4 <= kGmStages * kGmChunk, "the partial sums reuse the ring");
+
+// shared memory: the ring, the grid, then kGmCols entries of 9 * n_embd / 32 words each + 4 (no bank conflicts on
+// the B fragment loads: the entries' strides fall 4 banks apart)
+size_t gu_mma_smem(int64_t n_embd) {
+    return (size_t) kGmStages * kGmChunk + 256 * sizeof(uint32_t) +
+           (size_t) kGmCols * (size_t) (9 * (n_embd / 32) + 4) * sizeof(uint32_t);
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void gm_cp4(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src)
+                 : "memory");
+}
+__device__ __forceinline__ void gm_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template<int N> __device__ __forceinline__ void gm_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+}
+// d = A (16 x 32 s8, row) * B (32 x 8 s8, col), C = 0: the exact int32 dots
+__device__ __forceinline__ void gm_mma(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+}
+// the 4 sign bits of grid word w (0..7) of a sub-block: group w / 2's 7 bits with their parity as bit 7
+// (unpack_ksigns), bits 4 (w & 1) .. 4 (w & 1) + 3
+__device__ __forceinline__ uint32_t gm_sign_nib(uint32_t aux, int w) {
+    const uint32_t v = (aux >> (7 * (w >> 1))) & 127u;
+    const uint32_t s = v ^ ((__popc(v) & 1u) << 7);
+    return (s >> (4 * (w & 1))) & 15u;
+}
+// a grid word with byte j negated where bit j of `nib` is set: (g ^ 0xff) + 1 per byte, no carry out of a byte as
+// every grid value is >= 1 - the bytes __vsub4(g ^ m, m) gives
+__device__ __forceinline__ uint32_t gm_signed(uint32_t g, uint32_t nib) {
+    const uint32_t b = (nib * 0x204081u) & 0x01010101u;   // bit j of nib to bit 0 of byte j
+    const uint32_t m = (b << 8) - b;                      // 0xff in those bytes
+    return (g ^ m) + b;
+}
+// Row `bp` (an IQ3_XXS block in shared memory, 2-byte aligned), sub-block ib: grid words t and 4 + t (values
+// 4t..4t+3 and 16+4t..16+4t+3, the A fragment's), the 4-bit scale and the block scale
+__device__ __forceinline__ void gm_decode(const uint8_t* bp, int ib, int t, const uint32_t* grid, uint32_t& lo,
+                                          uint32_t& hi, int& ls, float& dw) {
+    const uint16_t* a16 = (const uint16_t*) (bp + 66 + 4 * ib);
+    const uint32_t aux = (uint32_t) a16[0] | ((uint32_t) a16[1] << 16);
+    lo = gm_signed(grid[bp[2 + 8 * ib + t]], gm_sign_nib(aux, t));
+    hi = gm_signed(grid[bp[6 + 8 * ib + t]], gm_sign_nib(aux, 4 + t));
+    ls = (int) (aux >> 28);
+    dw = __half2float(*(const __half*) bp);
+}
+// Chunk c (ring slot `ring`) for warp w: sub-blocks k = 16c + w and 16c + 8 + w, i.e. the reference lanes
+// L = k % 32 = w + 8 ((2c + s) % 4), held in acc[.][IIB + s] (IIB = 2 (c & 1)).
+template<int IIB>
+__device__ __forceinline__ void gm_chunk(float (&acc)[2][4][4], const uint8_t* ring, const uint32_t* s_grid,
+                                         const uint32_t* s_x, int xs, int c, int ne, int w, int g, int t) {
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        const int k = 16 * c + 8 * s + w;
+        uint32_t b0 = 0, b1 = 0;
+        if (g < ne) {
+            const uint32_t* xp = s_x + g * xs + 9 * k;
+            b0 = xp[1 + t];
+            b1 = xp[5 + t];
+        }
+        const float d8a = 2 * t < ne ? __uint_as_float(s_x[(2 * t) * xs + 9 * k]) : 0.0f;
+        const float d8b = 2 * t + 1 < ne ? __uint_as_float(s_x[(2 * t + 1) * xs + 9 * k]) : 0.0f;
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            uint32_t a[4];
+            int ls[2];
+            float dw[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                gm_decode(ring + (16 * mt + 8 * h + g) * kGmSeg + 98 * s, w, t, s_grid, a[h], a[2 + h], ls[h], dw[h]);
+            int si[4];
+            gm_mma(si, a, b0, b1);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {   // C: rows g (q < 2) and g + 8, entries 2t + (q & 1)
+                int sumi = si[q];
+                sumi = (ls[q >> 1] * sumi + sumi / 2) / 2;
+                const float d = dw[q >> 1] * ((q & 1) ? d8b : d8a);
+                acc[mt][IIB + s][q] += d * sumi;
+            }
+        }
+    }
+}
+#endif
+
+__global__ void __launch_bounds__(256, 2) native_gu_mma_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                               const int32_t* __restrict__ grp_start,
+                                                               const int32_t* __restrict__ n_groups,
+                                                               const int32_t* __restrict__ ent_tok,
+                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                               float* __restrict__ gate, float* __restrict__ up) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    extern __shared__ __align__(16) uint8_t s_gm[];
+    uint8_t* s_ring = s_gm;
+    uint32_t* s_grid = (uint32_t*) (s_gm + kGmStages * kGmChunk);
+    uint32_t* s_x = s_grid + 256;
+    float* s_part = (float*) s_gm;   // after a pass's K loop: [entry][row][9] (warp w's sum at w)
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    s_grid[tid] = iq3xxs_grid[tid];  // visible from the first barrier of the K loop
+    const int row0 = blockIdx.x * kGmRows;                   // 0 .. 2*n_ff, a tile of gate or of up rows
+    const bool is_up = row0 >= (int) L.n_ff;
+    const int r0 = is_up ? row0 - (int) L.n_ff : row0;
+    float* dst = is_up ? up : gate;
+    const size_t w_off = (is_up ? L.up_off : 0) + (size_t) r0 * L.gu_row;
+    const int xb = (int) (L.n_embd / 32), xw = 9 * xb, xs = xw + 4;
+    const int nch = (int) (L.n_embd / 512);
+    for (int gi = blockIdx.y; gi < ng; gi += gridDim.y) {   // the group stride, as native_gu_kernel
+        const uint8_t* wbase = (const uint8_t*) grp_ptr[gi] + w_off;
+        const bool al4 = ((size_t) wbase & 3) == 0;
+        const int e0 = grp_start[gi], e1 = grp_start[gi + 1];
+        for (int e = e0; e < e1; e += kGmCols) {
+            const int ne = min(kGmCols, e1 - e);
+            // chunk c into its ring slot: 4-byte cp.async (the rows are 4-byte aligned when the blob is), else
+            // 2-byte copies
+            auto issue = [&](int c) {
+                uint8_t* d = s_ring + (c % kGmStages) * kGmChunk;
+                const uint8_t* src = wbase + (size_t) c * kGmSeg;
+                if (al4) {
+                    for (int q = tid; q < kGmRows * (kGmSeg / 4); q += 256) {
+                        const int rr = q / (kGmSeg / 4), wq = q - rr * (kGmSeg / 4);
+                        gm_cp4(d + rr * kGmSeg + 4 * wq, src + (size_t) rr * L.gu_row + 4 * wq);
+                    }
+                } else {
+                    for (int q = tid; q < kGmRows * (kGmSeg / 2); q += 256) {
+                        const int rr = q / (kGmSeg / 2), wq = q - rr * (kGmSeg / 2);
+                        *(uint16_t*) (d + rr * kGmSeg + 2 * wq) =
+                            *(const uint16_t*) (src + (size_t) rr * L.gu_row + 2 * wq);
+                    }
+                }
+            };
+#pragma unroll
+            for (int c = 0; c < kGmStages - 1; ++c) {
+                if (c < nch) issue(c);
+                gm_commit();
+            }
+            for (int c = 0; c < ne; ++c) {   // the entries' q8_1 rows, the scale word as the float __low2float gives
+                const uint32_t* xsrc = (const uint32_t*) (xq + (size_t) ent_tok[e + c] * xb);
+                uint32_t* xd = s_x + c * xs;
+                for (int i = tid; i < xw; i += 256) {
+                    uint32_t v = xsrc[i];
+                    if (i % 9 == 0) v = __float_as_uint(__half2float(__ushort_as_half((unsigned short) (v & 0xFFFFu))));
+                    xd[i] = v;
+                }
+            }
+            float acc[2][4][4];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) acc[mt][i][q] = 0.0f;
+            for (int c = 0; c < nch; ++c) {
+                gm_wait<kGmStages - 2>();   // chunk c is here (this thread's copies) ...
+                __syncthreads();            // ... and everyone's; slot (c - 1) % kGmStages is free again
+                if (c + kGmStages - 1 < nch) issue(c + kGmStages - 1);
+                gm_commit();
+                const uint8_t* ring = s_ring + (c % kGmStages) * kGmChunk;
+                if (c & 1) gm_chunk<2>(acc, ring, s_grid, s_x, xs, c, ne, w, g, t);
+                else gm_chunk<0>(acc, ring, s_grid, s_x, xs, c, ne, w, g, t);
+            }
+            gm_wait<0>();
+            __syncthreads();
+            // the butterfly's first two steps in the warp: (L + (L + 16)) for L = w and L = w + 8, then their sum
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int row = 16 * mt + 8 * (q >> 1) + g, col = 2 * t + (q & 1);
+                    const float lo = acc[mt][0][q] + acc[mt][2][q];
+                    const float hi = acc[mt][1][q] + acc[mt][3][q];
+                    s_part[(col * kGmRows + row) * 9 + w] = lo + hi;
+                }
+            __syncthreads();
+            {   // its last three: lanes 0..7 -> 0..3 -> 0..1 -> 0
+                const int row = tid & (kGmRows - 1), col = tid / kGmRows;
+                if (col < ne) {
+                    const float* p = s_part + (col * kGmRows + row) * 9;
+                    const float c0 = p[0] + p[4], c1 = p[1] + p[5], c2 = p[2] + p[6], c3 = p[3] + p[7];
+                    const float d0 = c0 + c2, d1 = c1 + c3;
+                    dst[(size_t) (e + col) * L.n_ff + r0 + row] = d0 + d1;
+                }
+            }
+            __syncthreads();   // the ring and the entries are free for the next pass
+        }
+    }
+#elif defined(__CUDA_ARCH__)
+    __trap();   // the host launches it only where device code for sm_80+ was built
+#endif
+}
+#endif  // !__HIPCC__ && !STRATA_HIP_GFX906
+
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                       long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1792,6 +2008,28 @@ bool g_stage_grid = [] {
 bool g_nc6 = env_on("STRATA_IQ_NC6");
 // STRATA_GU_STAGE=1: the grouped gate/up kernel reads the group's activations from shared memory (the same bits)
 bool g_gu_stage = env_on("STRATA_GU_STAGE");
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+// STRATA_GU_MMA=1: IQ3_XXS gate/up on int8 tensor cores, sm_80+ (the same bits; not with STRATA_GROUPED_V1)
+bool g_gu_mma = env_on("STRATA_GU_MMA");
+// Whether native_gu_mma_kernel runs on the current device at L's shapes: sm_80+ (the card's, or STRATA_EMULATE_CC's)
+// with sm_80+ device code in this build, n_embd in whole chunks (rows 4-byte aligned), the shared memory without opt-in
+bool gu_mma_usable(const NativeExpertLayout& L) {
+    if (L.n_embd <= 0 || L.n_embd % 512 != 0 || L.n_ff % kGmRows != 0 || gu_mma_smem(L.n_embd) > 48 * 1024)
+        return false;
+    static int ok[64] = {};   // per device: 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (ok[dev] == 0) {
+        int major = 0;
+        cudaFuncAttributes fa{};
+        const bool q1 = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess;
+        const bool q2 = q1 && cudaFuncGetAttributes(&fa, native_gu_mma_kernel) == cudaSuccess;
+        if (!q1 || !q2) cudaGetLastError();
+        ok[dev] = q2 && strata::cc_major_of(major) >= 8 && fa.ptxVersion >= 80 ? 1 : 2;
+    }
+    return ok[dev] == 1;
+}
+#endif
 // The single-matrix mmvq (128-thread blocks, one per 4 rows) pays the 2-8 KB staging per block: on the RTX 5070 its
 // IQ2_XS / IQ2_S / IQ1_M calls were 10-20% slower staged at 3-8 columns (iq_multi_parity --bench), while the grouped
 // expert kernels gain.  So mmvq stages only with STRATA_IQ_STAGE_GRID_MMVQ=1 (bitwise the same either way).
@@ -1833,7 +2071,19 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
-               float* gate, float* up) {
+               float* gate, float* up, bool allow_mma) {
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if constexpr (TG == 18) {
+        if (allow_mma && g_gu_mma && !g_old_kernels && gu_mma_usable(L)) {
+            const dim3 gm((unsigned) (2 * L.n_ff / kGmRows), grid.y);
+            native_gu_mma_kernel<<<gm, 256, gu_mma_smem(L.n_embd), s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                                                         gate, up);
+            return;
+        }
+    }
+#else
+    (void) allow_mma;
+#endif
     const size_t sx_bytes = (size_t) kGuStageT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if (g_old_kernels) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
@@ -2607,7 +2857,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #undef STRATA_GU_AMD
 #endif
     switch (L.gu_type) {
-#define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+#define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, !v1); break;
         STRATA_GU_FMTS(STRATA_GU)
 #undef STRATA_GU
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
