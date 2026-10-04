@@ -68,6 +68,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 /// kernels even with STRATA_GU_MMA=1.  Bitwise the same results (native_grouped_parity checks it); kept for A/B
 /// timing.  Set before graph capture; captured graphs keep theirs.
 void native_grouped_set_v1(bool v1);
+/// STRATA_GU_MMA=2: this thread's next grouped calls take the tensor-core gate/up (where it applies) when on
+void native_grouped_set_mma_hint(bool on);
 
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).

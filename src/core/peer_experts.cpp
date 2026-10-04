@@ -246,8 +246,10 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
         const auto& f = lay.fmt[(size_t) layer];
         const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        strata::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
         strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                                d_scratch_, d_out_, s);
+        strata::kernels::native_grouped_set_mma_hint(false);
     } else {
         err = "peer experts: only native packs are supported";
         return false;
