@@ -472,6 +472,54 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 }
 
 namespace {
+__global__ void mtp_take_row_kernel(float* R, long long rs, float* inj, long long is, float* mixed, long long ms,
+                                    const int32_t* __restrict__ row_dev) {
+    const int row = *row_dev;
+    if (row <= 0) return;
+    const long long total = rs + is + ms;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long) gridDim.x * blockDim.x) {
+        if (i < rs) R[i] = R[(long long) row * rs + i];
+        else if (i < rs + is) inj[i - rs] = inj[(long long) row * is + (i - rs)];
+        else mixed[i - rs - is] = mixed[(long long) row * ms + (i - rs - is)];
+    }
+}
+}  // namespace
+
+void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, float* mixed, int64_t mixed_stride,
+                  const int32_t* row_dev, void* stream) {
+    const long long total = (long long) (R_stride + inj_stride + mixed_stride);
+    const unsigned blocks = (unsigned) ((total + 255) / 256 < 64 ? (total + 255) / 256 : 64);
+    mtp_take_row_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(R, (long long) R_stride, inj, (long long) inj_stride,
+                                                                   mixed, (long long) mixed_stride, row_dev);
+    check("mtp_take_row");
+}
+
+#if !defined(__HIPCC__) && defined(CUDART_VERSION) && CUDART_VERSION >= 12040
+namespace {
+struct CondHandles { unsigned long long h[8]; };
+__global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __restrict__ probs,
+                                      const int32_t* __restrict__ row, const int32_t* __restrict__ min_p_bits) {
+    const float p = probs[*row];
+    const float min_p = __int_as_float(*min_p_bits);
+    cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], p >= min_p ? 1u : 0u);
+    for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);
+}
+}  // namespace
+
+bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
+                    const int32_t* min_p_bits, void* stream) {
+    if (n < 1 || n > 8) { std::fprintf(stderr, "mtp_draft_cond: n out of range\n"); std::exit(1); }
+    CondHandles hs{};
+    for (int k = 0; k < n; ++k) hs.h[k] = h[k];
+    mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, min_p_bits);
+    check("mtp_draft_cond");
+    return true;
+}
+#else
+bool mtp_draft_cond(const unsigned long long*, int, const float*, const int32_t*, const int32_t*, void*) { return false; }
+#endif
+
+namespace {
 __global__ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long stride) {
     const int q = blockIdx.y;
     int32_t* st = steps + q * 4;

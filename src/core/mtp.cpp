@@ -45,6 +45,13 @@
 #include <immintrin.h>
 #endif
 
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(__HIPCC__) && defined(CUDART_VERSION) && \
+    CUDART_VERSION >= 12040
+#define STRATA_MTP_COND_NODES 1
+#else
+#define STRATA_MTP_COND_NODES 0
+#endif
+
 namespace strata::core {
 namespace {
 
@@ -52,6 +59,24 @@ constexpr float EPS = 1e-6f;
 constexpr int GGML_Q8_0 = 8;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+bool env_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::atoi(v) != 0;
+}
+// opt-in draft-path changes, each with the default path's drafts and probabilities bit for bit
+bool reuse_row_on() {   // the round's draft row from the catch-up
+    static const bool on = env_on("STRATA_MTP_REUSE_ROW");
+    return on;
+}
+bool fuse_top_on() {    // the head's argmax, probability and map in one kernel
+    static const bool on = env_on("STRATA_MTP_FUSE_TOP");
+    return on;
+}
+bool cond_on() {        // the min_p chain as conditional nodes of one graph
+    static const bool on = env_on("STRATA_MTP_COND");
+    return on;
+}
 
 struct Bump {
     uint8_t* base = nullptr;
@@ -120,6 +145,8 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
+    for (auto& row : cond_exec_)
+        for (auto& e : row) if (e) cudaGraphExecDestroy(e);
     if (cparams_) cudaFree(cparams_);
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
@@ -466,7 +493,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
 }
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
-bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
+bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool reuse_row) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -474,73 +501,81 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     const bool full = step_row0 >= 0;
     const int row0 = full ? step_row0 : -1 - step_row0;
     if (full && T != 1) { err = "mtp: the full layer runs one row at a time (its attention scratch is sized for one)"; return false; }
+    if (reuse_row && !full) { err = "mtp: only the full layer reuses a catch-up row"; return false; }
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const int32_t* step = step_ + row0 * 4;
     const int32_t* pos = pos_ + row0 * NH;
     try {
-        // ---- the two input branches
-        const WeightRef* we = wt_->find("token_embd.weight");
-        if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
-        if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
-            ne->gather_dev(tok_, T, emb_, cs);
-        } else {
-            const auto* codes = (const uint8_t*) we->data;
-            const auto* scales = (const float*) (codes + we->codes_bytes);
-            const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
-            embedding_gather_dev(codes, scales, offsets, tok_, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
-                                 (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, cs);
-        }
-        native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
-        native_quantize_q8_1(en_, xq_, (int) N, T, cs);
-        native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
-        native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
-        for (int c0 = 0; c0 < T * HC; c0 += 8) {
-            const int nc = (int) std::min<int64_t>(8, T * HC - c0);
-            native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
-            native_mmvq(GGML_Q8_0, q8("fc_hidden.weight"), xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
-        }
-        add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
-        // ---- the attention hyper-connection
-        {
-            FusedGrArgs fa[kFusedGrMaxT];
-            for (int t = 0; t < T; ++t) {
-                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
-                fa[t].w_norm = f32("attn_hyper_connection.hc_norm.weight");
-                fa[t].w_down = bf16("attn_hyper_connection.input_mix_weight_down.weight");
-                fa[t].w_up = bf16("attn_hyper_connection.input_mix_weight_up.weight");
-                fa[t].w_inject = bf16("attn_hyper_connection.block_inject_weight.weight");
-                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
-                fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N;
-            }
-            fused_gr_read_multi(fa, T, xn_, cs);
-        }
-        // ---- attention: K/V into the layer's own cache, then (full) dense attention over every cell
         auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
             if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
             else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
         };
-        native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
-        for (int t = 0; t < T; ++t) {
-            norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
-            if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
-                fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
-                fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
+        if (reuse_row) {
+            // the catch-up already ran this row's input branches, attention hyper-connection and K/V append, with
+            // the same per-row arithmetic: its R, injection and mixed rows become row 0
+            mtp_take_row(R_, HC * N, inj_, HC, mixed_, N, row_, cs);
+            native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
+        } else {
+            // ---- the two input branches
+            const WeightRef* we = wt_->find("token_embd.weight");
+            if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
+            if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
+                ne->gather_dev(tok_, T, emb_, cs);
+            } else {
+                const auto* codes = (const uint8_t*) we->data;
+                const auto* scales = (const float*) (codes + we->codes_bytes);
+                const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
+                embedding_gather_dev(codes, scales, offsets, tok_, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
+                                     (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, cs);
             }
-            // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
-            if (st_.kv_q4)
-                kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                                  vcur_ + t * NKV * HD, s, cs, &st_.host);
-            else if (st_.kv_int8)
-                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
-                                  kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
-            else
-                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
-                               vcur_ + t * NKV * HD, s, cs, &st_.host);
+            native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
+            native_quantize_q8_1(en_, xq_, (int) N, T, cs);
+            native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
+            native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
+            for (int c0 = 0; c0 < T * HC; c0 += 8) {
+                const int nc = (int) std::min<int64_t>(8, T * HC - c0);
+                native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
+                native_mmvq(GGML_Q8_0, q8("fc_hidden.weight"), xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
+            }
+            add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
+            // ---- the attention hyper-connection
+            {
+                FusedGrArgs fa[kFusedGrMaxT];
+                for (int t = 0; t < T; ++t) {
+                    fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
+                    fa[t].w_norm = f32("attn_hyper_connection.hc_norm.weight");
+                    fa[t].w_down = bf16("attn_hyper_connection.input_mix_weight_down.weight");
+                    fa[t].w_up = bf16("attn_hyper_connection.input_mix_weight_up.weight");
+                    fa[t].w_inject = bf16("attn_hyper_connection.block_inject_weight.weight");
+                    fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
+                    fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N;
+                }
+                fused_gr_read_multi(fa, T, xn_, cs);
+            }
+            // ---- attention: K/V into the layer's own cache, then (full) dense attention over every cell
+            native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
+            native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
+            native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
+            for (int t = 0; t < T; ++t) {
+                norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
+                if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
+                    fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
+                    fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
+                }
+                // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
+                if (st_.kv_q4)
+                    kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                                      vcur_ + t * NKV * HD, s, cs, &st_.host);
+                else if (st_.kv_int8)
+                    kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
+                                      kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);
+                else
+                    kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                                   vcur_ + t * NKV * HD, s, cs, &st_.host);
+            }
         }
         if (!full) return true;
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
@@ -643,6 +678,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                                  cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, cs);
             return true;
         }
+        if (fuse_top_on() && sample_greedy_top_prob(head_logits_, T, (int) nv, sub ? dvocab_ : nullptr, out_ids_, probs_, cs))
+            return true;
         SamplerParams sp;
         sp.greedy = true;
         sp.temperature = 0.0f;
@@ -695,55 +732,154 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
 }
 
-bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
-    if (exec) return true;
+// The round: the catch-up's K/V for the window's T cells, then the full layer for row a only (its cell's K/V is written
+// again, identically, unless STRATA_MTP_REUSE_ROW takes the row from the catch-up), staged by the host in step row
+// 2*max_t - 1; draft 0 and its probability to the mapped outputs.  The draft chain is one graph per step
+// (`capture_step`) so the host can stop it when a draft is unlikely, or conditional nodes (`capture_cond`).
+bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& err) {
     using namespace strata::kernels;
-    const int64_t HCN = g_->hc * g_->n_embd;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
-    bool ok = true;
+    const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
+    const bool reuse = reuse_row_on();
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
+    const int64_t rows = all_rows ? 2 * (int64_t) max_t_ : 2 * (int64_t) T;
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
-    copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) 2 * T * g_->n_head, cs_);
-    copy_i32_from_mapped(row_, m_row_, 2, cs_);
+    copy_i32_from_mapped(step_, m_step_, rows * 4, cs_);
+    copy_i32_from_mapped(pos_, m_pos_, rows * NH, cs_);
+    copy_i32_from_mapped(row_, m_row_, all_rows ? 3 : 2, cs_);
     copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
-    // the catch-up: K/V for the window's T cells, then the full layer for row a only (its cell's K/V is written
-    // again, identically), staged by the host in step row 2*max_t - 1; the draft chain is one graph per step
-    // (`capture_step`) so the host can stop it when a draft is unlikely
     const int ra = 2 * max_t_ - 1;
-    ok = record_forward(T, -1, cs_, err);
-    if (ok) mtp_select(Rin_, HCN, tok_, row_, Rin_, tok_, nullptr, 0, cs_);
+    bool ok = record_forward(T, -1, cs_, err);
+    if (ok && !reuse) mtp_select(Rin_, HCN, tok_, row_, Rin_, tok_, nullptr, 0, cs_);
     if (ok) {
-        copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
-        copy_i32_from_mapped(pos_ + ra * g_->n_head, m_pos_ + ra * g_->n_head, g_->n_head, cs_);
+        if (!all_rows) {
+            copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
+            copy_i32_from_mapped(pos_ + ra * NH, m_pos_ + ra * NH, NH, cs_);
+        }
         coupled_rec_ = coupled;
         coupled_j_ = 0;
-        ok = record_forward(1, ra, cs_, err);
+        ok = record_forward(1, ra, cs_, err, reuse);
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
-    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+    return ok;
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
+bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string& err) {
+    using namespace strata::kernels;
+    const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
+    const int row = max_t_ + j - 1;
+    if (copy_records) {
+        copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
+        copy_i32_from_mapped(pos_ + row * NH, m_pos_ + row * NH, NH, cs_);
+    }
+    coupled_rec_ = coupled;
+    coupled_j_ = j;
+    const bool ok = record_forward(1, row, cs_, err);
+    coupled_rec_ = false;
+    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    return ok;
+}
+
+bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
+    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
+    if (exec) return true;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    const bool ok = record_round(T, coupled, false, err);
+    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+}
+
 bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
-    using namespace strata::kernels;
-    const int64_t HCN = g_->hc * g_->n_embd;
-    const int row = max_t_ + j - 1;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
-    copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
-    copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
-    coupled_rec_ = coupled;
-    coupled_j_ = j;
-    bool ok = record_forward(1, row, cs_, err);
-    coupled_rec_ = false;
-    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    const bool ok = record_step(j, coupled, true, err);
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+}
+
+// STRATA_MTP_COND: [round, h1 <- p0 >= min_p] -> IF h1 [step 1, h2 <- p1 >= min_p] -> IF h2 [...] ...  Every record
+// is copied once, by the round.  The host compares the same probabilities with the same min_p, so it waits only for
+// the drafts the graph makes; the device side only removes the host round trip between steps.
+bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
+#if STRATA_MTP_COND_NODES
+    const int c = coupled ? 1 : 0;
+    cudaGraphExec_t& exec = cond_exec_[c][T];
+    if (exec && cond_steps_[c][T] == steps) return true;
+    if (exec) {
+        cudaGraphExecDestroy(exec);
+        exec = nullptr;
+    }
+    using namespace strata::kernels;
+    std::string err;
+    cudaGraph_t top = nullptr;
+    cudaGraphConditionalHandle h[kVerifyMaxT] = {};
+    unsigned long long hv[kVerifyMaxT] = {};
+    bool ok = steps >= 2 && steps <= kVerifyMaxT - 1 && cudaGraphCreate(&top, 0) == cudaSuccess;
+    for (int j = 1; ok && j < steps; ++j) {
+        // reset to 0 at every launch: a skipped step leaves the next one's handle at 0
+        ok = cudaGraphConditionalHandleCreate(&h[j], top, 0, cudaGraphCondAssignDefault) == cudaSuccess;
+        hv[j] = (unsigned long long) h[j];
+    }
+    cudaGraphNode_t prev = nullptr;
+    if (ok) ok = cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+    if (ok) {
+        const bool rec = record_round(T, coupled, true, err) &&
+                         mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_);
+        cudaGraph_t g0 = nullptr;
+        const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
+        ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
+        if (g0) cudaGraphDestroy(g0);
+    }
+    for (int j = 1; ok && j < steps; ++j) {
+        cudaGraphNodeParams np{};
+        np.type = cudaGraphNodeTypeConditional;
+        np.conditional.handle = h[j];
+        np.conditional.type = cudaGraphCondTypeIf;
+        np.conditional.size = 1;
+        cudaGraphNode_t node = nullptr;
+#if CUDART_VERSION >= 13000
+        ok = cudaGraphAddNode(&node, top, &prev, nullptr, 1, &np) == cudaSuccess;
+#else
+        ok = cudaGraphAddNode(&node, top, &prev, 1, &np) == cudaSuccess;
+#endif
+        if (!ok) break;
+        cudaGraph_t body = np.conditional.phGraph_out[0];
+        ok = cudaStreamBeginCaptureToGraph(cs_, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal) ==
+             cudaSuccess;
+        if (!ok) break;
+        bool rec = record_step(j, coupled, false, err);
+        if (rec && j + 1 < steps) rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_);
+        cudaGraph_t captured = nullptr;   // the body itself, owned by the node
+        ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
+        prev = node;
+    }
+    if (ok) ok = cudaGraphInstantiate(&exec, top, 0) == cudaSuccess;
+    if (top) cudaGraphDestroy(top);
+    if (ok) {
+        cudaGraphUpload(exec, cs_);
+        ok = cudaStreamSynchronize(cs_) == cudaSuccess;
+    }
+    if (!ok) {
+        const cudaError_t e = cudaGetLastError();
+        std::fprintf(stderr, "strata mtp: STRATA_MTP_COND: the conditional draft graph failed (%s%s%s); one graph per "
+                             "step from now on\n",
+                     cudaGetErrorString(e), err.empty() ? "" : ", ", err.c_str());
+        if (exec) cudaGraphExecDestroy(exec);
+        exec = nullptr;
+        cond_off_ = true;
+        return false;
+    }
+    cond_steps_[c][T] = steps;
+    return true;
+#else
+    (void) T; (void) coupled; (void) steps;
+    std::fprintf(stderr, "strata mtp: STRATA_MTP_COND: this build has no conditional graph nodes (CUDA 12.4+); one "
+                         "graph per step\n");
+    cond_off_ = true;
+    return false;
+#endif
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {
@@ -863,10 +999,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
-    if (!capture_round(T, cp, err)) return false;
     const int max_steps = std::min(max_t_ - 1, max_drafts_);
-    for (int j = 1; j < max_steps; ++j)
-        if (!capture_step(j, cp, err)) return false;
+    // STRATA_MTP_COND: the min_p chain in one graph (falls back to the graphs below for good if it cannot be built)
+    const bool cond = cond_on() && !cond_off_ && min_p > 0.0f && max_steps > 1 && capture_cond(T, cp, max_steps);
+    if (!cond) {
+        if (!capture_round(T, cp, err)) return false;
+        for (int j = 1; j < max_steps; ++j)
+            if (!capture_step(j, cp, err)) return false;
+    }
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
@@ -886,6 +1026,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
     h_row_[0] = a;
     h_row_[1] = 0;
+    std::memcpy(&h_row_[2], &min_p, sizeof(float));   // read by the conditional graph only
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
@@ -936,7 +1077,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         prefetch_ple(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+        const cudaGraphExec_t first = cond ? cond_exec_[cp ? 1 : 0][T] : (cp ? round_exec_c_[T] : round_exec_[T]);
+        if (cudaGraphLaunch(first, cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
@@ -957,13 +1099,16 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (probs) probs[0] = pj;
         n = 1;
         for (int j = 1; j < max_steps && pj >= min_p; ++j) {
-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
-                err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
+            if (!cond) {   // the conditional graph runs step j on the device by the same comparison
+                if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                    err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                (void) cudaStreamQuery(cs_);
             }
-            (void) cudaStreamQuery(cs_);
             prefetch_ple(drafts[j - 1]);
             wait_step(j);
+            if (cond && ((volatile int32_t*) h_out_)[j] < 0) break;   // the graph ended without it: the sync says why
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;

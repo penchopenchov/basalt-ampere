@@ -102,12 +102,23 @@ public:
     }
 
 private:
-    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+    /// reuse_row: the full layer's row 0 from the catch-up's row *row_ (STRATA_MTP_REUSE_ROW; full, T == 1)
+    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool reuse_row = false);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
+    /// all_rows: copy every step / position record (the chain's too) and the min_p bits, for a graph without per-step
+    /// copies (STRATA_MTP_COND)
+    bool record_round(int T, bool coupled, bool all_rows, std::string& err);
+    bool record_step(int j, bool coupled, bool copy_records, std::string& err);
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
+    /// STRATA_MTP_COND: the round and `steps - 1` chain steps in one graph, step j an IF node on draft j-1's
+    /// probability >= min_p; false (with the per-step path from then on) where it cannot be built
+    bool capture_cond(int T, bool coupled, int steps);
+    cudaGraphExec_t cond_exec_[2][9] = {};
+    int cond_steps_[2][9] = {};
+    bool cond_off_ = false;
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
