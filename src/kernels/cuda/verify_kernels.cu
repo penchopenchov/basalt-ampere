@@ -113,6 +113,59 @@ __global__ void __launch_bounds__(64) gdn_ab_multi_kernel(const float* __restric
     }
 }
 
+// gdn_ab_multi_kernel for rows of exactly 32 * NJ uint4: every weight load issued before the sums and the token loop
+// unrolled, so a warp waits for memory once instead of once per step.  The same sums in the same order: the same bits.
+template <int MAX_T, int NJ>
+__global__ void __launch_bounds__(64) gdn_ab_multi_unrolled_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                                                   const uint16_t* __restrict__ wb,
+                                                                   const float* __restrict__ dt,
+                                                                   const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                                                   float* __restrict__ beta, int n, int h_v, int T) {
+    const int row = blockIdx.x * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= 2 * h_v) return;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
+    uint4 wv[NJ];
+#pragma unroll
+    for (int q = 0; q < NJ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    float acc[MAX_T];
+#pragma unroll
+    for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
+#pragma unroll
+    for (int q = 0; q < NJ; ++q) {
+        const int j = lane + 32 * q;
+#pragma unroll
+        for (int t = 0; t < MAX_T; ++t) {
+            if (t < T) {
+                const float* xt = x + (size_t) t * n;
+                const float4 xa = *reinterpret_cast<const float4*>(xt + j * 8);
+                const float4 xb = *reinterpret_cast<const float4*>(xt + j * 8 + 4);
+                float a = acc[t];
+                a = fmaf(__uint_as_float(wv[q].x << 16), xa.x, a); a = fmaf(__uint_as_float(wv[q].x & 0xffff0000u), xa.y, a);
+                a = fmaf(__uint_as_float(wv[q].y << 16), xa.z, a); a = fmaf(__uint_as_float(wv[q].y & 0xffff0000u), xa.w, a);
+                a = fmaf(__uint_as_float(wv[q].z << 16), xb.x, a); a = fmaf(__uint_as_float(wv[q].z & 0xffff0000u), xb.y, a);
+                a = fmaf(__uint_as_float(wv[q].w << 16), xb.z, a); a = fmaf(__uint_as_float(wv[q].w & 0xffff0000u), xb.w, a);
+                acc[t] = a;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MAX_T; ++t) {
+        if (t >= T) break;
+        float a = acc[t];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane != 0) continue;
+        if (is_beta) {
+            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+        } else {
+            const float v = a + dt[r];
+            const float sp = v > 20.0f ? v : log1pf(__expf(v));
+            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+        }
+    }
+}
+
 // State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
 // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
 __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restrict__ state,
@@ -460,7 +513,19 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::exit(1);
     }
     const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
-    if (n_tok <= 4) {
+    // STRATA_GDN_AB_UNROLL=1: rows of 2560 take the unrolled kernel (the same bits)
+    static const bool unroll = [] { const char* v = std::getenv("STRATA_GDN_AB_UNROLL"); return v && std::atoi(v) != 0; }();
+    if (unroll && n_embd == 32 * 8 * 10) {
+        if (n_tok <= 4)
+            gdn_ab_multi_unrolled_kernel<4, 10><<<blocks, 64, 0, (cudaStream_t) stream>>>(
+                x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+        else if (n_tok <= 6)
+            gdn_ab_multi_unrolled_kernel<6, 10><<<blocks, 64, 0, (cudaStream_t) stream>>>(
+                x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+        else
+            gdn_ab_multi_unrolled_kernel<kVerifyMaxT, 10><<<blocks, 64, 0, (cudaStream_t) stream>>>(
+                x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    } else if (n_tok <= 4) {
         gdn_ab_multi_kernel<4><<<blocks, 64, 0, (cudaStream_t) stream>>>(
             x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     } else {

@@ -572,7 +572,7 @@ template<int TY> struct Split;
 // per-entry ones, which call Fmt<TY>::dot per column exactly as before #242 (the launchers test kSplit at compile
 // time, so the multi kernels are never instantiated for a type without a Split).
 template<int TY> inline constexpr bool kSplit = false;
-template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 22 || TY == 29);
+template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 22 || TY == 29);
 
 template<> inline constexpr bool kSplit<16> = true;
 template<> struct Split<16> {   // IQ2_XXS
@@ -681,15 +681,18 @@ template<> inline constexpr bool kSplit<18> = true;
 template<> struct Split<18> {   // IQ3_XXS
     struct W { int g[8]; int ls; float dw; };
     template<bool STAGE_GRID = false>
-    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
         const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
         const uint8_t* q3 = (const uint8_t*) &q3_packed;
         const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+        const uint32_t* grid_lut;
+        if constexpr (STAGE_GRID) grid_lut = s_grid;
+        else grid_lut = iq3xxs_grid;
         W r;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+            const int2 grid_pos = make_int2(grid_lut[q3[l0 + 0]], grid_lut[q3[l0 + 1]]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -1014,6 +1017,10 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
         for (int i = tid; i < 1024; i += nthreads) dst[i] = src[i];
         __syncthreads();
         return s_buf;
+    } else if constexpr (TY == 18) {
+        for (int i = tid; i < 256; i += nthreads) s_buf[i] = iq3xxs_grid[i];
+        __syncthreads();
+        return s_buf;
     } else if constexpr (TY == 29) {
         uint2* dst = (uint2*) s_buf;
         const uint2* src = (const uint2*) iq1s_grid_gpu;
@@ -1027,7 +1034,8 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
 
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
 struct IqGridWords {
-    static constexpr int value = !STAGE_GRID ? 4 : (TY == 22 || TY == 29) ? 2048 : (TY == 17) ? 1024 : (TY == 16) ? 512 : 4;
+    static constexpr int value = !STAGE_GRID ? 4 : (TY == 22 || TY == 29) ? 2048 : (TY == 17) ? 1024 : (TY == 16) ? 512 :
+                                 (TY == 18) ? 256 : 4;
 };
 
 // mmvq_kernel with the columns taken NC at a time.  After warp_sum every lane holds the same sum, so lane c stores
@@ -1091,9 +1099,9 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 }
 
 // native_gu_kernel with the group's entries taken GRP_NC at a time, each weight part decoded once per pass.
-// A group has at most one entry per token of the window (kVerifyMaxT = 8; setup writes --spec 4, and a split window
-// has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
-constexpr int GRP_NC = 4;
+// A group has at most one entry per token of the window (kVerifyMaxT = 8; a --spec 5 window carries up to 6 tokens),
+// so 6 takes such windows in one pass; 8 would take ~64-80 registers.
+constexpr int GRP_NC = 6;
 
 template<int TG, bool STAGE_GRID = kStageIqGrid<TG>>
 __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
@@ -1138,6 +1146,72 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
                     if (c < n && lane == c) dst[(size_t) (e + c) * L.n_ff + r] = s[c];
+            }
+        }
+    }
+}
+
+// native_gu_multi_kernel with the group's activations in shared memory, kGuStageT entries at a time: a q8_1 block
+// is 9 words, so the lanes' block-strided reads fall in distinct banks instead of spanning ~9 cache lines per load.
+// The same loads in the same order from shared memory, so the same bits (STRATA_GU_STAGE=0: the kernel above).
+constexpr int kGuStageT = 8;
+
+template<int TG, bool STAGE_GRID = kStageIqGrid<TG>>
+__global__ void __launch_bounds__(256) native_gu_multi_sx_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                 const int32_t* __restrict__ grp_start,
+                                                                 const int32_t* __restrict__ n_groups,
+                                                                 const int32_t* __restrict__ ent_tok,
+                                                                 const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                                 float* __restrict__ gate, float* __restrict__ up) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TG, STAGE_GRID>::value];
+    extern __shared__ __align__(16) uint32_t s_x[];
+    const uint32_t* s_grid = stage_iq_grid<TG, STAGE_GRID>(s_grid_buf, threadIdx.x, 256);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
+    const bool valid = row < 2 * L.n_ff;                     // every thread stages, so none returns early
+    const bool is_up = row >= L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const size_t w_off = valid ? (is_up ? L.up_off : 0) + (size_t) r * L.gu_row : 0;
+    const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
+    const int xw = xb * (int) (sizeof(block_q8_1) / sizeof(uint32_t));   // words per entry
+    const block_q8_1* sx = reinterpret_cast<const block_q8_1*>(s_x);
+    float* dst = is_up ? up : gate;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int c0 = e0; c0 < e1; c0 += kGuStageT) {
+            const int nc = min(kGuStageT, e1 - c0);
+            __syncthreads();                                 // the previous entries' reads are done
+            for (int i = threadIdx.x; i < nc * xw; i += 256) {
+                const int c = i / xw, w = i - c * xw;
+                s_x[i] = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[c0 + c] * xb)[w];
+            }
+            __syncthreads();
+            if (!valid) continue;
+            for (int e = c0; e < c0 + nc; e += GRP_NC) {     // the GRP_NC passes of native_gu_multi_kernel
+                const int n = min(GRP_NC, c0 + nc - e), b = e - c0;
+                if (n == 1) {
+                    const int off1[1] = { b * xb };
+                    float s1[1];
+                    row_dot_multi<TG, 1, true, STAGE_GRID>(wr, sx, off1, 1, nb, lane, s1, s_grid);
+                    if (lane == 0) dst[(size_t) e * L.n_ff + r] = s1[0];
+                } else if (n == 2) {
+                    const int off2[2] = { b * xb, (b + 1) * xb };
+                    float s2[2];
+                    row_dot_multi<TG, 2, true, STAGE_GRID>(wr, sx, off2, 2, nb, lane, s2, s_grid);
+                    if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = s2[lane];
+                } else {
+                    int off[GRP_NC];
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c) off[c] = (b + min(c, n - 1)) * xb;
+                    float sm[GRP_NC];
+                    row_dot_multi<TG, GRP_NC, false, STAGE_GRID>(wr, sx, off, n, nb, lane, sm, s_grid);
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n && lane == c) dst[(size_t) (e + c) * L.n_ff + r] = sm[c];
+                }
             }
         }
     }
@@ -1711,6 +1785,10 @@ bool g_stage_grid = [] {
     const char* v = std::getenv("STRATA_IQ_STAGE_GRID");
     return v == nullptr || v[0] == '\0' || v[0] != '0';
 }();
+// STRATA_IQ_NC6=1: five or six columns in one pass of six rather than of eight (the same bits)
+bool g_nc6 = env_on("STRATA_IQ_NC6");
+// STRATA_GU_STAGE=1: the grouped gate/up kernel reads the group's activations from shared memory (the same bits)
+bool g_gu_stage = env_on("STRATA_GU_STAGE");
 // The single-matrix mmvq (128-thread blocks, one per 4 rows) pays the 2-8 KB staging per block: on the RTX 5070 its
 // IQ2_XS / IQ2_S / IQ1_M calls were 10-20% slower staged at 3-8 columns (iq_multi_parity --bench), while the grouped
 // expert kernels gain.  So mmvq stages only with STRATA_IQ_STAGE_GRID_MMVQ=1 (bitwise the same either way).
@@ -1730,17 +1808,20 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
             if (ncols <= 1) mmvq_multi_kernel<TY, 1, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
             else if (ncols == 2) mmvq_multi_kernel<TY, 2, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
             else if (ncols <= 4) mmvq_multi_kernel<TY, 4, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+            else if (ncols <= 6 && g_nc6) mmvq_multi_kernel<TY, 6, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
             else mmvq_multi_kernel<TY, 8, false><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
             return;
         }
         if (ncols <= 1) mmvq_multi_kernel<TY, 1><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
         else if (ncols == 2) mmvq_multi_kernel<TY, 2><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
         else if (ncols <= 4) mmvq_multi_kernel<TY, 4><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+        else if (ncols <= 6 && g_nc6) mmvq_multi_kernel<TY, 6><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
         else mmvq_multi_kernel<TY, 8><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
     } else {
         if (ncols <= 1) mmvq_multi_kernel<TY, 1><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
         else if (ncols == 2) mmvq_multi_kernel<TY, 2><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
         else if (ncols <= 4) mmvq_multi_kernel<TY, 4><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+        else if (ncols <= 6 && g_nc6) mmvq_multi_kernel<TY, 6><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
         else mmvq_multi_kernel<TY, 8><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);   // 8 at a time past 8
     }
 }
@@ -1749,8 +1830,18 @@ template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
                float* gate, float* up) {
+    const size_t sx_bytes = (size_t) kGuStageT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if (g_old_kernels) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    else if (g_gu_stage && sx_bytes <= 40 * 1024) {
+        if constexpr (kStageIqGrid<TG>) {
+            if (!g_stage_grid) {
+                native_gu_multi_sx_kernel<TG, false><<<grid, 256, sx_bytes, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                return;
+            }
+        }
+        native_gu_multi_sx_kernel<TG><<<grid, 256, sx_bytes, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    }
     else if constexpr (kStageIqGrid<TG>) {
         if (!g_stage_grid) {
             native_gu_multi_kernel<TG, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);

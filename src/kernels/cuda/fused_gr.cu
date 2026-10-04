@@ -15,6 +15,7 @@
 #include <vector>
 
 namespace strata::kernels {
+extern int g_gr_fast;   // fused_gr_set_fast: 0 = the reference kernels (the bench's A/B)
 namespace {
 
 constexpr int N = 2560;         // n_embd
@@ -681,6 +682,88 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
     }
 }
 
+// gr_down_staged_kernel with PD weight tiles in flight ahead of the one being summed (a register ring; the loop is
+// unrolled so the ring's slots are registers).  Each lane's sums keep their order, so every PD gives the same bits.
+template <int MAX_T, int PD>
+__global__ void __launch_bounds__(THREADS) gr_down_staged_deep_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
+    constexpr int RING = PD + 1;
+    static_assert(PD >= 2 && PD < N_HTILES, "deeper than gr_down_staged_kernel, at most the rest of the row");
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint4 w[RING][HQ];
+    if (active) {
+#pragma unroll
+        for (int p = 0; p < RING; ++p)
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) w[p][q] = __ldg(w4 + p * (H_TILE / 8) + lane + 32 * q);
+    }
+    stage_htile(m, T, 0, hbuf, t);
+    cp_async_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t);
+    cp_async_commit();
+#pragma unroll
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (h + 1 < N_HTILES) cp_async_wait1();         // tile h has landed (h + 1 may still be on its way)
+        else cp_async_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (k < T) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        acc[k] += dot8v(w[h % RING][q], pk[j], pk[H_TILE / 8 + j]);
+                    }
+                }
+            }
+            if (h + RING < N_HTILES) {                  // the slot just summed takes the tile RING ahead
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) w[h % RING][q] = __ldg(w4 + (h + RING) * (H_TILE / 8) + lane + 32 * q);
+            }
+        }
+        __syncthreads();                                // every warp is done with buffer h & 1
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+        cp_async_commit();                              // an empty group at the end keeps the wait counts simple
+    }
+    if (!active) return;
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = k < T ? warp_sum(acc[k]) : 0.0f;
+    // lane k writes token k (every lane holds every sum after the xor reduction)
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if (k >= T || lane != k) continue;
+        if (inject_block) {
+            m.a[k].inject_out[row] = s[k];
+        } else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+template <int MT>
+void launch_staged(int depth, const GrMulti& c, dim3 grid, size_t smem, cudaStream_t st) {
+    if (depth >= 5) gr_down_staged_deep_kernel<MT, 5><<<grid, THREADS, smem, st>>>(c);
+    else if (depth == 4) gr_down_staged_deep_kernel<MT, 4><<<grid, THREADS, smem, st>>>(c);
+    else if (depth == 3) gr_down_staged_deep_kernel<MT, 3><<<grid, THREADS, smem, st>>>(c);
+    else if (depth == 2) gr_down_staged_deep_kernel<MT, 2><<<grid, THREADS, smem, st>>>(c);
+    else gr_down_staged_kernel<MT><<<grid, THREADS, smem, st>>>(c);
+}
+
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
 // stages n_tok * TILEV floats (1280 on sm_75, 2560 elsewhere), staged two tiles of n_tok * H_TILE.  The shared-memory
 // opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
@@ -729,6 +812,15 @@ int down_chunk(bool staged, int* tile_out) {
         int want_staged = (int) (2 * kFusedGrMaxT * H_TILE * sizeof(float));
         if (optin > 0 && want_staged > optin) want_staged = optin;
         cudaFuncSetAttribute(gr_down_staged_kernel<>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_deep_kernel<kFusedGrMaxT, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_deep_kernel<kFusedGrMaxT, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_deep_kernel<kFusedGrMaxT, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_deep_kernel<kFusedGrMaxT, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
+        cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
         cudaGetLastError();      // drop any error the attempt left behind
         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
@@ -799,8 +891,19 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         static const bool max4_on = [] { const char* v = std::getenv("STRATA_GR_DOWN_MAX4"); return v && std::atoi(v) != 0; }();
         const bool max4 = max4_on && ct <= 4;
         if (staged) {
-            if (max4) gr_down_staged_kernel<4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else gr_down_staged_kernel<><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            // STRATA_GR_DEPTH: weight tiles in flight per warp (1 = the earlier kernel; the same bits at every depth).
+            // STRATA_GR_DOWN_FIT=1: the smallest of 2 / 4 / 6 sums per thread that holds the launch's tokens, as
+            // STRATA_GR_DOWN_MAX4 does for 4 (the same bits)
+            static const int depth_env = [] { const char* v = std::getenv("STRATA_GR_DEPTH"); return v ? std::atoi(v) : 1; }();
+            static const bool fit_env = [] { const char* v = std::getenv("STRATA_GR_DOWN_FIT"); return v && std::atoi(v) != 0; }();
+            const bool ref = g_gr_fast == 0;
+            const int depth = ref ? 1 : depth_env;
+            const bool fit = !ref && fit_env;
+            const dim3 grid(DOWN_BLOCKS + 1);
+            if (fit && ct <= 2) launch_staged<2>(depth, c, grid, smem, st);
+            else if ((fit || (max4 && !ref)) && ct <= 4) launch_staged<4>(depth, c, grid, smem, st);
+            else if (fit && ct <= 6) launch_staged<6>(depth, c, grid, smem, st);
+            else launch_staged<kFusedGrMaxT>(depth, c, grid, smem, st);
         } else if (tv == 1280) {
             if (max4) gr_down_multi_kernel<1280, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
             else gr_down_multi_kernel<1280><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);

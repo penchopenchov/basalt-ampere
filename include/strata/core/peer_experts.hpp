@@ -31,6 +31,11 @@ namespace strata::core {
 /// the peer card writes into are then allocated with cudaHostAllocPortable; without a peer the flag stays off.
 void set_peer_portable(bool on);
 bool peer_portable();
+/// multi-GPU: whether the prompt path can take the peer (direct access both ways); set at startup, before the
+/// prompt path sizes its ring and buffers.  Without it the prompt path is the single-GPU one.
+void set_prompt_peer(bool on);
+bool prompt_peer();
+bool peers_access(int device);
 
 class PeerExperts {
 public:

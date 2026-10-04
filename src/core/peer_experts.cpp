@@ -19,6 +19,17 @@ namespace strata::core {
 static bool g_peer_portable = false;
 void set_peer_portable(bool on) { g_peer_portable = on; }
 bool peer_portable() { return g_peer_portable; }
+static bool g_prompt_peer = false;
+void set_prompt_peer(bool on) { g_prompt_peer = on; }
+bool prompt_peer() { return g_prompt_peer; }
+bool peers_access(int device) {
+    int a = 0, b = 0;
+    if (cudaDeviceCanAccessPeer(&a, 0, device) != cudaSuccess || cudaDeviceCanAccessPeer(&b, device, 0) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return a && b;
+}
 
 namespace {
 

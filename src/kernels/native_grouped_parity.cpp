@@ -301,10 +301,17 @@ void bench(cudaStream_t s, std::mt19937& rng) {
     std::printf("\n--bench: microseconds per call, a window's 48 calls in a graph, each layer with its own experts (the\n"
                 "weights stream from DRAM as in the engine); v1 / new (grid_groups): medians of %d launches each,\n"
                 "alternating, after %d warm-up pairs - idle GPU assumed\n", kPairs, kWarmPairs);
-    // a verify window's shape: 4 tokens x 10 experts, 2560 x 768 IQ3_S / IQ4_XS experts
-    Setup S(21, 23, 2560, 768, 4, 10, 32, rng, s);
+    // a verify window's shape: 4 tokens x 10 experts, 2560 x 768 IQ3_S / IQ4_XS experts (STRATA_BENCH_GU / _DOWN /
+    // _FF for another pack's: 18 / 20 / 640 is IQ3_XXS with IQ4_NL down projections)
+    auto env_int = [](const char* n, int d) { const char* v = std::getenv(n); return v ? std::atoi(v) : d; };
+    Setup S(env_int("STRATA_BENCH_GU", 21), env_int("STRATA_BENCH_DOWN", 23), 2560, env_int("STRATA_BENCH_FF", 768),
+            env_int("STRATA_BENCH_T", 4), 10, 32, rng, s);
     std::vector<int> vram(16, 1);
     vram.insert(vram.end(), 12, 2);                                   // 28 groups, 40 entries
+    if (const char* v = std::getenv("STRATA_BENCH_SIZES")) {          // another window's group sizes, e.g. "6,6,5,3,1"
+        vram.clear();
+        for (const char* q = v; *q;) { vram.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+    }
     const struct { const char* what; std::vector<int> sizes; int64_t gy; } rows[] = {
         {"no group (the PCIe call at pcie_frac 0)", {}, 4},
         {"1 group of 2 entries (a PCIe call)", {2}, 4},
