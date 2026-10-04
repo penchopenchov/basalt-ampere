@@ -1535,7 +1535,7 @@ void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-void native_mmvq_set_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 2; }   // tests: every column count
+void native_mmvq_set_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count
 bool native_mmvq_mma() { return g_mmvq_mma; }
 bool native_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
 long native_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }

@@ -2354,7 +2354,7 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
-void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 2; }   // tests: every column count
+void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count
 bool iq_mmvq_mma() { return g_mmvq_mma; }
 bool iq_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
 long iq_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }
