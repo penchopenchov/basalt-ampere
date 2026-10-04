@@ -17,6 +17,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <type_traits>
@@ -1434,6 +1435,195 @@ __global__ void __launch_bounds__(256, 2) native_gu_mma_kernel(const unsigned lo
     __trap();   // the host launches it only where device code for sm_80+ was built
 #endif
 }
+
+// ---------------------------------------------------------------- IQ3_S mmvq columns on int8 tensor cores (STRATA_MMVQ_MMA)
+// mmvq_multi_kernel<21> with the 32-value integer dots on mma.sync m16n8k32 s8, as native_gu_mma_kernel does for
+// IQ3_XXS: Split<21>::apply's arithmetic on each integer, the float terms summed in row_dot_multi's order (lane L adds
+// k = L, L + 32, ... in turn, then warp_sum).  Warp w takes sub-block w of every block, i.e. the lanes
+// L = 8 (kbx % 4) + w; walking the blocks in order it keeps one sum per such lane (acc[.][kbx % 4]), does the
+// butterfly's first two steps, and the block does the last three.  So every column is BITWISE mmvq_multi_kernel's
+// (iq_multi_parity checks it).
+//
+// A block owns 16 MT consecutive rows and walks K two blocks (220 bytes per row) at a time; a ring slot holds those
+// and the columns' sixteen q8_1 blocks, cp.async'd STAGES - 1 slots ahead.
+constexpr int kM3Seg = 2 * 110;    // bytes of a row per slot: two IQ3_S blocks
+constexpr int kM3ColWords = 148;   // a staged column: sixteen 9-word q8_1 blocks, padded (conflict-free B loads)
+template<int MT> struct M3Cfg {
+    static constexpr int R = 16 * MT;                              // rows per block
+    static constexpr int STAGES = MT == 1 ? 5 : 3;
+    static constexpr int WBYTES = R * kM3Seg;                      // weight bytes of a slot
+    static constexpr int SLOT = WBYTES + kGmCols * kM3ColWords * 4;
+    static constexpr int RING = STAGES * SLOT;
+    static constexpr int SMEM = RING + 512 * 4;                    // and the grid
+};
+static_assert(sizeof(block_iq3_s) == 110 && sizeof(block_q8_1) == 36, "the blocks this stages");
+static_assert(M3Cfg<1>::SMEM <= 48 * 1024 && M3Cfg<2>::SMEM <= 48 * 1024, "static shared memory");
+static_assert(M3Cfg<1>::SLOT % 16 == 0 && M3Cfg<2>::SLOT % 16 == 0 && M3Cfg<1>::WBYTES % 16 == 0 &&
+              M3Cfg<2>::WBYTES % 16 == 0, "16-byte copies into the column part");
+static_assert(kGmCols * M3Cfg<1>::R * 9 * 4 <= M3Cfg<1>::RING && kGmCols * M3Cfg<2>::R * 9 * 4 <= M3Cfg<2>::RING,
+              "the partial sums reuse the ring");
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void gm_cp16(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
+                 "l"(src) : "memory");
+}
+// Row `bp` (an IQ3_S block in shared memory, 2-byte aligned), sub-block ib: the signed grid words t and 4 + t (values
+// 4t..4t+3 and 16+4t..16+4t+3, the A fragment's; sign bit v of the sub-block's 32 is value v's), the integer scale
+// and the block scale
+__device__ __forceinline__ void m3_decode(const uint8_t* bp, int ib, int t, const uint32_t* grid, uint32_t& lo,
+                                          uint32_t& hi, int& ls, float& dw) {
+    const uint32_t qh = bp[66 + ib];
+    const uint16_t* s16 = (const uint16_t*) (bp + 74 + 4 * ib);
+    const uint32_t sg = (uint32_t) s16[0] | ((uint32_t) s16[1] << 16);
+    lo = gm_signed(grid[bp[2 + 8 * ib + t] | (((qh >> t) & 1u) << 8)], (sg >> (4 * t)) & 15u);
+    hi = gm_signed(grid[bp[6 + 8 * ib + t] | (((qh >> (4 + t)) & 1u) << 8)], (sg >> (16 + 4 * t)) & 15u);
+    ls = 1 + 2 * ((bp[106 + ib / 2] >> (4 * (ib & 1))) & 0x0F);
+    dw = __half2float(*(const __half*) bp);
+}
+// One slot for warp w: blocks 2c and 2c + 1, sub-block w of each, i.e. the lanes L = w + 8 (kbx % 4) held in
+// acc[.][IIB + s] (IIB = 2 (c & 1)).  C fragment q: row 16 mt + g (q < 2) or + 8, column 2 t + (q & 1).
+template<int MT, int IIB>
+__device__ __forceinline__ void m3_slot(float (&acc)[MT][4][4], const uint8_t* slot, const uint32_t* s_grid,
+                                        int ncols, int w, int g, int t) {
+    const uint32_t* sx = (const uint32_t*) (slot + M3Cfg<MT>::WBYTES);
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        const int k = 8 * s + w;   // the slot's q8_1 block
+        uint32_t b0 = 0, b1 = 0;
+        if (g < ncols) {
+            const uint32_t* xp = sx + g * kM3ColWords + 9 * k;
+            b0 = xp[1 + t];
+            b1 = xp[5 + t];
+        }
+        const float d8a = 2 * t < ncols ? __low2float(*(const half2*) (sx + (2 * t) * kM3ColWords + 9 * k)) : 0.0f;
+        const float d8b =
+            2 * t + 1 < ncols ? __low2float(*(const half2*) (sx + (2 * t + 1) * kM3ColWords + 9 * k)) : 0.0f;
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+            uint32_t a[4];
+            int ls[2];
+            float dw[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                m3_decode(slot + (16 * mt + 8 * h + g) * kM3Seg + 110 * s, w, t, s_grid, a[h], a[2 + h], ls[h], dw[h]);
+            int si[4];
+            gm_mma(si, a, b0, b1);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                int sumi = si[q];
+                sumi *= ls[q >> 1];
+                const float d = dw[q >> 1] * ((q & 1) ? d8b : d8a);
+                acc[mt][IIB + s][q] += d * sumi;
+            }
+        }
+    }
+}
+#endif
+
+template<int MT>
+__global__ void __launch_bounds__(256, 2) mmvq_iq3s_mma_kernel(const uint8_t* __restrict__ W, size_t rb,
+                                                               const block_q8_1* __restrict__ X, float* __restrict__ y,
+                                                               int n_in, int n_out, int ncols) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using C = M3Cfg<MT>;
+    __shared__ __align__(16) uint8_t s_m3[C::SMEM];
+    uint32_t* s_grid = (uint32_t*) (s_m3 + C::RING);
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    for (int i = tid; i < 512; i += 256) s_grid[i] = iq3s_grid[i];   // visible from the first barrier of the K loop
+    const int row0 = blockIdx.x * C::R;
+    const int nch = n_in / 512;
+    const int last = n_out - 1;   // rows past n_out stage a valid row, never stored
+    const uint8_t* xb = (const uint8_t*) X;
+    const size_t col_bytes = (size_t) (n_in / 32) * 36;
+    const bool w4 = (((size_t) W | rb) & 3) == 0;   // every row 4-byte aligned (rb is a multiple of 4 here)
+    const bool x16 = ((size_t) xb & 15) == 0;      // then so is every run of 16 q8_1 blocks
+    auto issue_w = [&](int c) {
+        uint8_t* d = s_m3 + (c % C::STAGES) * C::SLOT;
+        const uint8_t* src = W + (size_t) c * kM3Seg;
+        if (w4) {
+            for (int q = tid; q < C::R * (kM3Seg / 4); q += 256) {
+                const int rr = q / (kM3Seg / 4), wq = q - rr * (kM3Seg / 4);
+                gm_cp4(d + rr * kM3Seg + 4 * wq, src + (size_t) min(row0 + rr, last) * rb + 4 * wq);
+            }
+        } else {
+            for (int q = tid; q < C::R * (kM3Seg / 2); q += 256) {
+                const int rr = q / (kM3Seg / 2), wq = q - rr * (kM3Seg / 2);
+                *(uint16_t*) (d + rr * kM3Seg + 2 * wq) =
+                    *(const uint16_t*) (src + (size_t) min(row0 + rr, last) * rb + 2 * wq);
+            }
+        }
+    };
+    auto issue_x = [&](int c) {
+        uint8_t* d = s_m3 + (c % C::STAGES) * C::SLOT + C::WBYTES;
+        const uint8_t* src = xb + (size_t) c * 576;
+        if (x16) {
+            for (int q = tid; q < ncols * 36; q += 256) {
+                const int cc = q / 36, wq = q - cc * 36;
+                gm_cp16(d + cc * (kM3ColWords * 4) + 16 * wq, src + cc * col_bytes + 16 * wq);
+            }
+        } else {
+            for (int q = tid; q < ncols * 144; q += 256) {
+                const int cc = q / 144, wq = q - cc * 144;
+                gm_cp4(d + cc * (kM3ColWords * 4) + 4 * wq, src + cc * col_bytes + 4 * wq);
+            }
+        }
+    };
+    // weights (constant) before pdl_wait, activations after it; group 0 holds all of the first weights
+#pragma unroll
+    for (int c = 0; c < C::STAGES - 1; ++c)
+        if (c < nch) issue_w(c);
+    pdl_wait();
+#pragma unroll
+    for (int c = 0; c < C::STAGES - 1; ++c) {
+        if (c < nch) issue_x(c);
+        gm_commit();
+    }
+    float acc[MT][4][4];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[mt][i][q] = 0.0f;
+    for (int c = 0; c < nch; ++c) {
+        gm_wait<C::STAGES - 2>();   // slot c is here (this thread's copies) ...
+        __syncthreads();            // ... and everyone's; slot (c - 1) % STAGES is free again
+        if (c + C::STAGES - 1 < nch) {
+            issue_w(c + C::STAGES - 1);
+            issue_x(c + C::STAGES - 1);
+        }
+        gm_commit();
+        const uint8_t* slot = s_m3 + (c % C::STAGES) * C::SLOT;
+        if (c & 1) m3_slot<MT, 2>(acc, slot, s_grid, ncols, w, g, t);
+        else m3_slot<MT, 0>(acc, slot, s_grid, ncols, w, g, t);
+    }
+    gm_wait<0>();
+    __syncthreads();
+    float* s_part = (float*) s_m3;   // [column][row][9]: warp w's sum at w
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {   // the butterfly's steps 16 (L and L + 16) and 8
+            const int row = 16 * mt + 8 * (q >> 1) + g, col = 2 * t + (q & 1);
+            const float lo = acc[mt][0][q] + acc[mt][2][q];
+            const float hi = acc[mt][1][q] + acc[mt][3][q];
+            s_part[(col * C::R + row) * 9 + w] = lo + hi;
+        }
+    __syncthreads();
+    {   // steps 4, 2 and 1: lanes 0..7 -> 0..3 -> 0..1 -> 0
+        const int row = tid % C::R, col = tid / C::R;
+        if (col < ncols && row0 + row < n_out) {
+            const float* p = s_part + (col * C::R + row) * 9;
+            const float c0 = p[0] + p[4], c1 = p[1] + p[5], c2 = p[2] + p[6], c3 = p[3] + p[7];
+            const float d0 = c0 + c2, d1 = c1 + c3;
+            y[(size_t) col * n_out + row0 + row] = d0 + d1;
+        }
+    }
+#elif defined(__CUDA_ARCH__)
+    __trap();   // the host launches it only where device code for sm_80+ was built
+#endif
+}
 #endif  // !__HIPCC__ && !STRATA_HIP_GFX906
 
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
@@ -2031,6 +2221,29 @@ bool gu_mma_usable(const NativeExpertLayout& L) {
     }
     return ok[dev] == 1;
 }
+// STRATA_MMVQ_MMA=1: iq_mmvq's IQ3_S calls of 2..8 columns with n_in % 512 == 0 on mmvq_iq3s_mma_kernel where the
+// device runs it (the same bits; not with STRATA_OLD_IQ_MMVQ).  iq_set_mmvq_mma overrides it (tests).
+bool g_mmvq_mma = env_on("STRATA_MMVQ_MMA");
+std::atomic<long> g_mmvq_mma_launches{0};
+// The current device's SM count if it runs mmvq_iq3s_mma_kernel (sm_80+, the card's or STRATA_EMULATE_CC's, with
+// sm_80+ device code in this build), else 0; per device
+int mmvq_mma_sms() {
+    static int known[64] = {};   // 0 unknown, -1 no, else the SM count
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
+    if (known[dev] == 0) {
+        int major = 0, sms = 0;
+        cudaFuncAttributes f1{}, f2{};
+        const bool q = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                       cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess &&
+                       cudaFuncGetAttributes(&f1, mmvq_iq3s_mma_kernel<1>) == cudaSuccess &&
+                       cudaFuncGetAttributes(&f2, mmvq_iq3s_mma_kernel<2>) == cudaSuccess;
+        if (!q) cudaGetLastError();
+        known[dev] = q && strata::cc_major_of(major) >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
+                         ? sms : -1;
+    }
+    return known[dev] > 0 ? known[dev] : 0;
+}
 #endif
 // The single-matrix mmvq (128-thread blocks, one per 4 rows) pays the 2-8 KB staging per block: on the RTX 5070 its
 // IQ2_XS / IQ2_S / IQ1_M calls were 10-20% slower staged at 3-8 columns (iq_multi_parity --bench), while the grouped
@@ -2043,6 +2256,22 @@ bool g_stage_grid_mmvq = g_stage_grid && [] {
 template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
                  cudaStream_t s) {
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if constexpr (TY == 21) {
+        if (g_mmvq_mma && !g_old_kernels && ncols >= 2 && ncols <= kGmCols && n_in % 512 == 0) {
+            if (const int sms = mmvq_mma_sms()) {   // 32 rows per block while that gives every SM one, else 16
+                if ((n_out + 31) / 32 >= sms)
+                    launch_pdl(mmvq_iq3s_mma_kernel<2>, dim3((unsigned) ((n_out + 31) / 32)), dim3(256), 0, s, W, rb, X,
+                               y, n_in, n_out, ncols);
+                else
+                    launch_pdl(mmvq_iq3s_mma_kernel<1>, dim3((unsigned) ((n_out + 15) / 16)), dim3(256), 0, s, W, rb, X,
+                               y, n_in, n_out, ncols);
+                g_mmvq_mma_launches.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
+#endif
     const dim3 grid((unsigned) ((n_out + 3) / 4)), block(32, 4);
     auto go = [&](auto kernel) { launch_pdl(kernel, grid, block, 0, s, W, rb, X, y, n_in, n_out, ncols); };
     if constexpr (!kSplit<TY>) go(mmvq_kernel<TY>);
@@ -2120,6 +2349,17 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; }
+bool iq_mmvq_mma() { return g_mmvq_mma; }
+bool iq_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
+long iq_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }
+#else
+void iq_set_mmvq_mma(bool) {}
+bool iq_mmvq_mma() { return false; }
+bool iq_mmvq_mma_available() { return false; }
+long iq_mmvq_mma_launches() { return 0; }
+#endif
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }

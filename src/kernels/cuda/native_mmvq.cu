@@ -28,10 +28,12 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/pdl.hpp"
+#include "strata/core/emulate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -1112,6 +1114,284 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
     }
 }
 
+// ---------------------------------------------------------------- IQ4_XS columns on int8 tensor cores (STRATA_MMVQ_MMA)
+// For a 32-value sub-block the integer dot of a weight row and a column's q8_1 block is exact in int32 whichever
+// instruction computes it, so mma.sync m16n8k32 s8 takes it for 16 rows x 8 columns at once (A: the codebook values,
+// B: the q8_1 codes, C = 0).  The rest is IQ4XSTraits::apply's arithmetic on that integer, and the float terms are
+// summed in the exact layout's order (native_mmvq_multi_kernel, NW = 4): thread tid = 32 y + L adds the sub-blocks
+// k = 8 kbx + s with k % 128 == tid in ascending k, warp 0 adds the other warps' sums in warp order, and warp_sum's
+// butterfly (16, 8, 4, 2, 1) adds the lanes.  Here warp w takes sub-block s = w of every block, i.e. the lanes
+// L = 8 m + w (m = kbx % 4) of the four reference warps y = kbx % 16 / 4.  It walks the blocks chain by chain
+// (c = kbx % 16 ascending, kbx ascending within a chain), so each chain is one reference thread's sum; it folds chain
+// c = 4 y + m into v[m] in reference-warp order and does the butterfly's first two steps (m ^ 2, then m ^ 1); the
+// block does the last three (w ^ 4, w ^ 2, w ^ 1).  So every column is BITWISE the exact layout's, and with it a
+// single-column call's (mmvq_multi_parity checks it).
+//
+// A block owns 16 MT consecutive rows.  Block kbx of those rows (136 bytes each) and the columns' eight q8_1 blocks
+// at kbx are one ring slot, cp.async'd STAGES - 1 slots ahead in the same chain order.
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+constexpr int kMvRowBytes = 144;   // a staged row: the 136-byte block, padded so the A loads hit 32 banks
+constexpr int kMvColWords = 76;    // a staged column: eight 9-word q8_1 blocks, padded so the B loads do too
+template<int MT> struct MvCfg {
+    static constexpr int R = 16 * MT;                                    // rows per block
+    static constexpr int STAGES = MT == 1 ? 8 : 6;
+    static constexpr int WBYTES = R * kMvRowBytes;                       // weight bytes of a slot
+    static constexpr int SLOT = WBYTES + MAX_NCOLS * kMvColWords * 4;
+    static constexpr int SMEM = STAGES * SLOT;
+};
+static_assert(sizeof(IQ4XSBlock) == 136 && sizeof(Q81Block) == 36, "the blocks this stages");
+static_assert(MvCfg<1>::SMEM <= 48 * 1024 && MvCfg<2>::SMEM <= 48 * 1024, "static shared memory");
+static_assert(MAX_NCOLS * MvCfg<2>::R * 9 * 4 <= MvCfg<2>::SMEM && MAX_NCOLS * MvCfg<1>::R * 9 * 4 <= MvCfg<1>::SMEM,
+              "the partial sums reuse the ring");
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+template<int N> __device__ __forceinline__ void mv_cp(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
+                 "l"(src), "n"(N) : "memory");
+}
+__device__ __forceinline__ void mv_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template<int N> __device__ __forceinline__ void mv_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+}
+// d = A (16 x 32 s8, row) * B (32 x 8 s8, col), C = 0: the exact int32 dots
+__device__ __forceinline__ void mv_mma(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+}
+// iq4_table_lookup's CUDA lookup with the codebook words in registers: the same int8 values
+__device__ __forceinline__ int2 mv_iq4_lookup(uint32_t q4, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3) {
+    const uint32_t sel = 0x32103210 | ((q4 & 0x88888888) >> 1);
+    const uint32_t r0 = __byte_perm(__byte_perm(t0, t1, q4), __byte_perm(t2, t3, q4), sel);
+    const uint32_t r1 = __byte_perm(__byte_perm(t0, t1, q4 >> 16), __byte_perm(t2, t3, q4 >> 16), sel >> 16);
+    return make_int2(__byte_perm(r0, r1, 0x6420), __byte_perm(r0, r1, 0x7531));
+}
+// The next block in chain order: kbx + 16 in the same chain, else the next chain's first.
+__device__ __forceinline__ int mv_next(int kbx, int nb) { return kbx + 16 < nb ? kbx + 16 : (kbx & 15) + 1; }
+
+// One slot for warp w (sub-block w): MT mma tiles, each term added to acc[mt][q] as IQ4XSTraits::apply computes it.
+// C fragment q: row 16 mt + g (q < 2) or + 8, column 2 t + (q & 1).
+template<int MT>
+__device__ __forceinline__ void mv_slot(float (&acc)[MT][4], const uint8_t* slot, int ncols, int w, int g, int t,
+                                        uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3) {
+    const uint32_t* sx = reinterpret_cast<const uint32_t*>(slot + MvCfg<MT>::WBYTES);
+    uint32_t b0 = 0, b1 = 0;
+    if (g < ncols) {
+        const uint32_t* xp = sx + g * kMvColWords + 9 * w;
+        b0 = xp[1 + t];
+        b1 = xp[5 + t];
+    }
+    const float d8a = 2 * t < ncols ? __low2float(*reinterpret_cast<const half2*>(sx + (2 * t) * kMvColWords + 9 * w))
+                                    : 0.0f;
+    const float d8b = 2 * t + 1 < ncols
+                          ? __low2float(*reinterpret_cast<const half2*>(sx + (2 * t + 1) * kMvColWords + 9 * w))
+                          : 0.0f;
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        uint32_t a[4];
+        int ls[2];
+        float dw[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            // the row's d | scales_h << 16, its scales_l, and qs word 4 w + t (values 4t.. low, 16+4t.. high)
+            const uint32_t* wr = reinterpret_cast<const uint32_t*>(slot + (16 * mt + 8 * h + g) * kMvRowBytes);
+            const uint32_t h0 = wr[0], h1 = wr[1];
+            const int2 v = mv_iq4_lookup(wr[2 + 4 * w + t], t0, t1, t2, t3);
+            a[h] = (uint32_t) v.x;
+            a[2 + h] = (uint32_t) v.y;
+            ls[h] = (int) (((h1 >> (4 * w)) & 0x0f) | (((h0 >> (16 + 2 * w)) & 0x03) << 4));
+            dw[h] = __half2float(__ushort_as_half((unsigned short) (h0 & 0xffffu)));
+        }
+        int si[4];
+        mv_mma(si, a, b0, b1);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            int sumi = si[q];
+            sumi *= ls[q >> 1] - 32;
+            const float d = dw[q >> 1] * ((q & 1) ? d8b : d8a);
+            acc[mt][q] += d * sumi;
+        }
+    }
+}
+#endif
+
+template<int MT>
+__global__ void __launch_bounds__(256, 2) native_iq4_xs_mma_kernel(const IQ4XSBlock* __restrict__ w,
+                                                                const Q81Block* __restrict__ x, float* __restrict__ y,
+                                                                int n_in, int n_out, int ncols) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using C = MvCfg<MT>;
+    __shared__ __align__(16) uint8_t s_mv[C::SMEM];
+    const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int row0 = blockIdx.x * C::R;
+    const int nb = n_in / 256;
+    const size_t row_bytes = (size_t) nb * 136;
+    const size_t col_bytes = (size_t) nb * 8 * 36;   // q8_1 bytes of an activation column
+    const uint8_t* wb = reinterpret_cast<const uint8_t*>(w);
+    const uint8_t* xb = reinterpret_cast<const uint8_t*>(x);
+    const bool w8 = (reinterpret_cast<std::uintptr_t>(wb) & 7) == 0;    // then so is every weight block
+    const bool x16 = (reinterpret_cast<std::uintptr_t>(xb) & 15) == 0;  // then so is every run of 8 q8_1 blocks
+    const int last = n_out - 1;   // rows past n_out stage a valid row, never stored
+    auto issue_w = [&](int kbx, int sl) {
+        uint8_t* d = s_mv + sl * C::SLOT;
+        const uint8_t* src = wb + (size_t) kbx * 136;
+        if (w8) {
+            for (int q = tid; q < C::R * 17; q += 256) {
+                const int rr = q / 17, wq = q - rr * 17;
+                mv_cp<8>(d + rr * kMvRowBytes + 8 * wq, src + (size_t) min(row0 + rr, last) * row_bytes + 8 * wq);
+            }
+        } else {
+            for (int q = tid; q < C::R * 34; q += 256) {
+                const int rr = q / 34, wq = q - rr * 34;
+                mv_cp<4>(d + rr * kMvRowBytes + 4 * wq, src + (size_t) min(row0 + rr, last) * row_bytes + 4 * wq);
+            }
+        }
+    };
+    auto issue_x = [&](int kbx, int sl) {
+        uint8_t* d = s_mv + sl * C::SLOT + C::WBYTES;
+        const uint8_t* src = xb + (size_t) kbx * 288;
+        if (x16) {
+            for (int q = tid; q < ncols * 18; q += 256) {
+                const int cc = q / 18, wq = q - cc * 18;
+                mv_cp<16>(d + cc * (kMvColWords * 4) + 16 * wq, src + cc * col_bytes + 16 * wq);
+            }
+        } else {
+            for (int q = tid; q < ncols * 72; q += 256) {
+                const int cc = q / 72, wq = q - cc * 72;
+                mv_cp<4>(d + cc * (kMvColWords * 4) + 4 * wq, src + cc * col_bytes + 4 * wq);
+            }
+        }
+    };
+    // weights (constant) before pdl_wait, activations after it; group 0 holds all of the first weights
+    int kb = 0;
+#pragma unroll
+    for (int p = 0; p < C::STAGES - 1; ++p) {
+        if (p < nb) issue_w(kb, p);
+        kb = mv_next(kb, nb);
+    }
+    pdl_wait();
+    kb = 0;
+#pragma unroll
+    for (int p = 0; p < C::STAGES - 1; ++p) {
+        if (p < nb) issue_x(kb, p);
+        kb = mv_next(kb, nb);
+        mv_commit();
+    }
+    const uint32_t* tbl = reinterpret_cast<const uint32_t*>(iq4nl_values);
+    const uint32_t t0 = tbl[0], t1 = tbl[1], t2 = tbl[2], t3 = tbl[3];
+    int i = 0;   // slots consumed; kb is the block of slot i + STAGES - 1
+    // chain c (one reference thread's sum): its blocks c, c + 16, ... in turn, from 0
+    auto chain = [&](int c, float (&acc)[MT][4]) {
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[mt][q] = 0.0f;
+        for (int kbx = c; kbx < nb; kbx += 16) {
+            mv_wait<C::STAGES - 2>();   // slot i is here (this thread's copies) ...
+            __syncthreads();            // ... and everyone's; slot (i - 1) % STAGES is free again
+            if (i + C::STAGES - 1 < nb) {
+                const int sl = (i + C::STAGES - 1) % C::STAGES;
+                issue_w(kb, sl);
+                issue_x(kb, sl);
+                kb = mv_next(kb, nb);
+            }
+            mv_commit();
+            mv_slot<MT>(acc, s_mv + (i % C::STAGES) * C::SLOT, ncols, wp, g, t, t0, t1, t2, t3);
+            ++i;
+        }
+    };
+    float v[MT][4][4];   // [mt][m][q]: lane L = 8 m + wp's sum over the reference warps
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {   // reference warp 0: the sum starts as its chain
+        float acc[MT][4];
+        chain(m, acc);
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) v[mt][m][q] = acc[mt][q];
+    }
+    for (int y4 = 1; y4 < 4; ++y4) {   // reference warps 1..3 in order
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            float acc[MT][4];
+            chain(4 * y4 + m, acc);
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+                for (int q = 0; q < 4; ++q) v[mt][m][q] = v[mt][m][q] + acc[mt][q];
+        }
+    }
+    mv_wait<0>();
+    __syncthreads();
+    float* s_part = reinterpret_cast<float*>(s_mv);   // [column][row][9]: warp w's sum at w
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {   // the butterfly's steps 16 (m ^ 2) and 8 (m ^ 1)
+            const int row = 16 * mt + 8 * (q >> 1) + g, col = 2 * t + (q & 1);
+            const float a0 = v[mt][0][q] + v[mt][2][q];
+            const float a1 = v[mt][1][q] + v[mt][3][q];
+            s_part[(col * C::R + row) * 9 + wp] = a0 + a1;
+        }
+    __syncthreads();
+    {   // steps 4, 2 and 1: lanes w and w + 4, then 0..1 and 2..3, then 0 and 1
+        const int row = tid % C::R, col = tid / C::R;
+        if (col < ncols && row0 + row < n_out) {
+            const float* p = s_part + (col * C::R + row) * 9;
+            const float c0 = p[0] + p[4], c1 = p[1] + p[5], c2 = p[2] + p[6], c3 = p[3] + p[7];
+            const float d0 = c0 + c2, d1 = c1 + c3;
+            y[(size_t) col * n_out + row0 + row] = d0 + d1;
+        }
+    }
+#elif defined(__CUDA_ARCH__)
+    __trap();   // the host launches it only where device code for sm_80+ was built
+#endif
+}
+
+// STRATA_MMVQ_MMA=1: ncols > 1 IQ4_XS in exact mode on native_iq4_xs_mma_kernel where the device runs it (the same
+// bits).  native_mmvq_set_mma overrides it (tests).
+bool g_mmvq_mma = [] {
+    const char* v = std::getenv("STRATA_MMVQ_MMA");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}();
+std::atomic<long> g_mmvq_mma_launches{0};
+// The current device's SM count if it runs native_iq4_xs_mma_kernel (sm_80+, the card's or STRATA_EMULATE_CC's, with
+// sm_80+ device code in this build), else 0; per device
+int mmvq_mma_sms() {
+    static int known[64] = {};   // 0 unknown, -1 no, else the SM count
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    if (known[dev] == 0) {
+        int major = 0, sms = 0;
+        cudaFuncAttributes f1{}, f2{};
+        const bool q = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                       cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess &&
+                       cudaFuncGetAttributes(&f1, native_iq4_xs_mma_kernel<1>) == cudaSuccess &&
+                       cudaFuncGetAttributes(&f2, native_iq4_xs_mma_kernel<2>) == cudaSuccess;
+        if (!q) (void) cudaGetLastError();
+        known[dev] = q && strata::cc_major_of(major) >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
+                         ? sms : -1;
+    }
+    return known[dev] > 0 ? known[dev] : 0;
+}
+// 32 rows per block while that still gives every SM a block, else 16
+void launch_iq4_xs_mma(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, int sms,
+                       cudaStream_t s) {
+    const auto* w = static_cast<const IQ4XSBlock*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if ((n_out + 31) / 32 >= sms)
+        launch_pdl(native_iq4_xs_mma_kernel<2>, dim3(unsigned((n_out + 31) / 32)), dim3(256), 0, s, w, x, y, n_in,
+                   n_out, ncols);
+    else
+        launch_pdl(native_iq4_xs_mma_kernel<1>, dim3(unsigned((n_out + 15) / 16)), dim3(256), 0, s, w, x, y, n_in,
+                   n_out, ncols);
+    g_mmvq_mma_launches.fetch_add(1, std::memory_order_relaxed);
+}
+#endif  // !__HIPCC__ && !STRATA_HIP_GFX906
+
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
@@ -1250,6 +1530,18 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
+
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+void native_mmvq_set_mma(bool on) { g_mmvq_mma = on; }
+bool native_mmvq_mma() { return g_mmvq_mma; }
+bool native_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
+long native_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }
+#else
+void native_mmvq_set_mma(bool) {}
+bool native_mmvq_mma() { return false; }
+bool native_mmvq_mma_available() { return false; }
+long native_mmvq_mma_launches() { return 0; }
+#endif
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);
@@ -1416,6 +1708,15 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_stream(stream);
     STRATA_WAVE_MMVQ(IQ4XSTraits)
     if (ncols > 1) {
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+        if (g_multi_exact && g_mmvq_mma) {
+            if (const int sms = mmvq_mma_sms()) {
+                launch_iq4_xs_mma(weights, x_q8_1, y, n_in, n_out, ncols, sms, static_cast<cudaStream_t>(stream));
+                launch_check();
+                return;
+            }
+        }
+#endif
         launch_multi<IQ4XSTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
         return;

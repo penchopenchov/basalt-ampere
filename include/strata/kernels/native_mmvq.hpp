@@ -32,6 +32,16 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
 
+// STRATA_MMVQ_MMA=1 (read at startup; the setter overrides it, for tests): ncols > 1 IQ4_XS calls in exact mode
+// run on int8 tensor cores where the device has them (sm_80+ CUDA), every column still bitwise equal to a
+// single-column call. Set before graph capture; captured graphs keep the kernels they captured.
+void native_mmvq_set_mma(bool on);
+bool native_mmvq_mma();
+// Whether the current device runs the tensor-core kernel (never on HIP).
+bool native_mmvq_mma_available();
+// Tensor-core launches so far in this process (tests: proof that the path ran).
+long native_mmvq_mma_launches();
+
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does
 // not reconstruct that sum from the quantized integers.

@@ -11,6 +11,8 @@
 // (2) native_expert_grouped, every gate/up format with the down formats: groups of 0..11 entries (more than a pass
 //     of GRP_NC), unused grid rows (cap_groups > groups), scattered destinations; bitwise, new vs old, the rows it
 //     must not write included.
+// (3) iq_mmvq's IQ3_S columns on the tensor-core kernel (STRATA_MMVQ_MMA, turned on here where the device has it)
+//     against the old kernel, bitwise; with STRATA_MMVQ_MMA=1 in the environment (1) takes it as well.
 //
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
@@ -169,6 +171,71 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
     cudaFree(dw); cudaFree(dwf); cudaFree(dx); cudaFree(dxq); cudaFree(dy_old); cudaFree(dy_new);
 }
 
+// (3) STRATA_MMVQ_MMA: iq_mmvq's IQ3_S columns on the tensor-core kernel, turned on here where the device has it,
+// against the old per-column kernel (iq_set_old_kernels, which the tensor-core path never takes), bitwise; with row
+// tails, both block sizes the launcher picks, and weights / activations off their 4- and 16-byte alignment.  Every
+// call must take the tensor-core kernel (its launch counter), or the check checked nothing.
+void check_mmvq_mma(cudaStream_t s, std::mt19937& rng) {
+    if (!k::iq_mmvq_mma_available()) {
+        std::printf("IQ3_S    tensor-core iq_mmvq (STRATA_MMVQ_MMA): not available on this device or build "
+                    "(sm_80+ CUDA): skipped\n");
+        return;
+    }
+    const bool env = k::iq_mmvq_mma();
+    struct Shape { int n_in, n_out, w_off, x_off; };
+    const Shape shapes[] = {{2560, 6144, 0, 0}, {2560, 67, 0, 0}, {1024, 5, 0, 0}, {5120, 300, 0, 0},
+                            {512, 6000, 0, 0},  {2560, 1000, 2, 4}};
+    for (const Shape& sh : shapes) {
+        const auto w = random_rows(21, sh.n_out, sh.n_in, rng);
+        uint8_t* dw = dalloc<uint8_t>(w.size() + 16);
+        ck(cudaMemcpy(dw + sh.w_off, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
+        const auto x = random_x((size_t) 8 * sh.n_in, rng);
+        float* dx = dalloc<float>(x.size());
+        ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+        uint8_t* dxq = dalloc<uint8_t>((size_t) 8 * (sh.n_in / 32) * 36 + 16);
+        k::quantize_q8_1_rows(dx, 8, sh.n_in, dxq + sh.x_off, s);
+        float* dy_old = dalloc<float>((size_t) 8 * sh.n_out);
+        float* dy_new = dalloc<float>((size_t) 8 * sh.n_out);
+        std::vector<uint32_t> y_old((size_t) 8 * sh.n_out), y_new(y_old.size());
+        int bad = 0;
+        for (int nc = 2; nc <= 8; ++nc) {
+            ck(cudaMemset(dy_old, 0xFF, y_old.size() * 4), "memset");
+            ck(cudaMemset(dy_new, 0xFE, y_new.size() * 4), "memset");
+            k::iq_set_old_kernels(true);
+            k::iq_mmvq(21, dw + sh.w_off, dxq + sh.x_off, dy_old, sh.n_in, sh.n_out, nc, s);
+            k::iq_set_old_kernels(false);
+            k::iq_set_mmvq_mma(true);
+            const long before = k::iq_mmvq_mma_launches();
+            k::iq_mmvq(21, dw + sh.w_off, dxq + sh.x_off, dy_new, sh.n_in, sh.n_out, nc, s);
+            const long launches = k::iq_mmvq_mma_launches() - before;
+            k::iq_set_mmvq_mma(env);
+            ck(cudaStreamSynchronize(s), "sync");
+            ck(cudaMemcpy(y_old.data(), dy_old, y_old.size() * 4, cudaMemcpyDeviceToHost), "y_old");
+            ck(cudaMemcpy(y_new.data(), dy_new, y_new.size() * 4, cudaMemcpyDeviceToHost), "y_new");
+            size_t diff = 0;
+            bool finite = true;
+            for (size_t i = 0; i < y_old.size(); ++i) {
+                diff += y_old[i] != y_new[i];
+                if (i < (size_t) nc * sh.n_out) {
+                    float f;
+                    std::memcpy(&f, &y_new[i], 4);
+                    finite = finite && std::isfinite(f);
+                }
+            }
+            if (diff != 0 || !finite || launches != 1) {
+                std::printf("  IQ3_S    %5d x %5d  ncols %d%s: %zu outputs differ from the old kernel%s%s  FAIL\n",
+                            sh.n_out, sh.n_in, nc, sh.w_off || sh.x_off ? " (off-aligned)" : "", diff,
+                            finite ? "" : ", non-finite", launches == 1 ? "" : ", the tensor-core kernel did not run");
+                ++bad;
+            }
+        }
+        std::printf("IQ3_S    type 21  %5d x %5d  tensor-core iq_mmvq ncols 2..8%s: %s\n", sh.n_out, sh.n_in,
+                    sh.w_off || sh.x_off ? " (off-aligned)" : "", bad ? "FAIL" : "bitwise equal to the old kernel");
+        g_fail += bad;
+        cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dy_old); cudaFree(dy_new);
+    }
+}
+
 // ---------------------------------------------------------------------------------- (2) native_expert_grouped
 struct Grouped {
     k::NativeExpertLayout L;
@@ -312,6 +379,31 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         k::iq_set_old_kernels(false);
         cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dy);
     }
+    if (k::iq_mmvq_mma_available()) {   // the dense gate's shape: decode-once dp4a / tensor-core
+        const bool env = k::iq_mmvq_mma();
+        const int gi = 2560, go = 6144;
+        const auto w = random_rows(21, go, gi, rng);
+        uint8_t* dw = dalloc<uint8_t>(w.size());
+        ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
+        const auto x = random_x((size_t) 8 * gi, rng);
+        float* dx = dalloc<float>(x.size());
+        ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+        uint8_t* dxq = dalloc<uint8_t>((size_t) 8 * (gi / 32) * 36);
+        k::quantize_q8_1_rows(dx, 8, gi, dxq, s);
+        float* dy = dalloc<float>((size_t) 8 * go);
+        std::printf("IQ3_S    iq_mmvq %d x %d, dp4a / tensor-core:", go, gi);
+        for (int nc = 2; nc <= 8; ++nc) {
+            float us[2];
+            for (int mma = 0; mma < 2; ++mma) {
+                k::iq_set_mmvq_mma(mma == 1);
+                us[mma] = 1e3f * time_ms(s, it, [&] { k::iq_mmvq(21, dw, dxq, dy, gi, go, nc, s); });
+            }
+            std::printf("  %d: %.1f/%.1f", nc, us[0], us[1]);
+        }
+        std::printf("\n");
+        k::iq_set_mmvq_mma(env);
+        cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dy);
+    }
     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
     for (int gu : {16, 17, 18, 21, 22, 29}) {
         std::printf("%-8s/Q2_0 grouped, 16 groups of m entries:", name_of(gu));
@@ -406,6 +498,7 @@ int main(int argc, char** argv) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
+    check_mmvq_mma(s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
