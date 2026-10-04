@@ -5,7 +5,9 @@
 // gdn_rec_cols_pipe_kernel elsewhere and with STRATA_GDN_KEYHEAD=0.  Both are copied below verbatim, with the output
 // norm (gdn_out_norm_kernel) and the norm as it was before, which also stored the normalized value in FP32 although
 // nothing reads it.  The two recurrences do the same arithmetic in the same order per value head and column, so the
-// output, the state after it and the FP16 output must be the same bits.
+// output, the state after it and the FP16 output must be the same bits.  gdn_rec_wl_kernel (opt-in,
+// STRATA_GDN_REC_WARP=1) sums a column's rows in another order: its output and state against gdn_rec_kh_kernel's
+// within FP32 rounding (relative RMS below 1e-5, worst value below 1e-4 of the largest).
 //
 // Synthetic inputs of the model's shape (q/k L2-normalized per key head as gdn_l2_kernel leaves them), no model.
 //   gdn_rec_parity            the bit checks (T from 1 to 4099, a non-zero state as after an earlier chunk)
@@ -18,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -240,6 +243,113 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__
         for (int r = 0; r < RPG; ++r) base[r * rs] = s[j][r];
     }
 }
+// STRATA_GDN_REC_WARP=1: the recurrence with each column's sums over the 128 key rows inside one warp.  Lane (rg, cl)
+// of warp w: column 4 w + cl of the block's GDN_WC, rows 4 (rg + 8 m) + e (m, e < 4) of the three value heads of key
+// head qh.  A sum over a column's rows is each lane's 16-row chain, then a butterfly over the 8 row-group lanes (lane
+// bits 0-2; every lane ends with the same bits), so a token has no __syncthreads and no shared-memory round trip; the
+// inputs are staged as in gdn_rec_kh_kernel, with two __syncthreads per GDN_WTB tokens.  128 blocks, a quarter of the
+// rows per thread.  The same arithmetic with the row sums in another order: not the same bits as the kernels above.
+constexpr int GDN_WC = 16, GDN_WNCB = S / GDN_WC, GDN_WTB = 16;
+__global__ void __launch_bounds__(GDN_WC * 8) gdn_rec_wl_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                const float* __restrict__ gate,
+                                                                const float* __restrict__ beta,
+                                                                float* __restrict__ oc_out, int64_t T) {
+    constexpr int TB = GDN_WTB, NT = GDN_WC * 8, QKP = S / 4, VP = GDN_WC / 4;   // threads, 16-byte pieces
+    __shared__ __align__(16) float sq[2][TB][S];
+    __shared__ __align__(16) float sk[2][TB][S];
+    __shared__ __align__(16) float sv[2][TB][VPK][GDN_WC];
+    __shared__ float sg[2][TB][VPK], sb[2][TB][VPK];
+    const int qh = blockIdx.x / GDN_WNCB, cb = blockIdx.x % GDN_WNCB;
+    const int tid = threadIdx.x, lane = tid & 31, rg = lane & 7, c = 4 * (tid >> 5) + (lane >> 3);
+    const int col = cb * GDN_WC + c;
+    float s[VPK][16];   // [value head][4 m + e]: row 4 rg + 32 m + e
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int j = 0; j < VPK; ++j)
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                s[j][4 * m + e] = state[(size_t) (4 * rg + 32 * m + e) * rs + (size_t) (qh + j * HK) * S + col];
+    const int64_t nblk = (T + TB - 1) / TB;
+    auto stage = [&](int64_t k) {   // tokens [k * TB, k * TB + TB) into buffer k & 1
+        const int bb = (int) (k & 1);
+        const int64_t t0 = k * TB;
+        for (int p = tid; p < TB * 2 * QKP; p += NT) {
+            const int i = p / (2 * QKP), w = p % (2 * QKP), isk = w / QKP, jj = (w % QKP) * 4;
+            if (t0 + i < T)
+                gdn_cp16(isk ? &sk[bb][i][jj] : &sq[bb][i][jj], h + (t0 + i) * C + (isk ? HK * S : 0) + qh * S + jj);
+        }
+        for (int p = tid; p < TB * VPK * VP; p += NT) {
+            const int i = p / (VPK * VP), w = p % (VPK * VP), j = w / VP, jj = (w % VP) * 4;
+            if (t0 + i < T)
+                gdn_cp16(&sv[bb][i][j][jj], h + (t0 + i) * C + 2 * HK * S + (qh + j * HK) * S + cb * GDN_WC + jj);
+        }
+        for (int p = tid; p < 2 * TB * VPK; p += NT) {
+            const int isb = p / (TB * VPK), w = p % (TB * VPK), i = w / VPK, j = w % VPK;
+            if (t0 + i < T)
+                gdn_cp4(isb ? &sb[bb][i][j] : &sg[bb][i][j], (isb ? beta : gate) + (t0 + i) * HV + qh + j * HK);
+        }
+    };
+    if (nblk > 0) stage(0);
+    gdn_cp_commit();
+    for (int64_t k = 0; k < nblk; ++k) {
+        __syncthreads();   // every warp is done with block k - 1, the buffer stage(k + 1) fills
+        if (k + 1 < nblk) stage(k + 1);
+        gdn_cp_commit();
+        gdn_cp_wait_prev();
+        __syncthreads();
+        const int bb = (int) (k & 1);
+        const int n = (int) ((T - k * TB) < TB ? (T - k * TB) : TB);
+#pragma unroll 2
+        for (int i = 0; i < n; ++i) {
+            const int64_t t = k * TB + i;
+            const float4* k4 = reinterpret_cast<const float4*>(&sk[bb][i][4 * rg]);
+            const float4* q4 = reinterpret_cast<const float4*>(&sq[bb][i][4 * rg]);
+            float kc[16], qc[16];
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const float4 a = k4[8 * m], b = q4[8 * m];
+                kc[4 * m] = a.x; kc[4 * m + 1] = a.y; kc[4 * m + 2] = a.z; kc[4 * m + 3] = a.w;
+                qc[4 * m] = b.x; qc[4 * m + 1] = b.y; qc[4 * m + 2] = b.z; qc[4 * m + 3] = b.w;
+            }
+            float g[VPK], kv[VPK], delta[VPK], o[VPK];
+#pragma unroll
+            for (int j = 0; j < VPK; ++j) { g[j] = __expf(sg[bb][i][j]); kv[j] = 0.0f; o[j] = 0.0f; }
+#pragma unroll
+            for (int r = 0; r < 16; ++r)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) kv[j] = fmaf(s[j][r], kc[r], kv[j]);
+#pragma unroll
+            for (int x = 1; x < 8; x <<= 1)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) kv[j] += __shfl_xor_sync(0xffffffffu, kv[j], x);
+#pragma unroll
+            for (int j = 0; j < VPK; ++j) delta[j] = (sv[bb][i][j][c] - g[j] * kv[j]) * sb[bb][i][j];
+#pragma unroll
+            for (int r = 0; r < 16; ++r)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) {
+                    s[j][r] = fmaf(g[j], s[j][r], kc[r] * delta[j]);
+                    o[j] = fmaf(s[j][r], qc[r], o[j]);
+                }
+#pragma unroll
+            for (int x = 1; x < 8; x <<= 1)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) o[j] += __shfl_xor_sync(0xffffffffu, o[j], x);
+            if (rg < VPK)   // row group j writes value head j's output
+                oc_out[t * HV * S + (qh + rg * HK) * S + col] =
+                    (rg == 0 ? o[0] : rg == 1 ? o[1] : o[2]) * rsqrtf((float) S);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < VPK; ++j)
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                state[(size_t) (4 * rg + 32 * m + e) * rs + (size_t) (qh + j * HK) * S + col] = s[j][4 * m + e];
+}
 // the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
 // norm stays in its scratch buffer)
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
@@ -458,9 +568,80 @@ int check_bits(int64_t T, uint64_t seed) {
     return fails;
 }
 
+// gdn_rec_wl_kernel (STRATA_GDN_REC_WARP=1) against gdn_rec_kh_kernel: its row sums run in another order, so not the
+// same bits - the output and the state within a few FP32 roundings of the sums (relative RMS and worst value)
+struct Close {
+    double rms = 0, worst = 0;   // relative RMS of the difference; max |difference| / max |reference| (NaN: not finite)
+};
+Close close_to(const float* a, const float* ref, size_t n) {
+    std::vector<float> x(n), y(n);
+    ck(cudaMemcpy(x.data(), a, n * 4, cudaMemcpyDeviceToHost), "download");
+    ck(cudaMemcpy(y.data(), ref, n * 4, cudaMemcpyDeviceToHost), "download");
+    double d2 = 0, r2 = 0, dm = 0, rm = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(x[i])) return {NAN, NAN};
+        const double d = (double) x[i] - (double) y[i];
+        d2 += d * d;
+        r2 += (double) y[i] * y[i];
+        dm = std::max(dm, std::fabs(d));
+        rm = std::max(rm, std::fabs((double) y[i]));
+    }
+    return {r2 > 0 ? std::sqrt(d2 / r2) : std::sqrt(d2), rm > 0 ? dm / rm : dm};
+}
+int check_warp(int64_t T, uint64_t seed) {
+    Inputs in(T, seed);
+    const size_t st = (size_t) S * HV * S, oc_n = (size_t) T * HV * S;
+    float *st_kh = dalloc<float>(st), *st_w = dalloc<float>(st), *oc_kh = dalloc<float>(oc_n), *oc_w = dalloc<float>(oc_n);
+    ck(cudaMemcpy(st_kh, in.state0, st * 4, cudaMemcpyDeviceToDevice), "state copy");
+    ck(cudaMemcpy(st_w, in.state0, st * 4, cudaMemcpyDeviceToDevice), "state copy");
+    ck(cudaMemset(oc_w, 0xff, oc_n * 4), "sentinel");   // an unwritten output is NaN
+    gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG)>>>(st_kh, in.h, in.gate, in.beta, oc_kh, T);
+    gdn_rec_wl_kernel<<<HK * GDN_WNCB, GDN_WC * 8>>>(st_w, in.h, in.gate, in.beta, oc_w, T);
+    ck(cudaDeviceSynchronize(), "recurrence");
+    const Close co = close_to(oc_w, oc_kh, oc_n), cs = close_to(st_w, st_kh, st);
+    const bool ok = std::isfinite(co.rms) && std::isfinite(cs.rms) && co.rms < 1e-5 && co.worst < 1e-4 &&
+                    cs.rms < 1e-5 && cs.worst < 1e-4;
+    std::printf("T=%-6lld warp-row sums vs gdn_rec_kh_kernel: output rel RMS %.2e worst %.2e, state rel RMS %.2e worst "
+                "%.2e %s\n", (long long) T, co.rms, co.worst, cs.rms, cs.worst, ok ? "" : "FAIL");
+    cudaFree(st_kh); cudaFree(st_w); cudaFree(oc_kh); cudaFree(oc_w);
+    return ok ? 0 : 1;
+}
+
 float median(std::vector<float> v) {
     std::sort(v.begin(), v.end());
     return v.empty() ? 0.0f : v[v.size() / 2];
+}
+
+// gdn_rec_kh_kernel against gdn_rec_wl_kernel at one layer's chunk, alternating
+void bench_warp(int64_t T) {
+    Inputs in(T, 0xB4);
+    const size_t st = (size_t) S * HV * S, oc_n = (size_t) T * HV * S;
+    float* state = dalloc<float>(st);
+    float* oc = dalloc<float>(oc_n);
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "event");
+    ck(cudaEventCreate(&e1), "event");
+    const int warm = 3, rounds = T >= 16384 ? 10 : 20;
+    std::vector<float> t[2];
+    for (int i = 0; i < warm + rounds; ++i)
+        for (int j = 0; j < 2; ++j) {
+            const int v = (i + j) % 2;
+            ck(cudaMemcpy(state, in.state0, st * 4, cudaMemcpyDeviceToDevice), "state");
+            cudaEventRecord(e0);
+            if (v == 0) gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG)>>>(state, in.h, in.gate, in.beta, oc, T);
+            else gdn_rec_wl_kernel<<<HK * GDN_WNCB, GDN_WC * 8>>>(state, in.h, in.gate, in.beta, oc, T);
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "timed");
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (i >= warm) t[v].push_back(ms);
+        }
+    const float r0 = median(t[0]), r1 = median(t[1]);
+    std::printf("  T = %lld: gdn_rec_kh_kernel %.2f ms, gdn_rec_wl_kernel (STRATA_GDN_REC_WARP=1) %.2f ms  %.2fx\n",
+                (long long) T, r0, r1, r0 / r1);
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(state); cudaFree(oc);
 }
 
 void bench(int64_t T) {
@@ -874,10 +1055,12 @@ int main(int argc, char** argv) {
     const int64_t Ts[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 257, 1000, 4099};
     uint64_t seed = 11;
     for (const int64_t T : Ts) fails += check_bits(T, seed++);
+    for (const int64_t T : Ts) fails += check_warp(T, seed++);
     if (do_bench) {
         std::printf("--bench: the prompt path's DeltaNet recurrence\n");
         bench(8192);
         bench(32768);
+        bench_warp(8192);
         scale(8192);
         fewer_sms(8192);
     }

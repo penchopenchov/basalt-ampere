@@ -594,6 +594,136 @@ bool gdn_keyhead_ok() {
     }
     return known[dev] == 1;
 }
+// STRATA_GDN_REC_WARP=1: the recurrence with each column's sums over the 128 key rows inside one warp.  Lane (rg, cl)
+// of warp w: column 4 w + cl of the block's GDN_WC, rows 4 (rg + 8 m) + e (m, e < 4) of the three value heads of key
+// head qh.  A sum over a column's rows is each lane's 16-row chain, then a butterfly over the 8 row-group lanes (lane
+// bits 0-2; every lane ends with the same bits), so a token has no __syncthreads and no shared-memory round trip; the
+// inputs are staged as in gdn_rec_kh_kernel, with two __syncthreads per GDN_WTB tokens.  128 blocks, a quarter of the
+// rows per thread.  The same arithmetic with the row sums in another order: not the same bits as the kernels above.
+constexpr int GDN_WC = 16, GDN_WNCB = S / GDN_WC, GDN_WTB = 16;
+__global__ void __launch_bounds__(GDN_WC * 8) gdn_rec_wl_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                const float* __restrict__ gate,
+                                                                const float* __restrict__ beta,
+                                                                float* __restrict__ oc_out, int64_t T) {
+    constexpr int TB = GDN_WTB, NT = GDN_WC * 8, QKP = S / 4, VP = GDN_WC / 4;   // threads, 16-byte pieces
+    __shared__ __align__(16) float sq[2][TB][S];
+    __shared__ __align__(16) float sk[2][TB][S];
+    __shared__ __align__(16) float sv[2][TB][VPK][GDN_WC];
+    __shared__ float sg[2][TB][VPK], sb[2][TB][VPK];
+    const int qh = blockIdx.x / GDN_WNCB, cb = blockIdx.x % GDN_WNCB;
+    const int tid = threadIdx.x, lane = tid & 31, rg = lane & 7, c = 4 * (tid >> 5) + (lane >> 3);
+    const int col = cb * GDN_WC + c;
+    float s[VPK][16];   // [value head][4 m + e]: row 4 rg + 32 m + e
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int j = 0; j < VPK; ++j)
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                s[j][4 * m + e] = state[(size_t) (4 * rg + 32 * m + e) * rs + (size_t) (qh + j * HK) * S + col];
+    const int64_t nblk = (T + TB - 1) / TB;
+    auto stage = [&](int64_t k) {   // tokens [k * TB, k * TB + TB) into buffer k & 1
+        const int bb = (int) (k & 1);
+        const int64_t t0 = k * TB;
+        for (int p = tid; p < TB * 2 * QKP; p += NT) {
+            const int i = p / (2 * QKP), w = p % (2 * QKP), isk = w / QKP, jj = (w % QKP) * 4;
+            if (t0 + i < T)
+                gdn_cp16(isk ? &sk[bb][i][jj] : &sq[bb][i][jj], h + (t0 + i) * C + (isk ? HK * S : 0) + qh * S + jj);
+        }
+        for (int p = tid; p < TB * VPK * VP; p += NT) {
+            const int i = p / (VPK * VP), w = p % (VPK * VP), j = w / VP, jj = (w % VP) * 4;
+            if (t0 + i < T)
+                gdn_cp16(&sv[bb][i][j][jj], h + (t0 + i) * C + 2 * HK * S + (qh + j * HK) * S + cb * GDN_WC + jj);
+        }
+        for (int p = tid; p < 2 * TB * VPK; p += NT) {
+            const int isb = p / (TB * VPK), w = p % (TB * VPK), i = w / VPK, j = w % VPK;
+            if (t0 + i < T)
+                gdn_cp4(isb ? &sb[bb][i][j] : &sg[bb][i][j], (isb ? beta : gate) + (t0 + i) * HV + qh + j * HK);
+        }
+    };
+    if (nblk > 0) stage(0);
+    gdn_cp_commit();
+    for (int64_t k = 0; k < nblk; ++k) {
+        __syncthreads();   // every warp is done with block k - 1, the buffer stage(k + 1) fills
+        if (k + 1 < nblk) stage(k + 1);
+        gdn_cp_commit();
+        gdn_cp_wait_prev();
+        __syncthreads();
+        const int bb = (int) (k & 1);
+        const int n = (int) ((T - k * TB) < TB ? (T - k * TB) : TB);
+#pragma unroll 2
+        for (int i = 0; i < n; ++i) {
+            const int64_t t = k * TB + i;
+            const float4* k4 = reinterpret_cast<const float4*>(&sk[bb][i][4 * rg]);
+            const float4* q4 = reinterpret_cast<const float4*>(&sq[bb][i][4 * rg]);
+            float kc[16], qc[16];
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const float4 a = k4[8 * m], b = q4[8 * m];
+                kc[4 * m] = a.x; kc[4 * m + 1] = a.y; kc[4 * m + 2] = a.z; kc[4 * m + 3] = a.w;
+                qc[4 * m] = b.x; qc[4 * m + 1] = b.y; qc[4 * m + 2] = b.z; qc[4 * m + 3] = b.w;
+            }
+            float g[VPK], kv[VPK], delta[VPK], o[VPK];
+#pragma unroll
+            for (int j = 0; j < VPK; ++j) { g[j] = __expf(sg[bb][i][j]); kv[j] = 0.0f; o[j] = 0.0f; }
+#pragma unroll
+            for (int r = 0; r < 16; ++r)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) kv[j] = fmaf(s[j][r], kc[r], kv[j]);
+#pragma unroll
+            for (int x = 1; x < 8; x <<= 1)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) kv[j] += __shfl_xor_sync(0xffffffffu, kv[j], x);
+#pragma unroll
+            for (int j = 0; j < VPK; ++j) delta[j] = (sv[bb][i][j][c] - g[j] * kv[j]) * sb[bb][i][j];
+#pragma unroll
+            for (int r = 0; r < 16; ++r)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) {
+                    s[j][r] = fmaf(g[j], s[j][r], kc[r] * delta[j]);
+                    o[j] = fmaf(s[j][r], qc[r], o[j]);
+                }
+#pragma unroll
+            for (int x = 1; x < 8; x <<= 1)
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) o[j] += __shfl_xor_sync(0xffffffffu, o[j], x);
+            if (rg < VPK)   // row group j writes value head j's output
+                oc_out[t * HV * S + (qh + rg * HK) * S + col] =
+                    (rg == 0 ? o[0] : rg == 1 ? o[1] : o[2]) * rsqrtf((float) S);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < VPK; ++j)
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                state[(size_t) (4 * rg + 32 * m + e) * rs + (size_t) (qh + j * HK) * S + col] = s[j][4 * m + e];
+}
+// gdn_rec_wl_kernel when asked for (STRATA_GDN_REC_WARP=1) on a card with cp.async that holds all its blocks at once
+bool gdn_warp_ok() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_GDN_REC_WARP"); return v != nullptr && std::atoi(v) == 1; }();
+    if (!on) return false;
+    static int known[64] = {};   // per device: 0 not asked yet, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (known[dev] == 0) {
+        int major = 0, sms = 0, per_sm = 0;
+        const bool yes = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && major >= 8 &&
+                         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_rec_wl_kernel, GDN_WC * 8, 0) ==
+                             cudaSuccess &&
+                         (int64_t) per_sm * sms >= (int64_t) HK * GDN_WNCB;
+        if (!yes) {
+            cudaGetLastError();
+            std::fprintf(stderr, "strata: STRATA_GDN_REC_WARP: not on this card (sm_80+ holding %d blocks at once)\n",
+                         HK * GDN_WNCB);
+        }
+        known[dev] = yes ? 1 : 2;
+    }
+    return known[dev] == 1;
+}
 #endif
 // the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
 // norm stays in its scratch buffer)
@@ -913,7 +1043,9 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
 #if !defined(__HIPCC__)
-        if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
+        if (gdn_warp_ok())   // the row sums inside a warp (opt-in; not the same bits)
+            gdn_rec_wl_kernel<<<HK * GDN_WNCB, GDN_WC * 8, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        else if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
             gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
 #endif
