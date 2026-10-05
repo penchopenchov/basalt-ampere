@@ -102,10 +102,12 @@ bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream);
 /// STRATA_DM_WAIT_STATS: per layer, the times of the doorbell, CUDA0's own work done and each tier landed (CUDA0's
 /// clock), summed per peer-entry count and per layer.  Words: [0, 4) the layer's times; kDmStatBucket + 8 b + j for
 /// layers with min(peer entries, 15) == b: j 0 layers, 1 the tiers landed after CUDA0's work, 2 ns waited, 3 ns from
-/// the doorbell to the peer's rows, 4 ns from the doorbell to CUDA0's work done, 5 with CPU entries; kDmStatLayer + 4 l
-/// + j for layer l: j 0 peer entries, 1 layers, 2 ns waited, 3 with 4+ peer entries; then per CPU-entry count.
-constexpr int kDmStatBucket = 8, kDmStatLayer = kDmStatBucket + 16 * 8, kDmStatLayers = 64;
-constexpr int kDmStatCpu = kDmStatLayer + 4 * kDmStatLayers;   ///< + 2 min(CPU entries, 7): layers, ns to landed
+/// the doorbell to the peer's rows, 4 ns from the doorbell to CUDA0's work done, 5 with CPU entries, 6 / 7 ns the peer /
+/// the CPU pool landed after CUDA0's work; kDmStatLayer + kDmStatPerLayer l + j for layer l: j 0 peer entries, 1
+/// layers, 2 ns waited, 3 / 4 ns the CPU pool / the peer landed after CUDA0's work, 5 ns from the doorbell to CUDA0's
+/// work done, 6 ns from the doorbell to the peer's rows, 7 layers with peer entries; then per CPU-entry count.
+constexpr int kDmStatBucket = 8, kDmStatLayer = kDmStatBucket + 16 * 8, kDmStatLayers = 64, kDmStatPerLayer = 8;
+constexpr int kDmStatCpu = kDmStatLayer + kDmStatPerLayer * kDmStatLayers;   ///< + 2 min(CPU entries, 7): layers, ns to landed
 constexpr int kDmStatWords = kDmStatCpu + 16;
 /// One line per peer-entry count and two per-layer lines from the counters (host copy).
 std::string dec_moe_stats_text(const unsigned long long* w, double windows);

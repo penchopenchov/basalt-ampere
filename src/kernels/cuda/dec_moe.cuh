@@ -26,11 +26,13 @@ __device__ void dm_stat_record(unsigned long long* S, const DmPlan* plan, int la
     }
     const unsigned long long w = tl > tc ? tl - tc : 0ull;
     unsigned long long* b = S + kDmStatBucket + 8 * min(np, 15);
+    const unsigned long long wp = np > 0 && tp > tc ? tp - tc : 0ull, wc = nc > 0 && S[4] > tc ? S[4] - tc : 0ull;
     b[0] += 1; b[1] += w > 0; b[2] += w; b[3] += tp > tr ? tp - tr : 0ull; b[4] += tc > tr ? tc - tr : 0ull;
-    b[5] += nc > 0;
+    b[5] += nc > 0; b[6] += wp; b[7] += wc;
     if (layer >= 0 && layer < kDmStatLayers) {
-        unsigned long long* l = S + kDmStatLayer + 4 * layer;
-        l[0] += (unsigned long long) np; l[1] += 1; l[2] += w; l[3] += np >= 4;
+        unsigned long long* l = S + kDmStatLayer + kDmStatPerLayer * layer;
+        l[0] += (unsigned long long) np; l[1] += 1; l[2] += w; l[3] += wc; l[4] += wp;
+        l[5] += tc > tr ? tc - tr : 0ull; l[6] += np > 0 && tp > tr ? tp - tr : 0ull; l[7] += np > 0;
     }
 }
 
@@ -1330,33 +1332,58 @@ void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, cons
 std::string dec_moe_stats_text(const unsigned long long* w, double windows) {
     std::string s;
     char buf[256];
-    double tot_w = 0.0, tot_l = 0.0, tot_e = 0.0;
+    double tot_w = 0.0, tot_l = 0.0, tot_e = 0.0, tot_p = 0.0, tot_c = 0.0;
     for (int b = 0; b < 16; ++b) {
         const unsigned long long* c = w + kDmStatBucket + 8 * b;
         if (c[0] == 0) continue;
         const double n = (double) c[0];
         tot_w += (double) c[2]; tot_l += n; tot_e += n * b;
-        std::snprintf(buf, sizeof buf, "  peer %2d%s: %6.2f layers/window, %5.1f%% waited, wait %6.2f us/layer, "
-                      "peer done %6.2f us, CUDA0 done %6.2f us after the doorbell, %4.1f%% with CPU entries\n",
-                      b, b == 15 ? "+" : " ", n / windows, 100.0 * c[1] / n, c[2] / n / 1e3, c[3] / n / 1e3,
-                      c[4] / n / 1e3, 100.0 * c[5] / n);
+        std::snprintf(buf, sizeof buf, "  peer %2d%s: %6.2f layers/window, %5.1f%% waited, wait %6.2f us/layer "
+                      "(past CUDA0: peer %5.2f, CPU %5.2f), peer done %6.2f us, CUDA0 done %6.2f us after the doorbell, "
+                      "%4.1f%% with CPU entries\n",
+                      b, b == 15 ? "+" : " ", n / windows, 100.0 * c[1] / n, c[2] / n / 1e3, c[6] / n / 1e3,
+                      c[7] / n / 1e3, c[3] / n / 1e3, c[4] / n / 1e3, 100.0 * c[5] / n);
+        tot_p += (double) c[6]; tot_c += (double) c[7];
         s += buf;
     }
-    std::snprintf(buf, sizeof buf, "  total: %.3f ms/window waited, %.2f peer entries/layer\n", tot_w / windows / 1e6,
+    std::snprintf(buf, sizeof buf, "  total: %.3f ms/window waited (the peer past CUDA0 %.3f, the CPU pool %.3f), %.2f "
+                  "peer entries/layer\n", tot_w / windows / 1e6, tot_p / windows / 1e6, tot_c / windows / 1e6,
                   tot_l > 0 ? tot_e / tot_l : 0.0);
     s += buf;
     s += "  per layer peer entries:";
     for (int l = 0; l < kDmStatLayers; ++l) {
-        const unsigned long long* c = w + kDmStatLayer + 4 * l;
+        const unsigned long long* c = w + kDmStatLayer + kDmStatPerLayer * l;
         if (c[1] == 0) continue;
         std::snprintf(buf, sizeof buf, " %.1f", (double) c[0] / c[1]);
         s += buf;
     }
     s += "\n  per layer wait us:";
     for (int l = 0; l < kDmStatLayers; ++l) {
-        const unsigned long long* c = w + kDmStatLayer + 4 * l;
+        const unsigned long long* c = w + kDmStatLayer + kDmStatPerLayer * l;
         if (c[1] == 0) continue;
         std::snprintf(buf, sizeof buf, " %.1f", c[2] / (double) c[1] / 1e3);
+        s += buf;
+    }
+    s += "\n  per layer CPU-late us:";
+    for (int l = 0; l < kDmStatLayers; ++l) {
+        const unsigned long long* c = w + kDmStatLayer + kDmStatPerLayer * l;
+        if (c[1] == 0) continue;
+        std::snprintf(buf, sizeof buf, " %.1f", c[3] / (double) c[1] / 1e3);
+        s += buf;
+    }
+    s += "\n  per layer peer-late us:";
+    for (int l = 0; l < kDmStatLayers; ++l) {
+        const unsigned long long* c = w + kDmStatLayer + kDmStatPerLayer * l;
+        if (c[1] == 0) continue;
+        std::snprintf(buf, sizeof buf, " %.1f", c[4] / (double) c[1] / 1e3);
+        s += buf;
+    }
+    s += "\n  first layers (CUDA0 done / peer done after the doorbell, us):";
+    for (int l = 0; l < 4; ++l) {
+        const unsigned long long* c = w + kDmStatLayer + kDmStatPerLayer * l;
+        if (c[1] == 0) continue;
+        std::snprintf(buf, sizeof buf, " L%d %.1f / %.1f;", l, c[5] / (double) c[1] / 1e3,
+                      c[7] ? c[6] / (double) c[7] / 1e3 : 0.0);
         s += buf;
     }
     s += "\n  CPU entries -> landed after the doorbell:";
