@@ -130,7 +130,8 @@ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // (STRATA_DEC_GDNF=1's kernel), no separate norm launch.  Wider windows run slower with either.  4 = with 1, the MoE
 // route split: CUDA0's plan and q8_1 rows on the main stream (the routed experts follow it at once), the ring for the
 // peer card and the CPU pool (mapped rows, system fences, doorbells) on the priority side stream before the shared
-// expert.
+// expert.  8 = the SwiGLU pass inside the routed experts' down kernel (STRATA_DEC_GU2=2's chain; iq_kernels.cu).
+// 16 = the tiers' wait inside the combine kernel instead of its own launch.
 int dec_pk_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_PK"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -1386,7 +1387,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool sh_fork = !shx && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
         cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) && n >= 2 ? sh_hi_ : sh_cs_) : cs;
-        if (sh_fork) {
+        // STRATA_DEC_PK & 4: the side stream forks after the router (its ring reads the routed ids)
+        const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && (dec_pk_mask() & 4);
+        if (sh_fork && !pk_ring) {
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
         }
@@ -1429,7 +1432,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.host_seq_m = m_seq_; ra.peer_seq_m = dm_->m_w;
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
-            if (sh_fork && sh_stream == sh_hi_ && (dec_pk_mask() & 4)) {   // STRATA_DEC_PK & 4: the ring beside
+            if (pk_ring) {   // the ring beside, CUDA0's plan and rows here
+                cudaEventRecord(ev_fork_, cs);
+                cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
                 DmRouteArgs rp = ra;
                 rp.mode = 2; rp.xq_pub = dm_->xq_pub;
                 {
@@ -1615,11 +1620,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
         if (dm) {
-            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs);
+            const bool wait_in = (dec_pk_mask() & 16) != 0;   // the combine's blocks wait for the tiers
+            if (!wait_in) dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs);
             stamp(l, 23, grp);
             try {
                 dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
-                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs);
+                                shared_ + tb * N, bo_ + tb * N, N, K, n, wait_in ? dm_->m_w + 16 : nullptr,
+                                wait_in ? m_flag_ : nullptr, ring, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
