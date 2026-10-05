@@ -61,6 +61,10 @@ struct DmRouteArgs {
     /// the ring (header, mapped rows through `xq_pub`, doorbells), e.g. on a side stream beside a mode-1 launch
     int mode = 0;
     void* xq_pub = nullptr;          ///< device scratch like xq (mode 2)
+    const uint16_t* sh_gw = nullptr; ///< device: the shared expert's BF16 gate row (n_embd), or null
+    float* sh_part = nullptr;        ///< device: its gate's partial sums, n_embd / 256 per token in order
+    unsigned long long* stats = nullptr;   ///< STRATA_DM_WAIT_STATS (kDmStatWords, device) or null: the doorbell's time
+    int peer_cap = 0;                ///< STRATA_PEER_CAP: the peer's groups past this many go to the CPU pool (0: no cap)
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
@@ -99,9 +103,22 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Launches the peer window (cooperative) on `stream` of the current device; false on a launch error.
 bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream);
 
+/// STRATA_DM_WAIT_STATS: per layer, the times of the doorbell, CUDA0's own work done and each tier landed (CUDA0's
+/// clock), summed per peer-entry count and per layer.  Words: [0, 4) the layer's times; kDmStatBucket + 8 b + j for
+/// layers with min(peer entries, 15) == b: j 0 layers, 1 the tiers landed after CUDA0's work, 2 ns waited, 3 ns from
+/// the doorbell to the peer's rows, 4 ns from the doorbell to CUDA0's work done, 5 with CPU entries, 6 / 7 ns the peer /
+/// the CPU pool landed after CUDA0's work; kDmStatLayer + kDmStatPerLayer l + j for layer l: j 0 peer entries, 1
+/// layers, 2 ns waited, 3 / 4 ns the CPU pool / the peer landed after CUDA0's work, 5 ns from the doorbell to CUDA0's
+/// work done, 6 ns from the doorbell to the peer's rows, 7 layers with peer entries; then per CPU-entry count.
+constexpr int kDmStatBucket = 8, kDmStatLayer = kDmStatBucket + 16 * 8, kDmStatLayers = 64, kDmStatPerLayer = 8;
+constexpr int kDmStatCpu = kDmStatLayer + kDmStatPerLayer * kDmStatLayers;   ///< + 2 min(CPU entries, 7): layers, ns to landed
+constexpr int kDmStatWords = kDmStatCpu + 16;
+/// One line per peer-entry count and two per-layer lines from the counters (host copy).
+std::string dec_moe_stats_text(const unsigned long long* w, double windows);
+
 /// CUDA0's spin until the tiers this layer uses have landed (the combine waits by itself; this one is for profiles).
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
-                  uint32_t ring, void* stream);
+                  uint32_t ring, void* stream, unsigned long long* stats = nullptr, int layer = 0);
 
 /// CUDA0's VRAM share of the plan in one launch (gate/up, SwiGLU, down; native_expert_grouped's rows bit for bit):
 /// entry e's row into row plan->dst[e] of `out`.  `sync`: kDmCap + 1 zeroed device words, left zeroed.
@@ -111,6 +128,45 @@ size_t dec_moe_vram_scratch_bytes(int n_ff);
 /// native_expert_grouped's SwiGLU and down launches over `cap` possible groups (the window's entries).
 void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, float* out,
                   unsigned int* sync, void* stream, int kind = 0, int cap = kDmCap);
+
+/// STRATA_DEC_MOE3: CUDA0's MoE block in three launches with the shared expert and the combine inside.
+///   gate/up  one block per (16-row slice, group row): 8 warps take the slice of the plan's groups, two more warps a
+///            share of the slice's shared-expert rows for every token (the slice's rows split over the block rows,
+///            whatever the plan), so the shared work is spread over every block of the launch.  A programmatic
+///            dependent of dec_moe_route: before its wait a block reads only weights.
+///   SwiGLU   the routed entries and the shared expert's tokens into q8_1 rows.
+///   down     one block per (row slice, group row): 8 warps the slice's routed rows, the ninth a share of the slice's
+///            shared rows (times the token's sigmoid gate from dec_moe_route's partials); the last block of a slice
+///            to finish waits for the tiers the plan uses (one thread of the grid polls their mapped words) and sums
+///            the slice's rows per token in a fixed order (entries 0..k-1 with their router weights, then the shared
+///            row) into `output`.
+/// A token's output depends only on its own rows, never on the window's size or its column.
+struct DmM3Args {
+    const uint8_t* sg = nullptr; const uint8_t* su = nullptr; const uint8_t* sd = nullptr;   ///< shared weights
+    int sg_type = 0, su_type = 0, sd_type = 0;
+    size_t sg_row = 0, su_row = 0, sd_row = 0;   ///< bytes a row (dec_moe3 sets them)
+    const float* sh_part = nullptr;              ///< dec_moe_route's gate partials (n_embd / 256 per token)
+    float* shared = nullptr;                     ///< device scratch: n_tok rows of n_embd
+    float* parts = nullptr;                      ///< device: CUDA0's entry rows (entry i at row i)
+    const float* peer_rows_m = nullptr;          ///< mapped: the peer's entry rows
+    const float* cpu_rows_m = nullptr;           ///< mapped: the CPU pool's entry rows
+    const float* weights = nullptr;              ///< device: n_tok * k router weights
+    float* output = nullptr;                     ///< device: n_tok rows of n_embd
+    const volatile uint32_t* peer_done_m = nullptr;
+    const volatile uint32_t* host_flag_m = nullptr;
+    uint32_t ring = 0;
+    unsigned int* ctr = nullptr;                 ///< device: kDmM3Ctr zeroed words, left zeroed
+    int n_tok = 0, k = 0;
+    unsigned long long* stats = nullptr;         ///< STRATA_DM_WAIT_STATS (kDmStatWords, device) or null
+    int layer = 0;
+};
+constexpr int kDmM3Ctr = 256;
+/// Whether dec_moe3 covers a layer: the experts' formats and the shared expert's.
+bool dec_moe3_ok(const NativeExpertLayout& L, int sg_type, int su_type, int sd_type);
+size_t dec_moe3_scratch_bytes(int n_ff);
+/// `cap`: the window's entries (n_tok * k); `xq`: dec_moe_route's q8_1 rows.  STRATA_DEC_MOE3_GY: block rows (24).
+void dec_moe3(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, const DmM3Args& a,
+              int cap, void* stream);
 
 /// The tests: the persistent kernel's per-group math against native_expert_grouped on one device, without rings.
 /// Entries [start[g], start[g+1]) of group g read q8_1 row tok[e] and write row dst[e] of `out` (device).

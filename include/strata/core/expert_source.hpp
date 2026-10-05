@@ -498,6 +498,23 @@ public:
     bool copy_exchanges(uint64_t max_bytes);
     bool exchanges_staged() const { return !staged_.empty(); }
     int64_t exchanges() const { return exchanges_; }
+    // ---- STRATA_ADAPT_FAST: free places in the compact copy instead of exchange buffers.  `set_spares` (before
+    // pin_cache_complement) appends n blob-sized places to it.  A swap's evicted expert is copied by DMA from its GPU
+    // slot straight into a free place (`spare_take`), becomes the copy's (`spare_land`) once that copy has landed,
+    // and the incoming expert's place joins the free ones (`spare_release`) once it is resident on the GPU: no host
+    // copy, no exchange buffer.  Call between verify windows (the pool reads the offsets during one).
+    void set_spares(int64_t n) { spares_want_ = n; }
+    int64_t spares_free() const { return (int64_t) spare_free_.size(); }
+    /// A free place for `layer`'s blob (its host address; `off` its offset), or nullptr.
+    uint8_t* spare_take(int64_t layer, uint64_t& off);
+    /// `out` (held by no place) is read from the place at `off` from now on.
+    bool spare_land(int64_t layer, int64_t out, uint64_t off);
+    /// `in`'s place is free (it is resident on the GPU now).
+    bool spare_release(int64_t layer, int64_t in);
+    /// A place `spare_take` gave, unused.
+    void spare_return(int64_t layer, uint64_t off);
+    /// Debug: whether `bytes` equal the expert's bytes in the model files.
+    bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
     int64_t file_reads() const { return file_reads_.load(std::memory_order_relaxed); }
@@ -641,6 +658,8 @@ private:
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
     int64_t exchanges_ = 0;
+    int64_t spares_want_ = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   ///< STRATA_ADAPT_FAST: (offset, bytes) of free places
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
 #if defined(_WIN32)
