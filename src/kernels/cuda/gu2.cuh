@@ -383,3 +383,77 @@ void launch_dependent(void (*kernel)(KArgs...), dim3 grid, cudaStream_t s, Args.
     cfg.numAttrs = 1;
     (void) cudaLaunchKernelEx(&cfg, kernel, args...);   // an error stays for the caller's check
 }
+
+// ---------------------------------------------------------------- STRATA_DEC_GU2=3: SwiGLU inside the down kernel
+// The chain without its SwiGLU launch: the IQ4_NL down rows (n_ff 640) as a programmatic dependent of the gate/up
+// kernel.  Per chunk of entries, every block makes the entries' q8_1 h rows in shared memory with
+// swiglu_q8_1_entries_kernel's expressions (a warp is one q8_1 block, as there), so the bytes are the ones the
+// SwiGLU pass stored and native_down_multi_kernel copied; the row sums are that kernel's.  `bx`, `by`, `ny`: the
+// block's row block, its first group and the group stride.
+__device__ __forceinline__ void down_sw_body(int bx, int by, int ny, const unsigned long long* __restrict__ grp_ptr,
+                                             const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
+                                             const int32_t* __restrict__ ent_dst, const float* __restrict__ gate,
+                                             const float* __restrict__ up, const NativeExpertLayout& L,
+                                             float* __restrict__ out, uint32_t* s_hq_buf, int tid) {
+    constexpr int TD = 20, HB = 20, NFF = 640;
+    const int ng = *n_groups;
+    if (by >= ng) return;
+    const int r = bx * 32 + (tid >> 3), t = tid & 7;
+    const bool valid_r = r < L.n_embd;
+    const size_t w_off = L.down_off + (size_t) (valid_r ? r : 0) * L.d_row;
+    prefetch_l2((const uint8_t*) grp_ptr[by] + L.down_off + (size_t) bx * 32 * L.d_row,
+                min(32, (int) L.n_embd - bx * 32) * (int) L.d_row, tid);
+    pdl_wait();
+    block_q8_1* s_hq = reinterpret_cast<block_q8_1*>(s_hq_buf);
+    for (int g = by; g < ng; g += ny) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            __syncthreads();
+            const long long base = (long long) e * NFF;
+            for (int i = tid; i < n * NFF; i += 256) {   // whole warps: n * NFF and 256 are multiples of 32
+                const float gv = gate[base + i];
+                const float h = __fmul_rn(gv / (1.0f + __expf(-gv)), up[base + i]);
+                q8_1_store(h, s_hq, i);
+            }
+            __syncthreads();
+            if (!valid_r) continue;
+            if (n == 1) {
+                const int off1[1] = { 0 };
+                float s1[1];
+                row_dot_40_sub8<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
+                if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0];
+            } else if (n == 2) {
+                const int off2[2] = { 0, HB };
+                float s2[2];
+                row_dot_40_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
+                if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t];
+            } else {
+                int off[GRP_NC];
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * HB;
+                float s[GRP_NC];
+                row_dot_40_sub8<TD, GRP_NC>(wr, s_hq, off, n, t, s);
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c)
+                    if (c < n && t == c) out[(size_t) ent_dst[e + c] * L.n_embd + r] = s[c];
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) native_down_sw_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                             const int32_t* __restrict__ grp_start,
+                                                             const int32_t* __restrict__ n_groups,
+                                                             const int32_t* __restrict__ ent_dst,
+                                                             const float* __restrict__ gate,
+                                                             const float* __restrict__ up, NativeExpertLayout L,
+                                                             float* __restrict__ out) {
+    __shared__ alignas(16) uint32_t s_hq_buf[GRP_NC * 20 * 9];
+    down_sw_body((int) blockIdx.x, (int) blockIdx.y, (int) gridDim.y, grp_ptr, grp_start, n_groups, ent_dst, gate, up,
+                 L, out, s_hq_buf, (int) threadIdx.x);
+}
+
+// whether native_down_sw_kernel takes L's down rows
+inline bool down_sw_usable(const NativeExpertLayout& L) { return L.d_type == 20 && L.n_ff == 640; }

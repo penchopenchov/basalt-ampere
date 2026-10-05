@@ -2208,9 +2208,15 @@ bool g_stage_grid = [] {
 bool g_nc6 = env_on("STRATA_IQ_NC6");
 // STRATA_GU_STAGE=1: the grouped gate/up kernel reads the group's activations from shared memory (the same bits)
 bool g_gu_stage = env_on("STRATA_GU_STAGE");
-// STRATA_DEC_GU2=1: the grid formats' gate/up rows two a warp (native_gu2_kernel); 2: also the SwiGLU pass inside
-// the down kernel (native_down2_kernel).  The same bits.
-int g_gu2 = [] { const char* v = std::getenv("STRATA_DEC_GU2"); return v ? std::atoi(v) : 0; }();
+// STRATA_DEC_GU2=1: the grid formats' gate/up rows two a warp (native_gu2_kernel); 2: also SwiGLU and down as
+// programmatic dependents; 3 (or 2 with STRATA_DEC_PK & 8): the SwiGLU pass inside the down kernel where it takes
+// the down format (native_down_sw_kernel).  The same bits.
+int g_gu2 = [] {
+    const char* v = std::getenv("STRATA_DEC_GU2");
+    const char* pk = std::getenv("STRATA_DEC_PK");
+    const int m = v ? std::atoi(v) : 0;
+    return m == 2 && pk && (std::atoi(pk) & 8) ? 3 : m;
+}();
 // STRATA_DEC_GY (with STRATA_DEC_GU2=2; default 24): the most block rows a grouped call launches when its caller
 // leaves grid_groups to it (more groups take the stride; the same bits)
 int g_dec_gy = [] { const char* v = std::getenv("STRATA_DEC_GY"); return v ? std::atoi(v) : 24; }();
@@ -3089,8 +3095,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool v1 = g_grouped_v1;
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     const bool chain = g_gu2 >= 2 && !v1 && !g_old_kernels;   // STRATA_DEC_GU2=2: SwiGLU and down as dependents
+    const bool sw_fold = chain && g_gu2 >= 3 && down_sw_usable(L) && g_exp_phase == 0;
 #else
-    const bool chain = false;
+    const bool chain = false, sw_fold = false;
 #endif
     int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     if (chain && grid_groups <= 0 && g_dec_gy > 0 && gy > g_dec_gy) gy = g_dec_gy;
@@ -3167,6 +3174,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (sw_v1) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    } else if (sw_fold) {   // the down kernel makes the h rows
     } else if (chain) {
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
         launch_dependent(swiglu_q8_1_entries_pdl_kernel, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
@@ -3204,6 +3212,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
     } else
 #undef STRATA_D_AMD
+#endif
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (sw_fold) {
+        launch_dependent(native_down_sw_kernel, gd, s, grp_ptr, grp_start, n_groups, ent_dst, (const float*) gate,
+                         (const float*) up, L, out);
+        check("native_expert_grouped/down");
+        return;
+    }
 #endif
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, chain); break;
