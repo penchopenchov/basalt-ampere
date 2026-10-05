@@ -129,6 +129,9 @@ public:
               const std::set<std::string>* skip = nullptr);
 
     const WeightRef* find(const std::string& name) const;
+    /// Point a row at another device form that stands for the tensor (an 8-bit copy keyed by its own address,
+    /// hc_fused.hpp's hc8_adopt); its readers resolve that form.  False when there is no such row.
+    bool rebind(const std::string& name, const void* data);
     const std::map<std::string, WeightRef>& all() const { return table_; }
     const LoadReport& report() const { return report_; }
 

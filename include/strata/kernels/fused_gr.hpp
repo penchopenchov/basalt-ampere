@@ -49,6 +49,11 @@ constexpr int kFusedGrMaxT = 8;
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 
+/// STRATA_DEC_HC8=1: the same read on the matrices' 8-bit copies (hc_fused.hpp's hc8_view) in three kernels (norm,
+/// down + inject, up); a token's outputs come from the same operations whatever n_tok.  `rs` and `lo` are written as
+/// above; R' goes to R_out (when apply) before the down kernel reads it.  False, with nothing enqueued, when w_down has
+/// no copy.  fused_gr_read, fused_gr_read_multi and gr_read take this path for such matrices.
+bool hc8_gr_read_multi(const FusedGrArgs* a, int n_tok, int64_t n_embd, int64_t hc, void* stream);
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing

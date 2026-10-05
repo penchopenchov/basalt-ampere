@@ -1,6 +1,7 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/hc_fused.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -514,6 +515,35 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
+}
+
+void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                  const uint16_t* X_lo) {
+#if !defined(__HIPCC__)
+    strata::kernels::Hc8View v;
+    if (strata::kernels::hc8_view(W, v) && v.owned) {
+        if (v.rows != N || v.cols != K) {
+            std::fprintf(stderr, "prefill gemm: an 8-bit copy is %d x %d, the product wants %lld x %lld\n", v.rows,
+                         v.cols, (long long) N, (long long) K);
+            std::exit(1);
+        }
+        if (ldy <= 0) ldy = N;
+        const int64_t rows = std::min<int64_t>(N, scratch_elems_ / K);
+        if (rows <= 0 || scratch_ == nullptr) {
+            std::fprintf(stderr, "prefill gemm: no scratch for an 8-bit matrix (K=%lld)\n", (long long) K);
+            std::exit(1);
+        }
+        for (int64_t r0 = 0; r0 < N; r0 += rows) {
+            const int64_t n = std::min<int64_t>(rows, N - r0);
+            strata::kernels::hc8_dequant_bf16(v, r0, n, scratch_, stream_);
+            bf16(X, scratch_, Y + r0, T, n, K, ldy);
+            if (X_lo) bf16(X_lo, scratch_, Y + r0, T, n, K, ldy, 1.0f);
+        }
+        return;
+    }
+#endif
+    bf16(X, W, Y, T, N, K, ldy);
+    if (X_lo) bf16(X_lo, W, Y, T, N, K, ldy, 1.0f);
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,

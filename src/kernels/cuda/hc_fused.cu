@@ -14,10 +14,12 @@
 #include <algorithm>
 #include <cfloat>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace strata::kernels {
@@ -74,6 +76,7 @@ struct HcLaunch {
     unsigned long long* racc;              // hcx: [MAXT][NE] the logits as 32.32 fixed point, summed over the up slices
     unsigned long long* dbg;   // bench only: per-CTA phase times [nb][16]
     int early;       // 1: the next kernel let in at the start; 2: a first down item stages its weights before the wait
+    int pre8;        // 8-bit read: down stages requested before the norm is done
 };
 
 // ---------------------------------------------------------------- primitives
@@ -218,6 +221,37 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
     acc = fmaf(__uint_as_float(w.z & 0xffff0000u), x1.y, acc);
     acc = fmaf(__uint_as_float(w.w << 16), x1.z, acc);
     acc = fmaf(__uint_as_float(w.w & 0xffff0000u), x1.w, acc);
+    return acc;
+}
+
+// 8-bit weights: int8 with one f16 scale per G8 consecutive values of a row
+constexpr int G8 = 32;
+__device__ __forceinline__ float h2f(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+// four int8 as floats, exactly: q + 128 as the low byte of 2^23 + (q + 128), less 2^23 + 128
+__device__ __forceinline__ float4 i8x4_f(uint32_t q) {
+    const uint32_t u = q ^ 0x80808080u;
+    return make_float4(__uint_as_float(__byte_perm(u, 0x4B000000u, 0x7650u)) - 8388736.0f,
+                       __uint_as_float(__byte_perm(u, 0x4B000000u, 0x7651u)) - 8388736.0f,
+                       __uint_as_float(__byte_perm(u, 0x4B000000u, 0x7652u)) - 8388736.0f,
+                       __uint_as_float(__byte_perm(u, 0x4B000000u, 0x7653u)) - 8388736.0f);
+}
+// bytes 0, 1 (HI: 2, 3) of four int8 as an f16 pair, exactly: 1024 + (q + 128), less 1152
+template <bool HI>
+__device__ __forceinline__ uint32_t i8x2_h2(uint32_t q) {
+    const uint32_t v = __byte_perm(q ^ 0x80808080u, 0x64646464u, HI ? 0x7362u : 0x5140u);
+    const __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&v), __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480)));
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+__device__ __forceinline__ float dot8ff(const float4 w0, const float4 w1, const float4 x0, const float4 x1) {
+    float acc = 0.0f;
+    acc = fmaf(w0.x, x0.x, acc);
+    acc = fmaf(w0.y, x0.y, acc);
+    acc = fmaf(w0.z, x0.z, acc);
+    acc = fmaf(w0.w, x0.w, acc);
+    acc = fmaf(w1.x, x1.x, acc);
+    acc = fmaf(w1.y, x1.y, acc);
+    acc = fmaf(w1.z, x1.z, acc);
+    acc = fmaf(w1.w, x1.w, acc);
     return acc;
 }
 
@@ -422,6 +456,117 @@ __device__ void hc_down_main(const HcFusedArgs& a, const float* xn, int b, int t
     }
 }
 
+// ---- 8-bit down items: the CTA's four rows (every stage) and their scales bulk-copied into shared memory, one
+// barrier per stage; the activations through a ring of SX stages behind them.  The lane order is hc_down_main's; each
+// lane's chunk of eight lies in one scale group, applied to the chunk's dot product.
+constexpr int W8_STAGE = ROWS * 1024;                  // int8 bytes per stage
+constexpr int S8_BYTES = ROWS * (D / G8) * 2;          // the rows' scales
+constexpr int W8_BYTES = NSTAGE * W8_STAGE + S8_BYTES;
+template <int T, bool XH>
+struct Ring8 {
+    static constexpr int X = T * STAGE_X1 / (XH ? 2 : 1);
+    static constexpr int S0 = (SMEM - W8_BYTES) / X;
+    static constexpr int SX = S0 > RING_CAP ? RING_CAP : S0;
+    static_assert(SX >= 1, "one activation stage at least");
+};
+struct Down8 {
+    const int8_t* q;
+    const uint16_t* sc;
+};
+__device__ __forceinline__ Down8 down_rows8(const HcFusedArgs& a, int b) {
+    if (b < ND - 1) return {a.q_down + (size_t) b * ROWS * D, a.s_down + (size_t) b * ROWS * (D / G8)};
+    return {a.q_inject, a.s_inject};
+}
+// Stages [s0, s1) of the rows (stage s completes bars[s]) and, with stage 0, the scales (bars[NSTAGE]); warp r copies
+// row r, so every barrier takes ROWS arrivals.
+__device__ void hc_down8_issue(const HcFusedArgs& a, int b, int tid, char* smem, uint64_t* bars, int s0, int s1) {
+    const Down8 w = down_rows8(a, b);
+    if (w.q == nullptr || tid >= ROWS * 32) return;
+    const int r = tid >> 5, lane = tid & 31;
+    if (lane == 0 && s0 == 0 && s1 > 0) {
+        mbar_expect_tx(&bars[NSTAGE], (D / G8) * 2);
+        bulk_g2s(smem + NSTAGE * W8_STAGE + r * (D / G8) * 2, w.sc + (size_t) r * (D / G8), (D / G8) * 2, &bars[NSTAGE]);
+    }
+    for (int st = s0 + lane; st < s1; st += 32) {
+        mbar_expect_tx(&bars[st], 1024);
+        bulk_g2s(smem + st * W8_STAGE + r * 1024, w.q + (size_t) r * D + st * 1024, 1024, &bars[st]);
+    }
+}
+template <int T, bool XH>
+__device__ void hc_down8_main(const HcFusedArgs& a, const float* xn, int b, int tid, char* smem, uint64_t* bars,
+                              unsigned ph) {
+    constexpr int SX = Ring8<T, XH>::SX, XB = Ring8<T, XH>::X;
+    constexpr int TW = (T + 1) / 2;
+    if (down_rows8(a, b).q == nullptr) return;
+    const __half* xh = reinterpret_cast<const __half*>(xn);
+    const int lane = tid & 31, warp = tid >> 5, r = warp & 3, p = warp >> 2;
+    char* xr = smem + W8_BYTES - STAGE_W;   // the issue helpers write at slot + STAGE_W
+#pragma unroll
+    for (int st = 0; st < SX; ++st) {
+        if constexpr (XH) down_issue_xh<T>(xh, st, xr + st * XB, tid);
+        else down_issue_x<T>(xn, st, xr + st * XB, tid);
+        cp_async_commit();
+    }
+    const int nt = p == 0 ? TW : T / 2;
+    float acc[TW];
+#pragma unroll
+    for (int i = 0; i < TW; ++i) acc[i] = 0.0f;
+#pragma unroll
+    for (int st = 0; st < NSTAGE; ++st) {
+        cp_async_wait<SX - 1>();
+        if (st == 0) mbar_wait(&bars[NSTAGE], ph);
+        mbar_wait(&bars[st], ph);
+        __syncthreads();
+        const uint2* W = reinterpret_cast<const uint2*>(smem + st * W8_STAGE + r * 1024);
+        const uint16_t* S = reinterpret_cast<const uint16_t*>(smem + NSTAGE * W8_STAGE + r * (D / G8) * 2) + st * 32;
+        const char* slot = xr + (st % SX) * XB + STAGE_W;
+        const float4* X = reinterpret_cast<const float4*>(slot) + p * 256;
+        const uint4* XH4 = reinterpret_cast<const uint4*>(slot) + p * 128;
+#pragma unroll
+        for (int qq = 0; qq < QB; ++qq) {
+            const int j = lane + 32 * qq;
+            const uint2 wq = W[j];
+            const float4 w0 = i8x4_f(wq.x), w1 = i8x4_f(wq.y);
+            const float sc = h2f(S[j >> 2]);
+#pragma unroll
+            for (int i = 0; i < TW; ++i) {
+                if (i >= nt) continue;
+                float d;
+                if constexpr (XH) {
+                    const uint4 h = XH4[i * 256 + j];
+                    const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h.x));
+                    const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h.y));
+                    const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&h.z));
+                    const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&h.w));
+                    d = dot8ff(w0, w1, make_float4(f0.x, f0.y, f1.x, f1.y), make_float4(f2.x, f2.y, f3.x, f3.y));
+                } else {
+                    d = dot8ff(w0, w1, X[i * 512 + j], X[i * 512 + 128 + j]);
+                }
+                acc[i] = fmaf(sc, d, acc[i]);
+            }
+        }
+        __syncthreads();
+        if (st + SX < NSTAGE) {
+            if constexpr (XH) down_issue_xh<T>(xh, st + SX, xr + (st % SX) * XB, tid);
+            else down_issue_x<T>(xn, st + SX, xr + (st % SX) * XB, tid);
+        }
+        cp_async_commit();
+    }
+#pragma unroll
+    for (int i = 0; i < TW; ++i) {
+        if (i >= nt) break;
+        const int k = p + 2 * i;
+        const float sum = warp_sum(acc[i]);
+        if (lane != 0) continue;
+        if (b < ND - 1) {
+            const float x = sum / (float) HC;
+            a.lo[(size_t) k * LR + b * ROWS + r] = x / (1.0f + __expf(-x));
+        } else {
+            a.inject_out[k * HC + r] = sum;
+        }
+    }
+}
+
 // ---- split-K down items: a cluster of two CTAs per group of four rows.  CTA h of the pair owns lanes 16h..16h+15 of
 // the plain read's warp, i.e. chunks 16h + l + 32 q (256-byte runs of every row): it forms those lanes' sums in their
 // order, CTA 1 hands its 16 sums per (row, token) to CTA 0 through distributed shared memory, and CTA 0 runs the xor
@@ -548,12 +693,20 @@ __device__ __forceinline__ UpSlice up_slice(int u, int nu) {
     return {c0, c1 - c0};
 }
 // Piece p of the slice's w_up rows (stream p / 2, half p % 2) into shared memory, completing on bars[p].
-__device__ void hc_up_piece(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, int p) {
-    const unsigned bytes = (unsigned) sl.nc * LR * 2, half = bytes / 2;
+// 8-bit (q_up): into the upper half of the bf16 rows' area, for hc_up_widen; the first half of a stream brings its
+// rows' scales (SU8 per row) to `sc`.
+constexpr int SU8 = 16;   // f16 per up row's scales (LR / G8 padded: a row's scales are a 16-byte aligned run)
+__device__ void hc_up_piece(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, int p, uint16_t* sc) {
+    const bool q8 = a.q_up != nullptr;
+    const unsigned bytes = (unsigned) sl.nc * LR * (q8 ? 1 : 2), half = bytes / 2;
     const int c = p >> 1, h = p & 1;
-    mbar_expect_tx(&bars[p], half);
-    bulk_g2s(smem + (size_t) c * bytes + h * half, reinterpret_cast<const char*>(a.w_up + ((size_t) c * N + sl.c0) * LR) + h * half,
-             half, &bars[p]);
+    const char* src = q8 ? reinterpret_cast<const char*>(a.q_up + ((size_t) c * N + sl.c0) * LR)
+                         : reinterpret_cast<const char*>(a.w_up + ((size_t) c * N + sl.c0) * LR);
+    char* dst = smem + (q8 ? (size_t) 4 * sl.nc * LR : 0) + (size_t) c * bytes + h * half;
+    const unsigned sb = q8 && h == 0 ? (unsigned) sl.nc * SU8 * 2 : 0;
+    mbar_expect_tx(&bars[p], half + sb);
+    bulk_g2s(dst, src + h * half, half, &bars[p]);
+    if (sb) bulk_g2s(sc + c * sl.nc * SU8, a.s_up + ((size_t) c * N + sl.c0) * SU8, sb, &bars[p]);
 }
 // The mma up pass's layout: the w_up rows in groups of UPG, each group followed by 16 bytes, so group q starts on bank
 // 4 q and eight rows of eight consecutive groups (what an ldmatrix matrix reads) hit distinct banks.  One bulk copy per
@@ -571,21 +724,50 @@ __device__ void hc_up_piece_rows(const HcFusedArgs& a, UpSlice sl, char* smem, u
         dd = e;
     }
 }
+// The 8-bit rows in the same grouping: LR bytes per row, UPGB8 per group (group q again on bank 4 q).
+constexpr int UPGB8 = UPG * LR + 16;
+__device__ __forceinline__ int up_row_off8(int r) { return (r / UPG) * UPGB8 + (r % UPG) * LR; }
+__device__ void hc_up_piece_rows8(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, int p, uint16_t* sc) {
+    const int c = p >> 1, d0 = (p & 1) ? sl.nc / 2 : 0, d1 = (p & 1) ? sl.nc : sl.nc / 2;
+    mbar_expect_tx(&bars[p], (unsigned) (d1 - d0) * (LR + SU8 * 2));
+    bulk_g2s(sc + (c * sl.nc + d0) * SU8, a.s_up + ((size_t) c * N + sl.c0 + d0) * SU8, (unsigned) (d1 - d0) * SU8 * 2, &bars[p]);
+    for (int dd = d0; dd < d1;) {
+        const int r = c * sl.nc + dd, e = min(d1, dd + UPG - r % UPG);
+        bulk_g2s(smem + up_row_off8(r), a.q_up + ((size_t) c * N + sl.c0 + dd) * LR, (unsigned) (e - dd) * LR, &bars[p]);
+        dd = e;
+    }
+}
 // Tile t's m-index i (0..15) is row UPG (8 (t / 2) + i % 8) + 2 (t % 2) + i / 8: tiles 2u and 2u + 1 share groups
 // 8u..8u+7.
 __device__ __forceinline__ int up_tile_row(int t, int i) { return UPG * (8 * (t >> 1) + (i & 7)) + 2 * (t & 1) + (i >> 3); }
 static_assert(UPG == 4, "two m-tiles per eight groups");
 static_assert(30 * UPGB + (8 * (LR + 8) + 3 * 8 * HC * 30 + 8 * 30) * 4 <= SMEM, "an mma up slice of 30 columns, T = 8");
-// Thread 0 of an up CTA: the w_up pieces, two in flight (once `nload` reaches `n_in`), while watching for the down
-// projection to finish; `ph` is the barriers' phase.
-__device__ void hc_up_stream(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, const unsigned* nload,
-                             unsigned n_in, const unsigned* down, unsigned ph, bool rows = false) {
-    auto piece = [&](int p) { if (rows) hc_up_piece_rows(a, sl, smem, bars, p); else hc_up_piece(a, sl, smem, bars, p); };
+// Thread 0 of an up CTA: the w_up pieces, two in flight (the 8-bit slice: all at once) once `nload` reaches `n_in`,
+// while watching for the down projection to finish (unless !wait_down); `ph` is the barriers' phase.  `issued` > 0:
+// that many pieces were requested already (hc_up_issue8).  `sc`: the 8-bit rows' scales in shared memory.
+__device__ __forceinline__ void hc_up_piece_any(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, int p,
+                                                bool rows, uint16_t* sc) {
+    if (rows && a.q_up != nullptr) hc_up_piece_rows8(a, sl, smem, bars, p, sc);
+    else if (rows) hc_up_piece_rows(a, sl, smem, bars, p);
+    else hc_up_piece(a, sl, smem, bars, p, sc);
+}
+__device__ void hc_up_issue8(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, const unsigned* nload,
+                             unsigned n_in, bool rows, uint16_t* sc) {
     while (ld_acquire(nload) < n_in) {}
-    piece(0);
-    piece(1);
-    int issued = 2, landed = 0;
-    bool down_ok = false;
+    for (int p = 0; p < UP_PIECES; ++p) hc_up_piece_any(a, sl, smem, bars, p, rows, sc);
+}
+__device__ void hc_up_stream(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, const unsigned* nload,
+                             unsigned n_in, const unsigned* down, unsigned ph, bool rows = false, bool wait_down = true,
+                             uint16_t* sc = nullptr, int issued = 0) {
+    auto piece = [&](int p) { hc_up_piece_any(a, sl, smem, bars, p, rows, sc); };
+    if (issued == 0) {
+        while (ld_acquire(nload) < n_in) {}
+        piece(0);
+        piece(1);
+        issued = 2;
+    }
+    int landed = 0;
+    bool down_ok = !wait_down;
     while (landed < UP_PIECES || !down_ok) {
         if (landed < issued && mbar_test(&bars[landed], ph)) {
             ++landed;
@@ -597,17 +779,21 @@ __device__ void hc_up_stream(const HcFusedArgs& a, UpSlice sl, char* smem, uint6
 }
 
 // Shared memory of an up CTA: [w_up rows 4 nc x 640 B][lo T x LR][rp T x 4 x nc: R'][px T x 4 x nc: R' * w_norm]
-// [g T x 4 x nc]; mma: w_up rows in padded groups (up_row_off) and lo rows of LOS floats
+// [g T x 4 x nc][8-bit: the rows' scales 4 nc x SU8 f16, 16-byte aligned]; mma: w_up rows in padded groups
+// (up_row_off, 8-bit: up_row_off8) and lo rows of LOS floats
 constexpr int LOS = LR + 8;   // the eight tokens' rows of one k-step on distinct banks per half-warp
+constexpr int NG8 = LR / G8;  // scale groups per up row
 struct UpSmem {
     float *lo, *rp, *px, *g;
+    uint16_t* sc;
 };
-__device__ __forceinline__ UpSmem up_smem(char* smem, int nc, int T, bool mma = false) {
+__device__ __forceinline__ UpSmem up_smem(char* smem, int nc, int T, bool mma = false, bool q8 = false) {
     UpSmem u;
-    u.lo = reinterpret_cast<float*>(smem + (size_t) (mma ? 4 * nc / UPG * UPGB : 4 * nc * LR * 2));
+    u.lo = reinterpret_cast<float*>(smem + (size_t) (mma ? nc * (q8 ? UPGB8 : UPGB) : 4 * nc * LR * 2));
     u.rp = u.lo + T * (mma ? LOS : LR);
     u.px = u.rp + T * HC * nc;
     u.g = u.px + T * HC * nc;
+    u.sc = reinterpret_cast<uint16_t*>((reinterpret_cast<uintptr_t>(u.g + T * HC * nc) + 15) & ~(uintptr_t) 15);
     return u;
 }
 
@@ -615,7 +801,7 @@ __device__ __forceinline__ UpSmem up_smem(char* smem, int nc, int T, bool mma = 
 template <int T>
 __device__ void hc_up_pre(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, bool mma = false) {
     const int nc = sl.nc;
-    const UpSmem u = up_smem(smem, nc, T, mma);
+    const UpSmem u = up_smem(smem, nc, T, mma, a.q_up != nullptr);
     for (int idx = tid; idx < T * HC * nc; idx += THREADS) {
         const int k = idx / (HC * nc), rem = idx - k * HC * nc, c = rem / nc, dd = rem - c * nc;
         const int i = c * N + sl.c0 + dd;
@@ -720,9 +906,9 @@ __device__ __forceinline__ void up_pass(const UpSmem& u, const uint4* U, int nc,
 
 // fused_gr.cu gr_up_multi_kernel's rows, epilogue and mean for this slice.
 template <int T>
-__device__ void hc_up_rout(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, bool mma = false) {
+__device__ void hc_up_rout(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, bool mma = false, bool q8 = false) {
     const int nc = sl.nc, c0 = sl.c0;
-    const UpSmem u = up_smem(smem, nc, T, mma);
+    const UpSmem u = up_smem(smem, nc, T, mma, q8);
     for (int idx = tid; idx < T * HC * nc; idx += THREADS) {
         const int k = idx / (HC * nc), rem = idx - k * HC * nc, c = rem / nc, dd = rem - c * nc;
         a.R_out[(size_t) k * D + c * N + c0 + dd] = u.rp[idx];
@@ -842,6 +1028,128 @@ __device__ void hc_up_main_mma(const HcFusedArgs& a, UpSlice sl, int tid, char* 
         a.mixed[(size_t) k * N + c0 + col] = s / (float) HC;
     }
     stamp(dbg, b, 5, tid);
+}
+
+// The 8-bit up rows on tensor cores: one ldmatrix.x4 of int8 rows covers a whole scale group (32 values) of the tile's
+// 16 rows, thread (g, t4) holding bytes 4 t4..4 t4 + 3 of each 16-value half.  Those become f16 pairs (exact), the
+// mma's k order permuted alike in A and B: the pair (4 t4, 4 t4 + 1) as k (2 t4, 2 t4 + 1), (4 t4 + 2, 4 t4 + 3) as
+// (2 t4 + 8, 2 t4 + 9), so a token's lo loads as one float4 per half.  lo is split into f16 hi + lo parts; each
+// group's sums are scaled by their row's scale into the fp32 total.
+__device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void split_f16(float a, float b, uint32_t& hi, uint32_t& lo) {
+    const __half2 h = __floats2half2_rn(a, b);
+    const float2 hf = __half22float2(h);
+    const __half2 l = __floats2half2_rn(a - hf.x, b - hf.y);
+    hi = *reinterpret_cast<const uint32_t*>(&h);
+    lo = *reinterpret_cast<const uint32_t*>(&l);
+}
+template <int T>
+__device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, unsigned long long* dbg, int b) {
+    static_assert(T <= 8, "one mma column per token");
+    const int lane = tid & 31, warp = tid >> 5, nc = sl.nc, c0 = sl.c0, g = lane >> 2, t4 = lane & 3;
+    const UpSmem u = up_smem(smem, nc, T, true, true);
+    for (int i = tid; i < T * LR; i += THREADS) {
+        const int k = i / LR;
+        u.lo[k * LOS + i - k * LR] = __ldcg(a.lo + i);
+    }
+    if (a.apply) hc_up_rout<T>(a, sl, tid, smem, true, true);
+    __shared__ float s_rsv8[MAXT * HC];
+    if (tid < T * HC) s_rsv8[tid] = __ldcg(a.rs + tid);
+    __syncthreads();
+    float rsr[2][HC];
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int c = 0; c < HC; ++c) rsr[j][c] = 2 * t4 + j < T ? s_rsv8[(2 * t4 + j) * HC + c] : 0.0f;
+    stamp(dbg, b, 9, tid);
+    const int rows = HC * nc;
+    if (up_tile_row(warp, 0) < rows) {
+        const int ar = min(up_tile_row(warp, lane & 15), rows - 1);
+        const unsigned addr = smem_u32(smem + up_row_off8(ar) + (lane >> 4) * 16);
+        const float* lb = u.lo + (g < T ? g : 0) * LOS + 4 * t4;
+        const uint16_t* sc0 = u.sc + min(up_tile_row(warp, g), rows - 1) * SU8;
+        const uint16_t* sc1 = u.sc + min(up_tile_row(warp, g + 8), rows - 1) * SU8;
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int s = 0; s < NG8; ++s) {
+            uint32_t q[4];
+            asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(q[0]), "=r"(q[1]), "=r"(q[2]), "=r"(q[3]) : "r"(addr + s * 32));
+            float gh[4] = {0.f, 0.f, 0.f, 0.f}, gl[4] = {0.f, 0.f, 0.f, 0.f};   // the group's hi and lo chains
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t af[4] = {i8x2_h2<false>(q[2 * h]), i8x2_h2<false>(q[2 * h + 1]), i8x2_h2<true>(q[2 * h]),
+                                        i8x2_h2<true>(q[2 * h + 1])};
+                float4 x = *reinterpret_cast<const float4*>(lb + 32 * s + 16 * h);
+                if (g >= T) x = make_float4(0.f, 0.f, 0.f, 0.f);
+                uint32_t h0, l0, h1, l1;
+                split_f16(x.x, x.y, h0, l0);
+                split_f16(x.z, x.w, h1, l1);
+                mma_f16(gh, af, h0, h1);
+                mma_f16(gl, af, l0, l1);
+            }
+            const float s0 = h2f(sc0[s]), s1 = h2f(sc1[s]);
+            acc[0] = fmaf(s0, gh[0] + gl[0], acc[0]);
+            acc[1] = fmaf(s0, gh[1] + gl[1], acc[1]);
+            acc[2] = fmaf(s1, gh[2] + gl[2], acc[2]);
+            acc[3] = fmaf(s1, gh[3] + gl[3], acc[3]);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int k = 2 * t4 + (j & 1), r = up_tile_row(warp, g + 8 * (j >> 1));
+            if (k >= T || r >= rows) continue;
+            const int c = r / nc, dd = r - c * nc, idx = (k * HC + c) * nc + dd;
+            float rsc = rsr[j & 1][0];
+#pragma unroll
+            for (int cc = 1; cc < HC; ++cc) rsc = c == cc ? rsr[j & 1][cc] : rsc;
+            const float x = u.px[idx] * rsc;
+            u.g[idx] = x * sigmoidf_(acc[j]);
+        }
+    }
+    __syncthreads();
+    stamp(dbg, b, 4, tid);
+    for (int i = tid; i < T * nc; i += THREADS) {
+        const int k = i / nc, col = i - k * nc;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += u.g[(k * HC + c) * nc + col];
+        a.mixed[(size_t) k * N + c0 + col] = s / (float) HC;
+    }
+    stamp(dbg, b, 5, tid);
+}
+
+// The 8-bit slice (in the upper half of the bf16 rows' area) widened in place to bf16(q * scale) for hc_up_main, in
+// ascending steps: a step's writes reach only int8 bytes that earlier steps (or this one, before its barrier) read.
+__device__ __forceinline__ uint32_t bf16x2(float lo, float hi) {
+    uint32_t d;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+    return d;
+}
+__device__ void hc_up_widen(UpSlice sl, int tid, char* smem, const uint16_t* sc) {
+    const int B = 4 * sl.nc * LR;
+    for (int i0 = 0; i0 < B; i0 += THREADS * 16) {
+        const int i = i0 + tid * 16;   // 16 values of one scale group
+        uint4 v = make_uint4(0, 0, 0, 0);
+        float s = 0.0f;
+        if (i < B) {
+            v = *reinterpret_cast<const uint4*>(smem + B + i);
+            s = h2f(sc[i / LR * SU8 + i % LR / G8]);
+        }
+        __syncthreads();
+        if (i < B) {
+            const float4 f0 = i8x4_f(v.x), f1 = i8x4_f(v.y), f2 = i8x4_f(v.z), f3 = i8x4_f(v.w);
+            uint4* w = reinterpret_cast<uint4*>(smem + 2 * (size_t) i);
+            w[0] = make_uint4(bf16x2(f0.x * s, f0.y * s), bf16x2(f0.z * s, f0.w * s), bf16x2(f1.x * s, f1.y * s),
+                              bf16x2(f1.z * s, f1.w * s));
+            w[1] = make_uint4(bf16x2(f2.x * s, f2.y * s), bf16x2(f2.z * s, f2.w * s), bf16x2(f3.x * s, f3.y * s),
+                              bf16x2(f3.z * s, f3.w * s));
+        }
+        __syncthreads();
+    }
 }
 
 // warp_sum16 with the flush-to-zero adds of a fast-math build (mmvf_warp_sum)
@@ -1124,14 +1432,18 @@ struct Items {
 constexpr int CAND_WORDS = 2 * NE + 2 * KT;   // hc_top10's shared memory per warp
 // Shared memory bytes an up item of nc columns uses (w_up rows, then UpSmem).
 template <int T>
-__device__ __forceinline__ int up_smem_bytes(int nc, bool mma = false) {
-    return mma ? 4 * nc / UPG * UPGB + (T * LOS + 3 * T * HC * nc) * 4 : 4 * nc * LR * 2 + (T * LR + 3 * T * HC * nc) * 4;
+__device__ __forceinline__ int up_smem_bytes(int nc, bool mma = false, bool q8 = false) {
+    const int sc = q8 ? 16 + 4 * nc * SU8 * 2 : 0;
+    return sc + (mma ? nc * (q8 ? UPGB8 : UPGB) + (T * LOS + 3 * T * HC * nc) * 4
+                     : 4 * nc * LR * 2 + (T * LR + 3 * T * HC * nc) * 4);
 }
 
-template <int T>
+// Q8: the matrices from the 8-bit copies (HcFusedArgs::q_*).
+template <int T, bool Q8>
 __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     extern __shared__ __align__(128) char smem[];
     __shared__ __align__(8) uint64_t bars[UP_PIECES + 1];   // the w_up pieces, the router rows
+    __shared__ __align__(8) uint64_t dbars[Q8 ? NSTAGE + 1 : 1];   // 8-bit down stages, their scales
     __shared__ float part[WARPS];
     __shared__ float s_rs;
     __shared__ int s_item, s_last;
@@ -1143,6 +1455,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     stamp(dbg, b, 0, tid);
     if (tid == 0) {
         for (int p = 0; p <= UP_PIECES; ++p) mbar_init(&bars[p], 1);
+        if constexpr (Q8)
+            for (int p = 0; p <= NSTAGE; ++p) mbar_init(&dbars[p], ROWS);
         s_item = (int) atomicAdd(&sy->q.v, 1u);
     }
     __syncthreads();
@@ -1153,7 +1467,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     bool staged = false;   // the first down item's prologue ran before the wait
     if (L.early) {
         if ((L.early & 2) && item >= it.down && item < it.up) {
-            if (L.xh) hc_down_prologue<T, RING_CAP, true>(a, item - it.down, tid, smem);
+            if constexpr (Q8) hc_down8_issue(a, item - it.down, tid, smem, dbars, 0, L.pre8);
+            else if (L.xh) hc_down_prologue<T, RING_CAP, true>(a, item - it.down, tid, smem);
             else hc_down_prologue<T, RING_CAP>(a, item - it.down, tid, smem);
             staged = true;
         }
@@ -1161,7 +1476,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     }
     pdl_wait();
     stamp(dbg, b, 1, tid);
-    unsigned up_ph = 0, rt_ph = 0;
+    unsigned up_ph = 0, rt_ph = 0, dn_ph = 0;
     bool first = true;
     while (item < it.end) {
         if (item < it.ntask) {
@@ -1179,7 +1494,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             if (!staged) {
                 // weight reads queued ahead of the norm's would delay it
                 cta_wait(&sy->nload.v, (unsigned) it.ntask, tid);
-                if (L.xh) hc_down_prologue<T, RING_CAP, true>(a, d, tid, smem);
+                if constexpr (Q8) hc_down8_issue(a, d, tid, smem, dbars, 0, L.pre8);
+                else if (L.xh) hc_down_prologue<T, RING_CAP, true>(a, d, tid, smem);
                 else hc_down_prologue<T, RING_CAP>(a, d, tid, smem);
             }
             if (L.pf == 1 && tid == 0 && a.w_router != nullptr) {   // the router rows into L2 behind the down weights
@@ -1188,8 +1504,16 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             }
             cta_wait(&sy->norm.v, (unsigned) it.ntask, tid);
             stamp(dbg, b, 2, tid);
-            if (L.xh) hc_down_main<T, RING_CAP, true>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D / 2, d, tid, smem);
-            else hc_down_main<T, RING_CAP>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D, d, tid, smem);
+            if constexpr (Q8) {
+                hc_down8_issue(a, d, tid, smem, dbars, L.pre8, NSTAGE);
+                if (L.xh) hc_down8_main<T, true>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D / 2, d, tid, smem, dbars, dn_ph);
+                else hc_down8_main<T, false>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D, d, tid, smem, dbars, dn_ph);
+                dn_ph ^= 1u;
+            } else if (L.xh) {
+                hc_down_main<T, RING_CAP, true>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D / 2, d, tid, smem);
+            } else {
+                hc_down_main<T, RING_CAP>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D, d, tid, smem);
+            }
             cp_async_wait<0>();
             cta_signal(&sy->down.v, tid);
             stamp(dbg, b, 3, tid);
@@ -1198,13 +1522,16 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             const UpSlice sl = rx ? up_slice_even(item - it.up, it.nu) : up_slice(item - it.up, it.nu);
             if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 2;
             const bool mma = L.upmma != 0;
+            uint16_t* const sc8 = Q8 ? up_smem(smem, sl.nc, T, mma, true).sc : nullptr;
+            if (Q8 && tid == 0) hc_up_issue8(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, mma, sc8);   // ahead of R'
             hc_up_pre<T>(a, sl, tid, smem, mma);
             if (tid == 0) {
-                hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph, mma);
+                hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph, mma, !(Q8 && !mma),
+                             sc8, Q8 ? UP_PIECES : 0);
             } else if (it.end > it.t10) {
                 // while the down projection runs, warps 1..3 run the top-10 on fixed logits: its code is then in this
                 // SM's instruction caches if this CTA claims the top-10 item
-                const int warp = tid >> 5, off = (up_smem_bytes<T>(sl.nc, mma) + 15) & ~15;
+                const int warp = tid >> 5, off = (up_smem_bytes<T>(sl.nc, mma, Q8) + 15) & ~15;
                 int32_t* ids = reinterpret_cast<int32_t*>(L.t10_scratch + (size_t) b * 2 * KT);
                 uint32_t* cand = reinterpret_cast<uint32_t*>(smem + off) + (warp - 1) * CAND_WORDS;
                 if (warp >= 1 && warp <= 3 && off + warp * CAND_WORDS * 4 <= SMEM) {
@@ -1218,16 +1545,21 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             }
             up_ph ^= 1u;
             __syncthreads();
+            if (Q8 && !mma) {   // the 8-bit slice widened while the down projection runs
+                hc_up_widen(sl, tid, smem, up_smem(smem, sl.nc, T, false, true).sc);
+                cta_wait(&sy->down.v, (unsigned) ND, tid);
+            }
             stamp(dbg, b, 2, tid);
             uint32_t rw[RQ];   // the router weights stream in while the up pass runs (after the w_up copies)
             if (rx) hcx_router_load(a, sl, tid, rw);
-            if (mma) hc_up_main_mma<T>(a, sl, tid, smem, dbg, b);
+            if (Q8 && mma) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b);
+            else if (mma) hc_up_main_mma<T>(a, sl, tid, smem, dbg, b);
             else if (L.ups) hc_up_main<T, true>(a, sl, tid, smem, true, dbg, b);
             else hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
             if (rx) {
                 // the slice's mixed columns again (hc_up_main's expression) into shared memory, then the logit shares
-                const UpSmem u = up_smem(smem, sl.nc, T, mma);
-                float* mix = reinterpret_cast<float*>(smem + ((up_smem_bytes<T>(sl.nc, mma) + 15) & ~15));
+                const UpSmem u = up_smem(smem, sl.nc, T, mma, Q8);
+                float* mix = reinterpret_cast<float*>(smem + ((up_smem_bytes<T>(sl.nc, mma, Q8) + 15) & ~15));
                 for (int i = tid; i < T * sl.nc; i += THREADS) {
                     const int k = i / sl.nc, col = i - k * sl.nc;
                     float s = 0.0f;
@@ -1480,8 +1812,12 @@ __global__ void hc_l2_prefetch_kernel(const void* p0, size_t n0, const void* p1,
 }
 
 using KernelFn = void (*)(HcLaunch);
-constexpr KernelFn kKernels[MAXT] = {hc_fused_kernel<1>, hc_fused_kernel<2>, hc_fused_kernel<3>, hc_fused_kernel<4>,
-                                      hc_fused_kernel<5>, hc_fused_kernel<6>, hc_fused_kernel<7>, hc_fused_kernel<8>};
+constexpr KernelFn kKernels[MAXT] = {hc_fused_kernel<1, false>, hc_fused_kernel<2, false>, hc_fused_kernel<3, false>,
+                                      hc_fused_kernel<4, false>, hc_fused_kernel<5, false>, hc_fused_kernel<6, false>,
+                                      hc_fused_kernel<7, false>, hc_fused_kernel<8, false>};
+constexpr KernelFn kKernels8[MAXT] = {hc_fused_kernel<1, true>, hc_fused_kernel<2, true>, hc_fused_kernel<3, true>,
+                                       hc_fused_kernel<4, true>, hc_fused_kernel<5, true>, hc_fused_kernel<6, true>,
+                                       hc_fused_kernel<7, true>, hc_fused_kernel<8, true>};
 constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel<2>, hc_fused_sk_kernel<3>,
                                         hc_fused_sk_kernel<4>, hc_fused_sk_kernel<5>, hc_fused_sk_kernel<6>,
                                         hc_fused_sk_kernel<7>, hc_fused_sk_kernel<8>};
@@ -1561,7 +1897,8 @@ const DevInfo& dev_info() {
                    cudaMemcpy(d.t10 + NE, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
         }
         for (int t = 0; t < MAXT && d.ok; ++t)
-            d.ok = cudaFuncSetAttribute(kKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
+            d.ok = cudaFuncSetAttribute(kKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess &&
+                   cudaFuncSetAttribute(kKernels8[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
         for (int t = 0; t < MAXT && d.ok && sk_conf().on; ++t)
             d.ok = cudaFuncSetAttribute(kSkKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
         cudaGetLastError();
@@ -1570,7 +1907,166 @@ const DevInfo& dev_info() {
     return d;
 }
 
+// 8-bit copies: q = round(w / s) in [-127, 127], s = f16(absmax / 127) per G8 consecutive values of a row; a row's
+// `gpr` scales start every `srow` f16 (a multiple of 8: 16-byte aligned runs).  `err` (optional): the sums of w^2
+// and of the error^2.
+__global__ void hc8_quant_kernel(const uint16_t* w, int64_t groups, int gpr, int srow, int8_t* q, uint16_t* sc,
+                                 double* err) {
+    const int64_t gi = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    double e[2] = {0.0, 0.0};
+    if (gi < groups) {
+        float x[G8], amax = 0.0f;
+        for (int i = 0; i < G8; ++i) {
+            x[i] = __uint_as_float((uint32_t) w[gi * G8 + i] << 16);
+            amax = fmaxf(amax, fabsf(x[i]));
+        }
+        const __half h = __float2half_rn(amax / 127.0f);
+        const float s = __half2float(h);
+        sc[gi / gpr * srow + gi % gpr] = __half_as_ushort(h);
+        for (int i = 0; i < G8; ++i) {
+            const float v = s > 0.0f ? fminf(fmaxf(rintf(x[i] / s), -127.0f), 127.0f) : 0.0f;
+            q[gi * G8 + i] = (int8_t) v;
+            e[0] += (double) x[i] * x[i];
+            e[1] += (double) (v * s - x[i]) * (v * s - x[i]);
+        }
+    }
+    if (err != nullptr)
+        for (int k = 0; k < 2; ++k) {
+            double v = e[k];
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if ((threadIdx.x & 31) == 0) atomicAdd(&err[k], v);
+        }
+}
+struct Hc8Copy {
+    int8_t* q = nullptr;   // then the scales, in the same allocation
+    uint16_t* s = nullptr;
+    size_t bytes = 0;
+    int rows = 0, cols = 0, srow = 0;
+    bool owned = false;    // keyed by q itself: no bf16 matrix behind it
+};
+std::mutex g_hc8_mu;
+std::unordered_map<const void*, Hc8Copy> g_hc8;
+size_t g_hc8_bytes = 0;
+
+// the copy of the bf16 matrix w (device memory of the current card); false when there is no VRAM for it
+bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
+    const int64_t n = (int64_t) rows * cols, groups = n / G8;
+    const int gpr = cols / G8, srow = (gpr + 7) & ~7;
+    c.bytes = (size_t) n + (size_t) rows * srow * 2;
+    c.rows = rows;
+    c.cols = cols;
+    c.srow = srow;
+    if (cudaMalloc((void**) &c.q, c.bytes) != cudaSuccess) {
+        cudaGetLastError();
+        std::fprintf(stderr, "strata hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
+        return false;
+    }
+    c.s = reinterpret_cast<uint16_t*>(c.q + n);
+    cudaMemset(c.s, 0, (size_t) rows * srow * 2);
+    static const bool stats = std::getenv("STRATA_DEC_HC8_STATS") != nullptr;
+    double* derr = nullptr;
+    if (stats && cudaMalloc((void**) &derr, 2 * sizeof(double)) == cudaSuccess) cudaMemset(derr, 0, 2 * sizeof(double));
+    hc8_quant_kernel<<<(unsigned) ((groups + 255) / 256), 256>>>(w, groups, gpr, srow, c.q, c.s, derr);
+    cudaDeviceSynchronize();
+    if (derr != nullptr) {
+        double h[2];
+        cudaMemcpy(h, derr, sizeof h, cudaMemcpyDeviceToHost);
+        cudaFree(derr);
+        std::fprintf(stderr, "strata hc8: %d x %d: relative rms error %.3e\n", rows, cols, std::sqrt(h[1] / h[0]));
+    }
+    return true;
+}
+
+__global__ void hc8_dequant_bf16_kernel(const int8_t* q, const uint16_t* s, int cols, int srow, int64_t row0, int64_t n,
+                                        uint16_t* out) {
+    const int64_t i = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) * 8;   // 8 values, one scale group
+    if (i >= n * cols) return;
+    const int64_t r = row0 + i / cols;
+    const int k = (int) (i % cols);
+    const float sc = __half2float(__ushort_as_half(s[r * srow + k / G8]));
+    const uint2 w = *reinterpret_cast<const uint2*>(q + r * cols + k);
+    uint16_t o[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int v = (int) (int8_t) ((j < 4 ? w.x : w.y) >> (8 * (j & 3)));
+        o[j] = __bfloat16_as_ushort(__float2bfloat16_rn((float) v * sc));
+    }
+    *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<const uint4*>(o);
+}
+
 }  // namespace
+
+bool hc8_enabled() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DEC_HC8"); return e && e[0] == '1'; }();
+    return on;
+}
+
+bool hc8_only() {
+    static const bool on = [] {
+        const char* k = std::getenv("STRATA_DEC_HC8_KEEP");
+        return hc8_enabled() && !sk_conf().on && !(k && k[0] == '1');
+    }();
+    return on;
+}
+
+void hc8_prepare(const uint16_t* w, int rows, int cols) {
+    if (w == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return;
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    if (g_hc8.count(w)) return;
+    int dev = 0;
+    cudaPointerAttributes pa{};
+    cudaGetDevice(&dev);
+    if (cudaPointerGetAttributes(&pa, w) != cudaSuccess || pa.type != cudaMemoryTypeDevice || pa.device != dev) {
+        cudaGetLastError();
+        return;   // another card's matrix: its reads stay bf16
+    }
+    Hc8Copy c;
+    if (!hc8_make(w, rows, cols, c)) return;   // that read stays bf16
+    g_hc8[w] = c;
+    g_hc8_bytes += c.bytes;
+}
+
+const void* hc8_adopt(const uint16_t* w, int rows, int cols) {
+    if (w == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return nullptr;
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    Hc8Copy c;
+    if (!hc8_make(w, rows, cols, c)) return nullptr;
+    c.owned = true;
+    g_hc8[c.q] = c;
+    g_hc8_bytes += c.bytes;
+    return c.q;
+}
+
+bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes) {
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    const auto it = g_hc8.find(w);
+    if (it == g_hc8.end()) return false;
+    *q = it->second.q;
+    *s = it->second.s;
+    if (bytes != nullptr) *bytes = it->second.bytes;
+    return true;
+}
+
+bool hc8_view(const void* w, Hc8View& v) {
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    const auto it = g_hc8.find(w);
+    if (it == g_hc8.end()) return false;
+    const Hc8Copy& c = it->second;
+    v.q = c.q; v.s = c.s; v.rows = c.rows; v.cols = c.cols; v.srow = c.srow; v.bytes = c.bytes; v.owned = c.owned;
+    return true;
+}
+
+void hc8_dequant_bf16(const Hc8View& v, int64_t row0, int64_t n, uint16_t* out, void* stream) {
+    if (n <= 0) return;
+    const int64_t units = n * v.cols / 8;
+    hc8_dequant_bf16_kernel<<<(unsigned) ((units + 255) / 256), 256, 0, (cudaStream_t) stream>>>(v.q, v.s, v.cols, v.srow,
+                                                                                              row0, n, out);
+}
+
+size_t hc8_bytes() {
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    return g_hc8_bytes;
+}
 
 bool hc_fused_supported() { return dev_info().ok; }
 void dbg_init(int nb);
@@ -1696,6 +2192,37 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.early = pdl2_mask() & (a.T <= 4 ? 3 : 2);   // from 5 tokens the next kernel's early blocks slow the read
     if (L.dbg == nullptr) L.dbg = dbg_slot(a.T, a.w_router != nullptr);
     const SkConf& sk = sk_conf();
+    // the 8-bit copies when every matrix of the read has one (the split-K read stays bf16); the prefetches then take
+    // the copies too
+    {
+        HcFusedArgs& h = L.a;
+        bool q8 = false;
+        if (!sk.on && h.q_down == nullptr && hc8_enabled()) {
+            q8 = hc8_lookup(a.w_down, &h.q_down, &h.s_down) && hc8_lookup(a.w_up, &h.q_up, &h.s_up) &&
+                 (a.w_inject == nullptr || hc8_lookup(a.w_inject, &h.q_inject, &h.s_inject));
+            for (int r = 0; q8 && r < 4; ++r) {
+                const int8_t* q = nullptr;
+                const uint16_t* sc = nullptr;
+                size_t bytes = 0;
+                if (h.pf[r] != nullptr && hc8_lookup(h.pf[r], &q, &sc, &bytes)) { h.pf[r] = q; h.pf_bytes[r] = bytes; }
+            }
+        } else if (!sk.on && h.q_down != nullptr) {
+            q8 = h.q_up != nullptr && h.s_down != nullptr && h.s_up != nullptr &&
+                 (a.w_inject == nullptr || (h.q_inject != nullptr && h.s_inject != nullptr));
+        }
+        if (!q8) {
+            Hc8View v;
+            if ((hc8_view(a.w_down, v) && v.owned) || (hc8_view(a.w_up, v) && v.owned)) {
+                std::fprintf(stderr, "hc_fused_read: a matrix held only as its 8-bit copy needs the 8-bit read\n");
+                std::exit(1);
+            }
+            h.q_down = nullptr; h.q_up = nullptr; h.q_inject = nullptr;
+        }
+        if (a.w_inject == nullptr) h.q_inject = nullptr;
+    }
+    const bool q8 = L.a.q_down != nullptr;
+    static const int pre8 = [] { const char* e = std::getenv("STRATA_DEC_HC8_PRE"); return e ? std::atoi(e) : 3; }();
+    L.pre8 = std::min(std::max(pre8, 0), NSTAGE);
     if (sk.on) {
         L.nb = d.sms & ~1;
         const int nu = std::max(MIN_NU, sk.nu > 0 ? sk.nu : L.nb - ND);
@@ -1728,7 +2255,8 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     } else {
         L.nu = sk.nu >= MIN_NU && sk.nu <= L.nb ? sk.nu : 0;
         L.pf = sk.pf;
-        launch_pdl(kKernels[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM, (cudaStream_t) stream, L);
+        launch_pdl((q8 ? kKernels8 : kKernels)[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM,
+                   (cudaStream_t) stream, L);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

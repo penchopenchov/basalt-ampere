@@ -46,7 +46,45 @@ struct HcFusedArgs {
     float* weights = nullptr;           ///< [T][10]
     const void* pf[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t pf_bytes[4] = {0, 0, 0, 0};
+    /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null = the
+    /// bf16 matrices.  hc_fused_read fills them from hc8_prepare's copies when STRATA_DEC_HC8=1.
+    const int8_t* q_down = nullptr;
+    const uint16_t* s_down = nullptr;   ///< f16 [hc_lr][hc * n_embd / 32]
+    const int8_t* q_up = nullptr;
+    const uint16_t* s_up = nullptr;     ///< f16 [hc * n_embd][16] (hc_lr / 32 used)
+    const int8_t* q_inject = nullptr;
+    const uint16_t* s_inject = nullptr; ///< f16 [hc][hc * n_embd / 32]
 };
+
+/// STRATA_DEC_HC8=1: the read uses 8-bit copies of its matrices (not bitwise; every token's outputs stay independent
+/// of T and column).  STRATA_DEC_HC8_PRE=<n> (default 3): down stages requested before the norm is done.
+bool hc8_enabled();
+/// Quantize the bf16 matrix w [rows][cols] (cols a multiple of 32) to an 8-bit copy on the current device, once per
+/// pointer, outside any stream capture.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
+/// scales are one allocation (one prefetch range).
+void hc8_prepare(const uint16_t* w, int rows, int cols);
+/// The 8-bit copy of w (q, its scales, the bytes of both), or false when there is none.
+bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes = nullptr);
+/// Bytes held by the 8-bit copies.
+size_t hc8_bytes();
+/// STRATA_DEC_HC8=1 with the bf16 matrices dropped from VRAM (not with STRATA_DEC_HC_SK=1, whose read is bf16 only;
+/// STRATA_DEC_HC8_KEEP=1 keeps them beside the copies).
+bool hc8_only();
+/// Quantize the bf16 matrix staged at w (the caller frees it afterwards) and register the copy under the copy's own
+/// address, which stands for the matrix from then on: every reader resolves it with hc8_view.  nullptr: no VRAM.
+const void* hc8_adopt(const uint16_t* w, int rows, int cols);
+/// An 8-bit copy as its readers see it: q [rows][cols], f16 scales [rows][srow] (cols / 32 used).  `owned`: the key
+/// is the copy itself (no bf16 matrix behind it).
+struct Hc8View {
+    const int8_t* q = nullptr;
+    const uint16_t* s = nullptr;
+    int rows = 0, cols = 0, srow = 0;
+    size_t bytes = 0;
+    bool owned = false;
+};
+bool hc8_view(const void* w, Hc8View& v);
+/// Rows [row0, row0 + n) of w's copy as bf16 (q * scale rounded once), row-major `cols` per row, on `stream`.
+void hc8_dequant_bf16(const Hc8View& v, int64_t row0, int64_t n, uint16_t* out, void* stream);
 
 /// Allocate the read's scratch on the current device (outside a stream capture, once).
 void hc_fused_init();

@@ -58,6 +58,7 @@
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/hc_fused.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/emulate.hpp"
@@ -2240,6 +2241,24 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
                      (long long) split_at[0] - 1);
     }
+    // STRATA_DEC_HC8 (one GPU): the hyper-connection down/up matrices are held only as 8-bit copies - the arena leaves
+    // their bf16 form out and they are staged, copied and dropped right after the load
+    std::set<std::string> hc8_names;
+    if (strata::kernels::hc8_only() && !multi_gpu) {
+        if (std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
+            char line[1024], name[256];
+            while (std::fgets(line, sizeof line, f)) {
+                if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
+                const std::string n = name;
+                const bool blk = n.rfind("blk.", 0) == 0 &&
+                                 (n.ends_with(".hc_attn_down.weight") || n.ends_with(".hc_attn_up.weight") ||
+                                  n.ends_with(".hc_ffn_down.weight") || n.ends_with(".hc_ffn_up.weight"));
+                if (blk || n == "output_hc_down.weight" || n == "output_hc_up.weight") hc8_names.insert(n);
+            }
+            std::fclose(f);
+        }
+        for (const std::string& n : hc8_names) skip.insert(n);
+    }
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -2275,6 +2294,40 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
                          "skipped: served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
+    if (!hc8_names.empty()) {
+        std::set<std::string> others;
+        for (const auto& kv : wt.all())
+            if (!hc8_names.count(kv.first)) others.insert(kv.first);
+        uint64_t stage_bytes = 0;
+        void* stage = nullptr;
+        strata::core::WeightTable staged;
+        if (!strata::core::WeightTable::pool_bytes(o.pack, stage_bytes, err, &others) ||
+            cudaMalloc(&stage, stage_bytes) != cudaSuccess || !staged.load(o.pack, stage, stage_bytes, err, &others)) {
+            std::fprintf(stderr, "strata generate: hc8: staging the hyper-connection matrices failed%s%s\n",
+                         err.empty() ? "" : ": ", err.c_str());
+            return 1;
+        }
+        size_t n_done = 0;
+        for (const std::string& n : hc8_names) {
+            const strata::core::WeightRef* r = staged.find(n);
+            const void* q = r && r->data && r->kind == strata::core::WeightKind::Bf16InF32
+                                ? strata::kernels::hc8_adopt((const uint16_t*) r->data, (int) r->ne1, (int) r->ne0)
+                                : nullptr;
+            if (q == nullptr || !wt.rebind(n, q)) {
+                std::fprintf(stderr, "strata generate: hc8: no 8-bit copy of %s\n", n.c_str());
+                return 1;
+            }
+            ++n_done;
+        }
+        cudaFree(stage);
+        for (const auto& kv : wt.all())   // the injections stay bf16 in the arena, with copies beside them
+            if (kv.first.ends_with("_inject.weight") && kv.first.find(".hc_") != std::string::npos && kv.second.data)
+                strata::kernels::hc8_prepare((const uint16_t*) kv.second.data, (int) kv.second.ne1, (int) kv.second.ne0);
+        std::fprintf(stderr, "strata hc8: %zu hyper-connection matrices held only as 8-bit copies (%.0f MiB of bf16 "
+                             "left out of VRAM, %.0f MiB of copies) in %.1f s\n",
+                     n_done, (double) stage_bytes / 1048576.0, (double) strata::kernels::hc8_bytes() / 1048576.0,
+                     load_s());
+    }
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
@@ -3213,6 +3266,7 @@ int main(int argc, char** argv) {
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
+    strata::core::Verifier::prepare_hc8(wt, g);   // STRATA_DEC_HC8: before the cache sizes itself
     mem_mark("the weights, the session and the drafter");
     strata::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)

@@ -1181,6 +1181,9 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             std::exit(1);
         }
     }
+#if !defined(__HIPCC__)
+    if (hc8_gr_read_multi(a, n_tok, N, HC, stream)) return;
+#endif
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
@@ -1283,6 +1286,9 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
         std::exit(1);
     }
+#if !defined(__HIPCC__)
+    if (hc8_gr_read_multi(&a, 1, N, HC, stream)) return;
+#endif
     cudaStream_t st = (cudaStream_t) stream;
     gr_down_kernel<<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a);
     gr_up_kernel<<<UP_BLOCKS, THREADS, 0, st>>>(a);

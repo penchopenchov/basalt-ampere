@@ -211,7 +211,8 @@ const float* MtpDrafter::f32(const char* name) const {
     return nullptr;
 }
 const uint16_t* MtpDrafter::bf16(const char* name) const {
-    for (const auto& t : tensors_) if (t.name == name && t.kind == "bf16") return (const uint16_t*) (dense_ + t.off);
+    for (const auto& t : tensors_)
+        if (t.name == name && t.kind == "bf16") return t.dev ? (const uint16_t*) t.dev : (const uint16_t*) (dense_ + t.off);
     return nullptr;
 }
 const void* MtpDrafter::q8(const char* name) const {
@@ -246,6 +247,33 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
+        if (strata::kernels::hc8_only()) {   // the hyper-connection matrices as 8-bit copies only: out of the blob
+            std::vector<uint8_t> kept;
+            size_t staged = 0;
+            for (Tensor& t : tensors_) {
+                if (t.off + t.bytes > blob.size()) { err = "mtp: dense.txt names bytes past dense.bin: " + t.name; return false; }
+                const bool hc = t.kind == "bf16" && t.name.find("hyper_connection") != std::string::npos &&
+                                t.name.find("input_mix_weight_") != std::string::npos &&
+                                (uint64_t) t.rows * (uint64_t) t.cols * 2 == t.bytes;
+                if (hc) {
+                    void* tmp = nullptr;
+                    if (cudaMalloc(&tmp, t.bytes) != cudaSuccess) { err = "mtp: no VRAM to stage " + t.name; return false; }
+                    cudaMemcpy(tmp, blob.data() + t.off, t.bytes, cudaMemcpyHostToDevice);
+                    t.dev = strata::kernels::hc8_adopt((const uint16_t*) tmp, (int) t.rows, (int) t.cols);
+                    cudaFree(tmp);
+                    if (t.dev == nullptr) { err = "mtp: no VRAM for the 8-bit copy of " + t.name; return false; }
+                    staged += t.bytes;
+                    continue;
+                }
+                const size_t off = (kept.size() + 255) & ~(size_t) 255;
+                kept.resize(off + t.bytes);
+                std::memcpy(kept.data() + off, blob.data() + t.off, t.bytes);
+                t.off = off;
+            }
+            blob.swap(kept);
+            std::fprintf(stderr, "strata hc8: the draft layer's hyper-connection matrices as 8-bit copies only (%.1f MiB "
+                                 "of bf16 left out)\n", (double) staged / 1048576.0);
+        }
         const cudaError_t alloc = cudaMalloc((void**) &dense_, blob.size());
         if (alloc != cudaSuccess) {
             size_t free_bytes = 0, total_bytes = 0;
@@ -392,6 +420,17 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         return false;
     }
     if (dec_draft_level() >= 3) strata::kernels::hc_fused_init();
+    if (dec_draft_level() >= 3 || strata::kernels::hc8_only()) {
+        if (strata::kernels::hc8_enabled()) {   // the draft layer's reads on 8-bit copies too
+            const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
+            for (const char* p : {"attn_hyper_connection.", "mlp_hyper_connection.", "hyper_connection_mixer."}) {
+                const std::string s(p);
+                strata::kernels::hc8_prepare(bf16((s + "input_mix_weight_down.weight").c_str()), LR, D);
+                strata::kernels::hc8_prepare(bf16((s + "input_mix_weight_up.weight").c_str()), D, LR);
+                strata::kernels::hc8_prepare(bf16((s + "block_inject_weight.weight").c_str()), HCn, D);
+            }
+        }
+    }
     if (std::getenv("STRATA_VERIFY_PROFILE") != nullptr && cudaMalloc((void**) &gstamp_, 16) == cudaSuccess)
         cudaMemset(gstamp_, 0, 16);
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();

@@ -31,6 +31,11 @@ public:
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
               float beta = 0.0f);
 
+    /// `bf16` (twice with X_lo: Y += X_lo . W^T), or, when W is an 8-bit copy standing for a BF16 matrix that is not
+    /// in VRAM (STRATA_DEC_HC8, hc_fused.hpp), the same product with W's row slices dequantized to BF16 in the scratch.
+    void bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
+                const uint16_t* X_lo = nullptr);
+
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
