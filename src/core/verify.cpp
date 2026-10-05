@@ -122,10 +122,11 @@ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
-// STRATA_DEC_PK (bit mask), the same values: 1 = the shared expert's side kernels at the greatest stream priority
-// (their blocks are scheduled ahead of the routed experts' queued blocks, so the branch ends beside them, not after);
-// 2 = a GDN layer's z projection forked at that priority before the qkv projection (both stream together), joined
-// before the one-launch recurrence with the gated norm (STRATA_DEC_GDNF=1's kernel), no separate norm launch.
+// STRATA_DEC_PK (bit mask), the same values: 1 = in windows of 2+ tokens, the shared expert's side kernels at the
+// greatest stream priority (their blocks are scheduled ahead of the routed experts' queued blocks, so the branch ends
+// beside them, not after); 2 = in windows of 1-2 tokens, a GDN layer's z projection forked at that priority before
+// the qkv projection (both stream together), joined before the one-launch recurrence with the gated norm
+// (STRATA_DEC_GDNF=1's kernel), no separate norm launch.  Wider windows run slower with either.
 int dec_pk_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_PK"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -1051,7 +1052,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     cudaEventRecord(ev_join_, sh_cs_);
                 };
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                const bool pk_z = gdnf_fork && sh_hi_ != nullptr && (dec_pk_mask() & 2);
+                const bool pk_z = gdnf_fork && sh_hi_ != nullptr && (dec_pk_mask() & 2) && n <= 2;
                 if (pk_z) {   // STRATA_DEC_PK & 2: z at the greatest priority beside qkv, then the one-launch recurrence
                     cudaEventRecord(ev_fork_, cs);
                     cudaStreamWaitEvent(sh_hi_, ev_fork_, 0);
@@ -1379,7 +1380,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }();
         const bool sh_fork = !shx && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
-        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) ? sh_hi_ : sh_cs_) : cs;
+        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) && n >= 2 ? sh_hi_ : sh_cs_) : cs;
         if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
