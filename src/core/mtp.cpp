@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/verify.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
 
@@ -172,6 +173,7 @@ MtpDrafter::~MtpDrafter() {
     if (dhead_) cudaFree(dhead_);
     if (dvocab_) cudaFree(dvocab_);
     if (top_scratch_) cudaFree(top_scratch_);
+    if (gstamp_) cudaFree(gstamp_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
@@ -346,6 +348,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
+    if (std::getenv("STRATA_VERIFY_PROFILE") != nullptr && cudaMalloc((void**) &gstamp_, 16) == cudaSuccess)
+        cudaMemset(gstamp_, 0, 16);
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
                  (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
@@ -589,7 +593,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                     fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
                     fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N;
                 }
-                fused_gr_read_multi(fa, T, xn_, cs);
+                if (dec_draft_on() && T == 1)   // one row: the per-row read (its own rounding)
+                    gr_read(R_, fa[0].w_norm, fa[0].w_down, fa[0].w_up, fa[0].w_inject, EPS, gs, ss.block.gr, mixed_, inj_,
+                            cs);
+                else
+                    fused_gr_read_multi(fa, T, xn_, cs);
             }
             // ---- attention: K/V into the layer's own cache, then (full) dense attention over every cell
             native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
@@ -665,7 +673,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
                 fa[t].inject_out = inj2_ + t * HC; fa[t].mixed = mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            if (dec_draft_on() && T == 1) {   // one row: the write, then the per-row read (its own rounding)
+                gr_write(R_, bo_, inj_, gs, R_, cs);
+                gr_read(R_, fa[0].w_norm, fa[0].w_down, fa[0].w_up, fa[0].w_inject, EPS, gs, ss.block.gr, mixed_, inj2_, cs);
+            } else {
+                fused_gr_read_multi(fa, T, xn_, cs);
+            }
         }
         // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write
         for (int t = 0; t < T; ++t) {
@@ -814,6 +827,7 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
     copy_i32_from_mapped(row_, m_row_, all_rows ? 3 : 2, cs_);
     copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
     const int ra = 2 * max_t_ - 1;
+    if (gstamp_ != nullptr) gpu_stamp(gstamp_, 0, cs_);
     bool ok = record_forward(T, -1, cs_, err);
     if (ok && !reuse) mtp_select(Rin_, HCN, tok_, row_, Rin_, tok_, nullptr, 0, cs_);
     if (ok) {
@@ -827,6 +841,7 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok && gstamp_ != nullptr) gpu_stamp(gstamp_, 1, cs_);
     return ok;
 }
 
@@ -845,6 +860,7 @@ bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string
     const bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok && gstamp_ != nullptr) gpu_stamp(gstamp_, 1, cs_);
     return ok;
 }
 
@@ -1193,6 +1209,17 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    if (gstamp_ != nullptr) {   // STRATA_VERIFY_PROFILE: the GPU's idle time before the round and the draft's span
+        unsigned long long st[2] = {0, 0};
+        cudaMemcpy(st, gstamp_, 16, cudaMemcpyDeviceToHost);
+        DecodeGaps& dg = decode_gaps();
+        if (dg.verify_end != 0 && st[0] > dg.verify_end && st[1] > st[0]) {
+            dg.v2d += (double) (st[0] - dg.verify_end);
+            dg.draft_gpu += (double) (st[1] - st[0]);
+            ++dg.n_v2d;
+        }
+        dg.draft_end = st[1];
+    }
     ms_draft += ms_since(t0);
     ++rounds;
     return true;

@@ -55,6 +55,15 @@ struct VerifyHits {
     int64_t blob = 0;
 };
 
+/// STRATA_VERIFY_PROFILE: the GPU's idle time between a verify window and the draft round after it, and back (from
+/// globaltimer stamps of the window's first and last kernels and the drafter's), summed for profile_report.
+struct DecodeGaps {
+    unsigned long long verify_end = 0, draft_end = 0;
+    double v2d = 0, d2v = 0, draft_gpu = 0;
+    long long n_v2d = 0, n_d2v = 0;
+};
+DecodeGaps& decode_gaps();
+
 class Verifier {
 public:
     Verifier() = default;
