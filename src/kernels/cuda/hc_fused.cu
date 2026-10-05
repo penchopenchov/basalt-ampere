@@ -788,12 +788,15 @@ __device__ void hc_up_main_mma(const HcFusedArgs& a, UpSlice sl, int tid, char* 
         u.lo[k * LOS + i - k * LR] = __ldcg(a.lo + i);
     }
     if (a.apply) hc_up_rout<T>(a, sl, tid, smem, true);
+    // rs once per CTA: every up CTA reads the same few words, one request per warp and word would queue at one L2 slice
+    __shared__ float s_rsv[MAXT * HC];
+    if (tid < T * HC) s_rsv[tid] = __ldcg(a.rs + tid);
+    __syncthreads();
     float rsr[2][HC];
 #pragma unroll
     for (int j = 0; j < 2; ++j)
 #pragma unroll
-        for (int c = 0; c < HC; ++c) rsr[j][c] = 2 * t4 + j < T ? __ldcg(a.rs + (2 * t4 + j) * HC + c) : 0.0f;
-    __syncthreads();
+        for (int c = 0; c < HC; ++c) rsr[j][c] = 2 * t4 + j < T ? s_rsv[(2 * t4 + j) * HC + c] : 0.0f;
     stamp(dbg, b, 9, tid);
     const int rows = HC * nc;
     if (up_tile_row(warp, 0) < rows) {
