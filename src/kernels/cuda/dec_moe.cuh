@@ -8,6 +8,32 @@ namespace {
 
 constexpr int kDmThreads = 256;
 
+__device__ __forceinline__ unsigned long long dm_clock() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// STRATA_DM_WAIT_STATS: one layer's times (S[0] doorbell, S[1] CUDA0's work done, S[2] the peer landed, S[3] every
+// tier landed, S[4] the CPU pool landed) into the counters; one thread, after every time is stored
+__device__ void dm_stat_record(unsigned long long* S, const DmPlan* plan, int layer) {
+    const int np = plan->counts[2], nc = plan->counts[3];
+    const unsigned long long tr = S[0], tc = S[1];
+    const unsigned long long tp = np > 0 ? S[2] : tr, tl = (np > 0 || nc > 0) ? S[3] : tc;
+    if (nc > 0) {
+        unsigned long long* c = S + kDmStatCpu + 2 * min(nc, 7);
+        c[0] += 1; c[1] += S[4] > tr ? S[4] - tr : 0ull;
+    }
+    const unsigned long long w = tl > tc ? tl - tc : 0ull;
+    unsigned long long* b = S + kDmStatBucket + 8 * min(np, 15);
+    b[0] += 1; b[1] += w > 0; b[2] += w; b[3] += tp > tr ? tp - tr : 0ull; b[4] += tc > tr ? tc - tr : 0ull;
+    b[5] += nc > 0;
+    if (layer >= 0 && layer < kDmStatLayers) {
+        unsigned long long* l = S + kDmStatLayer + 4 * layer;
+        l[0] += (unsigned long long) np; l[1] += 1; l[2] += w; l[3] += np >= 4;
+    }
+}
+
 // ---------------------------------------------------------------- tier plan
 // Entry i (tid < n) of kind `want`: its group (distinct ids in routing order) and position.  s_* are block arrays.
 // Writes start[0..ng], and per entry pos[i] (its place in the entry list) for entries of kind `want`, -1 else.
@@ -74,8 +100,27 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
             else if (a.res1 != nullptr && a.res1[e] >= 0) kd = 2;
         }
         s_kind[tid] = kd;
-        if (kd < 0) atomicAdd(&s_ncpu, 1);
-        else if (kd == 2) atomicAdd(&s_npeer, 1);
+    }
+    __syncthreads();
+    if (a.peer_cap > 0) {   // the peer's groups past peer_cap (distinct ids in routing order) go to the CPU pool
+        __shared__ int32_t s_pf[kDmCap];
+        int first = tid;
+        const bool pe = tid < n && s_kind[tid] == 2;
+        if (pe)
+            for (int j = 0; j < tid; ++j)
+                if (s_ids[j] == s_ids[tid] && s_kind[j] == 2) { first = j; break; }
+        if (tid < kDmCap) s_pf[tid] = pe && first == tid;
+        __syncthreads();
+        int rank = 0;
+        if (pe)
+            for (int j = 0; j < first; ++j) rank += s_pf[j];
+        __syncthreads();
+        if (pe && rank >= a.peer_cap) s_kind[tid] = -1;
+        __syncthreads();
+    }
+    if (tid < n) {
+        if (s_kind[tid] < 0) atomicAdd(&s_ncpu, 1);
+        else if (s_kind[tid] == 2) atomicAdd(&s_npeer, 1);
     }
     __syncthreads();
     if (blockIdx.x == 0) {
@@ -147,6 +192,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         const unsigned int arrived = atomicAdd(a.ctr, 1u) + 1u;
         if (arrived == gridDim.x) {
             *a.ctr = 0u;
+            if (a.stats != nullptr) a.stats[0] = dm_clock();
             __threadfence_system();
             // the peer's word: the ring, the tokens and whether it has entries (it fetches nothing otherwise)
             *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (s_npeer > 0 ? 1u << 28 : 0u);
@@ -156,8 +202,27 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     }
 }
 
+// both tiers' words polled together, each one's landing time kept (S[2] the peer, S[4] the CPU pool, S[3] both)
+__device__ void dm_poll_tiers(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
+                              uint32_t ring, unsigned long long* S) {
+    bool pd = plan->counts[2] == 0, cd = plan->counts[3] == 0;
+    while (!pd || !cd) {
+        if (!pd && *peer_done >= ring) { pd = true; S[2] = dm_clock(); }
+        if (!cd && *host_flag >= ring) { cd = true; S[4] = dm_clock(); }
+        if (!pd || !cd) __nanosleep(32);
+    }
+    __threadfence_system();
+    S[3] = dm_clock();
+}
+
 __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
-                               uint32_t ring) {
+                               uint32_t ring, unsigned long long* stats, int layer) {
+    if (stats != nullptr) {
+        stats[1] = dm_clock();
+        dm_poll_tiers(plan, peer_done, host_flag, ring, stats);
+        dm_stat_record(stats, plan, layer);
+        return;
+    }
     if (plan->counts[2] > 0) while (*peer_done < ring) strata_spin_pause();
     if (plan->counts[3] > 0) while (*host_flag < ring) strata_spin_pause();
     __threadfence_system();
@@ -1167,8 +1232,12 @@ __global__ void __launch_bounds__(kM3Threads, 4) m3_down_kernel(const DmPlan* __
     unsigned int* fin = a.ctr + kDmM3Ctr - 1;
     const bool tiers = plan->counts[2] > 0 || plan->counts[3] > 0;
     if (tiers && blockIdx.x == 0 && blockIdx.y == 0 && tid == kM3Threads - 32) {
-        if (plan->counts[2] > 0) while (*a.peer_done_m < a.ring) __nanosleep(64);
-        if (plan->counts[3] > 0) while (*a.host_flag_m < a.ring) __nanosleep(64);
+        if (a.stats != nullptr) {
+            dm_poll_tiers(plan, a.peer_done_m, a.host_flag_m, a.ring, a.stats);
+        } else {
+            if (plan->counts[2] > 0) while (*a.peer_done_m < a.ring) __nanosleep(64);
+            if (plan->counts[3] > 0) while (*a.host_flag_m < a.ring) __nanosleep(64);
+        }
         __threadfence_system();
         *(volatile unsigned int*) flag = a.ring;
     }
@@ -1178,6 +1247,8 @@ __global__ void __launch_bounds__(kM3Threads, 4) m3_down_kernel(const DmPlan* __
         const bool last = atomicAdd(a.ctr + blockIdx.x, 1u) + 1u == (unsigned) Y;
         if (last) {
             a.ctr[blockIdx.x] = 0u;
+            // the stats' CUDA0 time: slice 0 holds the poller, so its arrival follows the tiers
+            if (a.stats != nullptr && blockIdx.x > 0) atomicMax(a.stats + 1, dm_clock());
             if (tiers) while (*(volatile unsigned int*) flag != a.ring) __nanosleep(32);
             __threadfence_system();
         }
@@ -1214,6 +1285,11 @@ __global__ void __launch_bounds__(kM3Threads, 4) m3_down_kernel(const DmPlan* __
     if (tid == 0 && atomicAdd(fin, 1u) + 1u == gridDim.x) {   // every slice has read the flag
         *fin = 0u;
         *flag = 0u;
+        if (a.stats != nullptr) {
+            __threadfence();
+            dm_stat_record(a.stats, plan, a.layer);
+            a.stats[1] = 0ull;
+        }
     }
 }
 
@@ -1246,9 +1322,53 @@ void dec_moe_route(const DmRouteArgs& a, void* stream) {
 }
 
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
-                  uint32_t ring, void* stream) {
-    dm_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(plan, peer_done_m, host_flag_m, ring);
+                  uint32_t ring, void* stream, unsigned long long* stats, int layer) {
+    dm_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(plan, peer_done_m, host_flag_m, ring, stats, layer);
     check("dec_moe_wait");
+}
+
+std::string dec_moe_stats_text(const unsigned long long* w, double windows) {
+    std::string s;
+    char buf[256];
+    double tot_w = 0.0, tot_l = 0.0, tot_e = 0.0;
+    for (int b = 0; b < 16; ++b) {
+        const unsigned long long* c = w + kDmStatBucket + 8 * b;
+        if (c[0] == 0) continue;
+        const double n = (double) c[0];
+        tot_w += (double) c[2]; tot_l += n; tot_e += n * b;
+        std::snprintf(buf, sizeof buf, "  peer %2d%s: %6.2f layers/window, %5.1f%% waited, wait %6.2f us/layer, "
+                      "peer done %6.2f us, CUDA0 done %6.2f us after the doorbell, %4.1f%% with CPU entries\n",
+                      b, b == 15 ? "+" : " ", n / windows, 100.0 * c[1] / n, c[2] / n / 1e3, c[3] / n / 1e3,
+                      c[4] / n / 1e3, 100.0 * c[5] / n);
+        s += buf;
+    }
+    std::snprintf(buf, sizeof buf, "  total: %.3f ms/window waited, %.2f peer entries/layer\n", tot_w / windows / 1e6,
+                  tot_l > 0 ? tot_e / tot_l : 0.0);
+    s += buf;
+    s += "  per layer peer entries:";
+    for (int l = 0; l < kDmStatLayers; ++l) {
+        const unsigned long long* c = w + kDmStatLayer + 4 * l;
+        if (c[1] == 0) continue;
+        std::snprintf(buf, sizeof buf, " %.1f", (double) c[0] / c[1]);
+        s += buf;
+    }
+    s += "\n  per layer wait us:";
+    for (int l = 0; l < kDmStatLayers; ++l) {
+        const unsigned long long* c = w + kDmStatLayer + 4 * l;
+        if (c[1] == 0) continue;
+        std::snprintf(buf, sizeof buf, " %.1f", c[2] / (double) c[1] / 1e3);
+        s += buf;
+    }
+    s += "\n  CPU entries -> landed after the doorbell:";
+    for (int b = 1; b < 8; ++b) {
+        const unsigned long long* c = w + kDmStatCpu + 2 * b;
+        if (c[0] == 0) continue;
+        std::snprintf(buf, sizeof buf, " %d%s: %.2f/window %.1f us;", b, b == 7 ? "+" : "", c[0] / windows,
+                      c[1] / (double) c[0] / 1e3);
+        s += buf;
+    }
+    s += "\n";
+    return s;
 }
 
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff) {

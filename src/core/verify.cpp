@@ -77,6 +77,8 @@ struct DecMoe {
     void* m3scr = nullptr;                   ///< STRATA_DEC_MOE3: dec_moe3's scratch (null: off)
     unsigned int* m3ctr = nullptr;           ///< its slice counters
     float* m3part = nullptr;                 ///< the shared gate's partial sums (dec_moe_route)
+    unsigned long long* wstat = nullptr;     ///< STRATA_DM_WAIT_STATS: the per-layer wait counters (device)
+    int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
     strata::kernels::DmRing* h_ring = nullptr; strata::kernels::DmRing* m_ring = nullptr;
@@ -418,6 +420,9 @@ bool Verifier::dm_init(std::string& err) {
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
              cudaMemcpy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok && env_on("STRATA_DM_WAIT_STATS"))
+        ok = cudaMalloc((void**) &d->wstat, kDmStatWords * 8) == cudaSuccess &&
+             cudaMemset(d->wstat, 0, kDmStatWords * 8) == cudaSuccess;
     if (!ok) { err = "verify: STRATA_DEC_MOE buffers"; return false; }
     if (env_on("STRATA_DEC_MOE3")) {
         ok = cudaMalloc(&d->m3scr, dec_moe3_scratch_bytes((int) lay.fmt[0].n_ff)) == cudaSuccess &&
@@ -505,7 +510,7 @@ void Verifier::dm_free() {
             if (p) cudaFree(p);
     }
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
-                    (void*) d->vsync, d->m3scr, (void*) d->m3ctr, (void*) d->m3part})
+                    (void*) d->vsync, d->m3scr, (void*) d->m3ctr, (void*) d->m3part, (void*) d->wstat})
         if (p) cudaFree(p);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
         if (h) cudaFreeHost(h);
@@ -1415,6 +1420,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.host_seq_m = m_seq_; ra.peer_seq_m = dm_->m_w;
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             if (m3) { ra.sh_gw = m3_gi; ra.sh_part = dm_->m3part; }
+            ra.stats = dm_->wstat;
+            // STRATA_PEER_CAP=n: a layer's peer groups past n go to the CPU pool
+            static const int peer_cap = [] { const char* v = std::getenv("STRATA_PEER_CAP"); return v ? std::atoi(v) : 0; }();
+            ra.peer_cap = peer_cap;
             PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
             dec_moe_route(ra, cs);
         } else if (all_resident_) {
@@ -1539,7 +1548,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             m3a.sh_part = dm_->m3part; m3a.shared = shared_ + tb * N; m3a.parts = parts_out;
             m3a.peer_rows_m = dm_->m_rows; m3a.cpu_rows_m = m_ymiss_; m3a.weights = w_ + tb * K; m3a.output = bo_ + tb * N;
             m3a.peer_done_m = dm_->m_w + 16; m3a.host_flag_m = m_flag_; m3a.ring = ring; m3a.ctr = dm_->m3ctr;
-            m3a.n_tok = n; m3a.k = (int) K;
+            m3a.n_tok = n; m3a.k = (int) K; m3a.stats = dm_->wstat; m3a.layer = (int) l;
             dec_moe3(L, dm_->plan, nat_xq_ + (size_t) tb * (N / 32) * 36, dm_->m3scr, m3a, (int) cap, cs);
             stamp(l, 20, grp);
             stamp(l, 21, grp);
@@ -1609,7 +1618,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (m3) {
             stamp(l, 23, grp);
         } else if (dm) {
-            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs);
+            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l);
             stamp(l, 23, grp);
             try {
                 dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
@@ -2228,6 +2237,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == 200)) {
+        // STRATA_DM_WAIT_STATS: the last 200 windows' counters
+        std::vector<unsigned long long> w((size_t) kDmStatWords);
+        cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
+        cudaMemset(dm_->wstat, 0, w.size() * 8);
+        const double nw = (double) dm_->wstat_windows;
+        std::fprintf(stderr, "strata verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
+                     dm_->wstat_t / nw, strata::kernels::dec_moe_stats_text(w.data(), nw).c_str());
+        dm_->wstat_windows = 0;
+        dm_->wstat_t = 0;
+    }
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {

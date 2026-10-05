@@ -59,6 +59,8 @@ struct DmRouteArgs {
     unsigned int ctr_base = 0;       ///< arrivals before this launch (ring - 1) * blocks
     const uint16_t* sh_gw = nullptr; ///< device: the shared expert's BF16 gate row (n_embd), or null
     float* sh_part = nullptr;        ///< device: its gate's partial sums, n_embd / 256 per token in order
+    unsigned long long* stats = nullptr;   ///< STRATA_DM_WAIT_STATS (kDmStatWords, device) or null: the doorbell's time
+    int peer_cap = 0;                ///< STRATA_PEER_CAP: the peer's groups past this many go to the CPU pool (0: no cap)
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
@@ -97,9 +99,20 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Launches the peer window (cooperative) on `stream` of the current device; false on a launch error.
 bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream);
 
+/// STRATA_DM_WAIT_STATS: per layer, the times of the doorbell, CUDA0's own work done and each tier landed (CUDA0's
+/// clock), summed per peer-entry count and per layer.  Words: [0, 4) the layer's times; kDmStatBucket + 8 b + j for
+/// layers with min(peer entries, 15) == b: j 0 layers, 1 the tiers landed after CUDA0's work, 2 ns waited, 3 ns from
+/// the doorbell to the peer's rows, 4 ns from the doorbell to CUDA0's work done, 5 with CPU entries; kDmStatLayer + 4 l
+/// + j for layer l: j 0 peer entries, 1 layers, 2 ns waited, 3 with 4+ peer entries; then per CPU-entry count.
+constexpr int kDmStatBucket = 8, kDmStatLayer = kDmStatBucket + 16 * 8, kDmStatLayers = 64;
+constexpr int kDmStatCpu = kDmStatLayer + 4 * kDmStatLayers;   ///< + 2 min(CPU entries, 7): layers, ns to landed
+constexpr int kDmStatWords = kDmStatCpu + 16;
+/// One line per peer-entry count and two per-layer lines from the counters (host copy).
+std::string dec_moe_stats_text(const unsigned long long* w, double windows);
+
 /// CUDA0's spin until the tiers this layer uses have landed (the combine waits by itself; this one is for profiles).
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
-                  uint32_t ring, void* stream);
+                  uint32_t ring, void* stream, unsigned long long* stats = nullptr, int layer = 0);
 
 /// CUDA0's VRAM share of the plan in one launch (gate/up, SwiGLU, down; native_expert_grouped's rows bit for bit):
 /// entry e's row into row plan->dst[e] of `out`.  `sync`: kDmCap + 1 zeroed device words, left zeroed.
@@ -138,6 +151,8 @@ struct DmM3Args {
     uint32_t ring = 0;
     unsigned int* ctr = nullptr;                 ///< device: kDmM3Ctr zeroed words, left zeroed
     int n_tok = 0, k = 0;
+    unsigned long long* stats = nullptr;         ///< STRATA_DM_WAIT_STATS (kDmStatWords, device) or null
+    int layer = 0;
 };
 constexpr int kDmM3Ctr = 256;
 /// Whether dec_moe3 covers a layer: the experts' formats and the shared expert's.
