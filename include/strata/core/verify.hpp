@@ -92,6 +92,10 @@ public:
     /// #649 (STRATA_VERIFY_TRACE=1, opt-in): the last windows' host-side handshake events and the GPU's breadcrumbs
     /// (in mapped memory, so they read while the GPU hangs).  Nothing when the trace is off.
     void trace_dump(std::FILE* f) const;
+    /// STRATA_DEC_MOE: the device plan's words while a window is stalled - the ring CUDA0 last published and its
+    /// tiers, and on the peer card the ring it was rung for, the ring it finished and whether its kernel still runs.
+    /// Empty without the device plan.
+    std::string dm_note() const;
 
     /// #267: raise every flag the window's spin kernels wait on past any ring (UINT32_MAX), so a window the GPU
     /// cannot finish drains instead of staying resident, then wait up to `timeout_ms` for its streams.  For the
@@ -249,6 +253,7 @@ private:
     bool dm_init(std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     void dm_free();
+    std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)
     bool capture(int T, std::string& err);
     bool pdl_rec_ = false;                 ///< STRATA_PDL=1: record_window may use programmatic dependent launch
     bool pdl_off_ = false;                 ///< ... a window failed to capture with it: the later ones go without
