@@ -2199,6 +2199,8 @@ bool g_stage_grid = [] {
 bool g_nc6 = env_on("STRATA_IQ_NC6");
 // STRATA_GU_STAGE=1: the grouped gate/up kernel reads the group's activations from shared memory (the same bits)
 bool g_gu_stage = env_on("STRATA_GU_STAGE");
+// STRATA_DEC_GU2=1: the grid formats' gate/up rows two a warp (native_gu2_kernel; the same bits)
+bool g_gu2 = env_on("STRATA_DEC_GU2");
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 // STRATA_GU_MMA=1: IQ3_XXS gate/up on int8 tensor cores, sm_80+ (the same bits; not with STRATA_GROUPED_V1); =2:
 // only for the calls whose caller asks (native_grouped_set_mma_hint), e.g. windows of several entries per expert
@@ -2303,6 +2305,10 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
     }
 }
 
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#include "gu2.cuh"
+#endif
+
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
@@ -2313,6 +2319,13 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
             const dim3 gm((unsigned) (2 * L.n_ff / kGmRows), grid.y);
             native_gu_mma_kernel<<<gm, 256, gu_mma_smem(L.n_embd), s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L,
                                                                          gate, up);
+            return;
+        }
+    }
+    if constexpr (kGu2<TG>) {
+        if (allow_mma && g_gu2 && !g_old_kernels && gu2_usable(L)) {
+            const dim3 g2((unsigned) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS), grid.y);
+            native_gu2_kernel<TG><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             return;
         }
     }
@@ -2352,6 +2365,7 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 }  // namespace
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
+void native_grouped_set_gu2(bool on) { g_gu2 = on; }
 bool iq_old_kernels() { return g_old_kernels; }
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count
