@@ -17,6 +17,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/dec_gdn.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -723,6 +724,24 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 PdlScope ps(pdl);   // the layer's GDN kernels, after the hc read
+                // STRATA_DEC_GDN=1: the same values in three launches (dec_gdn.hpp)
+                if (dec_gdn_enabled() && !batch_rec_ && tb == 0 && N == 2560 && dec_dense_supported(wqkv->native_type, (int) N) &&
+                    dec_dense_supported(wg->native_type, (int) N) && dec_dense_supported(wout->native_type, (int) ZV)) {
+                    const DecMat in[2] = {{wqkv->native_type, wqkv->native_data, (int) C, qkv},
+                                          {wg->native_type, wg->native_data, (int) ZV, z_}};
+                    dec_gdn_inproj(xm, (int) N, n, in, 2, cs);
+                    for (int i = 2; i <= 5; ++i) stamp(l, i, grp);
+                    DecRecArgs ra;
+                    ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
+                    ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+                    ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
+                    ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
+                    ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                    dec_gdn_rec(ra, n, cs);
+                    stamp(l, 6, grp);
+                    dec_dense(xq_, (int) ZV, n, DecMat{wout->native_type, wout->native_data, (int) N, bo_ + tb * N}, cs);
+                    goto gdn_done;
+                }
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
@@ -758,6 +777,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 6, grp);
                 native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+            gdn_done:;
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];

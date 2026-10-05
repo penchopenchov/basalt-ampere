@@ -167,7 +167,7 @@ void clear(Bufs& b, cudaStream_t s) {
 }
 
 // stage masks for the bench: 1 in-projections, 2 conv/ab/recurrence, 4 out projection
-void run_ref(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int stages = 7) {
+void run_ref(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int stages = 7, unsigned long long* = nullptr) {
     const float* conv = L.state + (size_t) S * HV * S;
     if (stages & 1) {
         native_quantize_q8_1(x, b.xq, N, T, s);
@@ -305,7 +305,48 @@ void rec_phases(cudaStream_t s) {
     }
 }
 
+// the in-projection per weight type (qkv and z both of it): ref vs new, us per layer
+void fmt_sweep(cudaStream_t s) {
+    std::mt19937 rng(11);
+    float* x = upload(randn((size_t) kDecMaxT * N, 1.f, rng));
+    Bufs b = make_bufs();
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    for (const Fmt& f : FMTS) {
+        std::vector<Layer> Ls;
+        for (int i = 0; i < 8; ++i) Ls.push_back(make_layer(f.type, f.type, 14, rng));
+        const double mb = (mat_bytes(f.type, N, C) + mat_bytes(f.type, N, ZV)) / 1e6;
+        for (int T : {1, 3}) {
+            double us[2];
+            for (int path = 0; path < 2; ++path) {
+                cudaGraph_t g;
+                cudaGraphExec_t ge;
+                CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+                {
+                    PdlScope ps(true, true);
+                    for (const Layer& L : Ls) (path ? run_new : run_ref)(L, x, b, T, s, 1, nullptr);
+                }
+                CK(cudaStreamEndCapture(s, &g));
+                CK(cudaGraphInstantiate(&ge, g, 0));
+                for (int w = 0; w < 3; ++w) CK(cudaGraphLaunch(ge, s));
+                CK(cudaEventRecord(e0, s));
+                for (int i = 0; i < 20; ++i) CK(cudaGraphLaunch(ge, s));
+                CK(cudaEventRecord(e1, s));
+                CK(cudaEventSynchronize(e1));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                us[path] = ms * 1000.0 / 20 / Ls.size();
+                CK(cudaGraphExecDestroy(ge));
+                CK(cudaGraphDestroy(g));
+            }
+            std::printf("fmt %-6s T=%d in-proj (%.1f MB): ref %6.2f us  new %6.2f us (%5.0f GB/s)\n", f.name, T, mb, us[0],
+                        us[1], mb * 1e3 / us[1]);
+        }
+    }
+}
+
 void bench(cudaStream_t s) {
+    if (std::getenv("DEC_FMT_SWEEP")) { setenv("STRATA_PDL", "1", 1); fmt_sweep(s); return; }
     rec_phases(s);
     std::mt19937 rng(7);
     constexpr int NL = 12;   // distinct layers per graph: far more weight than the L2 holds

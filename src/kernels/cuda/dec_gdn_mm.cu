@@ -68,7 +68,11 @@ struct Q6KBlock {
 static_assert(sizeof(Q5KBlock) == 176 && sizeof(Q81Block) == 36 && sizeof(IQ4XSBlock) == 136 &&
               sizeof(Q4KBlock) == 144 && sizeof(Q6KBlock) == 210 && sizeof(block_iq3_s) == 110, "block sizes");
 
-// ---------------------------------------------------------------- native_mmvq.cu, unchanged
+// ---------------------------------------------------------------- the dot products
+// native_mmvq.cu's Q4_K / Q5_K / Q6_K / IQ4_XS traits and iq_kernels.cu's IQ3_S one, with every operation that
+// depends only on the weight (code unpacking, scale extraction, sign and grid decoding) moved into `load`, which
+// runs once per (row, block, part); `apply`, once per column, keeps the activation loads, the integer dots and the
+// float expression of the reference in the same order.  Integer operations are exact, so moving them changes no bit.
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
     for (int offset = WARP / 2; offset > 0; offset >>= 1) {
@@ -83,29 +87,6 @@ __device__ __forceinline__ float warp_max(float x) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, WARP));
     }
     return x;
-}
-
-__device__ __forceinline__ float q5_q8_dot_impl(
-    const int* __restrict__ vl, const int* __restrict__ vh, const int* __restrict__ u,
-    const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m, const half2& dm5,
-    const float* __restrict__ d8) {
-    float sumf_d = 0.0f;
-    float sumf_m = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int vl0i = (vl[0] >> (4 * i)) & 0x0f0f0f0f;
-        const int vl1i = (vl[1] >> (4 * i)) & 0x0f0f0f0f;
-        const int vh0i = ((vh[0] >> i) << 4) & 0x10101010;
-        const int vh1i = ((vh[1] >> i) << 4) & 0x10101010;
-        const int v0i = vl0i | vh0i;
-        const int v1i = vl1i | vh1i;
-        const int dot1 = STRATA_DP4A(v0i, u[2 * i], STRATA_DP4A(v1i, u[2 * i + 1], 0));
-        const int dot2 = STRATA_DP4A(0x01010101, u[2 * i], STRATA_DP4A(0x01010101, u[2 * i + 1], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
-    }
-    const float2 dm5f = __half22float2(dm5);
-    return dm5f.x * sumf_d - dm5f.y * sumf_m;
 }
 
 __device__ __forceinline__ int load_int_b2(const void* ptr, int i32) {
@@ -133,92 +114,54 @@ __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
     return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
 }
 
-__device__ __forceinline__ float q4_q8_dot_impl(
-    const int* __restrict__ v, const int* __restrict__ u,
-    const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m, const half2& dm4,
-    const float* __restrict__ d8) {
-    float sumf_d = 0.0f;
-    float sumf_m = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int v0i = (v[0] >> (4 * i)) & 0x0f0f0f0f;
-        const int v1i = (v[1] >> (4 * i)) & 0x0f0f0f0f;
-        const int dot1 = STRATA_DP4A(v1i, u[2 * i + 1], STRATA_DP4A(v0i, u[2 * i], 0));
-        const int dot2 = STRATA_DP4A(0x01010101, u[2 * i + 1], STRATA_DP4A(0x01010101, u[2 * i], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
-    }
-    const float2 dm4f = __half22float2(dm4);
-    return dm4f.x * sumf_d - dm4f.y * sumf_m;
+__device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
+    const uint16_t* x16 = (const uint16_t*) x;
+    int x32 = x16[2 * i32 + 0] << 0;
+    x32 |= x16[2 * i32 + 1] << 16;
+    return x32;
 }
 
-__device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __restrict__ u,
-                                              const int8_t* __restrict__ scales,
-                                              float d, const float* __restrict__ d8) {
-    float sumf = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int sc = scales[4 * i];
-        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
-        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-        const int vi = __vsubss4(vil | vih, 0x20202020);
-        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
-    }
-    return d * sumf;
-}
-
-struct Q5KTraits {
-    using Block = Q5KBlock;
-    static constexpr int DIV = QK, T = QI / VDR, KBY = QK / Q8K, BPI = VDR * WARPS * WARP / QI;
-    __device__ static int kqs(int tid) { return VDR * (tid % (QI / VDR)); }
-    struct W { int vl[2], vh[2]; uint16_t aux[2]; half2 dm; int bq8_offset; };
-    __device__ static W load(const Block* __restrict__ bq5, int iqs) {
-        W r;
-        r.bq8_offset = 2 * ((iqs / 2) / 4);
-        const int* ql = reinterpret_cast<const int*>(bq5->qs + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4));
-        const int* qh = reinterpret_cast<const int*>(bq5->qh + 4 * ((iqs / 2) % 4));
-        r.vl[0] = ql[0];
-        r.vl[1] = ql[4];
-        r.vh[0] = qh[0] >> r.bq8_offset;
-        r.vh[1] = qh[4] >> r.bq8_offset;
-        const uint16_t* scales = reinterpret_cast<const uint16_t*>(bq5->scales);
-        const int j = r.bq8_offset / 2;
-        const int jm = j & 1;
-        const uint32_t s0 = scales[jm];
-        const uint32_t s2 = scales[jm + 2];
-        const uint32_t s4 = scales[jm + 4];
-        const uint32_t hi = uint32_t(-int32_t(j >= 2));
-        r.aux[0] = uint16_t(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
-        r.aux[1] = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-        r.dm = bq5->dm;
-        return r;
-    }
-    __device__ static float apply(const W& r, const Q81Block* __restrict__ bq8, int iqs) {
-        int u[4];
-        float d8[2];
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const Q81Block* bq8i = bq8 + r.bq8_offset + i;
-            d8[i] = __low2float(bq8i->ds);
-            const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
-            u[2 * i] = q8[0];
-            u[2 * i + 1] = q8[4];
-        }
-        const uint8_t* sc = reinterpret_cast<const uint8_t*>(r.aux);
-        return q5_q8_dot_impl(r.vl, r.vh, u, sc, sc + 2, r.dm, d8);
-    }
+// q8_1 activation columns.  XSm: shared memory, block b's 32 codes at qs + 8 b (16-byte aligned) and its fp16 scale
+// as a float at d[b].  XGl: the q8_1 blocks in global memory.
+struct XSm {
+    const int* qs;
+    const float* d;
+    __device__ XSm col(int j, int nb32) const { return XSm{qs + 8 * nb32 * j, d + nb32 * j}; }
+    __device__ int u(int b, int k) const { return qs[8 * b + k]; }
+    __device__ int4 u4(int b, int h) const { return reinterpret_cast<const int4*>(qs + 8 * b)[h]; }
+    __device__ float d8(int b) const { return d[b]; }
 };
-struct Q4KTraits {
+// bench probe: the same loads, at addresses that do not conflict (wrong values)
+struct XSmProbe {
+    const int* qs;
+    const float* d;
+    __device__ XSmProbe col(int j, int nb32) const { return XSmProbe{qs + 8 * nb32 * j, d + nb32 * j}; }
+    __device__ int u(int b, int k) const { return qs[(threadIdx.x & 31) + 32 * (b & 1)]; }
+    __device__ int4 u4(int b, int h) const { return reinterpret_cast<const int4*>(qs)[(threadIdx.x & 31) * 2 + h]; }
+    __device__ float d8(int b) const { return d[b & 7]; }
+};
+struct XGl {
+    const Q81Block* x;
+    __device__ XGl col(int j, int nb32) const { return XGl{x + nb32 * j}; }
+    __device__ int u(int b, int k) const { return reinterpret_cast<const int*>(x[b].qs)[k]; }
+    __device__ int4 u4(int b, int h) const {
+        const int* p = reinterpret_cast<const int*>(x[b].qs) + 4 * h;
+        return make_int4(p[0], p[1], p[2], p[3]);
+    }
+    __device__ float d8(int b) const { return __low2float(x[b].ds); }
+};
+
+// Q4_K: q4_q8_dot / Q4KTraits.  A call covers sub-blocks bq8_offset, bq8_offset + 1, two ints each.
+struct Q4KF {
     using Block = Q4KBlock;
-    static constexpr int DIV = QK, T = QI / VDR, KBY = QK / Q8K, BPI = VDR * WARPS * WARP / QI;
+    static constexpr int T = QI / VDR, KBY = QK / Q8K, BPI = VDR * WARPS * WARP / QI;
     __device__ static int kqs(int tid) { return VDR * (tid % (QI / VDR)); }
-    struct W { int v[2]; uint16_t aux[2]; half2 dm; int bq8_offset; };
+    struct W { int v0[2], v1[2], sc[2], m[2]; float2 dm; int bq8_offset; };
     __device__ static W load(const Block* __restrict__ bq4, int iqs) {
         W r;
         r.bq8_offset = 2 * ((iqs / 2) / 4);
         const int* ql = reinterpret_cast<const int*>(bq4->qs + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4));
-        r.v[0] = ql[0];
-        r.v[1] = ql[4];
+        const int v[2] = {ql[0], ql[4]};
         const uint16_t* scales = reinterpret_cast<const uint16_t*>(bq4->scales);
         const int j = r.bq8_offset / 2;
         const int jm = j & 1;
@@ -226,91 +169,168 @@ struct Q4KTraits {
         const uint32_t s2 = scales[jm + 2];
         const uint32_t s4 = scales[jm + 4];
         const uint32_t hi = uint32_t(-int32_t(j >= 2));
-        r.aux[0] = uint16_t(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
-        r.aux[1] = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-        r.dm = bq4->dm;
-        return r;
-    }
-    __device__ static float apply(const W& r, const Q81Block* __restrict__ bq8, int iqs) {
-        int u[4];
-        float d8[2];
+        uint16_t aux[2];
+        aux[0] = uint16_t(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+        aux[1] = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+        const uint8_t* sc = reinterpret_cast<const uint8_t*>(aux);
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            const Q81Block* bq8i = bq8 + r.bq8_offset + i;
-            d8[i] = __low2float(bq8i->ds);
-            const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
-            u[2 * i] = q8[0];
-            u[2 * i + 1] = q8[4];
+            r.v0[i] = (v[0] >> (4 * i)) & 0x0f0f0f0f;
+            r.v1[i] = (v[1] >> (4 * i)) & 0x0f0f0f0f;
+            r.sc[i] = sc[i];
+            r.m[i] = sc[2 + i];
         }
-        const uint8_t* sc = reinterpret_cast<const uint8_t*>(r.aux);
-        return q4_q8_dot_impl(r.v, u, sc, sc + 2, r.dm, d8);
+        r.dm = __half22float2(bq4->dm);
+        return r;
+    }
+    template<typename X>
+    __device__ static float apply(const W& r, const X& x, int kb, int iqs) {
+        const int k = (iqs / 2) % 4;
+        float sumf_d = 0.0f;
+        float sumf_m = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int b = kb + r.bq8_offset + i;
+            const int u0 = x.u(b, k), u1 = x.u(b, k + 4);
+            const float d8 = x.d8(b);
+            const int dot1 = STRATA_DP4A(r.v1[i], u1, STRATA_DP4A(r.v0[i], u0, 0));
+            const int dot2 = STRATA_DP4A(0x01010101, u1, STRATA_DP4A(0x01010101, u0, 0));
+            sumf_d += d8 * (dot1 * r.sc[i]);
+            sumf_m += d8 * (dot2 * r.m[i]);
+        }
+        return r.dm.x * sumf_d - r.dm.y * sumf_m;
     }
 };
-struct Q6KTraits {
+
+// Q5_K: q5_q8_dot / Q5KTraits, the high bits folded into the codes once.
+struct Q5KF {
+    using Block = Q5KBlock;
+    static constexpr int T = QI / VDR, KBY = QK / Q8K, BPI = VDR * WARPS * WARP / QI;
+    __device__ static int kqs(int tid) { return VDR * (tid % (QI / VDR)); }
+    struct W { int v0[2], v1[2], sc[2], m[2]; float2 dm; int bq8_offset; };
+    __device__ static W load(const Block* __restrict__ bq5, int iqs) {
+        W r;
+        r.bq8_offset = 2 * ((iqs / 2) / 4);
+        const int* ql = reinterpret_cast<const int*>(bq5->qs + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4));
+        const int* qh = reinterpret_cast<const int*>(bq5->qh + 4 * ((iqs / 2) % 4));
+        const int vl[2] = {ql[0], ql[4]};
+        const int vh[2] = {qh[0] >> r.bq8_offset, qh[4] >> r.bq8_offset};
+        const uint16_t* scales = reinterpret_cast<const uint16_t*>(bq5->scales);
+        const int j = r.bq8_offset / 2;
+        const int jm = j & 1;
+        const uint32_t s0 = scales[jm];
+        const uint32_t s2 = scales[jm + 2];
+        const uint32_t s4 = scales[jm + 4];
+        const uint32_t hi = uint32_t(-int32_t(j >= 2));
+        uint16_t aux[2];
+        aux[0] = uint16_t(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+        aux[1] = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+        const uint8_t* sc = reinterpret_cast<const uint8_t*>(aux);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int vl0i = (vl[0] >> (4 * i)) & 0x0f0f0f0f;
+            const int vl1i = (vl[1] >> (4 * i)) & 0x0f0f0f0f;
+            const int vh0i = ((vh[0] >> i) << 4) & 0x10101010;
+            const int vh1i = ((vh[1] >> i) << 4) & 0x10101010;
+            r.v0[i] = vl0i | vh0i;
+            r.v1[i] = vl1i | vh1i;
+            r.sc[i] = sc[i];
+            r.m[i] = sc[2 + i];
+        }
+        r.dm = __half22float2(bq5->dm);
+        return r;
+    }
+    template<typename X>
+    __device__ static float apply(const W& r, const X& x, int kb, int iqs) {
+        const int k = (iqs / 2) % 4;
+        float sumf_d = 0.0f;
+        float sumf_m = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int b = kb + r.bq8_offset + i;
+            const int u0 = x.u(b, k), u1 = x.u(b, k + 4);
+            const float d8 = x.d8(b);
+            const int dot1 = STRATA_DP4A(r.v0[i], u0, STRATA_DP4A(r.v1[i], u1, 0));
+            const int dot2 = STRATA_DP4A(0x01010101, u0, STRATA_DP4A(0x01010101, u1, 0));
+            sumf_d += d8 * (dot1 * r.sc[i]);
+            sumf_m += d8 * (dot2 * r.m[i]);
+        }
+        return r.dm.x * sumf_d - r.dm.y * sumf_m;
+    }
+};
+
+// Q6_K: q6_q8_dot / Q6KTraits, the signed codes and their scales decoded once.
+struct Q6KF {
     using Block = Q6KBlock;
-    static constexpr int DIV = 256, T = 32, KBY = 8, BPI = WARPS * WARP / 32;
+    static constexpr int T = 32, KBY = 8, BPI = WARPS * WARP / 32;
     __device__ static int kqs(int tid) { return tid % 32; }
-    struct W { int vl, vh; float d; const int8_t* scales; int bq8_offset; };
+    struct W { int vi[2], sc[2]; float d; int bq8_offset; };
     __device__ static W load(const Block* __restrict__ w, int iqs) {
         W r;
         r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
         const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
         const int vh_shift = 2 * ((iqs % 16) / 8);
-        r.vl = load_int_b2(w->ql, iqs);
-        r.vh = load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
-        r.scales = w->scales + scale_offset;
+        const int vl = load_int_b2(w->ql, iqs);
+        const int vh = load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            r.sc[i] = w->scales[scale_offset + 4 * i];
+            const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+            const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+            r.vi[i] = __vsubss4(vil | vih, 0x20202020);
+        }
         r.d = w->d;
         return r;
     }
-    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
-        int u[2];
-        float d8[2];
+    template<typename X>
+    __device__ static float apply(const W& r, const X& x, int kb, int iqs) {
+        float sumf = 0.0f;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            u[i] = reinterpret_cast<const int*>(x[r.bq8_offset + 2 * i].qs)[iqs % 8];
-            d8[i] = __low2float(x[r.bq8_offset + 2 * i].ds);
+            const int b = kb + r.bq8_offset + 2 * i;
+            const int u = x.u(b, iqs % 8);
+            const float d8 = x.d8(b);
+            sumf += d8 * (STRATA_DP4A(r.vi[i], u, 0) * r.sc[i]);
         }
-        return q6_q8_dot_impl(r.vl, r.vh, u, r.scales, r.d, d8);
+        return r.d * sumf;
     }
 };
-struct IQ4XSTraits {
+
+// IQ4_XS: iq4_xs_q8_dot / IQ4XSTraits.
+struct IQ4XSF {
     using Block = IQ4XSBlock;
-    static constexpr int DIV = 256, T = 8, KBY = 8, BPI = 4 * WARPS * WARP / 32;
+    static constexpr int T = 8, KBY = 8, BPI = 4 * WARPS * WARP / 32;
     __device__ static int kqs(int tid) { return 4 * (tid % 8); }
     struct W { int2 v[4]; int ls; float dw; };
     __device__ static W load(const Block* __restrict__ w, int iqs) {
         W r;
 #pragma unroll
         for (int j = 0; j < 4; ++j) r.v[j] = iq4_table_lookup(reinterpret_cast<const int*>(w->qs)[iqs + j]);
-        r.ls = ((w->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0f) | (((w->scales_h >> (iqs / 2)) & 0x03) << 4);
+        r.ls = (((w->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0f) | (((w->scales_h >> (iqs / 2)) & 0x03) << 4)) - 32;
         r.dw = __half2float(w->d);
         return r;
     }
-    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+    template<typename X>
+    __device__ static float apply(const W& r, const X& x, int kb, int iqs) {
+        const int b = kb + iqs / 4;
+        const int4 lo = x.u4(b, 0), hi = x.u4(b, 1);
         int sumi = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int u0 = reinterpret_cast<const int*>(x[iqs / 4].qs)[j];
-            const int u1 = reinterpret_cast<const int*>(x[iqs / 4].qs)[j + 4];
-            sumi = STRATA_DP4A(r.v[j].x, u0, sumi);
-            sumi = STRATA_DP4A(r.v[j].y, u1, sumi);
-        }
-        sumi *= r.ls - 32;
-        const float d = r.dw * __low2float(x[iqs / 4].ds);
+        sumi = STRATA_DP4A(r.v[0].x, lo.x, sumi);
+        sumi = STRATA_DP4A(r.v[0].y, hi.x, sumi);
+        sumi = STRATA_DP4A(r.v[1].x, lo.y, sumi);
+        sumi = STRATA_DP4A(r.v[1].y, hi.y, sumi);
+        sumi = STRATA_DP4A(r.v[2].x, lo.z, sumi);
+        sumi = STRATA_DP4A(r.v[2].y, hi.z, sumi);
+        sumi = STRATA_DP4A(r.v[3].x, lo.w, sumi);
+        sumi = STRATA_DP4A(r.v[3].y, hi.w, sumi);
+        sumi *= r.ls;
+        const float d = r.dw * x.d8(b);
         return d * sumi;
     }
 };
 
-// ---------------------------------------------------------------- iq_kernels.cu Split<21> (IQ3_S), unchanged
-__device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
-    const uint16_t* x16 = (const uint16_t*) x;
-    int x32 = x16[2 * i32 + 0] << 0;
-    x32 |= x16[2 * i32 + 1] << 16;
-    return x32;
-}
-__device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
-
-struct IQ3STraits {
+// IQ3_S: iq_kernels.cu Split<21>.  Call k of a row: block k / 8, part 2 (k % 8), activation q8_1 block k.
+struct IQ3SF {
     struct W { int g[8]; int ls; float dw; };
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs) {
         const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
@@ -333,12 +353,20 @@ struct IQ3STraits {
         r.dw = __half2float(bq3->d);
         return r;
     }
-    __device__ static float apply(const W& r, const Q81Block* __restrict__ bq8_1, int iqs) {
+    template<typename X>
+    __device__ static float apply(const W& r, const X& x, int b) {
+        const int4 lo = x.u4(b, 0), hi = x.u4(b, 1);
         int sumi = 0;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) sumi = STRATA_DP4A(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi);
+        sumi = STRATA_DP4A(r.g[0], lo.x, sumi);
+        sumi = STRATA_DP4A(r.g[1], lo.y, sumi);
+        sumi = STRATA_DP4A(r.g[2], lo.z, sumi);
+        sumi = STRATA_DP4A(r.g[3], lo.w, sumi);
+        sumi = STRATA_DP4A(r.g[4], hi.x, sumi);
+        sumi = STRATA_DP4A(r.g[5], hi.y, sumi);
+        sumi = STRATA_DP4A(r.g[6], hi.z, sumi);
+        sumi = STRATA_DP4A(r.g[7], hi.w, sumi);
         sumi *= r.ls;
-        const float d = r.dw * __low2float(bq8_1[iqs / 2].ds);
+        const float d = r.dw * x.d8(b);
         return d * sumi;
     }
 };
@@ -346,12 +374,15 @@ struct IQ3STraits {
 // ---------------------------------------------------------------- row dots (one warp per row)
 // The exact layout's four warps, replayed by one: lane `lane` sums the chains of reference threads lane + 32 rw.
 // NB > 0: the row's block count at compile time, so the four chains unroll into independent instruction streams.
-template<typename F, int NC, int NB>
-__device__ __forceinline__ void row_dot4(const uint8_t* row, const Q81Block* x, int xs, int nb_rt, int lane,
+template<typename F, int NC, int NB, typename X>
+__device__ __forceinline__ void row_dot4(const uint8_t* row, const X& x, int nb32, int nb_rt, int lane,
                                          float (&acc)[NC]) {
     const auto* w = reinterpret_cast<const typename F::Block*>(row);
     const int nb = NB > 0 ? NB : nb_rt;
     constexpr int ITERS = NB > 0 ? (NB + F::BPI - 1) / F::BPI : 1;
+    X xc[NC];
+#pragma unroll
+    for (int j = 0; j < NC; ++j) xc[j] = x.col(j, nb32);
     float c[WARPS][NC];
 #pragma unroll
     for (int rw = 0; rw < WARPS; ++rw)
@@ -368,14 +399,14 @@ __device__ __forceinline__ void row_dot4(const uint8_t* row, const Q81Block* x, 
                 if (kbx < nb) {
                     const typename F::W wv = F::load(w + kbx, kqs);
 #pragma unroll
-                    for (int j = 0; j < NC; ++j) c[rw][j] += F::apply(wv, x + j * xs + kbx * F::KBY, kqs);
+                    for (int j = 0; j < NC; ++j) c[rw][j] += F::apply(wv, xc[j], kbx * F::KBY, kqs);
                 }
             }
         } else {
             for (int kbx = tid / F::T; kbx < nb; kbx += F::BPI) {
                 const typename F::W wv = F::load(w + kbx, kqs);
 #pragma unroll
-                for (int j = 0; j < NC; ++j) c[rw][j] += F::apply(wv, x + j * xs + kbx * F::KBY, kqs);
+                for (int j = 0; j < NC; ++j) c[rw][j] += F::apply(wv, xc[j], kbx * F::KBY, kqs);
             }
         }
     }
@@ -389,10 +420,13 @@ __device__ __forceinline__ void row_dot4(const uint8_t* row, const Q81Block* x, 
 }
 
 // mmvq_multi_kernel's row_dot_multi for IQ3_S: calls k = lane, lane + 32, ... of 8 per 256-value block.
-template<int NC, int NB>
-__device__ __forceinline__ void row_dot_iq3s(const uint8_t* row, const Q81Block* x, int xs, int nb_rt, int lane,
+template<int NC, int NB, typename X>
+__device__ __forceinline__ void row_dot_iq3s(const uint8_t* row, const X& x, int nb32, int nb_rt, int lane,
                                              float (&acc)[NC]) {
     const int nk = (NB > 0 ? NB : nb_rt) * 8;
+    X xc[NC];
+#pragma unroll
+    for (int j = 0; j < NC; ++j) xc[j] = x.col(j, nb32);
 #pragma unroll
     for (int j = 0; j < NC; ++j) acc[j] = 0.0f;
     if constexpr (NB > 0) {
@@ -400,33 +434,31 @@ __device__ __forceinline__ void row_dot_iq3s(const uint8_t* row, const Q81Block*
         for (int i = 0; i < (NB * 8 + 31) / 32; ++i) {
             const int k = lane + 32 * i;
             if (k < nk) {
-                const int kbx = k / 8, iqs = 2 * (k % 8);
-                const IQ3STraits::W w = IQ3STraits::load(row, kbx, iqs);
+                const IQ3SF::W w = IQ3SF::load(row, k / 8, 2 * (k % 8));
 #pragma unroll
-                for (int j = 0; j < NC; ++j) acc[j] += IQ3STraits::apply(w, x + j * xs + kbx * 8, iqs);
+                for (int j = 0; j < NC; ++j) acc[j] += IQ3SF::apply(w, xc[j], k);
             }
         }
     } else {
         for (int k = lane; k < nk; k += 32) {
-            const int kbx = k / 8, iqs = 2 * (k % 8);
-            const IQ3STraits::W w = IQ3STraits::load(row, kbx, iqs);
+            const IQ3SF::W w = IQ3SF::load(row, k / 8, 2 * (k % 8));
 #pragma unroll
-            for (int j = 0; j < NC; ++j) acc[j] += IQ3STraits::apply(w, x + j * xs + kbx * 8, iqs);
+            for (int j = 0; j < NC; ++j) acc[j] += IQ3SF::apply(w, xc[j], k);
         }
     }
 #pragma unroll
     for (int j = 0; j < NC; ++j) acc[j] = warp_sum(acc[j]);
 }
 
-template<int NC, int NB>
-__device__ __forceinline__ void row_dot(int type, const uint8_t* row, const Q81Block* x, int xs, int nb, int lane,
+template<int NC, int NB, typename X>
+__device__ __forceinline__ void row_dot(int type, const uint8_t* row, const X& x, int nb32, int nb, int lane,
                                         float (&acc)[NC]) {
     switch (type) {
-        case 12: row_dot4<Q4KTraits, NC, NB>(row, x, xs, nb, lane, acc); break;
-        case 13: row_dot4<Q5KTraits, NC, NB>(row, x, xs, nb, lane, acc); break;
-        case 14: row_dot4<Q6KTraits, NC, NB>(row, x, xs, nb, lane, acc); break;
-        case 23: row_dot4<IQ4XSTraits, NC, NB>(row, x, xs, nb, lane, acc); break;
-        default: row_dot_iq3s<NC, NB>(row, x, xs, nb, lane, acc); break;
+        case 12: row_dot4<Q4KF, NC, NB>(row, x, nb32, nb, lane, acc); break;
+        case 13: row_dot4<Q5KF, NC, NB>(row, x, nb32, nb, lane, acc); break;
+        case 14: row_dot4<Q6KF, NC, NB>(row, x, nb32, nb, lane, acc); break;
+        case 23: row_dot4<IQ4XSF, NC, NB>(row, x, nb32, nb, lane, acc); break;
+        default: row_dot_iq3s<NC, NB>(row, x, nb32, nb, lane, acc); break;
     }
 }
 
@@ -484,13 +516,14 @@ __device__ __forceinline__ void issue_row(const DenseArgs& a, int g, void* slot,
 
 // The block's part of the projections: warp `warp` of block `blk` of `nblk`.  `smem` holds the barriers, the
 // quantized columns (with a.x) and the slots.
-template<int NC, int NB>
+template<int NC, int NB, bool SMX>
 __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nblk, uint8_t* smem) {
     const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const int nb32 = a.n_in / Q8K;
     uint64_t* bars = reinterpret_cast<uint64_t*>(smem) + warp * kMaxSlots;
-    Q81Block* xs = reinterpret_cast<Q81Block*>(smem + kNW * kMaxSlots * 8);
-    const int x_bytes = a.x ? (NC * nb32 * (int) sizeof(Q81Block) + 15) & ~15 : 0;
+    int8_t* xs_q = reinterpret_cast<int8_t*>(smem + kNW * kMaxSlots * 8);   // the columns' codes, then their scales
+    float* xs_d = reinterpret_cast<float*>(xs_q + NC * a.n_in);
+    const int x_bytes = SMX ? (NC * nb32 * (int) sizeof(Q81Block) + 15) & ~15 : 0;
     uint8_t* slots = smem + kNW * kMaxSlots * 8 + x_bytes + warp * a.nslot * a.slot_bytes;
     const int gw = blk * kNW + warp, nwt = nblk * kNW;
     const int nrows = a.rows > gw ? (a.rows - gw + nwt - 1) / nwt : 0;
@@ -498,12 +531,12 @@ __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nbl
     if (lane == 0) {
         for (int s = 0; s < a.nslot; ++s) mbar_init(bars + s, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-        for (int k = 0; k < a.nslot && k < nrows; ++k) issue_row(a, gw + k * nwt, slots + k * a.slot_bytes, bars + k, policy);
+        if (a.probe != 3)
+            for (int k = 0; k < a.nslot && k < nrows; ++k) issue_row(a, gw + k * nwt, slots + k * a.slot_bytes, bars + k, policy);
     }
     pdl_trigger();
     pdl_wait();
-    const Q81Block* x = a.xq;
-    if (a.x) {   // native_quantize_q8_1_kernel, element by element; the loads first, all in flight at once
+    if constexpr (SMX) {   // native_quantize_q8_1_kernel, element by element; the loads first, all in flight at once
         constexpr int U = 8;
         const int total = NC * a.n_in;
         for (int i0 = threadIdx.x; i0 < total; i0 += U * (int) blockDim.x) {
@@ -522,42 +555,47 @@ __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nbl
                 const float sum = warp_sum(xi);
                 const float d = q8_1_finite(amax / 127.0f);
                 const int8_t q = q8_1_quant(xi, d, amax);
-                xs[i / Q8K].qs[i % Q8K] = q;
-                if (i % Q8K == 0) xs[i / Q8K].ds = q8_1_ds(d, sum);
+                xs_q[i] = q;
+                if (i % Q8K == 0) xs_d[i / Q8K] = __low2float(q8_1_ds(d, sum));
             }
         }
         __syncthreads();
-        x = xs;
     }
+    const auto x = [&] {
+        if constexpr (SMX) return XSm{reinterpret_cast<const int*>(xs_q), xs_d};
+        else return XGl{a.xq};
+    }();
     __syncwarp();
     for (int k = 0; k < nrows; ++k) {
         const int s = k % a.nslot;
-        mbar_wait(bars + s, (uint32_t) (k / a.nslot) & 1u);
+        if (a.probe != 3) mbar_wait(bars + s, (uint32_t) (k / a.nslot) & 1u);
         int g = gw + k * nwt, m = 0;
         while (m + 1 < a.n_mats && g >= a.n_out[m]) g -= a.n_out[m++];
         const uintptr_t src = (uintptr_t) (a.w[m] + (size_t) g * a.row_bytes[m]);
         const uint8_t* row = slots + s * a.slot_bytes + (src & 15);
         float acc[NC];
-        if (a.probe) {
+        if (a.probe == 1) {
 #pragma unroll
             for (int j = 0; j < NC; ++j) acc[j] = (float) row[lane];
+        } else if (SMX && a.probe == 2) {
+            row_dot<NC, NB>(a.type[m], row, XSmProbe{reinterpret_cast<const int*>(xs_q), xs_d}, nb32, a.n_in / QK, lane, acc);
         } else
         row_dot<NC, NB>(a.type[m], row, x, nb32, a.n_in / QK, lane, acc);
 #pragma unroll
         for (int j = 0; j < NC; ++j)
             if (lane == j) a.y[m][(size_t) j * a.n_out[m] + g] = acc[j];
         __syncwarp();
-        if (lane == 0 && k + a.nslot < nrows) {
+        if (lane == 0 && k + a.nslot < nrows && a.probe != 3) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             issue_row(a, gw + (k + a.nslot) * nwt, slots + s * a.slot_bytes, bars + s, policy);
         }
     }
 }
 
-template<int NC, int NB>
+template<int NC, int NB, bool SMX>
 __global__ void __launch_bounds__(kNW * WARP, 1) dense_kernel(const DenseArgs a) {
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_block<NC, NB>(a, blockIdx.x, gridDim.x, smem);
+    dense_block<NC, NB, SMX>(a, blockIdx.x, gridDim.x, smem);
 }
 
 int row_bytes_of(int type, int n_in) {
@@ -591,7 +629,7 @@ int smem_optin() {
     return n;
 }
 
-template<int NC, int NB>
+template<int NC, int NB, bool SMX>
 void launch_nb(DenseArgs a, cudaStream_t s) {
     const int x_bytes = a.x ? (NC * (a.n_in / Q8K) * (int) sizeof(Q81Block) + 15) & ~15 : 0;
     const int fixed = kNW * kMaxSlots * 8 + x_bytes;
@@ -602,22 +640,25 @@ void launch_nb(DenseArgs a, cudaStream_t s) {
     const int smem = fixed + kNW * a.nslot * a.slot_bytes;
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(dense_kernel<NC, NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_optin());
+        cudaFuncSetAttribute(dense_kernel<NC, NB, SMX>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_optin());
         attr = true;
     }
     int blocks = sm_count();
     const int need = (a.rows + kNW - 1) / kNW;
     if (need < blocks) blocks = need;
-    launch_pdl(dense_kernel<NC, NB>, dim3((unsigned) blocks), dim3(kNW * WARP), (size_t) smem, s, a);
+    launch_pdl(dense_kernel<NC, NB, SMX>, dim3((unsigned) blocks), dim3(kNW * WARP), (size_t) smem, s, a);
 }
 
 // the block counts of the GDN projections' rows unrolled, any other one looped
 template<int NC>
 void launch_nc(const DenseArgs& a, cudaStream_t s) {
-    switch (a.n_in / QK) {
-        case 10: launch_nb<NC, 10>(a, s); break;
-        case 24: launch_nb<NC, 24>(a, s); break;
-        default: launch_nb<NC, 0>(a, s); break;
+    const int nb = a.n_in / QK;
+    if (a.x) {
+        if (nb == 10) launch_nb<NC, 10, true>(a, s);
+        else launch_nb<NC, 0, true>(a, s);
+    } else {
+        if (nb == 24) launch_nb<NC, 24, false>(a, s);
+        else launch_nb<NC, 0, false>(a, s);
     }
 }
 
