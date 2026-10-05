@@ -222,6 +222,9 @@ int main(int argc, char** argv) {
 
     // time: hot (back to back) and cold (192 MB written before each read, then R, bo and w_norm rewritten as the
     // previous kernels leave them; the read alone timed)
+    for (int hold = 1; hold >= 0; --hold) {
+    K::hc_fused_set_knobs(hold);
+    std::printf("weight streams %s:\n", hold ? "after the norm's inputs (hold)" : "at launch");
     for (int T = t_lo; T <= t_hi; ++T)
         for (int router = 0; router < 2; ++router) {
             const double bytes = 2.0 * LR * D * 2 + HC * D * 2 + (router ? (double) NE * N * 2 : 0.0);
@@ -253,6 +256,9 @@ int main(int argc, char** argv) {
                         T, router ? "read+router" : "read", hot[0], hot[1], bytes / hot[1] / 1e3, cold[0], cold[1],
                         bytes / cold[1] / 1e3);
         }
+    }
+    K::hc_fused_set_knobs(1);
+
     // per-phase times of single reads (globaltimer, relative to the first CTA's start)
     {
         int sms = 0;
@@ -288,6 +294,11 @@ int main(int argc, char** argv) {
                     }
                     std::printf("\n");
                 }
+                for (int b = 0; b < sms; ++b)
+                    if (h[b * 16 + 6])
+                        std::printf("  top-10 CTA %d: ticket %.2f loads %.2f softmax %.2f select %.2f us after its rows\n", b,
+                                    (h[b * 16 + 8] - h[b * 16 + 5]) / 1e3, (h[b * 16 + 9] - h[b * 16 + 8]) / 1e3,
+                                    (h[b * 16 + 10] - h[b * 16 + 9]) / 1e3, (h[b * 16 + 6] - h[b * 16 + 10]) / 1e3);
             }
         }
     }
