@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     K::fused_gr_check();
+    if (const char* e = std::getenv("HC_WARM")) K::hc_fused_set_warm(std::atoi(e));
     const int N = 2560, HC = 4, D = N * HC, LR = 320, NE = 512, KT = 10, TM = 8;
     std::mt19937 rng(11);
     std::normal_distribution<float> nd(0.f, 1.f);

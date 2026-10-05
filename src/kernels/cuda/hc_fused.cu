@@ -60,6 +60,7 @@ struct HcLaunch {
     int nb;          // CTAs (one per SM)
     int slot;        // counter set
     float* xc;       // the copies of xn, [NCOPY][MAXT][D]
+    float* warm;     // scratch for the router's warm-up run ([nb][MAXT][NE]), or null
     unsigned long long* dbg;   // bench only: per-CTA phase times [nb][16]
 };
 
@@ -564,7 +565,7 @@ __device__ __forceinline__ float warp_sum16_ftz(float (&v)[16], int lane) {
 // order - thread t's pairs t + 256 j, two ordered FMAs each, the warp's xor tree, then the tree over the 8 warp sums
 // and 24 zeros - for every row and token at once; the xor trees run 16 values at a time (warp_sum16_ftz).
 template <int T>
-__device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0, int e1, int tid,
+__device__ __noinline__ void hc_router_rows(const float* mixed, float* logits, const uint16_t* wsm, int e0, int e1, int tid,
                                float* partials /* [RT_MAX_ROWS * T][WARPS] */) {
     const int lane = tid & 31, warp = tid >> 5, ne = e1 - e0;
     constexpr int PAIRS = N / 2 / THREADS;   // 5
@@ -576,7 +577,7 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
         for (int q = 0; q < TG; ++q)
 #pragma unroll
             for (int j = 0; j < PAIRS; ++j)
-                x[q][j] = k0 + q < T ? __ldcg(reinterpret_cast<const float2*>(a.mixed + (size_t) (k0 + q) * N) + tid + THREADS * j)
+                x[q][j] = k0 + q < T ? __ldcg(reinterpret_cast<const float2*>(mixed + (size_t) (k0 + q) * N) + tid + THREADS * j)
                                      : make_float2(0.f, 0.f);
         float acc[32];
 #pragma unroll
@@ -622,7 +623,7 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
                 }
                 const float sum = warp_sum16_ftz(v, lane);
                 const int m = r * 16 + (lane >> 1), e = m / TG, q = m - e * TG;
-                if ((lane & 1) == 0 && m < NV && e < ne && k0 + q < T) a.logits[(size_t) (k0 + q) * NE + e0 + e] = sum;
+                if ((lane & 1) == 0 && m < NV && e < ne && k0 + q < T) logits[(size_t) (k0 + q) * NE + e0 + e] = sum;
             }
         }
         __syncthreads();
@@ -633,10 +634,8 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
 // passes pick, in order, the largest p with ties to the lower expert - a total order - so the same ten come out of:
 // theta = the 10th largest of the 32 lane maxima (every expert of the top ten is at least theta), then every expert
 // at least theta ranked by counting.  `cand` is shared memory for 2 * 512 + 2 * 10 words.
-__device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, unsigned long long* dbg, int b) {
-    const float* logits = a.logits + (size_t) k * NE;
-    int32_t* ids = a.ids + (size_t) k * KT;
-    float* weights = a.weights + (size_t) k * KT;
+__device__ __noinline__ void hc_top10(const float* logits, int32_t* ids, float* weights, int k, int lane, uint32_t* cand,
+                                      unsigned long long* dbg, int b) {
     float values[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) values[i] = __ldcg(logits + lane + i * 32);
@@ -811,11 +810,24 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
                 mbar_expect_tx(&bars[UP_PIECES], bytes);
                 bulk_g2s(smem, a.w_router + (size_t) e0 * N, bytes, &bars[UP_PIECES]);
             }
+            if (L.warm != nullptr) {   // the router and top-10 code once on scratch while the up items run
+                __shared__ int s_early;
+                if (tid == 0) s_early = ld_acquire(&sy->up.v) < (unsigned) it.nu / 2;
+                __syncthreads();
+                if (s_early) {
+                    float* const wl = L.warm + (size_t) b * MAXT * NE;
+                    hc_router_rows<T>(L.warm, wl, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p));
+                    if (tid < 32)
+                        hc_top10(L.warm, reinterpret_cast<int32_t*>(wl), wl + 16, 1, tid,
+                                 reinterpret_cast<uint32_t*>(rt_p + RT_MAX_ROWS * MAXT * WARPS * 4), nullptr, b);
+                    __syncthreads();
+                }
+            }
             cta_wait(&sy->up.v, (unsigned) it.nu, tid);
             mbar_wait(&bars[UP_PIECES], rt_ph);
             rt_ph ^= 1u;
             stamp(dbg, b, 4, tid);
-            hc_router_rows<T>(a, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p));
+            hc_router_rows<T>(a.mixed, a.logits, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p));
             stamp(dbg, b, 5, tid);
             __syncthreads();
             if (tid == 0) {
@@ -827,7 +839,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             if (s_last) {
                 stamp(dbg, b, 8, tid);
                 if ((tid >> 5) < T)
-                    hc_top10(a, tid >> 5, tid & 31,
+                    hc_top10(a.logits + (size_t) (tid >> 5) * NE, a.ids + (size_t) (tid >> 5) * KT,
+                             a.weights + (size_t) (tid >> 5) * KT, tid >> 5, tid & 31,
                              reinterpret_cast<uint32_t*>(rt_p + RT_MAX_ROWS * MAXT * WARPS * 4) + (tid >> 5) * (2 * NE + 2 * KT),
                              dbg, b);
                 __syncthreads();
@@ -878,12 +891,13 @@ constexpr KernelFn kKernels[MAXT] = {hc_fused_kernel<1>, hc_fused_kernel<2>, hc_
                                       hc_fused_kernel<5>, hc_fused_kernel<6>, hc_fused_kernel<7>, hc_fused_kernel<8>};
 
 unsigned long long* g_dbg = nullptr;
-int g_slot = 0;
+int g_slot = 0, g_warm = -1;
 
 struct DevInfo {
     bool checked = false, ok = false;
     int sms = 0;
     float* xc = nullptr;
+    float* warm = nullptr;
 };
 DevInfo g_dev[16];
 
@@ -902,7 +916,9 @@ const DevInfo& dev_info() {
         cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         d.sms = sms;
         d.ok = major == 12 && sms - ND >= MIN_NU && optin >= SMEM + 1024 &&
-               cudaMalloc((void**) &d.xc, (size_t) NCOPY * MAXT * D * sizeof(float)) == cudaSuccess;
+               cudaMalloc((void**) &d.xc, (size_t) NCOPY * MAXT * D * sizeof(float)) == cudaSuccess &&
+               cudaMalloc((void**) &d.warm, (size_t) sms * MAXT * NE * sizeof(float)) == cudaSuccess &&
+               cudaMemset(d.warm, 0, (size_t) sms * MAXT * NE * sizeof(float)) == cudaSuccess;
         for (int t = 0; t < MAXT && d.ok; ++t)
             d.ok = cudaFuncSetAttribute(kKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
         cudaGetLastError();
@@ -921,6 +937,7 @@ void hc_fused_init() {
 }
 
 void hc_fused_set_debug(unsigned long long* dbg) { g_dbg = dbg; }
+void hc_fused_set_warm(int on) { g_warm = on; }
 
 // STRATA_DEC_HC_DBG=<file>: every captured read stamps its CTAs' phases into its own slot; a thread writes the
 // median over slots (per T and kind) of each phase's min/max over CTAs, relative to the slot's first CTA start.
@@ -1023,6 +1040,8 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.slot = g_slot;
     g_slot = (g_slot + 1) % NSLOT;
     L.xc = d.xc;
+    static const bool env_warm = [] { const char* e = std::getenv("STRATA_DEC_HC_WARM"); return e && e[0] == '1'; }();
+    L.warm = g_warm >= 0 ? (g_warm ? d.warm : nullptr) : (env_warm ? d.warm : nullptr);
     L.dbg = g_dbg;
     if (L.dbg == nullptr) L.dbg = dbg_slot(a.T, a.w_router != nullptr);
     launch_pdl(kKernels[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM, (cudaStream_t) stream, L);
