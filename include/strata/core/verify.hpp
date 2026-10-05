@@ -41,6 +41,8 @@ namespace strata::core {
 
 class NativeHead;
 class RemoteExpertOpt;
+class PeerExperts;
+struct DecMoe;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
@@ -62,6 +64,9 @@ public:
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
+    /// STRATA_DEC_MOE=1: the peer expert tier the window drives itself (persistent kernel, mapped rings) instead of
+    /// the pool launching it per layer.  Before init.
+    void set_peer(PeerExperts* peer) { peer_ = peer; }
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -214,6 +219,11 @@ public:
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
+    PeerExperts* peer_ = nullptr;
+    DecMoe* dm_ = nullptr;                 ///< STRATA_DEC_MOE=1: the device-planned MoE tail (null: off)
+    bool dm_init(std::string& err);
+    bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
+    void dm_free();
     bool capture(int T, std::string& err);
     bool pdl_rec_ = false;                 ///< STRATA_PDL=1: record_window may use programmatic dependent launch
     bool pdl_off_ = false;                 ///< ... a window failed to capture with it: the later ones go without

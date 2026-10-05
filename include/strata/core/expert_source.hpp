@@ -233,6 +233,9 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// STRATA_DEC_MOE: the window planned this layer on the device; ext_kind[i] is entry i's tier (0 CUDA0, 2 the
+    /// peer, -1 the CPU).  The pool then computes only the CPU entries, publishes no plan and launches no peer.
+    const int32_t* ext_kind = nullptr;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
