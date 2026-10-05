@@ -61,9 +61,6 @@ void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* s
 /// that ran a down item, 2 for an up item.  nullptr = off.
 void hc_fused_set_debug(unsigned long long* dbg);
 
-/// The router CTAs run the router rows and the top-10 once on scratch while the up projection runs, so their code is
-/// in the instruction caches when the real inputs land (1), or not (0); -1 = STRATA_DEC_HC_WARM.
-void hc_fused_set_warm(int on);
 /// Tests only: k CTAs, one per SM, that hold their SM until *go (mapped host memory) is nonzero; each adds one to
 /// *started once running.
 void hc_test_hold_sms(int k, int* go, int* started, void* stream);
