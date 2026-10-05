@@ -16,6 +16,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/hc_fused.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -313,6 +314,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
+    if (const char* e = std::getenv("STRATA_DEC_HC"); e && e[0] == '1') strata::kernels::hc_fused_init();
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -565,6 +567,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     static const bool dec_qsa = [] { const char* v = std::getenv("STRATA_DEC_QSA"); return v != nullptr && std::atoi(v) != 0; }();
+    // STRATA_DEC_HC=1: each hyper-connection read (and the FFN read's router) as one kernel, bitwise the kernels it
+    // replaces; the next read's w_norm is prefetched into L2 at its end
+    static const bool dec_hc_env = [] { const char* e = std::getenv("STRATA_DEC_HC"); return e && e[0] == '1'; }();
+    const bool dec_hc = dec_hc_env && hc_fused_supported();
+    // STRATA_DEC_HC_PF=1: each read also prefetches the next read's weight matrices into L2 at its end
+    static const bool dec_hc_pf = [] { const char* e = std::getenv("STRATA_DEC_HC_PF"); return e && e[0] == '1'; }();
     // STRATA_PDL=1 (pdl.hpp): the dense chain's kernels may start during the previous kernel's tail.  Only where
     // that previous kernel is one of them or another plain kernel; never with the profile's or trace's stamps.
     const bool pdl = pdl_rec_ && !prof_on_ && trace_m_ == nullptr && !batch_rec_;
@@ -701,9 +709,32 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
+        auto hc_args = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+            HcFusedArgs h;
+            h.T = n; h.R = Rt(tb); h.R_out = Rt(tb); h.apply = apply;
+            h.bo_prev = bo_ + tb * N; h.inj_prev = inj_prev + tb * HC;
+            h.w_norm = (const float*) wn[half]->data; h.w_down = (const uint16_t*) wd[half]->data;
+            h.w_up = (const uint16_t*) wu[half]->data; h.w_inject = (const uint16_t*) wi[half]->data;
+            h.eps = EPS; h.lo = lo_ + tb * g.hc_lr; h.rs = rs_ + tb * HC; h.inject_out = inj_out + tb * HC;
+            h.mixed = mixed_ + tb * N; h.xn = xn_ + (size_t) tb * HC * N;
+            return h;
+        };
         {
             PdlScope ps(pdl, true);   // the read's first kernel follows a combine, copy or wait: a plain launch
-            gr_read_group(0, pending, inj2_, inj_);
+            if (dec_hc) {
+                HcFusedArgs h = hc_args(0, pending, inj2_, inj_);
+                h.pf[0] = wn[1]->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float);
+                if (dec_hc_pf) {   // the FFN read's weights and router, read after the mixer
+                    const size_t mat = (size_t) g.hc_lr * HC * N * 2;
+                    h.pf[1] = wd[1]->data; h.pf_bytes[1] = mat;
+                    h.pf[2] = wu[1]->data; h.pf_bytes[2] = mat;
+                    const WeightRef* wr = v.get("ffn_gate_inp.weight");
+                    if (wr != nullptr) { h.pf[3] = wr->data; h.pf_bytes[3] = (size_t) NE * N * 2; }
+                }
+                hc_fused_read(h, cs);
+            } else {
+                gr_read_group(0, pending, inj2_, inj_);
+            }
         }
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
@@ -954,9 +985,39 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
+        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        const bool router_multi = dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
+        bool routed = false;   // the fused read ran the router too
         {
             PdlScope ps(pdl);   // after the out projection's kernel
-            gr_read_group(1, true, inj_, inj2_);
+            if (dec_hc) {
+                HcFusedArgs h = hc_args(1, true, inj_, inj2_);
+                if (router_multi) {
+                    h.w_router = (const uint16_t*) w_router->data;
+                    h.logits = logits_ + tb * NE; h.ids = ids_ + tb * K; h.weights = w_ + tb * K;
+                    routed = true;
+                }
+                const WeightRef *next_norm = nullptr, *next_down = nullptr, *next_up = nullptr;
+                if (l + 1 < g.n_layers) {
+                    const LayerView vn(wt, l + 1);
+                    next_norm = vn.get("hc_attn_norm.weight");
+                    next_down = vn.get("hc_attn_down.weight");
+                    next_up = vn.get("hc_attn_up.weight");
+                } else {
+                    next_norm = wt.find("output_hc_norm.weight");
+                    next_down = wt.find("output_hc_down.weight");
+                    next_up = wt.find("output_hc_up.weight");
+                }
+                if (next_norm != nullptr) { h.pf[0] = next_norm->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float); }
+                if (dec_hc_pf && next_down != nullptr && next_up != nullptr) {   // the next read's weights, read after the experts
+                    const size_t mat = (size_t) g.hc_lr * HC * N * 2;
+                    h.pf[1] = next_down->data; h.pf_bytes[1] = mat;
+                    h.pf[2] = next_up->data; h.pf_bytes[2] = mat;
+                }
+                hc_fused_read(h, cs);
+            } else {
+                gr_read_group(1, true, inj_, inj2_);
+            }
         }
         static const bool sh_stream_env = [] {
             const char* e = std::getenv("STRATA_SH_STREAM");
@@ -970,8 +1031,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
-        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        if (routed) {
+        } else if (router_multi) {
             try {
                 PdlScope ps(pdl);   // after the hc read's last kernel (the fork adds no node on this stream)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
@@ -1198,7 +1259,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.inject_out = head_inj_;
                 a.mixed = head_mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            if (dec_hc) {
+                HcFusedArgs h;
+                h.T = T; h.R = Rt(0); h.R_out = Rt(0); h.apply = true; h.bo_prev = bo_; h.inj_prev = inj2_;
+                h.w_norm = (const float*) hn->data; h.w_down = (const uint16_t*) hd->data; h.w_up = (const uint16_t*) hu->data;
+                h.eps = EPS; h.lo = lo_; h.rs = rs_; h.mixed = head_mixed_; h.xn = xn_;
+                hc_fused_read(h, cs);
+            } else {
+                fused_gr_read_multi(fa, T, xn_, cs);
+            }
         } else {
             for (int t = 0; t < T; ++t) {
                 BlockBuffers bb = ss.block;
