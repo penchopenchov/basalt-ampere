@@ -333,7 +333,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
     const struct { const char* what; std::vector<int> sizes; int64_t gy; } rows[] = {
         {"no group (the PCIe call at pcie_frac 0)", {}, 4},
         {"1 group of 2 entries (a PCIe call)", {2}, 4},
-        {"28 groups, 40 entries (a VRAM call)", vram, 0},
+        {"28 groups, 40 entries (a VRAM call)", vram, env_int("STRATA_BENCH_GY", 0)},
     };
     const char* ab = std::getenv("STRATA_BENCH_AB");
     const bool ab_gu2 = ab != nullptr && std::string(ab) == "gu2";   // B: STRATA_BENCH_GU2 (default 1)

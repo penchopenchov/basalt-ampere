@@ -2211,6 +2211,9 @@ bool g_gu_stage = env_on("STRATA_GU_STAGE");
 // STRATA_DEC_GU2=1: the grid formats' gate/up rows two a warp (native_gu2_kernel); 2: also the SwiGLU pass inside
 // the down kernel (native_down2_kernel).  The same bits.
 int g_gu2 = [] { const char* v = std::getenv("STRATA_DEC_GU2"); return v ? std::atoi(v) : 0; }();
+// STRATA_DEC_GY (with STRATA_DEC_GU2=2; default 24): the most block rows a grouped call launches when its caller
+// leaves grid_groups to it (more groups take the stride; the same bits)
+int g_dec_gy = [] { const char* v = std::getenv("STRATA_DEC_GY"); return v ? std::atoi(v) : 24; }();
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 // STRATA_GU_MMA=1: IQ3_XXS gate/up on int8 tensor cores, sm_80+ (the same bits; not with STRATA_GROUPED_V1); =2:
 // only for the calls whose caller asks (native_grouped_set_mma_hint), e.g. windows of several entries per expert
@@ -3089,7 +3092,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool chain = false;
 #endif
-    const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+    int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+    if (chain && grid_groups <= 0 && g_dec_gy > 0 && gy > g_dec_gy) gy = g_dec_gy;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
 #if defined(STRATA_HIP_GFX906)
     const int em0 = exp_mode();
