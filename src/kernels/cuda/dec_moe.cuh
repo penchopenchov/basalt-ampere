@@ -21,7 +21,7 @@ __device__ __forceinline__ void dm_group(const int32_t* s_ids, const int32_t* s_
     if (mine) {
         const int32_t e = s_ids[tid];
         for (int j = 0; j < n; ++j)
-            if (s_ids[j] == e) {
+            if (s_ids[j] == e && s_kind[j] == want) {
                 if (j < first) first = j;
                 if (j < tid) ++rank;
                 ++cnt;
@@ -60,15 +60,19 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     __shared__ int32_t s_ncpu, s_npeer, s_ng, s_ne;
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     if (tid == 0) { s_ncpu = 0; s_npeer = 0; }
+    if (tid < n) s_ids[tid] = a.ids[tid];
     __syncthreads();
     if (tid < n) {
-        const int32_t e = a.ids[tid];
+        const int32_t e = s_ids[tid];
+        // an id past the table or repeated within its token goes to the CPU pool: a device group then holds at most
+        // one entry per token (kDmMaxEnt, the persistent kernels' shared rows)
+        bool ok = e >= 0 && e < a.n_expert;
+        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
         int kd = -1;
-        if (e >= 0 && e < a.n_expert) {
+        if (ok) {
             if (a.res0[e] >= 0) kd = 0;
             else if (a.res1 != nullptr && a.res1[e] >= 0) kd = 2;
         }
-        s_ids[tid] = e;
         s_kind[tid] = kd;
         if (kd < 0) atomicAdd(&s_ncpu, 1);
         else if (kd == 2) atomicAdd(&s_npeer, 1);
