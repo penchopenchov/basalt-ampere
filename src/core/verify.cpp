@@ -129,9 +129,7 @@ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // the qkv projection (both stream together), joined before the one-launch recurrence with the gated norm
 // (STRATA_DEC_GDNF=1's kernel), no separate norm launch.  Wider windows run slower with either.  4 = with 1, the MoE
 // route split: CUDA0's plan and q8_1 rows on the main stream (the routed experts follow it at once), the ring for the
-// peer card and the CPU pool (mapped rows, system fences, doorbells) on the priority side stream before the shared
-// expert.  8 = the SwiGLU pass inside the routed experts' down kernel (STRATA_DEC_GU2=2's chain; iq_kernels.cu).
-// 16 = the tiers' wait inside the combine kernel instead of its own launch.
+// peer card and the CPU pool (mapped rows, system fences, doorbells) on a stream of its own at that priority.
 int dec_pk_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_PK"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -520,6 +518,7 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (sh_hi_) cudaStreamSynchronize(sh_hi_);
+    if (ring_hi_) cudaStreamSynchronize(ring_hi_);
     dm_free();
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
@@ -533,6 +532,9 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
+    if (ring_hi_) cudaStreamDestroy(ring_hi_);
+    if (ev_ring_) cudaEventDestroy(ev_ring_);
+    if (ev_ring_join_) cudaEventDestroy(ev_ring_join_);
     if (shx_sync_) cudaFree(shx_sync_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
@@ -734,7 +736,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (dec_pk()) {
         int least = 0, greatest = 0;
         if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
-            cudaStreamCreateWithPriority(&sh_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess) {
+            cudaStreamCreateWithPriority(&sh_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+            ((dec_pk_mask() & 4) &&
+             (cudaStreamCreateWithPriority(&ring_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+              cudaEventCreateWithFlags(&ev_ring_, cudaEventDisableTiming) != cudaSuccess ||
+              cudaEventCreateWithFlags(&ev_ring_join_, cudaEventDisableTiming) != cudaSuccess))) {
             err = "verify: STRATA_DEC_PK stream create failed";
             return false;
         }
@@ -899,6 +905,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
+    bool ring_fork[2] = {false, false};   // STRATA_DEC_PK & 4: the group's ring stream is joined in post
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
@@ -1387,9 +1394,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool sh_fork = !shx && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
         cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) && n >= 2 ? sh_hi_ : sh_cs_) : cs;
-        // STRATA_DEC_PK & 4: the side stream forks after the router (its ring reads the routed ids)
-        const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && (dec_pk_mask() & 4);
-        if (sh_fork && !pk_ring) {
+        // STRATA_DEC_PK & 4: the ring on its own stream, forked after the router, joined where the side branch is
+        const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && ring_hi_ != nullptr;
+        ring_fork[grp] = pk_ring;
+        if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
         }
@@ -1433,14 +1441,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
             if (pk_ring) {   // the ring beside, CUDA0's plan and rows here
-                cudaEventRecord(ev_fork_, cs);
-                cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
+                cudaEventRecord(ev_ring_, cs);
+                cudaStreamWaitEvent(ring_hi_, ev_ring_, 0);
                 DmRouteArgs rp = ra;
                 rp.mode = 2; rp.xq_pub = dm_->xq_pub;
                 {
                     PdlScope pp(false);
-                    dec_moe_route(rp, sh_stream);
+                    dec_moe_route(rp, ring_hi_);
                 }
+                cudaEventRecord(ev_ring_join_, ring_hi_);
                 ra.mode = 1;
             }
             dec_moe_route(ra, cs);
@@ -1618,15 +1627,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (!shx && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
+            if (ring_fork[grp]) cudaStreamWaitEvent(cs, ev_ring_join_, 0);   // the ring's launch
         }
         if (dm) {
-            const bool wait_in = (dec_pk_mask() & 16) != 0;   // the combine's blocks wait for the tiers
-            if (!wait_in) dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs);
+            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs);
             stamp(l, 23, grp);
             try {
                 dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
-                                shared_ + tb * N, bo_ + tb * N, N, K, n, wait_in ? dm_->m_w + 16 : nullptr,
-                                wait_in ? m_flag_ : nullptr, ring, cs);
+                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {

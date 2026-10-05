@@ -341,6 +341,8 @@ private:
     cudaStream_t sh_cs_ = nullptr;
     cudaStream_t sh_hi_ = nullptr;   ///< STRATA_DEC_PK: the shared expert's side stream at the greatest priority
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    cudaStream_t ring_hi_ = nullptr;   ///< STRATA_DEC_PK & 4: the MoE ring's stream at the greatest priority
+    cudaEvent_t ev_ring_ = nullptr, ev_ring_join_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
 
