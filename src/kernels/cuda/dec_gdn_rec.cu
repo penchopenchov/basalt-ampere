@@ -145,6 +145,8 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     const float dt = a.dt[head], sa = a.ssm_a[head], gam = a.gamma[col];
     stamp(a, 1);
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
+    // this block has started: the barrier the ranks wait on before writing into each other's shared memory
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     pdl_wait();
     stamp(a, 2);
 
@@ -239,7 +241,9 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         }
     }
     stamp(a, 6);
-    // every rank's sums of squares, pushed into every rank's shared memory before one cluster barrier
+    // every rank's sums of squares, pushed into every rank's shared memory (once every rank has started) before one
+    // cluster barrier
+    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
     if (rg == 0) {
         const int t = lane / 4, r = lane % 4;
         const float v = __shfl_sync(0xffffffffu, wsum_t, t);
