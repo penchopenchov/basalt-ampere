@@ -281,7 +281,7 @@ struct Layers {
 // the 48 calls of one variant captured in one graph
 cudaGraphExec_t make_graph(cudaStream_t s, Setup& S, const Layers& Ls, bool v1, int64_t gy, int gu2 = -1) {
     k::native_grouped_set_v1(v1);
-    if (gu2 >= 0) k::native_grouped_set_gu2(gu2 != 0);
+    if (gu2 >= 0) k::native_grouped_set_gu2(gu2);
     cudaGraph_t g;
     cudaGraphExec_t ge;
     ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
@@ -336,7 +336,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         {"28 groups, 40 entries (a VRAM call)", vram, 0},
     };
     const char* ab = std::getenv("STRATA_BENCH_AB");
-    const bool ab_gu2 = ab != nullptr && std::string(ab) == "gu2";
+    const bool ab_gu2 = ab != nullptr && std::string(ab) == "gu2";   // B: STRATA_BENCH_GU2 (default 1)
     k::native_expert_set_mode(-1, env_int("STRATA_BENCH_PHASE", 0));   // 1: gate/up + SwiGLU only, 2: down only
     if (ab_gu2) std::printf("  A / B: the new launches without / with STRATA_DEC_GU2\n");
     cudaEvent_t e0, e1;
@@ -347,7 +347,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         const Layers Ls(S, ng);                                       // 48 x 28 experts: 3.7 GB for the VRAM call
         // STRATA_BENCH_AB=gu2: the new launches without / with native_gu2_kernel instead of v1 / new
         cudaGraphExec_t ga = ab_gu2 ? make_graph(s, S, Ls, false, r.gy, 0) : make_graph(s, S, Ls, true, 0);
-        cudaGraphExec_t gb = make_graph(s, S, Ls, false, r.gy, ab_gu2 ? 1 : -1);
+        cudaGraphExec_t gb = make_graph(s, S, Ls, false, r.gy, ab_gu2 ? env_int("STRATA_BENCH_GU2", 1) : -1);
         std::vector<float> ta, tb;
         for (int i = 0; i < kWarmPairs + kPairs; ++i) {
             const bool a_first = i % 2 == 0;
@@ -386,7 +386,7 @@ int main(int argc, char** argv) {
     check(18, 20, 512, 256, s, rng, 12);                                // groups of more than 8 entries
     {   // STRATA_DEC_GU2=1: the new launches take native_gu2_kernel (2560-value rows only), v1 the multi kernel
         const char* g = std::getenv("STRATA_DEC_GU2");
-        if (g != nullptr && g[0] == '1') {
+        if (g != nullptr && (g[0] == '1' || g[0] == '2')) {
             for (int gu : {16, 17, 18, 21, 22})
                 for (int dt : {20, 42}) check(gu, dt, 2560, 640, s, rng, gu == 18 ? 8 : 6);
             check(22, 20, 2560, 512, s, rng, 3);

@@ -321,17 +321,34 @@ struct DmShared {
 // with a co-resident grid every wait ends.  The rows are native_expert_grouped's, bit for bit.
 template<int TG, int TD>
 __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, float* gate,
-                           float* up, float* out, unsigned int* done, int b, int nb) {
+                           float* up, float* out, unsigned int* done, int b, int nb, bool gu2 = false) {
     const int tid = threadIdx.x;
     constexpr bool SG = kStageIqGrid<TG>;
-    const uint32_t* s_grid = stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
+    // gu2: gate/up items of GU2_ROWS rows, two a warp (native_gu2_kernel's rows, the same bits)
+    const bool g2 = kGu2<TG> && gu2 && gu2_usable(L);
+    const uint32_t* s_grid;
+    if constexpr (kGu2<TG>) s_grid = g2 ? gu2::stage_grid<TG>(sm.grid, tid) : stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
+    else s_grid = stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
     const int ng = sm.ng;
-    const int nrb = (int) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS);
+    const int ir = g2 ? GU2_ROWS : GU_ROWS;
+    const int nrb = (int) ((2 * L.n_ff + ir - 1) / ir);
     const int warp = tid >> 5, lane = tid & 31;
     for (int it = b; it < ng * nrb; it += nb) {
         const int g = it / nrb, rb = it - g * nrb;
-        dm_gu_item<TG, SG>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate, up,
-                           s_grid, warp, lane);
+        if constexpr (kGu2<TG>) {
+            const int row = rb * GU2_ROWS + 2 * warp;
+            if (g2) {
+                if (row < 2 * L.n_ff)
+                    gu2::pair<TG>((const uint8_t*) sm.gptr[g], row, sm.start[g], sm.start[g + 1], sm.tok, xq, L, gate,
+                                  up, s_grid, lane);
+            } else {
+                dm_gu_item<TG, SG>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate,
+                                   up, s_grid, warp, lane);
+            }
+        } else {
+            dm_gu_item<TG, SG>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate, up,
+                               s_grid, warp, lane);
+        }
         __threadfence();
         __syncthreads();
         if (tid == 0) atomicAdd(done + g, 1u);
@@ -375,9 +392,9 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42)
 
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
-                               float* out, unsigned int* done, int b, int nb) {
+                               float* out, unsigned int* done, int b, int nb, bool gu2 = false) {
     switch (L.gu_type * 100 + L.d_type) {
-#define STRATA_DM_CASE(TG, TD) case TG * 100 + TD: dm_experts<TG, TD>(sm, xq, L, gate, up, out, done, b, nb); break;
+#define STRATA_DM_CASE(TG, TD) case TG * 100 + TD: dm_experts<TG, TD>(sm, xq, L, gate, up, out, done, b, nb, gu2); break;
         STRATA_DM_PAIRS(STRATA_DM_CASE)
 #undef STRATA_DM_CASE
         default: break;
@@ -475,7 +492,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         bool bad = false;
         for (int g = 0; g < sm.ng; ++g) bad |= sm.gptr[g] == 0ull;
         stamp(s, 2);
-        if (!bad) dm_experts_any(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb);
+        if (!bad) dm_experts_any(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0);
         stamp(s, 3);
         __threadfence_system();
         ++served;
@@ -880,6 +897,8 @@ int dec_moe_peer_blocks() {
 
 bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream) {
     DmPeerArgs args = a;
+    static const int gu2_env = [] { const char* v = std::getenv("STRATA_DEC_GU2"); return v ? std::atoi(v) : 0; }();
+    if (gu2_env > 0) args.gu2 = 1;
     void* params[] = {&args};
     const cudaError_t e = cudaLaunchCooperativeKernel((const void*) dm_peer_kernel, dim3((unsigned) blocks),
                                                       dim3(kDmThreads), params, 0, (cudaStream_t) stream);

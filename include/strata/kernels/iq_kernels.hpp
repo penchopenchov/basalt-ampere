@@ -70,9 +70,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 void native_grouped_set_v1(bool v1);
 /// STRATA_GU_MMA=2: this thread's next grouped calls take the tensor-core gate/up (where it applies) when on
 void native_grouped_set_mma_hint(bool on);
-/// STRATA_DEC_GU2: the grid formats' gate/up rows on native_gu2_kernel (bitwise the same; not with v1).  Set before
-/// graph capture.
-void native_grouped_set_gu2(bool on);
+/// STRATA_DEC_GU2: 1 the grid formats' gate/up rows on native_gu2_kernel, 2 also the SwiGLU pass inside the down
+/// kernel (bitwise the same; not with v1).  Set before graph capture.
+void native_grouped_set_gu2(int mode);
 
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
