@@ -64,6 +64,10 @@ struct HcLaunch {
     int pf;          // 1 = the down CTAs prefetch the router rows (split-K: and w_up) into L2 after their weights
     int ups;         // 1 = the up rows' second chunks spread over the warp
     float* xc;       // the copies of xn, [NCOPY][MAXT][D]
+    int hcx;         // 1 = the top-10 as the last item; 2 = also the router logits from the up slices (see Items)
+    const unsigned long long* t10_dummy;   // [NE] fixed logits for the top-10's dry runs: 32.32 fixed point, then f32
+    float* t10_scratch;                    // [nb][2 * KT] their outputs
+    unsigned long long* racc;              // hcx: [MAXT][NE] the logits as 32.32 fixed point, summed over the up slices
     unsigned long long* dbg;   // bench only: per-CTA phase times [nb][16]
 };
 
@@ -785,13 +789,25 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
 // passes pick, in order, the largest p with ties to the lower expert - a total order - so the same ten come out of:
 // theta = the 10th largest of the 32 lane maxima (every expert of the top ten is at least theta), then every expert
 // at least theta ranked by counting.  `cand` is shared memory for 2 * 512 + 2 * 10 words.
-__device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, unsigned long long* dbg, int b) {
-    const float* logits = a.logits + (size_t) k * NE;
-    int32_t* ids = a.ids + (size_t) k * KT;
-    float* weights = a.weights + (size_t) k * KT;
+// `dbg` non-null: stamp the phases.  FIX: the logits come as 32.32 fixed point from `fx` and are written to `logits`
+// (when non-null).
+template <bool FIX = false>
+__device__ void hc_top10(const float* logits, int32_t* ids, float* weights, int lane, uint32_t* cand,
+                         unsigned long long* dbg, int b, const unsigned long long* fx = nullptr) {
     float values[16];
+    if constexpr (FIX) {
+        long long q[16];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = __ldcg(logits + lane + i * 32);
+        for (int i = 0; i < 16; ++i) q[i] = (long long) __ldcg(fx + lane + i * 32);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] = (float) ((double) q[i] * 0x1p-32);
+            if (logits != nullptr) const_cast<float*>(logits)[lane + i * 32] = values[i];
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) values[i] = __ldcg(logits + lane + i * 32);
+    }
     float maximum = -INFINITY;
 #pragma unroll
     for (int i = 0; i < 16; ++i) maximum = max_ftz(maximum, values[i]);
@@ -808,7 +824,7 @@ __device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, 
         values[i] = mul_ftz(values[i], reciprocal);
         if (isnan(values[i])) values[i] = -FLT_MAX;
     }
-    if (k == 0) stamp(dbg, b, 12, lane);
+    stamp(dbg, b, 12, lane);
     // (v, e) before (v', e') when v > v' or (v == v' and e < e')
     auto before = [](float v, int e, float v2, int e2) { return v > v2 || (v == v2 && e < e2); };
     // the lane's maximum
@@ -851,7 +867,7 @@ __device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, 
             ++off;
         }
     __syncwarp();
-    if (k == 0) stamp(dbg, b, 13, lane);
+    stamp(dbg, b, 13, lane);
     // rank every candidate; ranks 0..9 are the selection in order
     float* top_v = reinterpret_cast<float*>(cand + 2 * NE);
     int* top_e = reinterpret_cast<int*>(cand + 2 * NE + KT);
@@ -863,7 +879,7 @@ __device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, 
         if (r < KT) { top_v[r] = v; top_e[r] = e; }
     }
     __syncwarp();
-    if (k == 0) stamp(dbg, b, 14, lane);
+    stamp(dbg, b, 14, lane);
     // route's sums: lane L adds, in rank order, the selected values of its experts (expert & 31 == L)
     float selected_sum = 0.0f;
 #pragma unroll
@@ -879,25 +895,84 @@ __device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, 
     }
 }
 
+// One copy of the top-10's code for the hcx item and its dry runs, so the dry runs load the code the item runs.
+__device__ __noinline__ void hc_top10_item(const float* logits, int32_t* ids, float* weights, int lane, uint32_t* cand,
+                                           unsigned long long* dbg, int b) {
+    hc_top10(logits, ids, weights, lane, cand, dbg, b);
+}
+__device__ __noinline__ void hc_top10_item_fx(const unsigned long long* fx, float* logits, int32_t* ids, float* weights,
+                                              int lane, uint32_t* cand, unsigned long long* dbg, int b) {
+    hc_top10<true>(logits, ids, weights, lane, cand, dbg, b, fx);
+}
+
+// hcx: the up slice's share of the router logits.  Thread t takes experts t and t + 256 against the slice's mixed
+// columns (`mix`, [T][nc] in shared memory), in column order, and adds each sum as 32.32 fixed point - integer adds,
+// so the total is the same whatever order the slices land in.  `rw`: the experts' weights for the slice's columns.
+constexpr int RW = 16;   // column pairs per slice at most
+__device__ __forceinline__ UpSlice up_slice_even(int u, int nu) {   // column pairs, so the weights load as u32
+    const int c0 = 2 * (u * (N / 2) / nu), c1 = 2 * ((u + 1) * (N / 2) / nu);
+    return {c0, c1 - c0};
+}
+__device__ __forceinline__ void hcx_router_load(const HcFusedArgs& a, UpSlice sl, int tid, uint32_t (&rw)[2][RW]) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(a.w_router + (size_t) (tid + THREADS * h) * N + sl.c0);
+#pragma unroll
+        for (int j = 0; j < RW; ++j) rw[h][j] = 2 * j < sl.nc ? __ldg(w + j) : 0u;
+    }
+}
+template <int T>
+__device__ void hcx_router_part(const UpSlice sl, const uint32_t (&rw)[2][RW], const float* mix, int tid,
+                                unsigned long long* racc) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int e = tid + THREADS * h;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float* m = mix + k * sl.nc;
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < RW; ++j) {
+                if (2 * j >= sl.nc) break;
+                acc = fmaf(__uint_as_float(rw[h][j] << 16), m[2 * j], acc);
+                acc = fmaf(__uint_as_float(rw[h][j] & 0xffff0000u), m[2 * j + 1], acc);
+            }
+            const long long q = __float2ll_rn(acc * 4294967296.0f);
+            asm volatile("red.relaxed.gpu.global.add.u64 [%0], %1;" ::"l"(racc + (size_t) k * NE + e), "l"((unsigned long long) q)
+                         : "memory");
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the kernel
 // The read is a queue of work items in dependency order: the norm tasks, the down rows, the up slices, the router
 // rows.  A CTA claims one item at a time (in claim order) and waits only on items before its own, all of them claimed
 // by running CTAs, so the read finishes however few of its CTAs are resident.  With every CTA resident the first
 // claims split the CTAs into norm, down and up roles; the norm CTAs then take the remaining up (and down) items, the
 // down CTAs the router rows.
+// With hcx (and a router) the top-10 is one item after the router rows; hcx 2: the up slices form the router logits
+// too (no router items) and the top-10 item follows them.
 template <int T>
 struct Items {
-    int ncopy, ntask, nu, down, up, rt, end;
-    __device__ Items(int nb, int nu_, bool router) {
+    int ncopy, ntask, nu, down, up, rt, t10, end;
+    __device__ Items(int nb, int nu_, bool router, int hcx) {
         ncopy = nb / (4 * T) < NCOPY ? nb / (4 * T) : NCOPY;
         ntask = 4 * T * ncopy;
         nu = nu_ > 0 ? nu_ : nb - ND;
         down = ntask;
         up = down + ND;
         rt = up + nu;
-        end = rt + (router ? ND : 0);
+        t10 = rt + (router && hcx != 2 ? ND : 0);
+        end = t10 + (router && hcx ? 1 : 0);
     }
 };
+
+constexpr int CAND_WORDS = 2 * NE + 2 * KT;   // hc_top10's shared memory per warp
+// Shared memory bytes an up item of nc columns uses (w_up rows, then UpSmem).
+template <int T>
+__device__ __forceinline__ int up_smem_bytes(int nc) {
+    return 4 * nc * LR * 2 + (T * LR + 3 * T * HC * nc) * 4;
+}
 
 template <int T>
 __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
@@ -910,7 +985,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     const int b = blockIdx.x, tid = threadIdx.x, nb = L.nb;
     unsigned long long* dbg = L.dbg;
     HcSync* sy = &g_hc_sync[L.slot];
-    const Items<T> it(nb, L.nu, a.w_router != nullptr);
+    const Items<T> it(nb, L.nu, a.w_router != nullptr, L.hcx);
     stamp(dbg, b, 0, tid);
     if (tid == 0) {
         for (int p = 0; p <= UP_PIECES; ++p) mbar_init(&bars[p], 1);
@@ -930,6 +1005,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             const int j = item;
             if (!first) hc_norm_pre(a, j & 3, tid, nr);
             hc_norm_task(a, L.xc, (j >> 2) % T, j & 3, j / (4 * T), tid, nr, part, &s_rs, &sy->nload.v);
+            if (L.hcx == 2 && it.end > it.t10 && j < T * 4 && (j & 3) == 0)   // the token's logit sums, zero before any up slice adds
+                for (int e = tid; e < NE; e += THREADS) L.racc[(size_t) (j >> 2) * NE + e] = 0ull;
             stamp(dbg, b, 10, tid);
             cta_signal(&sy->norm.v, tid);
             stamp(dbg, b, 11, tid);
@@ -949,17 +1026,67 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             cta_signal(&sy->down.v, tid);
             stamp(dbg, b, 3, tid);
         } else if (item < it.rt) {
-            const UpSlice sl = up_slice(item - it.up, it.nu);
+            const bool rx = L.hcx == 2 && it.end > it.t10;   // this slice's share of the router logits too
+            const UpSlice sl = rx ? up_slice_even(item - it.up, it.nu) : up_slice(item - it.up, it.nu);
             if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 2;
+            uint32_t rw[2][RW];
+            if (rx) hcx_router_load(a, sl, tid, rw);
             hc_up_pre<T>(a, sl, tid, smem);
-            if (tid == 0) hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph);
+            if (tid == 0) {
+                hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph);
+            } else if (it.end > it.t10) {
+                // while the down projection runs, warps 1..3 run the top-10 on fixed logits: its code is then in this
+                // SM's instruction caches if this CTA claims the top-10 item
+                const int warp = tid >> 5, off = (up_smem_bytes<T>(sl.nc) + 15) & ~15;
+                int32_t* ids = reinterpret_cast<int32_t*>(L.t10_scratch + (size_t) b * 2 * KT);
+                uint32_t* cand = reinterpret_cast<uint32_t*>(smem + off) + (warp - 1) * CAND_WORDS;
+                if (warp >= 1 && warp <= 3 && off + warp * CAND_WORDS * 4 <= SMEM) {
+                    if (L.hcx == 2)
+                        hc_top10_item_fx(L.t10_dummy, nullptr, ids, L.t10_scratch + (size_t) b * 2 * KT + KT, tid & 31, cand,
+                                         nullptr, b);
+                    else
+                        hc_top10_item(reinterpret_cast<const float*>(L.t10_dummy + NE), ids,
+                                      L.t10_scratch + (size_t) b * 2 * KT + KT, tid & 31, cand, nullptr, b);
+                }
+            }
             up_ph ^= 1u;
             __syncthreads();
             stamp(dbg, b, 2, tid);
             if (L.ups) hc_up_main<T, true>(a, sl, tid, smem, true, dbg, b);
             else hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
+            if (rx) {
+                // the slice's mixed columns again (hc_up_main's expression) into shared memory, then the logit shares
+                const UpSmem u = up_smem(smem, sl.nc, T);
+                float* mix = reinterpret_cast<float*>(smem + ((up_smem_bytes<T>(sl.nc) + 15) & ~15));
+                for (int i = tid; i < T * sl.nc; i += THREADS) {
+                    const int k = i / sl.nc, col = i - k * sl.nc;
+                    float s = 0.0f;
+#pragma unroll
+                    for (int c = 0; c < HC; ++c) s += u.g[(k * HC + c) * sl.nc + col];
+                    mix[i] = s / (float) HC;
+                }
+                __syncthreads();
+                hcx_router_part<T>(sl, rw, mix, tid, L.racc);
+                stamp(dbg, b, 5, tid);
+            }
             cta_signal(&sy->up.v, tid);
             stamp(dbg, b, 3, tid);
+        } else if (item >= it.t10) {
+            // the top-10 once every router row (hcx 2: up slice) has added its logits: warp k takes token k
+            if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 3;
+            if (L.hcx == 2) cta_wait(&sy->up.v, (unsigned) it.nu, tid);
+            else cta_wait(&sy->router.v, (unsigned) ND, tid);
+            stamp(dbg, b, 8, tid);
+            const int k = tid >> 5;
+            uint32_t* cand = reinterpret_cast<uint32_t*>(smem) + k * CAND_WORDS;
+            if (k < T && L.hcx == 2)
+                hc_top10_item_fx(L.racc + (size_t) k * NE, a.logits + (size_t) k * NE, a.ids + (size_t) k * KT,
+                                 a.weights + (size_t) k * KT, tid & 31, cand, tid < 32 ? dbg : nullptr, b);
+            else if (k < T)
+                hc_top10_item(a.logits + (size_t) k * NE, a.ids + (size_t) k * KT, a.weights + (size_t) k * KT, tid & 31,
+                              cand, tid < 32 ? dbg : nullptr, b);
+            __syncthreads();
+            stamp(dbg, b, 6, tid);
         } else {
             const int r = item - it.rt, e0 = r * NE / ND, e1 = (r + 1) * NE / ND;
             char* const rt_p = smem + RT_MAX_ROWS * N * 2;
@@ -974,19 +1101,25 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             stamp(dbg, b, 4, tid);
             hc_router_rows<T>(a, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p));
             stamp(dbg, b, 5, tid);
-            __syncthreads();
-            if (tid == 0) {
-                __threadfence();
-                s_last = atomicAdd(&sy->router.v, 1u) == (unsigned) ND - 1;
-                if (s_last) __threadfence();
+            if (it.end > it.t10) {   // the top-10 item waits on the count
+                cta_signal(&sy->router.v, tid);
+                if (tid == 0) s_last = 0;
+            } else {
+                __syncthreads();
+                if (tid == 0) {
+                    __threadfence();
+                    s_last = atomicAdd(&sy->router.v, 1u) == (unsigned) ND - 1;
+                    if (s_last) __threadfence();
+                }
             }
             __syncthreads();
             if (s_last) {
                 stamp(dbg, b, 8, tid);
                 if ((tid >> 5) < T)
-                    hc_top10(a, tid >> 5, tid & 31,
+                    hc_top10(a.logits + (size_t) (tid >> 5) * NE, a.ids + (size_t) (tid >> 5) * KT,
+                             a.weights + (size_t) (tid >> 5) * KT, tid & 31,
                              reinterpret_cast<uint32_t*>(rt_p + RT_MAX_ROWS * MAXT * WARPS * 4) + (tid >> 5) * (2 * NE + 2 * KT),
-                             dbg, b);
+                             tid < 32 ? dbg : nullptr, b);
                 __syncthreads();
                 stamp(dbg, b, 6, tid);
             }
@@ -1128,9 +1261,10 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_sk_kernel(HcLaunch L) {
             if (s_last) {
                 stamp(dbg, b, 8, tid);
                 if ((tid >> 5) < T)
-                    hc_top10(a, tid >> 5, tid & 31,
+                    hc_top10(a.logits + (size_t) (tid >> 5) * NE, a.ids + (size_t) (tid >> 5) * KT,
+                             a.weights + (size_t) (tid >> 5) * KT, tid & 31,
                              reinterpret_cast<uint32_t*>(rt_p + SK_RMAX * MAXT * WARPS * 4) + (tid >> 5) * (2 * NE + 2 * KT),
-                             dbg, b);
+                             tid < 32 ? dbg : nullptr, b);
                 __syncthreads();
                 stamp(dbg, b, 6, tid);
             }
@@ -1183,9 +1317,11 @@ constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel
 // STRATA_DEC_HC_UPS=1: each up row's second chunks formed by the lanes that have none (the same products, fewer
 // instructions).  STRATA_DEC_HC_SK=1: the split-K read.  STRATA_DEC_HC_RPF=1: the down CTAs prefetch the router rows (and, split-K,
 // w_up) into L2 behind their weights.  STRATA_DEC_HC_NU=<n>: the up slices (the down CTAs take the ones past nb - 81).
+// STRATA_DEC_HCX=1: the top-10 as one item after the router rows, claimed by an up CTA that ran its code once while
+// waiting (bitwise).  =2: the router logits formed by the up slices instead (fixed-point sums, no router items).
 struct SkConf {
     bool on = false;
-    int pf = 0, nu = 0, ups = 0;
+    int pf = 0, nu = 0, ups = 0, hcx = 0;
 };
 const SkConf& sk_conf() {
     static const SkConf c = [] {
@@ -1198,6 +1334,8 @@ const SkConf& sk_conf() {
         k.nu = e ? std::atoi(e) : 0;
         e = std::getenv("STRATA_DEC_HC_UPS");
         k.ups = e && e[0] == '1' ? 1 : 0;
+        e = std::getenv("STRATA_DEC_HCX");
+        k.hcx = e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0;
         return k;
     }();
     return c;
@@ -1210,6 +1348,9 @@ struct DevInfo {
     bool checked = false, ok = false;
     int sms = 0;
     float* xc = nullptr;
+    unsigned long long* t10 = nullptr;    // [NE] fixed logits (fixed point), [NE] the same as f32 (in NE / 2 words), then
+                                          // [sms][2 * KT] float scratch
+    unsigned long long* racc = nullptr;   // [NSLOT][MAXT][NE]
 };
 DevInfo g_dev[16];
 
@@ -1228,7 +1369,20 @@ const DevInfo& dev_info() {
         cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         d.sms = sms;
         d.ok = major == 12 && sms - ND >= MIN_NU && optin >= SMEM + 1024 &&
-               cudaMalloc((void**) &d.xc, (size_t) NCOPY * MAXT * D * sizeof(float)) == cudaSuccess;
+               cudaMalloc((void**) &d.xc, (size_t) NCOPY * MAXT * D * sizeof(float)) == cudaSuccess &&
+               cudaMalloc((void**) &d.t10, (size_t) NE * 12 + (size_t) sms * 2 * KT * 4) == cudaSuccess &&
+               cudaMalloc((void**) &d.racc, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess;
+        if (d.ok) {   // distinct logits with a few ties, so the dry run takes the usual path
+            std::vector<unsigned long long> v(NE);
+            std::vector<float> f(NE);
+            for (int e = 0; e < NE; ++e) {
+                const double x = ((e * 389) % NE) / 64.0 - 4.0 + (e % 97 == 0 ? 0.0 : 0.001);
+                v[e] = (unsigned long long) (long long) (x * 4294967296.0);
+                f[e] = (float) x;
+            }
+            d.ok = cudaMemcpy(d.t10, v.data(), NE * 8, cudaMemcpyHostToDevice) == cudaSuccess &&
+                   cudaMemcpy(d.t10 + NE, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+        }
         for (int t = 0; t < MAXT && d.ok; ++t)
             d.ok = cudaFuncSetAttribute(kKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
         for (int t = 0; t < MAXT && d.ok && sk_conf().on; ++t)
@@ -1278,7 +1432,7 @@ void dbg_dump(const char* path) {
         if (!f) continue;
         for (int key = 2; key <= 2 * MAXT + 1; ++key) {
             // per slot: [phase][grp][min,max]
-            std::vector<double> v[16][2][2];
+            std::vector<double> v[16][3][2];
             int cnt = 0;
             for (int sl = 0; sl < n; ++sl) {
                 if (g_insitu.meta[sl] != key) continue;
@@ -1288,10 +1442,10 @@ void dbg_dump(const char* path) {
                 if (t0 == ~0ull) continue;
                 ++cnt;
                 for (int i = 0; i < 16; ++i)
-                    for (int g = 0; g < 2; ++g) {
+                    for (int g = 0; g < 3; ++g) {
                         double mn = 1e30, mx = -1;
                         for (int b = 0; b < nb; ++b) {
-                            if ((x[b * 16 + 15] == 2) != (g == 1)) continue;
+                            if ((x[b * 16 + 15] >= 2 ? (int) x[b * 16 + 15] - 1 : 0) != g) continue;
                             if (i == 15 || !x[b * 16 + i] || x[b * 16 + i] < t0) continue;
                             const double t = (double) (x[b * 16 + i] - t0) / 1e3;
                             mn = std::min(mn, t); mx = std::max(mx, t);
@@ -1302,8 +1456,11 @@ void dbg_dump(const char* path) {
             if (!cnt) continue;
             std::fprintf(f, "T %d %s: %d reads (median over reads of min/max over CTAs, us)\n", key / 2,
                          key & 1 ? "read+router" : "read", cnt);
-            for (int g = 0; g < 2; ++g) {
-                std::fprintf(f, "  %s:", g ? "up  " : "down");
+            for (int g = 0; g < 3; ++g) {
+                bool any = false;
+                for (int i = 0; i < 16; ++i) any = any || !v[i][g][0].empty();
+                if (!any) continue;
+                std::fprintf(f, "  %s:", g == 2 ? "t10 " : g ? "up  " : "down");
                 for (int i = 0; i < 16; ++i) {
                     if (v[i][g][0].empty()) continue;
                     double m[2];
@@ -1353,6 +1510,10 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.xc = d.xc;
     L.dbg = g_dbg;
     L.ups = sk_conf().ups;
+    L.hcx = sk_conf().hcx;
+    L.t10_dummy = d.t10;
+    L.t10_scratch = reinterpret_cast<float*>(d.t10 + NE) + NE;
+    L.racc = d.racc + (size_t) L.slot * MAXT * NE;
     if (L.dbg == nullptr) L.dbg = dbg_slot(a.T, a.w_router != nullptr);
     const SkConf& sk = sk_conf();
     if (sk.on) {

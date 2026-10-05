@@ -11,6 +11,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -180,6 +181,11 @@ int main(int argc, char** argv) {
     };
 
     int failures = 0;
+    // HC_TOL=1 (a path that is not bitwise): per output the max |diff| against the plain kernels (and relative to the
+    // largest |value|), routed experts that differ, and - bit for bit - each token's outputs against the same token in a
+    // window of t_hi tokens
+    const bool tol = std::getenv("HC_TOL") && std::getenv("HC_TOL")[0] == '1';
+    std::vector<std::vector<float>> by_t(t_hi + 1);
     for (int T = t_lo; T <= t_hi; ++T)
         for (int mode = 0; mode < 3; ++mode) {   // 0: attention-side read, 1: FFN read + router, 2: the head's read
             const bool inject = mode != 2, router = mode == 1;
@@ -202,6 +208,35 @@ int main(int argc, char** argv) {
                 }
                 cudaStreamSynchronize(s);
                 const std::vector<float> v2 = fetch(1, T);
+                if (tol) {
+                    double mx[8] = {0}, ref[8] = {0}, sum[8] = {0};
+                    size_t cnt[8] = {0};
+                    for (size_t i = 0; i < v[0].size(); ++i) {
+                        const int pt = part_of(i, T);
+                        if ((!inject && pt == 3) || (!router && pt >= 5) || pt == 7) continue;
+                        const double d = std::fabs((double) v[0][i] - (double) v[1][i]);
+                        mx[pt] = std::max(mx[pt], d); sum[pt] += d; ++cnt[pt];
+                        ref[pt] = std::max(ref[pt], (double) std::fabs(v[0][i]));
+                    }
+                    int idiff = 0;
+                    if (router) {
+                        const size_t base = v[0].size() - (size_t) T * KT;
+                        for (int k = 0; k < T; ++k)
+                            for (int j = 0; j < KT; ++j) {
+                                bool found = false;
+                                for (int j2 = 0; j2 < KT; ++j2)
+                                    found |= v[0][base + k * KT + j] == v[1][base + k * KT + j2];
+                                idiff += found ? 0 : 1;
+                            }
+                    }
+                    std::printf("T %d mode %d apply %d:", T, mode, apply);
+                    for (int pt : {0, 1, 4, 5, 6})
+                        if (cnt[pt]) std::printf(" %s max %.2e (rel %.2e) mean %.2e |", part_name[pt], mx[pt],
+                                                 ref[pt] > 0 ? mx[pt] / ref[pt] : 0.0, sum[pt] / cnt[pt]);
+                    std::printf(" routed experts differing %d of %d\n", idiff, router ? T * KT : 0);
+                    if (mode == 1 && apply == 1) by_t[T] = v[1];
+                    continue;
+                }
                 size_t ndiff = 0, first = 0;
                 for (size_t i = 0; i < v[0].size(); ++i) {
                     if (!inject && part_of(i, T) == 3) continue;
@@ -221,6 +256,25 @@ int main(int argc, char** argv) {
                 }
             }
         }
+    if (tol && !by_t[t_hi].empty()) {   // token k of a window of T against token k of the widest window
+        int bad = 0;
+        const int TH = t_hi;
+        const size_t szh[8] = {(size_t) TH * D, (size_t) TH * LR, (size_t) TH * HC, (size_t) TH * HC, (size_t) TH * N,
+                               (size_t) TH * NE, (size_t) TH * KT, (size_t) TH * KT};
+        const int per[8] = {D, LR, HC, HC, N, NE, KT, KT};
+        for (int T = t_lo; T < t_hi; ++T) {
+            if (by_t[T].empty()) continue;
+            size_t ot = 0, oh = 0;
+            for (int pt = 0; pt < 8; ++pt) {
+                for (size_t i = 0; i < (size_t) T * per[pt]; ++i)
+                    if (std::memcmp(&by_t[T][ot + i], &by_t[t_hi][oh + i], 4) != 0) ++bad;
+                ot += (size_t) T * per[pt];
+                oh += szh[pt];
+            }
+        }
+        std::printf("hc_fused_parity: %d values of a token differ between window sizes (must be 0)\n", bad);
+        failures += bad ? 1 : 0;
+    }
     std::printf("hc_fused_parity: %d differing cases (T %d..%d, 3 modes, with and without the pending write)\n",
                 failures, t_lo, t_hi);
 
@@ -269,31 +323,51 @@ int main(int argc, char** argv) {
         std::vector<unsigned long long> h((size_t) sms * 16);
         static const char* const ph[15] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit",
                                            "ticket", "up-lo", "norm-wr", "norm-sig", "t10-smax", "t10-cand", "t10-rank"};
+        // HC_STAMP_REPS=<n>: the median over n reads of each phase's min/max over CTAs
+        const char* re = std::getenv("HC_STAMP_REPS");
+        const int reps = re ? std::max(1, std::atoi(re)) : 1;
         for (int T : {1, 2, 3}) {
             if (T < t_lo || T > t_hi) continue;
             for (int cold = 0; cold < 2; ++cold) {
-                for (int i = 0; i < 3; ++i) run(1, T, true, true, true);
-                if (cold) evict(1, 1);
-                cudaMemsetAsync(ddbg, 0, (size_t) sms * 128, s);
-                K::hc_fused_set_debug(ddbg);
-                run(1, T, true, true, true);
-                K::hc_fused_set_debug(nullptr);
-                cudaStreamSynchronize(s);
-                cudaMemcpy(h.data(), ddbg, h.size() * 8, cudaMemcpyDeviceToHost);
-                unsigned long long t0 = ~0ull;
-                for (int b = 0; b < sms; ++b) if (h[b * 16] && h[b * 16] < t0) t0 = h[b * 16];
-                std::printf("T %d %s phases (us, min/max over CTAs; CTAs with a down item | with an up item):\n", T, cold ? "cold" : "hot");
-                for (int grp = 0; grp < 2; ++grp) {
-                    std::printf("  %s:", grp ? "up  " : "down");
-                    for (int i = 0; i < 15; ++i) {
-                        if (i >= 10 && i <= 11) continue;
-                        double mn = 1e30, mx = -1;
-                        for (int b = 0; b < sms; ++b) {
-                            if ((h[b * 16 + 15] == 2) != (grp == 1) || !h[b * 16 + i]) continue;
-                            const double v = (double) (h[b * 16 + i] - t0) / 1e3;
-                            mn = v < mn ? v : mn; mx = v > mx ? v : mx;
+                std::vector<double> acc[3][15][2];
+                for (int rep = 0; rep < reps; ++rep) {
+                    for (int i = 0; i < 3; ++i) run(1, T, true, true, true);
+                    if (cold) evict(1, 1);
+                    cudaMemsetAsync(ddbg, 0, (size_t) sms * 128, s);
+                    K::hc_fused_set_debug(ddbg);
+                    run(1, T, true, true, true);
+                    K::hc_fused_set_debug(nullptr);
+                    cudaStreamSynchronize(s);
+                    cudaMemcpy(h.data(), ddbg, h.size() * 8, cudaMemcpyDeviceToHost);
+                    unsigned long long t0 = ~0ull;
+                    for (int b = 0; b < sms; ++b) if (h[b * 16] && h[b * 16] < t0) t0 = h[b * 16];
+                    for (int grp = 0; grp < 3; ++grp)
+                        for (int i = 0; i < 15; ++i) {
+                            double mn = 1e30, mx = -1;
+                            for (int b = 0; b < sms; ++b) {
+                                if ((h[b * 16 + 15] >= 2 ? (int) h[b * 16 + 15] - 1 : 0) != grp || !h[b * 16 + i]) continue;
+                                const double v = (double) (h[b * 16 + i] - t0) / 1e3;
+                                mn = v < mn ? v : mn; mx = v > mx ? v : mx;
+                            }
+                            if (mx >= 0) { acc[grp][i][0].push_back(mn); acc[grp][i][1].push_back(mx); }
                         }
-                        if (mx >= 0) std::printf(" %s %.1f/%.1f", ph[i], mn, mx);
+                }
+                std::printf("T %d %s phases (us, median over %d reads of min/max over CTAs; CTAs with a down item | an up item "
+                            "| the top-10 item):\n", T, cold ? "cold" : "hot", reps);
+                for (int grp = 0; grp < 3; ++grp) {
+                    bool any = false;
+                    for (int i = 0; i < 15; ++i) any = any || !acc[grp][i][0].empty();
+                    if (!any) continue;
+                    std::printf("  %s:", grp == 2 ? "t10 " : grp ? "up  " : "down");
+                    for (int i = 0; i < 15; ++i) {
+                        if ((i >= 10 && i <= 11) || acc[grp][i][0].empty()) continue;
+                        double m[2];
+                        for (int j = 0; j < 2; ++j) {
+                            auto& w = acc[grp][i][j];
+                            std::nth_element(w.begin(), w.begin() + w.size() / 2, w.end());
+                            m[j] = w[w.size() / 2];
+                        }
+                        std::printf(" %s %.1f/%.1f", ph[i], m[0], m[1]);
                     }
                     std::printf("\n");
                 }
