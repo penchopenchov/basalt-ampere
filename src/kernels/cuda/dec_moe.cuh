@@ -58,6 +58,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap];
     __shared__ int32_t s_ncpu, s_npeer, s_ng, s_ne;
+    if (a.sh_gw != nullptr) pdl_trigger();   // dec_moe3's gate/up kernel may start (only weights before its wait)
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     if (tid == 0) { s_ncpu = 0; s_npeer = 0; }
     __syncthreads();
@@ -876,37 +877,48 @@ __device__ __forceinline__ float m3_dot(int ty, const uint8_t* row, const block_
 
 __device__ __forceinline__ void m3_bar() { asm volatile("bar.sync 1, 256;" ::: "memory"); }   // the 8 routed warps
 
-// active block rows: one per group up to gridDim.y, at least one (the shared rows)
-__device__ __forceinline__ int m3_rows(int ng) { return min(max(ng, 1), (int) gridDim.y); }
-
 template<int TG>
 __global__ void __launch_bounds__(kM3GuThreads, 2) m3_gu_kernel(const DmPlan* __restrict__ plan,
                                                            const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                            DmM3Args a, float* __restrict__ gate, float* __restrict__ up) {
     pdl_trigger();
-    const int ng = plan->counts[0], Y = m3_rows(ng);
-    if ((int) blockIdx.y >= Y) return;
-    __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
-    const uint32_t* s_grid = gu2::stage_grid<TG>(s_grid_buf, threadIdx.x & 255);
+    // the shared rows of the slice: blockIdx.y, blockIdx.y + gridDim.y, ..., whatever the plan (known before the wait)
+    const int gy = gridDim.y, nj = ((int) GU2_ROWS - (int) blockIdx.y + gy - 1) / gy;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int n_ff = (int) L.n_ff;
+    auto srow = [&](int jj, bool& is_up, int& r) {
+        const int rr = blockIdx.x * GU2_ROWS + (int) blockIdx.y + jj * gy;
+        is_up = rr >= n_ff;
+        r = is_up ? rr - n_ff : rr;
+        return is_up ? a.su + (size_t) r * a.su_row : a.sg + (size_t) r * a.sg_row;
+    };
+    if (warp >= 8)   // the weights before the wait
+        for (int jj = warp - 8; jj < nj; jj += kM3GuThreads / 32 - 8) {
+            bool u;
+            int r;
+            const uint8_t* wr = srow(jj, u, r);
+            const int rb = (int) (u ? a.su_row : a.sg_row);
+            if (lane * 128 < rb) asm volatile("prefetch.global.L2 [%0];" ::"l"(wr + lane * 128));
+        }
+    __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
+    const uint32_t* s_grid = gu2::stage_grid<TG>(s_grid_buf, threadIdx.x & 255);
+    pdl_wait();
+    const int ng = plan->counts[0];
     if (warp < 8) {
         const int row = blockIdx.x * GU2_ROWS + 2 * warp;
         if (row >= 2 * n_ff) return;
-        for (int g = blockIdx.y; g < ng; g += gridDim.y)
+        for (int g = blockIdx.y; g < ng; g += gy)
             gu2::pair<TG>((const uint8_t*) plan->ptr[g], row, plan->start[g], plan->start[g + 1], plan->tok, xq, L, gate,
                           up, s_grid, lane);
         return;
     }
-    // the shared warps: (row, token) dots of the slice's rows blockIdx.y, blockIdx.y + Y, ... taken in turn
-    const int hb = (int) (L.n_embd / 32), sw = warp - 8, nj = ((int) GU2_ROWS - (int) blockIdx.y + Y - 1) / Y;
-    for (int it = sw; it < nj * a.n_tok; it += kM3GuThreads / 32 - 8) {
+    // the shared warps: the (row, token) dots taken in turn
+    const int hb = (int) (L.n_embd / 32);
+    for (int it = warp - 8; it < nj * a.n_tok; it += kM3GuThreads / 32 - 8) {
         const int jj = it / a.n_tok, t = it - jj * a.n_tok;
-        const int rr = blockIdx.x * GU2_ROWS + (int) blockIdx.y + jj * Y;
-        if (rr >= 2 * n_ff) break;
-        const bool is_up = rr >= n_ff;
-        const int r = is_up ? rr - n_ff : rr;
-        const uint8_t* wr = is_up ? a.su + (size_t) r * a.su_row : a.sg + (size_t) r * a.sg_row;
+        bool is_up;
+        int r;
+        const uint8_t* wr = srow(jj, is_up, r);
         const float v = m3_dot(is_up ? a.su_type : a.sg_type, wr, xq + (size_t) t * hb, (int) L.n_embd, lane);
         if (lane == 0) (is_up ? up : gate)[((size_t) kDmCap + t) * n_ff + r] = v;
     }
@@ -987,14 +999,15 @@ __global__ void __launch_bounds__(kM3Threads, 4) m3_down_kernel(const DmPlan* __
                                                              const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                              DmM3Args a) {
     constexpr int R = TD == 20 ? 32 : 16;
-    const int ng = plan->counts[0], Y = m3_rows(ng);
+    // block rows with work: the groups', and the shared rows blockIdx.y, blockIdx.y + gridDim.y, ... < R
+    const int ng = plan->counts[0], gy = gridDim.y, Y = min(gy, max(ng, R));
     if ((int) blockIdx.y >= Y) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
     const int r0 = blockIdx.x * R, N = (int) L.n_embd;
     if (warp < 8 && (int) blockIdx.y < ng)   // weights before the wait
         prefetch_l2((const uint8_t*) plan->ptr[blockIdx.y] + L.down_off + (size_t) r0 * L.d_row, R * (int) L.d_row, tid);
     else if (warp == 8)
-        for (int j = blockIdx.y; j < R; j += Y)
+        for (int j = blockIdx.y; j < R; j += gy)
             if (lane == 0) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.sd + (size_t) (r0 + j) * a.sd_row));
     pdl_wait();
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
@@ -1011,7 +1024,7 @@ __global__ void __launch_bounds__(kM3Threads, 4) m3_down_kernel(const DmPlan* __
             gt = __fdividef(1.0f, 1.0f + __expf(-gs));
         }
         const int hb = (int) (L.n_ff / 32);
-        for (int j = blockIdx.y; j < R; j += Y) {
+        for (int j = blockIdx.y; j < R; j += gy) {
             const int r = r0 + j;
             const uint8_t* wr = a.sd + (size_t) r * a.sd_row;
             for (int t = 0; t < a.n_tok; ++t) {
@@ -1306,11 +1319,11 @@ void dec_moe3(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, v
     const int gy = std::max(1, std::min(cap, gy_env));
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS), (unsigned) gy);
     switch (L.gu_type) {
-        case 16: m3_launch(false, m3_gu_kernel<16>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
-        case 17: m3_launch(false, m3_gu_kernel<17>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
-        case 18: m3_launch(false, m3_gu_kernel<18>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
-        case 21: m3_launch(false, m3_gu_kernel<21>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
-        default: m3_launch(false, m3_gu_kernel<22>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
+        case 16: m3_launch(true, m3_gu_kernel<16>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
+        case 17: m3_launch(true, m3_gu_kernel<17>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
+        case 18: m3_launch(true, m3_gu_kernel<18>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
+        case 21: m3_launch(true, m3_gu_kernel<21>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
+        default: m3_launch(true, m3_gu_kernel<22>, ggu, kM3GuThreads, s, plan, X, L, a, S.gate, S.up); break;
     }
     check("dec_moe3/gu");
     const long long nh = (long long) (cap + a.n_tok) * L.n_ff;

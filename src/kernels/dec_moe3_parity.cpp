@@ -65,11 +65,11 @@ template<typename T> void up(T* d, const std::vector<T>& h) {
     ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "upload");
 }
 
-double graph_us(cudaStream_t s, int iters, const std::function<void(cudaStream_t)>& body) {
+double graph_us(cudaStream_t s, int iters, const std::function<void(cudaStream_t, int)>& body) {
     cudaGraph_t g;
     cudaGraphExec_t ge;
     ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
-    for (int i = 0; i < 8; ++i) body(s);   // 8 layers a graph, as consecutive layers run
+    for (int i = 0; i < 8; ++i) body(s, i);   // 8 layers a graph, as consecutive layers run
     ck(cudaStreamEndCapture(s, &g), "end capture");
     ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
     for (int i = 0; i < 5; ++i) ck(cudaGraphLaunch(ge, s), "launch");
@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
         std::printf("layer %d: experts %d/%d, shared %d/%d/%d: %s\n", l, (int) tg->type, (int) td->type, (int) sg->type,
                     (int) su->type, (int) sd->type, ok ? "covered" : "NOT COVERED");
         if (!ok) { ++g_fail; continue; }
-        constexpr int NX = 64;
+        const int NX = bench ? (int) NE : 64;   // bench: every expert its own blob (8 layers' worth, beyond L2)
         std::vector<uint8_t> blobs((size_t) NX * L.bytes);
         for (int x = 0; x < NX; ++x) {
             const size_t E = (size_t) ((x * 37 + 5) % NE);
@@ -185,6 +185,19 @@ int main(int argc, char** argv) {
                      sdb = K::iq_row_bytes((int) sd->type, FF) * H;
         uint8_t *d_sgw = dmal<uint8_t>(sgb), *d_suw = dmal<uint8_t>(sub), *d_sdw = dmal<uint8_t>(sdb);
         uint16_t* d_gi = dmal<uint16_t>(H);
+        // bench: the graph's layer i reads copy i of the shared weights and experts 64 i on (cold in L2, as a window)
+        int cur = 0;
+        int32_t* d_ids_c[8] = {d_ids};
+        const uint8_t *sgw_c[8] = {d_sgw}, *suw_c[8] = {d_suw}, *sdw_c[8] = {d_sdw};
+        if (bench)
+            for (int i = 1; i < 8; ++i) {
+                d_ids_c[i] = dmal<int32_t>(K::kDmCap);
+                uint8_t *a = dmal<uint8_t>(sgb), *b = dmal<uint8_t>(sub), *c = dmal<uint8_t>(sdb);
+                ck(cudaMemcpy(a, d_sgw, sgb, cudaMemcpyDeviceToDevice), "copy");
+                ck(cudaMemcpy(b, d_suw, sub, cudaMemcpyDeviceToDevice), "copy");
+                ck(cudaMemcpy(c, d_sdw, sdb, cudaMemcpyDeviceToDevice), "copy");
+                sgw_c[i] = a; suw_c[i] = b; sdw_c[i] = c;
+            }
         ck(cudaMemcpy(d_sgw, gguf.tensor_data(*sg), sgb, cudaMemcpyHostToDevice), "sg");
         ck(cudaMemcpy(d_suw, gguf.tensor_data(*su), sub, cudaMemcpyHostToDevice), "su");
         ck(cudaMemcpy(d_sdw, gguf.tensor_data(*sd), sdb, cudaMemcpyHostToDevice), "sd");
@@ -244,7 +257,7 @@ int main(int argc, char** argv) {
         };
         auto route = [&](int T, bool m3, cudaStream_t s) {
             K::DmRouteArgs ra;
-            ra.ids = d_ids; ra.x = d_x; ra.n_tok = T; ra.k = (int) KK; ra.n_embd = (int) H; ra.n_expert = (int) NE;
+            ra.ids = d_ids_c[cur]; ra.x = d_x; ra.n_tok = T; ra.k = (int) KK; ra.n_embd = (int) H; ra.n_expert = (int) NE;
             ra.layer = l; ra.res0 = d_res0; ra.res1 = d_res1; ra.cache_base = d_blob; ra.blob = (long long) L.bytes;
             ra.plan = d_plan; ra.xq = d_xq; ra.ring_m = h_ring; ra.x_m = h_x; ra.xq_m = h_xq; ra.host_seq_m = h_words;
             ra.peer_seq_m = h_words + 16; ra.ring = ring; ra.ctr = d_ctr;
@@ -255,7 +268,9 @@ int main(int argc, char** argv) {
             route(T, false, s);
             cudaStream_t ss = s;
             if (fork) { cudaEventRecord(ev_fork, s); cudaStreamWaitEvent(s1, ev_fork, 0); ss = s1; }
-            K::shared_expert_multi(T, d_x, d_xb, nsw, d_gi, d_sgate, d_sup, d_sg, d_sh, H, FF, ss);
+            K::NativeSharedWeights w = nsw;
+            w.gate_data = sgw_c[cur]; w.up_data = suw_c[cur]; w.down_data = sdw_c[cur];
+            K::shared_expert_multi(T, d_x, d_xb, w, d_gi, d_sgate, d_sup, d_sg, d_sh, H, FF, ss);
             if (fork) cudaEventRecord(ev_join, s1);
             const int cap = T * (int) KK;
             K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok, cap, cap,
@@ -267,7 +282,7 @@ int main(int argc, char** argv) {
         auto new_chain = [&](int T, cudaStream_t s) {
             route(T, true, s);
             K::DmM3Args a;
-            a.sg = d_sgw; a.su = d_suw; a.sd = d_sdw;
+            a.sg = sgw_c[cur]; a.su = suw_c[cur]; a.sd = sdw_c[cur];
             a.sg_type = (int) sg->type; a.su_type = (int) su->type; a.sd_type = (int) sd->type;
             a.sh_part = d_part; a.shared = d_sh2; a.parts = d_parts2; a.peer_rows_m = h_peer; a.cpu_rows_m = h_cpu;
             a.weights = d_w; a.output = d_bo2; a.peer_done_m = h_words + 32; a.host_flag_m = h_words + 48;
@@ -338,15 +353,28 @@ int main(int argc, char** argv) {
                 load(T, 0);
                 const K::DmPlan P = [&] { route(T, false, s0); ck(cudaStreamSynchronize(s0), "r"); return down(d_plan, 1)[0]; }();
                 const double bytes = (double) P.counts[0] * (double) L.bytes + (double) (sgb + sub + sdb);
-                const double t_fork = graph_us(s0, 50, [&](cudaStream_t s) { old_chain(T, s, true); });
-                const double t_ser = graph_us(s0, 50, [&](cudaStream_t s) { old_chain(T, s, false); });
-                const double t_new = graph_us(s0, 50, [&](cudaStream_t s) { new_chain(T, s); });
+                {
+                    const auto ids = down(d_ids, (size_t) T * KK);
+                    for (int i = 1; i < 8; ++i) {
+                        std::vector<int32_t> v(ids);
+                        for (auto& e : v) e = (e + 64 * i) % (int) NE;
+                        up(d_ids_c[i], v);
+                    }
+                }
+                const double t_fork = graph_us(s0, 50, [&](cudaStream_t s, int i) { cur = i; old_chain(T, s, true); });
+                const double t_ser = graph_us(s0, 50, [&](cudaStream_t s, int i) { cur = i; old_chain(T, s, false); });
+                const double t_new = graph_us(s0, 50, [&](cudaStream_t s, int i) { cur = i; new_chain(T, s); });
+                cur = 0;
                 std::printf("  bench   T=%d (%2d VRAM groups, %.1f MB): old forked %.1f us (%.0f GB/s), old serial %.1f us, "
                             "moe3 %.1f us (%.0f GB/s)\n", T, P.counts[0], bytes / 1e6, t_fork, bytes / t_fork / 1e3, t_ser,
                             t_new, bytes / t_new / 1e3);
             }
         }
         for (void* p : {(void*) d_blob, (void*) d_sgw, (void*) d_suw, (void*) d_sdw, (void*) d_gi}) cudaFree(p);
+        for (int i = 1; i < 8 && bench; ++i)
+            for (const void* p : {(const void*) d_ids_c[i], (const void*) sgw_c[i], (const void*) suw_c[i],
+                                  (const void*) sdw_c[i]})
+                cudaFree((void*) p);
     }
     std::printf("dec_moe3_parity: %s\n", g_fail ? "FAILED" : "ok");
     return g_fail ? 1 : 0;
