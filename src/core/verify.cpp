@@ -442,6 +442,9 @@ bool Verifier::dm_init(std::string& err) {
 }
 
 // The residency tables the window classifies with: host_res and the peer's, as they are now (between windows).
+// Each upload is queued on the stream that reads it (CUDA0's window, the peer's): a plain cudaMemcpy from pageable
+// memory may return before its DMA lands, and the window's route kernel would then read a table half old, half new
+// (an expert with two tiers in one ring).
 bool Verifier::dm_sync(std::string& err) {
     DecMoe* d = dm_;
     const size_t LE = d->shadow0.size();
@@ -455,12 +458,12 @@ bool Verifier::dm_sync(std::string& err) {
     };
     size_t a = 0, b = 0;
     if (span(hits_.h_res, d->shadow0, a, b) &&
-        cudaMemcpy(d->res0 + a, d->shadow0.data() + a, (b - a) * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaMemcpyAsync(d->res0 + a, d->shadow0.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
         err = "verify: STRATA_DEC_MOE residency upload";
         return false;
     }
     if (d->pdev >= 0 && span(peer_->residency().data(), d->shadow1, a, b)) {
-        if (cudaMemcpy(d->res1 + a, d->shadow1.data() + a, (b - a) * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMemcpyAsync(d->res1 + a, d->shadow1.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "verify: STRATA_DEC_MOE peer residency upload";
             return false;
         }
@@ -468,7 +471,7 @@ bool Verifier::dm_sync(std::string& err) {
         for (size_t i = a; i < b; ++i)
             p[i - a] = d->shadow1[i] >= 0 ? (unsigned long long) peer_->slot_address(d->shadow1[i]) : 0ull;
         const OnDevice on(d->pdev);
-        if (cudaMemcpy(d->ptab + a, p.data(), p.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMemcpyAsync(d->ptab + a, p.data(), p.size() * 8, cudaMemcpyHostToDevice, d->ps) != cudaSuccess) {
             err = "verify: STRATA_DEC_MOE peer table upload";
             return false;
         }
