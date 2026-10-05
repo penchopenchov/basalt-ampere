@@ -594,7 +594,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
 // `bytes` from global `src` (both 16-byte aligned, bytes a multiple of 16) into shared `dst`, completing on `bar`
 __device__ __forceinline__ void bulk_load(void* dst, const void* src, uint32_t bytes, uint64_t* bar, uint64_t policy) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
                  ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)), "l"(policy) : "memory");
 }
 __device__ __forceinline__ uint64_t evict_last_policy() {
