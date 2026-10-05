@@ -173,7 +173,7 @@ __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_
         const float scale = norm_scale256(x, d, HD, a.eps, sums);
         row[d] = scale * x * a.k_norm[d];
         __syncthreads();
-        rope_row<TAB>(row, a.pos_k[t * n_kv + h], d, ra);
+        rope_row<TAB>(row, a.pos_k[t * (a.pos_stride > 0 ? a.pos_stride : n_kv) + h], d, ra);
         const float y = row[d];
         kp[d] = y;
         append_q8_row(y, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
@@ -259,7 +259,7 @@ void qsa_dec_kv_post(const QsaDecKvPost& a, int n, const QsaShapes& s, const Rop
         std::exit(1);
     }
     const RopeArgs ra = rope_args(scaling);
-    const unsigned blocks = (unsigned) (n * s.n_head_kv + 1);
+    const unsigned blocks = (unsigned) (n * s.n_head_kv + (a.idx_raw != nullptr ? 1 : 0));
     if (ra.rt.cos != nullptr)
         kv_post_kernel<true><<<blocks, THREADS, 0, (cudaStream_t) stream>>>(a, n, (int) s.n_head_kv, (int) s.page_size, ra);
     else
@@ -274,7 +274,7 @@ void qsa_dec_q_post(const QsaDecQPost& a, int n, const QsaShapes& s, const RopeS
         std::exit(1);
     }
     const RopeArgs ra = rope_args(scaling);
-    const unsigned blocks = (unsigned) (n * (s.n_head + s.idx_n_head));
+    const unsigned blocks = (unsigned) (n * (s.n_head + (a.q_idx != nullptr ? s.idx_n_head : 0)));
     if (ra.rt.cos != nullptr)
         q_post_kernel<true><<<blocks, THREADS, 0, (cudaStream_t) stream>>>(a, n, (int) s.n_head, (int) s.idx_n_head, ra);
     else

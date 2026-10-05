@@ -57,6 +57,15 @@ struct VerifyHits {
     int64_t blob = 0;
 };
 
+/// STRATA_VERIFY_PROFILE: the GPU's idle time between a verify window and the draft round after it, and back (from
+/// globaltimer stamps of the window's first and last kernels and the drafter's), summed for profile_report.
+struct DecodeGaps {
+    unsigned long long verify_end = 0, draft_end = 0;
+    double v2d = 0, d2v = 0, draft_gpu = 0;
+    long long n_v2d = 0, n_d2v = 0;
+};
+DecodeGaps& decode_gaps();
+
 class Verifier {
 public:
     Verifier() = default;
@@ -212,6 +221,7 @@ public:
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_launch = 0;   ///< host time inside the window graph's launch
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.

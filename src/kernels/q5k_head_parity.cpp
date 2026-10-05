@@ -3,6 +3,7 @@
 //   q5k_head_parity [rows] [iters]
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/q5k_head.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -87,6 +89,60 @@ int main(int argc, char** argv) {
         std::printf("ncols %d: %s (%zu of %zu differ) | native_mmvq %7.1f us %6.0f GB/s | q5k_head %7.1f us %6.0f GB/s | %.2fx\n",
                     nc, bad ? "FAIL" : "bitwise", bad, a.size(), u0, wbytes / u0 / 1e3, u1, wbytes / u1 / 1e3, u0 / u1);
         if (bad) fail = 1;
+    }
+    // the fused argmax + probability (one column) against the logits' argmax and row_top_prob's probability
+    {
+        void* scratch = nullptr;
+        int* d_id = nullptr;
+        float* d_p = nullptr;
+        int* r_id = nullptr;
+        float* r_p = nullptr;
+        ck(cudaMalloc(&scratch, k::q5k_head_top1_scratch_bytes()), "scratch");
+        ck(cudaMemset(scratch, 0, k::q5k_head_top1_scratch_bytes()), "scratch0");
+        ck(cudaMalloc(&d_id, 64), "id"); ck(cudaMalloc(&d_p, 64), "p"); ck(cudaMalloc(&r_id, 64), "rid"); ck(cudaMalloc(&r_p, 64), "rp");
+        double max_rel = 0;
+        int id_bad = 0, logit_bad = 0;
+        const int n_rows[] = {rows, 106299, 40525, 1000};
+        for (int rr : n_rows) {
+            if (rr > rows) continue;
+            for (int col = 0; col < MT; ++col) {
+                const void* xc = (const char*) xq + (size_t) col * k::native_q8_1_bytes(n_in, 1);
+                k::native_mmvq(13, w, xc, y0, n_in, rr, 1, s);
+                if (!k::sample_greedy_top_prob(y0, 1, rr, nullptr, r_id, r_p, s)) { std::printf("no reference top-prob\n"); break; }
+                if (!k::q5k_head_top1(w, xc, y1, n_in, rr, nullptr, d_id, d_p, scratch, s)) { std::printf("top1 refused\n"); fail = 1; break; }
+                ck(cudaStreamSynchronize(s), "sync");
+                int a_id, b_id;
+                float a_p, b_p;
+                ck(cudaMemcpy(&a_id, r_id, 4, cudaMemcpyDeviceToHost), "a"); ck(cudaMemcpy(&b_id, d_id, 4, cudaMemcpyDeviceToHost), "b");
+                ck(cudaMemcpy(&a_p, r_p, 4, cudaMemcpyDeviceToHost), "c"); ck(cudaMemcpy(&b_p, d_p, 4, cudaMemcpyDeviceToHost), "d");
+                std::vector<float> a((size_t) rr), b((size_t) rr);
+                ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "la");
+                ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "lb");
+                for (size_t i = 0; i < a.size(); ++i) logit_bad += std::memcmp(&a[i], &b[i], 4) != 0;
+                id_bad += a_id != b_id;
+                max_rel = std::max(max_rel, (double) std::fabs(a_p - b_p) / std::max(1e-30, (double) std::fabs(a_p)));
+            }
+            float ms[2] = {0, 0};
+            for (int rep = 0; rep < 2; ++rep) {
+                cudaEventRecord(e0, s);
+                for (int it = 0; it < iters; ++it) {
+                    k::native_mmvq(13, w, xq, y0, n_in, rr, 1, s);
+                    k::sample_greedy_top_prob(y0, 1, rr, nullptr, r_id, r_p, s);
+                }
+                cudaEventRecord(e1, s);
+                cudaEventSynchronize(e1);
+                cudaEventElapsedTime(&ms[0], e0, e1);
+                cudaEventRecord(e0, s);
+                for (int it = 0; it < iters; ++it) k::q5k_head_top1(w, xq, y1, n_in, rr, nullptr, d_id, d_p, scratch, s);
+                cudaEventRecord(e1, s);
+                cudaEventSynchronize(e1);
+                cudaEventElapsedTime(&ms[1], e0, e1);
+            }
+            std::printf("top1 rows %6d: head + top-prob %7.1f us | fused %7.1f us\n", rr, 1e3 * ms[0] / iters, 1e3 * ms[1] / iters);
+        }
+        std::printf("top1: logits %s (%d differ), argmax %s (%d differ), probability max rel diff %.2e\n",
+                    logit_bad ? "FAIL" : "bitwise", logit_bad, id_bad ? "FAIL" : "equal", id_bad, max_rel);
+        if (logit_bad || id_bad || max_rel > 1e-5) fail = 1;
     }
     std::printf("%s\n", fail ? "q5k_head_parity: FAIL" : "q5k_head_parity: OK (bitwise)");
     return fail;

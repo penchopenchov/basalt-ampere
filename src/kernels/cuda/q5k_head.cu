@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -139,9 +140,42 @@ __device__ __forceinline__ void q5k_row_dev(const Q5KBlock* __restrict__ w, cons
 
 // Rows of 10 blocks (n_in 2560), the next row's weights loaded while this one is computed.  Lane L's blocks:
 // thread L: a = L / 16 and a + 8; threads L + 32, L + 64, L + 96: a + 2, a + 4, a + 6.
-template <int NC>
+// the running (max, its first row, sum of exp(l - max)) of the logits a warp has produced
+struct Top {
+    float m;
+    int idx;   // 0x7fffffff: no rows yet
+    float s;
+    __device__ __forceinline__ void init() {
+        m = __int_as_float(0xff800000);
+        idx = 0x7fffffff;
+        s = 0.0f;
+    }
+    __device__ __forceinline__ void take(float l, int row) {
+        if (l > m) {
+            s = s * __expf(m - l) + 1.0f;
+            m = l;
+            idx = row;
+        } else {
+            s += __expf(l - m);
+            if (l == m && row < idx) idx = row;
+        }
+    }
+    __device__ __forceinline__ void merge(const Top& o) {
+        if (o.idx == 0x7fffffff) return;   // no rows
+        if (idx == 0x7fffffff || o.m > m) {
+            s = o.s + s * __expf(m - o.m);
+            m = o.m;
+            idx = o.idx;
+        } else {
+            s += o.s * __expf(o.m - m);
+            if (o.m == m && o.idx < idx) idx = o.idx;
+        }
+    }
+};
+
+template <int NC, bool TOP = false>
 __device__ __forceinline__ void q5k_rows_10(const Q5KBlock* __restrict__ w, const XCol* xc, float* __restrict__ y,
-                                            int n_out, int row0, int stride, int lane) {
+                                            int n_out, int row0, int stride, int lane, Top* top = nullptr) {
     constexpr int NCH = 5;
     const int a = lane / 16, kqs = 2 * (lane % 16);
     const int kb[NCH] = {a, a + 8, a + 2, a + 4, a + 6};
@@ -174,6 +208,7 @@ __device__ __forceinline__ void q5k_rows_10(const Q5KBlock* __restrict__ w, cons
             for (int v = 1; v < VT; ++v) t += p[v][j];
             t = warp_sum(t);
             if (lane == 0) y[(size_t) j * n_out + row] = t;
+            if constexpr (TOP) top->take(t, row);
         }
 #pragma unroll
         for (int c = 0; c < NCH; ++c) cur[c] = nxt[c];
@@ -209,6 +244,75 @@ __global__ void __launch_bounds__(WPB * WARP) q5k_head_kernel(const Q5KBlock* __
     }
 }
 
+// One column, n_in 2560: the logits, and the argmax (first on ties) with its softmax probability over all rows,
+// by block partials and the last block's merge; `map` turns the row into a token id.
+__global__ void __launch_bounds__(WPB * WARP) q5k_head_top1_kernel(const Q5KBlock* __restrict__ w,
+                                                                   const Q81Block* __restrict__ x,
+                                                                   float* __restrict__ y, int n_out,
+                                                                   const int32_t* __restrict__ map, int* __restrict__ out_id,
+                                                                   float* __restrict__ out_prob, float* __restrict__ part,
+                                                                   unsigned* __restrict__ count) {
+    __shared__ __align__(16) int4 xe[80 * XS];
+    __shared__ Top wt[WPB];
+    __shared__ bool last;
+    for (int i = threadIdx.x; i < 80 * 4; i += blockDim.x) {
+        const int b = i / 4, pos = i % 4;
+        const Q81Block* blk = x + b;
+        const int* q8 = reinterpret_cast<const int*>(blk->qs) + pos;
+        const int u0 = __ldg(q8), u1 = __ldg(q8 + 4);
+        const unsigned dsb = __ldg(reinterpret_cast<const unsigned*>(&blk->ds));
+        const float d8 = __low2float(*reinterpret_cast<const half2*>(&dsb));
+        xe[xslot(b) + pos] = make_int4(u0, u1, STRATA_DP4A(0x01010101, u0, STRATA_DP4A(0x01010101, u1, 0)),
+                                       __float_as_int(d8));
+    }
+    __syncthreads();
+    const XCol xc[1] = {XCol{xe}};
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    Top top;
+    top.init();
+    q5k_rows_10<1, true>(w, xc, y, n_out, blockIdx.x * WPB + warp, gridDim.x * WPB, lane, &top);
+    if (lane == 0) wt[warp] = top;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        Top b = wt[0];
+        for (int i = 1; i < WPB; ++i) b.merge(wt[i]);
+        part[3 * blockIdx.x] = b.m;
+        part[3 * blockIdx.x + 1] = __int_as_float(b.idx);
+        part[3 * blockIdx.x + 2] = b.s;
+        __threadfence();
+        last = atomicAdd(count, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    Top g;   // each thread a strided share of the block partials, then the block
+    g.init();
+    for (int i = threadIdx.x; i < (int) gridDim.x; i += blockDim.x) {
+        Top o;
+        o.m = __ldcg(part + 3 * i);
+        o.idx = __float_as_int(__ldcg(part + 3 * i + 1));
+        o.s = __ldcg(part + 3 * i + 2);
+        g.merge(o);
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        Top o;
+        o.m = __shfl_xor_sync(0xffffffffu, g.m, off);
+        o.idx = __shfl_xor_sync(0xffffffffu, g.idx, off);
+        o.s = __shfl_xor_sync(0xffffffffu, g.s, off);
+        g.merge(o);
+    }
+    if (lane == 0) wt[warp] = g;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        Top b = wt[0];
+        for (int i = 1; i < WPB; ++i) b.merge(wt[i]);
+        const int id = b.idx < n_out ? b.idx : 0;
+        *out_id = map != nullptr ? map[id] : id;
+        *out_prob = 1.0f / b.s;
+        *count = 0u;
+    }
+}
+
 template <int NC, int BPR>
 void launch_bpr(const void* w, const void* x, float* y, int n_in, int n_out, cudaStream_t s) {
     // one resident wave: every warp walks rows with the grid's stride
@@ -240,6 +344,36 @@ void launch_nc(const void* w, const void* x, float* y, int n_in, int n_out, cuda
 bool q5k_head_supported(int n_in, int ncols) {
     return n_in > 0 && n_in % QK == 0 && n_in / QK <= 64 && ncols >= 1 && ncols <= 8 &&
            (size_t) ncols * (n_in / Q8K) * XS * sizeof(int4) <= 96 * 1024;
+}
+
+size_t q5k_head_top1_scratch_bytes() { return 4096 * 3 * sizeof(float) + 256; }
+
+bool q5k_head_top1(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, const int32_t* map,
+                   int* out_id, float* out_prob, void* scratch, void* stream) {
+    if (n_in != 2560 || n_out <= 0 || !weights || !x_q8_1 || !y || !out_id || !out_prob || !scratch) return false;
+    static int grid_max[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
+    if (grid_max[dev] == 0) {
+        int sms = 0, per_sm = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, q5k_head_top1_kernel, WPB * WARP, 0);
+        grid_max[dev] = (sms > 0 ? sms : 1) * (per_sm > 0 ? per_sm : 1);
+        if (grid_max[dev] > 4096) grid_max[dev] = 4096;
+    }
+    const long long want = ((long long) n_out + WPB - 1) / WPB;
+    const unsigned grid = (unsigned) (want < grid_max[dev] ? want : grid_max[dev]);
+    float* part = (float*) scratch;
+    unsigned* count = (unsigned*) ((char*) scratch + 4096 * 3 * sizeof(float));
+    q5k_head_top1_kernel<<<grid, WPB * WARP, 0, (cudaStream_t) stream>>>((const Q5KBlock*) weights,
+                                                                         (const Q81Block*) x_q8_1, y, n_out, map, out_id,
+                                                                         out_prob, part, count);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "q5k_head_top1: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
 }
 
 void q5k_head_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {

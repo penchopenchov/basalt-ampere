@@ -1528,6 +1528,18 @@ std::string Verifier::profile_report() {
     }
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
+    std::snprintf(b, sizeof b, " | graph launch %.3f ms/window", ms_launch / (double) prof_windows_);
+    out += b;
+    ms_launch = 0;
+    DecodeGaps& dg = decode_gaps();
+    if (dg.n_v2d > 0 && dg.n_d2v > 0) {
+        std::snprintf(b, sizeof b, " | GPU idle verify->draft %.3f, draft GPU %.3f, idle draft->verify %.3f ms",
+                      dg.v2d / 1e6 / (double) dg.n_v2d, dg.draft_gpu / 1e6 / (double) dg.n_v2d,
+                      dg.d2v / 1e6 / (double) dg.n_d2v);
+        out += b;
+    }
+    dg.v2d = dg.d2v = dg.draft_gpu = 0;
+    dg.n_v2d = dg.n_d2v = 0;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;
@@ -1708,6 +1720,11 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     staged_ = true;
 }
 
+DecodeGaps& decode_gaps() {
+    static DecodeGaps g;
+    return g;
+}
+
 void Verifier::collect_profile() {
     const ModelGeometry& g = *g_;
     cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
@@ -1739,6 +1756,10 @@ void Verifier::collect_profile() {
         }
     }
     prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
+    DecodeGaps& dg = decode_gaps();
+    if (dg.draft_end != 0 && at(0, 0) > dg.draft_end) { dg.d2v += (double) (at(0, 0) - dg.draft_end); ++dg.n_d2v; }
+    dg.draft_end = 0;
+    dg.verify_end = at(L, 1);
     ++prof_windows_;
 }
 
@@ -1793,7 +1814,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    if (prof_on_) decode_gaps().verify_end = 0;   // set again only by a collected window
+    const Clock::time_point tl = Clock::now();
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    ms_launch += ms_since(tl);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
