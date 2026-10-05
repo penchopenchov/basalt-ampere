@@ -147,16 +147,14 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
 
 // ---------------------------------------------------------------- the grouped rows, one work item at a time
 // native_gu_multi_kernel's body for block row `rb` of one group (entries [e0, e1)): the same calls in the same order.
+// gate/up row `row` (0 .. 2 n_ff: gate rows, then up rows) at `wr`, for entries [e0, e1)
 template<int TG, bool STAGE_GRID>
-__device__ __forceinline__ void dm_gu_item(const uint8_t* blob, int e0, int e1, const int32_t* __restrict__ ent_tok,
-                                           const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, int rb,
-                                           float* __restrict__ gate, float* __restrict__ up, const uint32_t* s_grid,
-                                           int warp, int lane) {
-    const int row = rb * GU_ROWS + warp;
-    if (row >= 2 * L.n_ff) return;
+__device__ __forceinline__ void dm_gu_row(const uint8_t* wr, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
+                                          const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
+                                          float* __restrict__ gate, float* __restrict__ up, const uint32_t* s_grid,
+                                          int lane) {
     const bool is_up = row >= L.n_ff;
     const int r = is_up ? row - (int) L.n_ff : row;
-    const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
     float* dst = is_up ? up : gate;
     for (int e = e0; e < e1; e += GRP_NC) {
@@ -184,6 +182,17 @@ __device__ __forceinline__ void dm_gu_item(const uint8_t* blob, int e0, int e1, 
     }
 }
 
+template<int TG, bool STAGE_GRID>
+__device__ __forceinline__ void dm_gu_item(const uint8_t* blob, int e0, int e1, const int32_t* __restrict__ ent_tok,
+                                           const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, int rb,
+                                           float* __restrict__ gate, float* __restrict__ up, const uint32_t* s_grid,
+                                           int warp, int lane) {
+    const int row = rb * GU_ROWS + warp;
+    if (row >= 2 * L.n_ff) return;
+    // gate and up rows are contiguous in the blob: row `row` is at row * gu_row
+    dm_gu_row<TG, STAGE_GRID>(blob + (size_t) row * L.gu_row, row, e0, e1, ent_tok, xq, L, gate, up, s_grid, lane);
+}
+
 // rows per down work item: native_down_multi_kernel's block rows at n_ff == 640
 template<int TD> __host__ __device__ constexpr int dm_down_rows() { return TD == 20 ? 32 : TD == 42 ? 16 : 8; }
 
@@ -199,18 +208,19 @@ __device__ __forceinline__ void dm_swiglu_q8(const float* __restrict__ gate, con
     }
 }
 
-// native_down_multi_kernel's body (hb == 20) for block row `rb` of one group, from the group's q8_1 rows in s_hq
+// native_down_multi_kernel's body (hb == 20) for block row `rb` of one group (`rows`: the address of its first row),
+// from the group's q8_1 rows in s_hq
 // (entry e at s_hq + (e - e0) * 20); row r of entry e lands in s_out[(e - e0) * ROWS + r - rb * R], R the item's
 // rows (dm_down_rows) and ROWS the stride of s_out's entries.
 template<int TD>
-__device__ __forceinline__ void dm_down_item(const uint8_t* blob, int e0, int e1, const block_q8_1* s_hq,
+__device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1, const block_q8_1* s_hq,
                                              const NativeExpertLayout& L, int rb, float* s_out, int tid, int ROWS) {
     const int nb = (int) (L.n_ff / Fmt<TD>::qk);
     (void) nb;
     if constexpr (TD == 20) {
         const int rl = tid >> 3, r = rb * 32 + rl, t = tid & 7;
         if (r >= L.n_embd) return;
-        const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
+        const uint8_t* wr = rows + (size_t) rl * L.d_row;
         for (int e = e0; e < e1; e += GRP_NC) {
             const int n = min(GRP_NC, e1 - e), b = (e - e0) * 20;
             if (n == 1) {
@@ -237,7 +247,7 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* blob, int e0, int e1
     } else if constexpr (TD == 42) {
         const int rl = tid >> 4, r = rb * 16 + rl, t = tid & 15;
         if (r >= L.n_embd) return;
-        const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
+        const uint8_t* wr = rows + (size_t) rl * L.d_row;
         for (int e = e0; e < e1; e += GRP_NC) {
             const int n = min(GRP_NC, e1 - e), b = (e - e0) * 20;
             if (n == 1) {
@@ -264,7 +274,7 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* blob, int e0, int e1
     } else {
         const int warp = tid >> 5, lane = tid & 31, r = rb * 8 + warp;
         if (r >= L.n_embd) return;
-        const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
+        const uint8_t* wr = rows + (size_t) warp * L.d_row;
         for (int e = e0; e < e1; e += GRP_NC) {
             const int n = min(GRP_NC, e1 - e), b = (e - e0) * 20;
             if (n == 1) {
@@ -344,7 +354,8 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
             __syncthreads();
         }
         for (int sb = 0; sb < SUB; ++sb)
-            dm_down_item<TD>((const uint8_t*) sm.gptr[g], e0, e1, sm.hq, L, sp * SUB + sb, sm.out + sb * R, tid, kDmSpan);
+            dm_down_item<TD>((const uint8_t*) sm.gptr[g] + L.down_off + (size_t) ((sp * SUB + sb) * R) * L.d_row, e0, e1,
+                             sm.hq, L, sp * SUB + sb, sm.out + sb * R, tid, kDmSpan);
         __syncthreads();
         constexpr int q = kDmSpan / 4;           // kDmSpan floats per entry, 16 bytes per thread
         const int nq = (e1 - e0) * q;
@@ -503,6 +514,278 @@ __global__ void __launch_bounds__(kDmThreads) dm_vram_kernel(const DmPlan* __res
     if (dm_arrive(sync, gridDim.x, sync + 1, ng)) sync[0] = 0u;
 }
 
+// ---------------------------------------------------------------- the VRAM share through the copy engine (TMA)
+// Each block walks its work items (b, b + nb, ...: gate/up items of 8 rows, then down items of 32 rows) with every
+// item's weight rows brought into shared memory by a bulk copy issued kTmaStages - 1 items ahead, so a block keeps
+// several items in flight whatever its warps are doing; the rows are then read from shared memory by the same row
+// dots (the same bits).  A down item waits for its group's gate/up items (counters, as dm_experts).
+constexpr int kTmaStages = 3;
+constexpr int kTmaStage = 11776;          // bytes: the largest item (32 IQ4_NL down rows, 8 IQ4_XS gate/up rows)
+constexpr int kTmaGuRows = 8, kTmaDownRows = 32;
+
+struct DmTmaShared {
+    alignas(128) uint8_t stage[kTmaStages][kTmaStage];
+    alignas(8) unsigned long long bar[kTmaStages];
+    alignas(16) block_q8_1 hq[kDmMaxEnt * 20];
+    alignas(16) float out[kDmMaxEnt * kTmaDownRows];
+    int32_t start[kDmCap + 1], tok[kDmCap], dst[kDmCap];
+    unsigned long long gptr[kDmCap];
+};
+
+__device__ __forceinline__ uint32_t dm_smem(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
+__device__ __forceinline__ void dm_bulk(void* dst, const void* src, uint32_t bytes, unsigned long long* bar) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(dm_smem(bar)), "r"(bytes) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(dm_smem(dst)), "l"(src), "r"(bytes), "r"(dm_smem(bar)) : "memory");
+}
+__device__ __forceinline__ void dm_bar_wait(unsigned long long* bar, uint32_t parity) {
+    uint32_t ok = 0;
+    while (!ok)
+        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                     : "=r"(ok) : "r"(dm_smem(bar)), "r"(parity) : "memory");
+}
+
+// sm's groups (ng, start, gptr, tok, dst set) through the bulk-copy pipeline: block b of nb takes items b, b + nb, ...
+// (gate/up items of 8 rows, then down items of 32 rows); `base` counts the block's earlier items on these barriers
+// (their phases).  Returns the items it took.
+template<int TG, int TD>
+__device__ int dm_experts_tma(DmTmaShared& sm, int ng, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
+                              float* gate, float* up, float* out, unsigned int* done, int b, int nb, int base) {
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int nga = (int) (2 * L.n_ff / kTmaGuRows), ndn = (int) (L.n_embd / kTmaDownRows);
+    const int na = ng * nga, total = na + ng * ndn;
+    auto issue = [&](int k) {
+        const int it = b + k * nb;
+        if (it >= total) return;
+        const uint8_t* src;
+        uint32_t bytes;
+        if (it < na) {
+            const int g = it / nga, c = it - g * nga;
+            bytes = (uint32_t) (kTmaGuRows * L.gu_row);
+            src = (const uint8_t*) sm.gptr[g] + (size_t) c * bytes;
+        } else {
+            const int j = it - na, g = j / ndn, c = j - g * ndn;
+            bytes = (uint32_t) (kTmaDownRows * L.d_row);
+            src = (const uint8_t*) sm.gptr[g] + L.down_off + (size_t) c * bytes;
+        }
+        const int st = (base + k) % kTmaStages;
+        dm_bulk(sm.stage[st], src, bytes, &sm.bar[st]);
+    };
+    __syncthreads();                             // the stages' earlier contents are consumed
+    if (tid == 0)
+        for (int k = 0; k < kTmaStages - 1; ++k) issue(k);
+    int g_staged = -1, k = 0;
+    for (; b + k * nb < total; ++k) {
+        const int it = b + k * nb;
+        if (k > 0) __syncthreads();              // stage (k - 1) is consumed: refill it
+        if (tid == 0) issue(k + kTmaStages - 1);
+        const int st = (base + k) % kTmaStages;
+        const uint32_t parity = (uint32_t) (((base + k) / kTmaStages) & 1);
+        const uint8_t* rows = sm.stage[st];
+        if (it < na) {
+            const int g = it / nga, c = it - g * nga;
+            dm_bar_wait(&sm.bar[st], parity);
+            dm_gu_row<TG, false>(rows + (size_t) warp * L.gu_row, c * kTmaGuRows + warp, sm.start[g], sm.start[g + 1],
+                                 sm.tok, xq, L, gate, up, nullptr, lane);
+            __threadfence();
+            __syncthreads();
+            if (tid == 0) atomicAdd(done + g, 1u);
+        } else {
+            const int j = it - na, g = j / ndn, c = j - g * ndn;
+            const int e0 = sm.start[g], e1 = sm.start[g + 1];
+            if (g != g_staged) {
+                if (tid == 0) {
+                    while (*(volatile unsigned int*) (done + g) < (unsigned int) nga) __nanosleep(20);
+                    __threadfence();
+                }
+                __syncthreads();
+                dm_swiglu_q8(gate, up, e0, e1, (int) L.n_ff, sm.hq, tid);
+                g_staged = g;
+                __syncthreads();
+            }
+            dm_bar_wait(&sm.bar[st], parity);
+            constexpr int R = dm_down_rows<TD>();
+#pragma unroll
+            for (int sb = 0; sb < kTmaDownRows / R; ++sb)
+                dm_down_item<TD>(rows + (size_t) (sb * R) * L.d_row, e0, e1, sm.hq, L, c * (kTmaDownRows / R) + sb,
+                                 sm.out + sb * R, tid, kTmaDownRows);
+            __syncthreads();
+            constexpr int q = kTmaDownRows / 4;
+            const int nq = (e1 - e0) * q;
+            for (int i = tid; i < nq; i += kDmThreads) {
+                const int e = i / q, cc = i - e * q;
+                *(float4*) (out + (size_t) sm.dst[e0 + e] * L.n_embd + c * kTmaDownRows + cc * 4) =
+                    *(const float4*) &sm.out[e * kTmaDownRows + cc * 4];
+            }
+        }
+    }
+    return k;
+}
+
+__device__ __forceinline__ void dm_bars_init(DmTmaShared& sm) {
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < kTmaStages; ++i)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(dm_smem(&sm.bar[i])) : "memory");
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+}
+
+template<int TG, int TD>
+__global__ void __launch_bounds__(kDmThreads) dm_vram_tma_kernel(const DmPlan* __restrict__ plan,
+                                                                 const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                                 float* gate, float* up, float* out, unsigned int* sync) {
+    __shared__ DmTmaShared sm;
+    const int tid = threadIdx.x;
+    const int ng = plan->counts[0];
+    for (int i = tid; i <= ng; i += kDmThreads) {
+        sm.start[i] = plan->start[i];
+        if (i < ng) sm.gptr[i] = plan->ptr[i];
+    }
+    for (int i = tid; i < kDmCap; i += kDmThreads) {
+        sm.tok[i] = plan->tok[i];
+        sm.dst[i] = plan->dst[i];
+    }
+    dm_bars_init(sm);
+    dm_experts_tma<TG, TD>(sm, ng, xq, L, gate, up, out, sync + 1, blockIdx.x, gridDim.x, 0);
+    if (dm_arrive(sync, gridDim.x, sync + 1, ng)) sync[0] = 0u;
+}
+
+// ---------------------------------------------------------------- the VRAM share as three launches, NR rows a warp
+// row_dot_multi over NR rows at once: each row's sums are row_dot_multi's (the same calls, k lane-strided, added in the
+// same order, the same warp_sum); the rows only share the loop, so a warp has NR rows' loads in flight.
+template<int TY, int NC, int NR, bool EXACT_N, bool STAGE_GRID>
+__device__ __forceinline__ void rows_dot_multi(const uint8_t* const (&rows)[NR], const block_q8_1* x, const int (&off)[NC],
+                                               int n, int nb, int lane, float (&s)[NR][NC],
+                                               const uint32_t* __restrict__ s_grid) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+#pragma unroll
+    for (int r = 0; r < NR; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[r][c] = 0.0f;
+    const int nk = nb * F::ipb;
+    if (nk <= 3 * 32) {   // every weight part of the lane loaded first (up to 3 per row), then the same adds in k order
+        typename S::W w[3][NR];
+#pragma unroll
+        for (int it = 0; it < 3; ++it) {
+            const int k = lane + 32 * it;
+            if (k < nk) {
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+#pragma unroll
+                for (int r = 0; r < NR; ++r) w[it][r] = S::template load<STAGE_GRID>(rows[r], kbx, iqs, s_grid);
+            }
+        }
+#pragma unroll
+        for (int it = 0; it < 3; ++it) {
+            const int k = lane + 32 * it;
+            if (k < nk) {
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+#pragma unroll
+                for (int r = 0; r < NR; ++r)
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (EXACT_N || c < n) s[r][c] += S::apply(w[it][r], x + off[c] + kbx * (F::qk / 32), iqs);
+            }
+        }
+    } else
+    for (int k = lane; k < nk; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) w[r] = S::template load<STAGE_GRID>(rows[r], kbx, iqs, s_grid);
+#pragma unroll
+        for (int r = 0; r < NR; ++r)
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (EXACT_N || c < n) s[r][c] += S::apply(w[r], x + off[c] + kbx * (F::qk / 32), iqs);
+    }
+#pragma unroll
+    for (int r = 0; r < NR; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[r][c] = warp_sum(s[r][c]);
+}
+
+// native_gu_multi_kernel with NR rows a warp (rows row0 + 8 i): block x covers 8 NR rows, block row y a group
+template<int TG, int NR, bool STAGE_GRID = kStageIqGrid<TG>>
+__global__ void __launch_bounds__(256) dm_gu_kernel(const DmPlan* __restrict__ plan, const block_q8_1* __restrict__ xq,
+                                                    NativeExpertLayout L, float* __restrict__ gate, float* __restrict__ up) {
+    const int ng = plan->counts[0];
+    if ((int) blockIdx.y >= ng) return;
+    __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TG, STAGE_GRID>::value];
+    const uint32_t* s_grid = stage_iq_grid<TG, STAGE_GRID>(s_grid_buf, threadIdx.x, 256);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = blockIdx.x * (GU_ROWS * NR) + warp;
+    const int nrow = 2 * (int) L.n_ff;
+    if (row0 >= nrow) return;
+    const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
+    const int g = blockIdx.y;
+    const uint8_t* blob = (const uint8_t*) plan->ptr[g];
+    const uint8_t* rows[NR];
+    int rr[NR];
+#pragma unroll
+    for (int i = 0; i < NR; ++i) {
+        rr[i] = row0 + GU_ROWS * i < nrow ? row0 + GU_ROWS * i : row0;
+        rows[i] = blob + (size_t) rr[i] * L.gu_row;
+    }
+    auto put = [&](int i, int e, float v) {
+        if (row0 + GU_ROWS * i >= nrow) return;
+        const int row = rr[i];
+        if (row >= L.n_ff) up[(size_t) e * L.n_ff + row - (int) L.n_ff] = v;
+        else gate[(size_t) e * L.n_ff + row] = v;
+    };
+    const int32_t* ent_tok = plan->tok;
+    const int e0 = plan->start[g], e1 = plan->start[g + 1];
+    for (int e = e0; e < e1; e += GRP_NC) {
+        const int n = min(GRP_NC, e1 - e);
+        if (n == 1) {
+            const int off1[1] = { ent_tok[e] * xb };
+            float s1[NR][1];
+            rows_dot_multi<TG, 1, NR, true, STAGE_GRID>(rows, xq, off1, 1, nb, lane, s1, s_grid);
+            if (lane == 0)
+#pragma unroll
+                for (int i = 0; i < NR; ++i) put(i, e, s1[i][0]);
+        } else if (n == 2) {
+            const int off2[2] = { ent_tok[e] * xb, ent_tok[e + 1] * xb };
+            float s2[NR][2];
+            rows_dot_multi<TG, 2, NR, true, STAGE_GRID>(rows, xq, off2, 2, nb, lane, s2, s_grid);
+            if (lane < 2)
+#pragma unroll
+                for (int i = 0; i < NR; ++i) put(i, e + lane, s2[i][lane]);
+        } else {
+            int off[GRP_NC];
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
+            float sm[NR][GRP_NC];
+            rows_dot_multi<TG, GRP_NC, NR, false, STAGE_GRID>(rows, xq, off, n, nb, lane, sm, s_grid);
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c)
+                if (c < n && lane == c)
+#pragma unroll
+                    for (int i = 0; i < NR; ++i) put(i, e + c, sm[i][c]);
+        }
+    }
+}
+
+template<int TG, int TD>
+int dm_vram_tma_blocks() {
+    static int known[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
+    if (known[dev] == 0) {
+        int sms = 0, per = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_vram_tma_kernel<TG, TD>, kDmThreads, 0) != cudaSuccess) {
+            cudaGetLastError();
+            per = 0;
+        }
+        const char* v = std::getenv("STRATA_DEC_MOE_TMA_PER_SM");
+        if (v != nullptr && std::atoi(v) > 0) per = std::min(per, std::atoi(v));
+        known[dev] = per > 0 ? sms * per : -1;
+    }
+    return known[dev];
+}
+
 template<int TG, int TD>
 int dm_vram_blocks() {
     static int known[64] = {};
@@ -627,13 +910,67 @@ void dm_vram_launch(F kernel, int blocks, void* stream, const DmPlan* plan, cons
     }
 }
 
-size_t dec_moe_vram_scratch_bytes(int n_ff) { return (size_t) kDmCap * n_ff * 2 * sizeof(float) + 256; }
+size_t dec_moe_vram_scratch_bytes(int n_ff) {
+    return (size_t) kDmCap * n_ff * 2 * sizeof(float) + (size_t) kDmCap * (n_ff / 32) * sizeof(block_q8_1) + 256;
+}
 
 void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, float* out,
-                  unsigned int* sync, void* stream) {
+                  unsigned int* sync, void* stream, int kind, int cap) {
     float* gate = (float*) scratch;
     float* up = gate + (size_t) kDmCap * L.n_ff;
     int blocks = 0;
+    if (kind >= 2) {   // NR = kind - 1 rows a warp for gate/up, then native_expert_grouped's SwiGLU and down launches
+        cudaStream_t s = (cudaStream_t) stream;
+        const int NR = kind - 1;
+        const dim3 ggu((unsigned) ((2 * L.n_ff) / (GU_ROWS * NR)), (unsigned) cap);
+        const auto* X = (const block_q8_1*) xq;
+        switch (L.gu_type * 10 + NR) {
+#define STRATA_DM_G(TG) \
+            case TG * 10 + 1: dm_gu_kernel<TG, 1><<<ggu, 256, 0, s>>>(plan, X, L, gate, up); break; \
+            case TG * 10 + 2: dm_gu_kernel<TG, 2><<<ggu, 256, 0, s>>>(plan, X, L, gate, up); break;
+            STRATA_DM_GU_FMTS(STRATA_DM_G)
+#undef STRATA_DM_G
+            default: std::fprintf(stderr, "dec_moe_vram: gate/up %d rows %d\n", L.gu_type, NR); std::exit(1);
+        }
+        block_q8_1* hq = (block_q8_1*) (up + (size_t) kDmCap * L.n_ff);
+        const long long nh = (long long) cap * L.n_ff;
+        swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, plan->start, plan->counts,
+                                                                                (int) L.n_ff, hq);
+        const int d_rows = L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8);
+        const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) cap);
+        switch (L.d_type) {
+#define STRATA_DM_DOWN(T) case T: launch_down<T>(gd, s, plan->ptr, plan->start, plan->counts, plan->dst, hq, L, out); break;
+            STRATA_DM_D_FMTS(STRATA_DM_DOWN)
+#undef STRATA_DM_DOWN
+            default: std::fprintf(stderr, "dec_moe_vram: down %d\n", L.d_type); std::exit(1);
+        }
+        check("dec_moe_vram");
+        return;
+    }
+    if (kind == 1) {
+        if (L.gu_row * kTmaGuRows > (size_t) kTmaStage || L.d_row * kTmaDownRows > (size_t) kTmaStage ||
+            (L.gu_row * kTmaGuRows) % 16 != 0 || (L.d_row * kTmaDownRows) % 16 != 0 || L.down_off % 16 != 0 ||
+            L.n_embd % kTmaDownRows != 0) {
+            std::fprintf(stderr, "dec_moe_vram: the TMA kernel does not take formats %d / %d\n", L.gu_type, L.d_type);
+            std::exit(1);
+        }
+        switch (L.gu_type * 100 + L.d_type) {
+#define STRATA_DM_T(TG, TD) case TG * 100 + TD: \
+            blocks = dm_vram_tma_blocks<TG, TD>(); \
+            if (blocks > 0) dm_vram_launch(dm_vram_tma_kernel<TG, TD>, blocks, stream, plan, (const block_q8_1*) xq, L, \
+                                           gate, up, out, sync); \
+            break;
+            STRATA_DM_PAIRS(STRATA_DM_T)
+#undef STRATA_DM_T
+            default: break;
+        }
+        if (blocks <= 0) {
+            std::fprintf(stderr, "dec_moe_vram: formats %d / %d\n", L.gu_type, L.d_type);
+            std::exit(1);
+        }
+        check("dec_moe_vram");
+        return;
+    }
     switch (L.gu_type * 100 + L.d_type) {
 #define STRATA_DM_V(TG, TD) case TG * 100 + TD: \
         blocks = dm_vram_blocks<TG, TD>(); \

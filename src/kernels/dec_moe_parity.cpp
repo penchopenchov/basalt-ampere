@@ -374,6 +374,15 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < n; ++i) if (kind[i] == 0) rows.push_back(i);
                 std::snprintf(what, sizeof what, "fused VRAM T=%d (%d groups)", T, P.counts[0]);
                 report(what, l, ndiff_rows(a3, b3, rows), rows.size() * H);
+                ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
+                for (int kind : {1, 2, 3}) {
+                    ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
+                    K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_p3, d_vsync, s0, kind, n);
+                    ck(cudaStreamSynchronize(s0), "vram kind");
+                    const auto t3 = down(d_p3, (size_t) n * H);
+                    std::snprintf(what, sizeof what, "VRAM kind %d T=%d (%d groups)", kind, T, P.counts[0]);
+                    report(what, l, ndiff_rows(a3, t3, rows), rows.size() * H);
+                }
                 if (std::getenv("DM_DEBUG")) {
                     const auto sy = down(d_vsync, K::kDmCap + 1);
                     int nz = 0;
@@ -420,16 +429,46 @@ int main(int argc, char** argv) {
                 cudaFree(d_p3);
             }
             if (bench && T == 3) {
-                // the VRAM share alone: native_expert_grouped over the plan's groups
-                const double us = time_us(s0, 200, [&] {
+                // eight copies of the blobs (past the L2), the route kernel pointing each call at the next one
+                uint8_t* big = dmal<uint8_t>(8 * blobs.size());
+                for (int c = 0; c < 8; ++c)
+                    ck(cudaMemcpy(big + c * blobs.size(), blobs.data(), blobs.size(), cudaMemcpyHostToDevice), "big");
+                int rot = 0;
+                auto route = [&] {
+                    K::DmRouteArgs rb = ra;
+                    rb.cache_base = big + (size_t) (rot++ % 8) * blobs.size();
+                    K::dec_moe_route(rb, s0);
+                };
+                const double r0 = time_us(s0, 200, route);
+                const double ug = time_us(s0, 200, [&] {
+                    route();
                     K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok,
                                              n, n, d_xq2, dv[0].scr, d_parts, s0);
-                });
-                std::printf("  bench: VRAM grouped T=%d, %d groups (%d entries): %.1f us, %.0f GB/s of expert bytes\n", T,
-                            P.counts[0], P.counts[1], us, P.counts[0] * (double) L.bytes / us / 1e3);
-                const double us2 = time_us(s0, 200, [&] { K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0); });
-                std::printf("  bench: VRAM fused   T=%d, %d groups (%d entries): %.1f us, %.0f GB/s of expert bytes\n", T,
-                            P.counts[0], P.counts[1], us2, P.counts[0] * (double) L.bytes / us2 / 1e3);
+                }) - r0;
+                const double uf = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0); }) - r0;
+                const double ut = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 1); }) - r0;
+                const double u2 = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 2, n); }) - r0;
+                const double u4 = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 3, n); }) - r0;
+                auto phase = [&](int ph) {
+                    K::native_expert_set_mode(-1, ph);
+                    const double u = time_us(s0, 200, [&] {
+                        route();
+                        K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok,
+                                                 n, n, d_xq2, dv[0].scr, d_parts, s0);
+                    }) - r0;
+                    K::native_expert_set_mode(-1, 0);
+                    return u;
+                };
+                const double ugu = phase(1), udn = phase(2);
+                std::printf("  bench: grouped phases: gate/up+SwiGLU %.1f us (%.0f GB/s), down %.1f us (%.0f GB/s)\n", ugu,
+                            P.counts[0] * (double) (2 * L.up_off) / ugu / 1e3, udn,
+                            P.counts[0] * (double) (L.bytes - L.down_off) / udn / 1e3);
+                const double gb = P.counts[0] * (double) L.bytes / 1e3;
+                std::printf("  bench: VRAM share T=%d, %d groups (%d entries, %.1f MB), past the L2: route %.1f us | "
+                            "grouped %.1f us %.0f GB/s | fused %.1f us %.0f GB/s | TMA %.1f us %.0f GB/s | PF1 %.1f us %.0f GB/s | "
+                            "PF2 %.1f us %.0f GB/s\n",
+                            T, P.counts[0], P.counts[1], gb / 1e3, r0, ug, gb / ug, uf, gb / uf, ut, gb / ut, u2, gb / u2, u4, gb / u4);
+                cudaFree(big);
             }
         }
 

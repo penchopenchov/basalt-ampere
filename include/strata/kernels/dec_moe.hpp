@@ -92,8 +92,11 @@ void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, cons
 /// CUDA0's VRAM share of the plan in one launch (gate/up, SwiGLU, down; native_expert_grouped's rows bit for bit):
 /// entry e's row into row plan->dst[e] of `out`.  `sync`: kDmCap + 1 zeroed device words, left zeroed.
 size_t dec_moe_vram_scratch_bytes(int n_ff);
+/// kind 0: one launch (co-resident blocks, group counters); 1: the same with the weight rows through bulk copies into
+/// shared memory; 2 / 3: gate/up with 1 / 2 rows a warp and each lane's weight parts loaded first, then
+/// native_expert_grouped's SwiGLU and down launches over `cap` possible groups (the window's entries).
 void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, float* out,
-                  unsigned int* sync, void* stream);
+                  unsigned int* sync, void* stream, int kind = 0, int cap = kDmCap);
 
 /// The tests: the persistent kernel's per-group math against native_expert_grouped on one device, without rings.
 /// Entries [start[g], start[g+1]) of group g read q8_1 row tok[e] and write row dst[e] of `out` (device).

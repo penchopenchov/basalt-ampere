@@ -65,7 +65,7 @@ struct DecMoe {
     strata::kernels::DmPlan* plan = nullptr;
     unsigned int* ctr = nullptr;
     unsigned long long* slot_off = nullptr;  ///< CUDA0's per-slot offsets (null: slot * blob)
-    bool fused = false;                      ///< the VRAM share in one launch (STRATA_DEC_MOE_FUSED=1)
+    int vram = -1;                           ///< STRATA_DEC_MOE_VRAM: the VRAM share's kernels (dec_moe_vram's kind; -1 grouped)
     void* vscr = nullptr;                    ///< its gate/up rows
     unsigned int* vsync = nullptr;           ///< its counters
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring; the peer's rows
@@ -345,8 +345,8 @@ bool Verifier::dm_init(std::string& err) {
               cudaMalloc((void**) &d->vsync, (kDmCap + 1) * 4) == cudaSuccess &&
               cudaMemset(d->vsync, 0, (kDmCap + 1) * 4) == cudaSuccess;
     {
-        const char* v = std::getenv("STRATA_DEC_MOE_FUSED");
-        d->fused = v != nullptr && std::atoi(v) != 0;
+        const char* v = std::getenv("STRATA_DEC_MOE_VRAM");
+        d->vram = v != nullptr ? std::atoi(v) : -1;
     }
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
@@ -1233,8 +1233,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const auto& f = lay.fmt[(size_t) l];
             const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             DmPlan* P = dm_->plan;
-            if (dm_->fused)
-                dec_moe_vram(L, P, nat_xq_ + (size_t) tb * (N / 32) * 36, dm_->vscr, parts_out, dm_->vsync, cs);
+            if (dm_->vram >= 0)
+                dec_moe_vram(L, P, nat_xq_ + (size_t) tb * (N / 32) * 36, dm_->vscr, parts_out, dm_->vsync, cs, dm_->vram,
+                             (int) cap);
             else
                 native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, parts_out, cs);
