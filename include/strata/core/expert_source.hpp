@@ -513,6 +513,8 @@ public:
     bool spare_release(int64_t layer, int64_t in);
     /// A place `spare_take` gave, unused.
     void spare_return(int64_t layer, uint64_t off);
+    /// Debug: whether `bytes` equal the expert's bytes in the model files.
+    bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
     int64_t file_reads() const { return file_reads_.load(std::memory_order_relaxed); }

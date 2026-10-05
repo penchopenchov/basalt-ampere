@@ -1495,12 +1495,23 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
 
-    // STRATA_ADAPT_FAST: the free places after the experts (see set_spares)
+    // STRATA_ADAPT_FAST: the free places after the experts (see set_spares).  A swap takes a place of its layer's
+    // blob size and gives one of the same size back, so each size keeps its own share of the n places: its layers'
+    // share, at least 8.
     const uint64_t spare_at = bytes;
-    uint64_t spare_blob = 0;
-    for (const uint64_t b : layer_blob_bytes_) spare_blob = std::max(spare_blob, b);
-    const int64_t spares = bytes > 0 && spare_blob > 0 ? std::max<int64_t>(spares_want_, 0) : 0;
-    bytes += (uint64_t) spares * spare_blob;
+    std::vector<std::pair<uint64_t, int64_t>> spare_sizes;   // (blob bytes, places)
+    if (bytes > 0 && spares_want_ > 0 && n_layers_ > 0) {
+        for (const uint64_t b : layer_blob_bytes_) {
+            if (b == 0) continue;
+            auto it = std::find_if(spare_sizes.begin(), spare_sizes.end(), [&](const auto& x) { return x.first == b; });
+            if (it == spare_sizes.end()) spare_sizes.emplace_back(b, 1);
+            else ++it->second;
+        }
+        for (auto& [b, n] : spare_sizes) {
+            n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
+            bytes += (uint64_t) n * b;
+        }
+    }
 
     void* arena = nullptr;
     const uint8_t* host = nullptr;
@@ -1744,7 +1755,14 @@ bool FileExpertSource::pin_cache_complement(
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
     spare_free_.clear();
-    for (int64_t i = 0; i < spares; ++i) spare_free_.emplace_back(spare_at + (uint64_t) i * spare_blob, spare_blob);
+    {
+        uint64_t at = spare_at;
+        for (const auto& [b, n] : spare_sizes)
+            for (int64_t i = 0; i < n; ++i, at += b) spare_free_.emplace_back(at, b);
+        if (!spare_sizes.empty())
+            std::fprintf(stderr, "FileExpertSource: %lld free places for the adaptive swaps (%zu blob sizes, %.0f MiB)\n",
+                         (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
+    }
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
@@ -1803,10 +1821,8 @@ uint8_t* FileExpertSource::spare_take(int64_t layer, uint64_t& off) {
     if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || layer >= n_layers_) return nullptr;
     const uint64_t need = layer_blob_bytes_[(size_t) layer];
     size_t pick = spare_free_.size();
-    for (size_t i = spare_free_.size(); i-- > 0;) {   // an exact fit first, else any place that is large enough
+    for (size_t i = spare_free_.size(); i-- > 0;)
         if (spare_free_[i].second == need) { pick = i; break; }
-        if (spare_free_[i].second > need && pick == spare_free_.size()) pick = i;
-    }
     if (pick == spare_free_.size()) return nullptr;
     off = spare_free_[pick].first;
     spare_free_[pick] = spare_free_.back();
@@ -1831,6 +1847,12 @@ bool FileExpertSource::spare_release(int64_t layer, int64_t in) {
     spare_free_.emplace_back(complement_offsets_[i], layer_blob_bytes_[(size_t) layer]);
     complement_offsets_[i] = kNoComplement;
     return true;
+}
+
+bool FileExpertSource::equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const {
+    if (bytes == nullptr || layer < 0 || layer >= n_layers_) return false;
+    std::vector<uint8_t> f((size_t) layer_blob_bytes_[(size_t) layer]);
+    return copy_from_files(layer, expert, f.data()) && std::memcmp(f.data(), bytes, f.size()) == 0;
 }
 
 void FileExpertSource::spare_return(int64_t layer, uint64_t off) {

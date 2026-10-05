@@ -474,6 +474,7 @@ struct Options {
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
+    bool adapt_decay_set = false;
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
@@ -1404,7 +1405,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
-        else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
+        else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
@@ -5655,6 +5656,13 @@ int main(int argc, char** argv) {
         // copies, so where an expert runs depends only on the window count, as with the plain rounds.
         const bool adapt_fast = [] { const char* v = std::getenv("STRATA_ADAPT_FAST"); return v && std::atoi(v) != 0; }() &&
                                 !multi_gpu && !remote_opt;
+        // Its rounds come every --adapt-every windows, so the counts decay less per round than the plain default
+        // (STRATA_ADAPT_FAST_DECAY, else --adapt-decay when given, else 0.93): the routing counts stay large enough
+        // for the thresholds and the peer margin.
+        const float fast_decay = [&] {
+            const char* v = std::getenv("STRATA_ADAPT_FAST_DECAY");
+            return v ? (float) std::atof(v) : o.adapt_decay_set ? o.adapt_decay : 0.93f;
+        }();
         struct XSwap { int32_t layer, in, out, slot; uint64_t off; bool xchg, promo; };
         std::vector<XSwap> xq;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
@@ -5666,6 +5674,7 @@ int main(int argc, char** argv) {
             const size_t n_ranked = swaps.size();
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             xq.clear();
+            size_t n_noplace = 0;
             const auto& lay = strata::kernels::cpu::expert_layout();
             for (const Swap& s : swaps) {
                 const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
@@ -5675,7 +5684,7 @@ int main(int argc, char** argv) {
                 uint64_t off = 0;
                 if (xchg) {
                     uint8_t* dst = src.spare_take(s.layer, off);
-                    if (dst == nullptr) continue;   // no free place: a later round
+                    if (dst == nullptr) { ++n_noplace; continue; }   // no free place: a later round
                     if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
                                         cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
                         std::fprintf(stderr, "strata serve: an eviction copy failed (layer %d, slot %d): %s\n",
@@ -5701,15 +5710,15 @@ int main(int argc, char** argv) {
                     return false;
                 }
             }
-            for (float& v : drive.d.usage) v *= o.adapt_decay;
+            for (float& v : drive.d.usage) v *= fast_decay;
             if (adapt_trace) {
                 size_t np = 0;
                 for (const XSwap& x : xq) np += x.promo;
-                std::fprintf(stderr, "strata adapt: w %lld (+%lld) ranked %zu swaps %zu promoted %zu peer %lld | free %lld, "
-                                     "%.2f ms\n",
+                std::fprintf(stderr, "strata adapt: w %lld (+%lld) ranked %zu swaps %zu promoted %zu peer %lld | free %lld "
+                                     "(%zu found none), %.2f ms\n",
                              (long long) adapt_trace_win, (long long) (adapt_trace_win - adapt_trace_prev), n_ranked,
                              xq.size(), np, (long long) ((peer.valid() ? peer.swaps() : 0) - peer_sw0),
-                             (long long) src.spares_free(),
+                             (long long) src.spares_free(), n_noplace,
                              std::chrono::duration<double, std::milli>(Clock::now() - at0).count());
                 adapt_trace_prev = adapt_trace_win;
             }
@@ -5741,6 +5750,19 @@ int main(int argc, char** argv) {
                 res_upload();
                 xq_stage = 2;
                 return true;
+            }
+            static const bool xq_check = std::getenv("STRATA_ADAPT_FAST_CHECK") != nullptr;
+            if (xq_check) {   // debug: the evicted experts' RAM bytes and the incoming experts' slots against the files
+                int64_t bad = 0;
+                std::vector<uint8_t> h;
+                for (const XSwap& x : xq) {
+                    if (x.xchg && !src.equals_file(x.layer, x.out, srcp->blob(x.layer, x.out))) ++bad;
+                    h.resize((size_t) lay.blob_bytes(x.layer));
+                    cudaMemcpy(h.data(), xcache.device_slot(x.slot), h.size(), cudaMemcpyDeviceToHost);
+                    if (!src.equals_file(x.layer, x.in, h.data())) ++bad;
+                }
+                std::fprintf(stderr, "strata adapt: checked %zu swaps against the files: %lld differ\n", xq.size(),
+                             (long long) bad);
             }
             for (const XSwap& x : xq) {
                 host_res[(size_t) x.layer * g.n_expert + x.in] = x.slot;
