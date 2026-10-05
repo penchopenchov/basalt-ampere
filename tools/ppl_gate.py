@@ -10,6 +10,7 @@ through verify windows of T tokens (every token committed); see include/strata/p
   python3 tools/ppl_gate.py --exe build/strata --config cfg.json --base base.kld --out DIR [--chunks 20] [--t 3]
                             [--set="--spec 5 --spec-min-p 0.7"]
   python3 tools/ppl_gate.py --report DIR/rows.tsv          # the summary of a finished run again
+  python3 tools/ppl_gate.py --diff A/rows.tsv B/rows.tsv   # row by row: identical rows, largest NLL/KLD change
 """
 from __future__ import annotations
 
@@ -58,6 +59,23 @@ def summary(rows_path: str, extra: dict | None = None) -> str:
     if extra:
         out.append("  ".join(f"{k} {v}" for k, v in extra.items()))
     return "\n".join(out)
+
+
+def diff(pa: str, pb: str) -> str:
+    def load(p):
+        return {(f[0], f[1]): f for f in (l.rstrip("\n").split("\t") for l in open(p)) if len(f) >= 10}
+    a, b = load(pa), load(pb)
+    keys = sorted(set(a) & set(b), key=lambda k: (int(k[0]), int(k[1])))
+    if not keys:
+        return "no common rows"
+    same = sum(a[k][3:] == b[k][3:] for k in keys)
+    top = sum(a[k][7] == b[k][7] for k in keys)
+    dn = max(abs(float(a[k][3]) - float(b[k][3])) for k in keys)
+    dk = max(abs(float(a[k][5]) - float(b[k][5])) for k in keys)
+    first = next((k for k in keys if a[k][3:] != b[k][3:]), None)
+    return (f"rows {len(keys)}: identical {same} ({100.0 * same / len(keys):.2f}%), same top-1 {top}, "
+            f"max |dNLL| {dn:.6f}, max |dKLD| {dk:.6f}, first difference "
+            f"{'none' if first is None else 'chunk %s pos %s' % first}")
 
 
 def engine_env(cfg: dict) -> dict:
@@ -165,8 +183,9 @@ def run(a) -> int:
             vis.kill()
     extra = {"T": a.t, "load s": f"{t_load:.0f}", "run s": f"{t_run:.1f}",
              "prompt ms/chunk": f"{pp_ms / nc:.0f}", "decode ms/chunk": f"{dec_ms / nc:.0f}",
-             "decode VRAM-cache hits": f"{100.0 * hits / look:.1f}% ({hits}/{look})" if look else "n/a",
-             "offloaded": off}
+             "decode routed experts": f"{look + off}: VRAM hits {100.0 * hits / max(1, look + off):.1f}%, "
+                                      f"peer GPU/PCIe {100.0 * off / max(1, look + off):.1f}%, "
+                                      f"CPU {100.0 * (look - hits) / max(1, look + off):.1f}%"}
     rep = summary(str(rows), extra)
     (out / "report.txt").write_text(f"exe {a.exe}\nenv {flags}\n{rep}\n")
     print(rep)
@@ -184,7 +203,11 @@ def main() -> int:
     ap.add_argument("--set", default="", help='"FLAG VALUE ..." engine arguments to replace or add (--set="--spec 5")')
     ap.add_argument("--progress", type=int, default=10, help="a progress line every N chunks (0: none)")
     ap.add_argument("--report", help="print the summary of an existing rows.tsv and exit")
+    ap.add_argument("--diff", nargs=2, metavar=("A", "B"), help="compare two rows.tsv files row by row and exit")
     a = ap.parse_args()
+    if a.diff:
+        print(diff(*a.diff))
+        return 0
     if a.report:
         print(summary(a.report))
         return 0
