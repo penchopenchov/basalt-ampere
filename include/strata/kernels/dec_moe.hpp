@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace strata::kernels {
 
@@ -74,10 +75,18 @@ struct DmPeerArgs {
     const NativeExpertLayout* lay = nullptr;     ///< peer device: per layer
     int n_expert = 0, k = 0, n_embd = 0, n_ff = 0, steps = 0;
     void* scratch = nullptr;                     ///< peer device: dec_moe_peer_scratch_bytes
-    unsigned int* arrive = nullptr;              ///< peer device: monotonic arrival counter
+    unsigned int* arrive = nullptr;              ///< peer device: 4 words zeroed before the launch (arrivals, barrier, abort)
     unsigned long long* stamps_m = nullptr;      ///< tests: block 0's phase times per ring (8 each), or null
     int gu2 = 0;                                 ///< the grid formats' gate/up two rows a warp (STRATA_DEC_GU2 sets it)
+    uint32_t* diag_m = nullptr;                  ///< mapped, kDmDiagWords zeroed words: the abort record, or null
 };
+/// A down wait inside a ring that does not end within this long aborts the window (so does a corrupt ring, or the host's
+/// release while a ring runs): the kernel writes its record to diag_m, raises done_m past every ring (CUDA0's waits
+/// pass) and exits.
+constexpr unsigned long long kDmWaitLimitNs = 200ull * 1000 * 1000;
+constexpr int kDmDiagWords = 16;
+/// The abort record in words (empty when diag[0] is 0).
+std::string dec_moe_peer_diag(const uint32_t* diag);
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff);
 /// Blocks the peer kernel runs with on the current device (all co-resident); 0 when it cannot run there.
 int dec_moe_peer_blocks();

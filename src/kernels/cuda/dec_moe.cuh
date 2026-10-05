@@ -3,8 +3,6 @@
 #include "strata/kernels/dec_moe.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
-#include <cooperative_groups.h>
-
 namespace strata::kernels {
 namespace {
 
@@ -21,7 +19,7 @@ __device__ __forceinline__ void dm_group(const int32_t* s_ids, const int32_t* s_
     if (mine) {
         const int32_t e = s_ids[tid];
         for (int j = 0; j < n; ++j)
-            if (s_ids[j] == e) {
+            if (s_ids[j] == e && s_kind[j] == want) {
                 if (j < first) first = j;
                 if (j < tid) ++rank;
                 ++cnt;
@@ -61,15 +59,19 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     pdl_wait();   // STRATA_DEC_PDL2: launched during the router's tail
     if (tid == 0) { s_ncpu = 0; s_npeer = 0; }
+    if (tid < n) s_ids[tid] = a.ids[tid];
     __syncthreads();
     if (tid < n) {
-        const int32_t e = a.ids[tid];
+        const int32_t e = s_ids[tid];
+        // an id past the table or repeated within its token goes to the CPU pool: a device group then holds at most
+        // one entry per token (kDmMaxEnt, the persistent kernels' shared rows)
+        bool ok = e >= 0 && e < a.n_expert;
+        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
         int kd = -1;
-        if (e >= 0 && e < a.n_expert) {
+        if (ok) {
             if (a.res0[e] >= 0) kd = 0;
             else if (a.res1 != nullptr && a.res1[e] >= 0) kd = 2;
         }
-        s_ids[tid] = e;
         s_kind[tid] = kd;
         if (kd < 0) atomicAdd(&s_ncpu, 1);
         else if (kd == 2) atomicAdd(&s_npeer, 1);
@@ -313,7 +315,73 @@ struct DmShared {
     int32_t start[kDmCap + 1], tok[kDmCap], dst[kDmCap];
     unsigned long long gptr[kDmCap];
     int32_t ng, ne;
+    int32_t stop;                                          // this block left its ring (the window aborted)
 };
+
+// The peer's waits inside a window: the abort word (device), the record (mapped), the host's doorbell (its release:
+// UINT32_MAX) and what a record names.
+struct DmWatch {
+    unsigned int* abort = nullptr;
+    uint32_t* diag_m = nullptr;
+    const volatile uint32_t* seq_m = nullptr;
+    uint32_t* done_m = nullptr;
+    uint32_t ring = 0;
+    int layer = 0, n_tok = 0, n = 0;
+    const int32_t* hdr_ids = nullptr;                      // the device copy of the ring's ids (the record's checksum)
+};
+
+__device__ __forceinline__ unsigned long long dm_now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// The first block to give up raises the abort word and writes the record: reason (1 a wait past kDmWaitLimitNs,
+// 2 a group of more entries than tokens, 3 released by the host), ring, layer, tokens, block, phase (1 a down wait,
+// 2 a grid barrier), group, count / wanted, the block's groups / entries, the group's entries, a checksum of the ids
+// the block grouped and of the device header.  Thread 0 of a block calls it.
+__device__ void dm_abort(const DmWatch& w, const DmShared* sm, uint32_t reason, uint32_t phase, int g, uint32_t have,
+                         uint32_t want) {
+    if (atomicCAS(w.abort, 0u, 1u) != 0u) return;
+    __threadfence_system();
+    *(volatile uint32_t*) w.done_m = 0xffffffffu;   // CUDA0's waits on this window pass
+    __threadfence_system();
+    if (w.diag_m == nullptr) return;
+    uint32_t h0 = 0, h1 = 0;
+    for (int i = 0; sm != nullptr && i < w.n; ++i) {
+        h0 = h0 * 16777619u ^ (uint32_t) sm->ids[i] ^ (uint32_t) sm->kind[i] << 20;
+        h1 = h1 * 16777619u ^ (uint32_t) __ldcg(w.hdr_ids + i) ^ (uint32_t) __ldcg(w.hdr_ids + kDmCap + i) << 20;
+    }
+    volatile uint32_t* d = w.diag_m;
+    d[1] = w.ring; d[2] = (uint32_t) w.layer; d[3] = (uint32_t) w.n_tok; d[4] = blockIdx.x; d[5] = phase;
+    d[6] = (uint32_t) g; d[7] = have; d[8] = want;
+    d[9] = sm != nullptr ? (uint32_t) sm->ng : 0u; d[10] = sm != nullptr ? (uint32_t) sm->ne : 0u;
+    d[11] = sm != nullptr && g >= 0 && g < sm->ng ? (uint32_t) (sm->start[g + 1] - sm->start[g]) : 0u;
+    d[12] = h0; d[13] = h1;
+    __threadfence_system();
+    d[0] = reason;
+    __threadfence_system();
+}
+
+// Thread 0's spin until *word >= want (acquire): false when the window was aborted or released meanwhile (the
+// release and a wait past kDmWaitLimitNs, when `limit`, abort it with a record).
+__device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm, const unsigned int* word,
+                                           unsigned int want, uint32_t phase, int g, bool limit) {
+    unsigned int v, spins = 0;
+    unsigned long long t0 = 0;
+    while ((v = *(const volatile unsigned int*) word) < want) {
+        __nanosleep(20);
+        if ((++spins & 255u) != 0u) continue;
+        if (*(volatile unsigned int*) w.abort != 0u) return false;
+        if (*w.seq_m == 0xffffffffu) { dm_abort(w, sm, 3u, phase, g, v, want); return false; }
+        if (!limit) continue;
+        const unsigned long long t = dm_now();
+        if (t0 == 0) t0 = t;
+        else if (t - t0 > kDmWaitLimitNs) { dm_abort(w, sm, 1u, phase, g, v, want); return false; }
+    }
+    __threadfence();
+    return true;
+}
 
 // The grouped experts of sm's lists (ng groups: blob gptr[g], entries [start[g], start[g+1]) reading q8_1 row tok[e]
 // and writing row dst[e] of `out`): block b of nb takes gate/up items (group, 8 rows) b, b + nb, ..., each one
@@ -322,8 +390,10 @@ struct DmShared {
 // with a co-resident grid every wait ends.  The rows are native_expert_grouped's, bit for bit.
 template<int TG, int TD>
 __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, float* gate,
-                           float* up, float* out, unsigned int* done, int b, int nb, bool gu2 = false) {
+                           float* up, float* out, unsigned int* done, int b, int nb, bool gu2 = false,
+                           const DmWatch* watch = nullptr) {
     const int tid = threadIdx.x;
+    if (tid == 0) sm.stop = 0;
     constexpr bool SG = kStageIqGrid<TG>;
     // gu2: gate/up items of GU2_ROWS rows, two a warp (native_gu2_kernel's rows, the same bits)
     const bool g2 = kGu2<TG> && gu2 && gu2_usable(L);
@@ -363,10 +433,15 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
         __syncthreads();                         // the previous item's reads of hq and out are done
         if (g != g_staged) {
             if (tid == 0) {
-                while (*(volatile unsigned int*) (done + g) < (unsigned int) nrb) __nanosleep(20);
-                __threadfence();
+                if (watch == nullptr) {
+                    while (*(volatile unsigned int*) (done + g) < (unsigned int) nrb) __nanosleep(20);
+                    __threadfence();
+                } else if (!dm_wait_ge(*watch, &sm, done + g, (unsigned int) nrb, 1u, g, true)) {
+                    sm.stop = 1;   // the window is aborted: its rows are not needed
+                }
             }
             __syncthreads();
+            if (sm.stop) return;
             dm_swiglu_q8(gate, up, e0, e1, (int) L.n_ff, sm.hq, tid);
             g_staged = g;
             __syncthreads();
@@ -393,9 +468,10 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42)
 
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
-                               float* out, unsigned int* done, int b, int nb, bool gu2 = false) {
+                               float* out, unsigned int* done, int b, int nb, bool gu2 = false,
+                               const DmWatch* watch = nullptr) {
     switch (L.gu_type * 100 + L.d_type) {
-#define STRATA_DM_CASE(TG, TD) case TG * 100 + TD: dm_experts<TG, TD>(sm, xq, L, gate, up, out, done, b, nb, gu2); break;
+#define STRATA_DM_CASE(TG, TD) case TG * 100 + TD: dm_experts<TG, TD>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
         STRATA_DM_PAIRS(STRATA_DM_CASE)
 #undef STRATA_DM_CASE
         default: break;
@@ -417,14 +493,38 @@ __device__ __forceinline__ bool dm_arrive(unsigned int* arrive, unsigned int tar
     return last;
 }
 
+// The peer's grid barrier (the k-th waits for k * nb arrivals on `bar`): false when the window was aborted or released
+// meanwhile.  A block that gets false leaves the kernel; the others follow at their next wait.
+__device__ __forceinline__ bool dm_grid_sync(const DmWatch& w, unsigned int* bar, unsigned int target, int32_t* s_ok) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(bar, 1u);
+        bool ok = true;
+        unsigned int v, spins = 0;
+        while (true) {
+            asm volatile("ld.acquire.gpu.u32 %0, [%1];" : "=r"(v) : "l"(bar) : "memory");
+            if (v >= target) break;
+            strata_spin_pause();
+            if ((++spins & 255u) != 0u) continue;
+            if (*(volatile unsigned int*) w.abort != 0u) { ok = false; break; }
+            if (*w.seq_m == 0xffffffffu) { dm_abort(w, nullptr, 3u, 2u, -1, v, target); ok = false; break; }
+        }
+        *s_ok = ok;
+    }
+    __syncthreads();
+    return *s_ok != 0;
+}
+
 // The peer window.  Per ring: block 0 waits for CUDA0's doorbell and copies the ring's header and q8_1 rows to the
 // device (only block 0 reads host memory); a grid barrier; every block groups the peer's entries (the same lists) and
 // runs its work items with the rows written straight to mapped memory; the last block to finish raises `done`.
+// Every wait inside a ring is bounded: a down wait past kDmWaitLimitNs, a corrupt ring or the host's release aborts
+// the window (a record in diag_m, done_m past every ring) and the kernel exits.
 __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
-    namespace cg = cooperative_groups;
-    cg::grid_group grid = cg::this_grid();
     __shared__ DmShared sm;
     __shared__ uint32_t s_seq;
+    __shared__ int32_t s_ok;
     const int tid = threadIdx.x;
     const int nb = gridDim.x;
     float* gate = (float*) a.scratch;
@@ -432,7 +532,16 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     block_q8_1* xq = (block_q8_1*) (up + (size_t) kDmCap * a.n_ff);
     DmRing* hdr = (DmRing*) (xq + (size_t) kVerifyMaxT * (a.n_embd / 32));
     unsigned int* done = (unsigned int*) (hdr + 1);
-    unsigned int served = 0;
+    // a.arrive (zeroed before every launch): [0] ring arrivals, [1] the grid barrier, [2] the abort word
+    unsigned int* bar = a.arrive + 1;
+    unsigned int* abort = a.arrive + 2;
+    unsigned int served = 0, bars = 0;
+    if (blockIdx.x == 0) {   // whatever an earlier window left: the group counters start at zero
+        for (int i = tid; i <= kDmCap; i += kDmThreads) done[i] = 0u;
+        __threadfence();
+    }
+    DmWatch w;
+    w.abort = abort; w.diag_m = a.diag_m; w.seq_m = a.seq_m; w.done_m = a.done_m; w.hdr_ids = hdr->ids;
     auto stamp = [&](int s, int i) {
         if (a.stamps_m != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
             unsigned long long t;
@@ -442,10 +551,12 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     };
     for (int s = 0; s < a.steps; ++s) {
         const uint32_t ring = (uint32_t) s + 1u;
+        w.ring = ring; w.layer = -1; w.n_tok = 0; w.n = 0;
         if (blockIdx.x == 0) {
             if (tid == 0) {
-                uint32_t v;
-                while (((v = *a.seq_m) & 0xffffu) < ring) strata_spin_pause();
+                uint32_t v = 0xffffffffu;   // an aborted window stops here
+                if (*(volatile unsigned int*) abort == 0u)
+                    while (((v = *a.seq_m) & 0xffffu) < ring) strata_spin_pause();
                 __threadfence_system();
                 s_seq = v;
             }
@@ -459,7 +570,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 const uint4* src = (const uint4*) (a.rings_m + s);
                 const uint4* xs = (const uint4*) (a.xq_m + (size_t) s * a.xq_stride);
                 constexpr int h16 = (int) (sizeof(DmRing) / 16);
-                const int n16 = h16 + nt * (a.n_embd / 32) * (int) sizeof(block_q8_1) / 16;
+                const int n16 = h16 + min(nt, kVerifyMaxT) * (a.n_embd / 32) * (int) sizeof(block_q8_1) / 16;
                 for (int i = tid; i < n16; i += kDmThreads) {
                     if (i < h16) ((uint4*) hdr)[i] = __ldcv(src + i);
                     else ((uint4*) xq)[i - h16] = __ldcv(xs + (i - h16));
@@ -470,14 +581,15 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             }
             __threadfence();
         }
-        grid.sync();
+        if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
         stamp(s, 1);
         if (hdr->n_tok < 0) return;              // released: the window is being abandoned
-        if (hdr->n_peer == 0) {
-            grid.sync();                         // block 0 rewrites the header next ring
+        if (hdr->n_peer == 0) {                  // block 0 rewrites the header next ring
+            if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
             continue;
         }
-        const int n_tok = hdr->n_tok, layer = hdr->layer, n = n_tok * a.k;
+        const int n_tok = min(hdr->n_tok, kVerifyMaxT), layer = hdr->layer, n = n_tok * a.k;
+        w.layer = layer; w.n_tok = n_tok; w.n = n;
         if (tid < n) {
             sm.ids[tid] = hdr->ids[tid];
             sm.kind[tid] = hdr->kind[tid];
@@ -490,10 +602,15 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             if (sm.first[tid]) sm.gptr[sm.gidx[tid]] = a.ptr[(size_t) layer * a.n_expert + sm.ids[tid]];
         }
         __syncthreads();
-        bool bad = false;
-        for (int g = 0; g < sm.ng; ++g) bad |= sm.gptr[g] == 0ull;
+        // a group of more entries than the shared rows hold (a ring the route kernel did not write) aborts the window
+        bool bad = false, big = false;
+        for (int g = 0; g < sm.ng; ++g) {
+            bad |= sm.gptr[g] == 0ull;
+            big |= sm.start[g + 1] - sm.start[g] > kDmMaxEnt;
+        }
+        if (big && tid == 0) dm_abort(w, &sm, 2u, 0u, -1, 0u, 0u);
         stamp(s, 2);
-        if (!bad) dm_experts_any(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0);
+        if (!bad && !big) dm_experts_any(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w);
         stamp(s, 3);
         __threadfence_system();
         ++served;
@@ -501,6 +618,8 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             __threadfence_system();
             *(volatile uint32_t*) a.done_m = ring;
             __threadfence_system();
+            // an abort raised meanwhile: its own store past every ring may have landed first
+            if (*(volatile unsigned int*) abort != 0u) *(volatile uint32_t*) a.done_m = 0xffffffffu;
             if (a.stamps_m != nullptr) {
                 unsigned long long t;
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -867,6 +986,19 @@ void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, cons
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff) {
     return (size_t) kDmCap * n_ff * 2 * sizeof(float) + (size_t) kVerifyMaxT * (n_embd / 32) * sizeof(block_q8_1) +
            sizeof(DmRing) + (kDmCap + 1) * sizeof(unsigned int) + 256;
+}
+
+std::string dec_moe_peer_diag(const uint32_t* d) {
+    if (d == nullptr || d[0] == 0u) return "";
+    const uint32_t r = d[0];
+    const char* why = r == 1u ? "a wait past the limit" : r == 2u ? "a group of more entries than tokens"
+                    : r == 3u ? "released by the host" : "unknown";
+    const char* where = d[5] == 1u ? "waiting for a group's gate/up items" : d[5] == 2u ? "at a grid barrier" : "planning";
+    char b[512];
+    std::snprintf(b, sizeof b, "aborted ring %u (%s): layer %d, %u tokens; block %u %s (group %d: %u of %u; the block "
+                  "has %u groups, %u entries, this group %u; ids checksum %08x, header %08x)", d[1], why, (int) d[2],
+                  d[3], d[4], where, (int) d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13]);
+    return b;
 }
 
 bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
