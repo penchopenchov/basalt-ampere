@@ -56,9 +56,14 @@ bool hc_fused_supported();
 void hc_fused_read(const HcFusedArgs& a, void* stream);
 /// Prefetch byte ranges into L2 with a one-CTA kernel (bulk prefetches; no data moves to the SMs).
 void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* stream);
-/// The bench's knob (-1 = leave): hold = the weight streams start once the norm's inputs have landed (1, the default;
-/// STRATA_DEC_HC_HOLD=0 in the engine) or at launch (0).
-void hc_fused_set_knobs(int hold);
+/// The bench's knobs (-1 = leave; the engine's env in brackets): hold = the weight streams start once the norm's inputs
+/// have landed (1, the default) or at launch (0) [STRATA_DEC_HC_HOLD]; deep = as many down stages in flight as shared
+/// memory holds [STRATA_DEC_HC_DEEP]; pfd = the down CTAs prefetch their weight rows into L2 at launch
+/// [STRATA_DEC_HC_PFD]; rlate = R' is written after the up projection's results [STRATA_DEC_HC_RLATE]; rearly = the router rows are loaded at launch when they fit beside the down ring
+/// [STRATA_DEC_HC_REARLY]; backoff = ns between polls of a hand-off counter [STRATA_DEC_HC_BACKOFF].
+/// STRATA_DEC_HC_TRIG=1 (engine only): the read lets the next kernel launch at once (griddepcontrol.launch_dependents
+/// at its start), so the next kernel's CTAs take each SM this read leaves and stage their weights during its tail.
+void hc_fused_set_knobs(int hold, int deep = -1, int pfd = -1, int rlate = -1, int rearly = -1, int backoff = -1);
 /// The bench only: per-CTA phase times (globaltimer ns) into dbg[nb][8]: start, after the dependency wait, role input
 /// ready, role done, router input ready, router rows done, top-10 done (last CTA), exit.  nullptr = off.
 void hc_fused_set_debug(unsigned long long* dbg);

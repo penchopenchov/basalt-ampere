@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <array>
+#include <string>
 #include <vector>
 
 namespace K = strata::kernels;
@@ -175,7 +177,25 @@ int main(int argc, char** argv) {
         return 7;
     };
 
+    // HC_V="hold,deep,pfd,rlate,rearly,backoff;..." (hc_fused_set_knobs) - every variant is checked and timed
+    std::vector<std::array<int, 6>> variants;
+    {
+        const char* e = std::getenv("HC_V");
+        std::string vs = e ? e : "1,0,0,0";
+        size_t p0 = 0;
+        while (p0 < vs.size()) {
+            size_t p1 = vs.find(';', p0);
+            if (p1 == std::string::npos) p1 = vs.size();
+            std::array<int, 6> k = {1, 0, 0, 0, 0, 0};
+            std::sscanf(vs.substr(p0, p1 - p0).c_str(), "%d,%d,%d,%d,%d,%d", &k[0], &k[1], &k[2], &k[3], &k[4], &k[5]);
+            variants.push_back(k);
+            p0 = p1 + 1;
+        }
+    }
     int failures = 0;
+    for (const auto& kv : variants) {
+    K::hc_fused_set_knobs(kv[0], kv[1], kv[2], kv[3], kv[4], kv[5]);
+    std::printf("== variant hold %d deep %d pfd %d rlate %d rearly %d backoff %d\n", kv[0], kv[1], kv[2], kv[3], kv[4], kv[5]);
     for (int T = t_lo; T <= t_hi; ++T)
         for (int mode = 0; mode < 3; ++mode) {   // 0: attention-side read, 1: FFN read + router, 2: the head's read
             const bool inject = mode != 2, router = mode == 1;
@@ -222,9 +242,7 @@ int main(int argc, char** argv) {
 
     // time: hot (back to back) and cold (192 MB written before each read, then R, bo and w_norm rewritten as the
     // previous kernels leave them; the read alone timed)
-    for (int hold = 1; hold >= 0; --hold) {
-    K::hc_fused_set_knobs(hold);
-    std::printf("weight streams %s:\n", hold ? "after the norm's inputs (hold)" : "at launch");
+    {
     for (int T = t_lo; T <= t_hi; ++T)
         for (int router = 0; router < 2; ++router) {
             const double bytes = 2.0 * LR * D * 2 + HC * D * 2 + (router ? (double) NE * N * 2 : 0.0);
@@ -257,7 +275,6 @@ int main(int argc, char** argv) {
                         bytes / cold[1] / 1e3);
         }
     }
-    K::hc_fused_set_knobs(1);
 
     // per-phase times of single reads (globaltimer, relative to the first CTA's start)
     {
@@ -267,9 +284,9 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &ddbg, (size_t) sms * 16 * 8);
         std::vector<unsigned long long> h((size_t) sms * 16);
         static const char* const ph[8] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit"};
-        for (int T : {1, 2, 3, 8}) {
+        for (int T : {1, 2, 3}) {
             if (T < t_lo || T > t_hi) continue;
-            for (int cold = 0; cold < 2; ++cold) {
+            for (int cold = 1; cold < 2; ++cold) {
                 for (int i = 0; i < 3; ++i) run(1, T, true, true, true);
                 if (cold) evict(1, 1);
                 cudaMemsetAsync(ddbg, 0, (size_t) sms * 128, s);
@@ -294,13 +311,9 @@ int main(int argc, char** argv) {
                     }
                     std::printf("\n");
                 }
-                for (int b = 0; b < sms; ++b)
-                    if (h[b * 16 + 6])
-                        std::printf("  top-10 CTA %d: ticket %.2f loads %.2f softmax %.2f select %.2f us after its rows\n", b,
-                                    (h[b * 16 + 8] - h[b * 16 + 5]) / 1e3, (h[b * 16 + 9] - h[b * 16 + 8]) / 1e3,
-                                    (h[b * 16 + 10] - h[b * 16 + 9]) / 1e3, (h[b * 16 + 6] - h[b * 16 + 10]) / 1e3);
             }
         }
+    }
     }
     return failures ? 1 : 0;
 }
