@@ -60,9 +60,19 @@ struct VerifyHits {
 /// STRATA_VERIFY_PROFILE: the GPU's idle time between a verify window and the draft round after it, and back (from
 /// globaltimer stamps of the window's first and last kernels and the drafter's), summed for profile_report.
 struct DecodeGaps {
-    unsigned long long verify_end = 0, draft_end = 0;
+    unsigned long long verify_end = 0, draft_end = 0, verify_prev_end = 0;
     double v2d = 0, d2v = 0, draft_gpu = 0;
     long long n_v2d = 0, n_d2v = 0;
+    // host time between marks on the decode loop's path (mark(i) adds the time since the last mark to hms[i])
+    bool host_on = false;
+    double hms[32] = {};
+    std::chrono::steady_clock::time_point hlast{};
+    void mark(int i) {
+        if (!host_on) return;
+        const auto n = std::chrono::steady_clock::now();
+        if (i >= 0) hms[i] += std::chrono::duration<double, std::milli>(n - hlast).count();
+        hlast = n;
+    }
 };
 DecodeGaps& decode_gaps();
 
@@ -139,8 +149,13 @@ public:
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
-    /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
-    bool commit(int n_keep, std::string& err);
+    /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  `parts`: 1 launches
+    /// the commit graph, 2 advances `ss.ple_prev` (3: both, in that order).
+    bool commit(int n_keep, std::string& err, int parts = 3);
+    /// STRATA_DEC_CHAIN=1: the decode loop's host work off the GPU's critical path (see run() and the serve loop)
+    static bool chain_on();
+    /// STRATA_DEC_MOE: the residency tables uploaded now (between windows) rather than at the next run()
+    bool dm_presync(std::string& err) { return dm_ == nullptr || dm_sync(err); }
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -298,6 +313,7 @@ private:
     unsigned long long* trace_h_ = nullptr;
     unsigned long long* trace_m_ = nullptr;
     size_t trace_n_ = 0;
+    double prof_graph0_ = 0;                        // the graph's start to layer 0's first stamp (ns, summed)
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;

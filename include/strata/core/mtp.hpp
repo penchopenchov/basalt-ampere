@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -84,6 +85,8 @@ public:
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
     bool coupled() const { return coupled_active_; }
+    /// Called once by the next draft() right after its graphs are launched (the host's own work in their shadow).
+    void set_launch_hook(std::function<void()> fn) { launch_hook_ = std::move(fn); }
 
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
@@ -140,6 +143,8 @@ private:
     const WeightTable* wt_ = nullptr;
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
+    std::function<void()> launch_hook_;
+    void run_launch_hook() { if (launch_hook_) { auto f = std::move(launch_hook_); launch_hook_ = nullptr; f(); } }
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;

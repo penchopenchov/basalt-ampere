@@ -5499,7 +5499,7 @@ int main(int argc, char** argv) {
                 cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
         };
-        auto apply_pending = [&](bool wait) {
+        auto apply_pending = [&](bool wait, bool exchanges = true) {
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
@@ -5511,7 +5511,7 @@ int main(int argc, char** argv) {
                 }
             for (auto& st : stages) st->adapt_live = false;
             unpin_blobs(pin_live);
-            src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
+            if (exchanges) src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
@@ -7133,6 +7133,15 @@ int main(int argc, char** argv) {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
+            static const bool chain = strata::core::Verifier::chain_on();
+            int adapt_age = 2;   // loop tops since the last adaptive round
+            bool applied_early = false;
+            struct Joined {
+                std::thread t;
+                ~Joined() { if (t.joinable()) t.join(); }
+            } apply_j;
+            std::thread& apply_thr = apply_j.t;
+            bool copy_live = false, copy_done = false;   // exchanges applied early whose RAM copies are under way
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -7164,7 +7173,18 @@ int main(int argc, char** argv) {
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-                apply_pending(!adapt_nowait());
+                strata::core::decode_gaps().mark(17);
+                // STRATA_DEC_CHAIN: an adaptive round's swaps land before the second window after it (a fixed window,
+                // so as reproducible as before), applied beside the draft before it (apply_thr) when their copies are
+                // done; what that moved to the peer lands one window later
+                if (apply_thr.joinable()) apply_thr.join();
+                if (copy_live && copy_done) {   // the RAM copies are done: their bookkeeping, between windows
+                    src.commit_exchanges();
+                    copy_live = false;
+                }
+                ++adapt_age;
+                if (!chain || (adapt_age >= 2 && !(applied_early && adapt_age == 2))) apply_pending(!adapt_nowait());
+                strata::core::decode_gaps().mark(18);
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -7177,6 +7197,7 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 tr("window", p, T);
+                strata::core::decode_gaps().mark(19);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -7188,8 +7209,111 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
-                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                const bool do_adapt = !drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0 &&
+                                      (!chain || (pending.empty() && !copy_live && !src.exchanges_staged()));
+                auto spawn_adapt = [&] {
+                    if (!do_adapt) return;
+                    adapt_age = 0;
+                    adapt_thr = std::thread([&] {
+                        const auto ta = Clock::now();
+                        adapt_ok = adapt();
+                        if (chain && adapt_ok) {   // the evictions' residency, uploaded beside the draft
+                            std::string perr;
+                            if (!ver.dm_presync(perr)) std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
+                        }
+                        strata::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                    });
+                };
+                if (chain) {
+                    // the draft launches first; the commit, the adaptive round and the output go in its shadow
+                    int n_emit = 0;
+                    bool eos_pre = false;
+                    for (int i = 0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
+                        ++n_emit;
+                        eos_pre = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                    }
+                    const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
+                    if (!ver.commit(a + 1, err, 2)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                    draft_offered += T - 1;
+                    draft_accepted += a;
+                    first_window = false;
+                    bool commit_ok = true, after_ran = false, eos = false;
+                    std::string cerr;
+                    auto after_launch = [&] {
+                        after_ran = true;
+                        commit_ok = ver.commit(a + 1, cerr, 1);
+                        spawn_adapt();
+                        // the swaps' residency at the next window, then their RAM copies a share per draft
+                        applied_early = adapt_age == 1 && !do_adapt && !pending.empty();
+                        if (applied_early || copy_live) {
+                            const bool boundary = applied_early;
+                            copy_live = true;
+                            copy_done = false;
+                            apply_thr = std::thread([&, boundary] {
+                                if (boundary) {
+                                    apply_pending(true, false);
+                                    std::string perr;
+                                    if (!ver.dm_presync(perr)) std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
+                                }
+                                copy_done = !src.exchanges_staged() || src.copy_exchanges(8ull << 20);
+                            });
+                        }
+                        for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                            std::printf("T %d\n", (int) outv[(size_t) i]);
+                            strata::core::progress_beat();
+                            ++produced_n;
+                            if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
+                            eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                        }
+                        std::fflush(stdout);
+                    };
+                    ++rounds;
+                    const Clock::time_point tw2 = Clock::now();
+                    if (hist_n > 0 && mtp.coupled() && will_draft)
+                        mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                    strata::core::decode_gaps().mark(5);
+                    bool drafted = true;
+                    if (will_draft) {
+                        mtp.set_launch_hook(after_launch);
+                        drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                        mtp.set_launch_hook(nullptr);
+                    }
+                    if (!after_ran) after_launch();
+                    {
+                        const Clock::time_point tw3 = Clock::now();
+                        auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+                        dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                        ++dec_windows; dec_T += T;
+                    }
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    strata::core::decode_gaps().mark(16);
+                    if (!commit_ok) {
+                        std::printf("ERR %s\n", cerr.c_str());
+                        return 1;
+                    }
+                    if (!adapt_ok) {
+                        std::printf("ERR an adaptive refill failed\n");
+                        return 1;
+                    }
+                    if (!drafted) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (timed_round && !eos)
+                        policy.observe(from_sfx, T, a, sfx_match,
+                                       std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    strata::core::decode_gaps().mark(17);
+                    if (eos) { finish = "stop"; break; }
+                    if (stop_req.load()) { finish = "cancel"; break; }
+                    x = outv[(size_t) a];
+                    p += a + 1;
+                    continue;
+                }
+                spawn_adapt();
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -7215,6 +7339,7 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                strata::core::decode_gaps().mark(5);
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
@@ -7224,6 +7349,7 @@ int main(int argc, char** argv) {
                     ++dec_windows; dec_T += T;
                 }
                 if (adapt_thr.joinable()) adapt_thr.join();
+                strata::core::decode_gaps().mark(16);
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -7235,11 +7361,15 @@ int main(int argc, char** argv) {
                 if (timed_round && !eos)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                strata::core::decode_gaps().mark(17);
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            if (apply_thr.joinable()) apply_thr.join();
+            if (copy_live) src.commit_exchanges();   // swaps applied early: the rest of their copies
+            copy_live = false;
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
