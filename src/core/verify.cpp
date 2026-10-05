@@ -43,6 +43,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dec_moe.hpp"
+#include "strata/kernels/dec_shx.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -459,6 +460,7 @@ Verifier::~Verifier() {
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (shx_sync_) cudaFree(shx_sync_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
@@ -699,6 +701,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
     if (env_on("STRATA_DEC_MOE") && !dm_init(err)) return false;
+    if (env_on("STRATA_DEC_SHX") && dm_ != nullptr && shx_sync_ == nullptr) {   // the shared expert in one launch
+        if (cudaMalloc(&shx_sync_, strata::kernels::kShxSyncWords * sizeof(unsigned int)) != cudaSuccess ||
+            cudaMemset(shx_sync_, 0, strata::kernels::kShxSyncWords * sizeof(unsigned int)) != cudaSuccess) {
+            err = "verify: STRATA_DEC_SHX buffers";
+            return false;
+        }
+        std::fprintf(stderr, "strata verify: STRATA_DEC_SHX on: the shared expert in one launch\n");
+    }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
@@ -735,6 +745,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const bool dm = dm_ != nullptr && !batch_rec_;   // STRATA_DEC_MOE: the device-planned tail (one group)
     const int G = (split_ && T >= 2 && !batch_rec_ && !dm) ? 2 : 1;   // a batch window is one group
+    const bool shx = dm && shx_sync_ != nullptr;   // STRATA_DEC_SHX: the shared expert in one launch, no side stream
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     static const bool dec_qsa = [] { const char* v = std::getenv("STRATA_DEC_QSA"); return v != nullptr && std::atoi(v) != 0; }();
     // STRATA_DEC_HC=1: each hyper-connection read (and the FFN read's router) as one kernel, bitwise the kernels it
@@ -1213,7 +1224,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const char* e = std::getenv("STRATA_SH_STREAM");
             return !e || e[0] != '0';
         }();
-        const bool sh_fork = sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
+        const bool sh_fork = !shx && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
+                             ev_join_ != nullptr;
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
@@ -1296,6 +1308,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
+            if (shx && dec_shx_ok(nsw.gate_type, nsw.up_type, nsw.down_type, N, g.n_ff)) {
+                ShxArgs sa;   // xm's own q8_1 rows: the route kernel's (q8_1_store) differ from them in rare blocks
+                sa.gate_w = nsw.gate_data; sa.up_w = nsw.up_data; sa.down_w = nsw.down_data;
+                sa.gate_inp = (const uint16_t*) wgi->data; sa.x = xm; sa.xq = xq_;
+                sa.gate = sh_gate_ + (size_t) tb * g.n_ff; sa.up = sh_up_ + (size_t) tb * g.n_ff; sa.hq = sh_xq_;
+                sa.g = sh_g_ + tb; sa.out = shared_ + tb * N; sa.sync = shx_sync_; sa.n_tok = n;
+                try {
+                    PdlScope ps(pdl);   // after the route kernel
+                    native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                    dec_shx(sa, cs);
+                } catch (const std::exception& e) {
+                    err = std::string("verify shared expert: ") + e.what();
+                    return false;
+                }
+            } else {
             if (!shared_expert_native_bf16_enabled()) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
@@ -1308,6 +1335,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
             if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
+            }
         }
         if (dm) {}   // the route kernel wrote nat_xq_
         else if (strata::kernels::cpu::expert_layout().native)
@@ -1414,7 +1442,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
-        if (!prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
+        if (!shx && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
         if (dm) {
