@@ -74,7 +74,8 @@ struct DecMoe {
     int vram = -1;                           ///< STRATA_DEC_MOE_VRAM: the VRAM share's kernels (dec_moe_vram's kind; -1 grouped)
     void* vscr = nullptr;                    ///< its gate/up rows
     unsigned int* vsync = nullptr;           ///< its counters
-    // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring; the peer's rows
+    // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
+    // record (kDmDiagWords); the peer's rows
     strata::kernels::DmRing* h_ring = nullptr; strata::kernels::DmRing* m_ring = nullptr;
     float* h_x = nullptr; float* m_x = nullptr;
     uint8_t* h_xq = nullptr; uint8_t* m_xq = nullptr;
@@ -335,6 +336,8 @@ std::string Verifier::dm_note() const {
         }
         s += "; peer card: rung for ring " + std::to_string(w & 0xffffu) + ((w >> 28) & 1u ? " (with entries)" : "") +
              ", finished ring " + std::to_string(done) + ", its kernel " + st;
+        const std::string ab = strata::kernels::dec_moe_peer_diag(d->h_w + 32);
+        if (!ab.empty()) s += "; the peer window " + ab;
     }
     return s;
 }
@@ -2006,6 +2009,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         gm.mark(13);
         *(volatile uint32_t*) (dm_->h_w + 0) = 0;
         *(volatile uint32_t*) (dm_->h_w + 16) = 0;
+        *(volatile uint32_t*) (dm_->h_w + 32) = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (dm_->pdev >= 0) {
             const OnDevice on(dm_->pdev);
@@ -2014,7 +2018,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
             pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
             pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) strata::kernels::cpu::expert_layout().fmt[0].n_ff;
-            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr;
+            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
             if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess || !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps)) {
                 err = "verify: the peer window did not launch";
                 return false;
@@ -2159,6 +2163,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         dm_->peer_live = false;
         const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
         if (pe != cudaSuccess) { err = std::string("verify: the peer window: ") + cudaGetErrorString(pe); return false; }
+        const std::string ab = strata::kernels::dec_moe_peer_diag(dm_->h_w + 32);
+        if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     commit_pending_ = false;
