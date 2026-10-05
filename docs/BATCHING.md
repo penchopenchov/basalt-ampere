@@ -93,9 +93,9 @@ slot (from all it holds, and from its turn checkpoint without the reply's thinki
 its slot and continued on the solo path (`tools/batch_interleave_test.py`). These
 settings make the comparison exact:
 
-- `STRATA_IQ_MT_MIN=1` (the multi-token CPU expert kernels for every group, as for the solo path's own
-  exactness tests: by default an expert's rows round differently alone than in a group, so the output depends on
-  how many rows of a window share an expert - which differs between a batch and a request alone),
+- `STRATA_IQ_MT_MIN=1`, the default (the multi-token CPU expert kernels for every group: with `=2` an expert's
+  rows round differently alone than in a group, so the output depends on how many rows of a window share an
+  expert - which differs between a batch and a request alone),
 - `--pcie-frac 0`: the PCIe share of the missed experts is chosen per window from the window's misses, so the
   same expert can run on the GPU in one window and on the CPU in another, which rounds differently, and
 - `--adapt-every 1000000` (the VRAM tier fixed), and `--no-prefill-borrow` while a prompt is read beside decoding
@@ -183,7 +183,7 @@ tests the server's side with a scripted engine (no GPU).
 | `tools/parking_test.py` | a follow-up to a conversation decodes the same tokens whether its state stayed live or came back from the parking cache (with a layer split: every stage's image). |
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
 
-For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `STRATA_IQ_MT_MIN=1`):
+For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (`STRATA_IQ_MT_MIN=1`, the default, is set by the scripts too):
 
 ```
 python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 8 --n 8 \
