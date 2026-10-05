@@ -325,6 +325,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
                           src/kernels/cuda/qsa_dec_attn.cu
+                          src/kernels/cuda/qsa_dec_fused.cu
                           src/kernels/cuda/qsa_prompt_attn.cu
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/dequant_bf16.cu
@@ -377,6 +378,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       src/kernels/cuda/native_flash_attn.cu
       src/kernels/cuda/native_qsa_indexer.cu
       src/kernels/cuda/native_qsa_score.cu
+      src/kernels/cuda/qsa_dec_fused.cu
       PROPERTIES COMPILE_OPTIONS "$<IF:$<BOOL:${STRATA_HIP_GFX906}>,,--use_fast_math>")
   elseif(STRATA_ENABLE_HIP)
     # Keep Q8_K's multiply and magic-bias rounding as separate FP32 operations on HIP; contraction to an
@@ -799,6 +801,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(qsa_dec_attn_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(qsa_dec_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME qsa_dec_attn_parity COMMAND qsa_dec_attn_parity 20)
+  add_executable(qsa_dec_fused_parity src/kernels/qsa_dec_fused_parity.cpp)
+  target_include_directories(qsa_dec_fused_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(qsa_dec_fused_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME qsa_dec_fused_parity COMMAND qsa_dec_fused_parity 20)
 
   # KV streaming (docs/kv-streaming-design.md): streamed vs resident attention, bitwise (GPU, synthetic, no model).
   add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)

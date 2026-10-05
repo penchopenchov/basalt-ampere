@@ -30,6 +30,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_dec_attn.hpp"
+#include "strata/kernels/qsa_dec_fused.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
@@ -793,50 +794,79 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                     native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 }
-                if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
-                else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
-                if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
-                    fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
-                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
-                } else if (st.kv_hybrid) {   // K8V4: only V is rotated
-                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
-                }
-                stamp(l, 8, grp);
-                if (batch_rec_) {   // every slot's indexer tail, restored by its commit
-                    for (int t = tb; t < te; ++t)
-                        copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS, slot_ss(t).qsa_states[qi].idx_tail,
-                                         TS, cs);
-                } else
-                if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
-                for (int t = tb; t < te; ++t) {
-                    const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
-                    const int32_t* step_t = step_ + t * kStepCount;
-                    if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
-                        kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, nullptr);
-                        kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, nullptr);
-                    } else if (st.kv_q4)
-                        kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, &st.host);
-                    else if (st.kv_int8)
-                        kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
-                                          kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
-                    else
-                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                       vcur_ + t * NKV * HD, s, cs, &st.host);
-                }
-                for (int t = tb; t < te; ++t) {
-                    const QsaState& sx = slot_ss(t).qsa_states[qi];
-                    const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                    native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                              (const float*) wikn->data, EPS, ib, s, sx.max_cells,
-                                              rope_scaling(), cs);
+                // STRATA_DEC_QSA=1: the K norm + RoPE, the INT8 appends, the tail snapshot and the indexer appends of the
+                // group's rows in one launch, the same bits
+                const bool fused_pre = dec_qsa && !batch_rec_ && st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
+                                       native_qsa_enabled() && native_rope_enabled() && qsa_dec_fused_supported(s);
+                if (fused_pre) {
+                    QsaDecKvPost kp;
+                    kp.kcur = kcur_ + tb * NKV * HD; kp.vcur = vcur_ + tb * NKV * HD; kp.pos_k = pos_k + tb * NKV;
+                    kp.k_norm = (const float*) wkn->data; kp.steps = step_ + tb * kStepCount;
+                    kp.k_q = st.k_q; kp.v_q = st.v_q; kp.k_scale = st.k_scale; kp.v_scale = st.v_scale;
+                    kp.page_table = st.page_table; kp.host = st.host;
+                    kp.idx_raw = idx_raw + tb * ID; kp.idx_k_norm = (const float*) wikn->data;
+                    kp.tail = st.idx_tail; kp.dead = st.idx_dead; kp.pooled = st.idx_pooled; kp.block_pos = st.idx_block_pos;
+                    kp.tail_snap = grp == 0 ? tail_snap_ + (size_t) qi * TS : nullptr;
+                    kp.max_cells = (int) st.max_cells; kp.eps = EPS;
+                    qsa_dec_kv_post(kp, n, s, rope_scaling(), cs);
+                    stamp(l, 8, grp);
+                } else {
+                    if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
+                    else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
+                    if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
+                        fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                        fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                    } else if (st.kv_hybrid) {   // K8V4: only V is rotated
+                        fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                    }
+                    stamp(l, 8, grp);
+                    if (batch_rec_) {   // every slot's indexer tail, restored by its commit
+                        for (int t = tb; t < te; ++t)
+                            copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS, slot_ss(t).qsa_states[qi].idx_tail,
+                                             TS, cs);
+                    } else
+                    if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                    for (int t = tb; t < te; ++t) {
+                        const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
+                        const int32_t* step_t = step_ + t * kStepCount;
+                        if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                            kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, nullptr);
+                            kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, nullptr);
+                        } else if (st.kv_q4)
+                            kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                              vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else if (st.kv_int8)
+                            kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                        else
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                           vcur_ + t * NKV * HD, s, cs, &st.host);
+                    }
+                    for (int t = tb; t < te; ++t) {
+                        const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
+                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                  (const float*) wikn->data, EPS, ib, s, sx.max_cells,
+                                                  rope_scaling(), cs);
+                    }
                 }
                 stamp(l, 9, grp);
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
-                if (qb) {
+                if (fused_pre) {   // the query split, norms and RoPEs in one launch
+                    if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                                      IQ * ID, N, IQ * ID, n, cs);
+                    else for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qidx_ + t * IQ * ID, (int) N,
+                                            (int) (IQ * ID), cs);
+                    QsaDecQPost qp;
+                    qp.q_full = qfull_ + tb * NH * 2 * HD; qp.qcur = qcur_ + tb * NH * HD; qp.pos_q = pos_ + tb * NH;
+                    qp.q_norm = (const float*) wqn->data; qp.q_idx = qidx_ + tb * IQ * ID; qp.pos_i = pos_i + tb * IQ;
+                    qp.idx_q_norm = (const float*) wiqn->data; qp.eps = EPS;
+                    qsa_dec_q_post(qp, n, s, rope_scaling(), cs);
+                } else if (qb) {
                     if (cudaMemcpy2DAsync(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD, (size_t) HD * 2 * 4,
                                           (size_t) HD * 4, (size_t) (n * NH), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
                         err = "verify: the q/gate split failed";

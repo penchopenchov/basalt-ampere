@@ -112,12 +112,12 @@ private:
     bool record_step(int j, bool coupled, bool copy_records, std::string& err);
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
-    cudaGraphExec_t step_exec_[9] = {};
+    cudaGraphExec_t step_exec_[2][9] = {};   ///< [tier_]
     /// STRATA_MTP_COND: the round and `steps - 1` chain steps in one graph, step j an IF node on draft j-1's
     /// probability >= min_p; false (with the per-step path from then on) where it cannot be built
     bool capture_cond(int T, bool coupled, int steps);
-    cudaGraphExec_t cond_exec_[2][9] = {};
-    int cond_steps_[2][9] = {};
+    cudaGraphExec_t cond_exec_[2][2][9] = {};   ///< [tier_][coupled]
+    int cond_steps_[2][2][9] = {};
     bool cond_off_ = false;
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
@@ -150,7 +150,7 @@ private:
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    cudaGraphExec_t round_exec_[9] = {};
+    cudaGraphExec_t round_exec_[2][9] = {};   ///< [tier_]
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;
@@ -170,6 +170,12 @@ private:
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
+    // STRATA_DEC_DRAFT: the subset's leading base rows (n_tier1_) serve the argmax drafts unless the text just held a
+    // token of the added rows; tier_ 0 = base rows only, 1 = every row (the graphs are captured per tier)
+    int64_t n_tier1_ = 0;
+    int tier_ = 1;
+    int tier2_recent_ = 0;
+    std::vector<uint8_t> tier2_;   ///< token id -> 1 when only the added rows hold it
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;

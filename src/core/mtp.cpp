@@ -146,12 +146,15 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
-    for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
-    for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
+    for (auto& row : round_exec_)
+        for (auto& e : row) if (e) cudaGraphExecDestroy(e);
+    for (auto& row : step_exec_)
+        for (auto& e : row) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
-    for (auto& row : cond_exec_)
-        for (auto& e : row) if (e) cudaGraphExecDestroy(e);
+    for (auto& tier : cond_exec_)
+        for (auto& row : tier)
+            for (auto& e : row) if (e) cudaGraphExecDestroy(e);
     if (cparams_) cudaFree(cparams_);
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
@@ -491,6 +494,24 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
+            // the base rows: the leading ids up to the first descent (tools/draft_vocab.py appends added ids after
+            // the base in id order)
+            n_tier1_ = n_dvocab_;
+            if (dec_draft_on()) {
+                const int32_t* ids = (const int32_t*) raw.data();
+                for (int64_t i = 1; i < n_dvocab_; ++i)
+                    if (ids[i] < ids[i - 1]) { n_tier1_ = i; break; }
+                if (n_tier1_ < n_dvocab_) {
+                    tier2_.assign((size_t) n_vocab_, 0);
+                    for (int64_t i = n_tier1_; i < n_dvocab_; ++i)
+                        if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 1;
+                    for (int64_t i = 0; i < n_tier1_; ++i)
+                        if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 0;
+                    std::fprintf(stderr, "strata mtp: draft head tiers: %lld base rows, %lld added rows read after an "
+                                         "added token (STRATA_DEC_DRAFT)\n", (long long) n_tier1_,
+                                 (long long) (n_dvocab_ - n_tier1_));
+                }
+            }
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
@@ -679,7 +700,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
-        const int64_t nv = sub ? n_dvocab_ : n_vocab_;
+        // the argmax drafts over the base rows only on tier 0 (the coupled sampler keeps the whole subset)
+        const int64_t nv = sub ? ((tier_ == 0 && !coupled_rec_) ? n_tier1_ : n_dvocab_) : n_vocab_;
         native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
@@ -794,7 +816,7 @@ bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string
 }
 
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
+    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[tier_][T];
     if (exec) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_round(T, coupled, false, err);
@@ -802,7 +824,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
 }
 
 bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
+    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[tier_][j];
     if (exec) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_step(j, coupled, true, err);
@@ -815,8 +837,8 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
 bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
 #if STRATA_MTP_COND_NODES
     const int c = coupled ? 1 : 0;
-    cudaGraphExec_t& exec = cond_exec_[c][T];
-    if (exec && cond_steps_[c][T] == steps) return true;
+    cudaGraphExec_t& exec = cond_exec_[tier_][c][T];
+    if (exec && cond_steps_[tier_][c][T] == steps) return true;
     if (exec) {
         cudaGraphExecDestroy(exec);
         exec = nullptr;
@@ -881,7 +903,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         cond_off_ = true;
         return false;
     }
-    cond_steps_[c][T] = steps;
+    cond_steps_[tier_][c][T] = steps;
     return true;
 #else
     (void) T; (void) coupled; (void) steps;
@@ -1010,6 +1032,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     const int max_steps = std::min(max_t_ - 1, max_drafts_);
+    if (!tier2_.empty()) {   // every row for a while after a token only the added rows hold
+        for (int t = 0; t < T; ++t)
+            if (tokens[t] >= 0 && tokens[t] < (int32_t) tier2_.size() && tier2_[(size_t) tokens[t]]) tier2_recent_ = 32;
+        tier_ = tier2_recent_ > 0 ? 1 : 0;
+        if (tier2_recent_ > 0) --tier2_recent_;
+    }
     // STRATA_MTP_COND: the min_p chain in one graph (falls back to the graphs below for good if it cannot be built)
     const bool cond = cond_on() && !cond_off_ && min_p > 0.0f && max_steps > 1 && capture_cond(T, cp, max_steps);
     if (!cond) {
@@ -1053,12 +1081,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
     int n = 0;
     if (min_p <= 0.0f && max_steps > 0) {
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[tier_][T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         for (int j = 1; j < max_steps; ++j) {
-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[tier_][j], cs_) != cudaSuccess) {
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -1087,7 +1115,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         prefetch_ple(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
-        const cudaGraphExec_t first = cond ? cond_exec_[cp ? 1 : 0][T] : (cp ? round_exec_c_[T] : round_exec_[T]);
+        const cudaGraphExec_t first = cond ? cond_exec_[tier_][cp ? 1 : 0][T] : (cp ? round_exec_c_[T] : round_exec_[tier_][T]);
         if (cudaGraphLaunch(first, cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1110,7 +1138,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         n = 1;
         for (int j = 1; j < max_steps && pj >= min_p; ++j) {
             if (!cond) {   // the conditional graph runs step j on the device by the same comparison
-                if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[tier_][j], cs_) != cudaSuccess) {
                     err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
