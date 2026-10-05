@@ -379,7 +379,9 @@ __device__ void dm_abort(const DmWatch& w, const DmShared* sm, uint32_t reason, 
 }
 
 // Thread 0's spin until *word >= want (acquire): false when the window was aborted or released meanwhile (the
-// release and a wait past kDmWaitLimitNs, when `limit`, abort it with a record).
+// release and a wait past kDmWaitLimitNs, when `limit`, abort it with a record).  Only block 0 reads the host's word:
+// many blocks reading host memory queue on the bus ahead of the doorbell and the ring's rows; the others follow the
+// abort word.
 __device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm, const unsigned int* word,
                                            unsigned int want, uint32_t phase, int g, bool limit) {
     unsigned int v, spins = 0;
@@ -388,7 +390,7 @@ __device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm,
         __nanosleep(20);
         if ((++spins & 255u) != 0u) continue;
         if (*(volatile unsigned int*) w.abort != 0u) return false;
-        if (*w.seq_m == 0xffffffffu) { dm_abort(w, sm, 3u, phase, g, v, want); return false; }
+        if (blockIdx.x == 0 && *w.seq_m == 0xffffffffu) { dm_abort(w, sm, 3u, phase, g, v, want); return false; }
         if (!limit) continue;
         const unsigned long long t = dm_now();
         if (t0 == 0) t0 = t;
@@ -509,7 +511,8 @@ __device__ __forceinline__ bool dm_arrive(unsigned int* arrive, unsigned int tar
 }
 
 // The peer's grid barrier (the k-th waits for k * nb arrivals on `bar`): false when the window was aborted or released
-// meanwhile.  A block that gets false leaves the kernel; the others follow at their next wait.
+// meanwhile (block 0 watches the host's word, as in dm_wait_ge).  A block that gets false leaves the kernel; the
+// others follow at their next wait.
 __device__ __forceinline__ bool dm_grid_sync(const DmWatch& w, unsigned int* bar, unsigned int target, int32_t* s_ok) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -523,7 +526,11 @@ __device__ __forceinline__ bool dm_grid_sync(const DmWatch& w, unsigned int* bar
             strata_spin_pause();
             if ((++spins & 255u) != 0u) continue;
             if (*(volatile unsigned int*) w.abort != 0u) { ok = false; break; }
-            if (*w.seq_m == 0xffffffffu) { dm_abort(w, nullptr, 3u, 2u, -1, v, target); ok = false; break; }
+            if (blockIdx.x == 0 && *w.seq_m == 0xffffffffu) {
+                dm_abort(w, nullptr, 3u, 2u, -1, v, target);
+                ok = false;
+                break;
+            }
         }
         *s_ok = ok;
     }
