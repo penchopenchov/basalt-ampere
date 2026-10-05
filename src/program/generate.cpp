@@ -5540,6 +5540,9 @@ int main(int argc, char** argv) {
         static const float promote_margin = [] { const char* v = std::getenv("STRATA_PEER_PROMOTE_MARGIN"); return v ? (float) std::atof(v) : 0.0f; }();
         // the round's swaps, best first: per layer the most-routed missing experts against the least-routed resident ones
         struct Swap { float gain; int32_t layer, in, out; };
+        // STRATA_PEER_PROMOTE_LOAD=x: a layer whose peer experts take more than x of its 10 routed entries per token
+        // promotes them without the margin (a layer's peer share, not the step's, sets how late the peer is)
+        static const float promote_load = [] { const char* v = std::getenv("STRATA_PEER_PROMOTE_LOAD"); return v ? (float) std::atof(v) : 0.0f; }();
         auto rank_swaps = [&](std::vector<Swap>& swaps) {
             swaps.clear();
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -5548,11 +5551,20 @@ int main(int argc, char** argv) {
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
+                float margin = promote_margin;
+                if (promote_load > 0.0f && peer.valid()) {
+                    float all = 0.0f, on = 0.0f;
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                        all += u[e];
+                        if (r[e] < 0 && peer.has(l, e)) on += u[e];
+                    }
+                    if (all > 0.0f && on * 10.0f > promote_load * all) margin = 0.0f;
+                }
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) {
                         const bool on_peer = peer.valid() && peer.has(l, e);
                         if (u[e] >= 2.0f && !(on_peer && !peer_promote) && !(remote_opt && remote_opt->owns(l, e)))
-                            cand.emplace_back(on_peer ? u[e] - promote_margin : u[e], e);
+                            cand.emplace_back(on_peer ? u[e] - margin : u[e], e);
                     }
                     else vict.emplace_back(u[e], e);
                 }
