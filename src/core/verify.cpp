@@ -77,7 +77,8 @@ struct DecMoe {
     void* m3scr = nullptr;                   ///< STRATA_DEC_MOE3: dec_moe3's scratch (null: off)
     unsigned int* m3ctr = nullptr;           ///< its slice counters
     float* m3part = nullptr;                 ///< the shared gate's partial sums (dec_moe_route)
-    // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring; the peer's rows
+    // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
+    // record (kDmDiagWords); the peer's rows
     strata::kernels::DmRing* h_ring = nullptr; strata::kernels::DmRing* m_ring = nullptr;
     float* h_x = nullptr; float* m_x = nullptr;
     uint8_t* h_xq = nullptr; uint8_t* m_xq = nullptr;
@@ -338,6 +339,8 @@ std::string Verifier::dm_note() const {
         }
         s += "; peer card: rung for ring " + std::to_string(w & 0xffffu) + ((w >> 28) & 1u ? " (with entries)" : "") +
              ", finished ring " + std::to_string(done) + ", its kernel " + st;
+        const std::string ab = strata::kernels::dec_moe_peer_diag(d->h_w + 32);
+        if (!ab.empty()) s += "; the peer window " + ab;
     }
     return s;
 }
@@ -455,6 +458,9 @@ bool Verifier::dm_init(std::string& err) {
 }
 
 // The residency tables the window classifies with: host_res and the peer's, as they are now (between windows).
+// Each upload is queued on the stream that reads it (CUDA0's window, the peer's): a plain cudaMemcpy from pageable
+// memory may return before its DMA lands, and the window's route kernel would then read a table half old, half new
+// (an expert with two tiers in one ring).
 bool Verifier::dm_sync(std::string& err) {
     DecMoe* d = dm_;
     const size_t LE = d->shadow0.size();
@@ -468,12 +474,12 @@ bool Verifier::dm_sync(std::string& err) {
     };
     size_t a = 0, b = 0;
     if (span(hits_.h_res, d->shadow0, a, b) &&
-        cudaMemcpy(d->res0 + a, d->shadow0.data() + a, (b - a) * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaMemcpyAsync(d->res0 + a, d->shadow0.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
         err = "verify: STRATA_DEC_MOE residency upload";
         return false;
     }
     if (d->pdev >= 0 && span(peer_->residency().data(), d->shadow1, a, b)) {
-        if (cudaMemcpy(d->res1 + a, d->shadow1.data() + a, (b - a) * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMemcpyAsync(d->res1 + a, d->shadow1.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "verify: STRATA_DEC_MOE peer residency upload";
             return false;
         }
@@ -481,7 +487,7 @@ bool Verifier::dm_sync(std::string& err) {
         for (size_t i = a; i < b; ++i)
             p[i - a] = d->shadow1[i] >= 0 ? (unsigned long long) peer_->slot_address(d->shadow1[i]) : 0ull;
         const OnDevice on(d->pdev);
-        if (cudaMemcpy(d->ptab + a, p.data(), p.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMemcpyAsync(d->ptab + a, p.data(), p.size() * 8, cudaMemcpyHostToDevice, d->ps) != cudaSuccess) {
             err = "verify: STRATA_DEC_MOE peer table upload";
             return false;
         }
@@ -2064,6 +2070,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         gm.mark(13);
         *(volatile uint32_t*) (dm_->h_w + 0) = 0;
         *(volatile uint32_t*) (dm_->h_w + 16) = 0;
+        *(volatile uint32_t*) (dm_->h_w + 32) = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (dm_->pdev >= 0) {
             const OnDevice on(dm_->pdev);
@@ -2072,7 +2079,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
             pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
             pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) strata::kernels::cpu::expert_layout().fmt[0].n_ff;
-            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr;
+            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
             if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess || !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps)) {
                 err = "verify: the peer window did not launch";
                 return false;
@@ -2217,6 +2224,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         dm_->peer_live = false;
         const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
         if (pe != cudaSuccess) { err = std::string("verify: the peer window: ") + cudaGetErrorString(pe); return false; }
+        const std::string ab = strata::kernels::dec_moe_peer_diag(dm_->h_w + 32);
+        if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     commit_pending_ = false;
