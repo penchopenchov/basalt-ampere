@@ -49,18 +49,16 @@ struct alignas(256) HcCtr {
     unsigned v;
 };
 struct HcSync {
-    HcCtr norm, down, up, router, exit, nload;
+    HcCtr q, norm, down, up, router, exit, nload;
 };
-__device__ HcSync g_hc_sync;
+// consecutive reads take different counter sets: a read's CTAs claim work before the previous kernel is done
+constexpr int NSLOT = 4;
+__device__ HcSync g_hc_sync[NSLOT];
 
 struct HcLaunch {
     HcFusedArgs a;
     int nb;          // CTAs (one per SM)
-    int hold;        // weight streams start once the norm's inputs have landed (1) or at launch (0)
-    int pfd;         // down CTAs prefetch their weight rows into L2 at launch
-    int rlate;       // up CTAs write R' after signalling the router
-    int rearly;      // the router rows are loaded at launch (when they fit beside the ring)
-    int trig;        // allow the dependent launch at once
+    int slot;        // counter set
     float* xc;       // the copies of xn, [NCOPY][MAXT][D]
     unsigned long long* dbg;   // bench only: per-CTA phase times [nb][16]
 };
@@ -80,17 +78,17 @@ __device__ __forceinline__ void mbar_init(uint64_t* bar, unsigned count) {
 __device__ __forceinline__ void mbar_expect_tx(uint64_t* bar, unsigned bytes) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
 }
-__device__ __forceinline__ void mbar_wait0(uint64_t* bar) {
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned ph) {
     unsigned done = 0;
     while (!done) {
-        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
-                     : "=r"(done) : "r"(smem_u32(bar)) : "memory");
+        asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                     : "=r"(done) : "r"(smem_u32(bar)), "r"(ph) : "memory");
     }
 }
-__device__ __forceinline__ bool mbar_test0(uint64_t* bar) {
+__device__ __forceinline__ bool mbar_test(uint64_t* bar, unsigned ph) {
     unsigned done;
-    asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
-                 : "=r"(done) : "r"(smem_u32(bar)) : "memory");
+    asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared::cta.b64 p, [%1], %2; selp.u32 %0, 1, 0, p; }"
+                 : "=r"(done) : "r"(smem_u32(bar)), "r"(ph) : "memory");
     return done != 0;
 }
 __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, unsigned bytes, uint64_t* bar) {
@@ -124,14 +122,9 @@ __device__ __forceinline__ void cta_signal(unsigned* ctr, int tid) {
         atomicAdd(ctr, 1u);
     }
 }
-__device__ int g_hc_backoff;   // ns between polls of a counter (0: spin)
-__device__ __forceinline__ void poll_pause() {
-    const int ns = g_hc_backoff;
-    if (ns > 0) __nanosleep((unsigned) ns);
-}
 __device__ __forceinline__ void cta_wait(const unsigned* ctr, unsigned target, int tid) {
     if (tid == 0) {
-        while (ld_acquire(ctr) < target) poll_pause();
+        while (ld_acquire(ctr) < target) {}
         __threadfence();
     }
     __syncthreads();
@@ -398,22 +391,21 @@ __device__ void hc_up_piece(const HcFusedArgs& a, UpSlice sl, char* smem, uint64
     bulk_g2s(smem + (size_t) c * bytes + h * half, reinterpret_cast<const char*>(a.w_up + ((size_t) c * N + sl.c0) * LR) + h * half,
              half, &bars[p]);
 }
-// Thread 0 of an up CTA: the w_up pieces, two in flight (after `nload` reaches `n_in` when that is nonzero), while
-// watching for the down projection to finish.
+// Thread 0 of an up CTA: the w_up pieces, two in flight (once `nload` reaches `n_in`), while watching for the down
+// projection to finish; `ph` is the barriers' phase.
 __device__ void hc_up_stream(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, const unsigned* nload,
-                             unsigned n_in, const unsigned* down) {
-    if (n_in) while (ld_acquire(nload) < n_in) poll_pause();
+                             unsigned n_in, const unsigned* down, unsigned ph) {
+    while (ld_acquire(nload) < n_in) {}
     hc_up_piece(a, sl, smem, bars, 0);
     hc_up_piece(a, sl, smem, bars, 1);
     int issued = 2, landed = 0;
     bool down_ok = false;
     while (landed < UP_PIECES || !down_ok) {
-        if (landed < issued && mbar_test0(&bars[landed])) {
+        if (landed < issued && mbar_test(&bars[landed], ph)) {
             ++landed;
             if (issued < UP_PIECES) hc_up_piece(a, sl, smem, bars, issued++);
         }
         if (!down_ok) down_ok = ld_acquire(down) >= (unsigned) ND;
-        if (!down_ok) poll_pause();
     }
     __threadfence();
 }
@@ -720,7 +712,6 @@ __device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, 
     }
     __syncwarp();
     if (k == 0) stamp(dbg, b, 14, lane);
-    if (k == 0 && dbg != nullptr && lane == 0) dbg[b * 16 + 15] = (unsigned long long) total;
     // route's sums: lane L adds, in rank order, the selected values of its experts (expert & 31 == L)
     float selected_sum = 0.0f;
 #pragma unroll
@@ -737,105 +728,117 @@ __device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, 
 }
 
 // ---------------------------------------------------------------- the kernel
-template <int T, int CAP>
+// The read is a queue of work items in dependency order: the norm tasks, the down rows, the up slices, the router
+// rows.  A CTA claims one item at a time (in claim order) and waits only on items before its own, all of them claimed
+// by running CTAs, so the read finishes however few of its CTAs are resident.  With every CTA resident the first
+// claims split the CTAs into norm, down and up roles; the norm CTAs then take the remaining up (and down) items, the
+// down CTAs the router rows.
+template <int T>
+struct Items {
+    int ncopy, ntask, nu, down, up, rt, end;
+    __device__ Items(int nb, bool router) {
+        ncopy = nb / (4 * T) < NCOPY ? nb / (4 * T) : NCOPY;
+        ntask = 4 * T * ncopy;
+        nu = nb - ND;
+        down = ntask;
+        up = down + ND;
+        rt = up + nu;
+        end = rt + (router ? ND : 0);
+    }
+};
+
+template <int T>
 __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     extern __shared__ __align__(128) char smem[];
-    __shared__ __align__(8) uint64_t bars[UP_PIECES];
+    __shared__ __align__(8) uint64_t bars[UP_PIECES + 1];   // the w_up pieces, the router rows
     __shared__ float part[WARPS];
     __shared__ float s_rs;
-    __shared__ int s_last;
+    __shared__ int s_item, s_last;
     const HcFusedArgs& a = L.a;
     const int b = blockIdx.x, tid = threadIdx.x, nb = L.nb;
-    const int nu = nb - ND;
     unsigned long long* dbg = L.dbg;
-    HcSync* sy = &g_hc_sync;
-    const bool is_down = b < ND;
-    const UpSlice sl = is_down ? UpSlice{0, 0} : up_slice(b - ND, nu);
-    const int e0 = is_down ? b * NE / ND : 0, e1 = is_down ? (b + 1) * NE / ND : 0;   // router rows (down CTAs)
-    // the norm tasks (token, stream, copy of xn) on the first CTAs
-    const int ncopy = nb / (4 * T) < NCOPY ? nb / (4 * T) : NCOPY, ntask = 4 * T * ncopy;
-    const bool norm_cta = b < ntask;
+    HcSync* sy = &g_hc_sync[L.slot];
+    const Items<T> it(nb, a.w_router != nullptr);
     stamp(dbg, b, 0, tid);
-    // the next kernel may launch (and stage its weights) as soon as CTAs leave; its pdl_wait still waits for all of this
-    if (L.trig) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-
-    // constant data first, before the previous kernel is waited on (with `hold`, the weight streams wait for the
-    // norm's inputs instead: weight reads queued ahead of them would delay the norm, which everything waits on)
-    NormRegs nr;
-    if (norm_cta) hc_norm_pre(a, b & 3, tid, nr);
-    if (tid == 0)
-        for (int p = 0; p < UP_PIECES; ++p) mbar_init(&bars[p], 1);
-    if (L.pfd && is_down && tid == 0) {   // this CTA's weight rows into L2 at once
-        const uint16_t* w = down_rows(a, b);
-        if (w != nullptr) prefetch_l2(w, (size_t) ROWS * D * 2);
+    if (tid == 0) {
+        for (int p = 0; p <= UP_PIECES; ++p) mbar_init(&bars[p], 1);
+        s_item = (int) atomicAdd(&sy->q.v, 1u);
     }
-    // router rows at launch, above the ring, when both fit (the partials and the top-10 then use the ring's space)
-    constexpr int RT_BYTES = RT_MAX_ROWS * N * 2;
-    constexpr bool RT_FITS = Ring<T, CAP>::S * Ring<T, CAP>::BYTES + RT_BYTES <= SMEM;
-    const bool rt_early = RT_FITS && L.rearly && a.w_router != nullptr;
-    char* const rt_w = rt_early ? smem + (SMEM - RT_BYTES) : smem;
-    char* const rt_p = rt_early ? smem : smem + RT_BYTES;
-    if (rt_early && is_down && tid == 0) {
-        const unsigned bytes = (unsigned) (e1 - e0) * N * 2;
-        mbar_expect_tx(&bars[0], bytes);
-        bulk_g2s(rt_w, a.w_router + (size_t) e0 * N, bytes, &bars[0]);
-    }
-    if (!L.hold && is_down) hc_down_prologue<T, CAP>(a, b, tid, smem);
     __syncthreads();
+    int item = s_item;
+    // constant data before the previous kernel is waited on
+    NormRegs nr;
+    if (item < it.ntask) hc_norm_pre(a, item & 3, tid, nr);
     pdl_wait();
     stamp(dbg, b, 1, tid);
-
-    if (norm_cta) {
-        hc_norm_task(a, L.xc, (b >> 2) % T, b & 3, b / (4 * T), tid, nr, part, &s_rs, &sy->nload.v);
-        stamp(dbg, b, 10, tid);
-        cta_signal(&sy->norm.v, tid);
-        stamp(dbg, b, 11, tid);
-    }
-    if (is_down) {
-        if (L.hold) {
-            cta_wait(&sy->nload.v, (unsigned) ntask, tid);
-            hc_down_prologue<T, CAP>(a, b, tid, smem);
+    unsigned up_ph = 0, rt_ph = 0;
+    bool first = true;
+    while (item < it.end) {
+        if (item < it.ntask) {
+            const int j = item;
+            if (!first) hc_norm_pre(a, j & 3, tid, nr);
+            hc_norm_task(a, L.xc, (j >> 2) % T, j & 3, j / (4 * T), tid, nr, part, &s_rs, &sy->nload.v);
+            stamp(dbg, b, 10, tid);
+            cta_signal(&sy->norm.v, tid);
+            stamp(dbg, b, 11, tid);
+        } else if (item < it.up) {
+            const int d = item - it.down;
+            if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 1;
+            cta_wait(&sy->nload.v, (unsigned) it.ntask, tid);   // weight reads queued ahead of the norm's would delay it
+            hc_down_prologue<T, RING_CAP>(a, d, tid, smem);
+            cta_wait(&sy->norm.v, (unsigned) it.ntask, tid);
+            stamp(dbg, b, 2, tid);
+            hc_down_main<T, RING_CAP>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D, d, tid, smem);
+            cp_async_wait<0>();
+            cta_signal(&sy->down.v, tid);
+            stamp(dbg, b, 3, tid);
+        } else if (item < it.rt) {
+            const UpSlice sl = up_slice(item - it.up, it.nu);
+            if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 2;
+            hc_up_pre<T>(a, sl, tid, smem);
+            if (tid == 0) hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph);
+            up_ph ^= 1u;
+            __syncthreads();
+            stamp(dbg, b, 2, tid);
+            hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
+            cta_signal(&sy->up.v, tid);
+            stamp(dbg, b, 3, tid);
+        } else {
+            const int r = item - it.rt, e0 = r * NE / ND, e1 = (r + 1) * NE / ND;
+            char* const rt_p = smem + RT_MAX_ROWS * N * 2;
+            if (tid == 0) {   // the rows into shared memory while the up projection runs
+                const unsigned bytes = (unsigned) (e1 - e0) * N * 2;
+                mbar_expect_tx(&bars[UP_PIECES], bytes);
+                bulk_g2s(smem, a.w_router + (size_t) e0 * N, bytes, &bars[UP_PIECES]);
+            }
+            cta_wait(&sy->up.v, (unsigned) it.nu, tid);
+            mbar_wait(&bars[UP_PIECES], rt_ph);
+            rt_ph ^= 1u;
+            stamp(dbg, b, 4, tid);
+            hc_router_rows<T>(a, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p));
+            stamp(dbg, b, 5, tid);
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence();
+                s_last = atomicAdd(&sy->router.v, 1u) == (unsigned) ND - 1;
+                if (s_last) __threadfence();
+            }
+            __syncthreads();
+            if (s_last) {
+                stamp(dbg, b, 8, tid);
+                if ((tid >> 5) < T)
+                    hc_top10(a, tid >> 5, tid & 31,
+                             reinterpret_cast<uint32_t*>(rt_p + RT_MAX_ROWS * MAXT * WARPS * 4) + (tid >> 5) * (2 * NE + 2 * KT),
+                             dbg, b);
+                __syncthreads();
+                stamp(dbg, b, 6, tid);
+            }
         }
-        cta_wait(&sy->norm.v, (unsigned) ntask, tid);
-        stamp(dbg, b, 2, tid);
-        hc_down_main<T, CAP>(a, L.xc + (size_t) (b % ncopy) * MAXT * D, b, tid, smem);
-        cta_signal(&sy->down.v, tid);
-        stamp(dbg, b, 3, tid);
-        if (a.w_router && !rt_early && tid == 0) {   // this CTA's router rows into shared memory while the up projection runs
-            const unsigned bytes = (unsigned) (e1 - e0) * N * 2;
-            mbar_expect_tx(&bars[0], bytes);
-            bulk_g2s(smem, a.w_router + (size_t) e0 * N, bytes, &bars[0]);
-        }
-    } else {
-        hc_up_pre<T>(a, sl, tid, smem);
-        if (tid == 0) hc_up_stream(a, sl, smem, bars, &sy->nload.v, L.hold ? (unsigned) ntask : 0u, &sy->down.v);
+        first = false;
         __syncthreads();
-        stamp(dbg, b, 2, tid);
-        hc_up_main<T>(a, sl, tid, smem, !L.rlate, dbg, b);
-        cta_signal(&sy->up.v, tid);
-        if (a.apply && L.rlate) hc_up_rout<T>(a, sl, tid, smem);
-        stamp(dbg, b, 3, tid);
-    }
-
-    if (a.w_router && is_down) {
-        cta_wait(&sy->up.v, (unsigned) nu, tid);
-        mbar_wait0(&bars[0]);
-        stamp(dbg, b, 4, tid);
-        hc_router_rows<T>(a, reinterpret_cast<const uint16_t*>(rt_w), e0, e1, tid, reinterpret_cast<float*>(rt_p));
-        stamp(dbg, b, 5, tid);
+        if (tid == 0) s_item = (int) atomicAdd(&sy->q.v, 1u);
         __syncthreads();
-        if (tid == 0) {
-            __threadfence();
-            s_last = atomicAdd(&sy->router.v, 1u) == (unsigned) ND - 1;
-            if (s_last) __threadfence();
-        }
-        __syncthreads();
-        if (s_last) stamp(dbg, b, 8, tid);
-        if (s_last && (tid >> 5) < T)
-            hc_top10(a, tid >> 5, tid & 31,
-                     reinterpret_cast<uint32_t*>(rt_p + RT_MAX_ROWS * MAXT * WARPS * 4) +
-                         (tid >> 5) * (2 * NE + 2 * KT), dbg, b);
-        if (s_last) { __syncthreads(); stamp(dbg, b, 6, tid); }
+        item = s_item;
     }
 
     // the next read's weights into L2, then the counters back to zero once every CTA is through
@@ -847,12 +850,11 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             if (hi16 > lo16) prefetch_l2((const char*) a.pf[r] + lo16 * 16, (hi16 - lo16) * 16);
         }
     }
-    __syncthreads();
     stamp(dbg, b, 7, tid);
     if (tid == 0) {
         __threadfence();
         if (atomicAdd(&sy->exit.v, 1u) == (unsigned) nb - 1) {
-            sy->norm.v = 0; sy->down.v = 0; sy->up.v = 0; sy->router.v = 0; sy->nload.v = 0; sy->exit.v = 0;
+            sy->q.v = 0; sy->norm.v = 0; sy->down.v = 0; sy->up.v = 0; sy->router.v = 0; sy->nload.v = 0; sy->exit.v = 0;
             __threadfence();
         }
     }
@@ -872,14 +874,11 @@ __global__ void hc_l2_prefetch_kernel(const void* p0, size_t n0, const void* p1,
 }
 
 using KernelFn = void (*)(HcLaunch);
-constexpr int CAP_DEEP = 10;   // as many down stages in flight as shared memory holds
-#define HC_K(C) {hc_fused_kernel<1, C>, hc_fused_kernel<2, C>, hc_fused_kernel<3, C>, hc_fused_kernel<4, C>, \
-                hc_fused_kernel<5, C>, hc_fused_kernel<6, C>, hc_fused_kernel<7, C>, hc_fused_kernel<8, C>}
-constexpr KernelFn kKernels[2][MAXT] = {HC_K(RING_CAP), HC_K(CAP_DEEP)};
-#undef HC_K
+constexpr KernelFn kKernels[MAXT] = {hc_fused_kernel<1>, hc_fused_kernel<2>, hc_fused_kernel<3>, hc_fused_kernel<4>,
+                                      hc_fused_kernel<5>, hc_fused_kernel<6>, hc_fused_kernel<7>, hc_fused_kernel<8>};
 
-int g_hold = -1, g_deep = -1, g_pfd = -1, g_rlate = -1, g_rearly = -1;
 unsigned long long* g_dbg = nullptr;
+int g_slot = 0;
 
 struct DevInfo {
     bool checked = false, ok = false;
@@ -904,12 +903,8 @@ const DevInfo& dev_info() {
         d.sms = sms;
         d.ok = major == 12 && sms - ND >= MIN_NU && optin >= SMEM + 1024 &&
                cudaMalloc((void**) &d.xc, (size_t) NCOPY * MAXT * D * sizeof(float)) == cudaSuccess;
-        for (int t = 0; t < 2 * MAXT && d.ok; ++t)
-            d.ok = cudaFuncSetAttribute(kKernels[t / MAXT][t % MAXT], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
-        if (const char* v = std::getenv("STRATA_DEC_HC_BACKOFF"); v != nullptr && d.ok) {
-            const int ns = std::atoi(v);
-            cudaMemcpyToSymbol(g_hc_backoff, &ns, sizeof(int));
-        }
+        for (int t = 0; t < MAXT && d.ok; ++t)
+            d.ok = cudaFuncSetAttribute(kKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
         cudaGetLastError();
         d.checked = true;
     }
@@ -925,14 +920,6 @@ void hc_fused_init() {
     if (d.ok) dbg_init(d.sms);
 }
 
-void hc_fused_set_knobs(int hold, int deep, int pfd, int rlate, int rearly, int backoff) {
-    if (backoff >= 0) cudaMemcpyToSymbol(g_hc_backoff, &backoff, sizeof(int));
-    if (rearly >= 0) g_rearly = rearly;
-    if (hold >= 0) g_hold = hold;
-    if (deep >= 0) g_deep = deep;
-    if (pfd >= 0) g_pfd = pfd;
-    if (rlate >= 0) g_rlate = rlate;
-}
 void hc_fused_set_debug(unsigned long long* dbg) { g_dbg = dbg; }
 
 // STRATA_DEC_HC_DBG=<file>: every captured read stamps its CTAs' phases into its own slot; a thread writes the
@@ -947,7 +934,7 @@ struct DbgState {
 DbgState g_insitu;
 void dbg_dump(const char* path) {
     static const char* const ph[16] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit",
-                                       "ticket", "up-lo", "norm-wr", "norm-sig", "t10-smax", "t10-cand", "t10-rank", "ncand"};
+                                       "ticket", "up-lo", "norm-wr", "norm-sig", "t10-smax", "t10-cand", "t10-rank", "role"};
     cudaSetDevice(g_insitu.dev);
     cudaStream_t s;
     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
@@ -975,9 +962,10 @@ void dbg_dump(const char* path) {
                 for (int i = 0; i < 16; ++i)
                     for (int g = 0; g < 2; ++g) {
                         double mn = 1e30, mx = -1;
-                        for (int b = g ? ND : 0; b < (g ? nb : ND); ++b) {
-                            if (!x[b * 16 + i] || (i != 15 && x[b * 16 + i] < t0)) continue;
-                            const double t = i == 15 ? (double) x[b * 16 + i] : (double) (x[b * 16 + i] - t0) / 1e3;
+                        for (int b = 0; b < nb; ++b) {
+                            if ((x[b * 16 + 15] == 2) != (g == 1)) continue;
+                            if (i == 15 || !x[b * 16 + i] || x[b * 16 + i] < t0) continue;
+                            const double t = (double) (x[b * 16 + i] - t0) / 1e3;
                             mn = std::min(mn, t); mx = std::max(mx, t);
                         }
                         if (mx >= 0) { v[i][g][0].push_back(mn); v[i][g][1].push_back(mx); }
@@ -1029,29 +1017,37 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         std::fprintf(stderr, "hc_fused_read: invalid arguments or unsupported device\n");
         std::exit(1);
     }
-    auto env = [](const char* n, int def) { const char* v = std::getenv(n); return v ? std::atoi(v) : def; };
-    static const int env_hold = env("STRATA_DEC_HC_HOLD", 1), env_deep = env("STRATA_DEC_HC_DEEP", 0),
-                     env_pfd = env("STRATA_DEC_HC_PFD", 0), env_rlate = env("STRATA_DEC_HC_RLATE", 0),
-                     env_rearly = env("STRATA_DEC_HC_REARLY", 0),
-                     env_trig = env("STRATA_DEC_HC_TRIG", 0);
     HcLaunch L;
     L.a = a;
     L.nb = d.sms;
-    L.hold = g_hold >= 0 ? g_hold : env_hold;
-    L.pfd = g_pfd >= 0 ? g_pfd : env_pfd;
-    L.rlate = g_rlate >= 0 ? g_rlate : env_rlate;
-    L.rearly = g_rearly >= 0 ? g_rearly : env_rearly;
-    L.trig = env_trig;
-    const int deep = g_deep >= 0 ? g_deep : env_deep;
+    L.slot = g_slot;
+    g_slot = (g_slot + 1) % NSLOT;
     L.xc = d.xc;
     L.dbg = g_dbg;
     if (L.dbg == nullptr) L.dbg = dbg_slot(a.T, a.w_router != nullptr);
-    launch_pdl(kKernels[deep ? 1 : 0][a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM, (cudaStream_t) stream, L);
+    launch_pdl(kKernels[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM, (cudaStream_t) stream, L);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "hc_fused_read: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+
+namespace {
+__global__ void hold_sms_kernel(volatile int* go, int* started) {
+    extern __shared__ char hold_smem[];
+    if (threadIdx.x == 0) {
+        hold_smem[0] = 0;
+        atomicAdd(started, 1);
+        __threadfence_system();
+        while (*go == 0) __nanosleep(1000);
+    }
+}
+}  // namespace
+void hc_test_hold_sms(int k, int* go, int* started, void* stream) {
+    constexpr int bytes = 64 * 1024;
+    cudaFuncSetAttribute(hold_sms_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    hold_sms_kernel<<<k, 32, bytes, (cudaStream_t) stream>>>(go, started);
 }
 
 void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* stream) {
