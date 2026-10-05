@@ -1,6 +1,6 @@
 // src/kernels/dec_moe_parity.cpp - STRATA_DEC_MOE's kernels on real GGUF experts against the path they replace.
 //
-//     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench]
+//     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]
 //
 // Per layer (default: one of each gate/up + down format pair):
 //   peer math   the persistent kernel's work items (dec_moe_peer_math_test) vs native_expert_grouped, every card
@@ -113,18 +113,308 @@ double time_us(cudaStream_t s, int iters, const std::function<void()>& f) {
     return best;
 }
 
+// --stress N: N peer windows (48 rings each) of random routings - T 1..8, rings with no, few, many or only peer
+// entries, back to back, rung by CUDA0's route kernel or by the host, some abandoned midway - each under a watchdog:
+// a window that does not finish within 5 s is a hang (the words and the kernel's abort record are printed).  Every
+// finished window's last ring is checked bitwise against native_expert_grouped on the peer.  DM_STRESS_DUP=1 also
+// routes tokens with repeated expert ids and ids past n_expert (the route kernel must keep them off the peer).
+// DM_STRESS_TORN=1: the host-rung rings carry an expert id with different tiers in different tokens (what the route
+// kernel publishes when it reads a residency table while an upload lands): the peer must neither hang nor fault.
+void stress(const strata::GgufFile& gguf, int l, int gt, int dt, int windows) {
+    const auto L = K::native_expert_layout(gt, dt, H, FF);
+    constexpr int NX0 = 32, NP = 48, NX1 = 64, RINGS = 48;
+    const bool dup = std::getenv("DM_STRESS_DUP") != nullptr, torn = std::getenv("DM_STRESS_TORN") != nullptr;
+    const auto* tg = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
+    const auto* tu = gguf.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
+    const auto* td = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
+    std::vector<uint8_t> blobs((size_t) NX1 * L.bytes);
+    for (int x = 0; x < NX1; ++x) {
+        const size_t E = (size_t) ((x * 37 + 5) % NE);
+        uint8_t* b = blobs.data() + (size_t) x * L.bytes;
+        std::memcpy(b, gguf.tensor_data(*tg) + E * L.up_off, L.up_off);
+        std::memcpy(b + L.up_off, gguf.tensor_data(*tu) + E * L.up_off, L.up_off);
+        std::memcpy(b + L.down_off, gguf.tensor_data(*td) + E * (L.bytes - L.down_off), L.bytes - L.down_off);
+    }
+    std::mt19937 rng(std::getenv("DM_STRESS_SEED") ? (unsigned) std::atoi(std::getenv("DM_STRESS_SEED")) : 4242u);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> xh((size_t) MT * H);
+    for (auto& v : xh) v = nd(rng);
+    const size_t xq_stride = (size_t) MT * H / 32 * 36;
+    // experts 0..NX0-1 on CUDA0, NX0..NX0+NP-1 on the peer (slot rotating with the layer), the rest on the CPU
+    std::vector<int32_t> res0(NE, -1), res1(NE, -1);
+    for (int e = 0; e < NX0; ++e) res0[e] = e;
+    for (int e = NX0; e < NX0 + NP; ++e) res1[e] = e - NX0;
+    auto slot1 = [&](int ly, int e) { return (e - NX0 + (ly % 5) * 7) % NX1; };
+    cudaStream_t s0, s1;
+    ck(cudaSetDevice(1), "dev1");
+    ck(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking), "stream");
+    uint8_t* blob1 = dmal<uint8_t>(blobs.size());
+    ck(cudaMemcpy(blob1, blobs.data(), blobs.size(), cudaMemcpyHostToDevice), "blob1");
+    std::vector<unsigned long long> ptab((size_t) RINGS * NE, 0ull);
+    for (int ly = 0; ly < RINGS; ++ly)
+        for (int e = NX0; e < NX0 + NP; ++e)
+            ptab[(size_t) ly * NE + e] = (unsigned long long) (blob1 + (size_t) slot1(ly, e) * L.bytes);
+    unsigned long long* d_ptab = dmal<unsigned long long>(ptab.size());
+    ck(cudaMemcpy(d_ptab, ptab.data(), ptab.size() * 8, cudaMemcpyHostToDevice), "ptab");
+    std::vector<K::NativeExpertLayout> lays(RINGS, L);
+    K::NativeExpertLayout* d_lay = dmal<K::NativeExpertLayout>(RINGS);
+    ck(cudaMemcpy(d_lay, lays.data(), RINGS * sizeof(K::NativeExpertLayout), cudaMemcpyHostToDevice), "lay");
+    void* pscr = dmal<uint8_t>(K::dec_moe_peer_scratch_bytes((int) H, (int) FF));
+    unsigned int* parr = dmal<unsigned int>(16);
+    float* x1 = dmal<float>(xh.size());
+    ck(cudaMemcpy(x1, xh.data(), xh.size() * 4, cudaMemcpyHostToDevice), "x1");
+    void* xq1 = dmal<uint8_t>(xq_stride);
+    K::quantize_q8_1_rows(x1, MT, H, xq1, nullptr);
+    void* scr1 = dmal<uint8_t>(K::native_expert_scratch_bytes(K::kDmCap, FF));
+    float* ref1 = dmal<float>((size_t) K::kDmCap * H);
+    Groups G;
+    G.upload();
+    const int pblocks = K::dec_moe_peer_blocks();
+    ck(cudaSetDevice(0), "dev0");
+    ck(cudaStreamCreateWithFlags(&s0, cudaStreamNonBlocking), "stream");
+    uint8_t* blob0 = dmal<uint8_t>((size_t) NX0 * L.bytes);
+    ck(cudaMemcpy(blob0, blobs.data(), (size_t) NX0 * L.bytes, cudaMemcpyHostToDevice), "blob0");
+    int32_t* d_res0 = dmal<int32_t>(NE);
+    int32_t* d_res1 = dmal<int32_t>(NE);
+    ck(cudaMemcpy(d_res0, res0.data(), NE * 4, cudaMemcpyHostToDevice), "res0");
+    ck(cudaMemcpy(d_res1, res1.data(), NE * 4, cudaMemcpyHostToDevice), "res1");
+    float* d_x = dmal<float>(xh.size());
+    ck(cudaMemcpy(d_x, xh.data(), xh.size() * 4, cudaMemcpyHostToDevice), "x");
+    K::DmPlan* d_plan = dmal<K::DmPlan>(1);
+    void* d_xq = dmal<uint8_t>(xq_stride);
+    int32_t* d_ids = dmal<int32_t>((size_t) RINGS * K::kDmCap);
+    float* d_parts = dmal<float>((size_t) K::kDmCap * H);
+    void* d_scr = dmal<uint8_t>(K::native_expert_scratch_bytes(K::kDmCap, FF));
+    unsigned int* d_ctr = dmal<unsigned int>(16);
+    K::DmRing* h_rings = hmap<K::DmRing>(RINGS);
+    float* h_x = hmap<float>((size_t) RINGS * MT * H);
+    uint8_t* h_xq = hmap<uint8_t>((size_t) RINGS * xq_stride);
+    uint32_t* h_words = hmap<uint32_t>(64);   // [0] host seq [16] peer seq [32] peer done [48] host flag
+    float* h_peer = hmap<float>((size_t) K::kDmCap * H);
+    uint32_t* h_diag = hmap<uint32_t>(K::kDmDiagWords);
+    std::printf("stress layer %d (gate/up %d, down %d), %d peer blocks, %d windows%s%s\n", l, gt, dt, pblocks, windows,
+                dup ? ", repeated and invalid ids" : "", torn ? ", torn tiers" : "");
+
+    auto peer_launch = [&](int steps) {
+        std::memset(h_diag, 0, K::kDmDiagWords * 4);
+        ck(cudaSetDevice(1), "dev1");
+        ck(cudaMemsetAsync(parr, 0, 64, s1), "arrive");
+        K::DmPeerArgs pa;
+        pa.rings_m = h_rings; pa.xq_m = h_xq; pa.xq_stride = xq_stride; pa.seq_m = h_words + 16;
+        pa.done_m = h_words + 32; pa.rows_m = h_peer; pa.ptr = d_ptab; pa.lay = d_lay;
+        pa.n_expert = (int) NE; pa.k = (int) KK; pa.n_embd = (int) H; pa.n_ff = (int) FF; pa.steps = steps;
+        pa.scratch = pscr; pa.arrive = parr; pa.diag_m = h_diag;
+        if (!K::dec_moe_peer_launch(pa, pblocks, s1)) std::exit(2);
+        ck(cudaSetDevice(0), "dev0");
+    };
+    auto stream_wait = [&](int dev, cudaStream_t s, double sec) {
+        ck(cudaSetDevice(dev), "dev");
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaError_t q;
+        while ((q = cudaStreamQuery(s)) == cudaErrorNotReady &&
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < sec) {}
+        ck(cudaSetDevice(0), "dev0");
+        if (q != cudaErrorNotReady && q != cudaSuccess) {
+            std::printf("CUDA error on device %d: %s\n", dev, cudaGetErrorString(q));
+            std::exit(2);
+        }
+        return q == cudaSuccess;
+    };
+    auto diag_line = [&] {
+        char b[512];
+        std::snprintf(b, sizeof b, "words: host seq %u, peer seq %#x, peer done %u; peer: %s", h_words[0], h_words[16],
+                      h_words[32], K::dec_moe_peer_diag(h_diag).c_str());
+        return std::string(b);
+    };
+    auto hang = [&](const char* what, int w) {
+        std::printf("HANG in window %d (%s): %s\n", w, what, diag_line().c_str());
+        *(volatile uint32_t*) (h_words + 16) = UINT32_MAX;
+        *(volatile uint32_t*) (h_words + 32) = UINT32_MAX;
+        const bool p = stream_wait(1, s1, 2.0), c = stream_wait(0, s0, 2.0);
+        std::printf("  after the release: peer kernel %s, CUDA0 %s; %s\n", p ? "exited" : "STILL RUNNING",
+                    c ? "finished" : "STILL RUNNING", diag_line().c_str());
+        std::fflush(stdout);
+        std::_Exit(3);
+    };
+    // ring r's ids: T tokens of KK ids each; the share of peer entries per ring varies widely
+    std::vector<int32_t> ids((size_t) RINGS * K::kDmCap);
+    auto make_window = [&](int T) {
+        for (int r = 0; r < RINGS; ++r) {
+            const int mode = (int) (rng() % 6);   // 0: no peer, 1: one peer expert, 2-3: mixed, 4: mostly peer, 5: all
+            const int pp = mode == 0 ? 0 : mode == 1 ? 8 : mode <= 3 ? 35 : mode == 4 ? 80 : 100;
+            const int npool = mode == 1 ? 1 : 2 + (int) (rng() % (NP - 2));   // distinct peer experts available
+            const int pbase = NX0 + (int) (rng() % (NP - npool + 1));
+            const int rdup = dup ? (int) (rng() % 4) : 0;   // 1: a repeated id, 2: an id past n_expert, 3: both
+            for (int t = 0; t < T; ++t) {
+                std::vector<int> pick;
+                int guard = 0;
+                while ((int) pick.size() < KK) {
+                    const int u = (int) (rng() % 100);
+                    int e;
+                    if (u < pp) e = pbase + (int) (rng() % npool);
+                    else if (u < pp + (100 - pp) / 2) e = (int) (rng() % NX0);
+                    else e = NX0 + NP + (int) (rng() % (NE - NX0 - NP));
+                    if (++guard > 1000) e = NX0 + NP + (int) pick.size();
+                    if (std::find(pick.begin(), pick.end(), e) == pick.end()) pick.push_back(e);
+                }
+                if ((rdup & 1) && t % 2 == 0) pick[KK - 1] = pick[(size_t) (rng() % (KK - 1))];
+                if ((rdup & 2) && t == T - 1) pick[KK - 2] = (int) NE + 3;
+                for (int j = 0; j < KK; ++j) ids[(size_t) r * K::kDmCap + t * KK + j] = pick[j];
+            }
+        }
+        ck(cudaMemcpy(d_ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
+    };
+    // CUDA0's rings (route, the VRAM share, the wait), the peer launched first or after the first rings
+    auto routed = [&](int T, int w, int abandon_at) {
+        std::memset(h_words, 0, 256);
+        h_words[48] = 0xfffffff0u;   // the CPU tier: never waited for
+        const bool late = rng() % 4 == 0;
+        if (!late) peer_launch(RINGS);
+        for (int r = 0; r < RINGS; ++r) {
+            if (r == abandon_at) break;
+            K::DmRouteArgs ra;
+            ra.ids = d_ids + (size_t) r * K::kDmCap; ra.x = d_x; ra.n_tok = T; ra.k = (int) KK; ra.n_embd = (int) H;
+            ra.n_expert = (int) NE; ra.layer = r; ra.res0 = d_res0; ra.res1 = d_res1; ra.cache_base = blob0;
+            ra.blob = (long long) L.bytes; ra.plan = d_plan; ra.xq = d_xq; ra.ring_m = h_rings + r;
+            ra.x_m = h_x + (size_t) r * MT * H; ra.xq_m = h_xq + r * xq_stride; ra.host_seq_m = h_words;
+            ra.peer_seq_m = h_words + 16; ra.ring = (uint32_t) r + 1; ra.ctr = d_ctr;
+            K::dec_moe_route(ra, s0);
+            if (r % 3 == 0)
+                K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok,
+                                         T * (int) KK, T * (int) KK, d_xq, d_scr, d_parts, s0);
+            K::dec_moe_wait(d_plan, h_words + 32, h_words + 48, (uint32_t) r + 1, s0);
+            if (late && r == 2) peer_launch(RINGS);
+        }
+        if (late && abandon_at >= 0 && abandon_at <= 2) peer_launch(RINGS);
+        if (!stream_wait(0, s0, 5.0)) hang("routed, CUDA0", w);
+        if (abandon_at >= 0) *(volatile uint32_t*) (h_words + 16) = UINT32_MAX;   // the peer stops at its next doorbell
+        if (!stream_wait(1, s1, 5.0)) hang(abandon_at >= 0 ? "abandoned, peer" : "routed, peer", w);
+    };
+    // the peer alone, rung by the host over the rings the last routed window left (each doorbell right after the
+    // previous ring landed, the first one before the kernel starts)
+    // an earlier entry of a peer expert routed again in a later token moves to the CPU or CUDA0 tier
+    auto tear = [&](int T) {
+        const int n = T * (int) KK;
+        for (int r = 0; r < RINGS; ++r) {
+            K::DmRing& R = h_rings[r];
+            for (int i = 0; i < n; ++i) {
+                if (R.kind[i] != 2) continue;
+                for (int j = (i / KK + 1) * KK; j < n; ++j)
+                    if (R.ids[j] == R.ids[i] && R.kind[j] == 2 && rng() % 2 == 0) {
+                        R.kind[i] = rng() % 2 ? -1 : 0;
+                        break;
+                    }
+            }
+            int np = 0;
+            for (int i = 0; i < n; ++i) np += R.kind[i] == 2;
+            R.n_peer = np;
+        }
+    };
+    auto host_rung = [&](int T, int w) {
+        std::memset(h_words, 0, 256);
+        peer_launch(RINGS);
+        for (int r = 0; r < RINGS; ++r) {
+            *(volatile uint32_t*) (h_words + 16) =
+                ((uint32_t) r + 1) | (uint32_t) T << 16 | (h_rings[r].n_peer > 0 ? 1u << 28 : 0u);
+            if (h_rings[r].n_peer == 0) continue;
+            const auto t0 = std::chrono::steady_clock::now();
+            while (*(volatile uint32_t*) (h_words + 32) < (uint32_t) r + 1)
+                if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > 5.0)
+                    hang("host-rung", w);
+        }
+        if (!stream_wait(1, s1, 5.0)) hang("host-rung, peer exit", w);
+    };
+    // the last ring's peer rows against native_expert_grouped on the peer
+    auto check = [&](int T, int w) {
+        const int r = RINGS - 1, n = T * (int) KK;
+        G.ptr.clear(); G.start.clear(); G.dst.clear(); G.tok.clear();
+        std::vector<int> rows;
+        const int32_t* id = ids.data() + (size_t) r * K::kDmCap;
+        for (int i = 0; i < n; ++i) {
+            if (h_rings[r].kind[i] != 2) continue;
+            bool first = true;
+            for (int j = 0; j < i; ++j) first &= !(h_rings[r].kind[j] == 2 && id[j] == id[i]);
+            if (!first) continue;
+            G.ptr.push_back((unsigned long long) (blob1 + (size_t) slot1(r, id[i]) * L.bytes));
+            G.start.push_back((int) G.dst.size());
+            for (int j = i; j < n; ++j)
+                if (h_rings[r].kind[j] == 2 && id[j] == id[i]) { G.dst.push_back(j); G.tok.push_back(j / KK); rows.push_back(j); }
+        }
+        if (rows.empty()) return 0;
+        G.start.push_back((int) G.dst.size());
+        ck(cudaSetDevice(1), "dev1");
+        const int ng = (int) G.ptr.size();
+        // on the stream that reads them: a pageable cudaMemcpy may return before its DMA lands
+        ck(cudaMemcpyAsync(G.d_ptr, G.ptr.data(), G.ptr.size() * 8, cudaMemcpyHostToDevice, s1), "up");
+        ck(cudaMemcpyAsync(G.d_start, G.start.data(), G.start.size() * 4, cudaMemcpyHostToDevice, s1), "up");
+        ck(cudaMemcpyAsync(G.d_n, &ng, 4, cudaMemcpyHostToDevice, s1), "up");
+        ck(cudaMemcpyAsync(G.d_dst, G.dst.data(), G.dst.size() * 4, cudaMemcpyHostToDevice, s1), "up");
+        ck(cudaMemcpyAsync(G.d_tok, G.tok.data(), G.tok.size() * 4, cudaMemcpyHostToDevice, s1), "up");
+        std::vector<float> b(h_peer, h_peer + (size_t) K::kDmCap * H);   // before anything else runs
+        K::native_expert_grouped(L, G.d_ptr, G.d_start, G.d_n, G.d_dst, G.d_tok, K::kDmCap, K::kDmCap, xq1, scr1, ref1, s1);
+        ck(cudaStreamSynchronize(s1), "ref");
+        const auto a = down(ref1, (size_t) K::kDmCap * H);
+        K::native_expert_grouped(L, G.d_ptr, G.d_start, G.d_n, G.d_dst, G.d_tok, K::kDmCap, K::kDmCap, xq1, scr1, ref1, s1);
+        ck(cudaStreamSynchronize(s1), "ref");
+        const auto a2 = down(ref1, (size_t) K::kDmCap * H);
+        ck(cudaSetDevice(0), "dev0");
+        const size_t nd = ndiff_rows(a, b, rows), nr = ndiff_rows(a, a2, rows);
+        if (nd || nr) {
+            std::vector<int> bad;
+            for (int r : rows)
+                if (std::memcmp(&a[(size_t) r * H], &b[(size_t) r * H], H * 4) != 0) bad.push_back(r);
+            std::string br;
+            for (int r : bad) br += " " + std::to_string(r);
+            std::printf("  window %d T=%d: last ring's peer rows differ (%zu of %zu; rows%s)%s\n", w, T, nd,
+                        rows.size() * H, br.c_str(), nr ? "; the reference differs between two calls" : "");
+            ++g_fail;
+        }
+        return 1;
+    };
+    int checked = 0, aborted = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int w = 0; w < windows; ++w) {
+        const int T = 1 + (int) (rng() % MT);
+        make_window(T);
+        const int kind = (int) (rng() % 8);   // 0-4 routed, 5 routed then host-rung, 6-7 abandoned midway
+        if (kind <= 5) {
+            routed(T, w, -1);
+            if (!dup) checked += check(T, w);
+            if (kind == 5 || torn) {
+                if (torn) tear(T);
+                host_rung(T, w);
+                if (torn && h_diag[0] == 2u) h_diag[0] = 0;   // a refused ring is the right outcome
+            }
+        } else {
+            routed(T, w, (int) (rng() % RINGS));
+            if (h_diag[0] == 3u) h_diag[0] = 0;   // released inside a ring: expected when abandoned
+        }
+        if (h_diag[0] != 0) {
+            ++aborted;
+            if (aborted <= 5) std::printf("  window %d T=%d: %s\n", w, T, diag_line().c_str());
+            ++g_fail;
+        }
+        if ((w + 1) % 500 == 0)
+            std::printf("  %d windows, %.1f s\n", w + 1,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::printf("stress: %d windows without a hang, %d aborted, %d checked bitwise\n", windows, aborted, checked);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
-        std::fprintf(stderr, "usage: dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench]\n");
+        std::fprintf(stderr, "usage: dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]\n");
         return 2;
     }
     bool bench = false;
+    int stress_n = 0;
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) { bench = true; continue; }
+        if (std::strcmp(argv[i], "--stress") == 0 && i + 1 < argc) { stress_n = std::atoi(argv[++i]); continue; }
         std::stringstream ss(argv[i]);
         std::string t;
         while (std::getline(ss, t, ',')) layers.push_back(std::atoi(t.c_str()));
@@ -147,6 +437,12 @@ int main(int argc, char** argv) {
         if (!seen) auto_layers.push_back(l);
     }
     if (layers.empty()) layers = auto_layers;
+    if (stress_n > 0) {   // the first listed layer only
+        if (!two || fmt[layers[0]].first < 0) { std::fprintf(stderr, "--stress: two cards and a layer with experts\n"); return 2; }
+        stress(gguf, layers[0], fmt[layers[0]].first, fmt[layers[0]].second, stress_n);
+        std::printf("dec_moe_parity --stress: %s\n", g_fail ? "FAILED" : "no hang, bitwise equal");
+        return g_fail ? 1 : 0;
+    }
 
     cudaStream_t s0, s1 = nullptr;
     ck(cudaSetDevice(0), "dev0");
