@@ -1141,6 +1141,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             }
         }
         (void) cudaStreamQuery(cs_);
+        run_launch_hook();
         prefetch_ple(tokens[a]);
         for (int j = 0; j + 1 < max_steps; ++j) {
             uint32_t spins = 0;
@@ -1164,12 +1165,15 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         prefetch_ple(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
+        decode_gaps().mark(6);
         const cudaGraphExec_t first = cond ? cond_exec_[tier_][cp ? 1 : 0][T] : (cp ? round_exec_c_[T] : round_exec_[tier_][T]);
         if (cudaGraphLaunch(first, cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         (void) cudaStreamQuery(cs_);
+        decode_gaps().mark(7);
+        run_launch_hook();
         prefetch_ple(tokens[a]);
         auto wait_step = [&](int j) {
             uint32_t spins = 0;
@@ -1202,13 +1206,16 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             ++n;
         }
         prefetch_ple(drafts[n - 1]);
+        decode_gaps().mark(8);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
     }
+    run_launch_hook();   // no graph ran: the hook still runs, once
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    decode_gaps().mark(9);
     if (gstamp_ != nullptr) {   // STRATA_VERIFY_PROFILE: the GPU's idle time before the round and the draft's span
         unsigned long long st[2] = {0, 0};
         cudaMemcpy(st, gstamp_, 16, cudaMemcpyDeviceToHost);
@@ -1220,6 +1227,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         }
         dg.draft_end = st[1];
     }
+    decode_gaps().mark(10);
     ms_draft += ms_since(t0);
     ++rounds;
     return true;

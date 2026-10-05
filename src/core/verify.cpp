@@ -391,6 +391,7 @@ bool Verifier::dm_sync(std::string& err) {
     const size_t LE = d->shadow0.size();
     auto span = [&](const int32_t* now, std::vector<int32_t>& sh, size_t& a, size_t& b) {
         a = LE; b = 0;
+        if (std::memcmp(now, sh.data(), LE * 4) == 0) return false;
         for (size_t i = 0; i < LE; ++i)
             if (now[i] != sh[i]) { if (a == LE) a = i; b = i + 1; }
         if (a < b) std::memcpy(sh.data() + a, now + a, (b - a) * 4);
@@ -634,8 +635,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 #endif
     }
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    if (prof_on_) decode_gaps().host_on = true;
     if (prof_on_) {
-        const size_t np = (size_t) g.n_layers * kProfPer + 4;
+        const size_t np = (size_t) g.n_layers * kProfPer + 8;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
     }
@@ -755,6 +757,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
 
+    if (prof_on_ && !batch_rec_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 2), cs);
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
@@ -1558,6 +1561,24 @@ std::string Verifier::profile_report() {
                       dg.d2v / 1e6 / (double) dg.n_d2v);
         out += b;
     }
+    if (dg.host_on) {
+        static const char* hn[32] = {"peer/copy sync", "profile read", "host sample", "run tail", "commit", "emit",
+                                     "draft stage", "draft launch", "draft wait", "draft sync", "draft prof read",
+                                     "run entry", "stage+ple", "dm_sync", "peer launch", "graph launch",
+                                     "adapt join", "observe", "apply_pending", "window/penalty", "adapt thread", "", "", "", "", "", "", "", "commit GPU",
+                                     "commit>draft", "verify>commit", ""};
+        out += " | host ms/window:";
+        for (int i = 0; i < 31; ++i) {
+            if (!hn[i][0]) continue;
+            std::snprintf(b, sizeof b, " %s %.3f", hn[i], dg.hms[i] / (double) prof_windows_);
+            out += b;
+            dg.hms[i] = 0;
+        }
+        const double gs = prof_graph0_ / 1e6 / (double) prof_windows_;
+        std::snprintf(b, sizeof b, " | graph start->layer0 %.3f ms", gs);
+        out += b;
+        prof_graph0_ = 0;
+    }
     dg.v2d = dg.d2v = dg.draft_gpu = 0;
     dg.n_v2d = dg.n_d2v = 0;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
@@ -1666,6 +1687,7 @@ bool Verifier::capture_commit(std::string& err) {
     }
     bool ok = true;
     try {
+        if (prof_on_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 3), cs_);
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
@@ -1696,6 +1718,7 @@ bool Verifier::capture_commit(std::string& err) {
             }
         }
         if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs_);
+        if (prof_on_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 4), cs_);
     } catch (const std::exception& e) {
         err = std::string("verify commit: ") + e.what();
         ok = false;
@@ -1776,8 +1799,16 @@ void Verifier::collect_profile() {
         }
     }
     prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
+    prof_graph0_ += gap(at(0, 0), at(L, 2));
     DecodeGaps& dg = decode_gaps();
-    if (dg.draft_end != 0 && at(0, 0) > dg.draft_end) { dg.d2v += (double) (at(0, 0) - dg.draft_end); ++dg.n_d2v; }
+    if (dg.draft_end != 0 && at(0, 0) > dg.draft_end) {
+        dg.d2v += (double) (at(0, 0) - dg.draft_end);
+        ++dg.n_d2v;
+        dg.hms[28] += gap(at(L, 4), at(L, 3)) / 1e6;          // the commit's GPU span
+        dg.hms[29] += gap(at(L, 4), dg.draft_end) / 1e6;      // the commit still running after the draft
+        dg.hms[30] += gap(at(L, 3), dg.verify_prev_end) / 1e6;   // the window's end to the commit's start
+    }
+    dg.verify_prev_end = at(L, 1);
     dg.draft_end = 0;
     dg.verify_end = at(L, 1);
     ++prof_windows_;
@@ -1795,6 +1826,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
+    DecodeGaps& gm = decode_gaps();
+    gm.mark(11);
     const Clock::time_point t0 = Clock::now();
     if (!staged_) stage_inputs(T, tokens, pos0);
     staged_ = false;
@@ -1812,8 +1845,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
+    gm.mark(12);
     if (dm_ != nullptr) {   // STRATA_DEC_MOE: this window's residency, then the peer window ahead of CUDA0's
         if (!dm_sync(err)) return false;
+        gm.mark(13);
         *(volatile uint32_t*) (dm_->h_w + 0) = 0;
         *(volatile uint32_t*) (dm_->h_w + 16) = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -1831,6 +1866,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
             dm_->peer_live = true;
         }
+        gm.mark(14);
     }
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
@@ -1840,7 +1876,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ms_launch += ms_since(tl);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    // STRATA_DEC_CHAIN: a sampled or penalized request's head sampling queued behind the window now, not after a sync
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr);
+    if (early_sample) {
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) pos0;
+        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+    }
     (void) cudaStreamQuery(cs_);
+    gm.mark(15);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -1956,6 +2001,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
+    gm.mark(-1);
     if (dm_ != nullptr && dm_->peer_live) {   // the peer window ends with CUDA0's last ring
         const OnDevice on(dm_->pdev);
         dm_->peer_live = false;
@@ -1969,7 +2015,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
         copy_used_ = false;
     }
+    gm.mark(0);
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
+    gm.mark(1);
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
@@ -1978,8 +2026,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ++windows;
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
-    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+    if (head_sampling_ && (sampled || hist_d_ != nullptr) && !early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
@@ -1988,6 +2035,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             return false;
         }
     }
+    gm.mark(2);
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
@@ -2006,6 +2054,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     VDBG("window done\n");
+    gm.mark(3);
     ++windows;
     progress_at("decode");
     progress_beat();
@@ -2127,35 +2176,43 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
-bool Verifier::commit(int n_keep, std::string& err) {
+bool Verifier::chain_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DEC_CHAIN"); return e && e[0] == '1'; }();
+    return on;
+}
+
+bool Verifier::commit(int n_keep, std::string& err, int parts) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
-    h_commit_[0] = n_keep;
-    h_commit_[1] = n_keep - 1;
-    for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
-    if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
-    // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
-    // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-    if (!g_commit_async || next_ != nullptr) {
-        const cudaError_t se = cudaStreamSynchronize(cs_);
-        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
-    } else {
-        const cudaError_t re = cudaEventRecord(commit_done_, cs_);
-        if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
-        (void) cudaStreamQuery(cs_);
-        commit_pending_ = true;
+    if (parts & 1) {
+        h_commit_[0] = n_keep;
+        h_commit_[1] = n_keep - 1;
+        for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+        if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+        // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
+        // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
+        // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
+        if (!g_commit_async || next_ != nullptr) {
+            const cudaError_t se = cudaStreamSynchronize(cs_);
+            if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+        } else {
+            const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+            if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
+            (void) cudaStreamQuery(cs_);
+            commit_pending_ = true;
+        }
+        decode_gaps().mark(4);
     }
-    if (ple_stage())   // stages that share one session must advance it once
+    if ((parts & 2) && ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit(n_keep, err);
+    return next_ == nullptr || next_->commit(n_keep, err, parts);
 }
 
 bool Verifier::wait_commit(std::string& err) {

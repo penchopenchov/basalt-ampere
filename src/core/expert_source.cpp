@@ -1807,14 +1807,37 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     return true;
 }
 
+bool FileExpertSource::copy_exchanges(uint64_t max_bytes) {
+    uint64_t base = 0;
+    const uint64_t end = xcopy_at_ + max_bytes;
+    for (const Exchange& x : staged_) {
+        const uint64_t lo = std::max(base, xcopy_at_), hi = std::min(base + x.bytes, end);
+        const uint8_t* src = override_[x.out];
+        const uint64_t at = complement_offsets_[x.in];
+        if (lo < hi && src != nullptr && at != kNoComplement && at <= complement_bytes_ &&
+            x.bytes <= complement_bytes_ - at && complement_host_ != nullptr)
+            std::memcpy((uint8_t*) complement_host_ + (size_t) (at + lo - base), src + (lo - base), (size_t) (hi - lo));
+        base += x.bytes;
+    }
+    xcopy_at_ = std::min(end, base);
+    xcopied_ = xcopy_at_ >= base;
+    return xcopied_;
+}
+
 int64_t FileExpertSource::commit_exchanges() {
     int64_t n = 0;
+    const bool copied = xcopied_;
+    xcopied_ = false;
+    if (!copied && xcopy_at_ > 0) copy_exchanges(~0ull >> 1);   // the rest of a partial copy (the same bytes)
+    const bool done = xcopied_ || copied;
+    xcopied_ = false;
+    xcopy_at_ = 0;
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_[x.out];
         const uint64_t at = complement_offsets_[x.in];
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr) {
-            std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+            if (!done) std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
             if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
         }
         override_[x.out] = nullptr;

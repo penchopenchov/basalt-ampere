@@ -492,6 +492,11 @@ public:
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
+    /// The copies of `commit_exchanges` ahead of it (it then only moves the bookkeeping), at most `max_bytes` per call
+    /// (true once all are done): once every staged `in` is in its GPU slot and resident there, so nothing reads its
+    /// place here any more.
+    bool copy_exchanges(uint64_t max_bytes);
+    bool exchanges_staged() const { return !staged_.empty(); }
     int64_t exchanges() const { return exchanges_; }
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
@@ -629,6 +634,8 @@ private:
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
+    bool xcopied_ = false;   // copy_exchanges finished staged_
+    uint64_t xcopy_at_ = 0;  // copy_exchanges' progress through staged_ (bytes)
     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
     bool xstage_pinned_ = false;
     int64_t xstage_cap_ = 0;
