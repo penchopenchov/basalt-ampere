@@ -812,6 +812,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // STRATA_PDL=1 (pdl.hpp): the dense chain's kernels may start during the previous kernel's tail.  Only where
     // that previous kernel is one of them or another plain kernel; never with the profile's or trace's stamps.
     const bool pdl = pdl_rec_ && !prof_on_ && trace_m_ == nullptr && !batch_rec_;
+    // STRATA_DEC_PDL2=1 (pdl.hpp): the chain's kernels let their dependents in early, which stage their weights
+    const bool pdl2 = pdl && pdl2_requested();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
@@ -957,7 +959,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return h;
         };
         {
-            PdlScope ps(pdl, true);   // the read's first kernel follows a combine, copy or wait: a plain launch
+            // the read's first kernel follows a combine, copy or wait: a plain launch, except after the device-planned
+            // tail's combine kernel (PDL2)
+            const bool after_kernel = (pdl2_mask() & 32) && pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
+            PdlScope ps(pdl, !after_kernel);
             if (dec_hc) {
                 HcFusedArgs h = hc_args(0, pending, inj2_, inj_);
                 h.pf[0] = wn[1]->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float);
@@ -1036,7 +1041,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
                     ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
                     ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
-                    ra.early_trigger = false;   // the native out projection does nothing before its wait
+                    ra.early_trigger = pdl && (pdl2_mask() & 64);   // PDL2: the out projection stages its weights
                     if (gdnf_fork) {
                         if (gdnf == 2) gdnf_z_side();
                         ra.o = y_;
@@ -1182,11 +1187,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 }
                 stamp(l, 9, grp);
-                native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
-                            n, cs);
+                {
+                    PdlScope pq(pdl2 && fused_pre && qb);   // PDL2: after the K/V post kernel
+                    native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                (int) (NH * 2 * HD), n, cs);
+                    if (fused_pre && qb)
+                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                                  IQ * ID, N, IQ * ID, n, cs);
+                }
                 if (fused_pre) {   // the query split, norms and RoPEs in one launch
-                    if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
-                                                      IQ * ID, N, IQ * ID, n, cs);
+                    if (qb) {}   // the indexer query projection ran above
                     else for (int t = tb; t < te; ++t)
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qidx_ + t * IQ * ID, (int) N,
                                             (int) (IQ * ID), cs);
@@ -1365,6 +1375,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.xq_m = dm_->m_xq + (size_t) r * dm_->xq_stride;
             ra.host_seq_m = m_seq_; ra.peer_seq_m = dm_->m_w;
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
+            PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
             dec_moe_route(ra, cs);
         } else if (all_resident_) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,

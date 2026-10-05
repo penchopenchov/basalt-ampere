@@ -59,6 +59,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap];
     __shared__ int32_t s_ncpu, s_npeer, s_ng, s_ne;
     const int tid = threadIdx.x, n = a.n_tok * a.k;
+    pdl_wait();   // STRATA_DEC_PDL2: launched during the router's tail
     if (tid == 0) { s_ncpu = 0; s_npeer = 0; }
     __syncthreads();
     if (tid < n) {
@@ -851,7 +852,9 @@ void dec_moe_route(const DmRouteArgs& a, void* stream) {
         std::fprintf(stderr, "dec_moe_route: %d entries / n_embd %d\n", a.n_tok * a.k, a.n_embd);
         std::exit(1);
     }
-    dm_route_kernel<<<(unsigned) dec_moe_route_blocks(a.n_tok, a.n_embd), kDmThreads, 0, (cudaStream_t) stream>>>(a);
+    const dim3 grid((unsigned) dec_moe_route_blocks(a.n_tok, a.n_embd));
+    if (pdl2_mask() & 32) launch_pdl(dm_route_kernel, grid, dim3(kDmThreads), 0, (cudaStream_t) stream, a);
+    else dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
     check("dec_moe_route");
 }
 

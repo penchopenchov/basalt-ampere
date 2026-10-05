@@ -311,6 +311,7 @@ __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T)
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
 __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T) {
+    if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights
     pdl_wait();
     const int w = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (w >= T * a.h_v) return;

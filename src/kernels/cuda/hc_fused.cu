@@ -69,6 +69,7 @@ struct HcLaunch {
     float* t10_scratch;                    // [nb][2 * KT] their outputs
     unsigned long long* racc;              // hcx: [MAXT][NE] the logits as 32.32 fixed point, summed over the up slices
     unsigned long long* dbg;   // bench only: per-CTA phase times [nb][16]
+    int early;       // 1: the next kernel let in at the start; 2: a first down item stages its weights before the wait
 };
 
 // ---------------------------------------------------------------- primitives
@@ -996,6 +997,14 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     // constant data before the previous kernel is waited on
     NormRegs nr;
     if (item < it.ntask) hc_norm_pre(a, item & 3, tid, nr);
+    bool staged = false;   // the first down item's prologue ran before the wait
+    if (L.early) {
+        if ((L.early & 2) && item >= it.down && item < it.up) {
+            hc_down_prologue<T, RING_CAP>(a, item - it.down, tid, smem);
+            staged = true;
+        }
+        if (L.early & 1) pdl_launch_dependents();
+    }
     pdl_wait();
     stamp(dbg, b, 1, tid);
     unsigned up_ph = 0, rt_ph = 0;
@@ -1013,8 +1022,11 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
         } else if (item < it.up) {
             const int d = item - it.down;
             if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 1;
-            cta_wait(&sy->nload.v, (unsigned) it.ntask, tid);   // weight reads queued ahead of the norm's would delay it
-            hc_down_prologue<T, RING_CAP>(a, d, tid, smem);
+            if (!staged) {
+                // weight reads queued ahead of the norm's would delay it
+                cta_wait(&sy->nload.v, (unsigned) it.ntask, tid);
+                hc_down_prologue<T, RING_CAP>(a, d, tid, smem);
+            }
             if (L.pf == 1 && tid == 0 && a.w_router != nullptr) {   // the router rows into L2 behind the down weights
                 const size_t r16 = (size_t) NE * N * 2 / 16, q0 = (size_t) d * r16 / ND, q1 = (size_t) (d + 1) * r16 / ND;
                 prefetch_l2(reinterpret_cast<const char*>(a.w_router) + q0 * 16, (q1 - q0) * 16);
@@ -1125,6 +1137,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             }
         }
         first = false;
+        staged = false;
         __syncthreads();
         if (tid == 0) s_item = (int) atomicAdd(&sy->q.v, 1u);
         __syncthreads();
@@ -1514,6 +1527,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.t10_dummy = d.t10;
     L.t10_scratch = reinterpret_cast<float*>(d.t10 + NE) + NE;
     L.racc = d.racc + (size_t) L.slot * MAXT * NE;
+    L.early = pdl2_mask() & (a.T <= 4 ? 3 : 2);   // from 5 tokens the next kernel's early blocks slow the read
     if (L.dbg == nullptr) L.dbg = dbg_slot(a.T, a.w_router != nullptr);
     const SkConf& sk = sk_conf();
     if (sk.on) {
