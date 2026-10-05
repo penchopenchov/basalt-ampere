@@ -1691,7 +1691,35 @@ bool Verifier::capture_commit(std::string& err) {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        for (int64_t l = lb_; l < le_ && ok; ++l) {
+        static const bool dec_commit = env_on("STRATA_DEC_COMMIT");
+        if (dec_commit) {   // every GDN layer's replay in one launch, every QSA layer's indexer appends in another
+            GdnCommitLayers ga;
+            ga.state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
+            ga.h = h_L_ + (size_t) gdn_index * MT * C; ga.qkv = qkv_L_ + (size_t) gdn_index * MT * C;
+            ga.gate = gate_L_ + (size_t) gdn_index * MT * HV; ga.beta = beta_L_ + (size_t) gdn_index * MT * HV;
+            ga.state_stride = gdn_floats; ga.h_stride = (size_t) MT * C; ga.gb_stride = (size_t) MT * HV;
+            ga.C = (int) C; ga.h_k = (int) g.ssm_k_heads; ga.h_v = (int) HV; ga.n_keep = commit_;
+            QsaCommitLayers qa;
+            qa.pos = commit_ + 2; qa.epsilon = EPS; qa.n_tok = (int) MT;
+            for (int64_t l = lb_; l < le_ && ok; ++l) {
+                if (!is_qsa_layer(g, l)) { ++ga.n_layers; continue; }
+                const LayerView v(*wt_, l);
+                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wikn || qa.n_layers >= kQsaCommitMaxLayers) { ok = false; break; }
+                const QsaState& st = ss.qsa_states[qsa_index + qa.n_layers];
+                QsaCommitLayer& q = qa.layer[qa.n_layers++];
+                q.raw = idx_raw_L_ + (size_t) ((qsa_index + qa.n_layers - 1) * MT) * ID;
+                q.tail_snap = tail_snap_ + (size_t) (qsa_index + qa.n_layers - 1) * TS;
+                q.gamma = (const float*) wikn->data;
+                q.tail = st.idx_tail; q.dead = st.idx_dead; q.pooled = st.idx_pooled; q.block_pos = st.idx_block_pos;
+                q.max_cells = (int) st.max_cells;
+            }
+            if (ok) {
+                gdn_commit_layers(ga, cs_);
+                native_qsa_indexer_commit_layers(qa, s, rope_scaling(), cs_);
+            }
+        }
+        for (int64_t l = lb_; l < le_ && ok && !dec_commit; ++l) {
             const LayerView v(*wt_, l);
             if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);

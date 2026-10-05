@@ -26,6 +26,17 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0);
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
+/// STRATA_DEC_COMMIT: n_layers consecutive GDN layers' commits in one launch (layer l's state at state + l *
+/// state_stride, its conv history right after the S x h_v x S state; h / qkv at l * h_stride, gate / beta at
+/// l * gb_stride): gdn_conv_commit and gdn_step_norm_multi's state-only commit, bitwise.
+struct GdnCommitLayers {
+    float* state = nullptr;
+    const float *h = nullptr, *qkv = nullptr, *gate = nullptr, *beta = nullptr;
+    size_t state_stride = 0, h_stride = 0, gb_stride = 0;
+    int C = 0, h_k = 0, h_v = 0, n_layers = 0;
+    const int32_t* n_keep = nullptr;
+};
+void gdn_commit_layers(const GdnCommitLayers& a, void* stream);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);

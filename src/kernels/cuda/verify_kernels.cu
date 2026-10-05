@@ -52,9 +52,8 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __res
     h[(size_t) t * C + c] = y;
 }
 
-__global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
-                                       const int32_t* __restrict__ n_keep) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+__device__ __forceinline__ void gdn_conv_commit_one(float* __restrict__ hist, const float* __restrict__ qkv, int C,
+                                                    const int32_t* __restrict__ n_keep, int c) {
     if (c >= C) return;
     const int n = *n_keep;
     if (n <= 0) return;
@@ -67,6 +66,11 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
     hist[c * 3] = seq[0];
     hist[c * 3 + 1] = seq[1];
     hist[c * 3 + 2] = seq[2];
+}
+
+__global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
+                                       const int32_t* __restrict__ n_keep) {
+    gdn_conv_commit_one(hist, qkv, C, n_keep, blockIdx.x * blockDim.x + threadIdx.x);
 }
 
 template <int MAX_T = kVerifyMaxT>
@@ -173,19 +177,16 @@ __global__ void __launch_bounds__(64) gdn_ab_multi_unrolled_kernel(const float* 
 
 // State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
 // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
-__global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restrict__ state,
-                                                                  const float* __restrict__ hbuf, int C,
-                                                                  const float* __restrict__ gate,
-                                                                  const float* __restrict__ beta,
-                                                                  int h_k, int h_v,
-                                                                  const int32_t* __restrict__ n_keep) {
+__device__ __forceinline__ void gdn_step_commit_block(float* __restrict__ state, const float* __restrict__ hbuf,
+                                                      int C, const float* __restrict__ gate,
+                                                      const float* __restrict__ beta, int h_k, int h_v,
+                                                      const int32_t* __restrict__ n_keep, int head, int cblk) {
     const int n = *n_keep;
     if (n <= 0) return;
     __shared__ float sk[S];
     __shared__ float red[RG][32];
-    const int head = blockIdx.x;
     const int col_local = threadIdx.x;
-    const int col = blockIdx.y * 32 + col_local;
+    const int col = cblk * 32 + col_local;
     const int rg = threadIdx.y;
     const int tid = rg * 32 + col_local;    // 0 .. 127
     const int qh = head % h_k;
@@ -213,6 +214,30 @@ __global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restr
     }
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+}
+
+__global__ void __launch_bounds__(32 * RG) gdn_step_commit_kernel(float* __restrict__ state,
+                                                                  const float* __restrict__ hbuf, int C,
+                                                                  const float* __restrict__ gate,
+                                                                  const float* __restrict__ beta,
+                                                                  int h_k, int h_v,
+                                                                  const int32_t* __restrict__ n_keep) {
+    gdn_step_commit_block(state, hbuf, C, gate, beta, h_k, h_v, n_keep, blockIdx.x, blockIdx.y);
+}
+
+// Every GDN layer's commit in one launch: blockIdx.z = the layer, y < S / 32 its state's column blocks (x = the
+// head), y = S / 32 its conv history (x = 32 RG channels).
+__global__ void __launch_bounds__(32 * RG) gdn_commit_layers_kernel(GdnCommitLayers a) {
+    const int l = blockIdx.z;
+    float* state = a.state + (size_t) l * a.state_stride;
+    if (blockIdx.y < S / 32) {
+        if ((int) blockIdx.x < a.h_v)
+            gdn_step_commit_block(state, a.h + (size_t) l * a.h_stride, a.C, a.gate + (size_t) l * a.gb_stride,
+                                  a.beta + (size_t) l * a.gb_stride, a.h_k, a.h_v, a.n_keep, blockIdx.x, blockIdx.y);
+    } else {
+        gdn_conv_commit_one(state + (size_t) S * a.h_v * S, a.qkv + (size_t) l * a.h_stride, a.C, a.n_keep,
+                            blockIdx.x * 32 * RG + threadIdx.y * 32 + threadIdx.x);
+    }
 }
 
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
@@ -552,6 +577,14 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
     launch_pdl(gdn_conv_l2_multi_kernel, dim3((unsigned) (channels / S), (unsigned) n_tok), dim3(S), 0,
                (cudaStream_t) stream, history, qkv, conv_w, h, channels, qk_heads, eps, t_begin);
     check("gdn_conv_l2_multi");
+}
+
+void gdn_commit_layers(const GdnCommitLayers& a, void* stream) {
+    if (a.n_layers <= 0) return;
+    const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
+    const unsigned gx = (unsigned) (a.h_v > conv_blocks ? a.h_v : conv_blocks);
+    gdn_commit_layers_kernel<<<dim3(gx, S / 32 + 1, (unsigned) a.n_layers), dim3(32, RG), 0, (cudaStream_t) stream>>>(a);
+    check("gdn_commit_layers");
 }
 
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {

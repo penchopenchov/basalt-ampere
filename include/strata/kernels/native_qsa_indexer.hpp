@@ -38,6 +38,26 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
                                      const RopeScaling& scaling, void* stream);
 
+/// STRATA_DEC_COMMIT: every QSA layer's commit in one launch - layer l's tail restored from tail_snap (mapped), then
+/// rows raw + t * idx_dim appended at relative positions pos[t] (t < n_tok, < 0 skipped), as n_tok
+/// native_qsa_indexer_append calls with pos_base 0 would, bitwise.
+constexpr int kQsaCommitMaxLayers = 16;
+struct QsaCommitLayer {
+    const float* raw = nullptr;
+    const float* tail_snap = nullptr;
+    const float* gamma = nullptr;
+    float *tail = nullptr, *dead = nullptr, *pooled = nullptr;
+    int32_t* block_pos = nullptr;
+    int max_cells = 0;
+};
+struct QsaCommitLayers {
+    QsaCommitLayer layer[kQsaCommitMaxLayers];
+    const int32_t* pos = nullptr;
+    float epsilon = 0.0f;
+    int n_layers = 0, n_tok = 0;
+};
+void native_qsa_indexer_commit_layers(const QsaCommitLayers& a, const QsaShapes& s, const RopeScaling& scaling,
+                                      void* stream);
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device,
                                int32_t pos_base, const float* gamma, float epsilon,
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,

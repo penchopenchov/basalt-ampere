@@ -43,13 +43,13 @@ __device__ float warp_sum(float x) {
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
 template <bool TAB>
-__global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+__device__ __forceinline__ void append_one(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
-                        const int32_t* __restrict__ mtab, RopeTab rt) {
+                        const int32_t* __restrict__ mtab, const RopeTab& rt) {
     const int pos = *pos_dev, d = threadIdx.x;
     if (pos < 0 || pos >= max_cells) return;
     const int slot = pos % R;
@@ -103,6 +103,32 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
     if (pos == 0) dead[d] = y;
     else pooled[std::size_t(b + 1) * D + d] = dead[d];
     if (d == 0 && pos != 0) *block_pos = rope_pos;
+}
+template <bool TAB>
+__global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+                        int pos_base, const float* __restrict__ gamma, float epsilon,
+                        float* __restrict__ tail, float* __restrict__ dead,
+                        float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                        int max_cells, float theta_scale, float freq_scale, float corr_low,
+                        float corr_high, float ext_factor, float mscale,
+                        const int32_t* __restrict__ mtab, RopeTab rt) {
+    append_one<TAB>(raw, pos_dev, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells, theta_scale,
+                    freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
+}
+// STRATA_DEC_COMMIT: block l restores layer l's tail from its snapshot, then appends its n_tok rows in order
+template <bool TAB>
+__global__ void __launch_bounds__(THREADS) commit_layers(QsaCommitLayers a, float theta_scale, float freq_scale,
+                                                         float corr_low, float corr_high, float ext_factor,
+                                                         float mscale, const int32_t* __restrict__ mtab, RopeTab rt) {
+    const QsaCommitLayer& L = a.layer[blockIdx.x];
+    for (int i = threadIdx.x; i < (R - 1) * D; i += THREADS) L.tail[i] = ((const volatile float*) L.tail_snap)[i];
+    __syncthreads();
+    for (int t = 0; t < a.n_tok; ++t) {
+        append_one<TAB>(L.raw + (size_t) t * D, a.pos + t, 0, L.gamma, a.epsilon, L.tail, L.dead, L.pooled,
+                        L.block_pos, L.max_cells, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
+                        mtab, rt);
+        __syncthreads();
+    }
 }
 // ---- C-2: the batched append.  The pooled key of a completed block b (its last cell pos = 4b+3), computed with
 // the single append's arithmetic: keys rounded through F16, summed tail[0]+tail[1]+tail[2]+incoming in that order,
@@ -249,6 +275,25 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
         append<false><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_base,gamma,epsilon,
             b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
             k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_qsa_indexer_commit_layers(const QsaCommitLayers& a, const QsaShapes& s, const RopeScaling& scaling,
+                                      void* stream) {
+    if (a.n_layers <= 0) return;
+    if (!stream || a.n_layers > kQsaCommitMaxLayers || a.n_tok < 1 || s.idx_dim != D || s.idx_block != R ||
+        s.n_rot != ROT || !std::isfinite(a.epsilon) || a.epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer commit: bad geometry, layer count or parameters");
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);
+    const RopeTab rt = rope_table_for(scaling);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (rt.cos != nullptr)
+        commit_layers<true><<<(unsigned) a.n_layers, THREADS, 0, st>>>(a, theta_scale, k.freq_scale, k.corr_low,
+            k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt);
+    else
+        commit_layers<false><<<(unsigned) a.n_layers, THREADS, 0, st>>>(a, theta_scale, k.freq_scale, k.corr_low,
+            k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
