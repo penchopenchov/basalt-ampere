@@ -29,6 +29,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_dec_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
@@ -561,6 +562,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool dec_qsa = [] { const char* v = std::getenv("STRATA_DEC_QSA"); return v != nullptr && std::atoi(v) != 0; }();
     // STRATA_PDL=1 (pdl.hpp): the dense chain's kernels may start during the previous kernel's tail.  Only where
     // that previous kernel is one of them or another plain kernel; never with the profile's or trace's stamps.
     const bool pdl = pdl_rec_ && !prof_on_ && trace_m_ == nullptr && !batch_rec_;
@@ -863,6 +865,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 }
                 stamp(l, 10, grp);
+                bool fused_gate = false;
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
@@ -886,12 +889,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
+                // STRATA_DEC_QSA=1: staged chunks and the gate in the merge, the same bits
+                fused_gate = dec_qsa && native_qsa_enabled() && !st.kv_rot && !st.kv_hybrid &&
+                             qsa_dec_attn_supported(pools, s);
+                if (fused_gate)
+                    qsa_dec_attn(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_, s,
+                                 attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs,
+                                 qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD);
+                else
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
+                if (fused_gate) {}   // the merge wrote attn32_
+                else if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
                 else
                 for (int t = tb; t < te; ++t) {

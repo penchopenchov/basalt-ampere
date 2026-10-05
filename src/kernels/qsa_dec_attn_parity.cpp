@@ -1,0 +1,184 @@
+// src/kernels/qsa_dec_attn_parity.cpp - qsa_dec_attn against qsa_decode_attn_batch (+ native_qsa_gate_apply), bitwise,
+// on random INT8 and FP16 pools through a permuted page table with masked pages; then a microbench of both.
+//   qsa_dec_attn_parity [iters]
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_dec_attn.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <vector>
+
+namespace k = strata::kernels;
+
+namespace {
+int g_fail = 0;
+void ck(cudaError_t e, const char* w) {
+    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
+}
+template <typename T> T* dalloc(size_t n) {
+    T* p = nullptr;
+    ck(cudaMalloc(&p, n * sizeof(T) + 256), "malloc");
+    ck(cudaMemset(p, 0, n * sizeof(T) + 256), "memset");
+    return p;
+}
+template <typename T> void up(T* d, const std::vector<T>& h) { ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "up"); }
+template <typename T> std::vector<T> down(const T* d, size_t n) {
+    std::vector<T> h(n);
+    ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "down");
+    return h;
+}
+uint16_t f16(float x) { __half h = __float2half(x); uint16_t b; std::memcpy(&b, &h, 2); return b; }
+
+struct Pools {
+    int8_t *kq = nullptr, *vq = nullptr;
+    uint16_t *ks = nullptr, *vs = nullptr, *kp = nullptr, *vp = nullptr;
+    int32_t* table = nullptr;
+};
+}  // namespace
+
+int main(int argc, char** argv) {
+    const int iters = argc > 1 ? std::atoi(argv[1]) : 200;
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int H = (int) s.n_head_kv, D = (int) s.head_dim, NH = (int) s.n_head, P = (int) s.page_size;
+    const int max_cells = 16384, pages = max_cells / P, MAXQ = 8;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_real_distribution<float> ud(0.002f, 0.05f);
+    const size_t rows = (size_t) pages * H * P;
+    Pools p;
+    p.kq = dalloc<int8_t>(rows * D); p.vq = dalloc<int8_t>(rows * D);
+    p.ks = dalloc<uint16_t>(rows * D / 64); p.vs = dalloc<uint16_t>(rows * D / 64);
+    p.kp = dalloc<uint16_t>(rows * D); p.vp = dalloc<uint16_t>(rows * D);
+    p.table = dalloc<int32_t>(pages);
+    {
+        std::vector<int8_t> c(rows * D);
+        std::vector<uint16_t> sc(rows * D / 64), hp(rows * D);
+        for (int which = 0; which < 2; ++which) {
+            for (auto& x : c) x = (int8_t) ((int) (rng() % 255) - 127);
+            for (auto& x : sc) x = f16(ud(rng));
+            for (auto& x : hp) x = f16(nd(rng) * 0.7f);
+            up(which ? p.vq : p.kq, c);
+            up(which ? p.vs : p.ks, sc);
+            up(which ? p.vp : p.kp, hp);
+        }
+    }
+    std::vector<int32_t> table(pages);
+    for (int i = 0; i < pages; ++i) table[i] = i;
+    std::shuffle(table.begin(), table.end(), rng);
+    float* q = dalloc<float>((size_t) MAXQ * NH * D);
+    float* qfull = dalloc<float>((size_t) MAXQ * NH * 2 * D);
+    {
+        std::vector<float> h((size_t) MAXQ * NH * D), hf((size_t) MAXQ * NH * 2 * D);
+        for (auto& x : h) x = nd(rng) * 2.0f;   // scores of a few units: many probabilities far below the max
+        for (auto& x : hf) x = nd(rng) * 3.0f;
+        up(q, h);
+        up(qfull, hf);
+    }
+    int32_t* steps = dalloc<int32_t>((size_t) MAXQ * k::kStepCount);
+    float* out_ref = dalloc<float>((size_t) MAXQ * NH * D);
+    float* out_new = dalloc<float>((size_t) MAXQ * NH * D);
+    float* gated_ref = dalloc<float>((size_t) MAXQ * NH * D);
+    float* gated_new = dalloc<float>((size_t) MAXQ * NH * D);
+    cudaStream_t st;
+    ck(cudaStreamCreate(&st), "stream");
+
+    auto pools_of = [&](int mode) {
+        k::QsaAttnPools a;
+        a.page_table = p.table;
+        if (mode == 1) { a.k_q = p.kq; a.v_q = p.vq; a.k_scale = p.ks; a.v_scale = p.vs; }
+        else { a.k_pool = p.kp; a.v_pool = p.vp; }
+        return a;
+    };
+    // one case: n_q queries of widths w[i] over cap; masked: some pages -1; ident: the identity selection
+    auto run_case = [&](int mode, int cap, int n_q, const std::vector<int>& w, bool masked, bool ident, bool bench,
+                        const char* label) {
+        std::vector<int32_t> tb = table;
+        if (masked) for (int i = 0; i < pages; i += 7) tb[i] = -1;
+        up(p.table, tb);
+        std::vector<int32_t> hs((size_t) n_q * k::kStepCount), hid((size_t) n_q * cap, 0);
+        for (int i = 0; i < n_q; ++i) {
+            const int n_kv = ident ? w[i] : std::min(max_cells, w[i] * 3 + 11);
+            k::qsa_step_fill(hs.data() + i * k::kStepCount, n_kv - 1, s);
+            hs[i * k::kStepCount + k::kStepWidth] = w[i];
+            std::vector<int32_t> cells(n_kv);
+            for (int c = 0; c < n_kv; ++c) cells[c] = c;
+            if (!ident) { std::shuffle(cells.begin(), cells.end(), rng); cells.resize(w[i]); std::sort(cells.begin(), cells.end()); }
+            for (int c = 0; c < w[i]; ++c) hid[(size_t) i * cap + c] = cells[c];
+        }
+        int32_t* ids = dalloc<int32_t>((size_t) n_q * cap);
+        up(ids, hid);
+        up(steps, hs);
+        const size_t sf = k::qsa_decode_attn_scratch_floats(cap, s);
+        float* scr_ref = dalloc<float>(sf * n_q);
+        float* scr_new = dalloc<float>(sf * n_q);
+        const k::QsaAttnPools a = pools_of(mode);
+        k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, scr_ref, out_ref, n_q, st);
+        k::native_qsa_gate_apply(out_ref, qfull, gated_ref, NH * n_q, D, st);
+        k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_new, n_q, st, qfull, gated_new);
+        ck(cudaStreamSynchronize(st), "sync");
+        const size_t n = (size_t) n_q * NH * D;
+        const auto r = down(out_ref, n), x = down(out_new, n), gr = down(gated_ref, n), gx = down(gated_new, n);
+        size_t bad = 0, gbad = 0;
+        double maxd = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::memcmp(&r[i], &x[i], 4) != 0) { ++bad; maxd = std::max(maxd, (double) std::fabs(r[i] - x[i])); }
+            if (std::memcmp(&gr[i], &gx[i], 4) != 0) ++gbad;
+        }
+        if (bad || gbad) ++g_fail;
+        std::printf("%-34s mode %d cap %5d nq %d: %s (attn %zu / gated %zu of %zu differ, max |d| %.3g)\n", label, mode, cap,
+                    n_q, bad || gbad ? "FAIL" : "bitwise", bad, gbad, n, maxd);
+        if (bench) {
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            double bytes = 0;
+            for (int i = 0; i < n_q; ++i)
+                bytes += (double) w[i] * H * (mode == 1 ? (2.0 * D + 2.0 * (D / 64) * 2) : 4.0 * D) + 4.0 * w[i];
+            float ms_ref = 0, ms_new = 0;
+            for (int rep = 0; rep < 2; ++rep) {
+                cudaEventRecord(e0, st);
+                for (int it = 0; it < iters; ++it) {
+                    k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, scr_ref, out_ref, n_q, st);
+                    k::native_qsa_gate_apply(out_ref, qfull, gated_ref, NH * n_q, D, st);
+                }
+                cudaEventRecord(e1, st);
+                cudaEventSynchronize(e1);
+                cudaEventElapsedTime(&ms_ref, e0, e1);
+                cudaEventRecord(e0, st);
+                for (int it = 0; it < iters; ++it)
+                    k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_new, n_q, st, qfull, gated_new);
+                cudaEventRecord(e1, st);
+                cudaEventSynchronize(e1);
+                cudaEventElapsedTime(&ms_new, e0, e1);
+            }
+            const double ur = 1e3 * ms_ref / iters, un = 1e3 * ms_new / iters;
+            std::printf("   bench: ref (attn+merge+gate) %7.2f us %6.1f GB/s | new %7.2f us %6.1f GB/s | %.2fx\n", ur,
+                        bytes / ur / 1e3, un, bytes / un / 1e3, ur / un);
+        }
+        cudaFree(ids);
+        cudaFree(scr_ref);
+        cudaFree(scr_new);
+    };
+    const int cap = (int) k::qsa_selection_width(k::kTopkMaxCells, s);
+    for (int mode = 1; mode >= 0; --mode) {
+        run_case(mode, cap, 1, {1}, false, true, false, "first cell");
+        run_case(mode, cap, 3, {63, 64, 65}, false, true, false, "chunk edges");
+        run_case(mode, cap, 3, {1250, 1251, 1252}, false, true, true, "prose window (identity)");
+        run_case(mode, cap, 2, {cap, cap}, false, false, true, "full selection");
+        run_case(mode, cap, 5, {cap, 1700, 900, 300, 2000}, true, false, false, "masked pages");
+        run_case(mode, cap, 8, {cap, cap, cap, cap, cap, cap, cap, cap}, false, false, true, "T=8 full");
+        run_case(mode, 4096, 1, {4096}, false, true, true, "draft window 4096");
+        run_case(mode, 4096, 1, {1250}, false, true, true, "draft window, 1250 cells");
+    }
+    std::printf("%s\n", g_fail ? "qsa_dec_attn_parity: FAIL" : "qsa_dec_attn_parity: OK (bitwise)");
+    return g_fail ? 1 : 0;
+}

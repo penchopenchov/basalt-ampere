@@ -324,6 +324,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
+                          src/kernels/cuda/qsa_dec_attn.cu
                           src/kernels/cuda/qsa_prompt_attn.cu
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/dequant_bf16.cu
@@ -792,6 +793,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q8_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q8_parity COMMAND kv_q8_parity)
+
+  # Decode attention for a few queries vs qsa_decode_attn_batch + the gate, bitwise (GPU, synthetic, no model).
+  add_executable(qsa_dec_attn_parity src/kernels/qsa_dec_attn_parity.cpp)
+  target_include_directories(qsa_dec_attn_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(qsa_dec_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME qsa_dec_attn_parity COMMAND qsa_dec_attn_parity 20)
 
   # KV streaming (docs/kv-streaming-design.md): streamed vs resident attention, bitwise (GPU, synthetic, no model).
   add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)

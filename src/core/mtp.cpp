@@ -20,6 +20,7 @@
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_dec_attn.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -64,17 +65,21 @@ bool env_on(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr && std::atoi(v) != 0;
 }
+bool dec_draft_on() {   // STRATA_DEC_DRAFT=1: the fast draft path (the switches below, the staged attention)
+    static const bool on = env_on("STRATA_DEC_DRAFT");
+    return on;
+}
 // opt-in draft-path changes, each with the default path's drafts and probabilities bit for bit
 bool reuse_row_on() {   // the round's draft row from the catch-up
-    static const bool on = env_on("STRATA_MTP_REUSE_ROW");
+    static const bool on = env_on("STRATA_MTP_REUSE_ROW") || dec_draft_on();
     return on;
 }
 bool fuse_top_on() {    // the head's argmax, probability and map in one kernel
-    static const bool on = env_on("STRATA_MTP_FUSE_TOP");
+    static const bool on = env_on("STRATA_MTP_FUSE_TOP") || dec_draft_on();
     return on;
 }
 bool cond_on() {        // the min_p chain as conditional nodes of one graph
-    static const bool on = env_on("STRATA_MTP_COND");
+    static const bool on = env_on("STRATA_MTP_COND") || dec_draft_on();
     return on;
 }
 
@@ -591,10 +596,15 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
-        qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
-        if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
-        for (int t = 0; t < T; ++t)
-            native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH, (int) HD, cs);
+        if (dec_draft_on() && !st_.kv_rot && qsa_dec_attn_supported(pools, s)) {   // the gate in the merge
+            qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs, qfull_, attn32_);
+        } else {
+            qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+            if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+            for (int t = 0; t < T; ++t)
+                native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH,
+                                      (int) HD, cs);
+        }
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.o_proj.weight"), xq_, bo_, (int) (NH * HD), (int) N, T, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
