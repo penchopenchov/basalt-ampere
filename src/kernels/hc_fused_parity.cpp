@@ -274,6 +274,33 @@ int main(int argc, char** argv) {
         }
         std::printf("hc_fused_parity: %d values of a token differ between window sizes (must be 0)\n", bad);
         failures += bad ? 1 : 0;
+        // the widest window again with its tokens in reverse order: token k's outputs at column TH - 1 - k
+        std::vector<float> Rr((size_t) TH * D), bor((size_t) TH * N), injr((size_t) TH * HC);
+        for (int k = 0; k < TH; ++k) {
+            const int j = TH - 1 - k;
+            std::memcpy(&Rr[(size_t) j * D], &R[(size_t) k * D], (size_t) D * 4);
+            std::memcpy(&bor[(size_t) j * N], &bo[(size_t) k * N], (size_t) N * 4);
+            std::memcpy(&injr[(size_t) j * HC], &inj[(size_t) k * HC], (size_t) HC * 4);
+        }
+        reset(1);
+        cudaMemcpy(o[1].R, Rr.data(), Rr.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dbo, bor.data(), bor.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dinj, injr.data(), injr.size() * 4, cudaMemcpyHostToDevice);
+        run(1, TH, true, true, true);
+        cudaStreamSynchronize(s);
+        const std::vector<float> vr = fetch(1, TH);
+        cudaMemcpy(dbo, bo.data(), bo.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dinj, inj.data(), inj.size() * 4, cudaMemcpyHostToDevice);
+        int badc = 0;
+        size_t off = 0;
+        for (int pt = 0; pt < 8; ++pt) {
+            for (int k = 0; k < TH; ++k)
+                badc += std::memcmp(&vr[off + (size_t) (TH - 1 - k) * per[pt]], &by_t[TH][off + (size_t) k * per[pt]],
+                                    (size_t) per[pt] * 4) != 0;
+            off += szh[pt];
+        }
+        std::printf("hc_fused_parity: %d (token, output) pairs differ when the window's tokens are reversed (must be 0)\n", badc);
+        failures += badc ? 1 : 0;
     }
     std::printf("hc_fused_parity: %d differing cases (T %d..%d, 3 modes, with and without the pending write)\n",
                 failures, t_lo, t_hi);
