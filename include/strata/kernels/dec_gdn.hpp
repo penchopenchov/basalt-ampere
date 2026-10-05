@@ -1,6 +1,7 @@
 // include/strata/kernels/dec_gdn.hpp - the GDN block of a verify window in three launches (STRATA_DEC_GDN=1).
 //
-//   dec_gdn_inproj   q8_1 of the block input (per block, in shared memory) + the qkv and z projections
+//   dec_gdn_inproj   q8_1 of the block input (once, then copied into each block's shared memory) + the qkv and z
+//                    projections
 //   dec_gdn_rec      conv1d + SiLU + q/k L2 norm, the alpha/beta gates, the delta-rule recurrence over the
 //                    window from the untouched state, the gated RMS norm, and the q8_1 of its output
 //   dec_dense        the out projection from those q8_1 columns
@@ -30,8 +31,10 @@ struct DecMat {
 /// The dense types dec_gdn_inproj / dec_dense take.
 bool dec_dense_supported(int ggml_type, int n_in) noexcept;
 
-/// q8_1 of x (n_tok columns of n_in floats, column t at x + t * n_in) and every matrix of `m` against it.
-void dec_gdn_inproj(const float* x, int n_in, int n_tok, const DecMat* m, int n_mats, void* stream);
+/// q8_1 of x (n_tok columns of n_in floats, column t at x + t * n_in) into `scratch` (16-byte aligned,
+/// dec_gdn_inproj_scratch bytes), and every matrix of `m` against it.
+void dec_gdn_inproj(const float* x, int n_in, int n_tok, const DecMat* m, int n_mats, void* scratch, void* stream);
+inline long long dec_gdn_inproj_scratch(int n_in, int n_tok) { return (long long) n_tok * (n_in / 32) * 40; }
 
 /// One matrix against n_tok q8_1 columns (column t at block t * n_in / 32 of xq).
 void dec_dense(const void* xq, int n_in, int n_tok, const DecMat& m, void* stream);
@@ -60,7 +63,9 @@ struct DecRecArgs {
 /// The recurrence of tokens [0, n_tok) from the untouched state; one cluster of four blocks per value head.
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream);
 
-/// Whether STRATA_DEC_GDN=1 asks for the path above.
+/// STRATA_DEC_GDN: 0 off, 1 the path above, 2 the same with the dense dots summed per 32-value block (the reference's
+/// math with fewer roundings, not its bits; a column still does not depend on T).
+int dec_gdn_mode();
 bool dec_gdn_enabled();
 
 }  // namespace strata::kernels

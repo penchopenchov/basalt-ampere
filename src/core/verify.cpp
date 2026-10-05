@@ -729,7 +729,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     dec_dense_supported(wg->native_type, (int) N) && dec_dense_supported(wout->native_type, (int) ZV)) {
                     const DecMat in[2] = {{wqkv->native_type, wqkv->native_data, (int) C, qkv},
                                           {wg->native_type, wg->native_data, (int) ZV, z_}};
-                    dec_gdn_inproj(xm, (int) N, n, in, 2, cs);
+                    dec_gdn_inproj(xm, (int) N, n, in, 2, xq_, cs);
                     for (int i = 2; i <= 5; ++i) stamp(l, i, grp);
                     DecRecArgs ra;
                     ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;

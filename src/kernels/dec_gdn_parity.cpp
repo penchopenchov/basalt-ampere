@@ -189,7 +189,7 @@ void run_new(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int
              unsigned long long* stamps = nullptr) {
     if (stages & 1) {
         const DecMat m[2] = {{L.tq, L.wqkv, C, b.qkv}, {L.tz, L.wz, ZV, b.z}};
-        dec_gdn_inproj(x, N, T, m, 2, s);
+        dec_gdn_inproj(x, N, T, m, 2, b.xq, s);
     }
     if (stages & 2) {
         DecRecArgs a;
@@ -209,19 +209,26 @@ std::vector<V> down(const V* d, size_t n) {
     return h;
 }
 
-// bit differences between two float arrays; prints the first
+bool g_quiet = false;   // relaxed mode: differences are expected, report their size instead
+
+// bit differences between two float arrays; prints the first (or, quiet, the error relative to the array's scale)
 long long cmp_f(const char* what, const float* a, const float* b, size_t n, double& max_abs) {
     std::vector<float> ha = down(a, n), hb = down(b, n);
     long long d = 0;
+    double scale = 0, worst = 0;
+    for (size_t i = 0; i < n; ++i) scale = std::max(scale, std::fabs((double) ha[i]));
     for (size_t i = 0; i < n; ++i) {
         if (std::memcmp(&ha[i], &hb[i], 4) != 0) {
-            if (d == 0) std::printf("    %s[%zu]: ref %.9g new %.9g\n", what, i, ha[i], hb[i]);
+            if (d == 0 && !g_quiet) std::printf("    %s[%zu]: ref %.9g new %.9g\n", what, i, ha[i], hb[i]);
             ++d;
             const double e = std::fabs((double) ha[i] - hb[i]);
             if (e > max_abs) max_abs = e;
+            worst = std::max(worst, e);
         }
-        if (!std::isfinite(ha[i])) { std::printf("    %s[%zu] not finite\n", what, i); ++d; }
+        if (!std::isfinite(ha[i]) || !std::isfinite(hb[i])) { std::printf("    %s[%zu] not finite\n", what, i); ++d; }
     }
+    if (g_quiet && d) std::printf("    %-5s %7lld/%-7zu differ, max abs %.3g = %.3g of max|ref| %.3g\n", what, d, n, worst,
+                                  worst / scale, scale);
     return d;
 }
 long long cmp_b(const char* what, const void* a, const void* b, size_t n) {
@@ -259,6 +266,25 @@ bool parity(cudaStream_t s) {
             const bool st_ok = std::memcmp(st0.data(), st1.data(), st0.size() * 4) == 0;
             std::printf("qkv %-6s z %-6s out %-6s T=%d: %s%s\n", fmt(cb[0]).name, fmt(cb[1]).name, fmt(cb[2]).name, T,
                         d == 0 ? "bitwise" : ("DIFF " + std::to_string(d)).c_str(), st_ok ? "" : " STATE WRITTEN");
+            if (g_quiet) {   // the dense outputs of each column alone must equal the T-column call, bit for bit
+                Bufs one = make_bufs();
+                long long inv = 0;
+                double m0 = 0;
+                for (int t = 0; t < T; ++t) {
+                    const DecMat m[2] = {{L.tq, L.wqkv, C, one.qkv}, {L.tz, L.wz, ZV, one.z}};
+                    dec_gdn_inproj(x + (size_t) t * N, N, 1, m, 2, one.xq, s);
+                    dec_dense((const uint8_t*) n.yq + (size_t) t * native_q8_1_bytes(ZV, 1), ZV, 1, DecMat{L.to, L.wo, N, one.bo}, s);
+                    CK(cudaStreamSynchronize(s));
+                    g_quiet = false;
+                    inv += cmp_f("qkv@t", n.qkv + (size_t) t * C, one.qkv, C, m0);
+                    inv += cmp_f("z@t", n.z + (size_t) t * ZV, one.z, ZV, m0);
+                    inv += cmp_f("out@t", n.bo + (size_t) t * N, one.bo, N, m0);
+                    g_quiet = true;
+                }
+                std::printf("    column/T invariance: %s\n", inv == 0 ? "bitwise" : "BROKEN");
+                ok = ok && inv == 0 && st_ok;
+                continue;
+            }
             ok = ok && d == 0 && st_ok;
             if (d != 0 && std::getenv("DEC_DBG")) {
                 Bufs n2 = make_bufs(), r2 = make_bufs();
@@ -413,13 +439,15 @@ int main(int argc, char** argv) {
     CK(cudaGetDeviceProperties(&p, dev));
     if (p.major < 9) { std::printf("dec_gdn_parity: needs sm_90+ (have %d.%d)\n", p.major, p.minor); return 77; }
     setenv("STRATA_GDN_AB_UNROLL", "1", 1);
+    g_quiet = dec_gdn_mode() == 2;
     std::printf("%s: %d SMs, L2 %d MB, smem/block opt-in %zu KB\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 20,
                 p.sharedMemPerBlockOptin >> 10);
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     const std::string mode = argc > 1 ? argv[1] : "";
     const bool ok = mode == "--bench-only" || parity(s);
-    if (mode != "--bench-only") std::printf("dec_gdn_parity: %s\n", ok ? "PASS (bitwise)" : "FAIL");
+    if (mode != "--bench-only")
+        std::printf("dec_gdn_parity: %s\n", !ok ? "FAIL" : g_quiet ? "PASS (relaxed: errors above, column/T invariant)" : "PASS (bitwise)");
     if (mode == "--bench" || mode == "--bench-only") bench(s);
     return ok ? 0 : 1;
 }

@@ -126,7 +126,9 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
 struct XSm {
     const int* qs;
     const float* d;
-    __device__ XSm col(int j, int nb32) const { return XSm{qs + 8 * nb32 * j, d + nb32 * j}; }
+    const int* s;   // the sum of each block's codes (the relaxed K-format dots)
+    __device__ XSm col(int j, int nb32) const { return XSm{qs + 8 * nb32 * j, d + nb32 * j, s + nb32 * j}; }
+    __device__ int isum(int b, int4, int4) const { return s[b]; }
     __device__ int u(int b, int k) const { return qs[8 * b + k]; }
     __device__ int4 u4(int b, int h) const { return reinterpret_cast<const int4*>(qs + 8 * b)[h]; }
     __device__ float d8(int b) const { return d[b]; }
@@ -136,6 +138,7 @@ struct XSmProbe {
     const int* qs;
     const float* d;
     __device__ XSmProbe col(int j, int nb32) const { return XSmProbe{qs + 8 * nb32 * j, d + nb32 * j}; }
+    __device__ int isum(int b, int4, int4) const { return b; }
     __device__ int u(int b, int k) const { return qs[(threadIdx.x & 31) + 32 * (b & 1)]; }
     __device__ int4 u4(int b, int h) const { return reinterpret_cast<const int4*>(qs)[(threadIdx.x & 31) * 2 + h]; }
     __device__ float d8(int b) const { return d[b & 7]; }
@@ -143,6 +146,13 @@ struct XSmProbe {
 struct XGl {
     const Q81Block* x;
     __device__ XGl col(int j, int nb32) const { return XGl{x + nb32 * j}; }
+    __device__ int isum(int, int4 lo, int4 hi) const {
+        int a = STRATA_DP4A(0x01010101, lo.x, STRATA_DP4A(0x01010101, lo.y, 0));
+        int b = STRATA_DP4A(0x01010101, lo.z, STRATA_DP4A(0x01010101, lo.w, 0));
+        a = STRATA_DP4A(0x01010101, hi.x, STRATA_DP4A(0x01010101, hi.y, a));
+        b = STRATA_DP4A(0x01010101, hi.z, STRATA_DP4A(0x01010101, hi.w, b));
+        return a + b;
+    }
     __device__ int u(int b, int k) const { return reinterpret_cast<const int*>(x[b].qs)[k]; }
     __device__ int4 u4(int b, int h) const {
         const int* p = reinterpret_cast<const int*>(x[b].qs) + 4 * h;
@@ -380,18 +390,17 @@ __device__ __forceinline__ void row_dot4(const uint8_t* row, const X& x, int nb3
     const auto* w = reinterpret_cast<const typename F::Block*>(row);
     const int nb = NB > 0 ? NB : nb_rt;
     constexpr int ITERS = NB > 0 ? (NB + F::BPI - 1) / F::BPI : 1;
+    constexpr int RWU = NC >= 6 ? 1 : WARPS;   // wide windows: one chain at a time (registers)
     X xc[NC];
 #pragma unroll
     for (int j = 0; j < NC; ++j) xc[j] = x.col(j, nb32);
-    float c[WARPS][NC];
-#pragma unroll
-    for (int rw = 0; rw < WARPS; ++rw)
-#pragma unroll
-        for (int j = 0; j < NC; ++j) c[rw][j] = 0.0f;
-#pragma unroll
+#pragma unroll RWU
     for (int rw = 0; rw < WARPS; ++rw) {
         const int tid = WARP * rw + lane;
         const int kqs = F::kqs(tid);
+        float c[NC];
+#pragma unroll
+        for (int j = 0; j < NC; ++j) c[j] = 0.0f;
         if constexpr (NB > 0) {
 #pragma unroll
             for (int i = 0; i < ITERS; ++i) {
@@ -399,24 +408,21 @@ __device__ __forceinline__ void row_dot4(const uint8_t* row, const X& x, int nb3
                 if (kbx < nb) {
                     const typename F::W wv = F::load(w + kbx, kqs);
 #pragma unroll
-                    for (int j = 0; j < NC; ++j) c[rw][j] += F::apply(wv, xc[j], kbx * F::KBY, kqs);
+                    for (int j = 0; j < NC; ++j) c[j] += F::apply(wv, xc[j], kbx * F::KBY, kqs);
                 }
             }
         } else {
             for (int kbx = tid / F::T; kbx < nb; kbx += F::BPI) {
                 const typename F::W wv = F::load(w + kbx, kqs);
 #pragma unroll
-                for (int j = 0; j < NC; ++j) c[rw][j] += F::apply(wv, xc[j], kbx * F::KBY, kqs);
+                for (int j = 0; j < NC; ++j) c[j] += F::apply(wv, xc[j], kbx * F::KBY, kqs);
             }
         }
+#pragma unroll
+        for (int j = 0; j < NC; ++j) acc[j] = rw == 0 ? c[j] : acc[j] + c[j];
     }
 #pragma unroll
-    for (int j = 0; j < NC; ++j) {
-        float v = c[0][j];
-#pragma unroll
-        for (int rw = 1; rw < WARPS; ++rw) v = v + c[rw][j];
-        acc[j] = warp_sum(v);
-    }
+    for (int j = 0; j < NC; ++j) acc[j] = warp_sum(acc[j]);
 }
 
 // mmvq_multi_kernel's row_dot_multi for IQ3_S: calls k = lane, lane + 32, ... of 8 per 256-value block.
@@ -462,6 +468,117 @@ __device__ __forceinline__ void row_dot(int type, const uint8_t* row, const X& x
     }
 }
 
+// ---------------------------------------------------------------- relaxed dots (STRATA_DEC_GDN=2)
+// Lane L takes the 32-value blocks b = L, L + 32, ... of the row: one exact integer dot per block (per 16-value
+// scale group for Q6_K), its float term added to the lane's sum in ascending b, then the butterfly.  The terms are
+// the reference's math with fewer roundings; only IQ3_S (whose reference already sums whole blocks in this order) is
+// bitwise.  A column's value does not depend on the other columns.
+__device__ __forceinline__ int dot8(const int (&c)[8], int4 lo, int4 hi) {
+    int a = STRATA_DP4A(c[0], lo.x, STRATA_DP4A(c[1], lo.y, 0));
+    int b = STRATA_DP4A(c[2], lo.z, STRATA_DP4A(c[3], lo.w, 0));
+    a = STRATA_DP4A(c[4], hi.x, STRATA_DP4A(c[5], hi.y, a));
+    b = STRATA_DP4A(c[6], hi.z, STRATA_DP4A(c[7], hi.w, b));
+    return a + b;
+}
+
+// Q4_K / Q5_K sub-block j of a super-block: the 6-bit scale and min (get_scale_min_k4)
+__device__ __forceinline__ void k4_scale_min(const uint8_t* q, int j, int& sc, int& m) {
+    if (j < 4) {
+        sc = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+template<int NC, int NB32, typename X>
+__device__ __forceinline__ void row_relaxed(int type, const uint8_t* row, const X& x, int nb32_rt, int lane,
+                                            float (&acc)[NC]) {
+    const int nb32 = NB32 > 0 ? NB32 : nb32_rt;
+    X xc[NC];
+#pragma unroll
+    for (int j = 0; j < NC; ++j) { xc[j] = x.col(j, nb32); acc[j] = 0.0f; }
+    constexpr int ITERS = NB32 > 0 ? (NB32 + 31) / 32 : 1;
+#pragma unroll
+    for (int it = 0; it < (NB32 > 0 ? ITERS : 1); ++it) {
+        for (int b = lane + 32 * it; b < nb32; b += (NB32 > 0 ? nb32 : 32)) {
+            const int kb = b / 8, j = b % 8;
+            int c[8];
+            if (type == 12 || type == 13) {   // Q4_K / Q5_K: d * sc * q - dmin * m
+                const auto* B = reinterpret_cast<const Q4KBlock*>(row + (size_t) kb * (type == 12 ? 144 : 176));
+                const uint8_t* qs = type == 12 ? B->qs : reinterpret_cast<const Q5KBlock*>(B)->qs;
+                const int* q4 = reinterpret_cast<const int*>(qs + 32 * (j / 2));
+#pragma unroll
+                for (int t = 0; t < 8; ++t) c[t] = (q4[t] >> (4 * (j & 1))) & 0x0f0f0f0f;
+                if (type == 13) {
+                    const int* qh = reinterpret_cast<const int*>(reinterpret_cast<const Q5KBlock*>(B)->qh);
+#pragma unroll
+                    for (int t = 0; t < 8; ++t) c[t] |= ((qh[t] >> j) & 0x01010101) << 4;
+                }
+                int sc, m;
+                k4_scale_min(B->scales, j, sc, m);
+                const float2 dm = __half22float2(B->dm);
+                const float dsc = dm.x * (float) sc, dmm = dm.y * (float) m;
+#pragma unroll
+                for (int q = 0; q < NC; ++q) {
+                    const int4 lo = xc[q].u4(b, 0), hi = xc[q].u4(b, 1);
+                    const int idot = dot8(c, lo, hi);
+                    const int is = xc[q].isum(b, lo, hi);
+                    acc[q] = fmaf(xc[q].d8(b), dsc * (float) idot - dmm * (float) is, acc[q]);
+                }
+            } else if (type == 14) {   // Q6_K: d * sc16 * (q - 32)
+                const auto* B = reinterpret_cast<const Q6KBlock*>(row + (size_t) kb * 210);
+                const int n = j / 4, g = j % 4;
+                const uint8_t* ql = B->ql + 64 * n + 32 * (g & 1);
+                const uint8_t* qh = B->qh + 32 * n;
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const int l = (load_int_b2(ql, t) >> (4 * (g >> 1))) & 0x0f0f0f0f;
+                    const int h = ((load_int_b2(qh, t) >> (2 * g)) & 0x03030303) << 4;
+                    c[t] = __vsub4(l | h, 0x20202020);
+                }
+                const int sc0 = B->scales[8 * n + 2 * g], sc1 = B->scales[8 * n + 2 * g + 1];
+                const float d = __half2float(B->d);
+#pragma unroll
+                for (int q = 0; q < NC; ++q) {
+                    const int4 lo = xc[q].u4(b, 0), hi = xc[q].u4(b, 1);
+                    int a0 = STRATA_DP4A(c[0], lo.x, STRATA_DP4A(c[1], lo.y, 0));
+                    int a1 = STRATA_DP4A(c[2], lo.z, STRATA_DP4A(c[3], lo.w, 0));
+                    int b0 = STRATA_DP4A(c[4], hi.x, STRATA_DP4A(c[5], hi.y, 0));
+                    int b1 = STRATA_DP4A(c[6], hi.z, STRATA_DP4A(c[7], hi.w, 0));
+                    const int isc = sc0 * (a0 + a1) + sc1 * (b0 + b1);
+                    acc[q] = fmaf(xc[q].d8(b) * d, (float) isc, acc[q]);
+                }
+            } else if (type == 23) {   // IQ4_XS: the reference's block term
+                const auto* B = reinterpret_cast<const IQ4XSBlock*>(row + (size_t) kb * 136);
+                const int* q4 = reinterpret_cast<const int*>(B->qs) + 4 * j;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const int2 v = iq4_table_lookup(q4[t]);
+                    c[t] = v.x;
+                    c[t + 4] = v.y;
+                }
+                const int ls = (((B->scales_l[j / 2] >> (4 * (j % 2))) & 0xf) | (((B->scales_h >> (2 * j)) & 3) << 4)) - 32;
+                const float dw = __half2float(B->d);
+#pragma unroll
+                for (int q = 0; q < NC; ++q) {
+                    const int4 lo = xc[q].u4(b, 0), hi = xc[q].u4(b, 1);
+                    const int sumi = dot8(c, lo, hi) * ls;
+                    const float d = dw * xc[q].d8(b);
+                    acc[q] += d * sumi;
+                }
+            } else {   // IQ3_S: the reference's call k = b, in its order
+                const IQ3SF::W w = IQ3SF::load(row, kb, 2 * j);
+#pragma unroll
+                for (int q = 0; q < NC; ++q) acc[q] += IQ3SF::apply(w, xc[q], b);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NC; ++j) acc[j] = warp_sum(acc[j]);
+}
+
 // ---------------------------------------------------------------- bulk copies into shared memory
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
@@ -480,6 +597,11 @@ __device__ __forceinline__ void bulk_load(void* dst, const void* src, uint32_t b
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
                  ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)), "l"(policy) : "memory");
 }
+__device__ __forceinline__ uint64_t evict_last_policy() {
+    uint64_t p;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
+    return p;
+}
 __device__ __forceinline__ uint64_t evict_first_policy() {
     uint64_t p;
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
@@ -488,9 +610,11 @@ __device__ __forceinline__ uint64_t evict_first_policy() {
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 
 // ---------------------------------------------------------------- the dense kernel
+// A persistent block per SM of NW warps.  Warp gw of NWT owns rows gw, gw + NWT, ... of the concatenated matrices and
+// streams them through its own ring of nslot shared-memory slots: one bulk copy per row, issued nslot rows ahead
+// (the first ones before the grid dependency wait: weights are constant).
 constexpr int kMaxMats = 3;
-constexpr int kNW = 16;            // warps per block
-constexpr int kMaxSlots = 4;
+constexpr int kSlotsPerWarp = 8;
 
 struct DenseArgs {
     int type[kMaxMats];
@@ -499,103 +623,125 @@ struct DenseArgs {
     int row_bytes[kMaxMats];
     float* y[kMaxMats];
     int n_mats, rows, n_in;
-    const float* x;          // fp32 columns to quantize in shared memory, or
+    const float* x;          // fp32 columns to quantize (by quant_x_kernel into xprep), or
+    const uint8_t* xprep;    // their quant_x_kernel layout, copied into shared memory, or
     const Q81Block* xq;      // q8_1 columns in global memory
-    int nslot, slot_bytes;   // the per-warp ring
-    int probe;               // 1: stream the rows only (bench)
+    int nslot, slot_bytes;   // the ring
+    int probe;               // bench: 1 stream the rows only, 3 compute only, 4 neither
+    int relaxed;             // the relaxed dots
 };
 
-__device__ __forceinline__ void issue_row(const DenseArgs& a, int g, void* slot, uint64_t* bar, uint64_t policy) {
-    int m = 0;
+__device__ __forceinline__ void row_of(const DenseArgs& a, int g, int& m, int& r) {
+    m = 0;
     while (m + 1 < a.n_mats && g >= a.n_out[m]) g -= a.n_out[m++];
-    const uintptr_t src = (uintptr_t) (a.w[m] + (size_t) g * a.row_bytes[m]);
-    const uintptr_t a0 = src & ~(uintptr_t) 15;
-    const uint32_t bytes = (uint32_t) (((src - a0) + a.row_bytes[m] + 15) & ~(uintptr_t) 15);
-    bulk_load(slot, (const void*) a0, bytes, bar, policy);
+    r = g;
 }
 
-// The block's part of the projections: warp `warp` of block `blk` of `nblk`.  `smem` holds the barriers, the
-// quantized columns (with a.x) and the slots.
-template<int NC, int NB, bool SMX>
+__device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(bar)) : "memory");
+}
+
+// The q8_1 of the in-projection's columns, once: codes | fp16 scales as floats | code sums (the layout dense_block
+// copies into shared memory).  native_quantize_q8_1_kernel's codes and scale (the warp max as an integer max of the
+// magnitudes' bits: the same value).  `n` = columns x n_in, a multiple of 32.
+__device__ __forceinline__ void quant_x_block(const float* __restrict__ x, int n, uint8_t* __restrict__ out, int blk,
+                                              int nthreads) {
+    const int i = blk * nthreads + (int) threadIdx.x;
+    if (i >= n) return;   // whole warps
+    int8_t* qs = reinterpret_cast<int8_t*>(out);
+    float* d_out = reinterpret_cast<float*>(out + n);
+    int* s_out = reinterpret_cast<int*>(d_out + n / Q8K);
+    const float xi = x[i];
+    const float amax = __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(fabsf(xi))));
+    const float d = q8_1_finite(amax / 127.0f);
+    const int8_t q = q8_1_quant(xi, d, amax);
+    qs[i] = q;
+    const int qsum = __reduce_add_sync(0xffffffffu, (int) q);
+    if (i % Q8K == 0) {
+        d_out[i / Q8K] = __half2float(__float2half(q8_1_finite(d)));
+        s_out[i / Q8K] = qsum;
+    }
+}
+
+__global__ void __launch_bounds__(256) quant_x_kernel(const float* __restrict__ x, int n, uint8_t* __restrict__ out) {
+    pdl_trigger();
+    pdl_wait();
+    quant_x_block(x, n, out, blockIdx.x, blockDim.x);
+}
+
+template<int NC, int NB, bool SMX, int NW>
 __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nblk, uint8_t* smem) {
     const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const int nb32 = a.n_in / Q8K;
-    uint64_t* bars = reinterpret_cast<uint64_t*>(smem) + warp * kMaxSlots;
-    int8_t* xs_q = reinterpret_cast<int8_t*>(smem + kNW * kMaxSlots * 8);   // the columns' codes, then their scales
+    uint64_t* bars = reinterpret_cast<uint64_t*>(smem) + warp * kSlotsPerWarp;
+    int8_t* xs_q = reinterpret_cast<int8_t*>(smem + NW * kSlotsPerWarp * 8);   // the columns' codes, scales, sums
     float* xs_d = reinterpret_cast<float*>(xs_q + NC * a.n_in);
-    const int x_bytes = SMX ? (NC * nb32 * (int) sizeof(Q81Block) + 15) & ~15 : 0;
-    uint8_t* slots = smem + kNW * kMaxSlots * 8 + x_bytes + warp * a.nslot * a.slot_bytes;
-    const int gw = blk * kNW + warp, nwt = nblk * kNW;
-    const int nrows = a.rows > gw ? (a.rows - gw + nwt - 1) / nwt : 0;
+    int* xs_s = reinterpret_cast<int*>(xs_d + NC * nb32);
+    const int x_bytes = SMX ? NC * nb32 * ((int) sizeof(Q81Block) + 4) : 0;
+    uint8_t* slots = smem + NW * kSlotsPerWarp * 8 + x_bytes + (size_t) warp * a.nslot * a.slot_bytes;
+    const int gw = blk * NW + warp, nwt = nblk * NW;
+    const int nrows = a.probe == 4 ? 0 : a.rows > gw ? (a.rows - gw + nwt - 1) / nwt : 0;
     const uint64_t policy = evict_first_policy();
+    auto issue = [&](int k) {
+        int m, r;
+        row_of(a, gw + k * nwt, m, r);
+        const uintptr_t src = (uintptr_t) (a.w[m] + (size_t) r * a.row_bytes[m]);
+        const uintptr_t a0 = src & ~(uintptr_t) 15;
+        const uint32_t bytes = (uint32_t) (((src - a0) + a.row_bytes[m] + 15) & ~(uintptr_t) 15);
+        const int s = k % a.nslot;
+        bulk_load(slots + (size_t) s * a.slot_bytes, (const void*) a0, bytes, bars + s, policy);
+    };
+    uint64_t* xbar = reinterpret_cast<uint64_t*>(smem) + NW * kSlotsPerWarp - 1;   // the last warp's spare slot barrier
     if (lane == 0) {
         for (int s = 0; s < a.nslot; ++s) mbar_init(bars + s, 1);
+        if (SMX && warp == 0) mbar_init(xbar, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         if (a.probe != 3)
-            for (int k = 0; k < a.nslot && k < nrows; ++k) issue_row(a, gw + k * nwt, slots + k * a.slot_bytes, bars + k, policy);
+            for (int k = 0; k < a.nslot && k < nrows; ++k) issue(k);
     }
+    if constexpr (SMX) __syncthreads();   // xbar initialized
     pdl_trigger();
     pdl_wait();
-    if constexpr (SMX) {   // native_quantize_q8_1_kernel, element by element; the loads first, all in flight at once
-        constexpr int U = 8;
-        const int total = NC * a.n_in;
-        for (int i0 = threadIdx.x; i0 < total; i0 += U * (int) blockDim.x) {
-            float v[U];
-#pragma unroll
-            for (int u = 0; u < U; ++u) {
-                const int i = i0 + u * (int) blockDim.x;
-                v[u] = i < total ? a.x[i] : 0.0f;
-            }
-#pragma unroll
-            for (int u = 0; u < U; ++u) {
-                const int i = i0 + u * (int) blockDim.x;
-                if (i >= total) break;   // warp-uniform: total is a multiple of 32
-                const float xi = v[u];
-                const float amax = warp_max(fabsf(xi));
-                const float sum = warp_sum(xi);
-                const float d = q8_1_finite(amax / 127.0f);
-                const int8_t q = q8_1_quant(xi, d, amax);
-                xs_q[i] = q;
-                if (i % Q8K == 0) xs_d[i / Q8K] = __low2float(q8_1_ds(d, sum));
-            }
-        }
-        __syncthreads();
+    if constexpr (SMX) {   // the quantized columns, prepared by quant_x_kernel
+        if (threadIdx.x == 0) bulk_load(xs_q, a.xprep, (uint32_t) x_bytes, xbar, evict_last_policy());
+        mbar_wait(xbar, 0);
     }
+    __syncwarp();
     const auto x = [&] {
-        if constexpr (SMX) return XSm{reinterpret_cast<const int*>(xs_q), xs_d};
+        if constexpr (SMX) return XSm{reinterpret_cast<const int*>(xs_q), xs_d, xs_s};
         else return XGl{a.xq};
     }();
-    __syncwarp();
     for (int k = 0; k < nrows; ++k) {
         const int s = k % a.nslot;
         if (a.probe != 3) mbar_wait(bars + s, (uint32_t) (k / a.nslot) & 1u);
-        int g = gw + k * nwt, m = 0;
-        while (m + 1 < a.n_mats && g >= a.n_out[m]) g -= a.n_out[m++];
-        const uintptr_t src = (uintptr_t) (a.w[m] + (size_t) g * a.row_bytes[m]);
-        const uint8_t* row = slots + s * a.slot_bytes + (src & 15);
+        int m, r;
+        row_of(a, gw + k * nwt, m, r);
+        const uintptr_t src = (uintptr_t) (a.w[m] + (size_t) r * a.row_bytes[m]);
+        const uint8_t* row = slots + (size_t) s * a.slot_bytes + (src & 15);
         float acc[NC];
         if (a.probe == 1) {
 #pragma unroll
             for (int j = 0; j < NC; ++j) acc[j] = (float) row[lane];
-        } else if (SMX && a.probe == 2) {
-            row_dot<NC, NB>(a.type[m], row, XSmProbe{reinterpret_cast<const int*>(xs_q), xs_d}, nb32, a.n_in / QK, lane, acc);
-        } else
-        row_dot<NC, NB>(a.type[m], row, x, nb32, a.n_in / QK, lane, acc);
-#pragma unroll
-        for (int j = 0; j < NC; ++j)
-            if (lane == j) a.y[m][(size_t) j * a.n_out[m] + g] = acc[j];
+        } else if (a.relaxed) {
+            row_relaxed<NC, NB * 8>(a.type[m], row, x, nb32, lane, acc);
+        } else {
+            row_dot<NC, NB>(a.type[m], row, x, nb32, a.n_in / QK, lane, acc);
+        }
         __syncwarp();
         if (lane == 0 && k + a.nslot < nrows && a.probe != 3) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            issue_row(a, gw + (k + a.nslot) * nwt, slots + s * a.slot_bytes, bars + s, policy);
+            issue(k + a.nslot);
         }
+#pragma unroll
+        for (int j = 0; j < NC; ++j)
+            if (lane == j) a.y[m][(size_t) j * a.n_out[m] + r] = acc[j];
     }
 }
 
-template<int NC, int NB, bool SMX>
-__global__ void __launch_bounds__(kNW * WARP, 1) dense_kernel(const DenseArgs a) {
+template<int NC, int NB, bool SMX, int NW>
+__global__ void __launch_bounds__(NW * WARP, 1) dense_kernel(const DenseArgs a) {
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_block<NC, NB, SMX>(a, blockIdx.x, gridDim.x, smem);
+    dense_block<NC, NB, SMX, NW>(a, blockIdx.x, gridDim.x, smem);
 }
 
 int row_bytes_of(int type, int n_in) {
@@ -619,6 +765,9 @@ int sm_count() {
     return n;
 }
 
+// shared memory the dense kernel leaves free for the next kernel's blocks (STRATA_DEC_GDN_RESERVE, bytes)
+const int g_reserve = [] { const char* v = std::getenv("STRATA_DEC_GDN_RESERVE"); return v ? std::atoi(v) : 0; }();
+
 int smem_optin() {
     static const int n = [] {
         int dev = 0, v = 0;
@@ -631,22 +780,23 @@ int smem_optin() {
 
 template<int NC, int NB, bool SMX>
 void launch_nb(DenseArgs a, cudaStream_t s) {
-    const int x_bytes = a.x ? (NC * (a.n_in / Q8K) * (int) sizeof(Q81Block) + 15) & ~15 : 0;
-    const int fixed = kNW * kMaxSlots * 8 + x_bytes;
-    const int budget = smem_optin() - 1024;
-    a.nslot = (budget - fixed) / (kNW * a.slot_bytes);
-    if (a.nslot > kMaxSlots) a.nslot = kMaxSlots;
+    constexpr int NW = NC <= 3 ? 16 : 8;
+    const int x_bytes = a.x ? NC * (a.n_in / Q8K) * ((int) sizeof(Q81Block) + 4) : 0;
+    const int fixed = NW * kSlotsPerWarp * 8 + x_bytes;
+    const int budget = smem_optin() - 1024 - g_reserve;
+    a.nslot = (budget - fixed) / (NW * a.slot_bytes);
+    if (a.nslot > kSlotsPerWarp - 1) a.nslot = kSlotsPerWarp - 1;   // the last barrier of the block is the x copy's
     if (a.nslot < 1) { std::fprintf(stderr, "dec_gdn: rows too wide for shared memory\n"); std::exit(1); }
-    const int smem = fixed + kNW * a.nslot * a.slot_bytes;
+    const int smem = fixed + NW * a.nslot * a.slot_bytes;
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(dense_kernel<NC, NB, SMX>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_optin());
+        cudaFuncSetAttribute(dense_kernel<NC, NB, SMX, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_optin());
         attr = true;
     }
     int blocks = sm_count();
-    const int need = (a.rows + kNW - 1) / kNW;
+    const int need = (a.rows + NW - 1) / NW;
     if (need < blocks) blocks = need;
-    launch_pdl(dense_kernel<NC, NB, SMX>, dim3((unsigned) blocks), dim3(kNW * WARP), (size_t) smem, s, a);
+    launch_pdl(dense_kernel<NC, NB, SMX, NW>, dim3((unsigned) blocks), dim3(NW * WARP), (size_t) smem, s, a);
 }
 
 // the block counts of the GDN projections' rows unrolled, any other one looped
@@ -703,6 +853,7 @@ DenseArgs make_args(const DecMat* m, int n_mats, int n_in) {
     a.slot_bytes = (widest + 15 + 15) & ~15;
     static const int probe = [] { const char* v = std::getenv("STRATA_DEC_GDN_PROBE"); return v ? std::atoi(v) : 0; }();
     a.probe = probe;
+    a.relaxed = dec_gdn_mode() == 2;
     return a;
 }
 
@@ -712,9 +863,14 @@ bool dec_dense_supported(int t, int n_in) noexcept {
     return n_in % 256 == 0 && (t == 12 || t == 13 || t == 14 || t == 21 || t == 23);
 }
 
-void dec_gdn_inproj(const float* x, int n_in, int n_tok, const DecMat* m, int n_mats, void* stream) {
+void dec_gdn_inproj(const float* x, int n_in, int n_tok, const DecMat* m, int n_mats, void* scratch, void* stream) {
     DenseArgs a = make_args(m, n_mats, n_in);
+    if (((uintptr_t) scratch & 15) != 0) { std::fprintf(stderr, "dec_gdn_inproj: scratch must be 16-byte aligned\n"); std::exit(1); }
     a.x = x;
+    a.xprep = (const uint8_t*) scratch;
+    const int n = n_tok * n_in;
+    launch_pdl(quant_x_kernel, dim3((unsigned) ((n + 255) / 256)), dim3(256), 0, (cudaStream_t) stream, x, n,
+               (uint8_t*) scratch);
     launch(a, n_tok, (cudaStream_t) stream);
 }
 
@@ -724,12 +880,14 @@ void dec_dense(const void* xq, int n_in, int n_tok, const DecMat& m, void* strea
     launch(a, n_tok, (cudaStream_t) stream);
 }
 
-bool dec_gdn_enabled() {
-    static const bool on = [] {
+int dec_gdn_mode() {
+    static const int m = [] {
         const char* v = std::getenv("STRATA_DEC_GDN");
-        return v != nullptr && std::atoi(v) != 0;
+        return v != nullptr ? std::atoi(v) : 0;
     }();
-    return on;
+    return m;
 }
+
+bool dec_gdn_enabled() { return dec_gdn_mode() != 0; }
 
 }  // namespace strata::kernels
