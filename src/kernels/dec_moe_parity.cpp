@@ -630,6 +630,40 @@ int main(int argc, char** argv) {
             char what[64];
             std::snprintf(what, sizeof what, "route T=%d (%d cpu, %d peer)", T, nc, np);
             report(what, l, bad, (size_t) n);
+            {   // the split route (mode 1 then mode 2) leaves every byte the one launch left
+                const std::vector<uint8_t> ring0((const uint8_t*) (h_rings + 5), (const uint8_t*) (h_rings + 6));
+                const std::vector<uint8_t> xm0((const uint8_t*) (h_x + (size_t) 5 * MT * H),
+                                               (const uint8_t*) (h_x + (size_t) 5 * MT * H + (size_t) T * H));
+                const std::vector<uint8_t> xqm0(h_xq + 5 * xq_stride, h_xq + 5 * xq_stride + q1.size());
+                const uint32_t w0 = h_words[0], w16 = h_words[16];
+                std::memset(h_rings + 5, 0, sizeof(K::DmRing));
+                std::memset(h_x + (size_t) 5 * MT * H, 0, (size_t) T * H * 4);
+                std::memset(h_xq + 5 * xq_stride, 0, q1.size());
+                h_words[0] = h_words[16] = 0;
+                ck(cudaMemset(d_plan, 0xee, sizeof(K::DmPlan)), "memset");
+                ck(cudaMemset(d_xq2, 0xee, q1.size()), "memset");
+                void* d_pub = dmal<uint8_t>(xq_stride);
+                K::DmRouteArgs r1 = ra, r2 = ra;
+                r1.mode = 1; r2.mode = 2; r2.xq_pub = d_pub;
+                K::dec_moe_route(r1, s0);
+                K::dec_moe_route(r2, s0);
+                ck(cudaStreamSynchronize(s0), "split route");
+                K::DmPlan P2;
+                ck(cudaMemcpy(&P2, d_plan, sizeof P2, cudaMemcpyDeviceToHost), "plan");
+                const auto q3 = down((const uint8_t*) d_xq2, q1.size());
+                size_t bad2 = std::memcmp(P.counts, P2.counts, sizeof P.counts) != 0;
+                for (int g = 0; g <= P.counts[0]; ++g) bad2 += P.start[g] != P2.start[g] || (g < P.counts[0] && P.ptr[g] != P2.ptr[g]);
+                for (int e = 0; e < P.counts[1]; ++e) bad2 += P.dst[e] != P2.dst[e] || P.tok[e] != P2.tok[e];
+                for (int i = 0; i < n; ++i) bad2 += P.kind[i] != P2.kind[i];
+                bad2 += std::memcmp(q3.data(), q2.data(), q2.size()) != 0;
+                bad2 += std::memcmp(ring0.data(), h_rings + 5, ring0.size()) != 0;
+                if (nc > 0) bad2 += std::memcmp(xm0.data(), h_x + (size_t) 5 * MT * H, xm0.size()) != 0;
+                if (np > 0) bad2 += std::memcmp(xqm0.data(), h_xq + 5 * xq_stride, xqm0.size()) != 0;
+                bad2 += h_words[0] != w0 || h_words[16] != w16;
+                cudaFree(d_pub);
+                std::snprintf(what, sizeof what, "split route T=%d", T);
+                report(what, l, bad2, (size_t) 6);
+            }
 
             // tail: new = grouped into parts by the device plan, then dec_moe_combine reading the tiers' rows
             ck(cudaMemsetAsync(d_parts, 0xff, (size_t) K::kDmCap * H * 4, s0), "memset");

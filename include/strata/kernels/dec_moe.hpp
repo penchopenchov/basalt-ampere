@@ -57,6 +57,10 @@ struct DmRouteArgs {
     uint32_t ring = 0;
     unsigned int* ctr = nullptr;     ///< device: arrival counter, monotonic across launches
     unsigned int ctr_base = 0;       ///< arrivals before this launch (ring - 1) * blocks
+    /// 0: all of the below; 1: only CUDA0's plan and the device q8_1 rows (no mapped writes, no doorbells); 2: only
+    /// the ring (header, mapped rows through `xq_pub`, doorbells), e.g. on a side stream beside a mode-1 launch
+    int mode = 0;
+    void* xq_pub = nullptr;          ///< device scratch like xq (mode 2)
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);

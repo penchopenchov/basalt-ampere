@@ -73,6 +73,7 @@ struct DecMoe {
     unsigned long long* slot_off = nullptr;  ///< CUDA0's per-slot offsets (null: slot * blob)
     int vram = -1;                           ///< STRATA_DEC_MOE_VRAM: the VRAM share's kernels (dec_moe_vram's kind; -1 grouped)
     void* vscr = nullptr;                    ///< its gate/up rows
+    void* xq_pub = nullptr;                  ///< STRATA_DEC_PK & 4: the side stream's q8_1 rows for the ring
     unsigned int* vsync = nullptr;           ///< its counters
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
@@ -127,7 +128,9 @@ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // greatest stream priority (their blocks are scheduled ahead of the routed experts' queued blocks, so the branch ends
 // beside them, not after); 2 = in windows of 1-2 tokens, a GDN layer's z projection forked at that priority before
 // the qkv projection (both stream together), joined before the one-launch recurrence with the gated norm
-// (STRATA_DEC_GDNF=1's kernel), no separate norm launch.  Wider windows run slower with either.
+// (STRATA_DEC_GDNF=1's kernel), no separate norm launch.  Wider windows run slower with either.  4 = with 1, the MoE
+// route split: CUDA0's plan and q8_1 rows on the main stream (the routed experts follow it at once), the ring for the
+// peer card and the CPU pool (mapped rows, system fences, doorbells) on a stream of its own at that priority.
 int dec_pk_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_PK"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -417,7 +420,8 @@ bool Verifier::dm_init(std::string& err) {
               mapped((size_t) (T * K * N) * 4, (void**) &d->h_rows, (void**) &d->m_rows) &&
               cudaMalloc(&d->vscr, dec_moe_vram_scratch_bytes((int) lay.fmt[0].n_ff)) == cudaSuccess &&
               cudaMalloc((void**) &d->vsync, (kDmCap + 1) * 4) == cudaSuccess &&
-              cudaMemset(d->vsync, 0, (kDmCap + 1) * 4) == cudaSuccess;
+              cudaMemset(d->vsync, 0, (kDmCap + 1) * 4) == cudaSuccess &&
+              cudaMalloc(&d->xq_pub, d->xq_stride) == cudaSuccess;
     {
         const char* v = std::getenv("STRATA_DEC_MOE_VRAM");
         d->vram = v != nullptr ? std::atoi(v) : -1;
@@ -502,7 +506,7 @@ void Verifier::dm_free() {
             if (p) cudaFree(p);
     }
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
-                    (void*) d->vsync})
+                    (void*) d->vsync, d->xq_pub})
         if (p) cudaFree(p);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
         if (h) cudaFreeHost(h);
@@ -520,6 +524,7 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (sh_hi_) cudaStreamSynchronize(sh_hi_);
+    if (ring_hi_) cudaStreamSynchronize(ring_hi_);
     dm_free();
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
@@ -533,6 +538,9 @@ Verifier::~Verifier() {
     if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
+    if (ring_hi_) cudaStreamDestroy(ring_hi_);
+    if (ev_ring_) cudaEventDestroy(ev_ring_);
+    if (ev_ring_join_) cudaEventDestroy(ev_ring_join_);
     if (shx_sync_) cudaFree(shx_sync_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
@@ -754,7 +762,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (dec_pk()) {
         int least = 0, greatest = 0;
         if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
-            cudaStreamCreateWithPriority(&sh_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess) {
+            cudaStreamCreateWithPriority(&sh_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+            ((dec_pk_mask() & 4) &&
+             (cudaStreamCreateWithPriority(&ring_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+              cudaEventCreateWithFlags(&ev_ring_, cudaEventDisableTiming) != cudaSuccess ||
+              cudaEventCreateWithFlags(&ev_ring_join_, cudaEventDisableTiming) != cudaSuccess))) {
             err = "verify: STRATA_DEC_PK stream create failed";
             return false;
         }
@@ -919,6 +931,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
+    bool ring_fork[2] = {false, false};   // STRATA_DEC_PK & 4: the group's ring stream is joined in post
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
@@ -1407,6 +1420,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool sh_fork = !shx && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
         cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) && n >= 2 ? sh_hi_ : sh_cs_) : cs;
+        // STRATA_DEC_PK & 4: the ring on its own stream, forked after the router, joined where the side branch is
+        const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && ring_hi_ != nullptr;
+        ring_fork[grp] = pk_ring;
         if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
@@ -1450,6 +1466,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.host_seq_m = m_seq_; ra.peer_seq_m = dm_->m_w;
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
+            if (pk_ring) {   // the ring beside, CUDA0's plan and rows here
+                cudaEventRecord(ev_ring_, cs);
+                cudaStreamWaitEvent(ring_hi_, ev_ring_, 0);
+                DmRouteArgs rp = ra;
+                rp.mode = 2; rp.xq_pub = dm_->xq_pub;
+                {
+                    PdlScope pp(false);
+                    dec_moe_route(rp, ring_hi_);
+                }
+                cudaEventRecord(ev_ring_join_, ring_hi_);
+                ra.mode = 1;
+            }
             dec_moe_route(ra, cs);
         } else if (all_resident_) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
@@ -1625,6 +1653,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (!shx && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
+            if (ring_fork[grp]) cudaStreamWaitEvent(cs, ev_ring_join_, 0);   // the ring's launch
         }
         if (dm) {
             dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs);

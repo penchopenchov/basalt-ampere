@@ -51,7 +51,7 @@ __device__ __forceinline__ void dm_group(const int32_t* s_ids, const int32_t* s_
 
 // Block 0 plans CUDA0's groups and publishes the ring's header; the other blocks quantize the FFN input (256 values
 // each) into the device q8_1 rows and, for the tiers that need them, into mapped memory.  The last block to finish
-// rings both doorbells.
+// rings both doorbells.  Mode 1 keeps only the plan and the device rows, mode 2 only the ring (DmRouteArgs::mode).
 __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap];
@@ -77,7 +77,23 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         else if (kd == 2) atomicAdd(&s_npeer, 1);
     }
     __syncthreads();
-    if (blockIdx.x == 0) {
+    const bool plan = a.mode != 2, pub = a.mode != 1;
+    if (blockIdx.x == 0 && !plan) {   // the ring's header only
+        if (tid < n) {
+            a.ring_m->ids[tid] = s_ids[tid];
+            a.ring_m->kind[tid] = s_kind[tid];
+        }
+        if (tid == 0) {
+            int ne = 0;
+            for (int j = 0; j < n; ++j) ne += s_kind[j] == 0;
+            DmRing* r = a.ring_m;
+            r->n_tok = a.n_tok;
+            r->layer = a.layer;
+            r->n_vram = ne;
+            r->n_peer = s_npeer;
+            r->n_cpu = s_ncpu;
+        }
+    } else if (blockIdx.x == 0) {
         DmPlan* p = a.plan;
         dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, p->start, &s_ng, &s_ne);
         if (tid < n) {
@@ -92,14 +108,18 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
                                                                                               : (size_t) slot * (size_t) a.blob));
                 }
             }
-            a.ring_m->ids[tid] = s_ids[tid];
-            a.ring_m->kind[tid] = kd;
+            if (pub) {
+                a.ring_m->ids[tid] = s_ids[tid];
+                a.ring_m->kind[tid] = kd;
+            }
         }
         if (tid == 0) {
             p->counts[0] = s_ng;
             p->counts[1] = s_ne;
             p->counts[2] = s_npeer;
             p->counts[3] = s_ncpu;
+        }
+        if (tid == 0 && pub) {
             DmRing* r = a.ring_m;
             r->n_tok = a.n_tok;
             r->layer = a.layer;
@@ -110,22 +130,24 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     } else {
         const long long i = (long long) (blockIdx.x - 1) * kDmThreads + tid;
         const long long nv = (long long) a.n_tok * a.n_embd;
+        void* xq = plan ? a.xq : a.xq_pub;
         if (i < nv) {   // n_embd is a multiple of 256: whole warps
             const float xi = a.x[i];
-            q8_1_store(xi, (block_q8_1*) a.xq, i);
-            if (s_ncpu > 0) a.x_m[i] = xi;
+            if (plan || s_npeer > 0) q8_1_store(xi, (block_q8_1*) xq, i);
+            if (pub && s_ncpu > 0) a.x_m[i] = xi;
         }
-        if (s_npeer > 0) {
+        if (pub && s_npeer > 0) {
             __syncthreads();
             // this block's 8 q8_1 blocks (288 bytes) to mapped memory, 16 bytes per thread
             const long long b0 = (long long) (blockIdx.x - 1) * (kDmThreads / 32);
             if (b0 * 32 < nv && tid < 18) {
-                const uint4* src = (const uint4*) ((const block_q8_1*) a.xq + b0);
+                const uint4* src = (const uint4*) ((const block_q8_1*) xq + b0);
                 uint4* dst = (uint4*) ((block_q8_1*) a.xq_m + b0);
                 dst[tid] = src[tid];
             }
         }
     }
+    if (!pub) return;
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
