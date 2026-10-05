@@ -1098,7 +1098,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
     if (ok) ok = cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
     if (ok) {
         const bool rec = record_round(T, coupled, true, err) &&
-                         mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env());
+                         mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env(), m_prob_, 0);
         cudaGraph_t g0 = nullptr;
         const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
         ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
@@ -1122,7 +1122,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
              cudaSuccess;
         if (!ok) break;
         bool rec = record_step(j, coupled, false, err);
-        if (rec && j + 1 < steps) rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env());
+        if (rec && j + 1 < steps) rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env(), m_prob_, j);
         cudaGraph_t captured = nullptr;   // the body itself, owned by the node
         ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
         prev = node;
