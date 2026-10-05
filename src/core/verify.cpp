@@ -2237,8 +2237,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-    if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == 200)) {
-        // STRATA_DM_WAIT_STATS: the last 200 windows' counters
+    static const int64_t wstat_every = [] {   // STRATA_DM_WAIT_EVERY: windows per report (default 200)
+        const char* v = std::getenv("STRATA_DM_WAIT_EVERY");
+        return v && std::atoi(v) > 0 ? (int64_t) std::atoi(v) : (int64_t) 200;
+    }();
+    if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {
+        // STRATA_DM_WAIT_STATS: the last wstat_every windows' counters
         std::vector<unsigned long long> w((size_t) kDmStatWords);
         cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
         cudaMemset(dm_->wstat, 0, w.size() * 8);

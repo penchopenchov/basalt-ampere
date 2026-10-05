@@ -527,6 +527,7 @@ void FileExpertSource::close() {
     override_.clear();
     staged_.clear();
     exchanges_ = 0;
+    spare_free_.clear();
     file_reads_.store(0);
     complement_arena_ = nullptr;
     complement_host_ = nullptr;
@@ -1494,6 +1495,13 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
 
+    // STRATA_ADAPT_FAST: the free places after the experts (see set_spares)
+    const uint64_t spare_at = bytes;
+    uint64_t spare_blob = 0;
+    for (const uint64_t b : layer_blob_bytes_) spare_blob = std::max(spare_blob, b);
+    const int64_t spares = bytes > 0 && spare_blob > 0 ? std::max<int64_t>(spares_want_, 0) : 0;
+    bytes += (uint64_t) spares * spare_blob;
+
     void* arena = nullptr;
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
@@ -1735,6 +1743,8 @@ bool FileExpertSource::pin_cache_complement(
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    spare_free_.clear();
+    for (int64_t i = 0; i < spares; ++i) spare_free_.emplace_back(spare_at + (uint64_t) i * spare_blob, spare_blob);
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
@@ -1787,6 +1797,44 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     xstage_cap_ = n;
     xstage_blob_ = blob;
     return true;
+}
+
+uint8_t* FileExpertSource::spare_take(int64_t layer, uint64_t& off) {
+    if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || layer >= n_layers_) return nullptr;
+    const uint64_t need = layer_blob_bytes_[(size_t) layer];
+    size_t pick = spare_free_.size();
+    for (size_t i = spare_free_.size(); i-- > 0;) {   // an exact fit first, else any place that is large enough
+        if (spare_free_[i].second == need) { pick = i; break; }
+        if (spare_free_[i].second > need && pick == spare_free_.size()) pick = i;
+    }
+    if (pick == spare_free_.size()) return nullptr;
+    off = spare_free_[pick].first;
+    spare_free_[pick] = spare_free_.back();
+    spare_free_.pop_back();
+    return (uint8_t*) complement_host_ + (size_t) off;
+}
+
+bool FileExpertSource::spare_land(int64_t layer, int64_t out, uint64_t off) {
+    if (!complement_ready_ || layer < 0 || out < 0 || layer >= n_layers_ || out >= n_expert_) return false;
+    const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+    if (i >= complement_offsets_.size() || complement_offsets_[i] != kNoComplement ||
+        off + layer_blob_bytes_[(size_t) layer] > complement_bytes_) return false;
+    complement_offsets_[i] = off;
+    ++exchanges_;
+    return true;
+}
+
+bool FileExpertSource::spare_release(int64_t layer, int64_t in) {
+    if (!complement_ready_ || layer < 0 || in < 0 || layer >= n_layers_ || in >= n_expert_) return false;
+    const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) in;
+    if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement) return false;
+    spare_free_.emplace_back(complement_offsets_[i], layer_blob_bytes_[(size_t) layer]);
+    complement_offsets_[i] = kNoComplement;
+    return true;
+}
+
+void FileExpertSource::spare_return(int64_t layer, uint64_t off) {
+    if (layer >= 0 && layer < n_layers_) spare_free_.emplace_back(off, layer_blob_bytes_[(size_t) layer]);
 }
 
 uint8_t* FileExpertSource::exchange_buffer(int64_t q) const {
