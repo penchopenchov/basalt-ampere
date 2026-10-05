@@ -7396,6 +7396,15 @@ int main(int argc, char** argv) {
             std::thread& apply_thr = apply_j.t;
             bool copy_live = false, copy_done = false;   // exchanges applied early whose RAM copies are under way
             if (cancelled) finish = "cancel";
+            // STRATA_DRAFT_LOG=<file>: one line per window (T, accepted, draft probabilities, ms) for draft-policy study
+            static FILE* const draft_log = [] {
+                const char* e = std::getenv("STRATA_DRAFT_LOG");
+                return e != nullptr ? std::fopen(e, "a") : nullptr;
+            }();
+            if (draft_log != nullptr) {
+                std::fprintf(draft_log, "R temp=%g min_p=%g S=%d\n", (double) req_temperature, req_spec_min_p, S_mtp);
+                std::fflush(draft_log);
+            }
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
@@ -7519,6 +7528,10 @@ int main(int argc, char** argv) {
                                   std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                     }
                     const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
+                    float wprob[16];
+                    const int wprob_n = std::min(S_mtp, 16);
+                    if (draft_log != nullptr)
+                        for (int i = 0; i < wprob_n; ++i) wprob[i] = first_window || from_sfx ? -1.0f : dprob[(size_t) i];
                     if (!ver.commit(a + 1, err, 2)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
@@ -7575,6 +7588,12 @@ int main(int argc, char** argv) {
                         auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                         dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                         ++dec_windows; dec_T += T;
+                        if (draft_log != nullptr) {
+                            std::fprintf(draft_log, "W %d %d %d %.3f %.3f %.3f", T, a, from_sfx ? 1 : 0, msd(round0, tw0),
+                                         msd(tw0, tw1), msd(tw1, tw3));
+                            for (int i = 0; i < wprob_n; ++i) std::fprintf(draft_log, " %.4f", wprob[i]);
+                            std::fputc('\n', draft_log);
+                        }
                     }
                     if (adapt_thr.joinable()) adapt_thr.join();
                     strata::core::decode_gaps().mark(16);
