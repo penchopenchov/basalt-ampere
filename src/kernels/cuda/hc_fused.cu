@@ -61,7 +61,8 @@ struct HcLaunch {
     int nb;          // CTAs (one per SM)
     int slot;        // counter set
     int nu;          // split-K kernel: up slices (even)
-    int pf;          // split-K kernel: 1 = the down CTAs prefetch w_up and w_router into L2 after their weights
+    int pf;          // 1 = the down CTAs prefetch the router rows (split-K: and w_up) into L2 after their weights
+    int ups;         // 1 = the up rows' second chunks spread over the warp
     float* xc;       // the copies of xn, [NCOPY][MAXT][D]
     unsigned long long* dbg;   // bench only: per-CTA phase times [nb][16]
 };
@@ -579,12 +580,12 @@ __device__ __forceinline__ float warp_sum16(float (&v)[16], int lane) {
 // Tokens [p0, p0 + P) of the up rows: a warp takes G = 16 / P rows at a time, each lane forms the G x P per-lane sums
 // of gr_up_multi_kernel (dot8 of its chunk, plus the second chunk on lanes 0-7), warp_sum16 reduces all of them, and
 // lane 2m runs the epilogue of value m.
-template <int P>
+template <int P, bool SPREAD = false>
 __device__ __forceinline__ void up_pass(const UpSmem& u, const uint4* U, int nc, int p0, const float (&rs_mine)[HC],
                                         int lane, int warp, unsigned long long* dbg = nullptr, int b = 0) {
     constexpr int G = 16 / P;
     float4 l0[P][2], l1[P][2];
-    const int j1 = lane < LR / 8 - 32 ? 32 + lane : 32;
+    const int j1 = SPREAD ? 32 + (lane & 7) : lane < LR / 8 - 32 ? 32 + lane : 32;
 #pragma unroll
     for (int q = 0; q < P; ++q) {
         const float4* lk = reinterpret_cast<const float4*>(u.lo + (p0 + q) * LR);
@@ -596,6 +597,31 @@ __device__ __forceinline__ void up_pass(const UpSmem& u, const uint4* U, int nc,
     for (int gi = warp; gi < groups; gi += WARPS) {
         const int r0 = gi * G;
         float v[16];
+        if constexpr (SPREAD) {
+            // the second chunks (32 + L, L < 8) of the G rows spread over the warp: lane l forms rows (l >> 3) + 4 i
+            // against chunk 32 + (l & 7); lane L < 8 takes row g's from lane L + 8 (g & 3)
+            constexpr int NI = (8 * G + 31) / 32;
+            float s2[NI][P];
+#pragma unroll
+            for (int i = 0; i < NI; ++i) {
+                const int g = (lane >> 3) + 4 * i, rr = r0 + g < rows && g < G ? r0 + g : rows - 1;
+                const uint4 wb = U[rr * 40 + 32 + (lane & 7)];
+#pragma unroll
+                for (int q = 0; q < P; ++q) s2[i][q] = dot8v(wb, l1[q][0], l1[q][1]);
+            }
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const int r = r0 + g < rows ? r0 + g : rows - 1;
+                const uint4 wa = U[r * 40 + lane];
+#pragma unroll
+                for (int q = 0; q < P; ++q) {
+                    float acc = dot8v(wa, l0[q][0], l0[q][1]);
+                    const float o = __shfl_sync(0xffffffffu, s2[g >> 2][q], (lane & 7) + 8 * (g & 3));
+                    if (lane < LR / 8 - 32) acc += o;
+                    v[g * P + q] = acc;
+                }
+            }
+        } else {
 #pragma unroll
         for (int g = 0; g < G; ++g) {
             const int r = r0 + g < rows ? r0 + g : rows - 1;
@@ -607,6 +633,7 @@ __device__ __forceinline__ void up_pass(const UpSmem& u, const uint4* U, int nc,
                 if (lane < LR / 8 - 32) acc += dot8v(wb, l1[q][0], l1[q][1]);
                 v[g * P + q] = acc;
             }
+        }
         }
 #pragma unroll
         for (int i = G * P; i < 16; ++i) v[i] = 0.0f;
@@ -635,7 +662,7 @@ __device__ void hc_up_rout(const HcFusedArgs& a, UpSlice sl, int tid, char* smem
         a.R_out[(size_t) k * D + c * N + c0 + dd] = u.rp[idx];
     }
 }
-template <int T>
+template <int T, bool SPREAD = false>
 __device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, bool rout, unsigned long long* dbg, int b) {
     const int lane = tid & 31, warp = tid >> 5, nc = sl.nc, c0 = sl.c0;
     const UpSmem u = up_smem(smem, nc, T);
@@ -655,8 +682,8 @@ __device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem
     __syncthreads();
     stamp(dbg, b, 9, tid);
     const uint4* U = reinterpret_cast<const uint4*>(smem);
-    up_pass<P1>(u, U, nc, 0, rs1, lane, warp, dbg, b);
-    if constexpr (P2 > 0) up_pass<(P2 > 0 ? P2 : 1)>(u, U, nc, P1, rs2, lane, warp);
+    up_pass<P1, SPREAD>(u, U, nc, 0, rs1, lane, warp, dbg, b);
+    if constexpr (P2 > 0) up_pass<(P2 > 0 ? P2 : 1), SPREAD>(u, U, nc, P1, rs2, lane, warp);
     __syncthreads();
     stamp(dbg, b, 4, tid);
     for (int i = tid; i < T * nc; i += THREADS) {
@@ -929,7 +956,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             up_ph ^= 1u;
             __syncthreads();
             stamp(dbg, b, 2, tid);
-            hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
+            if (L.ups) hc_up_main<T, true>(a, sl, tid, smem, true, dbg, b);
+            else hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
             cta_signal(&sy->up.v, tid);
             stamp(dbg, b, 3, tid);
         } else {
@@ -1072,7 +1100,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_sk_kernel(HcLaunch L) {
             up_ph ^= 1u;
             __syncthreads();
             stamp(dbg, b, 2, tid);
-            hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
+            if (L.ups) hc_up_main<T, true>(a, sl, tid, smem, true, dbg, b);
+            else hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
             cta_signal(&sy->up.v, tid);
             stamp(dbg, b, 3, tid);
         } else {
@@ -1151,11 +1180,12 @@ constexpr KernelFn kKernels[MAXT] = {hc_fused_kernel<1>, hc_fused_kernel<2>, hc_
 constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel<2>, hc_fused_sk_kernel<3>,
                                         hc_fused_sk_kernel<4>, hc_fused_sk_kernel<5>, hc_fused_sk_kernel<6>,
                                         hc_fused_sk_kernel<7>, hc_fused_sk_kernel<8>};
-// STRATA_DEC_HC_SK=1: the split-K read.  STRATA_DEC_HC_RPF=1: the down CTAs prefetch the router rows (and, split-K,
+// STRATA_DEC_HC_UPS=1: each up row's second chunks formed by the lanes that have none (the same products, fewer
+// instructions).  STRATA_DEC_HC_SK=1: the split-K read.  STRATA_DEC_HC_RPF=1: the down CTAs prefetch the router rows (and, split-K,
 // w_up) into L2 behind their weights.  STRATA_DEC_HC_NU=<n>: the up slices (the down CTAs take the ones past nb - 81).
 struct SkConf {
     bool on = false;
-    int pf = 0, nu = 0;
+    int pf = 0, nu = 0, ups = 0;
 };
 const SkConf& sk_conf() {
     static const SkConf c = [] {
@@ -1166,6 +1196,8 @@ const SkConf& sk_conf() {
         k.pf = e ? std::atoi(e) : 0;
         e = std::getenv("STRATA_DEC_HC_NU");
         k.nu = e ? std::atoi(e) : 0;
+        e = std::getenv("STRATA_DEC_HC_UPS");
+        k.ups = e && e[0] == '1' ? 1 : 0;
         return k;
     }();
     return c;
@@ -1320,6 +1352,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     g_slot = (g_slot + 1) % NSLOT;
     L.xc = d.xc;
     L.dbg = g_dbg;
+    L.ups = sk_conf().ups;
     if (L.dbg == nullptr) L.dbg = dbg_slot(a.T, a.w_router != nullptr);
     const SkConf& sk = sk_conf();
     if (sk.on) {
