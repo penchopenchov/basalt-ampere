@@ -240,6 +240,79 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_layers_kernel(GdnCommitLay
     }
 }
 
+// gdn_step_commit_block's math with every token's inputs loaded up front (one memory round trip per item instead of
+// several per token): the grid-stride form's per-block latency is what bounds it.
+__device__ __forceinline__ void gdn_commit_item_preloaded(float* __restrict__ state, const float* __restrict__ hbuf,
+                                                          int C, const float* __restrict__ gate,
+                                                          const float* __restrict__ beta, int h_k, int h_v, int n,
+                                                          int head, int cblk) {
+    __shared__ float sk[kVerifyMaxT][S];
+    __shared__ float red[2][RG][32];
+    const int col_local = threadIdx.x;
+    const int col = cblk * 32 + col_local;
+    const int rg = threadIdx.y;
+    const int tid = rg * 32 + col_local;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    __syncthreads();                    // the previous item is done with sk/red
+    float v[kVerifyMaxT], g[kVerifyMaxT], b[kVerifyMaxT];
+#pragma unroll
+    for (int t = 0; t < kVerifyMaxT; ++t) {
+        if (t >= n) break;
+        const float* ht = hbuf + (size_t) t * C;
+        sk[t][tid] = ht[qk + qh * S + tid];
+        v[t] = ht[2 * qk + head * S + col];
+        g[t] = gate[(size_t) t * h_v + head];
+        b[t] = beta[(size_t) t * h_v + head];
+    }
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < kVerifyMaxT; ++t) {
+        if (t >= n) break;
+        const float gt = __expf(g[t]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[t][rg * RPG + r], kv);
+        red[t & 1][rg][col_local] = kv;
+        __syncthreads();
+        const float kv_col = red[t & 1][0][col_local] + red[t & 1][1][col_local] + red[t & 1][2][col_local] +
+                             red[t & 1][3][col_local];
+        const float delta = (v[t] - gt * kv_col) * b[t];
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) s[r] = fmaf(gt, s[r], sk[t][rg * RPG + r] * delta);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+}
+
+// The same items from a few persistent blocks (grid-stride), so the commit takes a small share of the card beside
+// other streams' kernels instead of filling it. Items per layer: h_v * (S / 32) state blocks, then the conv blocks.
+__device__ __forceinline__ void gdn_commit_layers_items(const GdnCommitLayers& a, int conv_blocks, int first,
+                                                        int step) {
+    const int per_state = a.h_v * (S / 32), per_layer = per_state + conv_blocks, total = per_layer * a.n_layers;
+    const int n = min(*a.n_keep, kVerifyMaxT);
+    if (n <= 0) return;
+    for (int i = first; i < total; i += step) {
+        const int l = i / per_layer, j = i - l * per_layer;
+        float* state = a.state + (size_t) l * a.state_stride;
+        if (j < per_state)
+            gdn_commit_item_preloaded(state, a.h + (size_t) l * a.h_stride, a.C, a.gate + (size_t) l * a.gb_stride,
+                                      a.beta + (size_t) l * a.gb_stride, a.h_k, a.h_v, n, j >> 2, j & 3);
+        else
+            gdn_conv_commit_one(state + (size_t) S * a.h_v * S, a.qkv + (size_t) l * a.h_stride, a.C, a.n_keep,
+                                (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
+    }
+}
+
+__global__ void __launch_bounds__(32 * RG) gdn_commit_layers_gs_kernel(GdnCommitLayers a, int conv_blocks) {
+    gdn_commit_layers_items(a, conv_blocks, blockIdx.x, gridDim.x);
+}
+
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
@@ -579,9 +652,14 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
     check("gdn_conv_l2_multi");
 }
 
-void gdn_commit_layers(const GdnCommitLayers& a, void* stream) {
+void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks) {
     if (a.n_layers <= 0) return;
     const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
+    if (blocks > 0) {
+        gdn_commit_layers_gs_kernel<<<(unsigned) blocks, dim3(32, RG), 0, (cudaStream_t) stream>>>(a, conv_blocks);
+        check("gdn_commit_layers");
+        return;
+    }
     const unsigned gx = (unsigned) (a.h_v > conv_blocks ? a.h_v : conv_blocks);
     gdn_commit_layers_kernel<<<dim3(gx, S / 32 + 1, (unsigned) a.n_layers), dim3(32, RG), 0, (cudaStream_t) stream>>>(a);
     check("gdn_commit_layers");
