@@ -48,7 +48,9 @@ struct HcFusedArgs {
     size_t pf_bytes[4] = {0, 0, 0, 0};
 };
 
-/// The current device runs the fused read (sm_120 with enough SMs for the role split).
+/// Allocate the read's scratch on the current device (outside a stream capture, once).
+void hc_fused_init();
+/// The current device runs the fused read (sm_120 with enough SMs for the role split); hc_fused_init ran there.
 bool hc_fused_supported();
 /// Enqueue the read on `stream` (a PdlScope applies).  Aborts on invalid arguments.
 void hc_fused_read(const HcFusedArgs& a, void* stream);

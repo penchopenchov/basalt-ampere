@@ -35,7 +35,6 @@ constexpr int MIN_NU = 86;           // up CTAs needed for an up slice (30 colum
 static_assert(D % (QB * 256) == 0, "whole stages");
 
 constexpr int NCOPY = 8;             // copies of xn: the down CTAs read different copies, spreading the L2 load
-__device__ float g_hc_xn[NCOPY][MAXT][D];
 
 struct HcSync {
     unsigned norm, down, up, router, exit, pad[11];
@@ -46,6 +45,7 @@ struct HcLaunch {
     HcFusedArgs a;
     int nb;          // CTAs (one per SM)
     int up_early;    // w_up bulk copies at launch (1) or after the norm (0)
+    float* xc;       // the copies of xn, [NCOPY][MAXT][D]
     unsigned long long* dbg;   // bench only: per-CTA phase times [nb][16]
 };
 
@@ -209,8 +209,8 @@ __device__ __forceinline__ void hc_norm_pre(const HcFusedArgs& a, int c, int tid
     }
 }
 // Task (t, c, cp) writes copy cp of xn; copy 0 also writes rs.
-__device__ void hc_norm_task(const HcFusedArgs& a, int t, int c, int cp, int tid, const NormRegs& nr, float* part,
-                             float* s_rs) {
+__device__ void hc_norm_task(const HcFusedArgs& a, float* xc, int t, int c, int cp, int tid, const NormRegs& nr,
+                             float* part, float* s_rs) {
     const int lane = tid & 31, warp = tid >> 5;
     const float* R = a.R + (size_t) t * D;
     const float* bo = a.bo_prev + (size_t) t * N;
@@ -253,7 +253,7 @@ __device__ void hc_norm_task(const HcFusedArgs& a, int t, int c, int cp, int tid
         if (i >= (c + 1) * N) continue;
         const float4 g = nr.g[j];
         const float px = r[j].x * g.x, py = r[j].y * g.y, pz = r[j].z * g.z, pw = r[j].w * g.w;
-        *reinterpret_cast<float4*>(&g_hc_xn[cp][t][i]) = make_float4(px * rs, py * rs, pz * rs, pw * rs);
+        *reinterpret_cast<float4*>(xc + ((size_t) cp * MAXT + t) * D + i) = make_float4(px * rs, py * rs, pz * rs, pw * rs);
     }
 }
 
@@ -304,7 +304,7 @@ __device__ void hc_down_prologue(const HcFusedArgs& a, int b, int tid, char* rin
 // After the norm: lane L of warp (row r = w & 3, token parity p = w >> 2) sums chunks L + 32 q, q ascending, of row r
 // against tokens p, p + 2, ... - the plain read's per-lane order.
 template <int T>
-__device__ void hc_down_main(const HcFusedArgs& a, int b, int ncopy, int tid, char* ring) {
+__device__ void hc_down_main(const HcFusedArgs& a, const float* xn, int b, int tid, char* ring) {
     constexpr int S = Ring<T>::S, BYTES = Ring<T>::BYTES;
     constexpr int TW = (T + 1) / 2;   // tokens of parity 0 (parity 1 has T / 2)
     const uint16_t* w = down_rows(a, b);
@@ -312,7 +312,7 @@ __device__ void hc_down_main(const HcFusedArgs& a, int b, int ncopy, int tid, ch
     const int lane = tid & 31, warp = tid >> 5, r = warp & 3, p = warp >> 2;
 #pragma unroll
     for (int s = 0; s < S; ++s) {
-        down_issue_x<T>(&g_hc_xn[b % ncopy][0][0], s, ring + s * BYTES, tid);
+        down_issue_x<T>(xn, s, ring + s * BYTES, tid);
         cp_async_commit();
     }
     const int nt = p == 0 ? TW : T / 2;
@@ -338,7 +338,7 @@ __device__ void hc_down_main(const HcFusedArgs& a, int b, int ncopy, int tid, ch
         if (s + S < NSTAGE) {
             char* dst = ring + (s % S) * BYTES;
             down_issue_w(w, s + S, dst, tid);
-            down_issue_x<T>(&g_hc_xn[b % ncopy][0][0], s + S, dst, tid);
+            down_issue_x<T>(xn, s + S, dst, tid);
         }
         cp_async_commit();
     }
@@ -651,13 +651,13 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     stamp(dbg, b, 1, tid);
 
     if (norm_cta) {
-        hc_norm_task(a, (b >> 2) % T, b & 3, b / (4 * T), tid, nr, part, &s_rs);
+        hc_norm_task(a, L.xc, (b >> 2) % T, b & 3, b / (4 * T), tid, nr, part, &s_rs);
         cta_signal(&sy->norm, tid);
     }
     if (is_down) {
         cta_wait(&sy->norm, (unsigned) ntask, tid);
         stamp(dbg, b, 2, tid);
-        hc_down_main<T>(a, b, ncopy, tid, smem);
+        hc_down_main<T>(a, L.xc + (size_t) (b % ncopy) * MAXT * D, b, tid, smem);
         cta_signal(&sy->down, tid);
         stamp(dbg, b, 3, tid);
         if (a.w_router && tid == 0 && !L.up_early) prefetch_l2(a.w_router + (size_t) e0 * N, (size_t) (e1 - e0) * N * 2);
@@ -736,6 +736,7 @@ unsigned long long* g_dbg = nullptr;
 struct DevInfo {
     bool checked = false, ok = false;
     int sms = 0;
+    float* xc = nullptr;
 };
 DevInfo g_dev[16];
 
@@ -753,7 +754,8 @@ const DevInfo& dev_info() {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         d.sms = sms;
-        d.ok = major == 12 && sms - ND >= MIN_NU && optin >= SMEM + 1024;
+        d.ok = major == 12 && sms - ND >= MIN_NU && optin >= SMEM + 1024 &&
+               cudaMalloc((void**) &d.xc, (size_t) NCOPY * MAXT * D * sizeof(float)) == cudaSuccess;
         for (int t = 0; t < MAXT && d.ok; ++t)
             d.ok = cudaFuncSetAttribute(kKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
         cudaGetLastError();
@@ -765,6 +767,7 @@ const DevInfo& dev_info() {
 }  // namespace
 
 bool hc_fused_supported() { return dev_info().ok; }
+void hc_fused_init() { (void) dev_info(); }
 
 void hc_fused_set_knobs(int up_early) {
     if (up_early >= 0) g_up_early = up_early;
@@ -784,6 +787,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.a = a;
     L.nb = d.sms;
     L.up_early = g_up_early >= 0 ? g_up_early : env_up_early;
+    L.xc = d.xc;
     L.dbg = g_dbg;
     launch_pdl(kKernels[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM, (cudaStream_t) stream, L);
     const cudaError_t e = cudaGetLastError();

@@ -98,10 +98,15 @@ int main(int argc, char** argv) {
     cudaMemcpy(dRbak, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
     cudaStream_t s;
     cudaStreamCreate(&s);
+    // w_norm too: the previous read prefetches it (HcFusedArgs::pf) in the decode
+    float* dwnbak = nullptr;
+    cudaMalloc((void**) &dwnbak, wn.size() * 4);
+    cudaMemcpy(dwnbak, wn.data(), wn.size() * 4, cudaMemcpyHostToDevice);
     auto evict = [&](int f, int i) {
         cudaMemsetAsync(devict, i & 0xff, evict_bytes, s);
         cudaMemcpyAsync(o[f].R, dRbak, R.size() * 4, cudaMemcpyDeviceToDevice, s);
         cudaMemcpyAsync(dbo, dRbak, bo.size() * 4, cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(dwn, dwnbak, wn.size() * 4, cudaMemcpyDeviceToDevice, s);
     };
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
@@ -215,8 +220,8 @@ int main(int argc, char** argv) {
     std::printf("hc_fused_parity: %d differing cases (T %d..%d, 3 modes, with and without the pending write)\n",
                 failures, t_lo, t_hi);
 
-    // time: hot (back to back) and cold (192 MB written before each read, then R and bo rewritten as the previous kernel would leave them; the read
-    // alone timed)
+    // time: hot (back to back) and cold (192 MB written before each read, then R, bo and w_norm rewritten as the
+    // previous kernels leave them; the read alone timed)
     for (int T = t_lo; T <= t_hi; ++T)
         for (int router = 0; router < 2; ++router) {
             const double bytes = 2.0 * LR * D * 2 + HC * D * 2 + (router ? (double) NE * N * 2 : 0.0);
