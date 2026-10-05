@@ -54,6 +54,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/ppl_gate.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -6304,6 +6305,9 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            // ppl=K [ppl_t=T]: quality gate (strata/program/ppl_gate.hpp) - chunk K of STRATA_PPL_BASE, the rest of
+            // the chunk teacher-forced through verify windows of T tokens, every token committed
+            int req_ppl = -1, req_ppl_t = 3;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -6328,6 +6332,8 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -6346,6 +6352,17 @@ int main(int argc, char** argv) {
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            strata::program::PplGate* ppl = nullptr;
+            if (req_ppl >= 0) {
+                std::string pe2;
+                ppl = &strata::program::PplGate::get();
+                if (geni || !ppl->begin(req_ppl, ids.data(), n, n_vocab, pe2)) {
+                    std::printf("ERR %s\n", geni ? "ppl: text only" : pe2.c_str());
+                    continue;
+                }
+                req_temperature = 0.0f;
+                req_ppl_t = std::clamp(req_ppl_t, 1, S);
+            }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
@@ -7150,11 +7167,15 @@ int main(int argc, char** argv) {
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
+                if (ppl != nullptr) {
+                    if (p >= ppl->end()) break;
+                    T = (int) std::min<int64_t>(req_ppl_t, ppl->end() - p);
+                }
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
+                if (o.suffix_draft > 0 && !first_window && ppl == nullptr) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
@@ -7167,6 +7188,8 @@ int main(int argc, char** argv) {
                 if (p + T > o.max_context) break;
                 window[0] = x;
                 for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
+                if (ppl != nullptr)
+                    for (int i = 0; i < T; ++i) window[(size_t) i] = ppl->token(p + i);
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -7205,6 +7228,17 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (ppl != nullptr) {   // every row scored and committed
+                    a = T - 1;
+                    for (int t = 0; t < T; ++t) {
+                        std::vector<float> lg((size_t) n_vocab);
+                        if (!ver.copy_logits(t, lg.data()) || !ppl->score(p + t, std::move(lg), err)) {
+                            std::printf("ERR ppl: %s\n", err.empty() ? "the head logits copy failed" : err.c_str());
+                            return 1;
+                        }
+                        outv[(size_t) t] = ppl->token(p + t + 1);   // as if every draft were accepted: x, the MTP
+                    }
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -7230,7 +7264,8 @@ int main(int argc, char** argv) {
                     bool eos_pre = false;
                     for (int i = 0; i <= a && produced_n + n_emit < max_new && !eos_pre; ++i) {
                         ++n_emit;
-                        eos_pre = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                        eos_pre = ppl == nullptr &&
+                                  std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                     }
                     const bool will_draft = !eos_pre && produced_n + n_emit < max_new;
                     if (!ver.commit(a + 1, err, 2)) {
@@ -7267,7 +7302,8 @@ int main(int argc, char** argv) {
                             strata::core::progress_beat();
                             ++produced_n;
                             if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
-                            eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                            eos = ppl == nullptr &&
+                                  std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                         }
                         std::fflush(stdout);
                     };
@@ -7330,7 +7366,8 @@ int main(int argc, char** argv) {
                     strata::core::progress_beat();
                     ++produced_n;
                     if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
-                    eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                    eos = ppl == nullptr &&
+                          std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
                 ++rounds;
@@ -7370,6 +7407,10 @@ int main(int argc, char** argv) {
             if (apply_thr.joinable()) apply_thr.join();
             if (copy_live) src.commit_exchanges();   // swaps applied early: the rest of their copies
             copy_live = false;
+            if (ppl != nullptr && !ppl->finish(err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
