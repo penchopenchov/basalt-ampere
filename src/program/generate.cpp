@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/device.hpp"
+#include "strata/core/draft_cum.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
@@ -61,6 +62,7 @@
 #include "strata/kernels/hc_fused.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/draft_cum.hpp"
 #include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX   // gguf_reader.hpp includes windows.h
@@ -7409,7 +7411,7 @@ int main(int argc, char** argv) {
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    while (T < S_mtp && strata::core::draft_keep(dprob.data(), T - 1, (float) req_spec_min_p, strata::core::draft_cum_env())) ++T;
                 }
                 if (first_window) T = 1;
                 if (ppl != nullptr) {
@@ -8501,7 +8503,7 @@ int main(int argc, char** argv) {
             int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
-                while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+                while (T < S_mtp && strata::core::draft_keep(dprob.data(), T - 1, (float) o.spec_min_p, strata::core::draft_cum_env())) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;

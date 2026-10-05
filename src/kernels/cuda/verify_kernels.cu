@@ -5,6 +5,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/pdl.hpp"
+#include "strata/core/draft_cum.hpp"
 
 #include <cuda_runtime.h>
 
@@ -596,25 +597,26 @@ void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, fl
 namespace {
 struct CondHandles { unsigned long long h[8]; };
 __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __restrict__ probs,
-                                      const int32_t* __restrict__ row, const int32_t* __restrict__ min_p_bits) {
-    const float p = probs[*row];
+                                      const int32_t* __restrict__ row, const int32_t* __restrict__ min_p_bits,
+                                      float cum_th) {
     const float min_p = __int_as_float(*min_p_bits);
-    cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], p >= min_p ? 1u : 0u);
+    const bool keep = strata::core::draft_keep(probs, *row, min_p, cum_th);
+    cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
     for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);
 }
 }  // namespace
 
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
-                    const int32_t* min_p_bits, void* stream) {
+                    const int32_t* min_p_bits, void* stream, float cum_th) {
     if (n < 1 || n > 8) { std::fprintf(stderr, "mtp_draft_cond: n out of range\n"); std::exit(1); }
     CondHandles hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
-    mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, min_p_bits);
+    mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, min_p_bits, cum_th);
     check("mtp_draft_cond");
     return true;
 }
 #else
-bool mtp_draft_cond(const unsigned long long*, int, const float*, const int32_t*, const int32_t*, void*) { return false; }
+bool mtp_draft_cond(const unsigned long long*, int, const float*, const int32_t*, const int32_t*, void*, float) { return false; }
 #endif
 
 namespace {

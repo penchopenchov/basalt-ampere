@@ -2,6 +2,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/draft_cum.hpp"
 #include "strata/core/on_device.hpp"
 
 #include "strata/core/native_head.hpp"
@@ -1097,7 +1098,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
     if (ok) ok = cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
     if (ok) {
         const bool rec = record_round(T, coupled, true, err) &&
-                         mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_);
+                         mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env());
         cudaGraph_t g0 = nullptr;
         const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
         ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
@@ -1121,7 +1122,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
              cudaSuccess;
         if (!ok) break;
         bool rec = record_step(j, coupled, false, err);
-        if (rec && j + 1 < steps) rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_);
+        if (rec && j + 1 < steps) rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env());
         cudaGraph_t captured = nullptr;   // the body itself, owned by the node
         ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
         prev = node;
@@ -1376,10 +1377,13 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         };
         wait_step(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
+        float pr[strata::kernels::kVerifyMaxT];
+        const float cum_th = draft_cum_env();
         float pj = ((volatile float*) h_prob_)[0];
+        pr[0] = pj;
         if (probs) probs[0] = pj;
         n = 1;
-        for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+        for (int j = 1; j < max_steps && draft_keep(pr, j - 1, min_p, cum_th); ++j) {
             if (!cond) {   // the conditional graph runs step j on the device by the same comparison
                 if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[tier_][j], cs_) != cudaSuccess) {
                     err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
@@ -1392,6 +1396,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             if (cond && ((volatile int32_t*) h_out_)[j] < 0) break;   // the graph ended without it: the sync says why
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
+            pr[j] = pj;
             if (probs) probs[j] = pj;
             ++n;
         }

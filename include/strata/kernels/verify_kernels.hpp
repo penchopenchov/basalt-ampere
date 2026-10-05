@@ -106,10 +106,11 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, float* mixed, int64_t mixed_stride,
                   const int32_t* row_dev, void* stream);
 /// For draft steps that are conditional (IF) graph nodes (STRATA_MTP_COND): handle h[0] <- probs[*row] >= min_p, with
-/// min_p's float bits at *min_p_bits, and h[1..n) <- 0 (n <= 8).  False (nothing launched) when the build has no
-/// conditional graph nodes.
+/// min_p's float bits at *min_p_bits, and h[1..n) <- 0 (n <= 8).  With cum_th > 0 the comparison is the cumulative
+/// rule of draft_cum.hpp over probs[0..*row] instead.  False (nothing launched) when the build has no conditional
+/// graph nodes.
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
-                    const int32_t* min_p_bits, void* stream);
+                    const int32_t* min_p_bits, void* stream, float cum_th = 0.0f);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// A sliding attention window: for `n` step records (kStepCount ints each, n_kv at [1]) the selection becomes the
