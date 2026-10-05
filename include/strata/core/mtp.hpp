@@ -107,6 +107,8 @@ public:
 private:
     /// reuse_row: the full layer's row 0 from the catch-up's row *row_ (STRATA_MTP_REUSE_ROW; full, T == 1)
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool reuse_row = false);
+    void record_hidden(const float* R, int T, uint8_t* xq, cudaStream_t cs);
+    void end_branches();   ///< joins an open branch and clears the STRATA_DEC_DRAFT=2 recording state
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     /// all_rows: copy every step / position record (the chain's too) and the min_p bits, for a graph without per-step
@@ -151,6 +153,15 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
+    // STRATA_DEC_DRAFT=2: the branch stream of the round and chain graphs, its fork / join events, its Q8_1 input;
+    // par_ while those graphs are recorded, pre_next_ / have_pre_ for the next step's hidden input computed beside the
+    // head, fork_open_ while that branch is not joined yet
+    cudaStream_t cs2_ = nullptr;
+    cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    uint8_t* xq2_ = nullptr;
+    bool par_ = false, pre_next_ = false, have_pre_ = false, fork_open_ = false;
+    void fork(cudaStream_t cs) { cudaEventRecord(ev_fork_, cs); cudaStreamWaitEvent(cs2_, ev_fork_, 0); }
+    void join(cudaStream_t cs) { cudaEventRecord(ev_join_, cs2_); cudaStreamWaitEvent(cs, ev_join_, 0); }
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
