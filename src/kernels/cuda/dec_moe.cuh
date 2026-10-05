@@ -1038,7 +1038,7 @@ __global__ void __launch_bounds__(kM3Threads, 4) m3_down_kernel(const DmPlan* __
     // and raises a device flag that the slices' combining blocks wait on
     unsigned int* flag = a.ctr + kDmM3Ctr - 2;
     unsigned int* fin = a.ctr + kDmM3Ctr - 1;
-    const bool tiers = !(a.dbg & 1) && (plan->counts[2] > 0 || plan->counts[3] > 0);
+    const bool tiers = plan->counts[2] > 0 || plan->counts[3] > 0;
     if (tiers && blockIdx.x == 0 && blockIdx.y == 0 && tid == kM3Threads - 32) {
         if (plan->counts[2] > 0) while (*a.peer_done_m < a.ring) __nanosleep(64);
         if (plan->counts[3] > 0) while (*a.host_flag_m < a.ring) __nanosleep(64);
@@ -1072,7 +1072,7 @@ __global__ void __launch_bounds__(kM3Threads, 4) m3_down_kernel(const DmPlan* __
                 const size_t off = (size_t) (t * k + j) * N + col;
                 const int kd = s_kind[t * k + j];
                 const float* src = kd == 0 ? a.parts : kd == 2 ? a.peer_rows_m : a.cpu_rows_m;
-                v[j] = (a.dbg & 2) && kd != 0 ? 0.0f : __ldcv(src + off);
+                v[j] = __ldcv(src + off);
                 if (kd == 0) v[j] = __fadd_rn(0.0f, v[j]);
             }
         }
@@ -1309,8 +1309,6 @@ void dec_moe3(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, v
     static const int gy_env = [] { const char* v = std::getenv("STRATA_DEC_MOE3_GY"); return v ? std::atoi(v) : 24; }();
     cudaStream_t s = (cudaStream_t) stream;
     DmM3Args a = args;
-    static const int dbg = [] { const char* v = std::getenv("STRATA_M3_DBG"); return v ? std::atoi(v) : 0; }();
-    a.dbg = dbg;
     a.sg_row = iq_row_bytes(a.sg_type, L.n_embd);
     a.su_row = iq_row_bytes(a.su_type, L.n_embd);
     a.sd_row = iq_row_bytes(a.sd_type, L.n_ff);

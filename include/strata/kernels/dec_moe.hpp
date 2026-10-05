@@ -102,14 +102,16 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
                   unsigned int* sync, void* stream, int kind = 0, int cap = kDmCap);
 
 /// STRATA_DEC_MOE3: CUDA0's MoE block in three launches with the shared expert and the combine inside.
-///   gate/up  one block per (16-row slice, group row): 8 warps take the slice of the plan's groups, a ninth warp a
-///            share of the slice's shared-expert rows for every token (the slice's rows split over the active block
-///            rows), so the shared work is spread over every block of the launch.
+///   gate/up  one block per (16-row slice, group row): 8 warps take the slice of the plan's groups, two more warps a
+///            share of the slice's shared-expert rows for every token (the slice's rows split over the block rows,
+///            whatever the plan), so the shared work is spread over every block of the launch.  A programmatic
+///            dependent of dec_moe_route: before its wait a block reads only weights.
 ///   SwiGLU   the routed entries and the shared expert's tokens into q8_1 rows.
 ///   down     one block per (row slice, group row): 8 warps the slice's routed rows, the ninth a share of the slice's
 ///            shared rows (times the token's sigmoid gate from dec_moe_route's partials); the last block of a slice
-///            to finish waits for the tiers the plan uses and sums the slice's rows per token in a fixed order
-///            (entries 0..k-1 with their router weights, then the shared row) into `output`.
+///            to finish waits for the tiers the plan uses (one thread of the grid polls their mapped words) and sums
+///            the slice's rows per token in a fixed order (entries 0..k-1 with their router weights, then the shared
+///            row) into `output`.
 /// A token's output depends only on its own rows, never on the window's size or its column.
 struct DmM3Args {
     const uint8_t* sg = nullptr; const uint8_t* su = nullptr; const uint8_t* sd = nullptr;   ///< shared weights
@@ -127,7 +129,6 @@ struct DmM3Args {
     uint32_t ring = 0;
     unsigned int* ctr = nullptr;                 ///< device: kDmM3Ctr zeroed words, left zeroed
     int n_tok = 0, k = 0;
-    int dbg = 0;
 };
 constexpr int kDmM3Ctr = 256;
 /// Whether dec_moe3 covers a layer: the experts' formats and the shared expert's.
