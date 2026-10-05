@@ -56,6 +56,8 @@ struct DmRouteArgs {
     uint32_t ring = 0;
     unsigned int* ctr = nullptr;     ///< device: arrival counter, monotonic across launches
     unsigned int ctr_base = 0;       ///< arrivals before this launch (ring - 1) * blocks
+    const uint16_t* sh_gw = nullptr; ///< device: the shared expert's BF16 gate row (n_embd), or null
+    float* sh_part = nullptr;        ///< device: its gate's partial sums, n_embd / 256 per token in order
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
@@ -98,6 +100,43 @@ size_t dec_moe_vram_scratch_bytes(int n_ff);
 /// native_expert_grouped's SwiGLU and down launches over `cap` possible groups (the window's entries).
 void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, float* out,
                   unsigned int* sync, void* stream, int kind = 0, int cap = kDmCap);
+
+/// STRATA_DEC_MOE3: CUDA0's MoE block in three launches with the shared expert and the combine inside.
+///   gate/up  one block per (16-row slice, group row): 8 warps take the slice of the plan's groups, two more warps a
+///            share of the slice's shared-expert rows for every token (the slice's rows split over the block rows,
+///            whatever the plan), so the shared work is spread over every block of the launch.  A programmatic
+///            dependent of dec_moe_route: before its wait a block reads only weights.
+///   SwiGLU   the routed entries and the shared expert's tokens into q8_1 rows.
+///   down     one block per (row slice, group row): 8 warps the slice's routed rows, the ninth a share of the slice's
+///            shared rows (times the token's sigmoid gate from dec_moe_route's partials); the last block of a slice
+///            to finish waits for the tiers the plan uses (one thread of the grid polls their mapped words) and sums
+///            the slice's rows per token in a fixed order (entries 0..k-1 with their router weights, then the shared
+///            row) into `output`.
+/// A token's output depends only on its own rows, never on the window's size or its column.
+struct DmM3Args {
+    const uint8_t* sg = nullptr; const uint8_t* su = nullptr; const uint8_t* sd = nullptr;   ///< shared weights
+    int sg_type = 0, su_type = 0, sd_type = 0;
+    size_t sg_row = 0, su_row = 0, sd_row = 0;   ///< bytes a row (dec_moe3 sets them)
+    const float* sh_part = nullptr;              ///< dec_moe_route's gate partials (n_embd / 256 per token)
+    float* shared = nullptr;                     ///< device scratch: n_tok rows of n_embd
+    float* parts = nullptr;                      ///< device: CUDA0's entry rows (entry i at row i)
+    const float* peer_rows_m = nullptr;          ///< mapped: the peer's entry rows
+    const float* cpu_rows_m = nullptr;           ///< mapped: the CPU pool's entry rows
+    const float* weights = nullptr;              ///< device: n_tok * k router weights
+    float* output = nullptr;                     ///< device: n_tok rows of n_embd
+    const volatile uint32_t* peer_done_m = nullptr;
+    const volatile uint32_t* host_flag_m = nullptr;
+    uint32_t ring = 0;
+    unsigned int* ctr = nullptr;                 ///< device: kDmM3Ctr zeroed words, left zeroed
+    int n_tok = 0, k = 0;
+};
+constexpr int kDmM3Ctr = 256;
+/// Whether dec_moe3 covers a layer: the experts' formats and the shared expert's.
+bool dec_moe3_ok(const NativeExpertLayout& L, int sg_type, int su_type, int sd_type);
+size_t dec_moe3_scratch_bytes(int n_ff);
+/// `cap`: the window's entries (n_tok * k); `xq`: dec_moe_route's q8_1 rows.  STRATA_DEC_MOE3_GY: block rows (24).
+void dec_moe3(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, const DmM3Args& a,
+              int cap, void* stream);
 
 /// The tests: the persistent kernel's per-group math against native_expert_grouped on one device, without rings.
 /// Entries [start[g], start[g+1]) of group g read q8_1 row tok[e] and write row dst[e] of `out` (device).
