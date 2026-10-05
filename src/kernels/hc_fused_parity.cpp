@@ -1,6 +1,7 @@
 // src/kernels/hc_fused_parity.cpp - hc_fused_read against the kernels it replaces (fused_gr_read_multi, then the
 // MMVF router GEMV and the native top-10), bit for bit on every output, with real geometry and random inputs; then
-// the time of both with the weights hot in L2 and cold (L2 overwritten before every read).
+// the time of both with the weights hot in L2 and cold (L2 overwritten before every read).  STRATA_DEC_HC8=1: the
+// fused read on 8-bit copies of the matrices (run with HC_TOL=1).
 //
 //     build/hc_fused_parity [iters] [T min] [T max]
 #include "strata/kernels/bf16_gemv.hpp"
@@ -92,6 +93,13 @@ int main(int argc, char** argv) {
     cudaMemcpy(dwu, wu.data(), wu.size() * 2, cudaMemcpyHostToDevice);
     cudaMemcpy(dwi, wi.data(), wi.size() * 2, cudaMemcpyHostToDevice);
     cudaMemcpy(dwr, wr.data(), wr.size() * 2, cudaMemcpyHostToDevice);
+    const bool q8 = K::hc8_enabled();
+    if (q8) {
+        setenv("STRATA_DEC_HC8_STATS", "1", 0);
+        K::hc8_prepare(dwd, LR, D);
+        K::hc8_prepare(dwu, D, LR);
+        K::hc8_prepare(dwi, HC, D);
+    }
     const size_t evict_bytes = (size_t) 192 << 20;
     void* devict = nullptr;
     if (cudaMalloc(&devict, evict_bytes) != cudaSuccess) {
@@ -311,6 +319,7 @@ int main(int argc, char** argv) {
     for (int T = t_lo; T <= t_hi; ++T)
         for (int router = 0; router < 2; ++router) {
             const double bytes = 2.0 * LR * D * 2 + HC * D * 2 + (router ? (double) NE * N * 2 : 0.0);
+            const double bytes_f = q8 ? (2.0 * LR * D + HC * D) * (1.0 + 2.0 / 32) + (router ? (double) NE * N * 2 : 0.0) : bytes;
             double hot[2], cold[2];
             for (int f = 0; f < 2; ++f) {
                 for (int i = 0; i < 10; ++i) run(f, T, true, true, router);
@@ -336,8 +345,8 @@ int main(int argc, char** argv) {
             }
             std::printf("T %d %-12s | hot: old %6.1f us  fused %6.1f us (%5.0f GB/s) | cold: old %6.1f us  fused %6.1f us "
                         "(%5.0f GB/s)\n",
-                        T, router ? "read+router" : "read", hot[0], hot[1], bytes / hot[1] / 1e3, cold[0], cold[1],
-                        bytes / cold[1] / 1e3);
+                        T, router ? "read+router" : "read", hot[0], hot[1], bytes_f / hot[1] / 1e3, cold[0], cold[1],
+                        bytes_f / cold[1] / 1e3);
         }
     }
 

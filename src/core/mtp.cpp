@@ -391,7 +391,18 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         err = "mtp: second stream";
         return false;
     }
-    if (dec_draft_level() >= 3) strata::kernels::hc_fused_init();
+    if (dec_draft_level() >= 3) {
+        strata::kernels::hc_fused_init();
+        if (strata::kernels::hc8_enabled()) {   // the draft layer's reads on 8-bit copies too
+            const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
+            for (const char* p : {"attn_hyper_connection.", "mlp_hyper_connection.", "hyper_connection_mixer."}) {
+                const std::string s(p);
+                strata::kernels::hc8_prepare(bf16((s + "input_mix_weight_down.weight").c_str()), LR, D);
+                strata::kernels::hc8_prepare(bf16((s + "input_mix_weight_up.weight").c_str()), D, LR);
+                strata::kernels::hc8_prepare(bf16((s + "block_inject_weight.weight").c_str()), HCn, D);
+            }
+        }
+    }
     if (std::getenv("STRATA_VERIFY_PROFILE") != nullptr && cudaMalloc((void**) &gstamp_, 16) == cudaSuccess)
         cudaMemset(gstamp_, 0, 16);
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();

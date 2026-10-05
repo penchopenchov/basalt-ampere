@@ -152,6 +152,9 @@ public:
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+    /// STRATA_DEC_HC8=1: the 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current
+    /// device; called before the expert cache takes the free memory.
+    static void prepare_hc8(const WeightTable& wt, const ModelGeometry& g);
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  `parts`: 1 launches
     /// the commit graph, 2 advances `ss.ple_prev` (3: both, in that order).

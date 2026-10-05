@@ -527,6 +527,26 @@ Verifier::~Verifier() {
         if (h) cudaFreeHost(h);
 }
 
+void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
+    if (!strata::kernels::hc8_enabled()) return;
+    const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
+    auto add = [&](const WeightRef* d, const WeightRef* u, const WeightRef* i) {
+        if (d) strata::kernels::hc8_prepare((const uint16_t*) d->data, LR, D);
+        if (u) strata::kernels::hc8_prepare((const uint16_t*) u->data, D, LR);
+        if (i) strata::kernels::hc8_prepare((const uint16_t*) i->data, HCn, D);
+    };
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        const LayerView v(wt, l);
+        for (const char* p : {"hc_attn_", "hc_ffn_"}) {
+            const std::string s(p);
+            add(v.get((s + "down.weight").c_str()), v.get((s + "up.weight").c_str()), v.get((s + "inject.weight").c_str()));
+        }
+    }
+    add(wt.find("output_hc_down.weight"), wt.find("output_hc_up.weight"), nullptr);
+    std::fprintf(stderr, "strata hc8: 8-bit hyper-connection copies, %.0f MiB of VRAM\n",
+                 (double) strata::kernels::hc8_bytes() / 1048576.0);
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
