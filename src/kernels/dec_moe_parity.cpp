@@ -48,6 +48,7 @@ template<typename T> T* dmal(size_t n) {
     T* p = nullptr;
     ck(cudaMalloc((void**) &p, n * sizeof(T) + 256), "cudaMalloc");
     ck(cudaMemset(p, 0, n * sizeof(T) + 256), "cudaMemset");
+    ck(cudaDeviceSynchronize(), "alloc sync");   // the tests' streams are non-blocking
     return p;
 }
 template<typename T> T* hmap(size_t n) {
@@ -323,7 +324,8 @@ int main(int argc, char** argv) {
             for (int i = 0; i < n; ++i) bad += (kind[i] == 0) != (seen[i] == 1) || P.kind[i] != kind[i] ||
                                                h_rings[5].kind[i] != kind[i] || h_rings[5].ids[i] != ids[i];
             bad += P.counts[2] != np || P.counts[3] != nc || h_rings[5].n_peer != np || h_rings[5].n_cpu != nc ||
-                   h_rings[5].n_tok != T || h_words[0] != 6 || h_words[16] != 6;
+                   h_rings[5].n_tok != T || h_words[0] != 6 || (h_words[16] & 0xffffu) != 6 ||
+                   ((h_words[16] >> 16) & 0xffu) != (uint32_t) T || ((h_words[16] >> 28) & 1u) != (np > 0 ? 1u : 0u);
             const auto q1 = down((const uint8_t*) dv[0].xq, (size_t) T * H / 32 * 36);
             const auto q2 = down((const uint8_t*) d_xq2, (size_t) T * H / 32 * 36);
             bad += std::memcmp(q1.data(), q2.data(), q1.size()) != 0;
@@ -364,7 +366,7 @@ int main(int argc, char** argv) {
             // the fused VRAM call vs native_expert_grouped (d_parts2 holds the grouped rows)
             {
                 float* d_p3 = dmal<float>((size_t) K::kDmCap * H);
-                ck(cudaMemset(d_p3, 0, (size_t) K::kDmCap * H * 4), "memset");
+                ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
                 K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_p3, d_vsync, s0);
                 ck(cudaStreamSynchronize(s0), "vram");
                 const auto a3 = down(d_parts2, (size_t) n * H), b3 = down(d_p3, (size_t) n * H);
@@ -372,6 +374,49 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < n; ++i) if (kind[i] == 0) rows.push_back(i);
                 std::snprintf(what, sizeof what, "fused VRAM T=%d (%d groups)", T, P.counts[0]);
                 report(what, l, ndiff_rows(a3, b3, rows), rows.size() * H);
+                if (std::getenv("DM_DEBUG")) {
+                    const auto sy = down(d_vsync, K::kDmCap + 1);
+                    int nz = 0;
+                    for (auto v : sy) nz += v != 0;
+                    std::printf("    sync words nonzero after: %d\n", nz);
+                    {   // gate/up of the fused call vs the grouped call's scratch (gate | up at the same offsets? no: compare per entry)
+                        const auto gf = down((const float*) d_vscr, (size_t) K::kDmCap * FF * 2);
+                        const size_t f = (size_t) n * FF * 4, fa = (f + 255) & ~(size_t) 255;
+                        const auto gg = down((const float*) dv[0].scr, (size_t) n * FF);
+                        const auto ug = down((const float*) ((uint8_t*) dv[0].scr + fa), (size_t) n * FF);
+                        size_t dg = 0, du = 0;
+                        for (size_t i = 0; i < (size_t) n * FF; ++i) {
+                            dg += std::memcmp(&gf[i], &gg[i], 4) != 0;
+                            du += std::memcmp(&gf[(size_t) K::kDmCap * FF + i], &ug[i], 4) != 0;
+                        }
+                        std::printf("    gate differs %zu, up differs %zu (of %zu)\n", dg, du, (size_t) n * FF);
+                        for (int rep = 0; rep < 4; ++rep) {
+                            ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
+                            if (rep & 1) ck(cudaMemsetAsync(d_vscr, 0xff, K::dec_moe_vram_scratch_bytes((int) FF), s0), "nan");
+                            K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_p3, d_vsync, s0);
+                            ck(cudaStreamSynchronize(s0), "vram2");
+                            const auto c3 = down(d_p3, (size_t) n * H);
+                            size_t zeros = 0, nans = 0;
+                            for (int r : rows)
+                                for (int64_t c = 0; c < H; ++c) {
+                                    const float v = c3[(size_t) r * H + c];
+                                    zeros += v == 0.0f && a3[(size_t) r * H + c] != 0.0f;
+                                    nans += std::isnan(v);
+                                }
+                            std::printf("    rerun %d (%s scratch) differs from grouped: %zu (zeros %zu nans %zu)\n", rep,
+                                        rep & 1 ? "NaN" : "kept", ndiff_rows(a3, c3, rows), zeros, nans);
+                        }
+                    }
+                    for (int g = 0; g < P.counts[0]; ++g)
+                        for (int e = P.start[g]; e < P.start[g + 1]; ++e) {
+                            const int i = P.dst[e];
+                            size_t d = 0, first = H;
+                            for (int64_t c = 0; c < H; ++c)
+                                if (std::memcmp(&a3[(size_t) i * H + c], &b3[(size_t) i * H + c], 4) != 0) { ++d; if (first == (size_t) H) first = c; }
+                            if (d) std::printf("    group %d entry %d (n %d): %zu differ, first col %zu\n", g, e,
+                                               P.start[g + 1] - P.start[g], d, first);
+                        }
+                }
                 cudaFree(d_p3);
             }
             if (bench && T == 3) {
@@ -461,7 +506,7 @@ int main(int argc, char** argv) {
                 }
                 G.start.push_back(e);
                 G.upload();
-                ck(cudaMemset(dv[1].out, 0, (size_t) K::kDmCap * H * 4), "memset");
+                ck(cudaMemsetAsync(dv[1].out, 0, (size_t) K::kDmCap * H * 4, s1), "memset");
                 K::native_expert_grouped(L, G.d_ptr, G.d_start, G.d_n, G.d_dst, G.d_tok, n, n, dv[1].xq, dv[1].scr,
                                          dv[1].out, s1);
                 ck(cudaStreamSynchronize(s1), "peer ref");

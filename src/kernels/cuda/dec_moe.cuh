@@ -322,11 +322,9 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
         const int g = it / nrb, rb = it - g * nrb;
         dm_gu_item<TG, SG>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate, up,
                            s_grid, warp, lane);
+        __threadfence();
         __syncthreads();
-        if (tid == 0) {
-            __threadfence();
-            atomicAdd(done + g, 1u);
-        }
+        if (tid == 0) atomicAdd(done + g, 1u);
     }
     constexpr int R = dm_down_rows<TD>(), SUB = kDmSpan / R;
     const int nsp = (int) ((L.n_embd + kDmSpan - 1) / kDmSpan);
@@ -517,6 +515,8 @@ int dm_vram_blocks() {
             cudaGetLastError();
             per = 0;
         }
+        const char* v = std::getenv("STRATA_DEC_MOE_VRAM_PER_SM");
+        if (v != nullptr && std::atoi(v) > 0) per = std::min(per, std::atoi(v));
         known[dev] = per > 0 ? sms * per : -1;
     }
     return known[dev];
@@ -607,6 +607,26 @@ bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream) {
     return true;
 }
 
+// cooperative: the grid is resident at once (the down items wait on other blocks' gate/up items)
+template<typename F>
+void dm_vram_launch(F kernel, int blocks, void* stream, const DmPlan* plan, const block_q8_1* xq, NativeExpertLayout L,
+                    float* gate, float* up, float* out, unsigned int* sync) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((unsigned) blocks);
+    cfg.blockDim = dim3(kDmThreads);
+    cfg.stream = (cudaStream_t) stream;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeCooperative;
+    at[0].val.cooperative = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = 1;
+    const cudaError_t e = cudaLaunchKernelEx(&cfg, kernel, plan, xq, L, gate, up, out, sync);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "dec_moe_vram: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
 size_t dec_moe_vram_scratch_bytes(int n_ff) { return (size_t) kDmCap * n_ff * 2 * sizeof(float) + 256; }
 
 void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, float* out,
@@ -617,8 +637,8 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
     switch (L.gu_type * 100 + L.d_type) {
 #define STRATA_DM_V(TG, TD) case TG * 100 + TD: \
         blocks = dm_vram_blocks<TG, TD>(); \
-        if (blocks > 0) dm_vram_kernel<TG, TD><<<(unsigned) blocks, kDmThreads, 0, (cudaStream_t) stream>>>( \
-            plan, (const block_q8_1*) xq, L, gate, up, out, sync); \
+        if (blocks > 0) dm_vram_launch(dm_vram_kernel<TG, TD>, blocks, stream, plan, (const block_q8_1*) xq, L, gate, \
+                                       up, out, sync); \
         break;
         STRATA_DM_PAIRS(STRATA_DM_V)
 #undef STRATA_DM_V
