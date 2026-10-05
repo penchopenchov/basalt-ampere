@@ -362,6 +362,13 @@ int main(int argc, char** argv) {
             std::snprintf(what, sizeof what, "tail T=%d", T);
             report(what, l, nd2, a.size());
             cudaFree(d_p2);
+            if (bench) {   // the combine alone, tiers landed 
+                const double uc = time_us(s0, 200, [&] {
+                    K::dec_moe_combine(d_parts, h_peer, h_cpu, d_plan, d_w, d_sh, d_bo, H, KK, T, h_words + 32,
+                                       h_words + 48, 6, s0);
+                });
+                std::printf("  bench: combine T=%d (%d peer, %d cpu rows of %d): %.2f us per launch\n", T, np, nc, n, uc);
+            }
 
             // the fused VRAM call vs native_expert_grouped (d_parts2 holds the grouped rows)
             {

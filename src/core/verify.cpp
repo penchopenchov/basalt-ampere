@@ -122,6 +122,15 @@ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
+// STRATA_DEC_PK (bit mask), the same values: 1 = the shared expert's side kernels at the greatest stream priority
+// (their blocks are scheduled ahead of the routed experts' queued blocks, so the branch ends beside them, not after);
+// 2 = a GDN layer's z projection forked at that priority before the qkv projection (both stream together), joined
+// before the one-launch recurrence with the gated norm (STRATA_DEC_GDNF=1's kernel), no separate norm launch.
+int dec_pk_mask() {
+    static const int m = [] { const char* e = std::getenv("STRATA_DEC_PK"); return e ? std::atoi(e) : 0; }();
+    return m;
+}
+bool dec_pk() { return dec_pk_mask() != 0; }
 // STRATA_DEC_COMMIT: 1 = the commit graph in two launches; 2 = its GDN part from STRATA_DEC_COMMIT_CTAS persistent
 // blocks (default 32) so it trickles beside the draft instead of filling the card
 int dec_commit_mode() {
@@ -503,6 +512,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (sh_hi_) cudaStreamSynchronize(sh_hi_);
     dm_free();
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
@@ -515,6 +525,7 @@ Verifier::~Verifier() {
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (sh_hi_) cudaStreamDestroy(sh_hi_);
     if (shx_sync_) cudaFree(shx_sync_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
@@ -712,6 +723,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
+    }
+    if (dec_pk()) {
+        int least = 0, greatest = 0;
+        if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
+            cudaStreamCreateWithPriority(&sh_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess) {
+            err = "verify: STRATA_DEC_PK stream create failed";
+            return false;
+        }
+        std::fprintf(stderr, "strata verify: STRATA_DEC_PK=%d: side branches at stream priority %d\n", dec_pk_mask(), greatest);
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
@@ -1031,6 +1051,33 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     cudaEventRecord(ev_join_, sh_cs_);
                 };
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                const bool pk_z = gdnf_fork && sh_hi_ != nullptr && (dec_pk_mask() & 2);
+                if (pk_z) {   // STRATA_DEC_PK & 2: z at the greatest priority beside qkv, then the one-launch recurrence
+                    cudaEventRecord(ev_fork_, cs);
+                    cudaStreamWaitEvent(sh_hi_, ev_fork_, 0);
+                    {
+                        PdlScope pz(pdl, true);
+                        native_mmvq(wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, sh_hi_);
+                    }
+                    cudaEventRecord(ev_join_, sh_hi_);
+                    native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
+                    stamp(l, 2, grp);
+                    DecRecArgs ra;
+                    ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
+                    ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+                    ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
+                    ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
+                    ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                    cudaStreamWaitEvent(cs, ev_join_, 0);
+                    for (int i = 3; i <= 5; ++i) stamp(l, i, grp);
+                    {
+                        PdlScope pr(pdl, true);   // after the join
+                        dec_gdn_rec(ra, n, cs);
+                    }
+                    stamp(l, 6, grp);
+                    native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                    goto gdn_done;
+                }
                 if (gdnf_fork && gdnf == 3) gdnf_z_side();
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
@@ -1332,10 +1379,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }();
         const bool sh_fork = !shx && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
-        cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
+        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) ? sh_hi_ : sh_cs_) : cs;
         if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
-            cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+            cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
@@ -1441,7 +1488,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
             }
-            if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
+            if (sh_fork) cudaEventRecord(ev_join_, sh_stream);
             }
         }
         if (dm) {}   // the route kernel wrote nat_xq_
@@ -1787,7 +1834,7 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "\n");
     }
 #endif
-    const cudaError_t ie = cudaGraphInstantiate(&exec_[T], graph, 0);
+    const cudaError_t ie = cudaGraphInstantiateWithFlags(&exec_[T], graph, dec_pk() ? cudaGraphInstantiateFlagUseNodePriority : 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
         if (pdl_try) return retry_plain(cudaGetErrorString(ie));
