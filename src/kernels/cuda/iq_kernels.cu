@@ -1658,8 +1658,9 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     }
 }
 
-// native_down_kernel with the entries taken GRP_NC at a time
-template<int TD>
+// native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent
+// (STRATA_DEC_GU2=2) - the block's first group's weight rows are prefetched into L2 before the wait.
+template<int TD, bool DEP = false>
 __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
@@ -1668,6 +1669,14 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                                                                 float* __restrict__ out) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
+    if constexpr (DEP) {
+        const int rows = L.n_ff == 640 ? (TD == 20 ? 32 : TD == 42 ? 16 : 8) : 8;
+        const int r0 = blockIdx.x * rows, nr = min(rows, (int) L.n_embd - r0);
+        const uint8_t* p = (const uint8_t*) grp_ptr[blockIdx.y] + L.down_off + (size_t) r0 * L.d_row;
+        for (int o = threadIdx.x * 128; o < nr * (int) L.d_row; o += 256 * 128)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
+        pdl_wait();
+    }
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
     if constexpr (TD == 20) {
@@ -2199,6 +2208,12 @@ bool g_stage_grid = [] {
 bool g_nc6 = env_on("STRATA_IQ_NC6");
 // STRATA_GU_STAGE=1: the grouped gate/up kernel reads the group's activations from shared memory (the same bits)
 bool g_gu_stage = env_on("STRATA_GU_STAGE");
+// STRATA_DEC_GU2=1: the grid formats' gate/up rows two a warp (native_gu2_kernel); 2: also the SwiGLU pass inside
+// the down kernel (native_down2_kernel).  The same bits.
+int g_gu2 = [] { const char* v = std::getenv("STRATA_DEC_GU2"); return v ? std::atoi(v) : 0; }();
+// STRATA_DEC_GY (with STRATA_DEC_GU2=2; default 24): the most block rows a grouped call launches when its caller
+// leaves grid_groups to it (more groups take the stride; the same bits)
+int g_dec_gy = [] { const char* v = std::getenv("STRATA_DEC_GY"); return v ? std::atoi(v) : 24; }();
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 // STRATA_GU_MMA=1: IQ3_XXS gate/up on int8 tensor cores, sm_80+ (the same bits; not with STRATA_GROUPED_V1); =2:
 // only for the calls whose caller asks (native_grouped_set_mma_hint), e.g. windows of several entries per expert
@@ -2303,6 +2318,10 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
     }
 }
 
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#include "gu2.cuh"
+#endif
+
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
@@ -2313,6 +2332,13 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
             const dim3 gm((unsigned) (2 * L.n_ff / kGmRows), grid.y);
             native_gu_mma_kernel<<<gm, 256, gu_mma_smem(L.n_embd), s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L,
                                                                          gate, up);
+            return;
+        }
+    }
+    if constexpr (kGu2<TG>) {
+        if (allow_mma && g_gu2 && !g_old_kernels && gu2_usable(L)) {
+            const dim3 g2((unsigned) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS), grid.y);
+            native_gu2_kernel<TG><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
             return;
         }
     }
@@ -2343,15 +2369,19 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
-                 float* out) {
+                 float* out, bool dep = false) {
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    else if (dep) launch_dependent(native_down_multi_kernel<TD, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+#endif
     else native_down_multi_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
 
 }  // namespace
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
+void native_grouped_set_gu2(int mode) { g_gu2 = mode; }
 bool iq_old_kernels() { return g_old_kernels; }
 #if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count
@@ -3057,7 +3087,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const bool v1 = g_grouped_v1;
-    const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    const bool chain = g_gu2 >= 2 && !v1 && !g_old_kernels;   // STRATA_DEC_GU2=2: SwiGLU and down as dependents
+#else
+    const bool chain = false;
+#endif
+    int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+    if (chain && grid_groups <= 0 && g_dec_gy > 0 && gy > g_dec_gy) gy = g_dec_gy;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
 #if defined(STRATA_HIP_GFX906)
     const int em0 = exp_mode();
@@ -3131,6 +3167,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (sw_v1) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    } else if (chain) {
+#if !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+        launch_dependent(swiglu_q8_1_entries_pdl_kernel, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
+                         (const float*) up, grp_start, n_groups, (int) L.n_ff, hq);
+#endif
     } else {
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
                                                                                 (int) L.n_ff, hq);
@@ -3165,7 +3206,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #undef STRATA_D_AMD
 #endif
     switch (L.d_type) {
-#define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+#define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, chain); break;
         STRATA_D_FMTS(STRATA_DOWN)
 #undef STRATA_DOWN
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);

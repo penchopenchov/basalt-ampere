@@ -76,6 +76,7 @@ struct DmPeerArgs {
     void* scratch = nullptr;                     ///< peer device: dec_moe_peer_scratch_bytes
     unsigned int* arrive = nullptr;              ///< peer device: monotonic arrival counter
     unsigned long long* stamps_m = nullptr;      ///< tests: block 0's phase times per ring (8 each), or null
+    int gu2 = 0;                                 ///< the grid formats' gate/up two rows a warp (STRATA_DEC_GU2 sets it)
 };
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff);
 /// Blocks the peer kernel runs with on the current device (all co-resident); 0 when it cannot run there.
