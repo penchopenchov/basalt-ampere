@@ -126,6 +126,33 @@ __global__ void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t
     }
 }
 
+// quantize_q8_0_scaled_kernel with a warp per block (a lane per value): the same amax (max is exact in any order),
+// scale and rounding, so the same bytes and scales
+__global__ void quantize_q8_0_scaled_warp_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
+                                                 float* __restrict__ scales, long long n_blocks) {
+    const long long b = ((long long) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (b >= n_blocks) return;
+    const float xv = x[b * QK8_0 + lane];
+    float amax = fabsf(xv);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float s = amax > 0.f ? amax / 127.f : 0.f;
+    const float inv = s > 0.f ? 1.f / s : 0.f;
+    uint8_t* out = blocks + b * 34;
+    if (lane == 0) {
+        scales[b] = s;
+        const uint16_t d16bits = f16_from_f32(s);
+        out[0] = (uint8_t) (d16bits & 0xFF);
+        out[1] = (uint8_t) (d16bits >> 8);
+    }
+    const float t = xv * inv;
+    const float r = t + (t >= 0.f ? 0.5f : -0.5f);
+    int v = (int) r;
+    v = v < -127 ? -127 : (v > 127 ? 127 : v);
+    out[2 + lane] = (uint8_t) (int8_t) v;
+}
+
 __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x,
                                     long long n_blocks) {
     const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -253,9 +280,16 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
         std::exit(1);
     }
     const long long nb = n / QK8_0;
-    const int threads = 128;
-    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    quantize_q8_0_scaled_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, blocks, scales, nb);
+    // STRATA_DEC_DRAFT >= 2: a warp per block (the same bytes)
+    static const bool warp = [] { const char* e = std::getenv("STRATA_DEC_DRAFT"); return e && std::atoi(e) >= 2; }();
+    if (warp) {
+        const unsigned grid = (unsigned) ((nb * 32 + 255) / 256);
+        quantize_q8_0_scaled_warp_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, blocks, scales, nb);
+    } else {
+        const int threads = 128;
+        const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+        quantize_q8_0_scaled_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, blocks, scales, nb);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "quantize_q8_0_scaled launch: %s\n", cudaGetErrorString(e));

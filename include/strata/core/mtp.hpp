@@ -108,7 +108,8 @@ private:
     /// reuse_row: the full layer's row 0 from the catch-up's row *row_ (STRATA_MTP_REUSE_ROW; full, T == 1)
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool reuse_row = false);
     void record_hidden(const float* R, int T, uint8_t* xq, cudaStream_t cs);
-    void end_branches();   ///< joins an open branch and clears the STRATA_DEC_DRAFT=2 recording state
+    void end_branches();
+    void l2_window();   ///< joins an open branch and clears the STRATA_DEC_DRAFT=2 recording state
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     /// all_rows: copy every step / position record (the chain's too) and the min_p bits, for a graph without per-step
@@ -171,6 +172,7 @@ private:
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
+    uint64_t dense_bytes_ = 0;
     uint8_t* experts_ = nullptr;
     void* state_arena_ = nullptr;
     QsaState st_;

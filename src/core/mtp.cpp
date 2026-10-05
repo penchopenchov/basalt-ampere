@@ -257,6 +257,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         vram_ += blob.size();
+        dense_bytes_ = blob.size();
     }
     // ---- the 512 routed experts, one blob each
     {
@@ -376,9 +377,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
+    // STRATA_DRAFT_PRIO=1: the draft streams at the highest priority (their blocks go first beside other graphs)
+    int prio = 0;
+    if (env_on("STRATA_DRAFT_PRIO")) {
+        int least = 0;
+        cudaDeviceGetStreamPriorityRange(&least, &prio);
+    }
+    if (cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio) != cudaSuccess) { err = "mtp: stream"; return false; }
     if (dec_draft_par() &&
-        (cudaStreamCreateWithFlags(&cs2_, cudaStreamNonBlocking) != cudaSuccess ||
+        (cudaStreamCreateWithPriority(&cs2_, cudaStreamNonBlocking, prio) != cudaSuccess ||
          cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
          cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess)) {
         err = "mtp: second stream";
@@ -506,6 +513,37 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
 }
 }  // namespace
 
+// STRATA_DRAFT_L2=<MiB>: up to that much of the draft layer's dense weights (STRATA_DRAFT_L2_HEAD=1: of the draft
+// head's base rows) stay in L2 between its reads - an access policy window on the draft streams with persisting hits,
+// the hit ratio what the set-aside holds
+void MtpDrafter::l2_window() {
+    const char* e = std::getenv("STRATA_DRAFT_L2");
+    if (e == nullptr || std::atoi(e) <= 0) return;
+    const bool head = env_on("STRATA_DRAFT_L2_HEAD") && dhead_ != nullptr;
+    void* base = head ? (void*) dhead_ : (void*) dense_;
+    const size_t bytes = head ? (size_t) n_tier1_ * (size_t) head_->row_bytes() : (size_t) dense_bytes_;
+    if (base == nullptr || bytes == 0) return;
+    int maxp = 0, maxw = 0;
+    cudaDeviceGetAttribute(&maxp, cudaDevAttrMaxPersistingL2CacheSize, device_);
+    cudaDeviceGetAttribute(&maxw, cudaDevAttrMaxAccessPolicyWindowSize, device_);
+    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, std::min<size_t>((size_t) std::atoi(e) << 20, (size_t) maxp));
+    size_t got = 0;
+    cudaDeviceGetLimit(&got, cudaLimitPersistingL2CacheSize);
+    cudaStreamAttrValue v{};
+    v.accessPolicyWindow.base_ptr = base;
+    v.accessPolicyWindow.num_bytes = std::min<size_t>(bytes, (size_t) maxw);
+    v.accessPolicyWindow.hitRatio = std::min(1.0f, (float) got / (float) v.accessPolicyWindow.num_bytes);
+    v.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    v.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(cs_, cudaStreamAttributeAccessPolicyWindow, &v);
+    if (cs2_) cudaStreamSetAttribute(cs2_, cudaStreamAttributeAccessPolicyWindow, &v);
+    std::fprintf(stderr, "strata mtp: STRATA_DRAFT_L2: %.0f of %.0f MiB of the %s persist in L2 (set-aside %.0f MiB, "
+                         "max %d MiB, window max %d MiB): %s\n",
+                 v.accessPolicyWindow.hitRatio * (double) v.accessPolicyWindow.num_bytes / 1048576.0,
+                 (double) bytes / 1048576.0, head ? "draft head" : "dense weights", (double) got / 1048576.0, maxp >> 20,
+                 maxw >> 20, cudaGetErrorString(cudaGetLastError()));
+}
+
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err) {
     const OnDevice on_device(device_);
     wt_ = &wt;
@@ -566,6 +604,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         cudaDeviceSynchronize();
         vram_ += b;
     }
+    l2_window();
     return true;
 }
 
