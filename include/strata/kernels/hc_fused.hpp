@@ -8,11 +8,11 @@
 //   mixed[d] = mean_c xn[c,d] * sigmoid(w_up[c*n_embd + d] . lo),  R <- R'
 //   logits = w_router . mixed,  (ids, weights) = top-10 of softmax(logits)   (when w_router)
 //
-// One CTA per SM; the CTAs split into roles and hand data on through counters in global memory instead of kernel
-// boundaries: the first 4T CTAs normalize (token, stream) pairs, 81 CTAs run the down projection (four rows each,
-// weights and activations streamed through a shared-memory ring), the other CTAs hold their slice of w_up in shared
-// memory (bulk copies issued at launch) and run the up projection, then every CTA takes a few router rows and the
-// last one to finish runs the top-10.  Every value is computed with the operations, and in the order, of the kernels
+// One CTA per SM; the work is a queue of items in dependency order, handed on through counters in global memory
+// instead of kernel boundaries: the norm of (token, stream) pairs, 81 down items (four rows each, weights and
+// activations streamed through a shared-memory ring), one up item per remaining CTA (its slice of w_up bulk-copied
+// into shared memory) and 81 router items, the last of which runs the top-10.  A CTA claims items in order and waits
+// only on earlier items, so the read finishes even when other work holds some of the SMs.  Every value is computed with the operations, and in the order, of the kernels
 // it replaces (fused_gr.cu's read, the BF16 MMVF router GEMV and the native top-10), so the outputs are the same bits.
 //
 // `pf` / `pf_bytes`: up to four ranges (e.g. the next read's weights) prefetched into L2 once this read is done.
@@ -56,11 +56,13 @@ bool hc_fused_supported();
 void hc_fused_read(const HcFusedArgs& a, void* stream);
 /// Prefetch byte ranges into L2 with a one-CTA kernel (bulk prefetches; no data moves to the SMs).
 void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* stream);
-/// The bench's knob (-1 = leave): hold = the weight streams start once the norm's inputs have landed (1, the default;
-/// STRATA_DEC_HC_HOLD=0 in the engine) or at launch (0).
-void hc_fused_set_knobs(int hold);
-/// The bench only: per-CTA phase times (globaltimer ns) into dbg[nb][8]: start, after the dependency wait, role input
-/// ready, role done, router input ready, router rows done, top-10 done (last CTA), exit.  nullptr = off.
+/// The bench only: per-CTA phase times (globaltimer ns) into dbg[nb][16]: start, after the dependency wait, down/up
+/// input ready, down/up done, router input ready, router rows done, top-10 done (last CTA), exit; [15] = 1 for a CTA
+/// that ran a down item, 2 for an up item.  nullptr = off.
 void hc_fused_set_debug(unsigned long long* dbg);
+
+/// Tests only: k CTAs, one per SM, that hold their SM until *go (mapped host memory) is nonzero; each adds one to
+/// *started once running.
+void hc_test_hold_sms(int k, int* go, int* started, void* stream);
 
 }  // namespace strata::kernels

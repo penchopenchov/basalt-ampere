@@ -17,9 +17,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <array>
+#include <chrono>
+#include <string>
 #include <vector>
 
 namespace K = strata::kernels;
+
 
 static uint16_t bf16(float x) {
     uint32_t u;
@@ -222,9 +226,7 @@ int main(int argc, char** argv) {
 
     // time: hot (back to back) and cold (192 MB written before each read, then R, bo and w_norm rewritten as the
     // previous kernels leave them; the read alone timed)
-    for (int hold = 1; hold >= 0; --hold) {
-    K::hc_fused_set_knobs(hold);
-    std::printf("weight streams %s:\n", hold ? "after the norm's inputs (hold)" : "at launch");
+    {
     for (int T = t_lo; T <= t_hi; ++T)
         for (int router = 0; router < 2; ++router) {
             const double bytes = 2.0 * LR * D * 2 + HC * D * 2 + (router ? (double) NE * N * 2 : 0.0);
@@ -257,7 +259,6 @@ int main(int argc, char** argv) {
                         bytes / cold[1] / 1e3);
         }
     }
-    K::hc_fused_set_knobs(1);
 
     // per-phase times of single reads (globaltimer, relative to the first CTA's start)
     {
@@ -267,9 +268,9 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &ddbg, (size_t) sms * 16 * 8);
         std::vector<unsigned long long> h((size_t) sms * 16);
         static const char* const ph[8] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit"};
-        for (int T : {1, 2, 3, 8}) {
+        for (int T : {1, 2, 3}) {
             if (T < t_lo || T > t_hi) continue;
-            for (int cold = 0; cold < 2; ++cold) {
+            for (int cold = 1; cold < 2; ++cold) {
                 for (int i = 0; i < 3; ++i) run(1, T, true, true, true);
                 if (cold) evict(1, 1);
                 cudaMemsetAsync(ddbg, 0, (size_t) sms * 128, s);
@@ -280,13 +281,13 @@ int main(int argc, char** argv) {
                 cudaMemcpy(h.data(), ddbg, h.size() * 8, cudaMemcpyDeviceToHost);
                 unsigned long long t0 = ~0ull;
                 for (int b = 0; b < sms; ++b) if (h[b * 16] && h[b * 16] < t0) t0 = h[b * 16];
-                std::printf("T %d %s phases (us, min/max over CTAs; down CTAs 0..80 | up CTAs 81..):\n", T, cold ? "cold" : "hot");
+                std::printf("T %d %s phases (us, min/max over CTAs; CTAs with a down item | with an up item):\n", T, cold ? "cold" : "hot");
                 for (int grp = 0; grp < 2; ++grp) {
                     std::printf("  %s:", grp ? "up  " : "down");
                     for (int i = 0; i < 8; ++i) {
                         double mn = 1e30, mx = -1;
-                        for (int b = grp ? 81 : 0; b < (grp ? sms : 81); ++b) {
-                            if (!h[b * 16 + i]) continue;
+                        for (int b = 0; b < sms; ++b) {
+                            if ((h[b * 16 + 15] == 2) != (grp == 1) || !h[b * 16 + i]) continue;
                             const double v = (double) (h[b * 16 + i] - t0) / 1e3;
                             mn = v < mn ? v : mn; mx = v > mx ? v : mx;
                         }
@@ -294,13 +295,51 @@ int main(int argc, char** argv) {
                     }
                     std::printf("\n");
                 }
-                for (int b = 0; b < sms; ++b)
-                    if (h[b * 16 + 6])
-                        std::printf("  top-10 CTA %d: ticket %.2f loads %.2f softmax %.2f select %.2f us after its rows\n", b,
-                                    (h[b * 16 + 8] - h[b * 16 + 5]) / 1e3, (h[b * 16 + 9] - h[b * 16 + 8]) / 1e3,
-                                    (h[b * 16 + 10] - h[b * 16 + 9]) / 1e3, (h[b * 16 + 6] - h[b * 16 + 10]) / 1e3);
             }
         }
+    }
+    // co-residency: k SMs held by another stream's kernel until the read is done (as a spin kernel waiting on a host
+    // that waits on the read would); the read must still finish
+    {
+        int* h_go = nullptr;
+        int* h_started = nullptr;
+        cudaHostAlloc((void**) &h_go, 64, cudaHostAllocMapped);
+        cudaHostAlloc((void**) &h_started, 64, cudaHostAllocMapped);
+        int *d_go, *d_started;
+        cudaHostGetDevicePointer((void**) &d_go, h_go, 0);
+        cudaHostGetDevicePointer((void**) &d_started, h_started, 0);
+        cudaStream_t sb;
+        cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking);
+        const char* e = std::getenv("HC_BLOCK");
+        std::string bs = e ? e : "2:4,2:100,2:165,6:4,6:100,8:169";
+        size_t p0 = 0;
+        int stuck = 0;
+        while (p0 < bs.size()) {
+            size_t p1 = bs.find(',', p0);
+            if (p1 == std::string::npos) p1 = bs.size();
+            int T = 2, k = 0;
+            std::sscanf(bs.substr(p0, p1 - p0).c_str(), "%d:%d", &T, &k);
+            p0 = p1 + 1;
+            *(volatile int*) h_go = 0;
+            *(volatile int*) h_started = 0;
+            reset(1);
+            K::hc_test_hold_sms(k, d_go, d_started, sb);
+            auto t0 = std::chrono::steady_clock::now();
+            while (*(volatile int*) h_started < k && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2)) {}
+            const int held = *(volatile int*) h_started;
+            t0 = std::chrono::steady_clock::now();
+            run(1, T, true, true, true);
+            bool done = false;
+            while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3))
+                if (cudaStreamQuery(s) == cudaSuccess) { done = true; break; }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            *(volatile int*) h_go = 1;
+            cudaDeviceSynchronize();
+            stuck += done ? 0 : 1;
+            std::printf("co-residency T %d, %d SMs held: %s (%.2f ms)\n", T, held, done ? "finished" : "STUCK until released", ms);
+        }
+        std::printf("hc_fused_parity: %d stuck reads\n", stuck);
+        failures += stuck;
     }
     return failures ? 1 : 0;
 }
