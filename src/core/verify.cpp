@@ -313,6 +313,47 @@ void Verifier::trace_dump(std::FILE* f) const {
     std::fflush(f);
 }
 
+std::string Verifier::dm_note() const {
+    const DecMoe* d = dm_;
+    if (d == nullptr) return "";
+    auto rd = [](const uint32_t* p) { return *(const volatile uint32_t*) p; };
+    const uint32_t seq = rd(h_seq_);
+    std::string s = "; device plan: ring " + std::to_string(seq) + " published";
+    if (seq >= 1 && (int64_t) seq <= d->rings) {
+        const strata::kernels::DmRing& r = d->h_ring[seq - 1];
+        s += " (entries: VRAM " + std::to_string(r.n_vram) + ", peer " + std::to_string(r.n_peer) + ", CPU " +
+             std::to_string(r.n_cpu) + ")";
+    }
+    s += ", host flag " + std::to_string(rd(h_flag_));
+    if (d->pdev >= 0) {
+        const uint32_t w = rd(d->h_w + 0), done = rd(d->h_w + 16);
+        std::string st = "not launched";
+        if (d->peer_live) {
+            const OnDevice on(d->pdev);
+            const cudaError_t q = cudaStreamQuery(d->ps);
+            st = q == cudaErrorNotReady ? "running" : q == cudaSuccess ? "finished" : cudaGetErrorString(q);
+        }
+        s += "; peer card: rung for ring " + std::to_string(w & 0xffffu) + ((w >> 28) & 1u ? " (with entries)" : "") +
+             ", finished ring " + std::to_string(done) + ", its kernel " + st;
+    }
+    return s;
+}
+
+// After release_gpu_waits: whether the peer window ended once its doorbell was raised (it waited for CUDA0) or
+// still runs (it is stuck inside a ring).
+std::string Verifier::peer_released() {
+    DecMoe* d = dm_;
+    if (d == nullptr || d->pdev < 0 || !d->peer_live) return "";
+    const OnDevice on(d->pdev);
+    const Clock::time_point t0 = Clock::now();
+    cudaError_t q;
+    while ((q = cudaStreamQuery(d->ps)) == cudaErrorNotReady && ms_since(t0) < 2000)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (q == cudaErrorNotReady) return "; the peer kernel still runs after the release";
+    d->peer_live = false;
+    return q == cudaSuccess ? "; the peer kernel finished once released" : std::string("; the peer kernel: ") + cudaGetErrorString(q);
+}
+
 void Verifier::diag(std::FILE* f) const {
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
     // #251: outside a verify stage these are the LAST window's numbers (it finished), not the stalled work's
@@ -321,6 +362,7 @@ void Verifier::diag(std::FILE* f) const {
     std::fprintf(f, "  verify window%s: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
                     "served %u, plan (A) %u, copies (B) %u\n", current ? "" : " (last window, not the current stage)",
                  last_t_, (long long) last_pos0_, cur_layer_ + 1, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
+    if (dm_ != nullptr) std::fprintf(f, "  %s\n", dm_note().c_str() + 2);
     trace_dump(f);   // #649: STRATA_VERIFY_TRACE=1 only
 }
 
@@ -2041,14 +2083,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             if (now - a > std::chrono::seconds(20)) {
                 // #267: the caller ends the engine; no spin kernel may outlive it
                 trace_ev("TIMEOUT", k, l, (int64_t) cudaStreamQuery(cs_));
-                if (g_trace) {
-                    diag(stderr);   // the words and the breadcrumbs before the release ...
-                    const bool drained = release_gpu_waits(5000);
-                    trace_dump(stderr);   // ... and after it: did the GPU move once its waits were raised?
-                    err = "verify: timed out at layer " + std::to_string(l) + released_note(drained);
-                    return false;
-                }
-                err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+                const std::string words = dm_note();   // read before the release overwrites them
+                if (g_trace) diag(stderr);   // the words and the breadcrumbs before the release ...
+                const bool drained = release_gpu_waits(5000);
+                if (g_trace) trace_dump(stderr);   // ... and after it: did the GPU move once its waits were raised?
+                err = "verify: timed out at layer " + std::to_string(l) + words + released_note(drained) + peer_released();
                 return false;
             }
         }
