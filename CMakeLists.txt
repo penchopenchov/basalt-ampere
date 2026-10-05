@@ -332,6 +332,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
+                          src/kernels/cuda/dec_gdn_mm.cu
+                          src/kernels/cuda/dec_gdn_rec.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
@@ -384,6 +386,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       src/kernels/cuda/native_qsa_score.cu
       src/kernels/cuda/qsa_dec_fused.cu
       src/kernels/cuda/q5k_head.cu
+      src/kernels/cuda/dec_gdn_mm.cu
       PROPERTIES COMPILE_OPTIONS "$<IF:$<BOOL:${STRATA_HIP_GFX906}>,,--use_fast_math>")
   elseif(STRATA_ENABLE_HIP)
     # Keep Q8_K's multiply and magic-bias rounding as separate FP32 operations on HIP; contraction to an
@@ -652,6 +655,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME mmvq_multi_parity_cuda_layout COMMAND mmvq_multi_parity)
       set_tests_properties(mmvq_multi_parity_cuda_layout PROPERTIES ENVIRONMENT "STRATA_MMVQ_WAVE=0")
     endif()
+  endif()
+  if(STRATA_ENABLE_CUDA)
+    # the STRATA_DEC_GDN block against the per-stage verify kernels, bitwise (synthetic, GPU, no model; --bench)
+    add_executable(dec_gdn_parity src/kernels/dec_gdn_parity.cpp)
+    target_include_directories(dec_gdn_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(dec_gdn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME dec_gdn_parity COMMAND dec_gdn_parity)
+    set_tests_properties(dec_gdn_parity PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # the IQ kernels that decode a weight part once for every column/entry, bitwise vs the per-column ones
   # (GPU, synthetic, no model; --bench adds old/new timings)
