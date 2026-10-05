@@ -123,7 +123,7 @@ const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // STRATA_DEC_COMMIT: 1 = the commit graph in two launches; 2 = its GDN part from STRATA_DEC_COMMIT_CTAS persistent
-// blocks (default 32) so it trickles beside the draft; 3 = launched after the draft (flush_commit) instead of beside it
+// blocks (default 32) so it trickles beside the draft instead of filling the card
 int dec_commit_mode() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_COMMIT"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -1893,7 +1893,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (!capture(T, err) || !capture_commit(err) || !flush_commit(err)) return false;
+    if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     DecodeGaps& gm = decode_gaps();
     gm.mark(11);
@@ -2259,12 +2259,6 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         h_commit_[1] = n_keep - 1;
         for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (g_commit_async && next_ == nullptr && dec_commit_mode() == 3) {   // launched by flush_commit
-            commit_deferred_ = true;
-            decode_gaps().mark(4);
-            ms_commit += ms_since(t0);
-            return true;
-        }
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
@@ -2290,21 +2284,7 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
     return next_ == nullptr || next_->commit(n_keep, err, parts);
 }
 
-bool Verifier::flush_commit(std::string& err) {
-    if (!commit_deferred_) return next_ == nullptr || next_->flush_commit(err);
-    const OnDevice on_device(device_);
-    commit_deferred_ = false;
-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
-    if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    const cudaError_t re = cudaEventRecord(commit_done_, cs_);
-    if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
-    (void) cudaStreamQuery(cs_);
-    commit_pending_ = true;
-    return next_ == nullptr || next_->flush_commit(err);
-}
-
 bool Verifier::wait_commit(std::string& err) {
-    if (!flush_commit(err)) return false;
     if (commit_pending_) {
         const OnDevice on_device(device_);
         commit_pending_ = false;
@@ -2537,7 +2517,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
-    if (!flush_commit(err) || !stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[batch_key(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -2644,7 +2624,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
-    if (!flush_commit(err) || !stage_batch(rows, S, base, tokens, pos, err)) return false;
+    if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[batch_key(rows, S, base)], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[batch_key(rows, S, base)], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }

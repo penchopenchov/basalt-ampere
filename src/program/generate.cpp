@@ -7283,7 +7283,6 @@ int main(int argc, char** argv) {
                         mtp.set_launch_hook(nullptr);
                     }
                     if (!after_ran) after_launch();
-                    if (commit_ok) commit_ok = ver.flush_commit(cerr);   // STRATA_DEC_COMMIT=3: behind the draft
                     {
                         const Clock::time_point tw3 = Clock::now();
                         auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
