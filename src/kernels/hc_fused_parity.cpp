@@ -267,10 +267,11 @@ int main(int argc, char** argv) {
         unsigned long long* ddbg = nullptr;
         cudaMalloc((void**) &ddbg, (size_t) sms * 16 * 8);
         std::vector<unsigned long long> h((size_t) sms * 16);
-        static const char* const ph[8] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit"};
+        static const char* const ph[15] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit",
+                                           "ticket", "up-lo", "norm-wr", "norm-sig", "t10-smax", "t10-cand", "t10-rank"};
         for (int T : {1, 2, 3}) {
             if (T < t_lo || T > t_hi) continue;
-            for (int cold = 1; cold < 2; ++cold) {
+            for (int cold = 0; cold < 2; ++cold) {
                 for (int i = 0; i < 3; ++i) run(1, T, true, true, true);
                 if (cold) evict(1, 1);
                 cudaMemsetAsync(ddbg, 0, (size_t) sms * 128, s);
@@ -284,7 +285,8 @@ int main(int argc, char** argv) {
                 std::printf("T %d %s phases (us, min/max over CTAs; CTAs with a down item | with an up item):\n", T, cold ? "cold" : "hot");
                 for (int grp = 0; grp < 2; ++grp) {
                     std::printf("  %s:", grp ? "up  " : "down");
-                    for (int i = 0; i < 8; ++i) {
+                    for (int i = 0; i < 15; ++i) {
+                        if (i >= 10 && i <= 11) continue;
                         double mn = 1e30, mx = -1;
                         for (int b = 0; b < sms; ++b) {
                             if ((h[b * 16 + 15] == 2) != (grp == 1) || !h[b * 16 + i]) continue;

@@ -581,7 +581,7 @@ __device__ __forceinline__ float warp_sum16(float (&v)[16], int lane) {
 // lane 2m runs the epilogue of value m.
 template <int P>
 __device__ __forceinline__ void up_pass(const UpSmem& u, const uint4* U, int nc, int p0, const float (&rs_mine)[HC],
-                                        int lane, int warp) {
+                                        int lane, int warp, unsigned long long* dbg = nullptr, int b = 0) {
     constexpr int G = 16 / P;
     float4 l0[P][2], l1[P][2];
     const int j1 = lane < LR / 8 - 32 ? 32 + lane : 32;
@@ -621,6 +621,7 @@ __device__ __forceinline__ void up_pass(const UpSmem& u, const uint4* U, int nc,
             const float x = u.px[idx] * rsc;
             u.g[idx] = x * sigmoidf_(sum);
         }
+        if (dbg != nullptr) stamp(dbg, b, gi == warp ? 12 : 13, warp * 32 + lane);
     }
 }
 
@@ -654,9 +655,10 @@ __device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem
     __syncthreads();
     stamp(dbg, b, 9, tid);
     const uint4* U = reinterpret_cast<const uint4*>(smem);
-    up_pass<P1>(u, U, nc, 0, rs1, lane, warp);
+    up_pass<P1>(u, U, nc, 0, rs1, lane, warp, dbg, b);
     if constexpr (P2 > 0) up_pass<(P2 > 0 ? P2 : 1)>(u, U, nc, P1, rs2, lane, warp);
     __syncthreads();
+    stamp(dbg, b, 4, tid);
     for (int i = tid; i < T * nc; i += THREADS) {
         const int k = i / nc, col = i - k * nc;
         float s = 0.0f;
@@ -664,6 +666,7 @@ __device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem
         for (int c = 0; c < HC; ++c) s += u.g[(k * HC + c) * nc + col];
         a.mixed[(size_t) k * N + c0 + col] = s / (float) HC;
     }
+    stamp(dbg, b, 5, tid);
 }
 
 // warp_sum16 with the flush-to-zero adds of a fast-math build (mmvf_warp_sum)
@@ -858,10 +861,10 @@ __device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand, 
 template <int T>
 struct Items {
     int ncopy, ntask, nu, down, up, rt, end;
-    __device__ Items(int nb, bool router) {
+    __device__ Items(int nb, int nu_, bool router) {
         ncopy = nb / (4 * T) < NCOPY ? nb / (4 * T) : NCOPY;
         ntask = 4 * T * ncopy;
-        nu = nb - ND;
+        nu = nu_ > 0 ? nu_ : nb - ND;
         down = ntask;
         up = down + ND;
         rt = up + nu;
@@ -880,7 +883,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     const int b = blockIdx.x, tid = threadIdx.x, nb = L.nb;
     unsigned long long* dbg = L.dbg;
     HcSync* sy = &g_hc_sync[L.slot];
-    const Items<T> it(nb, a.w_router != nullptr);
+    const Items<T> it(nb, L.nu, a.w_router != nullptr);
     stamp(dbg, b, 0, tid);
     if (tid == 0) {
         for (int p = 0; p <= UP_PIECES; ++p) mbar_init(&bars[p], 1);
@@ -908,6 +911,10 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 1;
             cta_wait(&sy->nload.v, (unsigned) it.ntask, tid);   // weight reads queued ahead of the norm's would delay it
             hc_down_prologue<T, RING_CAP>(a, d, tid, smem);
+            if (L.pf == 1 && tid == 0 && a.w_router != nullptr) {   // the router rows into L2 behind the down weights
+                const size_t r16 = (size_t) NE * N * 2 / 16, q0 = (size_t) d * r16 / ND, q1 = (size_t) (d + 1) * r16 / ND;
+                prefetch_l2(reinterpret_cast<const char*>(a.w_router) + q0 * 16, (q1 - q0) * 16);
+            }
             cta_wait(&sy->norm.v, (unsigned) it.ntask, tid);
             stamp(dbg, b, 2, tid);
             hc_down_main<T, RING_CAP>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D, d, tid, smem);
@@ -1144,8 +1151,8 @@ constexpr KernelFn kKernels[MAXT] = {hc_fused_kernel<1>, hc_fused_kernel<2>, hc_
 constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel<2>, hc_fused_sk_kernel<3>,
                                         hc_fused_sk_kernel<4>, hc_fused_sk_kernel<5>, hc_fused_sk_kernel<6>,
                                         hc_fused_sk_kernel<7>, hc_fused_sk_kernel<8>};
-// STRATA_DEC_HC_SK=1: the split-K read; STRATA_DEC_HC_SK_PF=1: its down CTAs prefetch the up and router weights into
-// L2; STRATA_DEC_HC_SK_NU=<n>: its up slices
+// STRATA_DEC_HC_SK=1: the split-K read.  STRATA_DEC_HC_RPF=1: the down CTAs prefetch the router rows (and, split-K,
+// w_up) into L2 behind their weights.  STRATA_DEC_HC_NU=<n>: the up slices (the down CTAs take the ones past nb - 81).
 struct SkConf {
     bool on = false;
     int pf = 0, nu = 0;
@@ -1155,9 +1162,9 @@ const SkConf& sk_conf() {
         SkConf k;
         const char* e = std::getenv("STRATA_DEC_HC_SK");
         k.on = e && e[0] == '1';
-        e = std::getenv("STRATA_DEC_HC_SK_PF");
+        e = std::getenv("STRATA_DEC_HC_RPF");
         k.pf = e ? std::atoi(e) : 0;
-        e = std::getenv("STRATA_DEC_HC_SK_NU");
+        e = std::getenv("STRATA_DEC_HC_NU");
         k.nu = e ? std::atoi(e) : 0;
         return k;
     }();
@@ -1345,6 +1352,8 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         cfg.numAttrs = na;
         if (cudaLaunchKernelEx(&cfg, fn, L) == cudaSuccess && pdl) ++pdl_count();
     } else {
+        L.nu = sk.nu >= MIN_NU && sk.nu <= L.nb ? sk.nu : 0;
+        L.pf = sk.pf;
         launch_pdl(kKernels[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM, (cudaStream_t) stream, L);
     }
     const cudaError_t e = cudaGetLastError();
