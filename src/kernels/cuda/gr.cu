@@ -24,6 +24,7 @@
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
 
@@ -354,6 +355,20 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
                      ws.bytes, gr_workspace_bytes(s));
         std::exit(1);
     }
+#if !defined(__HIPCC__)
+    {   // matrices with 8-bit copies (STRATA_DEC_HC8): the read on the copies
+        FusedGrArgs fa;
+        fa.R = R; fa.apply = false; fa.w_norm = w_norm; fa.w_down = w_down; fa.w_up = w_up; fa.w_inject = w_inject;
+        fa.eps = eps; fa.lo = ws.lo; fa.rs = ws.gated; fa.inject_out = inject; fa.mixed = mixed;
+        if (hc8_gr_read_multi(&fa, 1, s.n_embd, s.hc, stream)) {
+            if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) {
+                std::fprintf(stderr, "gr_read: the 8-bit read failed\n");
+                std::exit(1);
+            }
+            return;
+        }
+    }
+#endif
     const int n_embd = (int) s.n_embd, hc = (int) s.hc, hc_lr = (int) s.hc_lr;
     const int hc_dim = (int) (s.hc * s.n_embd);
     cudaStream_t st = (cudaStream_t) stream;

@@ -67,6 +67,24 @@ void hc8_prepare(const uint16_t* w, int rows, int cols);
 bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes = nullptr);
 /// Bytes held by the 8-bit copies.
 size_t hc8_bytes();
+/// STRATA_DEC_HC8=1 with the bf16 matrices dropped from VRAM (not with STRATA_DEC_HC_SK=1, whose read is bf16 only;
+/// STRATA_DEC_HC8_KEEP=1 keeps them beside the copies).
+bool hc8_only();
+/// Quantize the bf16 matrix staged at w (the caller frees it afterwards) and register the copy under the copy's own
+/// address, which stands for the matrix from then on: every reader resolves it with hc8_view.  nullptr: no VRAM.
+const void* hc8_adopt(const uint16_t* w, int rows, int cols);
+/// An 8-bit copy as its readers see it: q [rows][cols], f16 scales [rows][srow] (cols / 32 used).  `owned`: the key
+/// is the copy itself (no bf16 matrix behind it).
+struct Hc8View {
+    const int8_t* q = nullptr;
+    const uint16_t* s = nullptr;
+    int rows = 0, cols = 0, srow = 0;
+    size_t bytes = 0;
+    bool owned = false;
+};
+bool hc8_view(const void* w, Hc8View& v);
+/// Rows [row0, row0 + n) of w's copy as bf16 (q * scale rounded once), row-major `cols` per row, on `stream`.
+void hc8_dequant_bf16(const Hc8View& v, int64_t row0, int64_t n, uint16_t* out, void* stream);
 
 /// Allocate the read's scratch on the current device (outside a stream capture, once).
 void hc_fused_init();

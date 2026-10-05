@@ -1941,37 +1941,25 @@ struct Hc8Copy {
     int8_t* q = nullptr;   // then the scales, in the same allocation
     uint16_t* s = nullptr;
     size_t bytes = 0;
+    int rows = 0, cols = 0, srow = 0;
+    bool owned = false;    // keyed by q itself: no bf16 matrix behind it
 };
 std::mutex g_hc8_mu;
 std::unordered_map<const void*, Hc8Copy> g_hc8;
 size_t g_hc8_bytes = 0;
 
-}  // namespace
-
-bool hc8_enabled() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_DEC_HC8"); return e && e[0] == '1'; }();
-    return on;
-}
-
-void hc8_prepare(const uint16_t* w, int rows, int cols) {
-    if (w == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return;
-    std::lock_guard<std::mutex> lk(g_hc8_mu);
-    if (g_hc8.count(w)) return;
-    int dev = 0;
-    cudaPointerAttributes pa{};
-    cudaGetDevice(&dev);
-    if (cudaPointerGetAttributes(&pa, w) != cudaSuccess || pa.type != cudaMemoryTypeDevice || pa.device != dev) {
-        cudaGetLastError();
-        return;   // another card's matrix: its reads stay bf16
-    }
+// the copy of the bf16 matrix w (device memory of the current card); false when there is no VRAM for it
+bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
     const int64_t n = (int64_t) rows * cols, groups = n / G8;
     const int gpr = cols / G8, srow = (gpr + 7) & ~7;
-    Hc8Copy c;
     c.bytes = (size_t) n + (size_t) rows * srow * 2;
+    c.rows = rows;
+    c.cols = cols;
+    c.srow = srow;
     if (cudaMalloc((void**) &c.q, c.bytes) != cudaSuccess) {
         cudaGetLastError();
-        std::fprintf(stderr, "strata hc8: no VRAM for an 8-bit copy (%zu bytes); that read stays bf16\n", c.bytes);
-        return;
+        std::fprintf(stderr, "strata hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
+        return false;
     }
     c.s = reinterpret_cast<uint16_t*>(c.q + n);
     cudaMemset(c.s, 0, (size_t) rows * srow * 2);
@@ -1986,8 +1974,67 @@ void hc8_prepare(const uint16_t* w, int rows, int cols) {
         cudaFree(derr);
         std::fprintf(stderr, "strata hc8: %d x %d: relative rms error %.3e\n", rows, cols, std::sqrt(h[1] / h[0]));
     }
+    return true;
+}
+
+__global__ void hc8_dequant_bf16_kernel(const int8_t* q, const uint16_t* s, int cols, int srow, int64_t row0, int64_t n,
+                                        uint16_t* out) {
+    const int64_t i = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) * 8;   // 8 values, one scale group
+    if (i >= n * cols) return;
+    const int64_t r = row0 + i / cols;
+    const int k = (int) (i % cols);
+    const float sc = __half2float(__ushort_as_half(s[r * srow + k / G8]));
+    const uint2 w = *reinterpret_cast<const uint2*>(q + r * cols + k);
+    uint16_t o[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int v = (int) (int8_t) ((j < 4 ? w.x : w.y) >> (8 * (j & 3)));
+        o[j] = __bfloat16_as_ushort(__float2bfloat16_rn((float) v * sc));
+    }
+    *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<const uint4*>(o);
+}
+
+}  // namespace
+
+bool hc8_enabled() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DEC_HC8"); return e && e[0] == '1'; }();
+    return on;
+}
+
+bool hc8_only() {
+    static const bool on = [] {
+        const char* k = std::getenv("STRATA_DEC_HC8_KEEP");
+        return hc8_enabled() && !sk_conf().on && !(k && k[0] == '1');
+    }();
+    return on;
+}
+
+void hc8_prepare(const uint16_t* w, int rows, int cols) {
+    if (w == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return;
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    if (g_hc8.count(w)) return;
+    int dev = 0;
+    cudaPointerAttributes pa{};
+    cudaGetDevice(&dev);
+    if (cudaPointerGetAttributes(&pa, w) != cudaSuccess || pa.type != cudaMemoryTypeDevice || pa.device != dev) {
+        cudaGetLastError();
+        return;   // another card's matrix: its reads stay bf16
+    }
+    Hc8Copy c;
+    if (!hc8_make(w, rows, cols, c)) return;   // that read stays bf16
     g_hc8[w] = c;
     g_hc8_bytes += c.bytes;
+}
+
+const void* hc8_adopt(const uint16_t* w, int rows, int cols) {
+    if (w == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return nullptr;
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    Hc8Copy c;
+    if (!hc8_make(w, rows, cols, c)) return nullptr;
+    c.owned = true;
+    g_hc8[c.q] = c;
+    g_hc8_bytes += c.bytes;
+    return c.q;
 }
 
 bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes) {
@@ -1998,6 +2045,22 @@ bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* byt
     *s = it->second.s;
     if (bytes != nullptr) *bytes = it->second.bytes;
     return true;
+}
+
+bool hc8_view(const void* w, Hc8View& v) {
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    const auto it = g_hc8.find(w);
+    if (it == g_hc8.end()) return false;
+    const Hc8Copy& c = it->second;
+    v.q = c.q; v.s = c.s; v.rows = c.rows; v.cols = c.cols; v.srow = c.srow; v.bytes = c.bytes; v.owned = c.owned;
+    return true;
+}
+
+void hc8_dequant_bf16(const Hc8View& v, int64_t row0, int64_t n, uint16_t* out, void* stream) {
+    if (n <= 0) return;
+    const int64_t units = n * v.cols / 8;
+    hc8_dequant_bf16_kernel<<<(unsigned) ((units + 255) / 256), 256, 0, (cudaStream_t) stream>>>(v.q, v.s, v.cols, v.srow,
+                                                                                              row0, n, out);
 }
 
 size_t hc8_bytes() {
@@ -2147,7 +2210,14 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
             q8 = h.q_up != nullptr && h.s_down != nullptr && h.s_up != nullptr &&
                  (a.w_inject == nullptr || (h.q_inject != nullptr && h.s_inject != nullptr));
         }
-        if (!q8) { h.q_down = nullptr; h.q_up = nullptr; h.q_inject = nullptr; }
+        if (!q8) {
+            Hc8View v;
+            if ((hc8_view(a.w_down, v) && v.owned) || (hc8_view(a.w_up, v) && v.owned)) {
+                std::fprintf(stderr, "hc_fused_read: a matrix held only as its 8-bit copy needs the 8-bit read\n");
+                std::exit(1);
+            }
+            h.q_down = nullptr; h.q_up = nullptr; h.q_inject = nullptr;
+        }
         if (a.w_inject == nullptr) h.q_inject = nullptr;
     }
     const bool q8 = L.a.q_down != nullptr;

@@ -483,4 +483,12 @@ const WeightRef* WeightTable::find(const std::string& name) const {
     return it == table_.end() ? nullptr : &it->second;
 }
 
+bool WeightTable::rebind(const std::string& name, const void* data) {
+    const auto it = table_.find(name);
+    if (it == table_.end() || data == nullptr) return false;
+    it->second.data = data;
+    it->second.resident = true;
+    return true;
+}
+
 }  // namespace strata::core
