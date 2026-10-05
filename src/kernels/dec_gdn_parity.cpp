@@ -240,7 +240,7 @@ void run_gdnf(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, in
             if (fork && g_gdnf == 2) z_side();
             dec_gdn_rec_split(a, T, s);
             if (fork) CK(cudaStreamWaitEvent(s, g_join, 0));
-            PdlScope pn(true, fork);
+            PdlScope pn(true, fork && std::getenv("GDNF_JOIN_PDL") == nullptr);
             dec_gdn_rec_norm(a, T, s);
         }
     }
