@@ -22,6 +22,7 @@
 // SOFTWARE.
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/dec_moe.hpp"
+#include "strata/kernels/pdl.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
@@ -91,8 +92,10 @@ namespace {
 __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                   const DmPlan* __restrict__ plan, const float* __restrict__ weights,
                                   const float* __restrict__ shared, float* __restrict__ output, int64_t n_embd, int k,
-                                  const volatile uint32_t* peer_done, const volatile uint32_t* host_flag, uint32_t ring) {
+                                  const volatile uint32_t* peer_done, const volatile uint32_t* host_flag, uint32_t ring,
+                                  int early) {
     __shared__ int s_kind[16];
+    if (early) pdl_launch_dependents();   // the next hc read may stage its weights
     const int64_t tk = blockIdx.y;
     if (threadIdx.x == 0 && peer_done != nullptr) {
         if (plan->counts[2] > 0) while (*peer_done < ring) __nanosleep(100);
@@ -127,7 +130,8 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         throw std::invalid_argument("dec_moe_combine requires a stream, width, 1..15 experts, tokens");
     dm_combine_kernel<<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0,
                         static_cast<cudaStream_t>(stream)>>>(parts, peer_rows_m, cpu_rows_m, plan, weights, shared,
-                                                             output, n_embd, int(k), peer_done_m, host_flag_m, ring);
+                                                             output, n_embd, int(k), peer_done_m, host_flag_m, ring,
+                                                             pdl2_mask() & 32);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
