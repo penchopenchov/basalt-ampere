@@ -54,10 +54,12 @@ struct DecRecArgs {
     float* gate = nullptr;           // token t at gate + t * h_v
     float* beta = nullptr;
     float* y = nullptr;              // optional fp32 output, token t at y + t * h_v * S
+    float* o = nullptr;              // dec_gdn_rec_split: the raw (pre-norm) output, laid out as y
     void* yq = nullptr;              // q8_1 of the output, token t at block t * h_v * S / 32
     int C = 0, n_embd = 0, h_k = 0, h_v = 0;
     float eps = 0.0f;
     unsigned long long* stamps = nullptr;   // bench: 10 per-phase timestamps per block
+    bool early_trigger = true;   // let the next kernel launch once the constants are loaded
 };
 
 /// The recurrence of tokens [0, n_tok) from the untouched state; one cluster of four blocks per value head.
@@ -67,5 +69,16 @@ void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream);
 /// math with fewer roundings, not its bits; a column still does not depend on T).
 int dec_gdn_mode();
 bool dec_gdn_enabled();
+
+/// dec_gdn_rec in two launches: the split kernel (conv, gates, recurrence; never reads z) writes the raw output to
+/// a.o, dec_gdn_rec_norm applies the gated RMS norm and writes a.yq (and a.y); the same bits as dec_gdn_rec.  The z
+/// projection can run beside the split kernel.
+void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream);
+void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream);
+
+/// STRATA_DEC_GDNF: the verify window's GDN block around native q8_1 + qkv/z/out projections.  1: dec_gdn_rec after
+/// z.  2: dec_gdn_rec_split beside z (z forked after qkv), then dec_gdn_rec_norm.  3: as 2 with z forked after the
+/// q8_1, beside qkv too.
+int dec_gdnf_mode();
 
 }  // namespace strata::kernels

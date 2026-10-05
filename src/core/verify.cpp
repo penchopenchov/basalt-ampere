@@ -971,9 +971,50 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     dec_dense(xq_, (int) ZV, n, DecMat{wout->native_type, wout->native_data, (int) N, bo_ + tb * N}, cs);
                     goto gdn_done;
                 }
+                // STRATA_DEC_GDNF: conv, gates, recurrence, gated norm and the output's q8_1 in dec_gdn_rec's one or
+                // two launches; at 2/3 the z projection runs on the side stream beside the recurrence (dec_gdn.hpp)
+                {
+                const int gdnf = (!batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT) ? dec_gdnf_mode() : 0;
+                const bool gdnf_fork = gdnf >= 2 && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
+                auto gdnf_z_side = [&] {
+                    cudaEventRecord(ev_fork_, cs);
+                    cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+                    PdlScope pz(pdl, true);
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, sh_cs_);
+                    cudaEventRecord(ev_join_, sh_cs_);
+                };
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                if (gdnf_fork && gdnf == 3) gdnf_z_side();
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
+                if (gdnf) {
+                    DecRecArgs ra;
+                    ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
+                    ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+                    ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
+                    ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
+                    ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                    ra.early_trigger = false;   // the native out projection does nothing before its wait
+                    if (gdnf_fork) {
+                        if (gdnf == 2) gdnf_z_side();
+                        ra.o = y_;
+                        dec_gdn_rec_split(ra, n, cs);
+                        for (int i = 3; i <= 5; ++i) stamp(l, i, grp);
+                        cudaStreamWaitEvent(cs, ev_join_, 0);
+                        PdlScope pn(pdl, true);   // the norm follows the join
+                        dec_gdn_rec_norm(ra, n, cs);
+                        stamp(l, 6, grp);
+                        native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                    } else {
+                        native_mmvq(wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, cs);
+                        for (int i = 3; i <= 5; ++i) stamp(l, i, grp);
+                        dec_gdn_rec(ra, n, cs);
+                        stamp(l, 6, grp);
+                        native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                    }
+                    goto gdn_done;
+                }
+                }
                 if (batch_rec_) {   // each row from its own slot's conv history, one row each
                     for (int t = tb; t < te; ++t) {
                         SessionState& sx = slot_ss(t);
