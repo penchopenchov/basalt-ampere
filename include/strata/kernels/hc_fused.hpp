@@ -56,8 +56,9 @@ bool hc_fused_supported();
 void hc_fused_read(const HcFusedArgs& a, void* stream);
 /// Prefetch byte ranges into L2 with a one-CTA kernel (bulk prefetches; no data moves to the SMs).
 void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* stream);
-/// Tuning knobs for the bench (-1 = leave): up_early = issue w_up's bulk copies at launch (1) or after the norm (0).
-void hc_fused_set_knobs(int up_early);
+/// The bench's knob (-1 = leave): hold = the weight streams start once the norm's inputs have landed (1, the default;
+/// STRATA_DEC_HC_HOLD=0 in the engine) or at launch (0).
+void hc_fused_set_knobs(int hold);
 /// The bench only: per-CTA phase times (globaltimer ns) into dbg[nb][8]: start, after the dependency wait, role input
 /// ready, role done, router input ready, router rows done, top-10 done (last CTA), exit.  nullptr = off.
 void hc_fused_set_debug(unsigned long long* dbg);

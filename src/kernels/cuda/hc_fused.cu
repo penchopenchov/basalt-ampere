@@ -31,20 +31,23 @@ constexpr int NSTAGE = D / (QB * 256);   // 10
 constexpr int STAGE_W = ROWS * QB * 32 * 16;   // weight bytes per stage (8 KB)
 constexpr int STAGE_X1 = QB * 256 * 4;         // activation bytes per stage and token (4 KB)
 constexpr int SMEM = 98 * 1024;      // dynamic shared memory per CTA
+constexpr int RING_CAP = 3;          // down stages in flight: the weight streams stay just deep enough for full bandwidth
+constexpr int UP_PIECES = 8;         // w_up slice copies (stream, half), two in flight
+constexpr int RT_MAX_ROWS = (NE + ND - 1) / ND;   // router rows per down CTA
 constexpr int MIN_NU = 86;           // up CTAs needed for an up slice (30 columns at most) to fit SMEM
 static_assert(D % (QB * 256) == 0, "whole stages");
 
 constexpr int NCOPY = 8;             // copies of xn: the down CTAs read different copies, spreading the L2 load
 
 struct HcSync {
-    unsigned norm, down, up, router, exit, pad[11];
+    unsigned norm, down, up, router, exit, nload, pad[10];
 };
 __device__ HcSync g_hc_sync;
 
 struct HcLaunch {
     HcFusedArgs a;
     int nb;          // CTAs (one per SM)
-    int up_early;    // w_up bulk copies at launch (1) or after the norm (0)
+    int hold;        // weight streams start once the norm's inputs have landed (1) or at launch (0)
     float* xc;       // the copies of xn, [NCOPY][MAXT][D]
     unsigned long long* dbg;   // bench only: per-CTA phase times [nb][16]
 };
@@ -70,6 +73,12 @@ __device__ __forceinline__ void mbar_wait0(uint64_t* bar) {
         asm volatile("{ .reg .pred p; mbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
                      : "=r"(done) : "r"(smem_u32(bar)) : "memory");
     }
+}
+__device__ __forceinline__ bool mbar_test0(uint64_t* bar) {
+    unsigned done;
+    asm volatile("{ .reg .pred p; mbarrier.test_wait.parity.shared::cta.b64 p, [%1], 0; selp.u32 %0, 1, 0, p; }"
+                 : "=r"(done) : "r"(smem_u32(bar)) : "memory");
+    return done != 0;
 }
 __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, unsigned bytes, uint64_t* bar) {
     asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
@@ -210,7 +219,7 @@ __device__ __forceinline__ void hc_norm_pre(const HcFusedArgs& a, int c, int tid
 }
 // Task (t, c, cp) writes copy cp of xn; copy 0 also writes rs.
 __device__ void hc_norm_task(const HcFusedArgs& a, float* xc, int t, int c, int cp, int tid, const NormRegs& nr,
-                             float* part, float* s_rs) {
+                             float* part, float* s_rs, unsigned* nload) {
     const int lane = tid & 31, warp = tid >> 5;
     const float* R = a.R + (size_t) t * D;
     const float* bo = a.bo_prev + (size_t) t * N;
@@ -239,6 +248,7 @@ __device__ void hc_norm_task(const HcFusedArgs& a, float* xc, int t, int c, int 
     const float v = warp_sum(ss);
     if (lane == 0) part[warp] = v;
     __syncthreads();
+    if (tid == 0) atomicAdd(nload, 1u);   // this task's inputs are in: the weight streams may start
     if (tid == 0) {
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w) s += part[w];
@@ -263,7 +273,8 @@ template <int T>
 struct Ring {
     static constexpr int BYTES = STAGE_W + T * STAGE_X1;
     static constexpr int S0 = SMEM / BYTES;
-    static constexpr int S = S0 > NSTAGE ? NSTAGE : S0;   // stages in flight
+    static constexpr int S1 = S0 > NSTAGE ? NSTAGE : S0;
+    static constexpr int S = S1 > RING_CAP ? RING_CAP : S1;   // stages in flight
 };
 __device__ __forceinline__ const uint16_t* down_rows(const HcFusedArgs& a, int b) {
     return b < ND - 1 ? a.w_down + (size_t) b * ROWS * D : a.w_inject;
@@ -286,16 +297,12 @@ __device__ __forceinline__ void down_issue_x(const float* xn, int s, char* slot,
     }
 }
 
-// Before the dependency wait: the weights of the first S stages (one cp.async group), and an L2 prefetch of the rest
-// of the CTA's rows.
+// The weights of the first S stages (one cp.async group).
 template <int T>
 __device__ void hc_down_prologue(const HcFusedArgs& a, int b, int tid, char* ring) {
     constexpr int S = Ring<T>::S;
     const uint16_t* w = down_rows(a, b);
     if (w == nullptr) return;
-    if (tid == 0 && S < NSTAGE)
-        for (int r = 0; r < ROWS; ++r)
-            prefetch_l2(w + (size_t) r * D + (size_t) S * 1024, (size_t) (NSTAGE - S) * 1024 * 2);
 #pragma unroll
     for (int s = 0; s < S; ++s) down_issue_w(w, s, ring + s * Ring<T>::BYTES, tid);
     cp_async_commit();
@@ -365,11 +372,31 @@ __device__ __forceinline__ UpSlice up_slice(int u, int nu) {
     const int c0 = u * N / nu, c1 = (u + 1) * N / nu;
     return {c0, c1 - c0};
 }
-__device__ void hc_up_issue(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bar) {
-    const unsigned row_bytes = LR * 2, bytes = (unsigned) sl.nc * row_bytes;
-    mbar_expect_tx(bar, 4 * bytes);
-    for (int c = 0; c < HC; ++c)
-        bulk_g2s(smem + (size_t) c * bytes, a.w_up + ((size_t) c * N + sl.c0) * LR, bytes, bar);
+// Piece p of the slice's w_up rows (stream p / 2, half p % 2) into shared memory, completing on bars[p].
+__device__ void hc_up_piece(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, int p) {
+    const unsigned bytes = (unsigned) sl.nc * LR * 2, half = bytes / 2;
+    const int c = p >> 1, h = p & 1;
+    mbar_expect_tx(&bars[p], half);
+    bulk_g2s(smem + (size_t) c * bytes + h * half, reinterpret_cast<const char*>(a.w_up + ((size_t) c * N + sl.c0) * LR) + h * half,
+             half, &bars[p]);
+}
+// Thread 0 of an up CTA: the w_up pieces, two in flight (after `nload` reaches `n_in` when that is nonzero), while
+// watching for the down projection to finish.
+__device__ void hc_up_stream(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, const unsigned* nload,
+                             unsigned n_in, const unsigned* down) {
+    if (n_in) while (ld_acquire(nload) < n_in) {}
+    hc_up_piece(a, sl, smem, bars, 0);
+    hc_up_piece(a, sl, smem, bars, 1);
+    int issued = 2, landed = 0;
+    bool down_ok = false;
+    while (landed < UP_PIECES || !down_ok) {
+        if (landed < issued && mbar_test0(&bars[landed])) {
+            ++landed;
+            if (issued < UP_PIECES) hc_up_piece(a, sl, smem, bars, issued++);
+        }
+        if (!down_ok) down_ok = ld_acquire(down) >= (unsigned) ND;
+    }
+    __threadfence();
 }
 
 // Shared memory of an up CTA: [w_up rows 4 nc x 640 B][lo T x LR][rp T x 4 x nc: R'][px T x 4 x nc: R' * w_norm]
@@ -468,7 +495,7 @@ __device__ __forceinline__ void up_pass(const UpSmem& u, const uint4* U, int nc,
 
 // fused_gr.cu gr_up_multi_kernel's rows, epilogue and mean for this slice.
 template <int T>
-__device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, uint64_t* bar) {
+__device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem) {
     const int lane = tid & 31, warp = tid >> 5, nc = sl.nc, c0 = sl.c0;
     const UpSmem u = up_smem(smem, nc, T);
     for (int i = tid; i < T * LR; i += THREADS) u.lo[i] = __ldcg(a.lo + i);
@@ -489,7 +516,6 @@ __device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem
         }
     }
     __syncthreads();
-    mbar_wait0(bar);
     const uint4* U = reinterpret_cast<const uint4*>(smem);
     up_pass<P1>(u, U, nc, 0, rs1, lane, warp);
     if constexpr (P2 > 0) up_pass<(P2 > 0 ? P2 : 1)>(u, U, nc, P1, rs2, lane, warp);
@@ -503,65 +529,94 @@ __device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem
     }
 }
 
-// Router rows [e0, e1): bf16_f32_mmvf_multi_kernel<256, *>'s per-row order with the whole CTA on each row.
+// warp_sum16 with the flush-to-zero adds of a fast-math build (mmvf_warp_sum)
+__device__ __forceinline__ float warp_sum16_ftz(float (&v)[16], int lane) {
+#pragma unroll
+    for (int o = 16, n = 8; o >= 2; o >>= 1, n >>= 1) {
+        const bool h = (lane & o) != 0;
+#pragma unroll
+        for (int j = 0; j < n; ++j) {
+            const float keep = h ? v[j + n] : v[j], send = h ? v[j] : v[j + n];
+            v[j] = add_ftz(keep, __shfl_xor_sync(0xffffffffu, send, o));
+        }
+    }
+    return add_ftz(v[0], __shfl_xor_sync(0xffffffffu, v[0], 1));
+}
+
+// Router rows [e0, e1) (at most RT_MAX_ROWS, their weights at wsm): bf16_f32_mmvf_multi_kernel<256, *>'s per-row
+// order - thread t's pairs t + 256 j, two ordered FMAs each, the warp's xor tree, then the tree over the 8 warp sums
+// and 24 zeros - for every row and token at once; the xor trees run 16 values at a time (warp_sum16_ftz).
 template <int T>
-__device__ void hc_router_rows(const HcFusedArgs& a, int e0, int e1, int tid, float* partials /* [4][T][32] */) {
-    const int lane = tid & 31, warp = tid >> 5;
+__device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0, int e1, int tid,
+                               float* partials /* [RT_MAX_ROWS * T][WARPS] */) {
+    const int lane = tid & 31, warp = tid >> 5, ne = e1 - e0;
     constexpr int PAIRS = N / 2 / THREADS;   // 5
-    for (int eb = e0; eb < e1; eb += 4) {
-        const int ne = e1 - eb < 4 ? e1 - eb : 4;
-        uint32_t wr[4][PAIRS];
+    constexpr int TG = T < 4 ? T : 4;        // tokens per pass
+    constexpr int NV = RT_MAX_ROWS * TG;     // values per lane per pass (28 at most: two rounds of 16)
+    for (int k0 = 0; k0 < T; k0 += TG) {
+        float2 x[TG][PAIRS];
 #pragma unroll
-        for (int e = 0; e < 4; ++e)
-#pragma unroll
-            for (int j = 0; j < PAIRS; ++j)
-                wr[e][j] = e < ne ? reinterpret_cast<const uint32_t*>(a.w_router + (size_t) (eb + e) * N)[tid + THREADS * j] : 0u;
-        float2 x[T][PAIRS];
-#pragma unroll
-        for (int k = 0; k < T; ++k)
+        for (int q = 0; q < TG; ++q)
 #pragma unroll
             for (int j = 0; j < PAIRS; ++j)
-                x[k][j] = __ldcg(reinterpret_cast<const float2*>(a.mixed + (size_t) k * N) + tid + THREADS * j);
-        if (tid < 32)
-            for (int i = 0; i < 4 * T; ++i) partials[i * 32 + tid] = 0.0f;
-        float acc[4][T];
+                x[q][j] = k0 + q < T ? __ldcg(reinterpret_cast<const float2*>(a.mixed + (size_t) (k0 + q) * N) + tid + THREADS * j)
+                                     : make_float2(0.f, 0.f);
+        float acc[32];
 #pragma unroll
-        for (int e = 0; e < 4; ++e)
+        for (int e = 0; e < RT_MAX_ROWS; ++e) {
+            uint32_t wr[PAIRS];
 #pragma unroll
-            for (int k = 0; k < T; ++k) {
-                acc[e][k] = 0.0f;
+            for (int j = 0; j < PAIRS; ++j)
+                wr[j] = e < ne ? reinterpret_cast<const uint32_t*>(wsm + (size_t) e * N)[tid + THREADS * j] : 0u;
+#pragma unroll
+            for (int q = 0; q < TG; ++q) {
+                float s = 0.0f;
 #pragma unroll
                 for (int j = 0; j < PAIRS; ++j) {
-                    const float w0 = __uint_as_float(wr[e][j] << 16), w1 = __uint_as_float(wr[e][j] & 0xffff0000u);
-                    acc[e][k] = fma_ftz(w0, x[k][j].x, acc[e][k]);
-                    acc[e][k] = fma_ftz(w1, x[k][j].y, acc[e][k]);
+                    const float w0 = __uint_as_float(wr[j] << 16), w1 = __uint_as_float(wr[j] & 0xffff0000u);
+                    s = fma_ftz(w0, x[q][j].x, s);
+                    s = fma_ftz(w1, x[q][j].y, s);
                 }
-            }
-        __syncthreads();
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            if (e >= ne) break;
-#pragma unroll
-            for (int k = 0; k < T; ++k) {
-                const float v = warp_sum_ftz(acc[e][k]);
-                if (lane == 0) partials[(e * T + k) * 32 + warp] = v;
+                acc[e * TG + q] = s;
             }
         }
-        __syncthreads();
-        if (tid < 32) {
-            for (int e = 0; e < ne; ++e)
 #pragma unroll
-                for (int k = 0; k < T; ++k) {
-                    const float v = warp_sum_ftz(partials[(e * T + k) * 32 + lane]);
-                    if (lane == 0) a.logits[(size_t) k * NE + eb + e] = v;
+        for (int i = NV; i < 32; ++i) acc[i] = 0.0f;
+        // the warp trees: value m of round r lands on lanes 2m, 2m + 1
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            float v[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) v[i] = acc[r * 16 + i];
+            const float sum = warp_sum16_ftz(v, lane);
+            const int m = r * 16 + (lane >> 1);
+            if ((lane & 1) == 0 && m < NV) partials[m * WARPS + warp] = sum;
+        }
+        __syncthreads();
+        // the tree over the warps: warp 0, lane l < 8 holds warp l's sum, the rest zeros
+        if (warp == 0) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                float v[16];
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const int m = r * 16 + i;
+                    v[i] = lane < WARPS && m < NV ? partials[m * WARPS + lane] : 0.0f;
                 }
+                const float sum = warp_sum16_ftz(v, lane);
+                const int m = r * 16 + (lane >> 1), e = m / TG, q = m - e * TG;
+                if ((lane & 1) == 0 && m < NV && e < ne && k0 + q < T) a.logits[(size_t) (k0 + q) * NE + e0 + e] = sum;
+            }
         }
         __syncthreads();
     }
 }
 
-// native_router.cu `route` for token k, on one warp.
-__device__ void hc_top10(const HcFusedArgs& a, int k, int lane) {
+// native_router.cu `route` for token k, on one warp, selecting by candidates instead of ten argmax passes.  The ten
+// passes pick, in order, the largest p with ties to the lower expert - a total order - so the same ten come out of:
+// theta = the 10th largest of the 32 lane maxima (every expert of the top ten is at least theta), then every expert
+// at least theta ranked by counting.  `cand` is shared memory for 2 * 512 + 2 * 10 words.
+__device__ void hc_top10(const HcFusedArgs& a, int k, int lane, uint32_t* cand) {
     const float* logits = a.logits + (size_t) k * NE;
     int32_t* ids = a.ids + (size_t) k * KT;
     float* weights = a.weights + (size_t) k * KT;
@@ -584,40 +639,79 @@ __device__ void hc_top10(const HcFusedArgs& a, int k, int lane) {
         values[i] = mul_ftz(values[i], reciprocal);
         if (isnan(values[i])) values[i] = -FLT_MAX;
     }
-    float selected = 0.0f, selected_sum = 0.0f;
-    unsigned taken = 0;   // bit i: values[i] already selected (now -inf)
-#pragma unroll 1
-    for (int rank = 0; rank < KT; ++rank) {
-        float best = (taken & 1u) ? -INFINITY : values[0];
-        int expert = lane;
+    // (v, e) before (v', e') when v > v' or (v == v' and e < e')
+    auto before = [](float v, int e, float v2, int e2) { return v > v2 || (v == v2 && e < e2); };
+    // the lane's maximum
+    float bv = values[0];
+    int be = lane;
 #pragma unroll
-        for (int i = 1; i < 16; ++i) {
-            const float v = (taken >> i & 1u) ? -INFINITY : values[i];
-            if (v > best) { best = v; expert = lane + i * 32; }
-        }
+    for (int i = 1; i < 16; ++i)
+        if (values[i] > bv) { bv = values[i]; be = lane + 32 * i; }
+    // theta: the lane maximum with exactly nine lane maxima before it
+    int rank = 0;
 #pragma unroll
-        for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
-            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
-        }
-        if ((expert & 31) == lane) {
-            taken |= 1u << (expert >> 5);
-            ids[rank] = expert;
-            selected_sum = add_ftz(selected_sum, best);
-        }
-        if (rank == lane) selected = best;
+    for (int m = 0; m < 32; ++m) {
+        const float ov = __shfl_sync(0xffffffffu, bv, m);
+        const int oe = __shfl_sync(0xffffffffu, be, m);
+        rank += before(ov, oe, bv, be) ? 1 : 0;
     }
+    const unsigned at9 = __ballot_sync(0xffffffffu, rank == KT - 1);
+    const int src = __ffs(at9) - 1;
+    const float tv = __shfl_sync(0xffffffffu, bv, src);
+    const int te = __shfl_sync(0xffffffffu, be, src);
+    // the candidates (not before theta is false), compacted into shared memory as (value bits, expert)
+    unsigned mine = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        if (!before(tv, te, values[i], lane + 32 * i)) mine |= 1u << i;
+    const int cnt = __popc(mine);
+    int off = cnt;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, off, o);
+        if (lane >= o) off += y;
+    }
+    const int total = __shfl_sync(0xffffffffu, off, 31);
+    off -= cnt;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        if (mine >> i & 1u) {
+            cand[2 * off] = __float_as_uint(values[i]);
+            cand[2 * off + 1] = (uint32_t) (lane + 32 * i);
+            ++off;
+        }
+    __syncwarp();
+    // rank every candidate; ranks 0..9 are the selection in order
+    float* top_v = reinterpret_cast<float*>(cand + 2 * NE);
+    int* top_e = reinterpret_cast<int*>(cand + 2 * NE + KT);
+    for (int c = lane; c < total; c += 32) {
+        const float v = __uint_as_float(cand[2 * c]);
+        const int e = (int) cand[2 * c + 1];
+        int r = 0;
+        for (int d = 0; d < total; ++d) r += before(__uint_as_float(cand[2 * d]), (int) cand[2 * d + 1], v, e) ? 1 : 0;
+        if (r < KT) { top_v[r] = v; top_e[r] = e; }
+    }
+    __syncwarp();
+    // route's sums: lane L adds, in rank order, the selected values of its experts (expert & 31 == L)
+    float selected_sum = 0.0f;
+#pragma unroll
+    for (int r = 0; r < KT; ++r)
+        if ((top_e[r] & 31) == lane) selected_sum = add_ftz(selected_sum, top_v[r]);
+    const float selected = lane < KT ? top_v[lane] : 0.0f;
+    const int sel_e = lane < KT ? top_e[lane] : 0;
     selected_sum = max_ftz(warp_sum_ftz(selected_sum), 6.103515625e-5f);
     const float inverse_selected_sum = rcp_ftz(selected_sum);
-    if (lane < KT) weights[lane] = mul_ftz(selected, inverse_selected_sum);
+    if (lane < KT) {
+        ids[lane] = sel_e;
+        weights[lane] = mul_ftz(selected, inverse_selected_sum);
+    }
 }
 
 // ---------------------------------------------------------------- the kernel
 template <int T>
 __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     extern __shared__ __align__(128) char smem[];
-    __shared__ __align__(8) uint64_t bar;
+    __shared__ __align__(8) uint64_t bars[UP_PIECES];
     __shared__ float part[WARPS];
     __shared__ float s_rs;
     __shared__ int s_last;
@@ -628,68 +722,71 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     HcSync* sy = &g_hc_sync;
     const bool is_down = b < ND;
     const UpSlice sl = is_down ? UpSlice{0, 0} : up_slice(b - ND, nu);
-    const int e0 = b * NE / nb, e1 = (b + 1) * NE / nb;
+    const int e0 = is_down ? b * NE / ND : 0, e1 = is_down ? (b + 1) * NE / ND : 0;   // router rows (down CTAs)
     // the norm tasks (token, stream, copy of xn) on the first CTAs
     const int ncopy = nb / (4 * T) < NCOPY ? nb / (4 * T) : NCOPY, ntask = 4 * T * ncopy;
     const bool norm_cta = b < ntask;
     stamp(dbg, b, 0, tid);
 
-    // constant data first, before the previous kernel is waited on
+    // constant data first, before the previous kernel is waited on (with `hold`, the weight streams wait for the
+    // norm's inputs instead: weight reads queued ahead of them would delay the norm, which everything waits on)
     NormRegs nr;
     if (norm_cta) hc_norm_pre(a, b & 3, tid, nr);
-    if (is_down) {
-        hc_down_prologue<T>(a, b, tid, smem);
-    } else if (tid == 0) {
-        mbar_init(&bar, 1);
-        if (L.up_early) {
-            hc_up_issue(a, sl, smem, &bar);
-            if (a.w_router) prefetch_l2(a.w_router + (size_t) e0 * N, (size_t) (e1 - e0) * N * 2);
-        }
-    }
+    if (tid == 0)
+        for (int p = 0; p < UP_PIECES; ++p) mbar_init(&bars[p], 1);
+    if (!L.hold && is_down) hc_down_prologue<T>(a, b, tid, smem);
     __syncthreads();
     pdl_wait();
     stamp(dbg, b, 1, tid);
 
     if (norm_cta) {
-        hc_norm_task(a, L.xc, (b >> 2) % T, b & 3, b / (4 * T), tid, nr, part, &s_rs);
+        hc_norm_task(a, L.xc, (b >> 2) % T, b & 3, b / (4 * T), tid, nr, part, &s_rs, &sy->nload);
         cta_signal(&sy->norm, tid);
     }
     if (is_down) {
+        if (L.hold) {
+            cta_wait(&sy->nload, (unsigned) ntask, tid);
+            hc_down_prologue<T>(a, b, tid, smem);
+        }
         cta_wait(&sy->norm, (unsigned) ntask, tid);
         stamp(dbg, b, 2, tid);
         hc_down_main<T>(a, L.xc + (size_t) (b % ncopy) * MAXT * D, b, tid, smem);
         cta_signal(&sy->down, tid);
         stamp(dbg, b, 3, tid);
-        if (a.w_router && tid == 0 && !L.up_early) prefetch_l2(a.w_router + (size_t) e0 * N, (size_t) (e1 - e0) * N * 2);
+        if (a.w_router && tid == 0) {   // this CTA's router rows into shared memory while the up projection runs
+            const unsigned bytes = (unsigned) (e1 - e0) * N * 2;
+            mbar_expect_tx(&bars[0], bytes);
+            bulk_g2s(smem, a.w_router + (size_t) e0 * N, bytes, &bars[0]);
+        }
     } else {
         hc_up_pre<T>(a, sl, tid, smem);
-        if (!L.up_early) {
-            cta_wait(&sy->norm, (unsigned) ntask, tid);
-            if (tid == 0) {
-                hc_up_issue(a, sl, smem, &bar);
-                if (a.w_router) prefetch_l2(a.w_router + (size_t) e0 * N, (size_t) (e1 - e0) * N * 2);
-            }
-        }
-        cta_wait(&sy->down, (unsigned) ND, tid);
+        if (tid == 0) hc_up_stream(a, sl, smem, bars, &sy->nload, L.hold ? (unsigned) ntask : 0u, &sy->down);
+        __syncthreads();
         stamp(dbg, b, 2, tid);
-        hc_up_main<T>(a, sl, tid, smem, &bar);
+        hc_up_main<T>(a, sl, tid, smem);
         cta_signal(&sy->up, tid);
         stamp(dbg, b, 3, tid);
     }
 
-    if (a.w_router) {
+    if (a.w_router && is_down) {
         cta_wait(&sy->up, (unsigned) nu, tid);
+        mbar_wait0(&bars[0]);
         stamp(dbg, b, 4, tid);
-        hc_router_rows<T>(a, e0, e1, tid, reinterpret_cast<float*>(smem));
+        hc_router_rows<T>(a, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid,
+                          reinterpret_cast<float*>(smem + RT_MAX_ROWS * N * 2));
         stamp(dbg, b, 5, tid);
         __syncthreads();
         if (tid == 0) {
             __threadfence();
-            s_last = atomicAdd(&sy->router, 1u) == (unsigned) nb - 1;
+            s_last = atomicAdd(&sy->router, 1u) == (unsigned) ND - 1;
             if (s_last) __threadfence();
         }
         __syncthreads();
-        if (s_last && (tid >> 5) < T) hc_top10(a, tid >> 5, tid & 31);
+        if (s_last) stamp(dbg, b, 8, tid);
+        if (s_last && (tid >> 5) < T)
+            hc_top10(a, tid >> 5, tid & 31,
+                     reinterpret_cast<uint32_t*>(smem + RT_MAX_ROWS * N * 2 + RT_MAX_ROWS * MAXT * WARPS * 4) +
+                         (tid >> 5) * (2 * NE + 2 * KT));
         if (s_last) { __syncthreads(); stamp(dbg, b, 6, tid); }
     }
 
@@ -707,7 +804,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     if (tid == 0) {
         __threadfence();
         if (atomicAdd(&sy->exit, 1u) == (unsigned) nb - 1) {
-            sy->norm = 0; sy->down = 0; sy->up = 0; sy->router = 0; sy->exit = 0;
+            sy->norm = 0; sy->down = 0; sy->up = 0; sy->router = 0; sy->nload = 0; sy->exit = 0;
             __threadfence();
         }
     }
@@ -730,7 +827,7 @@ using KernelFn = void (*)(HcLaunch);
 constexpr KernelFn kKernels[MAXT] = {hc_fused_kernel<1>, hc_fused_kernel<2>, hc_fused_kernel<3>, hc_fused_kernel<4>,
                                      hc_fused_kernel<5>, hc_fused_kernel<6>, hc_fused_kernel<7>, hc_fused_kernel<8>};
 
-int g_up_early = -1;
+int g_hold = -1;
 unsigned long long* g_dbg = nullptr;
 
 struct DevInfo {
@@ -769,8 +866,8 @@ const DevInfo& dev_info() {
 bool hc_fused_supported() { return dev_info().ok; }
 void hc_fused_init() { (void) dev_info(); }
 
-void hc_fused_set_knobs(int up_early) {
-    if (up_early >= 0) g_up_early = up_early;
+void hc_fused_set_knobs(int hold) {
+    if (hold >= 0) g_hold = hold;
 }
 void hc_fused_set_debug(unsigned long long* dbg) { g_dbg = dbg; }
 
@@ -782,11 +879,11 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         std::fprintf(stderr, "hc_fused_read: invalid arguments or unsupported device\n");
         std::exit(1);
     }
-    static const int env_up_early = [] { const char* v = std::getenv("STRATA_DEC_HC_UP_EARLY"); return v ? std::atoi(v) : 1; }();
+    static const int env_hold = [] { const char* v = std::getenv("STRATA_DEC_HC_HOLD"); return v ? std::atoi(v) : 1; }();
     HcLaunch L;
     L.a = a;
     L.nb = d.sms;
-    L.up_early = g_up_early >= 0 ? g_up_early : env_up_early;
+    L.hold = g_hold >= 0 ? g_hold : env_hold;
     L.xc = d.xc;
     L.dbg = g_dbg;
     launch_pdl(kKernels[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM, (cudaStream_t) stream, L);
