@@ -20,14 +20,15 @@ namespace strata::kernels {
 struct QsaDecKvPost {
     float* kcur = nullptr;              ///< [n][n_head_kv][head_dim], normed and rotated in place
     const float* vcur = nullptr;        ///< [n][n_head_kv][head_dim]
-    const int32_t* pos_k = nullptr;     ///< [n][n_head_kv] rotary positions of the K rows
+    const int32_t* pos_k = nullptr;     ///< [n][pos_stride] rotary positions of the K rows
+    int pos_stride = 0;                 ///< 0: n_head_kv
     const float* k_norm = nullptr;      ///< [head_dim]
     const int32_t* steps = nullptr;     ///< [n][kStepCount]: each row's cell at kStepPos
     int8_t *k_q = nullptr, *v_q = nullptr;
     uint16_t *k_scale = nullptr, *v_scale = nullptr;
     const int32_t* page_table = nullptr;
     KvHostPools host;                   ///< the host copy, when the cache streams
-    const float* idx_raw = nullptr;     ///< [n][idx_dim] raw indexer keys
+    const float* idx_raw = nullptr;     ///< [n][idx_dim] raw indexer keys; null: no indexer (a dense layer)
     const float* idx_k_norm = nullptr;  ///< [idx_dim]
     float *tail = nullptr, *dead = nullptr, *pooled = nullptr;
     int32_t* block_pos = nullptr;
@@ -41,7 +42,7 @@ struct QsaDecQPost {
     float* qcur = nullptr;              ///< [n][n_head][head_dim]
     const int32_t* pos_q = nullptr;     ///< [n][n_head]
     const float* q_norm = nullptr;      ///< [head_dim]
-    float* q_idx = nullptr;             ///< [n][idx_n_head][idx_dim], normed and rotated in place
+    float* q_idx = nullptr;             ///< [n][idx_n_head][idx_dim], normed and rotated in place; null: none
     const int32_t* pos_i = nullptr;     ///< [n][idx_n_head]
     const float* idx_q_norm = nullptr;  ///< [idx_dim]
     float eps = 1e-6f;

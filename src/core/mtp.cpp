@@ -21,6 +21,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_dec_attn.hpp"
+#include "strata/kernels/qsa_dec_fused.hpp"
 #include "strata/kernels/q5k_head.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
@@ -170,6 +171,7 @@ MtpDrafter::~MtpDrafter() {
     if (head_logits_) cudaFree(head_logits_);
     if (dhead_) cudaFree(dhead_);
     if (dvocab_) cudaFree(dvocab_);
+    if (top_scratch_) cudaFree(top_scratch_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
@@ -516,6 +518,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
+    if (dec_draft_on() && top_scratch_ == nullptr) {
+        const size_t b = strata::kernels::q5k_head_top1_scratch_bytes();
+        if (cudaMalloc(&top_scratch_, b) != cudaSuccess) { err = "mtp: the draft head's argmax scratch does not fit"; return false; }
+        cudaMemset(top_scratch_, 0, b);
+        cudaDeviceSynchronize();
+        vram_ += b;
+    }
     return true;
 }
 
@@ -586,6 +595,15 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
             native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
             native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
+            if (dec_draft_on() && st_.kv_int8 && !st_.kv_q4 && !st_.kv_rot && native_rope_enabled() &&
+                qsa_dec_fused_supported(s)) {   // the rows' K norm + RoPE and appends in one launch
+                QsaDecKvPost kp;
+                kp.kcur = kcur_; kp.vcur = vcur_; kp.pos_k = pos; kp.pos_stride = (int) NH;
+                kp.k_norm = f32("self_attn.k_norm.weight"); kp.steps = step;
+                kp.k_q = st_.k_q; kp.v_q = st_.v_q; kp.k_scale = st_.k_scale; kp.v_scale = st_.v_scale;
+                kp.page_table = st_.page_table; kp.host = st_.host; kp.eps = EPS;
+                qsa_dec_kv_post(kp, T, s, rope_scaling(), cs);
+            } else
             for (int t = 0; t < T; ++t) {
                 norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
                 if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
@@ -606,6 +624,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         if (!full) return true;
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
+        if (dec_draft_on() && !st_.kv_rot && native_rope_enabled() && qsa_dec_fused_supported(s)) {
+            QsaDecQPost qp;   // the query split, norm and RoPE in one launch
+            qp.q_full = qfull_; qp.qcur = qcur_; qp.pos_q = pos; qp.q_norm = f32("self_attn.q_norm.weight"); qp.eps = EPS;
+            qsa_dec_q_post(qp, T, s, rope_scaling(), cs);
+        } else
         for (int t = 0; t < T; ++t) {
             float* qc = qcur_ + t * NH * HD;
             if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4,
@@ -703,6 +726,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const bool sub = dhead_ != nullptr;
         // the argmax drafts over the base rows only on tier 0 (the coupled sampler keeps the whole subset)
         const int64_t nv = sub ? ((tier_ == 0 && !coupled_rec_) ? n_tier1_ : n_dvocab_) : n_vocab_;
+        // STRATA_DEC_DRAFT: the head, its argmax and the argmax's probability in one launch (the probability's sum in
+        // another order: last bits)
+        if (dec_draft_on() && fuse_top_on() && !coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr &&
+            q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
+                          out_ids_, probs_, top_scratch_, cs))
+            return true;
         if (dec_draft_on() && head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else

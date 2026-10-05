@@ -176,6 +176,7 @@ private:
     int tier_ = 1;
     int tier2_recent_ = 0;
     std::vector<uint8_t> tier2_;   ///< token id -> 1 when only the added rows hold it
+    void* top_scratch_ = nullptr;   ///< STRATA_DEC_DRAFT: the head's fused argmax partials
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;

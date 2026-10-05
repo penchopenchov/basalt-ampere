@@ -1256,6 +1256,9 @@ std::string Verifier::profile_report() {
     }
     std::snprintf(b, sizeof b, " | total %.2f ms/window over %lld windows", total / 1e6 / (double) prof_windows_, (long long) prof_windows_);
     out += b;
+    std::snprintf(b, sizeof b, " | graph launch %.3f ms/window", ms_launch / (double) prof_windows_);
+    out += b;
+    ms_launch = 0;
     for (auto& r : prof_sum_) for (double& d : r) d = 0;
     prof_windows_ = 0;
     return out;
@@ -1501,7 +1504,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    const Clock::time_point tl = Clock::now();
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    ms_launch += ms_since(tl);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
