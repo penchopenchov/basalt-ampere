@@ -61,6 +61,9 @@ public:
         const int32_t sl = res_[(size_t) (layer * n_expert_ + expert)];
         return sl >= 0 ? cache_.device_slot(sl) : nullptr;
     }
+    /// STRATA_DEC_MOE: the residency table ([n_layers * n_expert] slot or -1) and a slot's device address.
+    const std::vector<int32_t>& residency() const { return res_; }
+    const uint8_t* slot_address(int32_t slot) { return cache_.device_slot(slot); }
     /// Whether the primary (device 0) and the peer can read each other's memory directly (NVLink / PCIe P2P).
     bool p2p() const { return p2p_; }
 

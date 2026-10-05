@@ -66,7 +66,8 @@ struct DmPeerArgs {
     const DmRing* rings_m = nullptr;             ///< mapped: ring s at rings_m[s]
     const uint8_t* xq_m = nullptr;               ///< mapped: ring s's q8_1 rows at xq_m + s * xq_stride
     size_t xq_stride = 0;
-    const volatile uint32_t* seq_m = nullptr;    ///< mapped: the last ring CUDA0 published (UINT32_MAX: stop)
+    const volatile uint32_t* seq_m = nullptr;    ///< mapped: low 16 bits the last ring CUDA0 published, bits 16-23 its
+                                                 ///< tokens, bit 28 set when it has peer entries; UINT32_MAX: stop
     uint32_t* done_m = nullptr;                  ///< mapped: the last ring whose rows have landed
     float* rows_m = nullptr;                     ///< mapped: entry i's row at rows_m + i * n_embd
     const unsigned long long* ptr = nullptr;     ///< peer device: [n_layers * n_expert] blob address or 0
@@ -87,6 +88,12 @@ bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream);
 /// CUDA0's spin until the tiers this layer uses have landed (the combine waits by itself; this one is for profiles).
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
                   uint32_t ring, void* stream);
+
+/// CUDA0's VRAM share of the plan in one launch (gate/up, SwiGLU, down; native_expert_grouped's rows bit for bit):
+/// entry e's row into row plan->dst[e] of `out`.  `sync`: kDmCap + 1 zeroed device words, left zeroed.
+size_t dec_moe_vram_scratch_bytes(int n_ff);
+void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, float* out,
+                  unsigned int* sync, void* stream);
 
 /// The tests: the persistent kernel's per-group math against native_expert_grouped on one device, without rings.
 /// Entries [start[g], start[g+1]) of group g read q8_1 row tok[e] and write row dst[e] of `out` (device).

@@ -130,7 +130,8 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         if (arrived == gridDim.x) {
             *a.ctr = 0u;
             __threadfence_system();
-            *(volatile uint32_t*) a.peer_seq_m = a.ring;
+            // the peer's word: the ring, the tokens and whether it has entries (it fetches nothing otherwise)
+            *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (s_npeer > 0 ? 1u << 28 : 0u);
             *(volatile uint32_t*) a.host_seq_m = a.ring;
             __threadfence_system();
         }
@@ -192,8 +193,8 @@ __device__ __forceinline__ void dm_swiglu_q8(const float* __restrict__ gate, con
     const int nv = (e1 - e0) * n_ff;
     const size_t base = (size_t) e0 * n_ff;
     for (int i = tid; i < nv; i += kDmThreads) {   // n_ff is a multiple of 32: whole warps
-        const float g = gate[base + i];
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[base + i]);
+        const float g = __ldcg(gate + base + i);   // written by other blocks of this launch
+        const float h = __fmul_rn(g / (1.0f + __expf(-g)), __ldcg(up + base + i));
         q8_1_store(h, s_hq, i);
     }
 }
@@ -291,46 +292,55 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* blob, int e0, int e1
 }
 
 constexpr int kDmMaxEnt = kVerifyMaxT;   // entries of one group: at most one per token
+constexpr int kDmSpan = 64;               // down rows per work item
 
 struct DmShared {
     alignas(16) uint32_t grid[2048];                       // the format's codebook grid (stage_iq_grid)
     alignas(16) block_q8_1 hq[kDmMaxEnt * 20];             // one group's SwiGLU rows (n_ff == 640)
-    alignas(16) float out[kDmMaxEnt * 64];                 // one item's rows per entry
+    alignas(16) float out[kDmMaxEnt * kDmSpan];            // one item's rows per entry
     int32_t ids[kDmCap], kind[kDmCap], first[kDmCap], cnt[kDmCap], gstart[kDmCap], gidx[kDmCap], pos[kDmCap];
     int32_t start[kDmCap + 1], tok[kDmCap], dst[kDmCap];
     unsigned long long gptr[kDmCap];
     int32_t ng, ne;
 };
 
-// gate/up for every (group, block row) item, item = blockIdx-strided
-template<int TG>
-__device__ void dm_gu_all(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
-                          int item0, int stride) {
+// The grouped experts of sm's lists (ng groups: blob gptr[g], entries [start[g], start[g+1]) reading q8_1 row tok[e]
+// and writing row dst[e] of `out`): block b of nb takes gate/up items (group, 8 rows) b, b + nb, ..., each one
+// counted in done[g] when finished, then down items (group, kDmSpan rows) the same way, a group's first down item
+// on a block waiting until done[g] holds all of its gate/up items.  A block never waits during its gate/up items, so
+// with a co-resident grid every wait ends.  The rows are native_expert_grouped's, bit for bit.
+template<int TG, int TD>
+__device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, float* gate,
+                           float* up, float* out, unsigned int* done, int b, int nb) {
+    const int tid = threadIdx.x;
     constexpr bool SG = kStageIqGrid<TG>;
-    const uint32_t* s_grid = stage_iq_grid<TG, SG>(sm.grid, threadIdx.x, kDmThreads);
+    const uint32_t* s_grid = stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
+    const int ng = sm.ng;
     const int nrb = (int) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS);
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    for (int it = item0; it < sm.ng * nrb; it += stride) {
+    const int warp = tid >> 5, lane = tid & 31;
+    for (int it = b; it < ng * nrb; it += nb) {
         const int g = it / nrb, rb = it - g * nrb;
         dm_gu_item<TG, SG>((const uint8_t*) sm.gptr[g], sm.start[g], sm.start[g + 1], sm.tok, xq, L, rb, gate, up,
                            s_grid, warp, lane);
+        __syncthreads();
+        if (tid == 0) {
+            __threadfence();
+            atomicAdd(done + g, 1u);
+        }
     }
-}
-
-// down for every (group, span of kDmSpan rows) item; each item's rows go to row dst[e] of `out` (n_embd floats)
-constexpr int kDmSpan = 64;
-template<int TD>
-__device__ void dm_down_all(DmShared& sm, const NativeExpertLayout& L, const float* gate, const float* up, float* out,
-                            int item0, int stride) {
     constexpr int R = dm_down_rows<TD>(), SUB = kDmSpan / R;
     const int nsp = (int) ((L.n_embd + kDmSpan - 1) / kDmSpan);
-    const int tid = threadIdx.x;
     int g_staged = -1;
-    for (int it = item0; it < sm.ng * nsp; it += stride) {
+    for (int it = b; it < ng * nsp; it += nb) {
         const int g = it / nsp, sp = it - g * nsp;
         const int e0 = sm.start[g], e1 = sm.start[g + 1];
         __syncthreads();                         // the previous item's reads of hq and out are done
         if (g != g_staged) {
+            if (tid == 0) {
+                while (*(volatile unsigned int*) (done + g) < (unsigned int) nrb) __nanosleep(20);
+                __threadfence();
+            }
+            __syncthreads();
             dm_swiglu_q8(gate, up, e0, e1, (int) L.n_ff, sm.hq, tid);
             g_staged = g;
             __syncthreads();
@@ -338,55 +348,63 @@ __device__ void dm_down_all(DmShared& sm, const NativeExpertLayout& L, const flo
         for (int sb = 0; sb < SUB; ++sb)
             dm_down_item<TD>((const uint8_t*) sm.gptr[g], e0, e1, sm.hq, L, sp * SUB + sb, sm.out + sb * R, tid, kDmSpan);
         __syncthreads();
-        // kDmSpan floats per entry, 16 bytes per thread
-        constexpr int q = kDmSpan / 4;
+        constexpr int q = kDmSpan / 4;           // kDmSpan floats per entry, 16 bytes per thread
         const int nq = (e1 - e0) * q;
         for (int i = tid; i < nq; i += kDmThreads) {
             const int e = i / q, c = i - e * q;
             const int r0 = sp * kDmSpan + c * 4;
-            if (r0 < L.n_embd) {
-                const float4 v = *(const float4*) &sm.out[e * kDmSpan + c * 4];
-                *(float4*) (out + (size_t) sm.dst[e0 + e] * L.n_embd + r0) = v;
-            }
+            if (r0 < L.n_embd)
+                *(float4*) (out + (size_t) sm.dst[e0 + e] * L.n_embd + r0) = *(const float4*) &sm.out[e * kDmSpan + c * 4];
         }
     }
 }
 
 #define STRATA_DM_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42)
-#define STRATA_DM_D_FMTS(X) X(20) X(42) X(23)
+#define STRATA_DM_D_FMTS(X) X(20) X(42)
+#define STRATA_DM_PAIRS(X) \
+    X(16, 20) X(17, 20) X(18, 20) X(21, 20) X(22, 20) X(23, 20) X(29, 20) X(42, 20) \
+    X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42)
 
-__device__ void dm_gu_dispatch(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate,
-                               float* up, int item0, int stride) {
-    switch (L.gu_type) {
-#define STRATA_DM_GU(T) case T: dm_gu_all<T>(sm, xq, L, gate, up, item0, stride); break;
-        STRATA_DM_GU_FMTS(STRATA_DM_GU)
-#undef STRATA_DM_GU
-        default: break;
-    }
-}
-__device__ void dm_down_dispatch(DmShared& sm, const NativeExpertLayout& L, const float* gate, const float* up,
-                                 float* out, int item0, int stride) {
-    switch (L.d_type) {
-#define STRATA_DM_D(T) case T: dm_down_all<T>(sm, L, gate, up, out, item0, stride); break;
-        STRATA_DM_D_FMTS(STRATA_DM_D)
-#undef STRATA_DM_D
+__device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
+                               float* out, unsigned int* done, int b, int nb) {
+    switch (L.gu_type * 100 + L.d_type) {
+#define STRATA_DM_CASE(TG, TD) case TG * 100 + TD: dm_experts<TG, TD>(sm, xq, L, gate, up, out, done, b, nb); break;
+        STRATA_DM_PAIRS(STRATA_DM_CASE)
+#undef STRATA_DM_CASE
         default: break;
     }
 }
 
-// The peer window.  Per ring: wait for CUDA0's doorbell, group the peer's entries (every block, the same lists),
-// copy the q8_1 rows to the device, gate/up, a grid barrier, then SwiGLU + down with the rows written straight to
-// mapped memory; the last block to finish raises `done`.
-__global__ void __launch_bounds__(kDmThreads) dm_peer_kernel(DmPeerArgs a) {
+// The last block of a launch (or of a peer ring) to arrive: zero the group counters for the next one.
+__device__ __forceinline__ bool dm_arrive(unsigned int* arrive, unsigned int target, unsigned int* done, int ng) {
+    __syncthreads();
+    bool last = false;
+    if (threadIdx.x == 0) {
+        __threadfence();
+        last = atomicAdd(arrive, 1u) + 1u == target;
+        if (last) {
+            for (int g = 0; g < ng; ++g) done[g] = 0u;
+            __threadfence();
+        }
+    }
+    return last;
+}
+
+// The peer window.  Per ring: block 0 waits for CUDA0's doorbell and copies the ring's header and q8_1 rows to the
+// device (only block 0 reads host memory); a grid barrier; every block groups the peer's entries (the same lists) and
+// runs its work items with the rows written straight to mapped memory; the last block to finish raises `done`.
+__global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
     __shared__ DmShared sm;
+    __shared__ uint32_t s_seq;
     const int tid = threadIdx.x;
     const int nb = gridDim.x;
     float* gate = (float*) a.scratch;
     float* up = gate + (size_t) kDmCap * a.n_ff;
     block_q8_1* xq = (block_q8_1*) (up + (size_t) kDmCap * a.n_ff);
-    __shared__ uint32_t s_seq;
+    DmRing* hdr = (DmRing*) (xq + (size_t) kVerifyMaxT * (a.n_embd / 32));
+    unsigned int* done = (unsigned int*) (hdr + 1);
     unsigned int served = 0;
     auto stamp = [&](int s, int i) {
         if (a.stamps_m != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
@@ -395,30 +413,33 @@ __global__ void __launch_bounds__(kDmThreads) dm_peer_kernel(DmPeerArgs a) {
             a.stamps_m[s * 8 + i] = t;
         }
     };
-    DmRing* hdr = (DmRing*) (xq + (size_t) kVerifyMaxT * (a.n_embd / 32));
     for (int s = 0; s < a.steps; ++s) {
         const uint32_t ring = (uint32_t) s + 1u;
-        // block 0 alone reads host memory: it waits for the ring, then copies its header and q8_1 rows to the device
         if (blockIdx.x == 0) {
             if (tid == 0) {
                 uint32_t v;
-                while ((v = *a.seq_m) < ring) strata_spin_pause();
+                while (((v = *a.seq_m) & 0xffffu) < ring) strata_spin_pause();
                 __threadfence_system();
                 s_seq = v;
             }
             __syncthreads();
             stamp(s, 0);
-            if (s_seq != 0xffffffffu) {
+            const uint32_t v = s_seq;
+            if (v == 0xffffffffu) {
+                if (tid == 0) hdr->n_tok = -1;
+            } else if ((v >> 28) & 1u) {         // the header and the ring's q8_1 rows, in one pass
+                const int nt = (int) ((v >> 16) & 0xffu);
                 const uint4* src = (const uint4*) (a.rings_m + s);
-                for (int i = tid; i < (int) (sizeof(DmRing) / 16); i += kDmThreads) ((uint4*) hdr)[i] = __ldcv(src + i);
-                __syncthreads();
-                if (hdr->n_peer > 0) {
-                    const int n16 = hdr->n_tok * (a.n_embd / 32) * (int) sizeof(block_q8_1) / 16;
-                    const uint4* xs = (const uint4*) (a.xq_m + (size_t) s * a.xq_stride);
-                    for (int i = tid; i < n16; i += kDmThreads) ((uint4*) xq)[i] = __ldcv(xs + i);
+                const uint4* xs = (const uint4*) (a.xq_m + (size_t) s * a.xq_stride);
+                constexpr int h16 = (int) (sizeof(DmRing) / 16);
+                const int n16 = h16 + nt * (a.n_embd / 32) * (int) sizeof(block_q8_1) / 16;
+                for (int i = tid; i < n16; i += kDmThreads) {
+                    if (i < h16) ((uint4*) hdr)[i] = __ldcv(src + i);
+                    else ((uint4*) xq)[i - h16] = __ldcv(xs + (i - h16));
                 }
             } else if (tid == 0) {
-                hdr->n_tok = -1;
+                hdr->n_tok = 0;
+                hdr->n_peer = 0;
             }
             __threadfence();
         }
@@ -445,59 +466,80 @@ __global__ void __launch_bounds__(kDmThreads) dm_peer_kernel(DmPeerArgs a) {
         bool bad = false;
         for (int g = 0; g < sm.ng; ++g) bad |= sm.gptr[g] == 0ull;
         stamp(s, 2);
-        const NativeExpertLayout L = a.lay[layer];
-        if (!bad) dm_gu_dispatch(sm, xq, L, gate, up, blockIdx.x, nb);
+        if (!bad) dm_experts_any(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb);
         stamp(s, 3);
-        grid.sync();
-        stamp(s, 4);
-        if (!bad) dm_down_dispatch(sm, L, gate, up, a.rows_m, blockIdx.x, nb);
-        stamp(s, 5);
         __threadfence_system();
-        __syncthreads();
-        stamp(s, 6);
         ++served;
-        if (tid == 0) {
-            const unsigned int arrived = atomicAdd(a.arrive, 1u) + 1u;
-            if (arrived == served * (unsigned int) nb) {
-                __threadfence_system();
-                *(volatile uint32_t*) a.done_m = ring;
-                __threadfence_system();
-                if (a.stamps_m != nullptr) {
-                    unsigned long long t;
-                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-                    a.stamps_m[s * 8 + 7] = t;
-                }
+        if (dm_arrive(a.arrive, served * (unsigned int) nb, done, sm.ng)) {
+            __threadfence_system();
+            *(volatile uint32_t*) a.done_m = ring;
+            __threadfence_system();
+            if (a.stamps_m != nullptr) {
+                unsigned long long t;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                a.stamps_m[s * 8 + 4] = t;
             }
         }
     }
 }
 
-// the tests: the same work items over given groups, in two launches
-__global__ void __launch_bounds__(kDmThreads) dm_test_gu_kernel(NativeExpertLayout L, const unsigned long long* grp_ptr,
-                                                                 const int32_t* start, int n_groups, const int32_t* tok,
-                                                                 const block_q8_1* xq, float* gate, float* up) {
+// CUDA0's VRAM share in one launch over the device plan (a co-resident grid; `sync`: [0] arrivals, [1..] per group).
+template<int TG, int TD>
+__global__ void __launch_bounds__(kDmThreads) dm_vram_kernel(const DmPlan* __restrict__ plan,
+                                                             const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                             float* gate, float* up, float* out, unsigned int* sync) {
     __shared__ DmShared sm;
-    if (threadIdx.x == 0) sm.ng = n_groups;
-    for (int i = threadIdx.x; i <= n_groups; i += kDmThreads) {
-        sm.start[i] = start[i];
-        if (i < n_groups) sm.gptr[i] = grp_ptr[i];
+    const int tid = threadIdx.x;
+    const int ng = plan->counts[0];
+    for (int i = tid; i <= ng; i += kDmThreads) {
+        sm.start[i] = plan->start[i];
+        if (i < ng) sm.gptr[i] = plan->ptr[i];
     }
-    for (int i = threadIdx.x; i < kDmCap; i += kDmThreads) sm.tok[i] = tok[i];
+    for (int i = tid; i < kDmCap; i += kDmThreads) {
+        sm.tok[i] = plan->tok[i];
+        sm.dst[i] = plan->dst[i];
+    }
+    if (tid == 0) sm.ng = ng;
     __syncthreads();
-    dm_gu_dispatch(sm, xq, L, gate, up, blockIdx.x, gridDim.x);
+    dm_experts<TG, TD>(sm, xq, L, gate, up, out, sync + 1, blockIdx.x, gridDim.x);
+    if (dm_arrive(sync, gridDim.x, sync + 1, ng)) sync[0] = 0u;
 }
-__global__ void __launch_bounds__(kDmThreads) dm_test_down_kernel(NativeExpertLayout L, const unsigned long long* grp_ptr,
-                                                                   const int32_t* start, int n_groups, const int32_t* dst,
-                                                                   const float* gate, const float* up, float* out) {
+
+template<int TG, int TD>
+int dm_vram_blocks() {
+    static int known[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
+    if (known[dev] == 0) {
+        int sms = 0, per = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_vram_kernel<TG, TD>, kDmThreads, 0) != cudaSuccess) {
+            cudaGetLastError();
+            per = 0;
+        }
+        known[dev] = per > 0 ? sms * per : -1;
+    }
+    return known[dev];
+}
+
+// the tests: the work items over given groups, without rings (one launch)
+__global__ void __launch_bounds__(kDmThreads) dm_test_kernel(NativeExpertLayout L, const unsigned long long* grp_ptr,
+                                                              const int32_t* start, int n_groups, const int32_t* tok,
+                                                              const int32_t* dst, const block_q8_1* xq, float* gate,
+                                                              float* up, float* out, unsigned int* sync) {
     __shared__ DmShared sm;
     if (threadIdx.x == 0) sm.ng = n_groups;
     for (int i = threadIdx.x; i <= n_groups; i += kDmThreads) {
         sm.start[i] = start[i];
         if (i < n_groups) sm.gptr[i] = grp_ptr[i];
     }
-    for (int i = threadIdx.x; i < kDmCap; i += kDmThreads) sm.dst[i] = dst[i];
+    for (int i = threadIdx.x; i < kDmCap; i += kDmThreads) {
+        sm.tok[i] = tok[i];
+        sm.dst[i] = dst[i];
+    }
     __syncthreads();
-    dm_down_dispatch(sm, L, gate, up, out, blockIdx.x, gridDim.x);
+    dm_experts_any(sm, xq, L, gate, up, out, sync + 1, blockIdx.x, gridDim.x);
+    if (dm_arrive(sync, gridDim.x, sync + 1, n_groups)) sync[0] = 0u;
 }
 
 }  // namespace
@@ -521,7 +563,7 @@ void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, cons
 
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff) {
     return (size_t) kDmCap * n_ff * 2 * sizeof(float) + (size_t) kVerifyMaxT * (n_embd / 32) * sizeof(block_q8_1) +
-           sizeof(DmRing) + 256;
+           sizeof(DmRing) + (kDmCap + 1) * sizeof(unsigned int) + 256;
 }
 
 bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
@@ -565,15 +607,41 @@ bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream) {
     return true;
 }
 
+size_t dec_moe_vram_scratch_bytes(int n_ff) { return (size_t) kDmCap * n_ff * 2 * sizeof(float) + 256; }
+
+void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* xq, void* scratch, float* out,
+                  unsigned int* sync, void* stream) {
+    float* gate = (float*) scratch;
+    float* up = gate + (size_t) kDmCap * L.n_ff;
+    int blocks = 0;
+    switch (L.gu_type * 100 + L.d_type) {
+#define STRATA_DM_V(TG, TD) case TG * 100 + TD: \
+        blocks = dm_vram_blocks<TG, TD>(); \
+        if (blocks > 0) dm_vram_kernel<TG, TD><<<(unsigned) blocks, kDmThreads, 0, (cudaStream_t) stream>>>( \
+            plan, (const block_q8_1*) xq, L, gate, up, out, sync); \
+        break;
+        STRATA_DM_PAIRS(STRATA_DM_V)
+#undef STRATA_DM_V
+        default: break;
+    }
+    if (blocks <= 0) {
+        std::fprintf(stderr, "dec_moe_vram: formats %d / %d\n", L.gu_type, L.d_type);
+        std::exit(1);
+    }
+    check("dec_moe_vram");
+}
+
 void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* start,
                             int n_groups, const int32_t* tok, const int32_t* dst, const void* xq, void* scratch,
                             float* out, void* stream) {
     float* gate = (float*) scratch;
     float* up = gate + (size_t) kDmCap * L.n_ff;
-    const int blocks = 2 * 36;
-    dm_test_gu_kernel<<<blocks, kDmThreads, 0, (cudaStream_t) stream>>>(L, grp_ptr, start, n_groups, tok,
-                                                                        (const block_q8_1*) xq, gate, up);
-    dm_test_down_kernel<<<blocks, kDmThreads, 0, (cudaStream_t) stream>>>(L, grp_ptr, start, n_groups, dst, gate, up, out);
+    unsigned int* sync = (unsigned int*) (up + (size_t) kDmCap * L.n_ff);   // zeroed by the caller, left zeroed
+    int dev = 0, sms = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    dm_test_kernel<<<(unsigned) sms, kDmThreads, 0, (cudaStream_t) stream>>>(L, grp_ptr, start, n_groups, tok, dst,
+                                                                              (const block_q8_1*) xq, gate, up, out, sync);
     check("dec_moe_peer_math_test");
 }
 

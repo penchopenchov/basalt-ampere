@@ -37,6 +37,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/dec_moe.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -53,6 +54,38 @@
 #include <immintrin.h>
 
 namespace strata::core {
+
+// STRATA_DEC_MOE=1 (dec_moe.hpp): the MoE tail planned on CUDA0 from device residency tables, the peer card served
+// from mapped rings by one persistent kernel per window, the CPU pool by the host loop (only its own entries).
+struct DecMoe {
+    int64_t rings = 0;                       ///< rings per window (one per layer)
+    int32_t* res0 = nullptr;                 ///< CUDA0: [n_layers * n_expert] CUDA0 slot or -1 (host_res mirrored)
+    int32_t* res1 = nullptr;                 ///< CUDA0: the same for the peer's slots
+    std::vector<int32_t> shadow0, shadow1;   ///< what res0 / res1 hold
+    strata::kernels::DmPlan* plan = nullptr;
+    unsigned int* ctr = nullptr;
+    unsigned long long* slot_off = nullptr;  ///< CUDA0's per-slot offsets (null: slot * blob)
+    bool fused = false;                      ///< the VRAM share in one launch (STRATA_DEC_MOE_FUSED=1)
+    void* vscr = nullptr;                    ///< its gate/up rows
+    unsigned int* vsync = nullptr;           ///< its counters
+    // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring; the peer's rows
+    strata::kernels::DmRing* h_ring = nullptr; strata::kernels::DmRing* m_ring = nullptr;
+    float* h_x = nullptr; float* m_x = nullptr;
+    uint8_t* h_xq = nullptr; uint8_t* m_xq = nullptr;
+    uint32_t* h_w = nullptr; uint32_t* m_w = nullptr;
+    float* h_rows = nullptr; float* m_rows = nullptr;
+    size_t x_stride = 0, xq_stride = 0;      ///< per ring, floats / bytes
+    // the peer card
+    int pdev = -1;
+    cudaStream_t ps = nullptr;
+    unsigned long long* ptab = nullptr;      ///< [n_layers * n_expert] blob address or 0
+    strata::kernels::NativeExpertLayout* lay = nullptr;
+    void* pscr = nullptr;
+    unsigned int* parr = nullptr;
+    int pblocks = 0;
+    bool peer_live = false;                  ///< a peer window was launched and not yet waited for
+};
+
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -180,6 +213,10 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    if (dm_ != nullptr) {   // the peer window stops at its next ring; CUDA0's waits on it pass
+        *(volatile uint32_t*) (dm_->h_w + 0) = UINT32_MAX;
+        *(volatile uint32_t*) (dm_->h_w + 16) = UINT32_MAX;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     const OnDevice on_device(device_);
@@ -268,6 +305,133 @@ void Verifier::diag(std::FILE* f) const {
     trace_dump(f);   // #649: STRATA_VERIFY_TRACE=1 only
 }
 
+bool Verifier::dm_init(std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const char* why = nullptr;
+    if (!lay.native) why = "the experts are not a native pack";
+    else if (lb_ != 0 || le_ != g.n_layers || hand_in_ != nullptr) why = "a layer split";
+    else if (remote_opt_ != nullptr) why = "--remote-expert-opt";
+    else if (all_resident_) why = "every expert is resident";
+    else if (hits_.h_res == nullptr) why = "no host residency table";
+    else if ((int64_t) max_t_ * ss_->k > kDmCap) why = "the window is too large";
+    else if (!native_moe_combine_enabled()) why = "the native combine is off";
+    for (int64_t l = 0; why == nullptr && l < g.n_layers; ++l) {
+        const auto& f = lay.fmt[(size_t) l];
+        if (!dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)) why = "an expert format the kernels do not cover";
+    }
+    if (why != nullptr) {
+        std::fprintf(stderr, "strata verify: STRATA_DEC_MOE is off: %s\n", why);
+        return true;
+    }
+    DecMoe* d = new DecMoe;
+    dm_ = d;
+    const int64_t LE = g.n_layers * g.n_expert, N = g.n_embd, T = max_t_, K = ss_->k;
+    d->rings = le_ - lb_;
+    d->x_stride = (size_t) (T * N);
+    d->xq_stride = (size_t) (T * (N / 32) * 36);
+    bool ok = cudaMalloc((void**) &d->res0, (size_t) LE * 4) == cudaSuccess &&
+              cudaMalloc((void**) &d->res1, (size_t) LE * 4) == cudaSuccess &&
+              cudaMalloc((void**) &d->plan, sizeof(DmPlan)) == cudaSuccess &&
+              cudaMalloc((void**) &d->ctr, 64) == cudaSuccess && cudaMemset(d->ctr, 0, 64) == cudaSuccess &&
+              cudaMemset(d->res1, 0xff, (size_t) LE * 4) == cudaSuccess &&
+              mapped((size_t) d->rings * sizeof(DmRing), (void**) &d->h_ring, (void**) &d->m_ring) &&
+              mapped((size_t) d->rings * d->x_stride * 4, (void**) &d->h_x, (void**) &d->m_x) &&
+              mapped((size_t) d->rings * d->xq_stride, (void**) &d->h_xq, (void**) &d->m_xq) &&
+              mapped(256, (void**) &d->h_w, (void**) &d->m_w) &&
+              mapped((size_t) (T * K * N) * 4, (void**) &d->h_rows, (void**) &d->m_rows) &&
+              cudaMalloc(&d->vscr, dec_moe_vram_scratch_bytes((int) lay.fmt[0].n_ff)) == cudaSuccess &&
+              cudaMalloc((void**) &d->vsync, (kDmCap + 1) * 4) == cudaSuccess &&
+              cudaMemset(d->vsync, 0, (kDmCap + 1) * 4) == cudaSuccess;
+    {
+        const char* v = std::getenv("STRATA_DEC_MOE_FUSED");
+        d->fused = v != nullptr && std::atoi(v) != 0;
+    }
+    if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
+        ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
+             cudaMemcpy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!ok) { err = "verify: STRATA_DEC_MOE buffers"; return false; }
+    d->shadow0.assign((size_t) LE, INT32_MIN);
+    d->shadow1.assign((size_t) LE, -1);
+    if (peer_ != nullptr && peer_->valid()) {
+        const OnDevice on(peer_->device());
+        d->pdev = peer_->device();
+        std::vector<NativeExpertLayout> ls((size_t) g.n_layers);
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const auto& f = lay.fmt[(size_t) l];
+            ls[(size_t) l] = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        }
+        d->pblocks = dec_moe_peer_blocks();
+        ok = d->pblocks > 0 && cudaStreamCreateWithFlags(&d->ps, cudaStreamNonBlocking) == cudaSuccess &&
+             cudaMalloc((void**) &d->ptab, (size_t) LE * 8) == cudaSuccess &&
+             cudaMemset(d->ptab, 0, (size_t) LE * 8) == cudaSuccess &&
+             cudaMalloc((void**) &d->lay, ls.size() * sizeof(NativeExpertLayout)) == cudaSuccess &&
+             cudaMemcpy(d->lay, ls.data(), ls.size() * sizeof(NativeExpertLayout), cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMalloc(&d->pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
+             cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
+             cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
+        if (!ok) { err = "verify: STRATA_DEC_MOE peer buffers"; return false; }
+        d->shadow1.assign((size_t) LE, INT32_MIN);
+    }
+    std::fprintf(stderr, "strata verify: STRATA_DEC_MOE on: the MoE tail planned on the device%s\n",
+                 d->pdev >= 0 ? (", the peer card served by a persistent kernel (" + std::to_string(d->pblocks) +
+                                 " blocks)").c_str() : "");
+    return true;
+}
+
+// The residency tables the window classifies with: host_res and the peer's, as they are now (between windows).
+bool Verifier::dm_sync(std::string& err) {
+    DecMoe* d = dm_;
+    const size_t LE = d->shadow0.size();
+    auto span = [&](const int32_t* now, std::vector<int32_t>& sh, size_t& a, size_t& b) {
+        a = LE; b = 0;
+        for (size_t i = 0; i < LE; ++i)
+            if (now[i] != sh[i]) { if (a == LE) a = i; b = i + 1; }
+        if (a < b) std::memcpy(sh.data() + a, now + a, (b - a) * 4);
+        return a < b;
+    };
+    size_t a = 0, b = 0;
+    if (span(hits_.h_res, d->shadow0, a, b) &&
+        cudaMemcpy(d->res0 + a, d->shadow0.data() + a, (b - a) * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "verify: STRATA_DEC_MOE residency upload";
+        return false;
+    }
+    if (d->pdev >= 0 && span(peer_->residency().data(), d->shadow1, a, b)) {
+        if (cudaMemcpy(d->res1 + a, d->shadow1.data() + a, (b - a) * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "verify: STRATA_DEC_MOE peer residency upload";
+            return false;
+        }
+        std::vector<unsigned long long> p(b - a);
+        for (size_t i = a; i < b; ++i)
+            p[i - a] = d->shadow1[i] >= 0 ? (unsigned long long) peer_->slot_address(d->shadow1[i]) : 0ull;
+        const OnDevice on(d->pdev);
+        if (cudaMemcpy(d->ptab + a, p.data(), p.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "verify: STRATA_DEC_MOE peer table upload";
+            return false;
+        }
+    }
+    return true;
+}
+
+void Verifier::dm_free() {
+    DecMoe* d = dm_;
+    if (d == nullptr) return;
+    if (d->pdev >= 0) {
+        const OnDevice on(d->pdev);
+        if (d->ps) { cudaStreamSynchronize(d->ps); cudaStreamDestroy(d->ps); }
+        for (void* p : {(void*) d->ptab, (void*) d->lay, d->pscr, (void*) d->parr})
+            if (p) cudaFree(p);
+    }
+    for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
+                    (void*) d->vsync})
+        if (p) cudaFree(p);
+    for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
+        if (h) cudaFreeHost(h);
+    delete d;
+    dm_ = nullptr;
+}
+
 Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
@@ -277,6 +441,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    dm_free();
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
@@ -525,6 +690,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
+    if (env_on("STRATA_DEC_MOE") && !dm_init(err)) return false;
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
@@ -559,7 +725,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+    const bool dm = dm_ != nullptr && !batch_rec_;   // STRATA_DEC_MOE: the device-planned tail (one group)
+    const int G = (split_ && T >= 2 && !batch_rec_ && !dm) ? 2 : 1;   // a batch window is one group
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_PDL=1 (pdl.hpp): the dense chain's kernels may start during the previous kernel's tail.  Only where
     // that previous kernel is one of them or another plain kernel; never with the profile's or trace's stamps.
@@ -639,7 +806,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
             if (grp == 0) {
-                if (all_resident_) wait_flag_ge(m_flag_, 1, cs);
+                if (all_resident_ || dm) wait_flag_ge(m_flag_, 1, cs);
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
@@ -950,7 +1117,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (all_resident_) {
+        if (dm) {   // the tiers, CUDA0's plan, the q8_1 rows and the rings in one launch
+            DmRouteArgs ra;
+            ra.ids = ids_ + tb * K; ra.x = xm; ra.n_tok = n; ra.k = (int) K; ra.n_embd = (int) N;
+            ra.n_expert = (int) g.n_expert; ra.layer = (int) l;
+            ra.res0 = dm_->res0 + l * g.n_expert;
+            ra.res1 = dm_->pdev >= 0 ? dm_->res1 + l * g.n_expert : nullptr;
+            ra.cache_base = hits_.cache_base; ra.slot_off = dm_->slot_off; ra.blob = (long long) hits_.blob;
+            ra.plan = dm_->plan; ra.xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
+            const int64_t r = l - lb_;
+            ra.ring_m = dm_->m_ring + r; ra.x_m = dm_->m_x + (size_t) r * dm_->x_stride;
+            ra.xq_m = dm_->m_xq + (size_t) r * dm_->xq_stride;
+            ra.host_seq_m = m_seq_; ra.peer_seq_m = dm_->m_w;
+            ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
+            dec_moe_route(ra, cs);
+        } else if (all_resident_) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs);
@@ -1001,7 +1182,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
         }
-        if (strata::kernels::cpu::expert_layout().native)
+        if (dm) {}   // the route kernel wrote nat_xq_
+        else if (strata::kernels::cpu::expert_layout().native)
             quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
         else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
@@ -1046,7 +1228,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
             }
         };
-        if (all_resident_) {
+        if (dm) {   // CUDA0's entries straight into their parts rows; the other tiers are read by the combine
+            stamp(l, 19, grp);
+            const auto& f = lay.fmt[(size_t) l];
+            const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            DmPlan* P = dm_->plan;
+            if (dm_->fused)
+                dec_moe_vram(L, P, nat_xq_ + (size_t) tb * (N / 32) * 36, dm_->vscr, parts_out, dm_->vsync, cs);
+            else
+                native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
+                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, parts_out, cs);
+            stamp(l, 20, grp);
+            stamp(l, 21, grp);
+            stamp(l, 22, grp);
+        } else if (all_resident_) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
@@ -1094,7 +1289,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (!prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
-        if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
+        if (dm) {
+            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs);
+            stamp(l, 23, grp);
+            try {
+                dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
+                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
                 native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
@@ -1453,6 +1655,26 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
+    if (dm_ != nullptr) {   // STRATA_DEC_MOE: this window's residency, then the peer window ahead of CUDA0's
+        if (!dm_sync(err)) return false;
+        *(volatile uint32_t*) (dm_->h_w + 0) = 0;
+        *(volatile uint32_t*) (dm_->h_w + 16) = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (dm_->pdev >= 0) {
+            const OnDevice on(dm_->pdev);
+            DmPeerArgs pa;
+            pa.rings_m = dm_->h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
+            pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
+            pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
+            pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) strata::kernels::cpu::expert_layout().fmt[0].n_ff;
+            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr;
+            if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess || !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps)) {
+                err = "verify: the peer window did not launch";
+                return false;
+            }
+            dm_->peer_live = true;
+        }
+    }
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
@@ -1523,7 +1745,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
-        if (pool != nullptr)
+        if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
+            const strata::kernels::DmRing& R = dm_->h_ring[k];
+            sink_.ext_kind = R.kind;
+            if (pool != nullptr)
+                pool(user, dm_->h_x + (size_t) k * dm_->x_stride, R.ids, n, ss.k, h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+            sink_.ext_kind = nullptr;
+        } else if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
         if (remote_opt_) remote_opt_->end();
@@ -1568,6 +1796,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
+    if (dm_ != nullptr && dm_->peer_live) {   // the peer window ends with CUDA0's last ring
+        const OnDevice on(dm_->pdev);
+        dm_->peer_live = false;
+        const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
+        if (pe != cudaSuccess) { err = std::string("verify: the peer window: ") + cudaGetErrorString(pe); return false; }
+    }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);

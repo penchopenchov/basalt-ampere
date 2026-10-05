@@ -260,6 +260,8 @@ int main(int argc, char** argv) {
         float* d_parts = dmal<float>((size_t) K::kDmCap * H);
         float* d_hit = dmal<float>((size_t) K::kDmCap * H);
         unsigned int* d_ctr = dmal<unsigned int>(4);
+        void* d_vscr = dmal<uint8_t>(K::dec_moe_vram_scratch_bytes((int) FF));
+        unsigned int* d_vsync = dmal<unsigned int>(K::kDmCap + 1);
         constexpr int RINGS = 48;
         K::DmRing* h_rings = hmap<K::DmRing>(RINGS);
         float* h_x = hmap<float>((size_t) RINGS * MT * H);
@@ -359,6 +361,19 @@ int main(int argc, char** argv) {
             report(what, l, nd2, a.size());
             cudaFree(d_p2);
 
+            // the fused VRAM call vs native_expert_grouped (d_parts2 holds the grouped rows)
+            {
+                float* d_p3 = dmal<float>((size_t) K::kDmCap * H);
+                ck(cudaMemset(d_p3, 0, (size_t) K::kDmCap * H * 4), "memset");
+                K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_p3, d_vsync, s0);
+                ck(cudaStreamSynchronize(s0), "vram");
+                const auto a3 = down(d_parts2, (size_t) n * H), b3 = down(d_p3, (size_t) n * H);
+                std::vector<int> rows;
+                for (int i = 0; i < n; ++i) if (kind[i] == 0) rows.push_back(i);
+                std::snprintf(what, sizeof what, "fused VRAM T=%d (%d groups)", T, P.counts[0]);
+                report(what, l, ndiff_rows(a3, b3, rows), rows.size() * H);
+                cudaFree(d_p3);
+            }
             if (bench && T == 3) {
                 // the VRAM share alone: native_expert_grouped over the plan's groups
                 const double us = time_us(s0, 200, [&] {
@@ -367,6 +382,9 @@ int main(int argc, char** argv) {
                 });
                 std::printf("  bench: VRAM grouped T=%d, %d groups (%d entries): %.1f us, %.0f GB/s of expert bytes\n", T,
                             P.counts[0], P.counts[1], us, P.counts[0] * (double) L.bytes / us / 1e3);
+                const double us2 = time_us(s0, 200, [&] { K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0); });
+                std::printf("  bench: VRAM fused   T=%d, %d groups (%d entries): %.1f us, %.0f GB/s of expert bytes\n", T,
+                            P.counts[0], P.counts[1], us2, P.counts[0] * (double) L.bytes / us2 / 1e3);
             }
         }
 
@@ -409,7 +427,8 @@ int main(int argc, char** argv) {
                 }
                 for (int r = 0; r < rings; ++r) {
                     K::DmRouteArgs ra;
-                    ra.ids = d_ids; ra.x = dv[0].x; ra.n_tok = T; ra.k = (int) KK; ra.n_embd = (int) H;
+                    ra.ids = d_ids; ra.x = dv[0].x + (size_t) (r % 2) * 4 * H;   // rings alternate inputs
+                    ra.n_tok = T; ra.k = (int) KK; ra.n_embd = (int) H;
                     ra.n_expert = (int) NE; ra.layer = l; ra.res0 = d_res0; ra.res1 = peer_on ? d_res1 : nullptr;
                     ra.cache_base = dv[0].blob; ra.blob = (long long) L.bytes; ra.plan = d_plan; ra.xq = d_xq2;
                     ra.ring_m = h_rings + r; ra.x_m = h_x + (size_t) r * MT * H; ra.xq_m = h_xq + r * xq_stride;
@@ -438,7 +457,7 @@ int main(int argc, char** argv) {
                     G.ptr.push_back((unsigned long long) (dv[1].blob + (size_t) res1[ids[i]] * L.bytes));
                     G.start.push_back(e);
                     for (int j = i; j < n; ++j)
-                        if (ids[j] == ids[i]) { G.dst.push_back(j); G.tok.push_back(j / KK); rows.push_back(j); ++e; }
+                        if (ids[j] == ids[i]) { G.dst.push_back(j); G.tok.push_back(j / KK + 4); rows.push_back(j); ++e; }
                 }
                 G.start.push_back(e);
                 G.upload();
@@ -487,7 +506,7 @@ int main(int argc, char** argv) {
                     std::vector<double> rt;
                     for (int r = 0; r < RINGS; ++r) {
                         const auto t0 = std::chrono::steady_clock::now();
-                        *(volatile uint32_t*) (h_words + 16) = (uint32_t) r + 1;
+                        *(volatile uint32_t*) (h_words + 16) = ((uint32_t) r + 1) | (uint32_t) T << 16 | 1u << 28;
                         while (*(volatile uint32_t*) (h_words + 32) < (uint32_t) r + 1) {}
                         rt.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
                     }
@@ -495,12 +514,12 @@ int main(int argc, char** argv) {
                     ck(cudaStreamSynchronize(s1), "lat");
                     ck(cudaSetDevice(0), "dev0");
                     std::sort(rt.begin() + 1, rt.end());
-                    double ph[7] = {};
+                    double ph[4] = {};
                     for (int r = 1; r < RINGS; ++r)
-                        for (int i = 0; i < 7; ++i) ph[i] += (double) (h_st[r * 8 + i + 1] - h_st[r * 8 + i]) / 1e3 / (RINGS - 1);
+                        for (int i = 0; i < 4; ++i) ph[i] += (double) (h_st[r * 8 + i + 1] - h_st[r * 8 + i]) / 1e3 / (RINGS - 1);
                     std::printf("  bench: peer rung by the host: round trip median %.1f us (min %.1f); block 0 phases us: "
-                                "group+xq %.1f sync %.1f gu %.1f sync %.1f down %.1f fence %.1f done %.1f\n",
-                                rt[RINGS / 2], rt[1], ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6]);
+                                "fetch+sync %.1f group %.1f experts %.1f done %.1f\n",
+                                rt[RINGS / 2], rt[1], ph[0], ph[1], ph[2], ph[3]);
                 }
                 const double a0 = wall(false, false), a1 = wall(true, false), b0 = wall(false, true), b1 = wall(true, true);
                 std::printf("  bench: per ring on CUDA0 (T=%d, %d peer entries, %d peer blocks): route+wait %.1f us, "
