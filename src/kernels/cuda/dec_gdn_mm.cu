@@ -345,54 +345,88 @@ struct IQ3STraits {
 
 // ---------------------------------------------------------------- row dots (one warp per row)
 // The exact layout's four warps, replayed by one: lane `lane` sums the chains of reference threads lane + 32 rw.
-template<typename F, int NC>
-__device__ __forceinline__ void row_dot4(const uint8_t* row, const Q81Block* x, int xs, int nb, int lane,
+// NB > 0: the row's block count at compile time, so the four chains unroll into independent instruction streams.
+template<typename F, int NC, int NB>
+__device__ __forceinline__ void row_dot4(const uint8_t* row, const Q81Block* x, int xs, int nb_rt, int lane,
                                          float (&acc)[NC]) {
     const auto* w = reinterpret_cast<const typename F::Block*>(row);
+    const int nb = NB > 0 ? NB : nb_rt;
+    constexpr int ITERS = NB > 0 ? (NB + F::BPI - 1) / F::BPI : 1;
+    float c[WARPS][NC];
+#pragma unroll
+    for (int rw = 0; rw < WARPS; ++rw)
+#pragma unroll
+        for (int j = 0; j < NC; ++j) c[rw][j] = 0.0f;
 #pragma unroll
     for (int rw = 0; rw < WARPS; ++rw) {
         const int tid = WARP * rw + lane;
         const int kqs = F::kqs(tid);
-        float c[NC];
+        if constexpr (NB > 0) {
 #pragma unroll
-        for (int j = 0; j < NC; ++j) c[j] = 0.0f;
-        for (int kbx = tid / F::T; kbx < nb; kbx += F::BPI) {
-            const typename F::W wv = F::load(w + kbx, kqs);
+            for (int i = 0; i < ITERS; ++i) {
+                const int kbx = tid / F::T + i * F::BPI;
+                if (kbx < nb) {
+                    const typename F::W wv = F::load(w + kbx, kqs);
 #pragma unroll
-            for (int j = 0; j < NC; ++j) c[j] += F::apply(wv, x + j * xs + kbx * F::KBY, kqs);
+                    for (int j = 0; j < NC; ++j) c[rw][j] += F::apply(wv, x + j * xs + kbx * F::KBY, kqs);
+                }
+            }
+        } else {
+            for (int kbx = tid / F::T; kbx < nb; kbx += F::BPI) {
+                const typename F::W wv = F::load(w + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NC; ++j) c[rw][j] += F::apply(wv, x + j * xs + kbx * F::KBY, kqs);
+            }
         }
-#pragma unroll
-        for (int j = 0; j < NC; ++j) acc[j] = rw == 0 ? c[j] : acc[j] + c[j];
     }
 #pragma unroll
-    for (int j = 0; j < NC; ++j) acc[j] = warp_sum(acc[j]);
+    for (int j = 0; j < NC; ++j) {
+        float v = c[0][j];
+#pragma unroll
+        for (int rw = 1; rw < WARPS; ++rw) v = v + c[rw][j];
+        acc[j] = warp_sum(v);
+    }
 }
 
 // mmvq_multi_kernel's row_dot_multi for IQ3_S: calls k = lane, lane + 32, ... of 8 per 256-value block.
-template<int NC>
-__device__ __forceinline__ void row_dot_iq3s(const uint8_t* row, const Q81Block* x, int xs, int nb, int lane,
+template<int NC, int NB>
+__device__ __forceinline__ void row_dot_iq3s(const uint8_t* row, const Q81Block* x, int xs, int nb_rt, int lane,
                                              float (&acc)[NC]) {
+    const int nk = (NB > 0 ? NB : nb_rt) * 8;
 #pragma unroll
     for (int j = 0; j < NC; ++j) acc[j] = 0.0f;
-    for (int k = lane; k < nb * 8; k += 32) {
-        const int kbx = k / 8, iqs = 2 * (k % 8);
-        const IQ3STraits::W w = IQ3STraits::load(row, kbx, iqs);
+    if constexpr (NB > 0) {
 #pragma unroll
-        for (int j = 0; j < NC; ++j) acc[j] += IQ3STraits::apply(w, x + j * xs + kbx * 8, iqs);
+        for (int i = 0; i < (NB * 8 + 31) / 32; ++i) {
+            const int k = lane + 32 * i;
+            if (k < nk) {
+                const int kbx = k / 8, iqs = 2 * (k % 8);
+                const IQ3STraits::W w = IQ3STraits::load(row, kbx, iqs);
+#pragma unroll
+                for (int j = 0; j < NC; ++j) acc[j] += IQ3STraits::apply(w, x + j * xs + kbx * 8, iqs);
+            }
+        }
+    } else {
+        for (int k = lane; k < nk; k += 32) {
+            const int kbx = k / 8, iqs = 2 * (k % 8);
+            const IQ3STraits::W w = IQ3STraits::load(row, kbx, iqs);
+#pragma unroll
+            for (int j = 0; j < NC; ++j) acc[j] += IQ3STraits::apply(w, x + j * xs + kbx * 8, iqs);
+        }
     }
 #pragma unroll
     for (int j = 0; j < NC; ++j) acc[j] = warp_sum(acc[j]);
 }
 
-template<int NC>
+template<int NC, int NB>
 __device__ __forceinline__ void row_dot(int type, const uint8_t* row, const Q81Block* x, int xs, int nb, int lane,
                                         float (&acc)[NC]) {
     switch (type) {
-        case 12: row_dot4<Q4KTraits, NC>(row, x, xs, nb, lane, acc); break;
-        case 13: row_dot4<Q5KTraits, NC>(row, x, xs, nb, lane, acc); break;
-        case 14: row_dot4<Q6KTraits, NC>(row, x, xs, nb, lane, acc); break;
-        case 23: row_dot4<IQ4XSTraits, NC>(row, x, xs, nb, lane, acc); break;
-        default: row_dot_iq3s<NC>(row, x, xs, nb, lane, acc); break;
+        case 12: row_dot4<Q4KTraits, NC, NB>(row, x, xs, nb, lane, acc); break;
+        case 13: row_dot4<Q5KTraits, NC, NB>(row, x, xs, nb, lane, acc); break;
+        case 14: row_dot4<Q6KTraits, NC, NB>(row, x, xs, nb, lane, acc); break;
+        case 23: row_dot4<IQ4XSTraits, NC, NB>(row, x, xs, nb, lane, acc); break;
+        default: row_dot_iq3s<NC, NB>(row, x, xs, nb, lane, acc); break;
     }
 }
 
@@ -436,6 +470,7 @@ struct DenseArgs {
     const float* x;          // fp32 columns to quantize in shared memory, or
     const Q81Block* xq;      // q8_1 columns in global memory
     int nslot, slot_bytes;   // the per-warp ring
+    int probe;               // 1: stream the rows only (bench)
 };
 
 __device__ __forceinline__ void issue_row(const DenseArgs& a, int g, void* slot, uint64_t* bar, uint64_t policy) {
@@ -449,7 +484,7 @@ __device__ __forceinline__ void issue_row(const DenseArgs& a, int g, void* slot,
 
 // The block's part of the projections: warp `warp` of block `blk` of `nblk`.  `smem` holds the barriers, the
 // quantized columns (with a.x) and the slots.
-template<int NC>
+template<int NC, int NB>
 __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nblk, uint8_t* smem) {
     const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const int nb32 = a.n_in / Q8K;
@@ -468,15 +503,28 @@ __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nbl
     pdl_trigger();
     pdl_wait();
     const Q81Block* x = a.xq;
-    if (a.x) {   // native_quantize_q8_1_kernel, element by element
-        for (int i = threadIdx.x; i < NC * a.n_in; i += blockDim.x) {
-            const float xi = a.x[i];
-            const float amax = warp_max(fabsf(xi));
-            const float sum = warp_sum(xi);
-            const float d = q8_1_finite(amax / 127.0f);
-            const int8_t q = q8_1_quant(xi, d, amax);
-            xs[i / Q8K].qs[i % Q8K] = q;
-            if (i % Q8K == 0) xs[i / Q8K].ds = q8_1_ds(d, sum);
+    if (a.x) {   // native_quantize_q8_1_kernel, element by element; the loads first, all in flight at once
+        constexpr int U = 8;
+        const int total = NC * a.n_in;
+        for (int i0 = threadIdx.x; i0 < total; i0 += U * (int) blockDim.x) {
+            float v[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int i = i0 + u * (int) blockDim.x;
+                v[u] = i < total ? a.x[i] : 0.0f;
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int i = i0 + u * (int) blockDim.x;
+                if (i >= total) break;   // warp-uniform: total is a multiple of 32
+                const float xi = v[u];
+                const float amax = warp_max(fabsf(xi));
+                const float sum = warp_sum(xi);
+                const float d = q8_1_finite(amax / 127.0f);
+                const int8_t q = q8_1_quant(xi, d, amax);
+                xs[i / Q8K].qs[i % Q8K] = q;
+                if (i % Q8K == 0) xs[i / Q8K].ds = q8_1_ds(d, sum);
+            }
         }
         __syncthreads();
         x = xs;
@@ -490,7 +538,11 @@ __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nbl
         const uintptr_t src = (uintptr_t) (a.w[m] + (size_t) g * a.row_bytes[m]);
         const uint8_t* row = slots + s * a.slot_bytes + (src & 15);
         float acc[NC];
-        row_dot<NC>(a.type[m], row, x, nb32, a.n_in / QK, lane, acc);
+        if (a.probe) {
+#pragma unroll
+            for (int j = 0; j < NC; ++j) acc[j] = (float) row[lane];
+        } else
+        row_dot<NC, NB>(a.type[m], row, x, nb32, a.n_in / QK, lane, acc);
 #pragma unroll
         for (int j = 0; j < NC; ++j)
             if (lane == j) a.y[m][(size_t) j * a.n_out[m] + g] = acc[j];
@@ -502,10 +554,10 @@ __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nbl
     }
 }
 
-template<int NC>
+template<int NC, int NB>
 __global__ void __launch_bounds__(kNW * WARP, 1) dense_kernel(const DenseArgs a) {
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_block<NC>(a, blockIdx.x, gridDim.x, smem);
+    dense_block<NC, NB>(a, blockIdx.x, gridDim.x, smem);
 }
 
 int row_bytes_of(int type, int n_in) {
@@ -539,8 +591,8 @@ int smem_optin() {
     return n;
 }
 
-template<int NC>
-void launch_nc(DenseArgs a, cudaStream_t s) {
+template<int NC, int NB>
+void launch_nb(DenseArgs a, cudaStream_t s) {
     const int x_bytes = a.x ? (NC * (a.n_in / Q8K) * (int) sizeof(Q81Block) + 15) & ~15 : 0;
     const int fixed = kNW * kMaxSlots * 8 + x_bytes;
     const int budget = smem_optin() - 1024;
@@ -550,13 +602,23 @@ void launch_nc(DenseArgs a, cudaStream_t s) {
     const int smem = fixed + kNW * a.nslot * a.slot_bytes;
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(dense_kernel<NC>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_optin());
+        cudaFuncSetAttribute(dense_kernel<NC, NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_optin());
         attr = true;
     }
     int blocks = sm_count();
     const int need = (a.rows + kNW - 1) / kNW;
     if (need < blocks) blocks = need;
-    launch_pdl(dense_kernel<NC>, dim3((unsigned) blocks), dim3(kNW * WARP), (size_t) smem, s, a);
+    launch_pdl(dense_kernel<NC, NB>, dim3((unsigned) blocks), dim3(kNW * WARP), (size_t) smem, s, a);
+}
+
+// the block counts of the GDN projections' rows unrolled, any other one looped
+template<int NC>
+void launch_nc(const DenseArgs& a, cudaStream_t s) {
+    switch (a.n_in / QK) {
+        case 10: launch_nb<NC, 10>(a, s); break;
+        case 24: launch_nb<NC, 24>(a, s); break;
+        default: launch_nb<NC, 0>(a, s); break;
+    }
 }
 
 void launch(DenseArgs a, int n_tok, cudaStream_t s) {
@@ -598,6 +660,8 @@ DenseArgs make_args(const DecMat* m, int n_mats, int n_in) {
         if (a.row_bytes[i] > widest) widest = a.row_bytes[i];
     }
     a.slot_bytes = (widest + 15 + 15) & ~15;
+    static const int probe = [] { const char* v = std::getenv("STRATA_DEC_GDN_PROBE"); return v ? std::atoi(v) : 0; }();
+    a.probe = probe;
     return a;
 }
 

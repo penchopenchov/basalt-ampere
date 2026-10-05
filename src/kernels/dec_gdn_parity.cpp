@@ -18,6 +18,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -81,6 +82,7 @@ void* rand_mat(int t, int n_in, int n_out, std::mt19937& rng) {
     void* d = nullptr;
     CK(cudaMalloc(&d, bytes + 64));
     CK(cudaMemcpy(d, w.data(), bytes, cudaMemcpyHostToDevice));
+    CK(cudaDeviceSynchronize());   // a pageable copy may return before its DMA lands; the test streams do not wait for it
     return d;
 }
 
@@ -89,6 +91,7 @@ V* upload(const std::vector<V>& h) {
     V* d = nullptr;
     CK(cudaMalloc(&d, h.size() * sizeof(V) + 64));
     CK(cudaMemcpy(d, h.data(), h.size() * sizeof(V), cudaMemcpyHostToDevice));
+    CK(cudaDeviceSynchronize());
     return d;
 }
 std::vector<float> randn(size_t n, float sd, std::mt19937& rng) {
@@ -182,7 +185,8 @@ void run_ref(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int
     }
 }
 
-void run_new(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int stages = 7) {
+void run_new(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int stages = 7,
+             unsigned long long* stamps = nullptr) {
     if (stages & 1) {
         const DecMat m[2] = {{L.tq, L.wqkv, C, b.qkv}, {L.tz, L.wz, ZV, b.z}};
         dec_gdn_inproj(x, N, T, m, 2, s);
@@ -192,6 +196,7 @@ void run_new(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int
         a.state = L.state; a.qkv = b.qkv; a.conv_w = L.conv_w; a.x = x; a.w_alpha = L.wa; a.w_beta = L.wb;
         a.dt = L.dt; a.ssm_a = L.ssm_a; a.z = b.z; a.gamma = L.gamma; a.h = b.h; a.gate = b.gate; a.beta = b.beta;
         a.y = nullptr; a.yq = b.yq; a.C = C; a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = EPS;
+        a.stamps = stamps;
         dec_gdn_rec(a, T, s);
     }
     if (stages & 4) dec_dense(b.yq, ZV, T, DecMat{L.to, L.wo, N, b.bo}, s);
@@ -255,13 +260,53 @@ bool parity(cudaStream_t s) {
             std::printf("qkv %-6s z %-6s out %-6s T=%d: %s%s\n", fmt(cb[0]).name, fmt(cb[1]).name, fmt(cb[2]).name, T,
                         d == 0 ? "bitwise" : ("DIFF " + std::to_string(d)).c_str(), st_ok ? "" : " STATE WRITTEN");
             ok = ok && d == 0 && st_ok;
+            if (d != 0 && std::getenv("DEC_DBG")) {
+                Bufs n2 = make_bufs(), r2 = make_bufs();
+                clear(n2, s); clear(r2, s);
+                run_new(L, x, n2, T, s);
+                run_ref(L, x, r2, T, s);
+                CK(cudaStreamSynchronize(s));
+                double m2 = 0;
+                std::printf("  new vs new: %lld, ref vs ref: %lld\n", cmp_f("qkv", n.qkv, n2.qkv, (size_t) T * C, m2),
+                            cmp_f("qkv", r.qkv, r2.qkv, (size_t) T * C, m2));
+                std::vector<float> hn = down(n.qkv, (size_t) T * C), hr = down(r.qkv, (size_t) T * C);
+                for (int t = 0; t < T; ++t) std::printf("  t%d: ref %.6g new %.6g\n", t, hr[(size_t) t * C], hn[(size_t) t * C]);
+            }
             CK(cudaFree(x));
         }
     }
     return ok;
 }
 
+// where the recurrence kernel's time goes: per phase, the mean over blocks of (stamp - first block's start)
+void rec_phases(cudaStream_t s) {
+    std::mt19937 rng(9);
+    Layer L = make_layer(14, 23, 14, rng);
+    Bufs b = make_bufs();
+    unsigned long long* st = nullptr;
+    CK(cudaMalloc(&st, 8 * HV * 4 * 10));
+    for (int T : {1, 2, 3, 4, 8}) {
+        float* x = upload(randn((size_t) T * N, 1.f, rng));
+        run_new(L, x, b, T, s, 1);
+        CK(cudaStreamSynchronize(s));
+        run_new(L, x, b, T, s, 2, st);
+        CK(cudaStreamSynchronize(s));
+        std::vector<unsigned long long> h = down(st, (size_t) HV * 4 * 10);
+        unsigned long long t0 = ~0ull;
+        for (int k = 0; k < HV * 4; ++k) t0 = std::min(t0, h[k * 10]);
+        std::printf("rec T=%d phases (us from first start, mean / max over blocks):", T);
+        for (int i = 0; i < 10; ++i) {
+            double m = 0, mx = 0;
+            for (int k = 0; k < HV * 4; ++k) { const double v = (h[k * 10 + i] - t0) / 1e3; m += v; mx = std::max(mx, v); }
+            std::printf(" %d:%.2f/%.2f", i, m / (HV * 4), mx);
+        }
+        std::printf("\n");
+        CK(cudaFree(x));
+    }
+}
+
 void bench(cudaStream_t s) {
+    rec_phases(s);
     std::mt19937 rng(7);
     constexpr int NL = 12;   // distinct layers per graph: far more weight than the L2 holds
     const int types[NL][3] = {{23, 21, 14}, {14, 14, 14}, {12, 12, 13}, {14, 23, 14}, {13, 23, 12}, {14, 21, 14},
@@ -331,8 +376,9 @@ int main(int argc, char** argv) {
                 p.sharedMemPerBlockOptin >> 10);
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    const bool ok = parity(s);
-    std::printf("dec_gdn_parity: %s\n", ok ? "PASS (bitwise)" : "FAIL");
-    if (argc > 1 && std::string(argv[1]) == "--bench") bench(s);
+    const std::string mode = argc > 1 ? argv[1] : "";
+    const bool ok = mode == "--bench-only" || parity(s);
+    if (mode != "--bench-only") std::printf("dec_gdn_parity: %s\n", ok ? "PASS (bitwise)" : "FAIL");
+    if (mode == "--bench" || mode == "--bench-only") bench(s);
     return ok ? 0 : 1;
 }

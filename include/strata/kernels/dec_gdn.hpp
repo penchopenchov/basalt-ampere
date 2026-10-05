@@ -54,6 +54,7 @@ struct DecRecArgs {
     void* yq = nullptr;              // q8_1 of the output, token t at block t * h_v * S / 32
     int C = 0, n_embd = 0, h_k = 0, h_v = 0;
     float eps = 0.0f;
+    unsigned long long* stamps = nullptr;   // bench: 10 per-phase timestamps per block
 };
 
 /// The recurrence of tokens [0, n_tok) from the untouched state; one cluster of four blocks per value head.
