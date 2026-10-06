@@ -113,6 +113,12 @@ __device__ __forceinline__ void hc_q8_1_store_native(float xi, HcQ81* __restrict
     if (lane == 0) y[ib].ds = q8_1_ds(d, sum);
 }
 
+// A read without a router that writes xq, up slices of whole q8_1 blocks: the epilogue's warps write them (each warp
+// stores 32 consecutive values of one token: T * nc is a multiple of 32 and THREADS of 32)
+__device__ __forceinline__ bool up_q8_inline(const HcFusedArgs& a, int c0, int nc) {
+    return a.xq != nullptr && a.w_router == nullptr && nc == 32 && c0 % 32 == 0;
+}
+
 // A read without a router that writes xq: per q8_1 block of a token row, the columns of the up slices done so far
 // (the slice that completes a block quantizes it for every token and zeroes its count)
 __device__ unsigned g_hc_q8cnt[4][N / 32];
@@ -1359,12 +1365,14 @@ __device__ void hc_up_main(const HcFusedArgs& a, UpSlice sl, int tid, char* smem
     if constexpr (P2 > 0) up_pass<(P2 > 0 ? P2 : 1), SPREAD>(u, U, nc, P1, rs2, lane, warp);
     __syncthreads();
     stamp(dbg, b, 4, tid);
+    const bool q8i = up_q8_inline(a, c0, nc);   // a warp's 32 values are one q8_1 block of one token
     for (int i = tid; i < T * nc; i += THREADS) {
         const int k = i / nc, col = i - k * nc;
         float s = 0.0f;
 #pragma unroll
         for (int c = 0; c < HC; ++c) s += u.g[(k * HC + c) * nc + col];
         a.mixed[(size_t) k * N + c0 + col] = s / (float) HC;
+        if (q8i) hc_q8_1_store_native(s / (float) HC, static_cast<HcQ81*>(a.xq), k * (N / 32) + c0 / 32, tid & 31);
     }
     stamp(dbg, b, 5, tid);
 }
@@ -1441,12 +1449,14 @@ __device__ void hc_up_main_mma(const HcFusedArgs& a, UpSlice sl, int tid, char* 
     }
     __syncthreads();
     stamp(dbg, b, 4, tid);
+    const bool q8i = up_q8_inline(a, c0, nc);   // a warp's 32 values are one q8_1 block of one token
     for (int i = tid; i < T * nc; i += THREADS) {
         const int k = i / nc, col = i - k * nc;
         float s = 0.0f;
 #pragma unroll
         for (int c = 0; c < HC; ++c) s += u.g[(k * HC + c) * nc + col];
         a.mixed[(size_t) k * N + c0 + col] = s / (float) HC;
+        if (q8i) hc_q8_1_store_native(s / (float) HC, static_cast<HcQ81*>(a.xq), k * (N / 32) + c0 / 32, tid & 31);
     }
     stamp(dbg, b, 5, tid);
 }
@@ -1609,12 +1619,14 @@ __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char*
     }
     __syncthreads();
     stamp(dbg, b, 4, tid);
+    const bool q8i = up_q8_inline(a, c0, nc);   // a warp's 32 values are one q8_1 block of one token
     for (int i = tid; i < T * nc; i += THREADS) {
         const int k = i / nc, col = i - k * nc;
         float s = 0.0f;
 #pragma unroll
         for (int c = 0; c < HC; ++c) s += u.g[(k * HC + c) * nc + col];
         a.mixed[(size_t) k * N + c0 + col] = s / (float) HC;
+        if (q8i) hc_q8_1_store_native(s / (float) HC, static_cast<HcQ81*>(a.xq), k * (N / 32) + c0 / 32, tid & 31);
     }
     stamp(dbg, b, 5, tid);
 }
@@ -2144,7 +2156,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                 hcx_router_part<T>(sl, rw, mix, tid, L.racc);
                 stamp(dbg, b, 5, tid);
             }
-            if (a.xq != nullptr && a.w_router == nullptr) hc_up_q8<T>(a, sl.c0, sl.nc, tid, g_hc_q8cnt[L.slot]);
+            if (a.xq != nullptr && a.w_router == nullptr && !up_q8_inline(a, sl.c0, sl.nc))
+                hc_up_q8<T>(a, sl.c0, sl.nc, tid, g_hc_q8cnt[L.slot]);
             cta_signal(&sy->up.v, tid);
             stamp(dbg, b, 3, tid);
         } else if (item >= it.t10) {
@@ -2962,6 +2975,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         if (cudaLaunchKernelEx(&cfg, fn, L) == cudaSuccess && pdl) ++pdl_count();
     } else {
         L.nu = sk.nu >= MIN_NU && sk.nu <= L.nb ? sk.nu : 0;
+        if (L.cn && a.xq != nullptr && a.w_router == nullptr && L.nu == 0) L.nu = CN_MIN_NU;   // whole q8_1 blocks
         L.pf = sk.pf;
         launch_pdl((q8 ? kKernels8 : kKernels)[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM,
                    (cudaStream_t) stream, L);

@@ -24,6 +24,12 @@ bool dense_tc_supported(int ggml_type, int n_in, int n_out, const void* weights)
 void dense_tc(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
               void* stream);
 
+/// Two projections of one input in one launch (whole 16-row tiles, the first matrix's then the second's; types as
+/// above plus IQ3_S): each output is bitwise the same for every ncols and column.
+bool dense_tc_pair_supported(int type0, int type1, int n_in) noexcept;
+void dense_tc_pair(int type0, const void* w0, float* y0, int n_out0, int type1, const void* w1, float* y1, int n_out1,
+                   const void* x_q8_1, int n_in, int ncols, void* stream);
+
 /// STRATA_DEC_DTC: which verify projections take dense_tc for every window width (bits): 1 GDN qkv, 2 GDN z, 4 GDN
 /// out, 8 QSA q, 16 QSA out, 32 QSA k/v.  0 (default) none.
 int dense_tc_mask();

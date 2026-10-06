@@ -41,6 +41,7 @@ const Case CASES[] = {
     {"qkv IQ4_XS", 23, 2560, 10240, 136, {0, -1}},
     {"z Q6_K", 14, 2560, 6144, 210, {208, -1}},
     {"z IQ4_XS", 23, 2560, 6144, 136, {0, -1}},
+    {"z IQ3_S", 21, 2560, 6144, 110, {0, -1}},
     {"out Q6_K", 14, 6144, 2560, 210, {208, -1}},
     {"out IQ4_XS", 23, 6144, 2560, 136, {0, -1}},
     {"out Q4_K", 12, 6144, 2560, 144, {0, 2}},
@@ -133,6 +134,71 @@ bool parity(const Case& c, cudaStream_t s) {
     return ok;
 }
 
+// dense_tc_pair of a qkv and a z case: each output's T columns bitwise equal to the 8-column call, and its error
+// against native_mmvq
+bool pair_parity(const Case& a, const Case& b, cudaStream_t s) {
+    constexpr int TM = 8;
+    std::mt19937 rng(4242u + (unsigned) a.type * 7u + (unsigned) b.type);
+    const std::vector<uint8_t> wa = make_weights(a, rng), wb = make_weights(b, rng);
+    std::vector<float> x((std::size_t) TM * a.n_in);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : x) v = nd(rng);
+    const std::size_t qcol = strata::kernels::native_q8_1_bytes(a.n_in, 1);
+    void *dwa = nullptr, *dwb = nullptr, *xq = nullptr;
+    float *dx = nullptr, *ra = nullptr, *rb = nullptr, *ya = nullptr, *yb = nullptr;
+    cudaMalloc(&dwa, wa.size()); cudaMalloc(&dwb, wb.size()); cudaMalloc(&xq, qcol * TM);
+    cudaMalloc(&dx, x.size() * 4);
+    cudaMalloc(&ra, (std::size_t) TM * a.n_out * 4); cudaMalloc(&rb, (std::size_t) TM * b.n_out * 4);
+    cudaMalloc(&ya, (std::size_t) (TM + 1) * TM * a.n_out * 4); cudaMalloc(&yb, (std::size_t) (TM + 1) * TM * b.n_out * 4);
+    cudaMemcpy(dwa, wa.data(), wa.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dwb, wb.data(), wb.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+    strata::kernels::native_quantize_q8_1(dx, xq, a.n_in, TM, s);
+    for (int j = 0; j < TM; ++j) {
+        strata::kernels::native_mmvq(a.type, dwa, (const uint8_t*) xq + j * qcol, ra + (std::size_t) j * a.n_out, a.n_in,
+                                     a.n_out, 1, s);
+        strata::kernels::native_mmvq(b.type, dwb, (const uint8_t*) xq + j * qcol, rb + (std::size_t) j * b.n_out, b.n_in,
+                                     b.n_out, 1, s);
+    }
+    for (int T = 1; T <= TM; ++T)
+        strata::kernels::dense_tc_pair(a.type, dwa, ya + (std::size_t) T * TM * a.n_out, a.n_out, b.type, dwb,
+                                       yb + (std::size_t) T * TM * b.n_out, b.n_out, xq, a.n_in, T, s);
+    if (!ck(cudaStreamSynchronize(s), "pair run")) return false;
+    bool ok = true;
+    for (int m = 0; m < 2; ++m) {
+        const Case& c = m == 0 ? a : b;
+        float* dy = m == 0 ? ya : yb;
+        float* dr = m == 0 ? ra : rb;
+        std::vector<float> ref((std::size_t) TM * c.n_out), got((std::size_t) (TM + 1) * TM * c.n_out);
+        cudaMemcpy(ref.data(), dr, ref.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(got.data(), dy, got.size() * 4, cudaMemcpyDeviceToHost);
+        long long bits = 0;
+        const float* g8 = got.data() + (std::size_t) TM * TM * c.n_out;
+        for (int T = 1; T <= TM; ++T)
+            for (int j = 0; j < T; ++j)
+                for (int r = 0; r < c.n_out; ++r)
+                    if (std::memcmp(&got[((std::size_t) T * TM + j) * c.n_out + r], &g8[(std::size_t) j * c.n_out + r], 4))
+                        ++bits;
+        double maxd = 0, maxr = 0, sd = 0, sr = 0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            const double d = std::fabs((double) g8[i] - (double) ref[i]);
+            maxd = std::max(maxd, d);
+            maxr = std::max(maxr, std::fabs((double) ref[i]));
+            sd += d * d;
+            sr += (double) ref[i] * ref[i];
+        }
+        const double rms = std::sqrt(sd / std::max(sr, 1e-300));
+        const bool k = bits == 0 && rms < 1e-3;
+        std::printf("pair %-10s + %-10s [%d] T-columns bitwise: %s (%lld)  vs native: max|d|/max|ref| %.3e  rms %.3e  %s\n",
+                    a.name, b.name, m, bits == 0 ? "yes" : "NO", bits, maxd / std::max(maxr, 1e-30), rms,
+                    k ? "PASS" : "FAIL");
+        ok = ok && k;
+    }
+    cudaFree(dwa); cudaFree(dwb); cudaFree(xq); cudaFree(dx); cudaFree(ra); cudaFree(rb); cudaFree(ya); cudaFree(yb);
+    return ok;
+}
+
 // µs per call: NL calls on NL distinct weight copies (> L2), captured once as a graph, best of `reps` replays
 template<typename F>
 double time_graph(F&& call, int NL, cudaStream_t s, int reps = 7) {
@@ -174,7 +240,7 @@ void bench(cudaStream_t s) {
     const bool warm = std::getenv("DTC_BENCH_WARM") != nullptr;
     for (const Case& c : CASES) {
         bool on = pick == nullptr ? (&c == &CASES[0] || &c == &CASES[1] || &c == &CASES[3] || &c == &CASES[4] ||
-                                     &c == &CASES[6] || &c == &CASES[11])
+                                     &c == &CASES[7] || &c == &CASES[12])
                                   : false;
         if (pick != nullptr) {
             std::string all(pick), name(c.name);
@@ -223,6 +289,54 @@ void bench(cudaStream_t s) {
     }
 }
 
+// DTC_BENCH_PAIR=1: dense_tc_pair of qkv + z against dense_tc qkv then native z, L2-cold
+void bench_pair(cudaStream_t s) {
+    const int pairs[][2] = {{0, 6}, {1, 5}, {3, 5}, {0, 4}, {1, 6}};
+    std::printf("\npair bench: us per call (median of 7 graph replays)\n");
+    for (const auto& pr : pairs) {
+        const Case &a = CASES[pr[0]], &b = CASES[pr[1]];
+        const std::size_t wba = strata::kernels::native_mmvq_weight_bytes(a.type, a.n_in, a.n_out);
+        const std::size_t wbb = strata::kernels::native_mmvq_weight_bytes(b.type, b.n_in, b.n_out);
+        const std::size_t wb = ((wba + 255) & ~(std::size_t) 255) + ((wbb + 255) & ~(std::size_t) 255);
+        const int NL = (int) std::max<std::size_t>(8, (400u << 20) / wb);
+        std::mt19937 rng(5u);
+        const std::vector<uint8_t> w0 = make_weights(a, rng), w1 = make_weights(b, rng);
+        uint8_t* dw = nullptr;
+        void* xq = nullptr;
+        float *dx = nullptr, *y0 = nullptr, *y1 = nullptr;
+        cudaMalloc(&dw, wb * NL);
+        const std::size_t off1 = (wba + 255) & ~(std::size_t) 255;
+        for (int l = 0; l < NL; ++l) {
+            cudaMemcpy(dw + wb * l, w0.data(), wba, cudaMemcpyHostToDevice);
+            cudaMemcpy(dw + wb * l + off1, w1.data(), wbb, cudaMemcpyHostToDevice);
+        }
+        cudaMalloc(&xq, strata::kernels::native_q8_1_bytes(a.n_in, 8));
+        cudaMalloc(&dx, (std::size_t) 8 * a.n_in * 4);
+        cudaMalloc(&y0, (std::size_t) 8 * a.n_out * 4);
+        cudaMalloc(&y1, (std::size_t) 8 * b.n_out * 4);
+        std::vector<float> x((std::size_t) 8 * a.n_in);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        for (auto& v : x) v = nd(rng);
+        cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+        strata::kernels::native_quantize_q8_1(dx, xq, a.n_in, 8, s);
+        std::printf("%-10s + %-10s %.1f MB  floor %.2f us at 1.79 TB/s\n   T   serial us   pair us   GB/s\n", a.name,
+                    b.name, (wba + wbb) / 1e6, (wba + wbb) / 1.79e6);
+        for (int T = 1; T <= 4; ++T) {
+            const double ts = time_graph([&](int l) {
+                strata::kernels::dense_tc(a.type, dw + wb * l, xq, y0, a.n_in, a.n_out, T, s);
+                strata::kernels::native_mmvq(b.type, dw + wb * l + off1, xq, y1, b.n_in, b.n_out, T, s);
+            }, NL, s);
+            const double tp = time_graph([&](int l) {
+                strata::kernels::dense_tc_pair(a.type, dw + wb * l, y0, a.n_out, b.type, dw + wb * l + off1, y1, b.n_out,
+                                               xq, a.n_in, T, s);
+            }, NL, s);
+            std::printf("  %2d  %8.2f  %8.2f  %6.0f\n", T, ts, tp, (wba + wbb) / tp / 1e3);
+        }
+        cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(y0); cudaFree(y1);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -237,9 +351,16 @@ int main(int argc, char** argv) {
     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
     const bool only_bench = argc > 1 && std::string(argv[1]) == "--bench-only";
     bool ok = true;
-    if (!only_bench)
-        for (const Case& c : CASES) ok = parity(c, s) && ok;
-    if (argc > 1 && (std::string(argv[1]) == "--bench" || only_bench)) bench(s);
+    if (!only_bench) {
+        for (const Case& c : CASES)
+            if (c.type != 21 || c.n_in % 2048 == 0) ok = parity(c, s) && ok;
+        const int pairs[][2] = {{0, 6}, {1, 5}, {2, 4}, {3, 6}, {0, 5}};
+        for (const auto& pr : pairs) ok = pair_parity(CASES[pr[0]], CASES[pr[1]], s) && ok;
+    }
+    if (argc > 1 && (std::string(argv[1]) == "--bench" || only_bench)) {
+        if (std::getenv("DTC_BENCH_PAIR") != nullptr) bench_pair(s);
+        else bench(s);
+    }
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

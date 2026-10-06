@@ -163,8 +163,9 @@ int dec_qsaf_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_QSAF"); return e ? std::atoi(e) : 0; }();
     return m;
 }
-// STRATA_DEC_DTC2 & 8: the attention's hc read writes the projections' q8_1 rows (its up slices), no quantize launch
-// (bits 1 and 2: dense_tc.hpp)
+// STRATA_DEC_DTC2 (bit mask; 1, 2 and 4: dense_tc.cu's layouts and IQ3_S): 8 = the attention's hc read writes the
+// projections' q8_1 rows (its up slices), no quantize launch; 16 = a GDN layer's qkv and z projections in one
+// dense_tc_pair launch for every window width (z off the side stream)
 int dec_dtc2_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_DTC2"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -1226,6 +1227,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     cudaEventRecord(ev_join_, sh_cs_);
                 };
                 if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                // STRATA_DEC_DTC2 & 16: qkv and z in one dense_tc_pair launch for every window width, then the
+                // one-launch recurrence with the gated norm
+                if (gdnf && (dec_dtc2_mask() & 16) &&
+                    kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
+                    ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0) {
+                    {
+                        PdlScope pp(pdl);   // after the hc read or the q8_1 kernel
+                        kernels::dense_tc_pair(wqkv->native_type, wqkv->native_data, qkv + (size_t) tb * C, (int) C,
+                                               wg->native_type, wg->native_data, z_, (int) ZV, xq_, (int) N, n, cs);
+                    }
+                    for (int i = 2; i <= 5; ++i) stamp(l, i, grp);
+                    DecRecArgs ra;
+                    ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
+                    ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+                    ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
+                    ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
+                    ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                    {
+                        PdlScope pr(pdl);
+                        dec_gdn_rec(ra, n, cs);
+                    }
+                    stamp(l, 6, grp);
+                    dense_proj(4, wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                    goto gdn_done;
+                }
                 const bool pk_z = gdnf_fork && sh_hi_ != nullptr && (dec_pk_mask() & 2) && n <= 2;
                 if (pk_z) {   // STRATA_DEC_PK & 2: z at the greatest priority beside qkv, then the one-launch recurrence
                     cudaEventRecord(ev_fork_, cs);

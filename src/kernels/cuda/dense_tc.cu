@@ -21,6 +21,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -606,6 +607,153 @@ constexpr int one_smem_bytes(int n_in) {
     return 128 + NW * 16 * kMaxCols * 4 + 16 * one_row_stride((n_in / 256) * Fmt<TYPE>::SB) + (TYPE == 21 ? 2048 : 0);
 }
 
+// Two matrices of one input in one launch (dense_tc_pair): whole 16-row tiles as in dense_tc_tile_block, the first
+// matrix's tiles then the second's, each tile with its own format; a tile's arithmetic is dense_tc_tile_block's.
+struct PairMat {
+    const uint8_t* w;
+    float* y;
+    int type, n_out;
+};
+__host__ __device__ constexpr int sb_bytes(int type) {
+    return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : 136;
+}
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+template<int TYPE>
+__device__ __forceinline__ void pair_terms(float (&acc)[4], const uint8_t* rowA, const uint8_t* rowB, int wp, int hb,
+                                           int n, int g, int t, const uint8_t* __restrict__ x, int nb32, int nchunk,
+                                           int ncols, const uint32_t* grid, int probe) {
+    constexpr int CB = 2 * Fmt<TYPE>::SB;
+    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    if constexpr (TYPE == 23) {
+        const uint32_t* tbl = reinterpret_cast<const uint32_t*>(dtc_iq4nl);
+        t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3];
+    }
+    rowA += (hb >> 1) * Fmt<TYPE>::SB;
+    rowB += (hb >> 1) * Fmt<TYPE>::SB;
+    for (int c = wp >> 2; c < nchunk; c += 2) {
+        XFrag xf;
+#pragma unroll
+        for (int k4 = 0; k4 < 4; ++k4) {
+            const int k = 16 * c + 4 * hb + k4;
+            xf.b0[k4] = xf.b1[k4] = 0;
+            if (g < ncols) {
+                const uint8_t* xb = x + ((size_t) g * nb32 + k) * kQ81;
+                xf.b0[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 4) + t);
+                xf.b1[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 20) + t);
+            }
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int col = 2 * t + e;
+                xf.d8[k4][e] = col < ncols ? __low2float(__ldg(reinterpret_cast<const half2*>(
+                                                 x + ((size_t) col * nb32 + k) * kQ81)))
+                                           : 0.0f;
+            }
+        }
+        const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
+        if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3, grid);
+    }
+}
+
+// block blk of nblk (256 threads); smem: 128 + 4096 + 2048 (IQ3_S grid) + 2 slots of the larger tile
+__device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* smem, PairMat m0, PairMat m1,
+                                                    const uint8_t* __restrict__ x, int n_in, int ncols, int probe) {
+    uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
+    float* red = reinterpret_cast<float*>(smem + 128);   // [warp][row][column]
+    uint32_t* grid = reinterpret_cast<uint32_t*>(smem + 128 + 8 * 16 * kMaxCols * 4);
+    uint8_t* slots = smem + 128 + 8 * 16 * kMaxCols * 4 + 2048;
+    const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int hb = wp & 3, n = hb & 1;
+    const int nchunk = n_in / 512, nb32 = n_in / 32;
+    const int nt0 = (m0.n_out + 15) / 16, ntiles = nt0 + (m1.n_out + 15) / 16;
+    const int tb0 = 16 * (n_in / 256) * sb_bytes(m0.type), tb1 = 16 * (n_in / 256) * sb_bytes(m1.type);
+    const int slot_bytes = tb0 > tb1 ? tb0 : tb1;
+    const int mine = blk < ntiles ? (ntiles - 1 - blk) / nblk + 1 : 0;
+    if (m0.type == 21 || m1.type == 21)
+        for (int i = tid; i < 512; i += 256) grid[i] = iq3s_grid[i];
+    auto issue = [&](int i) {
+        const int tile = blk + i * nblk;
+        const bool second = tile >= nt0;
+        const PairMat& m = second ? m1 : m0;
+        const int lt = second ? tile - nt0 : tile;
+        const int row_bytes = (n_in / 256) * sb_bytes(m.type);
+        const int rows = min(16, m.n_out - lt * 16);
+        const uint32_t bytes = (uint32_t) ((rows * row_bytes + 15) & ~15);
+        const uint32_t sb = (uint32_t) __cvta_generic_to_shared(slots + (size_t) (i & 1) * slot_bytes);
+        const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1));
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bb), "r"(bytes) : "memory");
+        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                     ::"r"(sb), "l"(m.w + (size_t) lt * 16 * row_bytes), "r"(bytes), "r"(bb) : "memory");
+    };
+    if (tid == 0) {
+        for (int q = 0; q < 2; ++q)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"((uint32_t) __cvta_generic_to_shared(bar + q)));
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        if (!(probe & 2))
+            for (int i = 0; i < 2 && i < mine; ++i) issue(i);
+    }
+    __syncthreads();
+    pdl_wait();
+    for (int i = 0; i < mine; ++i) {
+        const int tile = blk + i * nblk;
+        const bool second = tile >= nt0;
+        const PairMat& m = second ? m1 : m0;
+        const int row0 = (second ? tile - nt0 : tile) * 16;
+        const int row_bytes = (n_in / 256) * sb_bytes(m.type);
+        if (!(probe & 2)) {
+            uint32_t done = 0;
+            const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1)), par = (uint32_t) (i >> 1) & 1u;
+            do {
+                asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+                             " selp.u32 %0, 1, 0, p;\n}" : "=r"(done) : "r"(bb), "r"(par) : "memory");
+            } while (!done);
+        }
+        const uint8_t* slot = slots + (size_t) (i & 1) * slot_bytes;
+        const uint8_t* rowA = slot + g * row_bytes;
+        const uint8_t* rowB = slot + (g + 8) * row_bytes;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        switch (m.type) {
+            case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+            case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+            case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+            case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+            default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+        }
+        float* rw = red + wp * 16 * kMaxCols;
+        rw[g * kMaxCols + 2 * t] = acc[0];
+        rw[g * kMaxCols + 2 * t + 1] = acc[1];
+        rw[(g + 8) * kMaxCols + 2 * t] = acc[2];
+        rw[(g + 8) * kMaxCols + 2 * t + 1] = acc[3];
+        if (i == mine - 1) pdl_launch_dependents();
+        __syncthreads();   // the slot is read and the warp sums are in
+        if (tid == 0 && i + 2 < mine && !(probe & 2)) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            issue(i + 2);
+        }
+        if (tid < 16 * kMaxCols) {
+            const int row = tid / kMaxCols, col = tid % kMaxCols;
+            if (col < ncols && row0 + row < m.n_out) {
+                const float* rr = red + row * kMaxCols + col;
+                constexpr int WS = 16 * kMaxCols;   // one warp's sums
+                const float v = ((rr[0] + rr[4 * WS]) + (rr[WS] + rr[5 * WS])) +
+                                ((rr[2 * WS] + rr[6 * WS]) + (rr[3 * WS] + rr[7 * WS]));
+                m.y[(size_t) col * m.n_out + row0 + row] = v;
+            }
+        }
+        __syncthreads();   // the sums are read
+    }
+}
+#endif
+
+__global__ void __launch_bounds__(256) dense_tc_pair_kernel(PairMat m0, PairMat m1, const uint8_t* __restrict__ x,
+                                                            int n_in, int ncols, int probe) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    extern __shared__ __align__(128) uint8_t smem[];
+    dense_tc_pair_block((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
+#elif defined(__CUDA_ARCH__)
+    __trap();
+#endif
+}
+
 template<int TYPE, int S, int MT, int KS>
 size_t smem_bytes() {
     return (size_t) S * 16 * MT * row_stride(KS * Fmt<TYPE>::SB) + (size_t) MT * KS * 4 * 16 * kMaxCols * 4;
@@ -766,6 +914,42 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dense_tc: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+bool dense_tc_pair_supported(int t0, int t1, int n_in) noexcept {
+    auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23; };
+    if (!ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
+    const int tb = 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
+    return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb <= 99 * 1024;
+}
+
+void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const void* w1, float* y1, int n_out1,
+                   const void* x_q8_1, int n_in, int ncols, void* stream) {
+    if (!dense_tc_pair_supported(t0, t1, n_in) || ncols < 1 || ncols > kMaxCols || n_out0 < 1 || n_out1 < 1 ||
+        ((uintptr_t) w0 & 15) != 0 || ((uintptr_t) w1 & 15) != 0 || ((uintptr_t) x_q8_1 & 3) != 0) {
+        std::fprintf(stderr, "dense_tc_pair: types %d/%d n_in %d not supported\n", t0, t1, n_in);
+        std::exit(1);
+    }
+    const int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(dense_tc_pair_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
+        attr = true;
+    }
+    int occ = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_pair_kernel, 256, smem);
+    if (g_bps > 0 && g_bps < occ) occ = g_bps;
+    if (occ < 1) occ = 1;
+    const int ntiles = (n_out0 + 15) / 16 + (n_out1 + 15) / 16;
+    const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
+    const PairMat m0{(const uint8_t*) w0, y0, t0, n_out0}, m1{(const uint8_t*) w1, y1, t1, n_out1};
+    launch_pdl(dense_tc_pair_kernel, dim3((unsigned) grid), dim3(256), (size_t) smem, (cudaStream_t) stream, m0, m1,
+               (const uint8_t*) x_q8_1, n_in, ncols, g_probe);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "dense_tc_pair: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
 }
