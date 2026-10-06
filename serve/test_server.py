@@ -1102,50 +1102,46 @@ class StartFailureLog(unittest.TestCase):
             self.assertNotIn("an earlier start", text)
 
 
-class StartNarrator(unittest.TestCase):
-    """The start's words say what happens to the experts - --mmap-experts loads nothing into RAM up front."""
-
-    def test_the_words_follow_the_flags(self):
-        from serve.server import experts_loading_words
-        self.assertEqual(experts_loading_words([], "38.0 GiB"), "loading experts into RAM (38.0 GiB)")
-        self.assertEqual(experts_loading_words(["--mmap-experts"], "47.0 GiB"), "mapping experts (47.0 GiB)")
-        self.assertEqual(experts_loading_words(["--resident-experts"], ""), "loading experts into RAM")
-        budget = experts_loading_words(["--mmap-experts", "--resident-budget-gib", "71"], "50.0 GiB")
-        self.assertEqual(budget, "loading experts into RAM, budget 71 GiB")
-
-    def narrate(self, args, lines):
-        import contextlib
-        import io
-        from serve.server import narrate_start
-        d = tempfile.mkdtemp()
-        log = Path(d) / "engine.log"
-        log.write_text("".join(x + "\n" for x in lines), encoding="utf-8")
-        done, out = threading.Event(), io.StringIO()
-        with contextlib.redirect_stdout(out):
-            t = threading.Thread(target=narrate_start, args=(str(log), 0, args, done))
-            t.start()
-            time.sleep(0.8)
-            done.set()
-            t.join(5)
-        return out.getvalue()
-
-    def test_a_mapped_start(self):
-        said = self.narrate(["--mmap-experts"], ["basalt generate: experts via mmap (--mmap-experts; the GGUF shards "
-                                                 "in place, no experts.bin)"])
-        self.assertIn("[server] mapping experts", said)
-        self.assertNotIn("loading experts into RAM", said)
-
-    def test_an_arena_start(self):
-        said = self.narrate([], ["basalt generate: expert arena: resident, 31.64 GiB",
-                                 "basalt generate: loaded 31.64 GiB at 3.17 GiB/s"])
-        self.assertIn("[server] loading experts into RAM\n", said)
-        self.assertIn("experts loaded: 31.64 GiB at 3.17 GiB/s", said)
-
-
 class LoadProgress(unittest.TestCase):
-    """The engine's `basalt load:` lines become one bar per target."""
+    """The engine's `basalt load:` lines: a bar while a target loads, one line when it is done."""
 
-    def test_bars_replace_the_step_lines(self):
+    def test_parse(self):
+        from serve.server import load_progress
+        self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100))
+        self.assertIsNone(load_progress("basalt load: cuda0 ten 100"))
+        self.assertIsNone(load_progress("basalt generate: loaded 3 GiB"))
+
+    def test_log_output_prints_only_the_result(self):
+        import io
+        from serve.server import LoadBars
+        out = io.StringIO()
+        bars = LoadBars(out)
+        for d in range(0, 101, 5):
+            bars.update("ram", d << 30, 100 << 30)
+        bars.update("ram", 100 << 30, 100 << 30)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("[server] loaded into system ram: 100.0 GiB in "))
+
+    def test_terminal_bar_becomes_a_result_line(self):
+        import io
+        from serve.server import LoadBars
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        out = Tty()
+        bars = LoadBars(out)
+        bars.update("cuda0", 1 << 30, 4 << 30)
+        bars.update("cuda1", 0, 2 << 30)
+        bars.update("cuda0", 4 << 30, 4 << 30)
+        text = out.getvalue()
+        self.assertIn("\x1b[2A", text)                            # the two bars erased
+        self.assertIn("[server] loaded into cuda0: 4.0 GiB in ", text)
+        self.assertTrue(text.rstrip("\n").endswith("0.0/2.0 GiB"))   # cuda1's bar still last
+        self.assertEqual(list(bars.bars), ["cuda1"])
+
+    def test_narrator_shows_only_progress(self):
         import contextlib
         import io
         from serve.server import narrate_start
@@ -1160,45 +1156,9 @@ class LoadProgress(unittest.TestCase):
             time.sleep(0.6)
             done.set()
             t.join(5)
-        said = out.getvalue()
-        self.assertIn("loading into cuda0", said)
-        self.assertNotIn("loading experts into RAM", said)
-        self.assertNotIn("almost ready", said)
-
-    def test_parse(self):
-        from serve.server import load_progress
-        self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100))
-        self.assertIsNone(load_progress("basalt load: cuda0 ten 100"))
-        self.assertIsNone(load_progress("basalt generate: loaded 3 GiB"))
-
-    def test_log_output_prints_quarters(self):
-        import io
-        from serve.server import LoadBars
-        out = io.StringIO()
-        bars = LoadBars(out)
-        for d in range(0, 101, 5):
-            bars.update("ram", d << 30, 100 << 30)
         lines = out.getvalue().splitlines()
-        self.assertEqual(len(lines), 5)
-        self.assertTrue(lines[0].startswith("[server] loading into system ram:"))
-        self.assertIn("100.0/100.0 GiB", lines[-1])
-
-    def test_terminal_redraws_in_place(self):
-        import io
-        from serve.server import LoadBars
-
-        class Tty(io.StringIO):
-            def isatty(self):
-                return True
-        out = Tty()
-        bars = LoadBars(out)
-        bars.update("cuda0", 1 << 30, 4 << 30)
-        bars.update("cuda1", 0, 2 << 30)
-        bars.say("[server] engine starting")
-        text = out.getvalue()
-        self.assertIn("\x1b[2A", text)                         # moved back over two bars
-        self.assertTrue(text.rstrip("\n").endswith("0.0/2.0 GiB"))   # the bars stay last
-        self.assertIn("[server] engine starting\n", text)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("[server] loaded into cuda0:"))
 
 
 class CancelledRead(unittest.TestCase):

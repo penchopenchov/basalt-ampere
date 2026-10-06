@@ -245,47 +245,20 @@ def pump_lines(stream, sink) -> None:
         pass
 
 
-def experts_loading_words(args: list, size: str) -> str:
-    """The expert loading step, by the engine's flags: a RAM budget (--resident-budget-gib), the RAM copy of what
-    the GPU does not hold (--resident-experts), mapped files (--mmap-experts), or everything in RAM."""
-    at = f" ({size})" if size else ""
-    if "--resident-budget-gib" in args:
-        try:
-            return f"loading experts into RAM, budget {float(args[args.index('--resident-budget-gib') + 1]):g} GiB"
-        except (IndexError, ValueError):
-            return "loading experts into RAM, budget"
-    if "--resident-experts" in args:
-        return f"loading experts into RAM{at}"
-    if "--mmap-experts" in args:
-        return f"mapping experts{at}"
-    return f"loading experts into RAM{at}"
-
-
-def experts_size(args: list) -> str:
-    """The size of the experts the start reads, from the model file (or the source GGUF); empty when unknown."""
-    try:
-        if "--model" in args:
-            from serve.modelfile import ModelFile
-            return f"{ModelFile(args[args.index('--model') + 1]).section('experts')[1] / 2**30:.1f} GiB"
-        if "--native" in args:
-            return f"{os.path.getsize(args[args.index('--native') + 1]) / 2**30:.1f} GiB"
-    except (OSError, IndexError, KeyError, ValueError):
-        pass
-    return ""
-
-
 class LoadBars:
-    """The engine's `basalt load: <target> <done> <total>` lines as one progress bar per target.  On a terminal the
-    bars are redrawn in place under the other start lines; otherwise each target prints at 0, 25, 50, 75, 100%."""
+    """The engine's `basalt load: <target> <done> <total>` lines.  On a terminal each target shows a progress bar
+    while it loads; when it is done the bar is replaced by one line with its size and time.  Elsewhere only that
+    line is printed."""
 
     WIDTH = 30
 
     def __init__(self, out=None):
         self.out = out or sys.stdout
         self.tty = self.out.isatty()
-        self.bars: dict[str, tuple[int, int]] = {}
+        self.bars: dict[str, tuple[int, int]] = {}    # loading now
+        self.t0: dict[str, float] = {}
+        self.finished: set[str] = set()
         self.drawn = 0
-        self.steps: dict[str, int] = {}
 
     @staticmethod
     def name(target: str) -> str:
@@ -296,8 +269,7 @@ class LoadBars:
         f = min(1.0, done / total) if total > 0 else 0.0
         n = int(f * self.WIDTH)
         bar = "=" * n + (">" if n < self.WIDTH else "") + " " * (self.WIDTH - n - 1)
-        label = f"loading into {self.name(target)}:"
-        return f"[server] {label:<24} [{bar}] {done / 2**30:5.1f}/{total / 2**30:.1f} GiB"
+        return f"[server] loading {self.name(target) + ':':<12} [{bar}] {done / 2**30:5.1f}/{total / 2**30:.1f} GiB"
 
     def _erase(self):
         if self.tty and self.drawn:
@@ -315,22 +287,28 @@ class LoadBars:
         self.out.flush()
 
     def say(self, text: str) -> None:
-        """A start line, printed above the bars."""
+        """A line printed above the bars."""
         self._erase()
         self.out.write(text + "\n")
         self._draw()
 
     def update(self, target: str, done: int, total: int) -> None:
-        self.bars[target] = (done, total)
-        if self.tty:
-            self._erase()
-            self._draw()
+        if target in self.finished:
             return
-        step = 4 if total > 0 and done >= total else int(4 * done / total) if total > 0 else 0
-        if step > self.steps.get(target, -1):
-            self.steps[target] = step
-            self.out.write(self.line(target) + "\n")
-            self.out.flush()
+        self.t0.setdefault(target, time.time())
+        self._erase()
+        if total > 0 and done >= total:
+            self.bars.pop(target, None)
+            self.finished.add(target)
+            self.out.write(f"[server] loaded into {self.name(target)}: {total / 2**30:.1f} GiB in "
+                           f"{time.time() - self.t0[target]:.1f} s\n")
+        else:
+            self.bars[target] = (done, total)
+        self._draw()
+
+    @property
+    def seen(self) -> bool:
+        return bool(self.bars or self.finished)
 
 
 def load_progress(line: str):
@@ -347,20 +325,9 @@ def load_progress(line: str):
 
 
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0, out=None) -> None:
-    """Print the engine's start steps from its log, one line each, and its load progress as bars."""
-    loading = experts_loading_words(args, experts_size(args))
+    """Show the engine's load progress from its log (LoadBars), and a heartbeat while nothing moves."""
     bars = LoadBars(out)
     t0 = last = time.time()
-    said = set()
-
-    def say(key, text):   # the step lines stand in for the bars when the engine prints none
-        nonlocal last
-        if key not in said and not bars.bars:
-            said.add(key)
-            last = time.time()
-            bars.say(text)
-
-    say("weights", "[server] engine starting")
     pos = offset
     while not done.wait(0.25):
         try:
@@ -376,15 +343,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                 if (p := load_progress(line)) is not None:
                     bars.update(*p)
                     last = time.time()
-                elif "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
-                    say("arena", f"[server] {loading}")
-                elif " loaded " in line and "GiB at" in line:
-                    say("loaded", "[server] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
-                        f", {time.time() - t0:.0f} s")
-                elif "expert cache " in line and " slots, " in line and "auto" not in line:
-                    n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[server] filling GPU expert cache ({n})")
-        if time.time() - last > heartbeat and not bars.bars:
+        if time.time() - last > heartbeat:
             last = time.time()
             bars.say(f"[server] still starting, {time.time() - t0:.0f} s")
 
@@ -3322,11 +3281,10 @@ def main() -> int:
             print("[server] warning: lazy loading is text-only, vision off", flush=True)
             del cfg["vision"]
         if cfg.get("vision"):
-            print("[server] loading the vision encoder", flush=True)
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env))
-        print("[server] model unloaded, the first request loads it" if lazy else
-              "[server] loading the model", flush=True)
+        if lazy:
+            print("[server] model unloaded, the first request loads it", flush=True)
         if cfg.get("log"):                              # the engine's stderr goes to its log file: follow it
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
