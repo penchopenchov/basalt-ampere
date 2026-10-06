@@ -9,11 +9,11 @@ Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts
 - **Commits:** small and logical, message style `area: what it does`. Never amend and never force-push; always make new commits. End each message with the co-author line your tool's instructions specify.
 - **Code comments:** brief and stateless. Say what the code does and why. No hardware names, measured numbers, dates or history in comments.
 - **No notes in the repo.** No markdown notes, scratch files or handoffs get committed.
-- **Don't push or publish anywhere** (GitHub, HF, any remote) without the maintainer's approval. The `upstream` remote has push disabled on purpose.
+- **Don't push or publish anywhere** (GitHub, HF, any remote) without the maintainer's approval.
 - **Never expose a server beyond 127.0.0.1 without `--api-key`.**
-- **Don't write tools nobody asked for.** The maintainer has their own bench and harness scripts.
-- **Headline benchmark numbers come from the maintainer's own runs,** at 400 W and 600 W. Agent benches are development A/Bs only. Label every number with its GPU power limit; the daily limit is 400 W.
-- **Quality gate:** PPL/KLD against the Q8_0 reference, through the decode path (`ppl.sh` on the test machine). Byte identity with old output is not required, but say whenever numerics change. Bitwise-neutral refactors need only the greedy-identity check.
+- **Don't write tools nobody asked for.**
+- **Headline benchmark numbers come from the maintainer's own runs.** Agent benches are development A/Bs only. Label every number with its GPU power limit.
+- **Quality gate:** PPL/KLD against the Q8_0 reference, through the decode path (`basalt-bench --quality`). Byte identity with old output is not required, but say whenever numerics change. Bitwise-neutral refactors need only the greedy-identity check.
 - **Fast iteration:** quick checks, go/no-go. If something isn't working, write down why and move on.
 - **No permission prompts while the maintainer is away** (ssh to other hosts, docker, system changes). A prompt blocks the whole session.
 - **No drafting/speculation work** in the performance effort; the focus is the per-pass decode cost.
