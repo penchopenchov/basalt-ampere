@@ -15,13 +15,12 @@
 // three implementations that pick the same token, bit for bit:
 //   - the SPLIT top_k (default): `sampler_split_part_kernel` cuts each row into 4,096-logit blocks over the whole
 //     GPU, each keeps its own top_k, and `sampler_split_merge_kernel` merges those lists and runs the tail;
-//   - `sampler_one_block_kernel` (`STRATA_SAMPLER_ONE_BLOCK=1`, and the fallback when the split cannot run): one
+//   - `sampler_one_block_kernel` (the fallback when the split cannot run): one
 //     block per token, `top_k` block-argmax rounds, each over the logits after the previous pick;
-//   - `sampler_kernel` (`STRATA_OLD_SAMPLER=1`), the kernel of engine 0.1.20, kept as the reference.
+//   - `sampler_kernel`, the block-per-token reference the others are checked against.
 // The two new ones share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
-#include "strata/core/emulate.hpp"
 
 #include <cuda_runtime.h>
 
@@ -351,7 +350,7 @@ __global__ void __launch_bounds__(kAmThreads) sampler_greedy_top_prob_cluster_ke
 /// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
 ///
-/// **KEPT AS THE REFERENCE, BEHIND `STRATA_OLD_SAMPLER=1`.**  Two costs remain in it: the `taken`
+/// **KEPT AS THE REFERENCE.**  Two costs remain in it: the `taken`
 /// sweep is O(k) per logit per round, O(k^2 x n_vocab) per row (47 M shared-memory compares at k = 20, 500 M at
 /// 64), and the double-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
 /// 1/64 of FP32.  The kernels after this one remove both and select the same list in the same order.
@@ -600,7 +599,7 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
 /// what has not been picked.  The round is then the same block argmax with the same tie rule, so the list is the
 /// same list in the same order.  An empty round leaves (-inf, id 0) as before, and every round after it is empty
 /// in both versions (nothing after -inf beats -inf).  O(k x n_vocab) per row instead of O(k^2 x n_vocab), then warp
-/// 0 runs the tail.  `STRATA_SAMPLER_ONE_BLOCK=1`, and the fallback when the split path cannot run.
+/// 0 runs the tail.  The fallback when the split path cannot run.
 __global__ void __launch_bounds__(1024)
 sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
                          int history_len, const SamplerParams p, int* __restrict__ out) {
@@ -921,22 +920,6 @@ coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kp
     }
 }
 
-// Which sampled path runs, read once: `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20),
-// `STRATA_SAMPLER_ONE_BLOCK=1` the one-block kernel; by default the split top_k wherever it applies.
-enum class SampledPath { Split, OneBlock, Old };
-
-bool env_flag(const char* name) {
-    const char* e = std::getenv(name);
-    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
-}
-
-SampledPath sampled_path() {
-    static const SampledPath path = env_flag("STRATA_OLD_SAMPLER")         ? SampledPath::Old
-                                    : env_flag("STRATA_SAMPLER_ONE_BLOCK") ? SampledPath::OneBlock
-                                                                           : SampledPath::Split;
-    return path;
-}
-
 // A stream being captured into a graph must not reach `split_scratch` (cudaMalloc): it
 // gets the one-block kernel, which needs no memory of its own.  The legacy stream cannot be captured.
 bool stream_capturing(void* stream) {
@@ -1029,7 +1012,7 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
         int major = 0, clusters = 0;
         cudaFuncAttributes fa{};
         const bool runs = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                          strata::cc_major_of(major) >= 9 &&
+                          major >= 9 &&
                           cudaFuncGetAttributes(&fa, sampler_greedy_cluster_kernel) == cudaSuccess &&
                           fa.ptxVersion >= 90 && fa.binaryVersion >= 90 &&
                           cudaOccupancyMaxActiveClusters(&clusters, sampler_greedy_cluster_kernel, &cfg) ==
@@ -1072,7 +1055,7 @@ bool sample_greedy_top_prob(const float* logits, int n_tokens, int n_vocab, cons
         int major = 0, clusters = 0;
         cudaFuncAttributes fa{};
         const bool runs = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                          strata::cc_major_of(major) >= 9 &&
+                          major >= 9 &&
                           cudaFuncGetAttributes(&fa, sampler_greedy_top_prob_cluster_kernel) == cudaSuccess &&
                           fa.ptxVersion >= 90 && fa.binaryVersion >= 90 &&
                           cudaOccupancyMaxActiveClusters(&clusters, sampler_greedy_top_prob_cluster_kernel, &cfg) ==
@@ -1105,30 +1088,21 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                                : 0;
     if (p.greedy || p.temperature <= 0.0f) {
         // Without penalties (shmem == 0: no window) on sm_90+, a cluster of CTAs per token - the same token; see
-        // `sampler_greedy_cluster_kernel`.  STRATA_ARGMAX_MULTI=0: always the one-block kernel.
-        static const bool multi = [] {
-            const char* v = std::getenv("STRATA_ARGMAX_MULTI");
-            return !v || std::atoi(v) != 0;
-        }();
+        // `sampler_greedy_cluster_kernel`.
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
-        if (!(multi && shmem == 0 && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
+        if (!(shmem == 0 && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
             sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
-    } else if (sampled_path() == SampledPath::Old) {
-        // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
-        // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, n_tokens, history, history_len, p, out);
     } else {
-        // The split top_k by default: stage 1 over (61 blocks x rows) for 248,320 logits, stage 2 one warp per
-        // row.  The one-block kernel when asked for, or when the split cannot run: a wider vocabulary than the merge
+        // The split top_k: stage 1 over (61 blocks x rows) for 248,320 logits, stage 2 one warp per
+        // row.  The one-block kernel when the split cannot run: a wider vocabulary than the merge
         // holds, more than `kSplitMaxRows` rows (the engine samples at most a verify window), a stream under capture,
         // no scratch.
         const int k = sampled_k(p.top_k, n_vocab);
         const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
         int2* scratch = nullptr;
-        if (sampled_path() == SampledPath::Split && n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
+        if (n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
             !stream_capturing(stream))
             // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
             scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);

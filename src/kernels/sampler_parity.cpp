@@ -440,13 +440,6 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--bench") bench = true;
         else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench]\n"); return 2; }
     }
-    {
-        // the sampled path under test; ctest runs this binary once per path
-        auto on = [](const char* n) { const char* e = std::getenv(n); return e && *e && std::strcmp(e, "0") != 0; };
-        std::printf("  sampled path: %s\n", on("STRATA_OLD_SAMPLER")         ? "sampler_kernel (STRATA_OLD_SAMPLER)"
-                                            : on("STRATA_SAMPLER_ONE_BLOCK") ? "one block (STRATA_SAMPLER_ONE_BLOCK)"
-                                                                             : "split top_k (default)");
-    }
     if (bench) {
         bench_sampled();
         return 0;

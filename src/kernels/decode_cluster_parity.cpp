@@ -1,8 +1,8 @@
 // src/kernels/decode_cluster_parity.cpp - S19: the decode kernels on thread-block clusters (sm_90+) against the ones
 // they replace, bit for bit (GPU, synthetic, no model).
 //
-//   QSA top-k : qsa_block_topk_cluster vs qsa_block_topk's one-CTA dispatch (the register kernel up to 33,792 blocks,
-//               block_topk_kernel above) and vs qsa_block_topk_ref - every id of every row of the `cap`-wide buffer,
+//   QSA top-k : qsa_block_topk_cluster vs qsa_block_topk_ref -
+//               every id of every row of the `cap`-wide buffer,
 //               including the entries past the width that neither may write.
 //   argmax    : sample_greedy_cluster vs sample_tokens' one-block greedy kernel.
 //
@@ -14,8 +14,7 @@
 //   decode_cluster_parity --selftest     parity (exit 0 = identical everywhere); skipped (exit 0) below sm_90
 //   decode_cluster_parity --bench        per-call times, old vs new, at 32K / 128K / 262K
 //
-// The old paths are reached through the public dispatchers with STRATA_QSA_CLUSTER=0 / STRATA_ARGMAX_MULTI=0, set
-// here before their first call (they read the variables once).
+// The one-CTA references are qsa_block_topk_ref and the one-block greedy kernel (greedy_one_block).
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -43,8 +42,23 @@ void ck(cudaError_t e, const char* what) {
     }
 }
 
-void set_env(const char* name, const char* value) {
-    setenv(name, value, 1);
+// The one-block greedy kernel through the public dispatcher: a one-token neutral penalty window keeps the cluster
+// kernel out of it (sample_tokens takes the cluster path only without a penalty window).
+void greedy_one_block(const float* logits, int T, int nv, int* out, void* stream) {
+    static int32_t* hist = nullptr;
+    static int cap = 0;
+    if (cap < T) {
+        if (hist != nullptr) cudaFree(hist);
+        std::vector<int32_t> h((size_t) T, -1);
+        ck(cudaMalloc(&hist, (size_t) T * 4), "cudaMalloc");
+        ck(cudaMemcpy(hist, h.data(), (size_t) T * 4, cudaMemcpyHostToDevice), "up");
+        cap = T;
+    }
+    k::SamplerParams sp;
+    sp.greedy = true;
+    sp.temperature = 0.f;
+    sp.penalty_last_n = 1;
+    k::sample_tokens(logits, T, nv, hist, 1, sp, out, stream);
 }
 
 template <typename T> struct Dev {
@@ -139,7 +153,7 @@ int run_topk_case(const TopkCase& c, std::mt19937& rng, bool verbose) {
                     (long long) c.capacity, c.nq);
         return 1;
     }
-    k::qsa_block_topk(d_sc.p, d_st.p, c.nq, max_blocks, cap, s, d_old.p, nullptr);
+    k::qsa_block_topk_ref(d_sc.p, d_st.p, c.nq, max_blocks, cap, s, d_old.p, nullptr);
     k::qsa_block_topk_ref(d_sc.p, d_st.p, c.nq, max_blocks, cap, s, d_ref.p, nullptr);
     ck(cudaDeviceSynchronize(), "topk sync");
     const std::vector<int32_t> a = d_new.get(), b = d_old.get(), r = d_ref.get();
@@ -205,14 +219,11 @@ int run_argmax_case(int nv, int T, int pattern, std::mt19937& rng, bool verbose)
     d_l.put(l);
     ck(cudaMemset(d_new.p, 0xA5, (size_t) T * 4), "memset");
     ck(cudaMemset(d_old.p, 0x5A, (size_t) T * 4), "memset");
-    k::SamplerParams sp;
-    sp.greedy = true;
-    sp.temperature = 0.f;
     if (!k::sample_greedy_cluster(d_l.p, T, nv, d_new.p, nullptr)) {
         std::printf("FAIL argmax nv %d T %d: the cluster kernel did not run\n", nv, T);
         return 1;
     }
-    k::sample_tokens(d_l.p, T, nv, nullptr, 0, sp, d_old.p, nullptr);
+    greedy_one_block(d_l.p, T, nv, d_old.p, nullptr);
     ck(cudaDeviceSynchronize(), "argmax sync");
     const std::vector<int> a = d_new.get(), b = d_old.get();
     // and an independent host answer: the lowest index of the largest non-NaN value above -inf, else 0
@@ -276,10 +287,8 @@ int run_graph_case(std::mt19937& rng) {
         d_st.put(steps);
         d_l.put(l);
         ck(cudaGraphLaunch(ge, cs), "graph launch");
-        k::qsa_block_topk(d_sc.p, d_st.p, nq, max_blocks, cap, s, d_old.p, cs);
-        k::SamplerParams sp;
-        sp.greedy = true;
-        k::sample_tokens(d_l.p, nq, nv, nullptr, 0, sp, a_old.p, cs);
+        k::qsa_block_topk_ref(d_sc.p, d_st.p, nq, max_blocks, cap, s, d_old.p, cs);
+        greedy_one_block(d_l.p, nq, nv, a_old.p, cs);
         ck(cudaStreamSynchronize(cs), "graph sync");
         const auto x = d_new.get(), y = d_old.get();
         const auto u = a_new.get(), v = a_old.get();
@@ -356,9 +365,7 @@ int bench() {
             Dev<float> d_l(l.size());
             Dev<int> d_o((size_t) T);
             d_l.put(l);
-            k::SamplerParams sp;
-            sp.greedy = true;
-            const float t_old = time_us(cs, [&] { k::sample_tokens(d_l.p, T, nv, nullptr, 0, sp, d_o.p, cs); });
+            const float t_old = time_us(cs, [&] { greedy_one_block(d_l.p, T, nv, d_o.p, cs); });
             const float t_new = time_us(cs, [&] { k::sample_greedy_cluster(d_l.p, T, nv, d_o.p, cs); });
             std::printf("  n_vocab %6d T %d: one block %6.1f  cluster %5.1f  -> %.1fx\n", nv, T, t_old, t_new,
                         t_old / t_new);
@@ -371,8 +378,6 @@ int bench() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    set_env("STRATA_QSA_CLUSTER", "0");     // the dispatchers: the one-CTA kernels (the cluster ones called directly)
-    set_env("STRATA_ARGMAX_MULTI", "0");
     const bool do_bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const bool verbose = argc > 2 && std::strcmp(argv[2], "-v") == 0;
     int dev = 0, major = 0;
