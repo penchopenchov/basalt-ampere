@@ -90,6 +90,7 @@ bool parity(const Case& c, cudaStream_t s) {
         return false;
     cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();   // pageable copies may still be in flight for a non-blocking stream
     strata::kernels::native_quantize_q8_1(dx, xq, c.n_in, TM, s);
     for (int j = 0; j < TM; ++j)
         strata::kernels::native_mmvq(c.type, dw, (const uint8_t*) xq + j * qcol, yref + (std::size_t) j * c.n_out,
@@ -182,6 +183,7 @@ void bench(cudaStream_t s) {
         std::normal_distribution<float> nd(0.f, 1.f);
         for (auto& v : x) v = nd(rng);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
         strata::kernels::native_quantize_q8_1(dx, xq, c->n_in, 8, s);
         std::printf("%-12s %5d x %5d  %.1f MB  floor %.2f us at 1.79 TB/s\n", c->name, c->n_in, c->n_out, wb / 1e6,
                     wb / 1.79e6);

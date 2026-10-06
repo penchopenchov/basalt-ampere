@@ -208,14 +208,14 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
 }
 #endif
 
-template<int TYPE, int S, int MT, int KS>
-__global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* __restrict__ w,
-                                                                 const uint8_t* __restrict__ x, float* __restrict__ y,
-                                                                 int n_in, int n_out, int ncols, int probe) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+// block blk of nblk; smem: smem_bytes<TYPE, S, MT, KS>() bytes, 128-byte aligned
+template<int TYPE, int S, int MT, int KS>
+__device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem, const uint8_t* __restrict__ w,
+                                               const uint8_t* __restrict__ x, float* __restrict__ y, int n_in,
+                                               int n_out, int ncols, int probe) {
     constexpr int SB = Fmt<TYPE>::SB, CB = 2 * KS * SB, RS = row_stride(KS * SB), R = 16 * MT, SLOT = R * RS;
     constexpr int NU = RS / 16, NT = MT * KS * 128;
-    extern __shared__ __align__(128) uint8_t smem[];
     uint8_t* ring = smem;
     float* red = reinterpret_cast<float*>(smem + S * SLOT);   // [warp][row][column]
     const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -223,10 +223,10 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
     const int nchunk = n_in / (512 * KS), nb32 = n_in / 32;
     const size_t row_bytes = (size_t) (n_in / 256) * SB;
     const int ntiles = (n_out + R - 1) / R;
-    const int mine = (int) blockIdx.x < ntiles ? (ntiles - 1 - (int) blockIdx.x) / (int) gridDim.x + 1 : 0;
+    const int mine = blk < ntiles ? (ntiles - 1 - blk) / nblk + 1 : 0;
     const int nunits = mine * nchunk;
     auto issue = [&](int u) {   // unit u = (tile, chunk) into slot u % S
-        const int tile = (int) blockIdx.x + (u / nchunk) * (int) gridDim.x, c = u % nchunk;
+        const int tile = blk + (u / nchunk) * nblk, c = u % nchunk;
         uint8_t* dst = ring + (u % S) * SLOT;
         for (int q = tid; q < R * NU; q += NT) {
             const int r = q / NU, k = q - r * NU;
@@ -251,7 +251,7 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
     if constexpr (TYPE == 23) { t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3]; }
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int u = 0; u < nunits; ++u) {
-        const int tile = (int) blockIdx.x + (u / nchunk) * (int) gridDim.x, c = u % nchunk;
+        const int tile = blk + (u / nchunk) * nblk, c = u % nchunk;
         XFrag xf;   // read before the wait: it does not depend on the slot
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -305,6 +305,16 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
         }
     }
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
+#endif
+
+template<int TYPE, int S, int MT, int KS>
+__global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* __restrict__ w,
+                                                                 const uint8_t* __restrict__ x, float* __restrict__ y,
+                                                                 int n_in, int n_out, int ncols, int probe) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    extern __shared__ __align__(128) uint8_t smem[];
+    dense_tc_block<TYPE, S, MT, KS>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols, probe);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -314,13 +324,13 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
 // copy (the first two before the grid dependency wait).  Warp w takes half super-block w % 4 of the chunks
 // w / 4, w / 4 + 2, ... in order; a row's eight warp sums are added as
 // ((w0 + w4) + (w1 + w5)) + ((w2 + w6) + (w3 + w7)).
-template<int TYPE>
-__global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __restrict__ w,
-                                                           const uint8_t* __restrict__ x, float* __restrict__ y,
-                                                           int n_in, int n_out, int ncols, int probe) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+// block blk of nblk (256 threads); smem: 128 + 4096 + 2 tiles of bytes, 128-byte aligned
+template<int TYPE>
+__device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* smem, const uint8_t* __restrict__ w,
+                                                    const uint8_t* __restrict__ x, float* __restrict__ y, int n_in,
+                                                    int n_out, int ncols, int probe) {
     constexpr int SB = Fmt<TYPE>::SB, CB = 2 * SB;
-    extern __shared__ __align__(128) uint8_t smem[];
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
     float* red = reinterpret_cast<float*>(smem + 128);   // [warp][row][column]
     uint8_t* slots = smem + 128 + 8 * 16 * kMaxCols * 4;
@@ -329,10 +339,10 @@ __global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __res
     const int nchunk = n_in / 512, nb32 = n_in / 32;
     const int row_bytes = (n_in / 256) * SB, tb = 16 * row_bytes;
     const int ntiles = (n_out + 15) / 16;
-    const int mine = (int) blockIdx.x < ntiles ? (ntiles - 1 - (int) blockIdx.x) / (int) gridDim.x + 1 : 0;
+    const int mine = blk < ntiles ? (ntiles - 1 - blk) / nblk + 1 : 0;
     // tile i into slot i & 1; the last tile's rows past n_out are not copied (and never stored)
     auto issue = [&](int i) {
-        const int tile = (int) blockIdx.x + i * (int) gridDim.x;
+        const int tile = blk + i * nblk;
         const int rows = min(16, n_out - tile * 16);
         const uint32_t bytes = (uint32_t) ((rows * row_bytes + 15) & ~15);
         const uint32_t sb = (uint32_t) __cvta_generic_to_shared(slots + (size_t) (i & 1) * tb);
@@ -354,7 +364,7 @@ __global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __res
     uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
     if constexpr (TYPE == 23) { t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3]; }
     for (int i = 0; i < mine; ++i) {
-        const int row0 = ((int) blockIdx.x + i * (int) gridDim.x) * 16;
+        const int row0 = (blk + i * nblk) * 16;
         if (!(probe & 2)) {
             uint32_t done = 0;
             const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1)), par = (uint32_t) (i >> 1) & 1u;
@@ -413,6 +423,16 @@ __global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __res
         }
         __syncthreads();   // the sums are read
     }
+}
+#endif
+
+template<int TYPE>
+__global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __restrict__ w,
+                                                           const uint8_t* __restrict__ x, float* __restrict__ y,
+                                                           int n_in, int n_out, int ncols, int probe) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    extern __shared__ __align__(128) uint8_t smem[];
+    dense_tc_tile_block<TYPE>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols, probe);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
