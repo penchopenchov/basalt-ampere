@@ -112,10 +112,10 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
                               const float* x_scales, int k_per_token, void* scratch, float* out, void* stream);
 /// The per-hit kernels (`moe_hit_grouped_s2`, `_dev`, `_multi`) and the grouped ones (`moe_grouped_s2`)
 /// were rewritten with bitwise-identical outputs: conflict-free staged activations, `hx` once per chunk, wide loads,
-/// two rows per warp.  The previous kernels stay for A/B: `STRATA_OLD_GROUPED=1` in the environment selects them,
+/// two rows per warp.  The previous kernels stay for A/B: `OLD_GROUPED=1` in the environment selects them,
 /// and so does `moe_grouped_select_old(1)`; `0` forces the new ones, `-1` returns to the environment.  The environment
 /// variable is read once, on first use; the kernel choice is made at each launch (so a captured graph keeps the
-/// kernels chosen at capture).  Use `moe_grouped_select_old` to switch at runtime.  `STRATA_GROUPED_PAIR_MIN_HITS=N`
+/// kernels chosen at capture).  Use `moe_grouped_select_old` to switch at runtime.  `GROUPED_PAIR_MIN_HITS=N`
 /// (read once too) keeps the previous per-hit kernels below N hits of capacity; a forced choice overrides it.  The
 /// new kernels also need 4-byte aligned activations and scratch, and the per-hit ones an 8-byte aligned arena and
 /// slot size; otherwise the previous kernels run.

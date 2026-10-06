@@ -27,8 +27,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#ifndef STRATA_VERSION
-#define STRATA_VERSION "unknown"
+#ifndef BASALT_VERSION
+#define BASALT_VERSION "unknown"
 #endif
 #ifndef BASALT_BENCH_ENGINE
 #define BASALT_BENCH_ENGINE ""
@@ -1291,7 +1291,7 @@ int main(int argc, char** argv) {
     if (o.format == "json") {
         JW j;
         j.begin_obj();
-        j.key("engine_version"); j.str(STRATA_VERSION);
+        j.key("engine_version"); j.str(BASALT_VERSION);
         j.key("commit"); j.str(BASALT_BENCH_GIT);
         j.key("build_type"); j.str(BASALT_BENCH_BUILD_TYPE);
         j.key("cuda_toolkit"); j.str(BASALT_BENCH_CUDA);

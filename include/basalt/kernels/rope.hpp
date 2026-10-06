@@ -19,9 +19,9 @@
 #include "basalt/kernels/rope_scaling.hpp"
 
 #if defined(__CUDACC__)
-#define STRATA_ROPE_HD __host__ __device__
+#define ROPE_HD __host__ __device__
 #else
-#define STRATA_ROPE_HD
+#define ROPE_HD
 #endif
 
 namespace basalt::kernels {
@@ -39,7 +39,7 @@ namespace basalt::kernels {
 ///
 /// In-place is safe: the caller writes both outputs from the two inputs it read, and under NEOX no two pairs
 /// share an element (`i` pairs with `i + n_rot/2`, so the halves are disjoint).
-STRATA_ROPE_HD inline void rope_neox_pair(float a, float b, float c, float s, float& oa, float& ob) {
+ROPE_HD inline void rope_neox_pair(float a, float b, float c, float s, float& oa, float& ob) {
     oa = a * c - b * s;
     ob = a * s + b * c;
 }

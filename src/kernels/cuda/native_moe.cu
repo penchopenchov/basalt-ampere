@@ -87,7 +87,7 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
-// STRATA_DEC_MOE: combine's sum with each entry's row read from its tier (dec_moe.hpp), after the tiers this layer
+// DEC_MOE: combine's sum with each entry's row read from its tier (dec_moe.hpp), after the tiers this layer
 // uses have landed.  A VRAM row is +0.0 + row as the old path's hit add made it; the sum is combine's.
 namespace {
 __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
@@ -121,7 +121,7 @@ __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* 
     if (shared) sum += shared[tk * n_embd + col];
     output[tk * n_embd + col] = sum;
 }
-// STRATA_DEC_GLUE & 4: the same sums, four columns a thread with every row loaded before the first add; DEP: a
+// DEC_GLUE & 4: the same sums, four columns a thread with every row loaded before the first add; DEP: a
 // programmatic dependent of dec_moe_wait - CUDA0's rows, the weights and the shared row (all final once the wait
 // kernel runs) are loaded before pdl_wait, only the mapped tiers' rows after it
 template<int KM, bool DEP>

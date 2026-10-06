@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-#define STRATA_DP4A(a, b, c) __dp4a((a), (b), (c))
+#define DP4A(a, b, c) __dp4a((a), (b), (c))
 
 /// Yield the thread while a doorbell flag is being polled.  The length of the pause is a backoff hint, not a
 /// contract.

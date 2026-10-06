@@ -1,4 +1,4 @@
-// src/kernels/dec_moe_parity.cpp - STRATA_DEC_MOE's kernels on real GGUF experts against the path they replace.
+// src/kernels/dec_moe_parity.cpp - DEC_MOE's kernels on real GGUF experts against the path they replace.
 //
 //     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]
 //
@@ -699,7 +699,7 @@ int main(int argc, char** argv) {
                 });
                 std::printf("  bench: combine T=%d (%d peer, %d cpu rows of %d): %.2f us per launch\n", T, np, nc, n, uc);
             }
-            {   // the combine without its own wait (verify's call; STRATA_DEC_GLUE & 4 takes the four-column kernel)
+            {   // the combine without its own wait (verify's call; DEC_GLUE & 4 takes the four-column kernel)
                 float* d_bo3 = dmal<float>((size_t) MT * H);
                 K::dec_moe_combine(d_parts, h_peer, h_cpu, d_plan, d_w, d_sh, d_bo3, H, KK, T, nullptr, nullptr, 6, s0);
                 ck(cudaStreamSynchronize(s0), "combine");
@@ -718,8 +718,8 @@ int main(int argc, char** argv) {
                 cudaFree(d_bo3);
             }
 
-            // STRATA_DEC_GLUE: the plan built in the gate/up launch (+ the ring launch's kinds) vs the route's plan,
-            // its rows vs native_expert_grouped's (d_parts2); needs STRATA_DEC_GU2=2
+            // DEC_GLUE: the plan built in the gate/up launch (+ the ring launch's kinds) vs the route's plan,
+            // its rows vs native_expert_grouped's (d_parts2); needs DEC_GU2=2
             if (K::dec_moe_glue_ok(L)) {
                 std::vector<unsigned long long> pt(NE);
                 for (int e = 0; e < NE; ++e)
@@ -795,7 +795,7 @@ int main(int argc, char** argv) {
                 }
                 cudaFree(d_pt); cudaFree(d_p4); cudaFree(d_pub);
             } else {
-                std::printf("  glue: skipped (STRATA_DEC_GU2=2 not set or formats)\n");
+                std::printf("  glue: skipped (DEC_GU2=2 not set or formats)\n");
             }
 
             // the fused VRAM call vs native_expert_grouped (d_parts2 holds the grouped rows)

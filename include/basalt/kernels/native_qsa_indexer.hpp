@@ -38,7 +38,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
                                      const RopeScaling& scaling, void* stream);
 
-/// STRATA_DEC_COMMIT: every QSA layer's commit in one launch - layer l's tail restored from tail_snap (mapped), then
+/// DEC_COMMIT: every QSA layer's commit in one launch - layer l's tail restored from tail_snap (mapped), then
 /// rows raw + t * idx_dim appended at relative positions pos[t] (t < n_tok, < 0 skipped), as n_tok
 /// native_qsa_indexer_append calls with pos_base 0 would, bitwise.
 constexpr int kQsaCommitMaxLayers = 16;

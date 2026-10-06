@@ -14,7 +14,7 @@ __device__ __forceinline__ unsigned long long dm_clock() {
     return t;
 }
 
-// STRATA_DM_WAIT_STATS: one layer's times (S[0] doorbell, S[1] CUDA0's work done, S[2] the peer landed, S[3] every
+// DM_WAIT_STATS: one layer's times (S[0] doorbell, S[1] CUDA0's work done, S[2] the peer landed, S[3] every
 // tier landed, S[4] the CPU pool landed) into the counters; one thread, after every time is stored
 __device__ void dm_stat_record(unsigned long long* S, const DmPlan* plan, int layer) {
     const int np = plan->counts[2], nc = plan->counts[3];
@@ -86,7 +86,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     __shared__ int32_t s_ncpu, s_npeer, s_ng, s_ne;
     if (a.sh_gw != nullptr) pdl_trigger();   // the next kernel may start (only weights before its wait)
     const int tid = threadIdx.x, n = a.n_tok * a.k;
-    pdl_wait();   // STRATA_DEC_PDL2: launched during the router's tail
+    pdl_wait();   // DEC_PDL2: launched during the router's tail
     if (tid == 0) { s_ncpu = 0; s_npeer = 0; }
     if (tid < n) s_ids[tid] = a.ids[tid];
     __syncthreads();
@@ -258,8 +258,8 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
     __threadfence_system();
 }
 
-// ---------------------------------------------------------------- STRATA_DEC_GLUE & 1: the route inside gate/up
-// STRATA_DEC_GLUE & 2: dm_route_kernel's mode 2 (with kinds) in one block, the mapped q8_1 rows copied from `xq` (the
+// ---------------------------------------------------------------- DEC_GLUE & 1: the route inside gate/up
+// DEC_GLUE & 2: dm_route_kernel's mode 2 (with kinds) in one block, the mapped q8_1 rows copied from `xq` (the
 // same q8_1_store bits); called after the block's pdl_wait
 __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
     __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap];
@@ -745,9 +745,9 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     }
 }
 
-#define STRATA_DM_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42)
-#define STRATA_DM_D_FMTS(X) X(20) X(42)
-#define STRATA_DM_PAIRS(X) \
+#define DM_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42)
+#define DM_D_FMTS(X) X(20) X(42)
+#define DM_PAIRS(X) \
     X(16, 20) X(17, 20) X(18, 20) X(21, 20) X(22, 20) X(23, 20) X(29, 20) X(42, 20) \
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42)
 
@@ -756,10 +756,10 @@ __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeE
                                float* out, unsigned int* done, int b, int nb, bool gu2 = false,
                                const DmWatch* watch = nullptr) {
     switch (L.gu_type * 100 + L.d_type) {
-#define STRATA_DM_CASE(TG, TD) \
+#define DM_CASE(TG, TD) \
         case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
-        STRATA_DM_PAIRS(STRATA_DM_CASE)
-#undef STRATA_DM_CASE
+        DM_PAIRS(DM_CASE)
+#undef DM_CASE
         default: break;
     }
 }
@@ -1273,9 +1273,9 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
                     L.gu_type == 42;
     bool td = false;
     switch (L.d_type) {
-#define STRATA_DM_OK(T) case T: td = kSplit<T>; break;
-        STRATA_DM_D_FMTS(STRATA_DM_OK)
-#undef STRATA_DM_OK
+#define DM_OK(T) case T: td = kSplit<T>; break;
+        DM_D_FMTS(DM_OK)
+#undef DM_OK
         default: break;
     }
     return tg && td && gu2_usable(L) && L.n_ff == 640 && g_gu2 >= 2 && !g_old_kernels && !g_grouped_v1 &&
@@ -1315,9 +1315,9 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratc
     const int d_rows = L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8);
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
     switch (L.d_type) {
-#define STRATA_DM_DOWN(T) case T: launch_down<T>(gd, s, P->ptr, P->start, P->counts, P->dst, hq, L, out, true); break;
-        STRATA_DM_D_FMTS(STRATA_DM_DOWN)
-#undef STRATA_DM_DOWN
+#define DM_DOWN(T) case T: launch_down<T>(gd, s, P->ptr, P->start, P->counts, P->dst, hq, L, out, true); break;
+        DM_D_FMTS(DM_DOWN)
+#undef DM_DOWN
         default: std::fprintf(stderr, "dec_moe_glue: down %d\n", L.d_type); std::exit(1);
     }
     check("dec_moe_glue/down");
@@ -1419,15 +1419,15 @@ std::string dec_moe_peer_diag(const uint32_t* d) {
 bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
     bool gu = false, d = false;
     switch (gu_type) {
-#define STRATA_DM_OK(T) case T: gu = kSplit<T>; break;
-        STRATA_DM_GU_FMTS(STRATA_DM_OK)
-#undef STRATA_DM_OK
+#define DM_OK(T) case T: gu = kSplit<T>; break;
+        DM_GU_FMTS(DM_OK)
+#undef DM_OK
         default: break;
     }
     switch (d_type) {
-#define STRATA_DM_OK(T) case T: d = true; break;
-        STRATA_DM_D_FMTS(STRATA_DM_OK)
-#undef STRATA_DM_OK
+#define DM_OK(T) case T: d = true; break;
+        DM_D_FMTS(DM_OK)
+#undef DM_OK
         default: break;
     }
     return gu && d && n_ff == 640 && n_embd % 256 == 0 && !g_old_kernels && !g_grouped_v1;
@@ -1495,11 +1495,11 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         const dim3 ggu((unsigned) ((2 * L.n_ff) / (GU_ROWS * NR)), (unsigned) cap);
         const auto* X = (const block_q8_1*) xq;
         switch (L.gu_type * 10 + NR) {
-#define STRATA_DM_G(TG) \
+#define DM_G(TG) \
             case TG * 10 + 1: dm_gu_kernel<TG, 1><<<ggu, 256, 0, s>>>(plan, X, L, gate, up); break; \
             case TG * 10 + 2: dm_gu_kernel<TG, 2><<<ggu, 256, 0, s>>>(plan, X, L, gate, up); break;
-            STRATA_DM_GU_FMTS(STRATA_DM_G)
-#undef STRATA_DM_G
+            DM_GU_FMTS(DM_G)
+#undef DM_G
             default: std::fprintf(stderr, "dec_moe_vram: gate/up %d rows %d\n", L.gu_type, NR); std::exit(1);
         }
         block_q8_1* hq = (block_q8_1*) (up + (size_t) kDmCap * L.n_ff);
@@ -1509,9 +1509,9 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         const int d_rows = L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8);
         const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) cap);
         switch (L.d_type) {
-#define STRATA_DM_DOWN(T) case T: launch_down<T>(gd, s, plan->ptr, plan->start, plan->counts, plan->dst, hq, L, out); break;
-            STRATA_DM_D_FMTS(STRATA_DM_DOWN)
-#undef STRATA_DM_DOWN
+#define DM_DOWN(T) case T: launch_down<T>(gd, s, plan->ptr, plan->start, plan->counts, plan->dst, hq, L, out); break;
+            DM_D_FMTS(DM_DOWN)
+#undef DM_DOWN
             default: std::fprintf(stderr, "dec_moe_vram: down %d\n", L.d_type); std::exit(1);
         }
         check("dec_moe_vram");
@@ -1525,13 +1525,13 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
             std::exit(1);
         }
         switch (L.gu_type * 100 + L.d_type) {
-#define STRATA_DM_T(TG, TD) case TG * 100 + TD: \
+#define DM_T(TG, TD) case TG * 100 + TD: \
             blocks = dm_vram_tma_blocks<TG, TD>(); \
             if (blocks > 0) dm_vram_launch(dm_vram_tma_kernel<TG, TD>, blocks, stream, plan, (const block_q8_1*) xq, L, \
                                            gate, up, out, sync); \
             break;
-            STRATA_DM_PAIRS(STRATA_DM_T)
-#undef STRATA_DM_T
+            DM_PAIRS(DM_T)
+#undef DM_T
             default: break;
         }
         if (blocks <= 0) {
@@ -1542,13 +1542,13 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         return;
     }
     switch (L.gu_type * 100 + L.d_type) {
-#define STRATA_DM_V(TG, TD) case TG * 100 + TD: \
+#define DM_V(TG, TD) case TG * 100 + TD: \
         blocks = dm_vram_blocks<TG, TD>(); \
         if (blocks > 0) dm_vram_launch(dm_vram_kernel<TG, TD>, blocks, stream, plan, (const block_q8_1*) xq, L, gate, \
                                        up, out, sync); \
         break;
-        STRATA_DM_PAIRS(STRATA_DM_V)
-#undef STRATA_DM_V
+        DM_PAIRS(DM_V)
+#undef DM_V
         default: break;
     }
     if (blocks <= 0) {

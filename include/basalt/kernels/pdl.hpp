@@ -59,7 +59,7 @@ private:
 #include <cuda_runtime.h>
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
-#define STRATA_PDL_LAUNCH 1
+#define PDL_LAUNCH 1
 #include <map>
 #include <mutex>
 #include <utility>
@@ -81,7 +81,7 @@ __device__ __forceinline__ void pdl_launch_dependents() {
 #endif
 }
 
-#if defined(STRATA_PDL_LAUNCH)
+#if defined(PDL_LAUNCH)
 /// The current device and the kernel's build both have griddepcontrol (compute capability 9.0+), per device.
 inline bool pdl_kernel_ok(const void* func) {
     int dev = 0;
@@ -116,7 +116,7 @@ inline bool pdl_kernel_ok(const void* func) {
 template <typename... KArgs, typename... Args>
 inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream,
                        Args... args) {
-#if defined(STRATA_PDL_LAUNCH)
+#if defined(PDL_LAUNCH)
     PdlState& ps = pdl_state();
     if (ps.on) {
         if (ps.plain > 0) {

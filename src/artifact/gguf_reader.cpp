@@ -3,7 +3,7 @@
 // from the library it exercises.
 #include "basalt/artifact/gguf_reader.hpp"
 
-#ifndef STRATA_GGUF_MAIN_DISABLED
+#ifndef GGUF_MAIN_DISABLED
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("usage: gguf_reader <file.gguf> [--check]\n");
@@ -64,4 +64,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-#endif // STRATA_GGUF_MAIN_DISABLED
+#endif // GGUF_MAIN_DISABLED

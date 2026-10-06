@@ -38,9 +38,9 @@
 #include <cmath>
 
 #if defined(__CUDACC__)
-#define STRATA_ROPE_SCALING_HD __host__ __device__
+#define ROPE_SCALING_HD __host__ __device__
 #else
-#define STRATA_ROPE_SCALING_HD
+#define ROPE_SCALING_HD
 #endif
 
 namespace basalt::kernels {
@@ -133,7 +133,7 @@ private:
 /// `y = (i0 / 2 - low) / max(0.001, high - low)`.  ggml passes the even dim index `i0`; this takes
 /// the pair index (ggml's `i0/2`) so Strata's pair-indexed kernels don't re-derive the mapping.  The
 /// 0.001 floor on the denominator is ggml's, kept verbatim: `corr_dims` can produce low == high.
-STRATA_ROPE_SCALING_HD inline float rope_yarn_ramp(float low, float high, int pair) {
+ROPE_SCALING_HD inline float rope_yarn_ramp(float low, float high, int pair) {
     const float y = ((float) pair - low) / (high - low > 0.001f ? high - low : 0.001f);
     const float clamped = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
     return 1.0f - clamped;
@@ -145,7 +145,7 @@ STRATA_ROPE_SCALING_HD inline float rope_yarn_ramp(float low, float high, int pa
 /// to take cos/sin of, with ggml's mscale already folded in.  `mscale_in` must be `attn_factor`
 /// (ggml's kernels receive the raw knob and apply the log term here, where it is per-pair constant;
 /// this helper keeps that shape so the native path reads against ggml line by line).
-STRATA_ROPE_SCALING_HD inline void rope_scaled_angle(float theta_extrap, float freq_scale, float corr_low,
+ROPE_SCALING_HD inline void rope_scaled_angle(float theta_extrap, float freq_scale, float corr_low,
                                                      float corr_high, float ext_factor, float mscale_in,
                                                      int pair, float& cos_out, float& sin_out) {
     // The interpolation, always applied; the correction mixed in on top (ggml-cuda/rope.cu rope_yarn).

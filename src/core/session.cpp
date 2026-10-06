@@ -23,9 +23,9 @@
 // spin is just less polite to the pipeline.
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
-#define STRATA_SPIN_PAUSE() _mm_pause()
+#define SPIN_PAUSE() _mm_pause()
 #else
-#define STRATA_SPIN_PAUSE() ((void) 0)
+#define SPIN_PAUSE() ((void) 0)
 #endif
 
 namespace basalt::core {
@@ -688,7 +688,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
                 return false;
             }
             if (rang) break;                             // rung, and the graph is still running: the overlap
-            STRATA_SPIN_PAUSE();
+            SPIN_PAUSE();
         }
         if (mid_graph) ++gr.rings_mid_graph;
         // the window, from just before the launch to the instant the ring was seen
@@ -919,7 +919,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
         uint32_t spins = 0;
         progress_at("token: waiting for the GPU to reach layer", l);
         while (*seq < want) {
-            STRATA_SPIN_PAUSE();
+            SPIN_PAUSE();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(flush_us)) {

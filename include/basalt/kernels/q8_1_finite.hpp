@@ -6,7 +6,7 @@
 // is the same defect). Clamped to the largest finite half, such a block gives an approximate product instead of NaN,
 // and the values are held to the int8 range they then exceed. Every block that was finite before is stored bit for
 // bit as before: values in (65504, 65520) round to 65504 anyway, and a finite block's |x / d| is at most 127. A NaN
-// stays NaN (the comparisons are false for it), so STRATA_DBG_NAN still sees one.
+// stays NaN (the comparisons are false for it), so DBG_NAN still sees one.
 #pragma once
 
 #include <cuda_fp16.h>

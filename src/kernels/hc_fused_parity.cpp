@@ -1,6 +1,6 @@
 // src/kernels/hc_fused_parity.cpp - hc_fused_read against the kernels it replaces (fused_gr_read_multi, then the
 // MMVF router GEMV and the native top-10), bit for bit on every output, with real geometry and random inputs; then
-// the time of both with the weights hot in L2 and cold (L2 overwritten before every read).  STRATA_DEC_HC8=1: the
+// the time of both with the weights hot in L2 and cold (L2 overwritten before every read).  DEC_HC8=1: the
 // fused read on 8-bit copies of the matrices (run with HC_TOL=1).
 //
 //     build/hc_fused_parity [iters] [T min] [T max]

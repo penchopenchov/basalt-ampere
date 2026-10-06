@@ -326,7 +326,7 @@ __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const i
     }
 }
 
-// #649 (HIP, STRATA_DOORBELL_STORE=1): the same publish, but the ring is STORED (the step's own number, known at
+// #649 (HIP, DOORBELL_STORE=1): the same publish, but the ring is STORED (the step's own number, known at
 // capture) instead of read-modify-written over PCIe - one store, no read of host memory from the GPU.
 __global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                               const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,

@@ -77,7 +77,7 @@ public:
     /// Some SSDs drop into a power state after ~250 ms without a command and stall the next reads 50-150 ms
     /// (a WD_BLACK SN7100 on Windows 11; the NVMe idle timeouts of the power plan did not change it), which in
     /// decode happens after a few rounds whose rows all came from the row cache. 0 turns it off (the reader's
-    /// default; generate turns it on, see STRATA_SSD_KEEPALIVE). A keep-alive read that fails turns it off.
+    /// default; generate turns it on, see SSD_KEEPALIVE). A keep-alive read that fails turns it off.
     void set_keepalive(double period_ms, double window_s);
 
     /// Fault injection for tests and for the plan's P2 exit check: every read completes no earlier than

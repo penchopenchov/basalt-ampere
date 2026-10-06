@@ -61,7 +61,7 @@ public:
         const int32_t sl = res_[(size_t) (layer * n_expert_ + expert)];
         return sl >= 0 ? cache_.device_slot(sl) : nullptr;
     }
-    /// STRATA_DEC_MOE: the residency table ([n_layers * n_expert] slot or -1) and a slot's device address.
+    /// DEC_MOE: the residency table ([n_layers * n_expert] slot or -1) and a slot's device address.
     const std::vector<int32_t>& residency() const { return res_; }
     const uint8_t* slot_address(int32_t slot) { return cache_.device_slot(slot); }
     /// Whether the primary (device 0) and the peer can read each other's memory directly (NVLink / PCIe P2P).
@@ -80,7 +80,7 @@ public:
     /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
     void apply_pending(bool wait);
-    /// STRATA_PEER_PROMOTE: `in` moved to the primary, which gave up `out` (`blob`: its bytes in host memory).  The
+    /// PEER_PROMOTE: `in` moved to the primary, which gave up `out` (`blob`: its bytes in host memory).  The
     /// slot `in` held takes `out`, resident at `apply_pending`.  Call only between verify windows.
     bool reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err);
 

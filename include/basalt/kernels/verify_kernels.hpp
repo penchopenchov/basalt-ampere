@@ -26,7 +26,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0);
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
-/// STRATA_DEC_COMMIT: n_layers consecutive GDN layers' commits in one launch (layer l's state at state + l *
+/// DEC_COMMIT: n_layers consecutive GDN layers' commits in one launch (layer l's state at state + l *
 /// state_stride, its conv history right after the S x h_v x S state; h / qkv at l * h_stride, gate / beta at
 /// l * gb_stride): gdn_conv_commit and gdn_step_norm_multi's state-only commit, bitwise.
 struct GdnCommitLayers {
@@ -102,10 +102,10 @@ void map_ids(int32_t* ids, const int32_t* table, int n, void* stream);
 /// probs[t] = softmax(logits[t])[ids[t]] for n_rows rows of n_vocab (the probability of each row's argmax).
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream);
 /// Row 0 of R, inj and mixed <- row *row_dev of each (rows R_stride, inj_stride, mixed_stride floats apart); nothing
-/// when that row is 0.  The draft round takes its draft row from the catch-up with it (STRATA_MTP_REUSE_ROW).
+/// when that row is 0.  The draft round takes its draft row from the catch-up with it (MTP_REUSE_ROW).
 void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, float* mixed, int64_t mixed_stride,
                   const int32_t* row_dev, void* stream);
-/// For draft steps that are conditional (IF) graph nodes (STRATA_MTP_COND): handle h[0] <- probs[*row] >= min_p, with
+/// For draft steps that are conditional (IF) graph nodes (MTP_COND): handle h[0] <- probs[*row] >= min_p, with
 /// min_p's float bits at *min_p_bits, and h[1..n) <- 0 (n <= 8).  With cum_th > 0 the comparison is the cumulative
 /// rule of draft_cum.hpp for chain step j instead: hist[0..j) the earlier steps' probabilities, probs[*row] step j's.
 /// False (nothing launched) when the build has no conditional graph nodes.

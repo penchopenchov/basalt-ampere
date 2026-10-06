@@ -1,4 +1,4 @@
-// src/kernels/cuda/gu2.cuh - STRATA_DEC_GU2=1: the grouped gate/up rows of the grid formats (IQ2_XXS, IQ2_XS,
+// src/kernels/cuda/gu2.cuh - DEC_GU2=1: the grouped gate/up rows of the grid formats (IQ2_XXS, IQ2_XS,
 // IQ2_S, IQ3_XXS, IQ3_S) and Q2_0 with n_embd 2560, two rows a warp.  Included by iq_kernels.cu (its Split / Fmt / grid
 // helpers).
 //
@@ -361,7 +361,7 @@ __host__ __device__ inline bool gu2_usable(const NativeExpertLayout& L) {
     return L.n_embd == 2560 && L.n_ff % 2 == 0 && L.gu_row % 4 == 0 && L.up_off % 4 == 0;
 }
 
-// ---------------------------------------------------------------- STRATA_DEC_GU2=2: a programmatic chain
+// ---------------------------------------------------------------- DEC_GU2=2: a programmatic chain
 // The SwiGLU pass and the down kernel launched as programmatic dependents (gate/up -> SwiGLU -> down), each grid
 // letting the next one launch as soon as all its blocks have started: a down block prefetches its weight rows into
 // L2 before it waits for the SwiGLU pass, so the down weights stream while the gate/up rows are still being read.

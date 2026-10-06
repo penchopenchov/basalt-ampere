@@ -2,7 +2,7 @@
 // The dequantizers themselves are header-only in include/basalt/artifact/dequant.hpp.
 #include "basalt/artifact/dequant.hpp"
 
-#ifdef STRATA_DEQUANT_SELFTEST
+#ifdef DEQUANT_SELFTEST
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("usage: dequant <file.gguf>\n");

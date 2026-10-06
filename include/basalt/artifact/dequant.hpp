@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define STRATA_GGUF_MAIN_DISABLED 1
+#define GGUF_MAIN_DISABLED 1
 #include "basalt/artifact/gguf_reader.hpp"
 
 namespace basalt {

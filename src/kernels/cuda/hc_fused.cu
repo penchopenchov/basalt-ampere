@@ -49,7 +49,7 @@ static_assert(D % (QB * 256) == 0, "whole stages");
 
 constexpr int NCOPY = 8;             // copies of xn: the down CTAs read different copies, spreading the L2 load
 
-// cn (STRATA_DEC_HC2 & 1): down items over half-streams, no norm tasks
+// cn (DEC_HC2 & 1): down items over half-streams, no norm tasks
 constexpr int CN_HS = 2 * HC;                  // half-streams
 constexpr int CN_W = N / 2;                    // elements per half-stream
 constexpr int CN_RG = 32;                      // w_down rows per item
@@ -720,7 +720,7 @@ __device__ void hc_down8_main(const HcFusedArgs& a, const float* xn, int b, int 
     }
 }
 
-// The 8-bit mma up pass's B operand, formed once per up item (STRATA_DEC_HC2 & 4): for scale group s, half h and lane
+// The 8-bit mma up pass's B operand, formed once per up item (DEC_HC2 & 4): for scale group s, half h and lane
 // 4 g + t4, the f16 hi and lo parts of lo[g][32 s + 16 h + 4 t4 .. + 3] as split_f16 forms them (uint4 {hi 0 1, hi 2 3,
 // lo 0 1, lo 2 3}; zeros for g >= T).  lo_frag_store writes one value's two halves.
 constexpr int BF_BYTES = (LR / 32) * 2 * 32 * 16;
@@ -1102,7 +1102,7 @@ struct UpSmem {
     float *lo, *rp, *px, *g;
     uint16_t* sc;
 };
-// The 8-bit slice as one tensor copy (STRATA_DEC_HC3 & 4, hc_up_tma): 16-byte k-chunk c of row slot r = 32 stream + col
+// The 8-bit slice as one tensor copy (DEC_HC3 & 4, hc_up_tma): 16-byte k-chunk c of row slot r = 32 stream + col
 // at c * UPCM_CH + 16 r (eight consecutive slots are one conflict-free ldmatrix matrix); scales at slot * SU8.
 constexpr int UPCM_SL = 32;                    // row slots per stream
 constexpr int UPCM_CH = HC * UPCM_SL * 16;     // bytes per k-chunk
@@ -1364,7 +1364,7 @@ __device__ __forceinline__ void split_f16(float a, float b, uint32_t& hi, uint32
     lo = *reinterpret_cast<const uint32_t*>(&l);
 }
 // cnp non-null: lo and rs from the cn down items' sums (cn_lo; `out`: this item writes the read's lo, rs and inject).
-// BF (STRATA_DEC_HC2 & 4): the B fragments formed once per item (lo_frag_store, at `bf`) instead of by every warp in
+// BF (DEC_HC2 & 4): the B fragments formed once per item (lo_frag_store, at `bf`) instead of by every warp in
 // every k-step; the same values, so the same bits.  HI1 (with BF): lo as its f16 hi part only - half the mma
 // (fp32-accumulating f16 mma is the pass's limit).
 template <int T, bool BF = false, bool HI1 = false>

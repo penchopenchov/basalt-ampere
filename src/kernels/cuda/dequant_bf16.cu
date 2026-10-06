@@ -203,21 +203,21 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
-#define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
+#define DEQUANT_CASE(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
     switch (type) {
-    case 2: STRATA_DQ(2);
-    case 6: STRATA_DQ(6);
-    case 7: STRATA_DQ(7);
-    case 8: STRATA_DQ(8);
-    case 11: STRATA_DQ(11);
-    case 12: STRATA_DQ(12);
-    case 13: STRATA_DQ(13);
-    case 14: STRATA_DQ(14);
-    case 20: STRATA_DQ(20);
-    case 23: STRATA_DQ(23);
-    case 42: STRATA_DQ(42);
+    case 2: DEQUANT_CASE(2);
+    case 6: DEQUANT_CASE(6);
+    case 7: DEQUANT_CASE(7);
+    case 8: DEQUANT_CASE(8);
+    case 11: DEQUANT_CASE(11);
+    case 12: DEQUANT_CASE(12);
+    case 13: DEQUANT_CASE(13);
+    case 14: DEQUANT_CASE(14);
+    case 20: DEQUANT_CASE(20);
+    case 23: DEQUANT_CASE(23);
+    case 42: DEQUANT_CASE(42);
     }
-#undef STRATA_DQ
+#undef DEQUANT_CASE
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }

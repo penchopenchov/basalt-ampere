@@ -15,7 +15,7 @@
 //     the FP32 kernel by summation order and the exp2 rounding, not by an FP16 cast.
 // Not bitwise equal to `qsa_decode_attn_batch`; `qsa_prompt_attn_parity` bounds the difference and the prompt
 // quality gate (needles, teacher-forced top-1) checks it end to end. Q4_0 KV (mode 4): each block's codes enter
-// exactly as int8 and its scale (one per 32 values) in FP32, as int8 KV's do (STRATA_PROMPT_ATTN_Q4=0: the old kernel).
+// exactly as int8 and its scale (one per 32 values) in FP32, as int8 KV's do (PROMPT_ATTN_Q4=0: the old kernel).
 #pragma once
 
 #include "basalt/kernels/qsa_decode_attn.hpp"

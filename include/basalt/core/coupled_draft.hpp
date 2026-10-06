@@ -37,9 +37,9 @@
 #include <cstdint>
 
 #if defined(__CUDACC__)
-#define STRATA_COUPLED_HD __host__ __device__
+#define COUPLED_HD __host__ __device__
 #else
-#define STRATA_COUPLED_HD
+#define COUPLED_HD
 #endif
 
 namespace basalt::core {
@@ -62,18 +62,18 @@ inline void set_coupled_draft(bool on) {
 }
 
 /// The MTP cell of chain step j after a window at `p` with `a` drafts accepted (draft() runs step j there).
-STRATA_COUPLED_HD inline int64_t coupled_draft_cell(int64_t p, int a, int j) { return p + a + j; }
+COUPLED_HD inline int64_t coupled_draft_cell(int64_t p, int a, int j) { return p + a + j; }
 
 /// The Philox counter the verify window will draw for the row that checks the draft made at MTP cell `cell`.
-STRATA_COUPLED_HD inline uint64_t coupled_draft_counter(int64_t cell) { return (uint64_t) (cell + 1); }
+COUPLED_HD inline uint64_t coupled_draft_counter(int64_t cell) { return (uint64_t) (cell + 1); }
 
 /// The penalty window the draft layer and the target use: min(penalty_last_n, cap), 0 when penalties are off.
-STRATA_COUPLED_HD inline int coupled_hist_len(int penalty_last_n, int cap) {
+COUPLED_HD inline int coupled_hist_len(int penalty_last_n, int cap) {
     return penalty_last_n <= 0 ? 0 : (penalty_last_n < cap ? penalty_last_n : cap);
 }
 
 /// Where draft j's penalty window starts in the ring (base in [cap - h, cap), draft i at cap + i).
-STRATA_COUPLED_HD inline int coupled_hist_start(int cap, int j, int h) { return cap + j - h; }
+COUPLED_HD inline int coupled_hist_start(int cap, int j, int h) { return cap + j - h; }
 
 /// The ring's base on the host: the last `h` tokens of (tail[0..n_tail), next), -1 padded in front, into
 /// out[0..h) - row 0 of `penalty_rows` for the one-token window [next].

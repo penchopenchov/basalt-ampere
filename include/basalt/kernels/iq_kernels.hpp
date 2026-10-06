@@ -63,26 +63,26 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
-/// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
+/// true: `native_expert_grouped`'s launches before the group stride (GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries, and gate/up on the dp4a
-/// kernels even with STRATA_GU_MMA=1.  Bitwise the same results (native_grouped_parity checks it); kept for A/B
+/// kernels even with GU_MMA=1.  Bitwise the same results (native_grouped_parity checks it); kept for A/B
 /// timing.  Set before graph capture; captured graphs keep theirs.
 void native_grouped_set_v1(bool v1);
-/// STRATA_GU_MMA=2: this thread's next grouped calls take the tensor-core gate/up (where it applies) when on
+/// GU_MMA=2: this thread's next grouped calls take the tensor-core gate/up (where it applies) when on
 void native_grouped_set_mma_hint(bool on);
-/// STRATA_DEC_GU2: 1 the grid formats' gate/up rows on native_gu2_kernel, 2 also the SwiGLU pass inside the down
+/// DEC_GU2: 1 the grid formats' gate/up rows on native_gu2_kernel, 2 also the SwiGLU pass inside the down
 /// kernel (bitwise the same; not with v1).  Set before graph capture.
 void native_grouped_set_gu2(int mode);
 
-/// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
+/// The bench only: the AMD kernel layout (EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
 void native_expert_set_mode(int mode, int phase);
 /// `iq_mmvq` and `native_expert_grouped` decode each weight part once and apply it to every column / entry;
-/// true selects the older kernels that decode it again per column (STRATA_OLD_IQ_MMVQ=1 at startup).  Both give
+/// true selects the older kernels that decode it again per column (OLD_IQ_MMVQ=1 at startup).  Both give
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
-/// STRATA_MMVQ_MMA=1 (read at startup; the setter overrides it, for tests): `iq_mmvq`'s IQ3_S calls of 2..8 columns
+/// MMVQ_MMA=1 (read at startup; the setter overrides it, for tests): `iq_mmvq`'s IQ3_S calls of 2..8 columns
 /// with n_in % 512 == 0 run on int8 tensor cores where the device has them (sm_80+ CUDA), never with the old kernels;
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_mmvq_mma(bool on);

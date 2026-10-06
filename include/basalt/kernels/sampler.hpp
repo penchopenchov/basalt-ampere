@@ -47,7 +47,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 // cannot run: HIP, a card or a build below sm_90.  Device pointers; capturable.
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream);
 
-// The draft head's tail in one launch (STRATA_MTP_FUSE_TOP): sample_greedy_cluster's pick, its probability summed as
+// The draft head's tail in one launch (MTP_FUSE_TOP): sample_greedy_cluster's pick, its probability summed as
 // row_top_prob sums it (verify_kernels.hpp), then map_ids through `map` (nullptr: none).  Bitwise those three calls;
 // false (nothing launched) where sample_greedy_cluster cannot run.  Device pointers; capturable.
 bool sample_greedy_top_prob(const float* logits, int n_tokens, int n_vocab, const int32_t* map, int* out, float* probs,

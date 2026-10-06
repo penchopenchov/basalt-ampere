@@ -29,13 +29,13 @@
 // group blocks differently: IQ4_XS takes 16 blocks per iteration with 4 warps and 8 with 2, so at n_in = 2048 (8
 // blocks of 256) each thread holds at most one block in both layouts and they coincide; its case uses n_in = 4096.
 //
-// THE TENSOR-CORE PATH (STRATA_MMVQ_MMA).  Where the device runs it, IQ4_XS calls with T > 1 in exact mode take
+// THE TENSOR-CORE PATH (MMVQ_MMA).  Where the device runs it, IQ4_XS calls with T > 1 in exact mode take
 // native_iq4_xs_mma_kernel.  The last section turns it on with native_mmvq_set_mma and compares, on the same Q8_1
 // bytes, its T-column call against the exact dp4a multi-column kernel (the setter off) and against T single-column
 // calls (the ncols == 1 kernel, which the tensor-core path never replaces), bitwise, over row tails, rows of 1, 10,
 // 16, 24 and 48 blocks, both block sizes the launcher picks, and weights / activations off their 8- and 16-byte
 // alignment; the launch counter must move on every tensor-core call, or the check checked nothing.  With
-// STRATA_MMVQ_MMA=1 in the environment the sweeps above take it for their IQ4_XS case as well.
+// MMVQ_MMA=1 in the environment the sweeps above take it for their IQ4_XS case as well.
 //
 //     build/mmvq_multi_parity [--bench]      --bench: the dp4a and tensor-core kernels timed at the model's shapes
 #include "basalt/kernels/iq_kernels.hpp"
@@ -331,7 +331,7 @@ bool compare_mma(const MmaCase& c, int T, int w_off, int x_off, cudaStream_t s) 
 
 int mma_section(cudaStream_t s) {
     namespace k = basalt::kernels;
-    std::printf("\n=== tensor-core IQ4_XS (STRATA_MMVQ_MMA) ===\n");
+    std::printf("\n=== tensor-core IQ4_XS (MMVQ_MMA) ===\n");
     if (!k::native_mmvq_mma_available()) {
         std::printf("not available on this device or build (sm_80+ CUDA): skipped\n");
         return 0;

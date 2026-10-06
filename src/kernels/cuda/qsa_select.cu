@@ -619,12 +619,12 @@ constexpr int CL_N = 8;        // CTAs per query (the portable cluster size)
 constexpr int CL_T = 1024;     // threads per CTA
 constexpr int CL_MAXQ = 16;    // larger calls (prefill sub-batches) fill the GPU with one CTA per query already
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-#define STRATA_SEL_CLUSTER 1
+#define SEL_CLUSTER 1
 #else
-#define STRATA_SEL_CLUSTER 0   // an older target's code is a trap; qsa_block_topk_cluster never launches it there
+#define SEL_CLUSTER 0   // an older target's code is a trap; qsa_block_topk_cluster never launches it there
 #endif
 
-#if STRATA_SEL_CLUSTER
+#if SEL_CLUSTER
 __device__ __forceinline__ void cl_arrive_relaxed() {
     asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
 }
@@ -673,7 +673,7 @@ __device__ __forceinline__ unsigned long long cl_excl_scan64(unsigned long long 
 __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* __restrict__ scores,
                                                                   const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                   int64_t cap, int32_t* __restrict__ ids) {
-#if STRATA_SEL_CLUSTER
+#if SEL_CLUSTER
     extern __shared__ uint32_t keys[];                  // this CTA's blocks' keys
     __shared__ __align__(16) int hin[2][CL_N][256];     // the cluster's histograms, slot = the pushing rank
     __shared__ __align__(16) int hloc[2][256];          // this CTA's histogram

@@ -1,4 +1,4 @@
-// src/kernels/dense_tc_parity.cpp - dense_tc (STRATA_DEC_DTC) against native_mmvq, and its column contract.
+// src/kernels/dense_tc_parity.cpp - dense_tc (DEC_DTC) against native_mmvq, and its column contract.
 //
 //     build/dense_tc_parity [--bench]
 //
@@ -8,7 +8,7 @@
 //   - the error against native_mmvq's single-column outputs (the current numerics): max |diff| / max |ref| and the
 //     RMS of the diff over the RMS of ref, per case; it fails above 1e-3 RMS.
 // --bench: native_mmvq and dense_tc timed per T as CUDA graphs over enough weight copies that the L2 holds none
-// (launched as programmatic dependents under STRATA_PDL=1).
+// (launched as programmatic dependents under PDL=1).
 #include "basalt/kernels/dense_tc.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -219,7 +219,7 @@ double time_graph(F&& call, int NL, cudaStream_t s, int reps = 7) {
     cudaGraphExec_t ge;
     cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
     {
-        basalt::kernels::PdlScope ps(true);   // with STRATA_PDL=1, as the verify graphs launch them
+        basalt::kernels::PdlScope ps(true);   // with PDL=1, as the verify graphs launch them
         for (int l = 0; l < NL; ++l) call(l);
     }
     cudaStreamEndCapture(s, &g);

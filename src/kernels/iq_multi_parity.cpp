@@ -11,8 +11,8 @@
 // (2) native_expert_grouped, every gate/up format with the down formats: groups of 0..11 entries (more than a pass
 //     of GRP_NC), unused grid rows (cap_groups > groups), scattered destinations; bitwise, new vs old, the rows it
 //     must not write included.
-// (3) iq_mmvq's IQ3_S columns on the tensor-core kernel (STRATA_MMVQ_MMA, turned on here where the device has it)
-//     against the old kernel, bitwise; with STRATA_MMVQ_MMA=1 in the environment (1) takes it as well.
+// (3) iq_mmvq's IQ3_S columns on the tensor-core kernel (MMVQ_MMA, turned on here where the device has it)
+//     against the old kernel, bitwise; with MMVQ_MMA=1 in the environment (1) takes it as well.
 //
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
@@ -171,13 +171,13 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
     cudaFree(dw); cudaFree(dwf); cudaFree(dx); cudaFree(dxq); cudaFree(dy_old); cudaFree(dy_new);
 }
 
-// (3) STRATA_MMVQ_MMA: iq_mmvq's IQ3_S columns on the tensor-core kernel, turned on here where the device has it,
+// (3) MMVQ_MMA: iq_mmvq's IQ3_S columns on the tensor-core kernel, turned on here where the device has it,
 // against the old per-column kernel (iq_set_old_kernels, which the tensor-core path never takes), bitwise; with row
 // tails, both block sizes the launcher picks, and weights / activations off their 4- and 16-byte alignment.  Every
 // call must take the tensor-core kernel (its launch counter), or the check checked nothing.
 void check_mmvq_mma(cudaStream_t s, std::mt19937& rng) {
     if (!k::iq_mmvq_mma_available()) {
-        std::printf("IQ3_S    tensor-core iq_mmvq (STRATA_MMVQ_MMA): not available on this device or build "
+        std::printf("IQ3_S    tensor-core iq_mmvq (MMVQ_MMA): not available on this device or build "
                     "(sm_80+ CUDA): skipped\n");
         return;
     }

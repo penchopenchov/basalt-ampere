@@ -115,7 +115,7 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
     append_one<TAB>(raw, pos_dev, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells, theta_scale,
                     freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
 }
-// STRATA_DEC_COMMIT: block l restores layer l's tail from its snapshot, then appends its n_tok rows in order
+// DEC_COMMIT: block l restores layer l's tail from its snapshot, then appends its n_tok rows in order
 template <bool TAB>
 __global__ void __launch_bounds__(THREADS) commit_layers(QsaCommitLayers a, float theta_scale, float freq_scale,
                                                          float corr_low, float corr_high, float ext_factor,

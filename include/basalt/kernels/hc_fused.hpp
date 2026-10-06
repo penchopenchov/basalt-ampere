@@ -44,15 +44,15 @@ struct HcFusedArgs {
     float* logits = nullptr;            ///< [T][512]
     int32_t* ids = nullptr;             ///< [T][10]
     float* weights = nullptr;           ///< [T][10]
-    /// mixed's q8_1 rows (36-byte blocks, [T][n_embd / 32]), or null: written by the router items (STRATA_DEC_GLUE),
-    /// or without a router by the up slices (STRATA_DEC_DTC2 & 8); needs hc_fused_q8_rows_ok
+    /// mixed's q8_1 rows (36-byte blocks, [T][n_embd / 32]), or null: written by the router items (DEC_GLUE),
+    /// or without a router by the up slices (DEC_DTC2 & 8); needs hc_fused_q8_rows_ok
     void* xq = nullptr;
     const void* pf[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t pf_bytes[4] = {0, 0, 0, 0};
     /// let the next kernel in at the start (its blocks take the SMs this read's blocks leave)
     bool next_early = false;
     /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null = the
-    /// bf16 matrices.  hc_fused_read fills them from hc8_prepare's copies when STRATA_DEC_HC8=1.
+    /// bf16 matrices.  hc_fused_read fills them from hc8_prepare's copies when DEC_HC8=1.
     const int8_t* q_down = nullptr;
     const uint16_t* s_down = nullptr;   ///< f16 [hc_lr][hc * n_embd / 32]
     const int8_t* q_up = nullptr;
@@ -61,10 +61,10 @@ struct HcFusedArgs {
     const uint16_t* s_inject = nullptr; ///< f16 [hc][hc * n_embd / 32]
 };
 
-/// STRATA_DEC_HC8=1: the read uses 8-bit copies of its matrices (not bitwise; every token's outputs stay independent
-/// of T and column).  STRATA_DEC_HC8_PRE=<n> (default 3): down stages requested before the norm is done.
+/// DEC_HC8=1: the read uses 8-bit copies of its matrices (not bitwise; every token's outputs stay independent
+/// of T and column).  DEC_HC8_PRE=<n> (default 3): down stages requested before the norm is done.
 bool hc8_enabled();
-/// Whether a read writes HcFusedArgs::xq (not split-K, not STRATA_DEC_HCX=2 / 4).
+/// Whether a read writes HcFusedArgs::xq (not split-K, not DEC_HCX=2 / 4).
 bool hc_fused_q8_rows_ok();
 /// Quantize the bf16 matrix w [rows][cols] (cols a multiple of 32) to an 8-bit copy on the current device, once per
 /// pointer, outside any stream capture.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
@@ -74,8 +74,8 @@ void hc8_prepare(const uint16_t* w, int rows, int cols);
 bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes = nullptr);
 /// Bytes held by the 8-bit copies.
 size_t hc8_bytes();
-/// STRATA_DEC_HC8=1 with the bf16 matrices dropped from VRAM (not with STRATA_DEC_HC_SK=1, whose read is bf16 only;
-/// STRATA_DEC_HC8_KEEP=1 keeps them beside the copies).
+/// DEC_HC8=1 with the bf16 matrices dropped from VRAM (not with DEC_HC_SK=1, whose read is bf16 only;
+/// DEC_HC8_KEEP=1 keeps them beside the copies).
 bool hc8_only();
 /// Quantize the bf16 matrix staged at w (the caller frees it afterwards) and register the copy under the copy's own
 /// address, which stands for the matrix from then on: every reader resolves it with hc8_view.  nullptr: no VRAM.

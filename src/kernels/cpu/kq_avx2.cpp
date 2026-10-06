@@ -1,7 +1,7 @@
 // src/kernels/cpu/kq_avx2.cpp - Unsloth UD-Q4_K_XL's expert rows (Q4_K gate/up, Q5_1 and Q8_0 down) for several
 // tokens at once, BIT-EXACT against ggml-cpu's own dot products.
 //
-// ggml-cpu is built for AVX2 here (STRATA_PORTABLE: GGML_AVX2=ON, GGML_AVX512=OFF), so its vec_dot for these formats
+// ggml-cpu is built for AVX2 here (PORTABLE: GGML_AVX2=ON, GGML_AVX512=OFF), so its vec_dot for these formats
 // is the __AVX2__ branch of ggml-cpu/arch/x86/quants.c: ggml_vec_dot_q4_K_q8_K, ggml_vec_dot_q5_1_q8_1,
 // ggml_vec_dot_q8_0_q8_0.  The functions below are those branches with the loop over tokens moved inside the loop
 // over blocks: everything that depends only on the weights (the 4-bit unpacking, the 6-bit scales and mins, the

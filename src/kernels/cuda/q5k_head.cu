@@ -95,7 +95,7 @@ __device__ __forceinline__ float q5_apply(const W5& r, const XCol& x, int kby, i
         const int b = kby + r.bq8_offset + i;
         const int4 e = x.e[xslot(b) + (iqs / 2) % 4];
         const float d8 = __int_as_float(e.w);
-        const int dot1 = STRATA_DP4A(r.v[i][0], e.x, STRATA_DP4A(r.v[i][1], e.y, 0));
+        const int dot1 = DP4A(r.v[i][0], e.x, DP4A(r.v[i][1], e.y, 0));
         const int dot2 = e.z;
         sumf_d += d8 * (dot1 * r.sc[i]);
         sumf_m += d8 * (dot2 * r.m[i]);
@@ -228,7 +228,7 @@ __global__ void __launch_bounds__(WPB * WARP) q5k_head_kernel(const Q5KBlock* __
         const int u0 = __ldg(q8), u1 = __ldg(q8 + 4);
         const unsigned dsb = __ldg(reinterpret_cast<const unsigned*>(&blk->ds));
         const float d8 = __low2float(*reinterpret_cast<const half2*>(&dsb));
-        xe[xslot(b) + pos] = make_int4(u0, u1, STRATA_DP4A(0x01010101, u0, STRATA_DP4A(0x01010101, u1, 0)),
+        xe[xslot(b) + pos] = make_int4(u0, u1, DP4A(0x01010101, u0, DP4A(0x01010101, u1, 0)),
                                      __float_as_int(d8));
     }
     __syncthreads();
@@ -262,7 +262,7 @@ __global__ void __launch_bounds__(WPB * WARP) q5k_head_top1_kernel(const Q5KBloc
         const int u0 = __ldg(q8), u1 = __ldg(q8 + 4);
         const unsigned dsb = __ldg(reinterpret_cast<const unsigned*>(&blk->ds));
         const float d8 = __low2float(*reinterpret_cast<const half2*>(&dsb));
-        xe[xslot(b) + pos] = make_int4(u0, u1, STRATA_DP4A(0x01010101, u0, STRATA_DP4A(0x01010101, u1, 0)),
+        xe[xslot(b) + pos] = make_int4(u0, u1, DP4A(0x01010101, u0, DP4A(0x01010101, u1, 0)),
                                        __float_as_int(d8));
     }
     __syncthreads();

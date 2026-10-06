@@ -50,9 +50,9 @@ bool cpu_avx512bw_ok();
 /// (q2_avx2.cpp, iq_avx2.cpp, and ggml-cpu in the portable build).
 bool cpu_avx2_ok();
 /// Whether this CPU (and its OS) runs AVX (Sandy Bridge and newer): the AVX1 router dot (kq_avx1.cpp) and ggml-cpu in
-/// a STRATA_ISA_FLOOR=avx build.  The other expert rows then run on ggml-cpu (experimental, slow).
+/// a ISA_FLOOR=avx build.  The other expert rows then run on ggml-cpu (experimental, slow).
 bool cpu_avx1_ok();
-/// SSE4.2 + POPCNT: ggml-cpu in a STRATA_ISA_FLOOR=none build.
+/// SSE4.2 + POPCNT: ggml-cpu in a ISA_FLOOR=none build.
 bool cpu_sse42_ok();
 /// The cap on the probes above (3 = no cap, 2 = AVX2, 1 = AVX, 0 = SSE4.2); always 3.  ggml-cpu keeps what it was
 /// compiled for.

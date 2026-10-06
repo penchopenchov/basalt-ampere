@@ -171,11 +171,11 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 constexpr int kAmCtas = 8;      // CTAs per token (the portable cluster size)
 constexpr int kAmThreads = 1024;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-#define STRATA_AM_CLUSTER 1
+#define AM_CLUSTER 1
 #else
-#define STRATA_AM_CLUSTER 0     // older targets: a trap, never launched (sample_greedy_cluster checks)
+#define AM_CLUSTER 0     // older targets: a trap, never launched (sample_greedy_cluster checks)
 #endif
-#if STRATA_AM_CLUSTER
+#if AM_CLUSTER
 __device__ __forceinline__ void am_take(float s, int v, float& bv, int& best) {
     if (s > bv) { bv = s; best = v; }
 }
@@ -186,7 +186,7 @@ __device__ __forceinline__ void am_merge(float ov, int oi, float& bv, int& best)
 // grid (kAmCtas, n_tokens), cluster (kAmCtas, 1, 1), kAmThreads threads
 __global__ void __launch_bounds__(kAmThreads) sampler_greedy_cluster_kernel(const float* __restrict__ logits,
                                                                             int n_vocab, int* __restrict__ out) {
-#if STRATA_AM_CLUSTER
+#if AM_CLUSTER
     __shared__ float sv[32];
     __shared__ int si[32];
     __shared__ float cv[kAmCtas];    // on CTA 0: each CTA's result
@@ -250,7 +250,7 @@ __global__ void __launch_bounds__(kAmThreads) sampler_greedy_top_prob_cluster_ke
                                                                                      const int32_t* __restrict__ map,
                                                                                      int* __restrict__ out,
                                                                                      float* __restrict__ probs) {
-#if STRATA_AM_CLUSTER
+#if AM_CLUSTER
     __shared__ float sv[32];
     __shared__ int si[32];
     __shared__ float cv[kAmCtas];

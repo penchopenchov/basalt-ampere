@@ -849,7 +849,7 @@ void disk_wait_threads(std::FILE* f) {
 void stall_report(std::FILE* f, uint64_t layers_during) {
     basalt::core::Progress& p = basalt::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
-                    "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, stage_text().c_str(),
+                    "last finished step (0 = stopped, more = slow)\n", BASALT_VERSION, stage_text().c_str(),
                  (long long) ((basalt::core::progress_now_ms() - p.since_ms.load()) / 1000),
                  (unsigned long long) layers_during);
     for (int pass = 0; pass < 2; ++pass) {
@@ -3526,7 +3526,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
+    std::fprintf(stderr, "strata generate: session is up (engine %s)\n", BASALT_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
             return basalt::core::lm_head(wt, g, ss.block, d_logits, stream, err);
@@ -5222,7 +5222,7 @@ int main(int argc, char** argv) {
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" BASALT_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),

@@ -10,21 +10,21 @@
 #pragma once
 
 #if defined(__CUDACC__)
-#define STRATA_DRAFT_CUM_HD __host__ __device__
+#define DRAFT_CUM_HD __host__ __device__
 #else
-#define STRATA_DRAFT_CUM_HD
+#define DRAFT_CUM_HD
 #endif
 
 namespace basalt::core {
 
 /// The acceptance rate of a sampled draft by its probability bin.
-STRATA_DRAFT_CUM_HD inline float draft_cum_acc(float p) {
+DRAFT_CUM_HD inline float draft_cum_acc(float p) {
     return p < 0.30f ? 0.12f : p < 0.50f ? 0.26f : p < 0.70f ? 0.43f : p < 0.80f ? 0.51f
          : p < 0.90f ? 0.59f : p < 0.95f ? 0.66f : p < 0.99f ? 0.79f : 0.96f;
 }
 
 /// Whether draft j stays in the window: with the rule on, prod_{i <= j} acc(probs[i]) >= th; else probs[j] >= min_p.
-STRATA_DRAFT_CUM_HD inline bool draft_keep(const float* probs, int j, float min_p, float th) {
+DRAFT_CUM_HD inline bool draft_keep(const float* probs, int j, float min_p, float th) {
     if (!(th > 0.0f)) return probs[j] >= min_p;
     float c = 1.0f;
     for (int i = 0; i <= j; ++i) c = c * draft_cum_acc(probs[i]);

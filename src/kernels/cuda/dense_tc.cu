@@ -448,7 +448,7 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
 // ((w0 + w4) + (w1 + w5)) + ((w2 + w6) + (w3 + w7)).
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 // block blk of nblk (256 threads); smem: 128 + 4096 + 2 tiles of 16 rs bytes, 128-byte aligned.  rs: the staged rows'
-// stride - the row's bytes (one bulk copy per tile) or more (one per row, STRATA_DEC_DTC2 & 32: one_row_stride)
+// stride - the row's bytes (one bulk copy per tile) or more (one per row, DEC_DTC2 & 32: one_row_stride)
 template<int TYPE>
 __device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* smem, const uint8_t* __restrict__ w,
                                                     const uint8_t* __restrict__ x, float* __restrict__ y, int n_in,
@@ -576,7 +576,7 @@ __global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __res
 #endif
 }
 
-// One tile per block (STRATA_DEC_DTC2 & 2, where every tile has a block of its own): the 16 rows land by one bulk copy
+// One tile per block (DEC_DTC2 & 2, where every tile has a block of its own): the 16 rows land by one bulk copy
 // each, issued before the grid dependency wait, and NW warps share its chunks: warp w takes half super-block
 // w % 4 of the chunks w / 4, w / 4 + NW / 4, ...  A row's sums: per half super-block the warp groups in order, then
 // (hb0 + hb1) + (hb2 + hb3).
@@ -974,7 +974,7 @@ int sm_count() {
     return n;
 }
 
-// The live configuration: STRATA_DEC_DTC2 2 | 4 | 8 | 16 and STRATA_DEC_PAIR 2 | 4 | 16 (see verify.cpp).
+// The live configuration: DEC_DTC2 2 | 4 | 8 | 16 and DEC_PAIR 2 | 4 | 16 (see verify.cpp).
 constexpr int g_v2 = 30;
 constexpr int g_pair = 22;
 
@@ -1152,6 +1152,6 @@ void dense_tc_l2_prefetch(const void* w, size_t bytes, void* stream) {
 
 int dense_tc_pair_mask() { return g_pair; }
 
-int dense_tc_mask() { return 29; }   // STRATA_DEC_DTC 1 | 4 | 8 | 16 (see verify.cpp)
+int dense_tc_mask() { return 29; }   // DEC_DTC 1 | 4 | 8 | 16 (see verify.cpp)
 
 }  // namespace basalt::kernels

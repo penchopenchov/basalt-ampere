@@ -92,8 +92,8 @@ __device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes
             // it rather than reasoning about which cast happens to work.
             int xw;
             memcpy(&xw, xq + 4 * j, 4);
-            s = STRATA_DP4A(cw, xw, s);
-            hx = STRATA_DP4A(ones, xw, hx);
+            s = DP4A(cw, xw, s);
+            hx = DP4A(ones, xw, hx);
         }
         // One weight scale per 64 elements, so per TWO 32-element chunks.
         const float dw = f16_at(scales + (size_t) (c >> 1) * 2);
@@ -197,7 +197,7 @@ __global__ void down_kernel(const uint8_t* __restrict__ blob_base, const int32_t
     if (lane == 0) out[(size_t) dst_index[h] * H + r] = s;
 }
 
-// ---- THE SAME INTEGERS FROM FEWER INSTRUCTIONS.  `STRATA_OLD_GROUPED=1` keeps the kernels above.
+// ---- THE SAME INTEGERS FROM FEWER INSTRUCTIONS.  `OLD_GROUPED=1` keeps the kernels above.
 //
 // **INSIDE A CHUNK, WHICH CODE MEETS WHICH ACTIVATION IN A `dp4a` WORD IS FREE.**  `s = sum_e code_e * x_e` and
 // `hx = sum_e x_e` are exact integer sums (|s| <= 32 * 3 * 128), so any grouping of the 32 products into words
@@ -254,7 +254,7 @@ __device__ __forceinline__ int load_x_chunk(const uint8_t* __restrict__ xb, int 
         // natural word j: x[4j .. 4j+3]; a 64-bit shift (sh is 0, 8, 16 or 24) rather than __funnelshift_r, so the same
         // source needs no CUDA-only intrinsic.
         n[j] = (unsigned) ((((unsigned long long) v[j + 1] << 32) | v[j]) >> sh);
-        hx = STRATA_DP4A(0x01010101, (int) n[j], hx);
+        hx = DP4A(0x01010101, (int) n[j], hx);
     }
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
@@ -274,7 +274,7 @@ __device__ __forceinline__ int load_x_chunk(const uint8_t* __restrict__ xb, int 
 __device__ __forceinline__ int chunk_s(const int m[8], const int X[8]) {
     int s = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) s = STRATA_DP4A(m[j], X[j], s);
+    for (int j = 0; j < 8; ++j) s = DP4A(m[j], X[j], s);
     return s;
 }
 
@@ -380,7 +380,7 @@ __device__ __forceinline__ int dot4(const uint8_t* codes, const int8_t* q) {
                           (((c >> 4) & 3u) << 16) | (((c >> 6) & 3u) << 24));
     int xw;
     memcpy(&xw, q, sizeof xw);
-    return STRATA_DP4A(cw, xw, 0);
+    return DP4A(cw, xw, 0);
 }
 
 __device__ __forceinline__ float row_dot_cpu_order(const uint8_t* codes, const uint8_t* scales,
@@ -481,7 +481,7 @@ void check(const char* who, void* stream) {
     (void) stream;
 }
 
-// The previous kernels stay selectable for A/B - `STRATA_OLD_GROUPED=1` in the environment, or
+// The previous kernels stay selectable for A/B - `OLD_GROUPED=1` in the environment, or
 // `moe_grouped_select_old` (the parity test runs both in one process).  The environment is read once, on first use;
 // the choice is made at each launch, so a captured graph keeps the kernels it was captured with.
 std::atomic<int> g_select_old{-1};
@@ -758,8 +758,8 @@ __device__ __forceinline__ float chunk_dot(uint2 cb, const int* xw, float dw, fl
         const unsigned cbyte = cbytes[j];
         const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) | (((cbyte >> 4) & 3u) << 16) |
                               (((cbyte >> 6) & 3u) << 24));
-        s = STRATA_DP4A(cw, xw[j], s);
-        hx = STRATA_DP4A(ones, xw[j], hx);
+        s = DP4A(cw, xw[j], s);
+        hx = DP4A(ones, xw[j], hx);
     }
     return dw * dx * (float) (s - hx);
 }

@@ -33,7 +33,7 @@ __device__ __forceinline__ uint16_t bf(float f) {
     u += 0x7fffu + ((u >> 16) & 1u);
     return (uint16_t) (u >> 16);
 }
-// The BF16 GEMMs' second operand (STRATA_PREFILL_BF16X2): what the BF16 image `hi` left out of f, itself in BF16.
+// The BF16 GEMMs' second operand (PREFILL_BF16X2): what the BF16 image `hi` left out of f, itself in BF16.
 // W.hi + W.lo carries ~16 mantissa bits of the activation - the decode path's FP32 x to within ~1e-5.
 __device__ __forceinline__ uint16_t bf_lo(float f, uint16_t hi) { return bf(f - __uint_as_float((uint32_t) hi << 16)); }
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }

@@ -1,5 +1,5 @@
 // src/kernels/hc8_parity.cpp - the reads and products that take a hyper-connection matrix held only as its 8-bit copy
-// (STRATA_DEC_HC8, hc_fused.hpp's hc8_adopt), real geometry and random inputs (GPU, synthetic, no model):
+// (DEC_HC8, hc_fused.hpp's hc8_adopt), real geometry and random inputs (GPU, synthetic, no model):
 //
 //   1. hc8_gr_read_multi (what fused_gr_read, fused_gr_read_multi and gr_read run for such matrices) against
 //      fused_gr_read_multi on the bf16 matrices (the error the copies add) and on the copies dequantized to bf16 (the

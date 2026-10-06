@@ -301,7 +301,7 @@ int main() {
             auto bad=a; bad.head_dim++;
             check(!conversation_kv_restore(bad,f.state,f.g,upto,index,err),"reject incompatible geometry");
             if (fmt==kKvInt8) {
-                // #293: INT8 K/V saved through the Hadamard rotation (STRATA_KV_ROT=1) never restores into a state
+                // #293: INT8 K/V saved through the Hadamard rotation (KV_ROT=1) never restores into a state
                 // without it, nor the reverse
                 f.state.kv_rot=true;
                 ConversationKv rotated;

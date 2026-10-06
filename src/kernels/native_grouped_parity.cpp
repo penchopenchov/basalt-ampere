@@ -10,7 +10,7 @@
 // scattered destinations, stale scratch, grid_groups 0 (= cap), 1, 2, 3, 4 and above cap: the output must be BITWISE
 // equal to v1's, the rows the call must not write included (both start from the same NaN pattern).
 //
-// With STRATA_GU_MMA=1 the new launches take IQ3_XXS gate/up on the tensor-core kernel (sm_80+ CUDA) while v1 keeps
+// With GU_MMA=1 the new launches take IQ3_XXS gate/up on the tensor-core kernel (sm_80+ CUDA) while v1 keeps
 // the dp4a one, so the IQ3_XXS rows check it against the dp4a kernel, bitwise as well (and --bench times the two).
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
@@ -319,35 +319,35 @@ void bench(cudaStream_t s, std::mt19937& rng) {
     std::printf("\n--bench: microseconds per call, a window's 48 calls in a graph, each layer with its own experts (the\n"
                 "weights stream from DRAM as in the engine); v1 / new (grid_groups): medians of %d launches each,\n"
                 "alternating, after %d warm-up pairs - idle GPU assumed\n", kPairs, kWarmPairs);
-    // a verify window's shape: 4 tokens x 10 experts, 2560 x 768 IQ3_S / IQ4_XS experts (STRATA_BENCH_GU / _DOWN /
+    // a verify window's shape: 4 tokens x 10 experts, 2560 x 768 IQ3_S / IQ4_XS experts (BENCH_GU / _DOWN /
     // _FF for another pack's: 18 / 20 / 640 is IQ3_XXS with IQ4_NL down projections)
     auto env_int = [](const char* n, int d) { const char* v = std::getenv(n); return v ? std::atoi(v) : d; };
-    Setup S(env_int("STRATA_BENCH_GU", 21), env_int("STRATA_BENCH_DOWN", 23), 2560, env_int("STRATA_BENCH_FF", 768),
-            env_int("STRATA_BENCH_T", 4), 10, 32, rng, s);
+    Setup S(env_int("BENCH_GU", 21), env_int("BENCH_DOWN", 23), 2560, env_int("BENCH_FF", 768),
+            env_int("BENCH_T", 4), 10, 32, rng, s);
     std::vector<int> vram(16, 1);
     vram.insert(vram.end(), 12, 2);                                   // 28 groups, 40 entries
-    if (const char* v = std::getenv("STRATA_BENCH_SIZES")) {          // another window's group sizes, e.g. "6,6,5,3,1"
+    if (const char* v = std::getenv("BENCH_SIZES")) {          // another window's group sizes, e.g. "6,6,5,3,1"
         vram.clear();
         for (const char* q = v; *q;) { vram.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
     }
     const struct { const char* what; std::vector<int> sizes; int64_t gy; } rows[] = {
         {"no group (the PCIe call at pcie_frac 0)", {}, 4},
         {"1 group of 2 entries (a PCIe call)", {2}, 4},
-        {"28 groups, 40 entries (a VRAM call)", vram, env_int("STRATA_BENCH_GY", 0)},
+        {"28 groups, 40 entries (a VRAM call)", vram, env_int("BENCH_GY", 0)},
     };
-    const char* ab = std::getenv("STRATA_BENCH_AB");
-    const bool ab_gu2 = ab != nullptr && std::string(ab) == "gu2";   // B: STRATA_BENCH_GU2 (default 1)
-    k::native_expert_set_mode(-1, env_int("STRATA_BENCH_PHASE", 0));   // 1: gate/up + SwiGLU only, 2: down only
-    if (ab_gu2) std::printf("  A / B: the new launches without / with STRATA_DEC_GU2\n");
+    const char* ab = std::getenv("BENCH_AB");
+    const bool ab_gu2 = ab != nullptr && std::string(ab) == "gu2";   // B: BENCH_GU2 (default 1)
+    k::native_expert_set_mode(-1, env_int("BENCH_PHASE", 0));   // 1: gate/up + SwiGLU only, 2: down only
+    if (ab_gu2) std::printf("  A / B: the new launches without / with DEC_GU2\n");
     cudaEvent_t e0, e1;
     ck(cudaEventCreate(&e0), "event");
     ck(cudaEventCreate(&e1), "event");
     for (const auto& r : rows) {
         const int ng = S.plan_sizes(r.sizes, 0, rng);
         const Layers Ls(S, ng);                                       // 48 x 28 experts: 3.7 GB for the VRAM call
-        // STRATA_BENCH_AB=gu2: the new launches without / with native_gu2_kernel instead of v1 / new
+        // BENCH_AB=gu2: the new launches without / with native_gu2_kernel instead of v1 / new
         cudaGraphExec_t ga = ab_gu2 ? make_graph(s, S, Ls, false, r.gy, 0) : make_graph(s, S, Ls, true, 0);
-        cudaGraphExec_t gb = make_graph(s, S, Ls, false, r.gy, ab_gu2 ? env_int("STRATA_BENCH_GU2", 1) : -1);
+        cudaGraphExec_t gb = make_graph(s, S, Ls, false, r.gy, ab_gu2 ? env_int("BENCH_GU2", 1) : -1);
         std::vector<float> ta, tb;
         for (int i = 0; i < kWarmPairs + kPairs; ++i) {
             const bool a_first = i % 2 == 0;
@@ -372,20 +372,20 @@ int main(int argc, char** argv) {
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
     {
-        const char* m = std::getenv("STRATA_GU_MMA");
+        const char* m = std::getenv("GU_MMA");
         const bool mma = m != nullptr && m[0] != '\0' && m[0] != '0';
-        std::printf("gate/up: %s\n", mma ? "STRATA_GU_MMA=1 - IQ3_XXS on the tensor-core kernel where the device "
+        std::printf("gate/up: %s\n", mma ? "GU_MMA=1 - IQ3_XXS on the tensor-core kernel where the device "
                                           "has it (sm_80+ CUDA), v1 on dp4a: checked bitwise"
-                                        : "the dp4a kernels (STRATA_GU_MMA=1 checks the tensor-core one)");
+                                        : "the dp4a kernels (GU_MMA=1 checks the tensor-core one)");
     }
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 8})        // STRATA_GU_FMTS
-        for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
+    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 8})        // GU_FMTS
+        for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
     check(18, 20, 2560, 640, s, rng);
     check(18, 20, 512, 256, s, rng, 12);                                // groups of more than 8 entries
-    {   // STRATA_DEC_GU2=1: the new launches take native_gu2_kernel (2560-value rows only), v1 the multi kernel
-        const char* g = std::getenv("STRATA_DEC_GU2");
+    {   // DEC_GU2=1: the new launches take native_gu2_kernel (2560-value rows only), v1 the multi kernel
+        const char* g = std::getenv("DEC_GU2");
         if (g != nullptr && (g[0] == '1' || g[0] == '2')) {
             for (int gu : {16, 17, 18, 21, 22, 42})
                 for (int dt : {20, 42}) check(gu, dt, 2560, 640, s, rng, gu == 18 ? 8 : 6);

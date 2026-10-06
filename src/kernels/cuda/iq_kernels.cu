@@ -56,7 +56,7 @@ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_
     }
     return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
 }
-#define ggml_cuda_dp4a(a, b, c) STRATA_DP4A((a), (b), (c))
+#define ggml_cuda_dp4a(a, b, c) DP4A((a), (b), (c))
 
 // ---------------------------------------------------------------- the dot products (vecdotq.cuh)
 __device__ __forceinline__ float vec_dot_q2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
@@ -537,9 +537,9 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
+#define GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
+#define D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
+#define MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -2170,17 +2170,17 @@ bool is_iq(int t) {
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
     switch (t) {
-#define STRATA_QK(T) case T: return Fmt<T>::qk;
-        STRATA_GU_FMTS(STRATA_QK)
-#undef STRATA_QK
+#define QK_CASE(T) case T: return Fmt<T>::qk;
+        GU_FMTS(QK_CASE)
+#undef QK_CASE
         default: return 0;
     }
 }
 int d_qk(int t) {
     switch (t) {
-#define STRATA_QK(T) case T: return Fmt<T>::qk;
-        STRATA_D_FMTS(STRATA_QK)
-#undef STRATA_QK
+#define QK_CASE(T) case T: return Fmt<T>::qk;
+        D_FMTS(QK_CASE)
+#undef QK_CASE
         default: return 0;
     }
 }
@@ -2395,9 +2395,9 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     const auto* W = (const uint8_t*) w;
     const auto* X = (const block_q8_1*) x_q8_1;
     switch (t) {
-#define STRATA_MMVQ(T) case T: launch_mmvq<T>(W, rb, X, y, n_in, n_out, ncols, s); break;
-        STRATA_MMVQ_FMTS(STRATA_MMVQ)
-#undef STRATA_MMVQ
+#define MMVQ_CASE(T) case T: launch_mmvq<T>(W, rb, X, y, n_in, n_out, ncols, s); break;
+        MMVQ_FMTS(MMVQ_CASE)
+#undef MMVQ_CASE
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
     check("iq_mmvq");
@@ -2505,9 +2505,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
     if (g_exp_phase != 2) {
     switch (L.gu_type) {
-#define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, !v1); break;
-        STRATA_GU_FMTS(STRATA_GU)
-#undef STRATA_GU
+#define GU_CASE(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, !v1); break;
+        GU_FMTS(GU_CASE)
+#undef GU_CASE
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
     check("native_expert_grouped/gu");
@@ -2529,9 +2529,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
     switch (L.d_type) {
-#define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, chain); break;
-        STRATA_D_FMTS(STRATA_DOWN)
-#undef STRATA_DOWN
+#define DOWN_CASE(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, chain); break;
+        D_FMTS(DOWN_CASE)
+#undef DOWN_CASE
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
@@ -2539,4 +2539,4 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 
 }  // namespace basalt::kernels
 
-#include "dec_moe.cuh"   // STRATA_DEC_MOE: the decode MoE tail's kernels, on this file's row dots
+#include "dec_moe.cuh"   // DEC_MOE: the decode MoE tail's kernels, on this file's row dots

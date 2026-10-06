@@ -211,7 +211,7 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
-#define STRATA_ATTN_CHUNK(M) attn_chunk_kernel<M>
+#define ATTN_CHUNK(M) attn_chunk_kernel<M>
 
 }  // namespace
 
@@ -235,16 +235,16 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     cudaStream_t st = (cudaStream_t) stream;
     if (kv_mode == 3)
-        STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+        ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else if (kv_mode == 2)
-        STRATA_ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+        ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else if (kv_mode == 1)
-        STRATA_ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+        ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else
-        STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+        ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
                                                                                   attn, stride);
@@ -283,16 +283,16 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
     if (kv_mode == 3)
-        STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+        ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else if (kv_mode == 2)
-        STRATA_ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+        ATTN_CHUNK(2)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else if (kv_mode == 1)
-        STRATA_ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+        ATTN_CHUNK(1)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else
-        STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+        ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
     const cudaError_t e = cudaGetLastError();

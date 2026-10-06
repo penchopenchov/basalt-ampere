@@ -2,11 +2,11 @@
 //
 // src/prefill/kernels.cu runs gdn_rec_kh_kernel (the three value heads that share a key head in one thread, the
 // inputs staged in blocks of 8 tokens) on devices that hold all 64 of its blocks at once, and
-// gdn_rec_cols_pipe_kernel elsewhere and with STRATA_GDN_KEYHEAD=0.  Both are copied below verbatim, with the output
+// gdn_rec_cols_pipe_kernel elsewhere and with GDN_KEYHEAD=0.  Both are copied below verbatim, with the output
 // norm (gdn_out_norm_kernel) and the norm as it was before, which also stored the normalized value in FP32 although
 // nothing reads it.  The two recurrences do the same arithmetic in the same order per value head and column, so the
 // output, the state after it and the FP16 output must be the same bits.  gdn_rec_wl_kernel (opt-in,
-// STRATA_GDN_REC_WARP=1) sums a column's rows in another order: its output and state against gdn_rec_kh_kernel's
+// GDN_REC_WARP=1) sums a column's rows in another order: its output and state against gdn_rec_kh_kernel's
 // within FP32 rounding (relative RMS below 1e-5, worst value below 1e-4 of the largest).
 //
 // Synthetic inputs of the model's shape (q/k L2-normalized per key head as gdn_l2_kernel leaves them), no model.
@@ -52,7 +52,7 @@ __device__ __forceinline__ uint16_t hf(float f) { return __half_as_ushort(__floa
 // ------------------------------------------------------------------ the engine's kernels (src/prefill/kernels.cu)
 // gdn_rec_cols_kernel with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this token
 // computes (software pipelining).  The same arithmetic in the same order: the same bits, and the same CB-column split.
-// STRATA_GDN_PIPELINE=0: gdn_rec_cols_kernel.
+// GDN_PIPELINE=0: gdn_rec_cols_kernel.
 __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                       const float* __restrict__ gate,
                                                                       const float* __restrict__ beta,
@@ -226,7 +226,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__
         for (int r = 0; r < RPG; ++r) base[r * rs] = s[j][r];
     }
 }
-// STRATA_GDN_REC_WARP=1: the recurrence with each column's sums over the 128 key rows inside one warp.  Lane (rg, cl)
+// GDN_REC_WARP=1: the recurrence with each column's sums over the 128 key rows inside one warp.  Lane (rg, cl)
 // of warp w: column 4 w + cl of the block's GDN_WC, rows 4 (rg + 8 m) + e (m, e < 4) of the three value heads of key
 // head qh.  A sum over a column's rows is each lane's 16-row chain, then a butterfly over the 8 row-group lanes (lane
 // bits 0-2; every lane ends with the same bits), so a token has no __syncthreads and no shared-memory round trip; the
@@ -551,7 +551,7 @@ int check_bits(int64_t T, uint64_t seed) {
     return fails;
 }
 
-// gdn_rec_wl_kernel (STRATA_GDN_REC_WARP=1) against gdn_rec_kh_kernel: its row sums run in another order, so not the
+// gdn_rec_wl_kernel (GDN_REC_WARP=1) against gdn_rec_kh_kernel: its row sums run in another order, so not the
 // same bits - the output and the state within a few FP32 roundings of the sums (relative RMS and worst value)
 struct Close {
     double rms = 0, worst = 0;   // relative RMS of the difference; max |difference| / max |reference| (NaN: not finite)
@@ -620,7 +620,7 @@ void bench_warp(int64_t T) {
             if (i >= warm) t[v].push_back(ms);
         }
     const float r0 = median(t[0]), r1 = median(t[1]);
-    std::printf("  T = %lld: gdn_rec_kh_kernel %.2f ms, gdn_rec_wl_kernel (STRATA_GDN_REC_WARP=1) %.2f ms  %.2fx\n",
+    std::printf("  T = %lld: gdn_rec_kh_kernel %.2f ms, gdn_rec_wl_kernel (GDN_REC_WARP=1) %.2f ms  %.2fx\n",
                 (long long) T, r0, r1, r0 / r1);
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
