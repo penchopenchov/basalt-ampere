@@ -50,8 +50,11 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <chrono>
 #include <cmath>
@@ -273,12 +276,22 @@ const int64_t g_test_stall = [] {
 }();
 // a dense projection of the window: dense_tc where STRATA_DEC_DTC has the projection's bit and the type, else
 // native_mmvq (either one for every window width, so a column's value never depends on T)
+// one stderr line per distinct fast-path fallback (what, a, b)
+void note_fallback(const char* what, int a, int b) {
+    static std::mutex mu;
+    static std::set<std::tuple<std::string, int, int>> seen;
+    std::lock_guard<std::mutex> lk(mu);
+    if (seen.insert({what, a, b}).second)
+        std::fprintf(stderr, "strata verify: fallback: %s (types %d / %d)\n", what, a, b);
+}
 void dense_proj(int bit, int type, const void* w, const void* xq, float* y, int n_in, int n_out, int n, void* s) {
     if ((kernels::dense_tc_mask() & bit) && kernels::dense_tc_supported(type, n_in, n_out, w) &&
         kernels::dense_tc_type_on(type))
         kernels::dense_tc(type, w, xq, y, n_in, n_out, n, s);
-    else
+    else {
+        if (kernels::dense_tc_mask() & bit) note_fallback("STRATA_DEC_DTC projection on native_mmvq", bit, type);
         kernels::native_mmvq(type, w, xq, y, n_in, n_out, n, s);
+    }
 }
 }  // namespace
 
@@ -1234,9 +1247,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // STRATA_DEC_DTC2 & 16: qkv and z in one dense_tc_pair launch for every window width, then the
                 // one-launch recurrence with the gated norm
-                if (gdnf && (dec_dtc2_mask() & 16) &&
-                    kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
-                    ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0) {
+                const bool pair_ok = kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
+                                     ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0;
+                if (gdnf && (dec_dtc2_mask() & 16) && !pair_ok)
+                    note_fallback("STRATA_DEC_DTC2 & 16: GDN qkv + z without dense_tc_pair", wqkv->native_type,
+                                  wg->native_type);
+                if (gdnf && (dec_dtc2_mask() & 16) && pair_ok) {
                     {
                         PdlScope pp(pdl);   // after the hc read or the q8_1 kernel
                         kernels::dense_tc_pair(wqkv->native_type, wqkv->native_data, qkv + (size_t) tb * C, (int) C,
@@ -1669,6 +1685,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if ((dec_glue_mask() & 1) && pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
             const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
             glue_on[grp] = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
+            if (!glue_on[grp]) note_fallback("STRATA_DEC_GLUE off for the layer's experts", f.gu_type, f.d_type);
         }
         {
             PdlScope ps(pdl);   // after the out projection's kernel
