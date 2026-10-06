@@ -45,6 +45,7 @@ const Case CASES[] = {
     {"out IQ4_XS", 23, 6144, 2560, 136, {0, -1}},
     {"out Q4_K", 12, 6144, 2560, 144, {0, 2}},
     {"out Q5_K", 13, 6144, 2560, 176, {0, 2}},
+    {"out IQ3_S", 21, 6144, 2560, 110, {0, -1}},
     {"q Q6_K", 14, 2560, 12288, 210, {208, -1}},
     {"kv Q6_K", 14, 2560, 512, 210, {208, -1}},
     {"tail Q4_K", 12, 1024, 1000, 144, {0, 2}},
@@ -173,7 +174,7 @@ void bench(cudaStream_t s) {
     const bool warm = std::getenv("DTC_BENCH_WARM") != nullptr;
     for (const Case& c : CASES) {
         bool on = pick == nullptr ? (&c == &CASES[0] || &c == &CASES[1] || &c == &CASES[3] || &c == &CASES[4] ||
-                                     &c == &CASES[6] || &c == &CASES[10])
+                                     &c == &CASES[6] || &c == &CASES[11])
                                   : false;
         if (pick != nullptr) {
             std::string all(pick), name(c.name);

@@ -17,6 +17,10 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#define GGML_COMMON_DECL_CUDA
+#define GGML_COMMON_IMPL_CUDA
+#include "ggml-common.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +36,7 @@ template<> struct Fmt<12> { static constexpr int SB = 144; };
 template<> struct Fmt<13> { static constexpr int SB = 176; };
 template<> struct Fmt<14> { static constexpr int SB = 210; };
 template<> struct Fmt<23> { static constexpr int SB = 136; };
+template<> struct Fmt<21> { static constexpr int SB = 110; };
 
 // a staged row of a slot: two super-blocks from the 16-byte unit holding their first byte, padded to an odd number
 // of 16-byte units so the eight rows a load touches fall in different banks
@@ -70,6 +75,13 @@ __device__ __forceinline__ uint2 iq4_lookup(uint32_t q4, uint32_t t0, uint32_t t
     return make_uint2(__byte_perm(r0, r1, 0x6420), __byte_perm(r0, r1, 0x7531));
 }
 
+// IQ3_S: the grid word g with byte j negated where bit j of nib is set
+__device__ __forceinline__ uint32_t iq3s_signed(uint32_t g, uint32_t nib) {
+    const uint32_t b = (nib * 0x204081u) & 0x01010101u;   // bit j of nib to bit 0 of byte j
+    const uint32_t m = (b << 8) - b;                      // 0xff in those bytes
+    return (g ^ m) + b;
+}
+
 // The column data of a warp's four blocks: column g's codes 4t.. (b0) and 16 + 4t.. (b1), and the q8_1 scales of
 // columns 2t and 2t + 1.
 struct XFrag {
@@ -81,7 +93,8 @@ struct XFrag {
 // (row, column) terms added to acc.
 template<int TYPE>
 __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* const (&p)[2], int n, int t,
-                                              const XFrag& x, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3) {
+                                              const XFrag& x, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3,
+                                              const uint32_t* grid = nullptr) {
     if constexpr (TYPE == 12 || TYPE == 13) {
         uint32_t qw[2][4], hw[2][2], sw[2][3];
         float2 dm[2];
@@ -172,6 +185,32 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
         }
 #pragma unroll
         for (int q = 0; q < 4; ++q) acc[q] += dd[q >> 1] * part[q];
+    } else if constexpr (TYPE == 21) {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]; 2-byte aligned
+        float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float dw[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) dw[h] = __half2float(*reinterpret_cast<const __half*>(p[h]));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int ib = 4 * n + i;
+            uint32_t lo[2], hi[2];
+            int ls[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {   // values 4t.. and 16 + 4t.. of block ib
+                const uint8_t* bp = p[h];
+                const uint32_t qh = bp[66 + ib];
+                const uint32_t sg = ld32_b2(bp + 74 + 4 * ib);
+                lo[h] = iq3s_signed(grid[bp[2 + 8 * ib + t] | (((qh >> t) & 1u) << 8)], (sg >> (4 * t)) & 15u);
+                hi[h] = iq3s_signed(grid[bp[6 + 8 * ib + t] | (((qh >> (4 + t)) & 1u) << 8)], (sg >> (16 + 4 * t)) & 15u);
+                ls[h] = 1 + 2 * ((bp[106 + ib / 2] >> (4 * (ib & 1))) & 0x0F);
+            }
+            int d[4];
+            mma_k32(d, lo[0], lo[1], hi[0], hi[1], x.b0[i], x.b1[i]);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) part[q] += x.d8[i][q & 1] * (float) (d[q] * ls[q >> 1]);
+        }
+#pragma unroll
+        for (int q = 0; q < 4; ++q) acc[q] += dw[q >> 1] * part[q];
     } else {   // IQ4_XS
         uint32_t qw[2][4];
         int sl[2], shh[2];
@@ -463,6 +502,9 @@ __device__ __forceinline__ void dense_tc_one_block(int blk, uint8_t* smem, const
     const int row_bytes = (n_in / 256) * SB, rs = one_row_stride(row_bytes);
     const int row0 = blk * 16, rows = min(16, n_out - row0);
     const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar);
+    uint32_t* grid = reinterpret_cast<uint32_t*>(slot + 16 * rs);   // IQ3_S: the codebook after the rows
+    if constexpr (TYPE == 21)
+        for (int i = tid; i < 512; i += NW * 32) grid[i] = iq3s_grid[i];
     if (tid == 0) {
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(bb));
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -519,7 +561,7 @@ __device__ __forceinline__ void dense_tc_one_block(int blk, uint8_t* smem, const
         XFrag xn;
         if (c + NG < nchunk) load_x(xn, c + NG);
         const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
-        if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3);
+        if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3, grid);
         xf = xn;
     }
     float* rw = red + wp * 16 * kMaxCols;
@@ -561,7 +603,7 @@ __global__ void __launch_bounds__(NW * 32) dense_tc_one_kernel(const uint8_t* __
 
 template<int TYPE, int NW>
 constexpr int one_smem_bytes(int n_in) {
-    return 128 + NW * 16 * kMaxCols * 4 + 16 * one_row_stride((n_in / 256) * Fmt<TYPE>::SB);
+    return 128 + NW * 16 * kMaxCols * 4 + 16 * one_row_stride((n_in / 256) * Fmt<TYPE>::SB) + (TYPE == 21 ? 2048 : 0);
 }
 
 template<int TYPE, int S, int MT, int KS>
@@ -638,6 +680,13 @@ void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, in
                (const uint8_t*) x, y, n_in, n_out, ncols, g_probe);
 }
 
+// the one-tile path takes the shape (STRATA_DEC_DTC2 & 2; IQ3_S only there)
+template<int TYPE>
+bool one_ok(const void* w, int n_in, int n_out) {
+    return ((g_v2 & 2) || TYPE == 21) && ((uintptr_t) w & 15) == 0 && (n_in / 256) * Fmt<TYPE>::SB % 16 == 0 &&
+           (n_out + 15) / 16 <= sm_count() && one_smem_bytes<TYPE, 24>(n_in) <= 99 * 1024;
+}
+
 template<int TYPE, int NW>
 void launch_one(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     static bool attr = false;
@@ -658,13 +707,17 @@ void launch_one(const void* w, const void* x, float* y, int n_in, int n_out, int
 template<int TYPE>
 void launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     const bool aligned = ((uintptr_t) w & 15) == 0;
-    if ((g_v2 & 2) && aligned && (n_in / 256) * Fmt<TYPE>::SB % 16 == 0 && (n_out + 15) / 16 <= sm_count() && one_smem_bytes<TYPE, 24>(n_in) <= 99 * 1024) {
+    if (one_ok<TYPE>(w, n_in, n_out)) {
         static const int nw = env_int("STRATA_DEC_DTC2_NW", 24);
         if (nw == 16) launch_one<TYPE, 16>(w, x, y, n_in, n_out, ncols, s);
         else if (nw == 32 && one_smem_bytes<TYPE, 32>(n_in) <= 99 * 1024) launch_one<TYPE, 32>(w, x, y, n_in, n_out, ncols, s);
         else launch_one<TYPE, 24>(w, x, y, n_in, n_out, ncols, s);
         return;
     }
+    if constexpr (TYPE == 21) {
+        std::fprintf(stderr, "dense_tc: IQ3_S n_in %d n_out %d needs the one-tile path\n", n_in, n_out);
+        std::exit(1);
+    } else {
     if (g_tile && aligned && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) {
         launch_tile<TYPE>(w, x, y, n_in, n_out, ncols, s);
         return;
@@ -677,6 +730,7 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
     else if (ks2) launch_mt<TYPE, 1, 2>(w, x, y, n_in, n_out, ncols, s);
     else if (mt == 2) launch_mt<TYPE, 2, 1>(w, x, y, n_in, n_out, ncols, s);
     else launch_mt<TYPE, 1, 1>(w, x, y, n_in, n_out, ncols, s);
+    }
 }
 
 }  // namespace
@@ -685,13 +739,18 @@ bool dense_tc_supported(int t, int n_in) noexcept {
     return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23);
 }
 
+bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
+    if (t == 21) return n_in > 0 && n_in % 512 == 0 && n_out > 0 && one_ok<21>(w, n_in, n_out);
+    return dense_tc_supported(t, n_in);
+}
+
 bool dense_tc_type_on(int t) noexcept {
-    static const int m = env_int("STRATA_DEC_DTC_TYPES", 15);
-    return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : 0)) != 0;
+    static const int m = env_int("STRATA_DEC_DTC_TYPES", 15) | ((g_v2 & 4) ? 16 : 0);
+    return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : t == 21 ? 16 : 0)) != 0;
 }
 
 void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
-    if (!dense_tc_supported(type, n_in) || ncols < 1 || ncols > kMaxCols || n_out < 1 || ((uintptr_t) w & 3) != 0 ||
+    if (!dense_tc_supported(type, n_in, n_out, w) || ncols < 1 || ncols > kMaxCols || n_out < 1 || ((uintptr_t) w & 3) != 0 ||
         ((uintptr_t) x & 3) != 0) {
         std::fprintf(stderr, "dense_tc: type %d n_in %d n_out %d ncols %d not supported\n", type, n_in, n_out, ncols);
         std::exit(1);
@@ -701,6 +760,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
         case 12: launch<12>(w, x, y, n_in, n_out, ncols, s); break;
         case 13: launch<13>(w, x, y, n_in, n_out, ncols, s); break;
         case 14: launch<14>(w, x, y, n_in, n_out, ncols, s); break;
+        case 21: launch<21>(w, x, y, n_in, n_out, ncols, s); break;
         default: launch<23>(w, x, y, n_in, n_out, ncols, s); break;
     }
     const cudaError_t e = cudaGetLastError();
