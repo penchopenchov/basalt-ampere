@@ -1107,14 +1107,11 @@ class StartNarrator(unittest.TestCase):
 
     def test_the_words_follow_the_flags(self):
         from serve.server import experts_loading_words
-        self.assertIn("loading the experts into RAM (about 38 GB)", experts_loading_words([], "about 38 GB"))
-        mapped = experts_loading_words(["--mmap-experts"], "about 47 GB")
-        self.assertIn("mapping the experts from the model files (about 47 GB", mapped)
-        self.assertIn("not loaded into RAM", mapped)
-        self.assertIn("the GPU does not hold", experts_loading_words(["--resident-experts"], "about 47 GB"))
-        budget = experts_loading_words(["--mmap-experts", "--resident-budget-gib", "71"], "about 50 GB")
-        self.assertIn("up to 71 GiB", budget)
-        self.assertNotIn("about 50 GB", budget)
+        self.assertEqual(experts_loading_words([], "38.0 GiB"), "loading experts into RAM (38.0 GiB)")
+        self.assertEqual(experts_loading_words(["--mmap-experts"], "47.0 GiB"), "mapping experts (47.0 GiB)")
+        self.assertEqual(experts_loading_words(["--resident-experts"], ""), "loading experts into RAM")
+        budget = experts_loading_words(["--mmap-experts", "--resident-budget-gib", "71"], "50.0 GiB")
+        self.assertEqual(budget, "loading experts into RAM, budget 71 GiB")
 
     def narrate(self, args, lines):
         import contextlib
@@ -1135,13 +1132,13 @@ class StartNarrator(unittest.TestCase):
     def test_a_mapped_start(self):
         said = self.narrate(["--mmap-experts"], ["basalt generate: experts via mmap (--mmap-experts; the GGUF shards "
                                                  "in place, no experts.bin)"])
-        self.assertIn("mapping the experts from the model files", said)
-        self.assertNotIn("loading the experts into RAM", said)
+        self.assertIn("[server] mapping experts", said)
+        self.assertNotIn("loading experts into RAM", said)
 
     def test_an_arena_start(self):
         said = self.narrate([], ["basalt generate: expert arena: resident, 31.64 GiB",
                                  "basalt generate: loaded 31.64 GiB at 3.17 GiB/s"])
-        self.assertIn("loading the experts into RAM (tens of GB)", said)
+        self.assertIn("[server] loading experts into RAM\n", said)
         self.assertIn("experts loaded: 31.64 GiB at 3.17 GiB/s", said)
 
 

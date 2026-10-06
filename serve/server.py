@@ -246,35 +246,37 @@ def pump_lines(stream, sink) -> None:
 
 
 def experts_loading_words(args: list, size: str) -> str:
-    """What the start does with the experts, by the engine's flags (generate.cpp's option parsing): a RAM budget
-    copies the hottest N GiB into RAM (--resident-budget-gib), the resident low-RAM mode the ones the GPU does not hold
-    (--resident-experts), plain --mmap-experts reads them from the model files through the OS file cache (nothing is
-    loaded into RAM up front); otherwise all of them go into RAM."""
+    """The expert loading step, by the engine's flags: a RAM budget (--resident-budget-gib), the RAM copy of what
+    the GPU does not hold (--resident-experts), mapped files (--mmap-experts), or everything in RAM."""
+    at = f" ({size})" if size else ""
     if "--resident-budget-gib" in args:
         try:
-            n = f"up to {float(args[args.index('--resident-budget-gib') + 1]):g} GiB"
+            return f"loading experts into RAM, budget {float(args[args.index('--resident-budget-gib') + 1]):g} GiB"
         except (IndexError, ValueError):
-            n = "a RAM budget"
-        return f"loading the most-used experts into RAM ({n}), the rest stay on disk"
+            return "loading experts into RAM, budget"
     if "--resident-experts" in args:
-        return f"loading the experts the GPU does not hold into RAM (of {size})"
+        return f"loading experts into RAM{at}"
     if "--mmap-experts" in args:
-        return f"mapping the experts from the model files ({size}, --mmap-experts), not loaded into RAM"
-    return f"loading the experts into RAM ({size})"
+        return f"mapping experts{at}"
+    return f"loading experts into RAM{at}"
+
+
+def experts_size(args: list) -> str:
+    """The size of the experts the start reads, from the model file (or the source GGUF); empty when unknown."""
+    try:
+        if "--model" in args:
+            from serve.modelfile import ModelFile
+            return f"{ModelFile(args[args.index('--model') + 1]).section('experts')[1] / 2**30:.1f} GiB"
+        if "--native" in args:
+            return f"{os.path.getsize(args[args.index('--native') + 1]) / 2**30:.1f} GiB"
+    except (OSError, IndexError, KeyError, ValueError):
+        pass
+    return ""
 
 
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
-    """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
-    into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
-    people closed the window thinking it had hung.  The warning comes at that step, not after it."""
-    gb = 0.0
-    if "--native" in args:                              # about the size of the experts it will read
-        try:
-            gb = os.path.getsize(args[args.index("--native") + 1]) / 1e9
-        except (OSError, IndexError):
-            pass
-    size = f"about {gb:.0f} GB" if gb >= 1 else "tens of GB"
-    loading = experts_loading_words(args, size)
+    """Print the engine's start steps from its log, one line each, so a long start does not look hung."""
+    loading = experts_loading_words(args, experts_size(args))
     t0 = last = time.time()
     said = set()
 
@@ -285,7 +287,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             last = time.time()
             print(text, flush=True)
 
-    say("weights", "[server] starting the engine, reading the weights")
+    say("weights", "[server] engine starting")
     pos = offset
     while not done.wait(0.5):
         try:
@@ -299,13 +301,13 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
-                    say("arena", f"[server] {loading}, this can take a few minutes")
+                    say("arena", f"[server] {loading}")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[server] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
-                        f" ({time.time() - t0:.0f} s so far)")
+                        f", {time.time() - t0:.0f} s")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[server] filling the GPU expert cache ({n})")
+                    say("cache", f"[server] filling GPU expert cache ({n})")
                 elif "session is up" in line:
                     say("up", "[server] almost ready")
         if time.time() - last > heartbeat:
