@@ -1426,8 +1426,6 @@ void launch_check() {
 }
 
 
-#define STRATA_WAVE_MMVQ(...)
-
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
                 int n_in, int n_out, int ncols, void* stream) {
@@ -1437,7 +1435,6 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    STRATA_WAVE_MMVQ(SmallTraits<Weight, Qi>)
     if (ncols > 1) {
         launch_multi<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -1522,7 +1519,6 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q5KTraits)
     if (ncols > 1) {
         launch_multi<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -1569,7 +1565,6 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q20Traits)
     if (ncols > 1) {
         launch_multi<Q20Traits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -1609,7 +1604,6 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q3KTraits)
     if (ncols > 1) {
         launch_multi<Q3KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -1649,7 +1643,6 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    STRATA_WAVE_MMVQ(IQ4XSTraits)
     if (ncols > 1) {
         if (g_multi_exact && g_mmvq_mma && ncols >= g_mmvq_mma_min_t + (n_in > n_out ? 1 : 0)) {
             if (const int sms = mmvq_mma_sms()) {
@@ -1702,7 +1695,6 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q4KTraits)
     if (ncols > 1) {
         launch_multi<Q4KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -1748,7 +1740,6 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q6KTraits)
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();

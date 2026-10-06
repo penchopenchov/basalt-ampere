@@ -44,43 +44,6 @@
 #include <thread>
 #include <vector>
 
-#ifndef STRATA_PREFILL_MMQ
-// A build without the MMQ sources: no MMQ, the FP16 expert path everywhere.
-namespace basalt::prefill::mmq {
-bool built() { return false; }
-bool supported(int) { return false; }
-bool fits(int, int64_t) { return false; }
-size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
-size_t q8_bytes(int64_t, int64_t) { return 0; }
-void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
-Context::Context() {}
-Context::~Context() {}
-void Context::run(const Product&, void*) {}
-void gather_native(const void*, const void*, size_t, const void*, size_t, void*, void*, void*) {}
-bool gather_native_group(const GatherGroup&, size_t, size_t, size_t, size_t, void*, size_t, void*, size_t, void*) { return false; }
-void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
-void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
-void iota(int32_t*, int64_t, void*) {}
-}  // namespace basalt::prefill::mmq
-#endif
-#ifndef STRATA_PREFILL_FUSED
-// The fused int8 experts need the MMQ build; without it the FP16 path runs.
-namespace basalt::prefill::fused {
-bool built() { return false; }
-bool available() { return false; }
-bool enabled() { return false; }
-bool requested() { return false; }
-size_t act_bytes(int64_t, int64_t) { return 0; }
-size_t group_bytes(int64_t, int) { return 0; }
-void quantize_act(const float*, int64_t, int64_t, void*, void*) {}
-void group(const int32_t*, int64_t, int, int, void*, int32_t*, int32_t*, void*) {}
-void experts(const Batch&, int, int64_t, const void*, const void*, const int32_t*, void*, float*, void*) {}
-bool native_supported(int, int) { return false; }
-void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
-void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
-                    float*, void*) {}
-}  // namespace basalt::prefill::fused
-#endif
 
 namespace basalt::prefill {
 namespace {

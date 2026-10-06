@@ -28,13 +28,6 @@ void ck(cublasStatus_t s, const char* what) {
     }
 }
 
-// #247/#325: on Windows (seen on gfx1201), hipBLAS can return success with the correct BF16/FP16 product for some
-// shapes (hc up once T >= 96, the router) and still leave hipErrorInvalidValue set, which the next kernel's error
-// check turns into an exit. The multiply has finished, so that one stale error is cleared after a GEMM that succeeded;
-// any other error still stops the engine. Windows only: on Linux a stale hipErrorInvalidValue is a real error from
-// an earlier call and keeps being reported. A no-op everywhere else (CUDA compiles none of it).
-#define STRATA_ABSORB_HIPBLAS_STICKY(what) ((void) 0)
-
 // A setup call whose failure the engine survives (the handle keeps its defaults), as before #240 - but said.
 void note(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d (continuing)\n", what, (int) s);
@@ -116,7 +109,6 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx");
-    STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
 void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
@@ -152,7 +144,6 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                     CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx f16");
-    STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

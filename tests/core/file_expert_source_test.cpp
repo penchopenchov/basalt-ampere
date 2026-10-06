@@ -2,10 +2,8 @@
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
-#if defined(STRATA_NATIVE_EXPERTS)
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "ggml.h"
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -121,7 +119,6 @@ void test_canonical_layout() {
     source.close();
 }
 
-#if defined(STRATA_NATIVE_EXPERTS)
 void test_native_variable_layout() {
     using namespace basalt::core;
     using namespace basalt::kernels::cpu;
@@ -183,7 +180,6 @@ void test_native_variable_layout() {
     require(reopened && source.reads() == 1 && reopened[0] == 'c', "reopened native source kept stale state");
     source.close();
 }
-#endif
 
 void test_complement_plan() {
     using namespace basalt::core::detail;
@@ -348,9 +344,7 @@ int main() {
         test_cgroup_memory_budget();
         test_host_memory();
         test_canonical_layout();
-#if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
-#endif
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

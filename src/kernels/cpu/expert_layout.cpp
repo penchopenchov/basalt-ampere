@@ -133,15 +133,6 @@ void act_quant_any(const float* x, int n, ActQ& a) {
     else act_quant_q8_1_avx2(x, n, a);
 }
 
-#if !defined(STRATA_NATIVE_EXPERTS)
-// Without ggml-cpu no native pack loads (expert_layout_load refuses), so these are never reached.
-bool native_experts_available() noexcept { return false; }
-bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
-void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
-void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
-void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
-void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
-#endif
 
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     ExpertLayout L;
@@ -153,10 +144,6 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         g_layout = L;
         return true;
     }
-#if !defined(STRATA_NATIVE_EXPERTS)
-    err = "this pack has native (IQ) experts but the engine was built without STRATA_NATIVE_EXPERTS";
-    return false;
-#else
     L.native = true;
     L.fmt.resize((size_t) n_layers);
     L.offset.assign((size_t) n_layers, ~0ull);
@@ -248,7 +235,6 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.total = at;
     g_layout = L;
     return true;
-#endif
 }
 
 }  // namespace basalt::kernels::cpu
