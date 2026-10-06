@@ -243,6 +243,11 @@ if(BUILD_TESTING)
   target_link_libraries(expert_layout_test PRIVATE engine)
   add_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
   set_tests_properties(expert_layout_test PROPERTIES TIMEOUT 60)
+  # the .basalt reader: table, meta JSON, the GGUF view of the source tensors, the layout text, the hc8 table
+  add_executable(model_file_test tests/core/model_file_test.cpp)
+  target_link_libraries(model_file_test PRIVATE engine)
+  add_test(NAME model_file_test COMMAND model_file_test)
+  set_tests_properties(model_file_test PROPERTIES TIMEOUT 60)
   # a native pack's BF16 (--compat-bf16) PLE key stays in the arena; a quantized key row loads as before
   add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
   target_link_libraries(native_dense_ple_key_test PRIVATE engine)
@@ -269,6 +274,8 @@ target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_t
 add_executable(basalt src/program/generate.cpp)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE engine prefill spec ${_gpu_runtime_target})
+# `basalt serve` runs the Python server from the source tree
+target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # The standard benchmark: a host-only program that drives the engine over its stdin/stdout protocol.
 execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short=10 HEAD

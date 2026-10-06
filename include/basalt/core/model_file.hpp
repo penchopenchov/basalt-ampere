@@ -35,7 +35,7 @@ struct FileRange {
     uint64_t bytes = 0;
 
     FileRange() = default;
-    FileRange(std::string p, uint64_t off = 0, uint64_t n = 0) : path(std::move(p)), offset(off), bytes(n) {}
+    explicit FileRange(std::string p, uint64_t off = 0, uint64_t n = 0) : path(std::move(p)), offset(off), bytes(n) {}
 
     bool empty() const { return path.empty(); }
     /// Whether the file exists and, for a bounded range, holds the range.

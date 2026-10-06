@@ -23,6 +23,7 @@
 #include "basalt/core/layout.hpp"
 #include "basalt/core/session.hpp"
 #include "basalt/core/weights.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -84,6 +85,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -150,6 +152,8 @@ bool resident_stage_swaps(basalt::core::FileExpertSource& src, basalt::core::Exp
 
 struct Options {
     std::string pack = "pack/full";
+    std::string model;                ///< --model: a .basalt file that replaces --pack, --native, --ple-gguf, --mtp, --expert-profile
+    std::string dump_hc8;             ///< --dump-hc8: write the 8-bit hyper-connection copies here, then exit
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
     int64_t max_context = 4096;
@@ -437,10 +441,91 @@ struct Options {
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
 };
 
+/// Calls `f` with the tensor name of every row of a pack index (the first field of each non-comment line).
+bool for_each_index_name(const basalt::core::FileRange& index, const std::function<void(const std::string&)>& f) {
+    std::vector<uint8_t> raw;
+    std::string err;
+    if (!basalt::core::read_range(index, raw, err)) return false;
+    const std::string text(raw.begin(), raw.end());
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos) nl = text.size();
+        const std::string line = text.substr(at, nl - at);
+        at = nl + 1;
+        char name[256];
+        if (line.empty() || line[0] == '#' || std::sscanf(line.c_str(), "%255s", name) != 1) continue;
+        f(name);
+    }
+    return true;
+}
+
+/// `basalt serve MODEL.basalt [--host H] [--port P] [--python PY] [server args...]`: runs the Python server over this
+/// binary and the model.  Only returns on failure.
+int serve_subcommand(int argc, char** argv) {
+    std::string model, host = "127.0.0.1", port = "8080", python;
+    std::vector<std::string> extra;
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto value = [&](std::string& dst) {
+            if (i + 1 >= argc) { std::fprintf(stderr, "basalt serve: %s needs a value\n", a.c_str()); std::exit(2); }
+            dst = argv[++i];
+        };
+        if (a == "--host") value(host);
+        else if (a == "--port") value(port);
+        else if (a == "--python") value(python);
+        else if (model.empty() && !a.empty() && a[0] != '-') model = a;
+        else extra.push_back(a);
+    }
+    if (model.empty()) {
+        std::fprintf(stderr, "usage: basalt serve MODEL.basalt [--host H] [--port P] [--python PY] [server args...]\n");
+        return 2;
+    }
+    char exe[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) { std::fprintf(stderr, "basalt serve: cannot find this binary (/proc/self/exe)\n"); return 1; }
+    exe[n] = 0;
+    const std::string src_dir = BASALT_SOURCE_DIR;
+    if (python.empty()) {
+        const std::string venv = src_dir + "/.venv/bin/python";
+        python = ::access(venv.c_str(), X_OK) == 0 ? venv : "python3";
+    }
+    // the working directory changes below: the model's path must not depend on it
+    char real[4096];
+    if (::realpath(model.c_str(), real) == nullptr) {
+        std::fprintf(stderr, "basalt serve: cannot open %s\n", model.c_str());
+        return 1;
+    }
+    if (::chdir(src_dir.c_str()) != 0) {
+        std::fprintf(stderr, "basalt serve: cannot enter the source tree %s\n", src_dir.c_str());
+        return 1;
+    }
+    std::vector<std::string> args = {python, "-m", "serve.server", "--engine", "engine", "--model", real,
+                                     "--exe", exe, "--host", host, "--port", port};
+    args.insert(args.end(), extra.begin(), extra.end());
+    std::vector<char*> cargs;
+    for (std::string& s : args) cargs.push_back(s.data());
+    cargs.push_back(nullptr);
+    ::execvp(python.c_str(), cargs.data());
+    std::fprintf(stderr, "basalt serve: cannot run %s: %s\n", python.c_str(), std::strerror(errno));
+    return 1;
+}
+
 void usage() {
     std::fprintf(stderr,
-                 "basalt generate --pack DIR --tokens \"1,2,3\" [options]\n"
+                 "basalt serve MODEL.basalt [--host H] [--port P] [--python PY] [server args...]\n"
+                 "    runs the Python server (serve/) over this binary and the model: host 127.0.0.1, port 8080;\n"
+                 "    --python defaults to .venv/bin/python in the source tree, else python3; the other arguments\n"
+                 "    go to the server.  It runs in the source tree, so give paths to it as absolute ones.\n"
+                 "basalt generate (--model FILE.basalt | --pack DIR) --tokens \"1,2,3\" [options]\n"
                  "\n"
+                 "  --model FILE         a .basalt model file: the dense weights, experts, source tensors (embedding,\n"
+                 "                       PLE table, native projections, head), draft layer, default expert profile\n"
+                 "                       and 8-bit hyper-connection copies all come from it.  Replaces --pack,\n"
+                 "                       --native, --ple-gguf, --mtp and --expert-profile (the last two may still be\n"
+                 "                       given to use another drafter or profile); the engine's other flags apply\n"
+                 "  --dump-hc8 FILE      load as usual, write the 8-bit hyper-connection copies to FILE (the layout in\n"
+                 "                       basalt/core/model_file.hpp; the converter stores it as the `hc8` section), exit\n"
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
@@ -1068,6 +1153,7 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With lazy
     // loading, a kernel first used mid-prompt would find no VRAM left for its code and the engine would end ("out of
     // memory: cudaFuncSetAttribute").
@@ -1078,6 +1164,7 @@ int main(int argc, char** argv) {
     std::string ppl_base, ppl_out;
     bool have_tokens = false;
     bool have_logits_stride = false;
+    bool pack_given = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -1086,7 +1173,9 @@ int main(int argc, char** argv) {
         };
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
-        else if (a == "--pack") o.pack = next("--pack");
+        else if (a == "--pack") { o.pack = next("--pack"); pack_given = true; }
+        else if (a == "--model") o.model = next("--model");
+        else if (a == "--dump-hc8") o.dump_hc8 = next("--dump-hc8");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
             std::string e;
@@ -1348,6 +1437,60 @@ int main(int argc, char** argv) {
         }
         }
     }
+    // ---- where every loader reads from: a pack directory and the other files named by flags, or one .basalt file
+    basalt::core::ModelSources srcs;
+    basalt::core::ModelFile model_file;
+    bool mtp_from_model = false;
+    if (!o.model.empty()) {
+        if (pack_given || !o.ple_gguf.empty() || !o.native_preset.empty() || !o.native_head_gguf.empty() ||
+            !o.native_dense_gguf.empty() || !o.embd_gguf.empty()) {
+            std::fprintf(stderr, "basalt generate: --model replaces --pack, --native, --ple-gguf, --native-head-gguf, "
+                                 "--native-dense-gguf and --embd-gguf: give one or the other\n");
+            return 2;
+        }
+        std::string merr;
+        if (!model_file.open(o.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr)) {
+            std::fprintf(stderr, "basalt generate: --model: %s\n", merr.c_str());
+            return 1;
+        }
+        basalt::core::model_sources(model_file, srcs);
+        if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty()) {
+            std::fprintf(stderr, "basalt generate: %s lacks the dense, dense.index or experts section\n", o.model.c_str());
+            return 1;
+        }
+        o.pack = o.model;            // a label for messages; the loaders read `srcs`
+        o.native_preset = o.model;   // the source tensors are served through the GGUF view of this file
+        // the drafter and the default expert profile come with the model unless a flag names others
+        if (o.mtp.empty() && !srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) {
+            o.mtp = o.model;
+            mtp_from_model = true;
+        } else if (!o.mtp.empty()) {
+            basalt::core::mtp_dir_sources(o.mtp, srcs);
+        }
+        if (o.expert_profile.empty()) {
+            if (!srcs.profile.empty()) o.expert_profile = o.model + "#profile";
+        } else {
+            srcs.profile = basalt::core::FileRange(o.expert_profile);
+            srcs.profile_magic = true;
+        }
+        // the 8-bit hyper-connection copies, unless this run is making them
+        if (!srcs.hc8.empty() && o.dump_hc8.empty()) {
+            std::map<std::string, basalt::core::Hc8Copy> table;
+            if (!basalt::core::hc8_read(srcs.hc8, table, merr)) {
+                std::fprintf(stderr, "basalt generate: %s: %s\n", o.model.c_str(), merr.c_str());
+                return 1;
+            }
+            basalt::core::hc8_set_table(std::move(table));
+        }
+    } else {
+        basalt::core::pack_dir_sources(o.pack, srcs);
+        if (!o.mtp.empty()) basalt::core::mtp_dir_sources(o.mtp, srcs);
+        if (!o.expert_profile.empty()) srcs.profile = basalt::core::FileRange(o.expert_profile);
+    }
+    const basalt::core::PackFiles pack_files =
+        o.model.empty() ? basalt::core::PackFiles::dir(o.pack) : basalt::core::PackFiles::from(srcs);
+    const basalt::core::ExpertFiles expert_files =
+        o.model.empty() ? basalt::core::ExpertFiles::dir(o.pack) : basalt::core::ExpertFiles::from(srcs);
     basalt::core::set_coupled_draft(o.coupled_draft);
     basalt::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // multi-GPU: without direct access the prompt path cannot take the peer, so it keeps the single-GPU kernels
@@ -1714,7 +1857,20 @@ int main(int argc, char** argv) {
     // file) and runs its experts in verify windows only (--spec).
     {
         const basalt::core::ModelGeometry g0;
-        if (!basalt::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        bool layout_ok = false;
+        if (o.model.empty()) {
+            layout_ok = basalt::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err);
+        } else {
+            std::vector<uint8_t> text;
+            // no layout section: the canonical layout
+            if (!srcs.experts_layout.empty() && !basalt::core::read_range(srcs.experts_layout, text, err)) {
+                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
+                return 1;
+            }
+            layout_ok = basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), g0.n_layers,
+                                                                      g0.n_expert, err);
+        }
+        if (!layout_ok) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
@@ -1910,7 +2066,7 @@ int main(int argc, char** argv) {
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         // a --compat-bf16 pack (OrcaRouter IQ3_XXS) keeps its BF16 key in the arena
-        if (native_pack && !basalt::core::NativeDense::keep_unquantized_ple_key(o.pack, skip, err)) {
+        if (native_pack && !basalt::core::NativeDense::keep_unquantized_ple_key(pack_files, skip, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
@@ -1928,18 +2084,12 @@ int main(int argc, char** argv) {
     // routing-aware prefetch (RouterLookahead, below) copies all of them from CUDA0's arena, and would otherwise turn
     // itself off
     auto add_foreign = [&](int64_t lb, int64_t le, std::set<std::string>& out, bool keep_routers) {
-        std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb");
-        if (!f) return;
-        char line[1024], name[256];
-        while (std::fgets(line, sizeof line, f)) {
-            if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
-            const std::string n = name;
-            if (n.rfind("blk.", 0) != 0 || n.find("ple") != std::string::npos) continue;
-            if (keep_routers && n.ends_with(".ffn_gate_inp.weight")) continue;
-            const int64_t l = std::atoll(name + 4);
+        for_each_index_name(pack_files.index, [&](const std::string& n) {
+            if (n.rfind("blk.", 0) != 0 || n.find("ple") != std::string::npos) return;
+            if (keep_routers && n.ends_with(".ffn_gate_inp.weight")) return;
+            const int64_t l = std::atoll(n.c_str() + 4);
             if (l < lb || l >= le) out.insert(n);
-        }
-        std::fclose(f);
+        });
     };
     if (stage_trim) {
         add_foreign(0, split_at[0], skip, o.mmap_experts);
@@ -1951,22 +2101,16 @@ int main(int argc, char** argv) {
     // out and they are staged, copied and dropped right after the load
     std::set<std::string> hc8_names;
     if (basalt::kernels::hc8_only() && !multi_gpu) {
-        if (std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
-            char line[1024], name[256];
-            while (std::fgets(line, sizeof line, f)) {
-                if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
-                const std::string n = name;
-                const bool blk = n.rfind("blk.", 0) == 0 &&
-                                 (n.ends_with(".hc_attn_down.weight") || n.ends_with(".hc_attn_up.weight") ||
-                                  n.ends_with(".hc_ffn_down.weight") || n.ends_with(".hc_ffn_up.weight"));
-                if (blk || n == "output_hc_down.weight" || n == "output_hc_up.weight") hc8_names.insert(n);
-            }
-            std::fclose(f);
-        }
+        for_each_index_name(pack_files.index, [&](const std::string& n) {
+            const bool blk = n.rfind("blk.", 0) == 0 &&
+                             (n.ends_with(".hc_attn_down.weight") || n.ends_with(".hc_attn_up.weight") ||
+                              n.ends_with(".hc_ffn_down.weight") || n.ends_with(".hc_ffn_up.weight"));
+            if (blk || n == "output_hc_down.weight" || n == "output_hc_up.weight") hc8_names.insert(n);
+        });
         for (const std::string& n : hc8_names) skip.insert(n);
     }
     uint64_t pool_bytes = 0;
-    if (!basalt::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
         return 1;
     }
@@ -1993,7 +2137,7 @@ int main(int argc, char** argv) {
         return s;
     };
     basalt::core::WeightTable wt;
-    if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!wt.load(pack_files, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
         return 1;
     }
@@ -2001,20 +2145,34 @@ int main(int argc, char** argv) {
                          "skipped: served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
     if (!hc8_names.empty()) {
+        // the copies the model file holds are registered as they are; the rest are quantized from their bf16 matrices,
+        // staged for the purpose and dropped
+        std::set<std::string> staged_names;
+        size_t n_done = 0;
+        for (const std::string& n : hc8_names) {
+            const basalt::core::WeightRef* r0 = wt.find(n);
+            const void* q = r0 ? basalt::core::hc8_table_adopt(n, nullptr, (int) r0->ne1, (int) r0->ne0) : nullptr;
+            if (q == nullptr) { staged_names.insert(n); continue; }
+            if (!wt.rebind(n, q)) {
+                std::fprintf(stderr, "basalt generate: hc8: no 8-bit copy of %s\n", n.c_str());
+                return 1;
+            }
+            ++n_done;
+        }
+        uint64_t stage_bytes = 0;
+        if (!staged_names.empty()) {
         std::set<std::string> others;
         for (const auto& kv : wt.all())
-            if (!hc8_names.count(kv.first)) others.insert(kv.first);
-        uint64_t stage_bytes = 0;
+            if (!staged_names.count(kv.first)) others.insert(kv.first);
         void* stage = nullptr;
         basalt::core::WeightTable staged;
-        if (!basalt::core::WeightTable::pool_bytes(o.pack, stage_bytes, err, &others) ||
-            cudaMalloc(&stage, stage_bytes) != cudaSuccess || !staged.load(o.pack, stage, stage_bytes, err, &others)) {
+        if (!basalt::core::WeightTable::pool_bytes(pack_files, stage_bytes, err, &others) ||
+            cudaMalloc(&stage, stage_bytes) != cudaSuccess || !staged.load(pack_files, stage, stage_bytes, err, &others)) {
             std::fprintf(stderr, "basalt generate: hc8: staging the hyper-connection matrices failed%s%s\n",
                          err.empty() ? "" : ": ", err.c_str());
             return 1;
         }
-        size_t n_done = 0;
-        for (const std::string& n : hc8_names) {
+        for (const std::string& n : staged_names) {
             const basalt::core::WeightRef* r = staged.find(n);
             const void* q = r && r->data && r->kind == basalt::core::WeightKind::Bf16InF32
                                 ? basalt::kernels::hc8_adopt((const uint16_t*) r->data, (int) r->ne1, (int) r->ne0)
@@ -2026,9 +2184,13 @@ int main(int argc, char** argv) {
             ++n_done;
         }
         cudaFree(stage);
+        }
         for (const auto& kv : wt.all())   // the injections stay bf16 in the arena, with copies beside them
-            if (kv.first.ends_with("_inject.weight") && kv.first.find(".hc_") != std::string::npos && kv.second.data)
-                basalt::kernels::hc8_prepare((const uint16_t*) kv.second.data, (int) kv.second.ne1, (int) kv.second.ne0);
+            if (kv.first.ends_with("_inject.weight") && kv.first.find(".hc_") != std::string::npos && kv.second.data) {
+                if (basalt::core::hc8_table_adopt(kv.first, (const uint16_t*) kv.second.data, (int) kv.second.ne1,
+                                                  (int) kv.second.ne0) == nullptr)
+                    basalt::kernels::hc8_prepare((const uint16_t*) kv.second.data, (int) kv.second.ne1, (int) kv.second.ne0);
+            }
         std::fprintf(stderr, "basalt hc8: %zu hyper-connection matrices held only as 8-bit copies (%.0f MiB of bf16 "
                              "left out of VRAM, %.0f MiB of copies) in %.1f s\n",
                      n_done, (double) stage_bytes / 1048576.0, (double) basalt::kernels::hc8_bytes() / 1048576.0,
@@ -2278,7 +2440,7 @@ int main(int argc, char** argv) {
         std::string perr;
         const bool remote = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         if (remote || o.expert_profile.empty() ||
-            !basalt::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, prof, pslots, perr)) {
+            !basalt::core::read_expert_profile(srcs.profile, srcs.profile_magic, g.n_layers, g.n_expert, prof, pslots, perr)) {
             std::fprintf(stderr, "basalt generate: --split-skip-if-fits: %s; the split stays\n",
                          remote ? "remote expert caches are in use" : perr.empty() ? "no expert profile" : perr.c_str());
         } else {
@@ -2334,7 +2496,7 @@ int main(int argc, char** argv) {
             const int64_t lb = split_at[i], le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
             add_foreign(lb, le, skip_s, false);
             basalt::core::NativeDense::set_layer_range((int) lb, (int) le);
-            if (!basalt::core::WeightTable::pool_bytes(o.pack, pool_s, err, &skip_s)) {
+            if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_s, err, &skip_s)) {
                 std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
                 return 1;
             }
@@ -2345,7 +2507,7 @@ int main(int argc, char** argv) {
         }
         void* arena_s = nullptr;
         if (cudaMalloc(&arena_s, pool_s) != cudaSuccess ||
-            !st.wt.load(o.pack, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s)) {
+            !st.wt.load(pack_files, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s)) {
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // what that card had free
             cudaMemGetInfo(&free_b, &total_b);
@@ -2406,7 +2568,7 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
-        if (!basalt::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
+        if (!basalt::core::read_expert_profile(srcs.profile, srcs.profile_magic, g.n_layers, g.n_expert, profile, pslots, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
@@ -2745,7 +2907,7 @@ int main(int argc, char** argv) {
     basalt::core::MtpDrafter mtp;
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
-            std::fprintf(stderr, "basalt generate: --mtp is ignored without --spec T (T >= 2)\n");
+            if (!mtp_from_model) std::fprintf(stderr, "basalt generate: --mtp is ignored without --spec T (T >= 2)\n");
             o.mtp.clear();
         }
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
@@ -2754,7 +2916,7 @@ int main(int argc, char** argv) {
         static const basalt::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const basalt::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
@@ -2844,7 +3006,7 @@ int main(int argc, char** argv) {
         // A native pack without experts.bin maps the model's GGUF shards instead (native_experts.txt's spans, checked
         // against the files first) - no second copy of the experts on the disk
         src.set_gguf(o.native_preset);
-        if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
+        if (!src.open(expert_files.experts, g.n_layers, g.n_expert, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
@@ -2863,7 +3025,7 @@ int main(int argc, char** argv) {
     } else {
         arena_src.set_gguf(o.native_preset);   // a native pack may take its experts from shard 1
         const uint64_t pin_limit = 0;   // the whole arena is pinned
-        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
+        if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
@@ -2888,6 +3050,16 @@ int main(int argc, char** argv) {
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     basalt::core::Verifier::prepare_hc8(wt, g); // before the cache sizes itself
+    if (!o.dump_hc8.empty()) {
+        // --dump-hc8: the copies, as a .basalt's `hc8` section holds them; nothing else of the startup is kept
+        cudaDeviceSynchronize();
+        const auto extra = o.mtp.empty() ? std::vector<std::pair<std::string, const void*>>{} : mtp.hc8_keys();
+        if (!basalt::core::hc8_dump(wt, g, extra, o.dump_hc8, err)) {
+            std::fprintf(stderr, "basalt generate: --dump-hc8: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
     basalt::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena
     const bool auto_cache = o.expert_cache < 0;

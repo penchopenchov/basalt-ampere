@@ -191,10 +191,14 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     impl_->q5_0 = std::strcmp(t->type_name(), "Q5_0") == 0;
     impl_->rb = impl_->q5_0 ? (PLE_HEAD_DIM / 32) * 22 : PLE_ROW_BYTES;
     if (std::strcmp(t->type_name(), "I8") == 0) {
-        const MetaValue* f = impl_->file->get("strata.ple.format");
-        const MetaValue* s = impl_->file->get("strata.ple.scale");
+        // the keys are "ple.format" / "ple.scale" under the file's own prefix: basalt. (a model file), or the
+        // prefix the older tools/ple_fp8_pack.py files carry
+        const MetaValue* f = impl_->file->get("basalt.ple.format");
+        const MetaValue* s = impl_->file->get("basalt.ple.scale");
+        if (f == nullptr) f = impl_->file->get("strata.ple.format");
+        if (s == nullptr) s = impl_->file->get("strata.ple.scale");
         if (f == nullptr || f->s != "f8_e4m3" || s == nullptr || !(s->num() > 0.0)) {
-            err = "per_layer_token_embd.weight is I8 without strata.ple.format = f8_e4m3 and a positive strata.ple.scale";
+            err = "per_layer_token_embd.weight is I8 without ple.format = f8_e4m3 and a positive ple.scale";
             close();
             return false;
         }
