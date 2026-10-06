@@ -434,7 +434,6 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __res
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
-#if !defined(__HIPCC__)
 // The recurrence with one thread for the three value heads that share a key head (head % HK): column c of heads
 // qh, qh + 16 and qh + 32, row group rg.  gdn_rec_cols_pipe_kernel spends its time in shared memory, not in
 // arithmetic: every thread of a warp needs the same 32 q and k values per token (the k twice), and a warp receives one
@@ -724,7 +723,6 @@ bool gdn_warp_ok() {
     }
     return known[dev] == 1;
 }
-#endif
 // the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
 // norm stays in its scratch buffer)
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
@@ -1042,13 +1040,11 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
-#if !defined(__HIPCC__)
         if (gdn_warp_ok())   // the row sums inside a warp (opt-in; not the same bits)
             gdn_rec_wl_kernel<<<HK * GDN_WNCB, GDN_WC * 8, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
             gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
-#endif
         if (pipe)   // the software-pipelined loads (same bits)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else

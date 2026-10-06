@@ -849,7 +849,6 @@ struct DevInfo {
 std::mutex g_mu;
 DevInfo g_dev[32];
 
-#if !defined(STRATA_HIP_GFX906)
 template <int T, bool GU, int WW> bool setup_ww(int& occ) {
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_kernel<T, GU, WW>) != cudaSuccess || fa.ptxVersion < 80) return false;
@@ -878,7 +877,6 @@ template <bool GU> bool setup_v2(int& occ) {
                  GU ? "gate/up" : "down", fa.numRegs, (size_t) fa.localSizeBytes, V2<GU>::SMEM);
     return true;
 }
-#endif
 
 const DevInfo& dev_info() {
     int dev = 0;
@@ -887,11 +885,6 @@ const DevInfo& dev_info() {
     DevInfo& d = g_dev[dev & 31];
     if (d.done) return d;
     d.done = true;
-#if defined(STRATA_HIP_GFX906)
-    // gfx906 reports compute capability 9.0 through HIP, but the mma.sync bodies above are CUDA sm_80+ only and
-    // empty in a hipcc build: never available here (the prompt path keeps its own expert GEMMs)
-    return d;
-#else
     int major = 0;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
@@ -902,7 +895,6 @@ const DevInfo& dev_info() {
            setup_one<T_Q2_0, false>(occ) && setup_one<T_IQ4_NL, false>(occ);
     d.occ = d.ok ? occ : 1;
     cudaGetLastError();
-#endif
     return d;
 }
 
@@ -925,7 +917,6 @@ int v2_occ() {
     DevInfo& d = g_dev[dev & 31];
     if (d.v2 < 0) {
         d.v2 = 0;
-#if !defined(STRATA_HIP_GFX906)
         int occ = 1 << 20;
         if (setup_v2<true>(occ) && setup_v2<false>(occ)) {
             d.v2 = 1;
@@ -935,7 +926,6 @@ int v2_occ() {
                                  "kernels stay\n");
         }
         cudaGetLastError();
-#endif
     }
     return d.v2 == 1 ? d.v2_occ : 0;
 }

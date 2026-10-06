@@ -9,12 +9,6 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 static std::string human(uint64_t b) {
     char buf[64];
@@ -40,12 +34,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // The runtime's numbering, which setup needs on Windows: there an integrated Radeon is HIP device 0 and pushes the
-    // discrete card to 1, while setup finds the cards in the display-adapter order (#325).  No arch check here - the
-    // cards this binary has no code for are part of the answer.  Format (setup.py's hip_devices parses it):
+    // Every card the runtime enumerates, without the arch check `device_info` applies.  Format:
     //   device N: <name>
-    //     arch gfx1201, 15.9 GiB, wave32          (CUDA: compute capability 12.0, 11.9 GiB)
-    //     cannot run: <why>                       (only for a card this binary cannot run)
+    //     compute capability 12.0, 31.4 GiB
     if (list_devices) {
         const int count = strata::core::device_count();
         if (count == 0) std::printf("(no GPU device)\n");
@@ -56,8 +47,6 @@ int main(int argc, char** argv) {
                 continue;
             }
             std::printf("device %d: %s\n  %s\n", ordinal, name.c_str(), detail.c_str());
-            if (const std::string why = strata::core::gpu_arch_problem(ordinal); !why.empty())
-                std::printf("  cannot run: %s\n", why.c_str());
         }
         return 0;
     }
@@ -65,22 +54,10 @@ int main(int argc, char** argv) {
     try {
         const strata::core::DeviceInfo d = strata::core::device_info(0);
         std::printf("device %d: %s\n", d.ordinal, d.name.c_str());
-#if defined(STRATA_USE_HIP)
-        std::printf("  HIP arch            %s wave32 (compiled for %s)\n", d.arch.c_str(),
-                    strata::core::compiled_gpu_archs());
-#else
         std::printf("  compute capability  %d.%d   (sm_%d%d)\n", d.cc_major, d.cc_minor, d.cc_major, d.cc_minor);
-#endif
         std::printf("  multiprocessors     %d\n", d.multi_processor_count);
         std::printf("  VRAM total / free   %s / %s\n", human(d.total_bytes).c_str(), human(d.free_bytes).c_str());
         std::printf("  driver / runtime    %d / %d\n", d.driver_version, d.runtime_version);
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
-        // #468 #461: which HIP runtime this process loaded - the one beside the exe, or an AMD driver's System32 copy
-        if (HMODULE h = GetModuleHandleA("amdhip64_7.dll")) {
-            char path[MAX_PATH] = {};
-            if (GetModuleFileNameA(h, path, MAX_PATH) > 0) std::printf("  HIP runtime         %s\n", path);
-        }
-#endif
 
         // The planner's view against the card's.  A plan that does not fit in what is actually FREE is the
         // failure this print exists to make visible at startup rather than at token 4000.

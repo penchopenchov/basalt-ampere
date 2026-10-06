@@ -41,7 +41,6 @@ float h2f(uint16_t b) { __half h; *reinterpret_cast<uint16_t*>(&h) = b; return _
 uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
 
 int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
-#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
     if (fmt == 2) {   // mode 4 (Q4_0 KV) runs on sm_80 and newer only: below that the dispatcher keeps the old kernel
         int dev = 0, major = 0;
         ck(cudaGetDevice(&dev), "device");
@@ -52,7 +51,6 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
             return 0;
         }
     }
-#endif
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
     const int64_t pages = (ctx + PS - 1) / PS, rows = pages * NKV * PS;
@@ -240,33 +238,14 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
 }  // namespace
 
 int main(int argc, char** argv) {
-#if defined(__HIP_PLATFORM_AMD__)
-    // S6: on AMD the kernel under test is the RDNA4 matrix-core one (opt-in in the engine); other cards skip
-    {
-        int dev = 0;
-        hipDeviceProp_t prop{};
-        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess) return 2;
-        if (std::strncmp(prop.gcnArchName, "gfx12", 5) != 0) {
-            std::printf("SKIP: %s is not gfx12 (the matrix-core prompt attention is RDNA4 only)\n", prop.gcnArchName);
-            return 77;
-        }
-#if defined(_WIN32)
-        _putenv_s("STRATA_HIP_WMMA", "1");
-#else
-        setenv("STRATA_HIP_WMMA", "1", 1);
-#endif
-    }
-#endif
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
     int fails = 0;
     fails += run(1, ctx, nq, reps);
-#if !defined(__HIP_PLATFORM_AMD__)
     fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
     fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
     fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
-#endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
     std::printf("FAILURES: %d\n", fails);

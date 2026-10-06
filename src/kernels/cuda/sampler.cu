@@ -168,7 +168,6 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     }
 }
 
-#if !defined(__HIPCC__)
 /// **THE SAME ARGMAX ON A THREAD-BLOCK CLUSTER (sm_90+, S19), FOR THE CALLS WITHOUT PENALTIES.**  One block per
 /// token reads its 1 MB row (248,320 logits) on one SM with one load in flight per thread: latency-bound, 40 us per
 /// call on an RTX 5070, for every verify window and every draft step.  Here a cluster of `kAmCtas` CTAs shares the
@@ -337,7 +336,6 @@ __global__ void __launch_bounds__(kAmThreads) sampler_greedy_top_prob_cluster_ke
     __trap();
 #endif
 }
-#endif  // !__HIPCC__
 
 /// **THE SAMPLED PATH, ONE BLOCK PER TOKEN.**  The kernel below replaced a version that ran the whole chain
 /// in ONE THREAD per token (`<<<ceil(T/64), 64>>>`, so a 4-token window fielded four threads): `top_k` alone
@@ -1007,10 +1005,6 @@ int2* split_scratch(void* stream, size_t entries) {
 }  // namespace
 
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
-#if defined(__HIPCC__)
-    (void) logits; (void) n_tokens; (void) n_vocab; (void) out; (void) stream;
-    return false;
-#else
     if (n_tokens <= 0 || n_vocab <= 0) return true;
     if (n_tokens > 65535) return false;
     // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - sm_90+ (the card's,
@@ -1052,15 +1046,10 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
         std::exit(1);
     }
     return true;
-#endif
 }
 
 bool sample_greedy_top_prob(const float* logits, int n_tokens, int n_vocab, const int32_t* map, int* out, float* probs,
                             void* stream) {
-#if defined(__HIPCC__)
-    (void) logits; (void) n_tokens; (void) n_vocab; (void) map; (void) out; (void) probs; (void) stream;
-    return false;
-#else
     if (n_tokens <= 0 || n_vocab <= 0) return true;
     if (n_tokens > 65535) return false;
     // per device, as in sample_greedy_cluster: 1 runs here, 2 does not
@@ -1101,7 +1090,6 @@ bool sample_greedy_top_prob(const float* logits, int n_tokens, int n_vocab, cons
         std::exit(1);
     }
     return true;
-#endif
 }
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,

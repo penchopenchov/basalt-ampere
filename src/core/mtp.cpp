@@ -51,7 +51,7 @@
 #include <immintrin.h>
 #endif
 
-#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(__HIPCC__) && defined(CUDART_VERSION) && \
+#if defined(CUDART_VERSION) && \
     CUDART_VERSION >= 12040
 #define STRATA_MTP_COND_NODES 1
 #else
@@ -1182,11 +1182,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     // the old loop ran 30 of 30 rounds clean, prompt speed unchanged.
     static const bool per_group_sync = [] {
         if (const char* v = std::getenv("STRATA_MTP_PREFILL_SYNC")) return std::atoi(v) != 0;
-#if defined(STRATA_USE_HIP)
-        return true;
-#else
         return false;
-#endif
     }();
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {

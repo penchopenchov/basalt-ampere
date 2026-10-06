@@ -145,37 +145,11 @@ std::string vram_free_note() {
 // Whether pin_blobs locks anything (AMD on Linux with STRATA_ARENA_MMAP=1): the callers only gather the swaps' spans
 // then - `blob()` is not free (it counts reads, and the file tier may assemble the blob), so the default runs skip it.
 bool pin_blobs_on() {
-#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
-    static const bool on = std::getenv("STRATA_ARENA_MMAP") && std::getenv("STRATA_ARENA_MMAP")[0] == '1';
-    return on;
-#else
     return false;
-#endif
 }
 int pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>& live) {
     int failed = 0;   // ranges left pageable (a copy from them still works, through the driver's staging)
-#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
-    if (!pin_blobs_on() || r.empty()) return 0;
-    for (auto& [a, e] : r) { a &= ~(uintptr_t) 4095; e = (e + 4095) & ~(uintptr_t) 4095; }
-    std::sort(r.begin(), r.end());
-    size_t k = 0;
-    for (size_t i = 1; i < r.size(); ++i) {
-        if (r[i].first <= r[k].second) r[k].second = std::max(r[k].second, r[i].second);
-        else r[++k] = r[i];
-    }
-    r.resize(k + 1);
-    for (const auto& [a, e] : r) {
-        if (cudaHostRegister((void*) a, (size_t) (e - a), cudaHostRegisterReadOnly | cudaHostRegisterPortable) ==
-            cudaSuccess)
-            live.push_back((void*) a);
-        else {
-            (void) cudaGetLastError();
-            ++failed;
-        }
-    }
-#else
     (void) r; (void) live;
-#endif
     return failed;
 }
 void unpin_blobs(std::vector<void*>& v) {
@@ -1174,18 +1148,6 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     std::memset(h, 0, kBytes);   // fault the pages in before timing
     cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);   // warmup: context up, copy engine primed
     float ms[kBursts] = {};
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
-    // Windows HIP: the events do not bracket the copies there (an RX 6800 read 3,300-26,000 GB/s, so every link kept
-    // the x16 share), so each burst is timed on the host between two synchronizes: 256 MiB takes ~10 ms, so the
-    // synchronize around it hardly matters
-    bool ok = cudaDeviceSynchronize() == cudaSuccess;
-    for (int b = 0; b < kBursts && ok; ++b) {
-        const Clock::time_point t0 = Clock::now();
-        cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
-        ok = cudaDeviceSynchronize() == cudaSuccess;
-        ms[b] = (float) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    }
-#else
     // the bursts run back to back on the stream, an event between each two
     cudaEvent_t ev[kBursts + 1];
     int n_ev = 0;
@@ -1201,7 +1163,6 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
         for (int b = 0; b < kBursts && ok; ++b) ok = cudaEventElapsedTime(&ms[b], ev[b], ev[b + 1]) == cudaSuccess;
     }
     for (int i = 0; i < n_ev; ++i) cudaEventDestroy(ev[i]);
-#endif
     double bw = -1.0;
     if (samples != nullptr) samples->clear();
     for (int b = 0; b < kBursts && ok; ++b) {
@@ -1235,15 +1196,6 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
-    // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
-    // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped
-    // experts.bin stayed resident, the release of the VRAM-held ones was undone by the driver at once, and a
-    // 32 GB PC ran with ~0.3 GB free: the kernel swapped, and a turn's checkpoint took 25-80 s.  Above this size
-    // ROCclr stages through its own pinned buffers instead; decode is unchanged (49.06 vs 49.16 ms/window).
-    if (std::getenv("STRATA_ARENA_MMAP") && std::getenv("STRATA_ARENA_MMAP")[0] == '1')
-        setenv("GPU_PINNED_MIN_XFER_SIZE", "1000000", 0);   // MiB; an explicit setting wins
-#endif
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
@@ -1712,22 +1664,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
     }
-#if defined(STRATA_USE_HIP)
-    {
-        // every GPU this run uses must be an architecture the binary has code for (a gfx1100 build on a gfx1201
-        // card would otherwise fail later with "invalid device function")
-        std::vector<int> used{0};
-        if (multi_gpu) used.insert(used.end(), split_devs.begin(), split_devs.end());
-        for (int r = 0; r < 3; ++r)
-            if (o.expert_cache_remote[(size_t) r] > 0) used.push_back(remote_dev[r]);
-        for (const int d : used) {
-            if (const std::string why = strata::core::gpu_arch_problem(d); !why.empty()) {
-                std::fprintf(stderr, "strata generate: %s\n", why.c_str());
-                return 1;
-            }
-        }
-    }
-#endif
     if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
@@ -3152,21 +3088,9 @@ int main(int argc, char** argv) {
         const bool named = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess;
         if (!named) cudaGetLastError();
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
-#if defined(STRATA_USE_HIP)
-        std::fprintf(stderr, "strata generate: GPU %d: %s (%s)\n", dev, name, named ? p.gcnArchName : "?");
-#if defined(_WIN32)
-        // #468 #461: which HIP runtime was loaded - the bundled one beside the exe, or an AMD driver's System32 copy
-        if (HMODULE h = GetModuleHandleA("amdhip64_7.dll")) {
-            char path[MAX_PATH] = {};
-            if (GetModuleFileNameA(h, path, MAX_PATH) > 0)
-                std::fprintf(stderr, "strata generate: HIP runtime %s\n", path);
-        }
-#endif
-#else
         std::fprintf(stderr, "strata generate: GPU %d: %s, compute capability %d.%d%s\n", dev, name,
                      strata::cc_major_of(p.major), strata::cc_minor_of(p.minor),
                      strata::emulated_cc() ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)" : "");
-#if !defined(STRATA_HIP_GFX906)   // a CUDA toolkit mismatch; the gfx906 HIP build has no CUDART_VERSION
         {   // #542: a build whose libcudart is older than its headers (a CUDA 13 kit with a dangling libcudart.so that
             // CMake resolved to the system's CUDA 12 one) reads cudaDeviceProp shifted - silently, and slowly
             int rt = 0;
@@ -3177,8 +3101,6 @@ int main(int argc, char** argv) {
                                      "toolkit>, with its libcudart.so present) (#542)\n",
                              CUDART_VERSION / 1000, CUDART_VERSION % 1000 / 10, rt / 1000, rt % 1000 / 10);
         }
-#endif
-#endif
         const std::string e = strata::core::device_code_error();
         if (!e.empty()) {
             std::fprintf(stderr, "strata generate: this engine has no code for %s (sm_%d%d): %s - rebuild it for this "
@@ -3392,9 +3314,6 @@ int main(int argc, char** argv) {
                         : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
-#if defined(STRATA_USE_HIP)
-        if (why == nullptr) why = "it is NVIDIA-only for now";
-#endif
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: --vram-elastic is off: %s\n", why);
             o.vram_elastic = false;

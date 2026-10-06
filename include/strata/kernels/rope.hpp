@@ -18,7 +18,7 @@
 
 #include "strata/kernels/rope_scaling.hpp"
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if defined(__CUDACC__)
 #define STRATA_ROPE_HD __host__ __device__
 #else
 #define STRATA_ROPE_HD

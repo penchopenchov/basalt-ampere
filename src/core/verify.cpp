@@ -131,10 +131,6 @@ bool env_on(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && e[0] != 0 && e[0] != '0';
 }
-#if defined(STRATA_USE_HIP)
-const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
-const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
-#endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // STRATA_DEC_PK (bit mask), the same values: 1 = in windows of 2+ tokens, the shared expert's side kernels at the
 // greatest stream priority (their blocks are scheduled ahead of the routed experts' queued blocks, so the branch ends
@@ -190,15 +186,6 @@ int dec_commit_blocks() {
 }
 
 bool mapped(size_t bytes, void** h, void** d) {
-#if defined(STRATA_USE_HIP)
-    if (g_coherent) {
-        if (hipHostMalloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent |
-                                        (peer_portable() ? hipHostMallocPortable : 0)) != hipSuccess)
-            return false;
-        std::memset(*h, 0, bytes);
-        return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
-    }
-#endif
     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
@@ -823,15 +810,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             trace_h_ = trace_m_ = nullptr;
             trace_n_ = 0;
         }
-#if defined(STRATA_USE_HIP)
-        std::fprintf(stderr, "strata verify trace (#649): on; coherent words %s, doorbell %s, HIP_HOST_COHERENT=%s "
-                             "HSA_ENABLE_SDMA=%s GPU_MAX_HW_QUEUES=%s\n", g_coherent ? "explicit" : "default",
-                     g_doorbell_store ? "stored" : "incremented", std::getenv("HIP_HOST_COHERENT") ? std::getenv("HIP_HOST_COHERENT") : "-",
-                     std::getenv("HSA_ENABLE_SDMA") ? std::getenv("HSA_ENABLE_SDMA") : "-",
-                     std::getenv("GPU_MAX_HW_QUEUES") ? std::getenv("GPU_MAX_HW_QUEUES") : "-");
-#else
         std::fprintf(stderr, "strata verify trace (#649): on\n");
-#endif
     }
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
     if (prof_on_) decode_gaps().host_on = true;
@@ -1735,15 +1714,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
-#if defined(STRATA_HIP_GFX906)
-        } else if (dec_batch) {
-            // gfx906: the Coder's 256-expert router (the native router is 512 x 10 only) for the whole window in one
-            // multi-column BF16 projection and one top-k, bitwise the per-token calls (route_window_parity); ~3 ms
-            // of a ~55 ms verify window on 2x MI50.  STRATA_ROUTE_PER_TOKEN=1: the per-token calls.
-            if (!moe_route_window(wt, g, l, K, ss.moe, mixed_ + tb * N, logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n,
-                                  cs, err))
-                return false;
-#endif
         } else
         for (int t = tb; t < te; ++t) {
             MoEBuffers mb = ss.moe;
@@ -1796,12 +1766,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                               (uint32_t) ((l - lb_) * G + grp + 1), cs);
-#if defined(STRATA_USE_HIP)
-            if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
-                doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                                       m_ids_ + tb * K, m_w_ + tb * K, m_seq_, (uint32_t) ((l - lb_) * G + grp + 1), cs);
-            else
-#endif
             if (remote_opt_)   // #578: the helper GPUs reduce with the routing weights - publish them
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
@@ -2190,7 +2154,6 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-#if !defined(STRATA_USE_HIP)   // a CUDA debug listing (node types, kernel names)
     if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
         size_t nn = 0;
         cudaGraphGetNodes(graph, nullptr, &nn);
@@ -2220,7 +2183,6 @@ bool Verifier::capture(int T, std::string& err) {
         for (size_t i = 0; i < v.size() && i < 40; ++i) std::fprintf(stderr, " %d x %.60s;", v[i].first, v[i].second.c_str());
         std::fprintf(stderr, "\n");
     }
-#endif
     const cudaError_t ie = cudaGraphInstantiateWithFlags(&exec_[T], graph, dec_pk() ? cudaGraphInstantiateFlagUseNodePriority : 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {

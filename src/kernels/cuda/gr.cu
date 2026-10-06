@@ -356,7 +356,6 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
                      ws.bytes, gr_workspace_bytes(s));
         std::exit(1);
     }
-#if !defined(__HIPCC__)
     {   // matrices with 8-bit copies (STRATA_DEC_HC8): the read on the copies
         FusedGrArgs fa;
         fa.R = R; fa.apply = false; fa.w_norm = w_norm; fa.w_down = w_down; fa.w_up = w_up; fa.w_inject = w_inject;
@@ -369,7 +368,6 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
             return;
         }
     }
-#endif
     const int n_embd = (int) s.n_embd, hc = (int) s.hc, hc_lr = (int) s.hc_lr;
     const int hc_dim = (int) (s.hc * s.n_embd);
     cudaStream_t st = (cudaStream_t) stream;

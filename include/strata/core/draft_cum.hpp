@@ -11,7 +11,7 @@
 
 #include <cstdlib>
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if defined(__CUDACC__)
 #define STRATA_DRAFT_CUM_HD __host__ __device__
 #else
 #define STRATA_DRAFT_CUM_HD

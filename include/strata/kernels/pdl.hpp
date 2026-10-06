@@ -16,15 +16,11 @@
 namespace strata::kernels {
 
 inline bool pdl_requested() {
-#if defined(__HIPCC__) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
-    return false;
-#else
     static const bool on = [] {
         const char* e = std::getenv("STRATA_PDL");
         return e != nullptr && e[0] == '1';
     }();
     return on;
-#endif
 }
 
 /// STRATA_DEC_PDL2=1: the decode chain's kernels start their dependents early (pdl_launch_dependents) and stage their
@@ -79,10 +75,10 @@ private:
 
 }  // namespace strata::kernels
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if defined(__CUDACC__)
 #include <cuda_runtime.h>
 
-#if !defined(__HIPCC__) && defined(CUDART_VERSION) && CUDART_VERSION >= 12030
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
 #define STRATA_PDL_LAUNCH 1
 #include <map>
 #include <mutex>
@@ -92,7 +88,7 @@ private:
 namespace strata::kernels {
 
 __device__ __forceinline__ void pdl_wait() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && !defined(__HIPCC__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
@@ -100,7 +96,7 @@ __device__ __forceinline__ void pdl_wait() {
 /// Lets the next kernel on the stream (launched as a programmatic dependent) start once every block of this grid has
 /// called it or exited.  Scheduling only: the dependent still reads this grid's results after its pdl_wait().
 __device__ __forceinline__ void pdl_launch_dependents() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && !defined(__HIPCC__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
 }
