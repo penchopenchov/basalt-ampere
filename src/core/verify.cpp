@@ -156,7 +156,9 @@ int dec_glue_mask() {
 // STRATA_DEC_QSAF (bit mask): 1 = a QSA layer's indexer key, K/V projections, K/V post and indexer query projection
 // on the side stream beside the query projection; 2 = with 1, the indexer query projection after the query projection
 // on the main stream instead; 4 = the block scores skip a window whose selections are all the identity; 8 = the head's
-// hyper-connection read for every column in one launch
+// hyper-connection read for every column in one launch (not bitwise); 16 = layer 1's PLE in two launches after its
+// projections (native_ple_window); 32 = in place of 1, K, V and the indexer projections on three branches of their own;
+// 64 = the attention's merge also writes the output projection's q8_1 rows
 int dec_qsaf_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_QSAF"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -588,6 +590,8 @@ Verifier::~Verifier() {
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (sh_hi_) cudaStreamSynchronize(sh_hi_);
     if (ring_hi_) cudaStreamSynchronize(ring_hi_);
+    for (cudaStream_t q : qs_)
+        if (q) cudaStreamSynchronize(q);
     dm_free();
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
@@ -602,6 +606,10 @@ Verifier::~Verifier() {
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
     if (ring_hi_) cudaStreamDestroy(ring_hi_);
+    for (cudaStream_t q : qs_)
+        if (q) cudaStreamDestroy(q);
+    for (cudaEvent_t e : qev_)
+        if (e) cudaEventDestroy(e);
     if (ev_ring_) cudaEventDestroy(ev_ring_);
     if (ev_ring_join_) cudaEventDestroy(ev_ring_join_);
     if (shx_sync_) cudaFree(shx_sync_);
@@ -841,6 +849,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
+    }
+    if (dec_qsaf_mask() & 32) {
+        int least = 0, greatest = 0;
+        bool qok = cudaDeviceGetStreamPriorityRange(&least, &greatest) == cudaSuccess;
+        for (auto& q : qs_) qok = qok && cudaStreamCreateWithPriority(&q, cudaStreamNonBlocking, greatest) == cudaSuccess;
+        for (auto& e : qev_) qok = qok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+        if (!qok) { err = "verify: STRATA_DEC_QSAF stream create failed"; return false; }
     }
     // Check whether 100% of experts across [lb_, le_) are resident in this stage's VRAM cache.
     // When true, every layer plans on device and writes directly into parts_ without any CPU doorbells,
@@ -1341,7 +1356,51 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 cudaStream_t qside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
                 const bool qsaf_side = (dec_qsaf_mask() & 1) && fused_pre && qb && qside != nullptr && ev_fork_ != nullptr &&
                                        ev_join_ != nullptr;
-                if (qsaf_side) {
+                const bool qsaf_wide = (dec_qsaf_mask() & 32) && fused_pre && qb && qs_[0] != nullptr;
+                if (qsaf_wide) {   // & 32: K, V and the indexer key/query each on a branch of their own, beside the query
+                    {
+                        PdlScope ps(pdl);   // after the hc read
+                        native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                    }
+                    cudaEventRecord(qev_[0], cs);
+                    for (cudaStream_t q : qs_) cudaStreamWaitEvent(q, qev_[0], 0);
+                    {
+                        PdlScope pz(pdl, true);
+                        dense_proj(32, wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD),
+                                   n, qs_[1]);
+                    }
+                    cudaEventRecord(qev_[1], qs_[1]);
+                    {
+                        PdlScope pz(pdl, true);
+                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID,
+                                                  n, qs_[2]);
+                    }
+                    cudaEventRecord(qev_[2], qs_[2]);
+                    {
+                        PdlScope pz(pdl, true);
+                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                                  IQ * ID, N, IQ * ID, n, qs_[2]);
+                    }
+                    {
+                        PdlScope pz(pdl, true);
+                        dense_proj(32, wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD),
+                                   n, qs_[0]);
+                    }
+                    cudaStreamWaitEvent(qs_[0], qev_[1], 0);
+                    cudaStreamWaitEvent(qs_[0], qev_[2], 0);
+                    qsa_dec_kv_post(kv_post_args(), n, s, rope_scaling(), qs_[0]);
+                    cudaEventRecord(qev_[3], qs_[0]);
+                    cudaEventRecord(qev_[1], qs_[2]);
+                    {
+                        PdlScope pq(pdl);   // after the q8_1 kernel
+                        dense_proj(8, wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                   (int) (NH * 2 * HD), n, cs);
+                    }
+                    cudaStreamWaitEvent(cs, qev_[3], 0);
+                    cudaStreamWaitEvent(cs, qev_[1], 0);
+                    for (int i = 7; i <= 9; ++i) stamp(l, i, grp);
+                    qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
+                } else if (qsaf_side) {
                     const bool iq_main = (dec_qsaf_mask() & 2) != 0;
                     {
                         PdlScope ps(pdl);   // after the hc read
@@ -1476,6 +1535,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 10, grp);
                 bool fused_gate = false;
+                bool attn_q8 = false;   // STRATA_DEC_QSAF & 64: the merge wrote the q8_1 rows
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
@@ -1502,10 +1562,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // STRATA_DEC_QSA=1: staged chunks and the gate in the merge, the same bits
                 fused_gate = dec_qsa && native_qsa_enabled() && !st.kv_rot && !st.kv_hybrid &&
                              qsa_dec_attn_supported(pools, s);
+                attn_q8 = fused_gate && (dec_qsaf_mask() & 64) && !st.kv_rot && !st.kv_hybrid;
                 if (fused_gate)
                     qsa_dec_attn(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_, s,
                                  attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs,
-                                 qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD);
+                                 qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD, attn_q8 ? xq_ : nullptr);
                 else
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
@@ -1525,7 +1586,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 14, grp);
                 PdlScope ps(pdl);   // after the gate kernel
-                native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
+                if (!attn_q8) native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 dense_proj(16, wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
             }
         } catch (const std::exception& e) {
