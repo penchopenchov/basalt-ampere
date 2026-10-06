@@ -533,6 +533,7 @@ bool FileExpertSource::pin_cache_complement(
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
+    headroom_bytes = std::max(headroom_bytes, platform::ram_margin());   // never lock into the machine's last RAM
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -678,10 +679,13 @@ bool FileExpertSource::pin_cache_complement(
             if (it == spare_sizes.end()) spare_sizes.emplace_back(b, 1);
             else ++it->second;
         }
+        uint64_t extra = 0;
         for (auto& [b, n] : spare_sizes) {
             n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
-            bytes += (uint64_t) n * b;
+            extra += (uint64_t) n * b;
         }
+        if (bytes + extra > budget) spare_sizes.clear();   // no room for free places: swaps use exchange buffers
+        else bytes += extra;
     }
 
     void* arena = nullptr;
@@ -910,6 +914,10 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
         xstage_cap_ = 0;
     }
     const size_t total = (size_t) n * (size_t) blob;
+    if (total > platform::ram_budget()) {
+        err = "the exchange buffers need " + std::to_string(total >> 20) + " MiB of RAM, which is not available";
+        return false;
+    }
     void* p = nullptr;
     if (cudaHostAlloc(&p, total, cudaHostAllocDefault) == cudaSuccess && p != nullptr) {
         xstage_pinned_ = true;
@@ -1663,13 +1671,15 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
             err = buf;
             return false;
         }
-        if (hm.available < need) {
+        // the arena is locked resident: it must leave the margin free, or the machine swaps
+        bool known = false;
+        const uint64_t budget = platform::ram_budget(&known);
+        if ((known && need > budget) || hm.available < need) {
             std::snprintf(buf, sizeof buf,
-                          "the expert arena needs %.2f GiB of RAM but %.2f GiB is available (%.2f GiB short): the load "
-                          "may swap or be stopped by the OS. Close other programs (or wait for an engine that is "
-                          "still exiting), or run with less RAM: --mmap-experts with --resident-budget-gib N",
-                          (double) need / gib, (double) hm.available / gib, (double) (need - hm.available) / gib);
-            ram_warning_ = buf;
+                          "the experts need %.1f GiB of RAM, %.1f GiB is available; use --resident-experts or "
+                          "--mmap-experts", (double) need / gib, (double) hm.available / gib);
+            err = buf;
+            return false;
         }
     }
 

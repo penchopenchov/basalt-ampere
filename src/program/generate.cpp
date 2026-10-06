@@ -17,6 +17,7 @@
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/pinned.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -1116,6 +1117,8 @@ int main(int argc, char** argv) {
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
+    // if memory runs out the kernel ends this process first, not the rest of the machine
+    if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) { std::fputs("1000", f); std::fclose(f); }
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With lazy
     // loading, a kernel first used mid-prompt would find no VRAM left for its code and the engine would end ("out of
     // memory: cudaFuncSetAttribute").
@@ -1394,6 +1397,8 @@ int main(int argc, char** argv) {
         usage();
         return 2;
     }
+    // a load that exhausts the RAM ends here instead of swapping the machine to a halt; stopped at READY
+    if (o.serve) basalt::platform::start_memory_watchdog(1ull << 30);
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
     {
@@ -1979,6 +1984,21 @@ int main(int argc, char** argv) {
     // load phase reports.  A layer split places bytes per stage: no total, the progress lines stand alone.
     uint64_t model_bytes = 0, expert_total_bytes = 0, cuda0_fixed_bytes = 0;   // the latter: all but the cache fill
     bool ssd_warned = false;   // the fit check already said the experts will be read from the SSD
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        expert_total_bytes += (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l);
+    // The default expert mode copies every expert into RAM and keeps it there, so a machine that cannot hold them
+    // would swap until it froze.  Refuse before anything is allocated.  (A shared arena may already be in RAM.)
+    if (!o.mmap_experts && o.shared_expert_arena.empty()) {
+        bool known = false;
+        const uint64_t budget = basalt::platform::ram_budget(&known);
+        if (known && expert_total_bytes > budget) {
+            std::fprintf(stderr, "basalt error: the experts need %.1f GiB of RAM, %.1f GiB is available; use "
+                                 "--resident-experts or --mmap-experts\n",
+                         (double) expert_total_bytes / 1073741824.0,
+                         (double) basalt::platform::available_memory() / 1073741824.0);
+            return 1;
+        }
+    }
     if (!multi_gpu) {
         uint64_t dense_bytes = 0, mtp_bytes = 0, head_bytes = 0;
         std::set<std::string> index_names;
@@ -1989,16 +2009,15 @@ int main(int argc, char** argv) {
             (o.mtp.empty() || o.spec < 2 ||
              basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err));
         if (planned) {
-            for (int64_t l = 0; l < g.n_layers; ++l)
-                expert_total_bytes += (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l);
             cuda0_fixed_bytes = pool_bytes + dense_bytes + head_bytes + mtp_bytes +
                                 basalt::core::Verifier::hc8_plan_bytes(
                                     [&](const std::string& n) { return index_names.count(n) > 0; }, g);
             model_bytes = cuda0_fixed_bytes + expert_total_bytes;
-            // the model's bytes against what the primary card and the RAM have free: the rest is read from the SSD
+            // the model's bytes against what the primary card and the RAM have free: with the file-backed modes the
+            // rest is read from the SSD (the default arena mode was checked against the RAM above)
             size_t free_vram = 0, total_vram = 0;
             const auto free_ram = basalt::core::conversation_available_memory();
-            if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_ram) {
+            if (o.mmap_experts && cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_ram) {
                 const uint64_t vram = (uint64_t) free_vram > ((uint64_t) o.vram_reserve_mib << 20)
                                           ? (uint64_t) free_vram - ((uint64_t) o.vram_reserve_mib << 20) : 0;
                 const uint64_t ram = *free_ram > o.resident_headroom ? *free_ram - o.resident_headroom : 0;
@@ -2007,7 +2026,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
                                          "the SSD while generating (slow)\n",
                                  (double) model_bytes / 1073741824.0, (double) (vram + ram) / 1073741824.0);
-            } else {
+            } else if (o.mmap_experts) {
                 (void) cudaGetLastError();
             }
             basalt::core::LoadProgress::announce_total(model_bytes);
@@ -2909,7 +2928,8 @@ int main(int argc, char** argv) {
         const uint64_t pin_limit = 0;   // the whole arena is pinned
         if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
+            std::fprintf(stderr, "%s%s\n", err.rfind("the experts need", 0) == 0 ? "basalt error: " : "basalt generate: ",
+                         err.c_str());
             return 1;
         }
         if (!arena_src.ram_warning().empty())   // said before the load's numbers, which it explains
@@ -4137,7 +4157,7 @@ int main(int argc, char** argv) {
         if (resident_ok) {
             if (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on &&
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
-                std::fprintf(stderr, "basalt generate: CPU expert residency: %s\n", err.c_str());
+                std::fprintf(stderr, "basalt error: CPU expert residency: %s\n", err.c_str());
                 return 1;
             }
             std::fprintf(stderr, "basalt generate: resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
@@ -5289,6 +5309,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        basalt::platform::stop_memory_watchdog();
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
