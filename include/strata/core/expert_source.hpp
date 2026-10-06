@@ -598,12 +598,7 @@ private:
     struct Map {
         const uint8_t* base = nullptr;
         uint64_t bytes = 0;
-#if defined(_WIN32)
-        void* file = nullptr;
-        void* mapping = nullptr;
-#else
         int fd = -1;
-#endif
     };
     std::vector<Map> maps_;
     std::vector<const uint8_t*> role_ptr_;    ///< 3 x n_layers: gate / up / down of the layer's expert 0
@@ -662,12 +657,7 @@ private:
     std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   ///< STRATA_ADAPT_FAST: (offset, bytes) of free places
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
-#if defined(_WIN32)
-    void* file_ = nullptr;
-    void* mapping_ = nullptr;
-#else
     int fd_ = -1;
-#endif
 };
 
 // ================================ THE RESIDENT ARENA (R2.1) ================================

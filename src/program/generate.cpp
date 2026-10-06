@@ -64,20 +64,11 @@
 #include "strata/core/device.hpp"
 #include "strata/core/draft_cum.hpp"
 #include "strata/core/emulate.hpp"
-#ifndef NOMINMAX
-#define NOMINMAX   // gguf_reader.hpp includes windows.h
-#endif
 #include "strata/artifact/gguf_reader.hpp"
-#if defined(_WIN32)
-#include <windows.h>
-#include <psapi.h>
-#include <io.h>
-#else
 #include <unistd.h>
 #include <cerrno>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
-#endif
 
 #include <cuda_runtime.h>
 
@@ -108,18 +99,6 @@
 #include <vector>
 
 namespace {
-// Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
-// pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
-// a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
-bool under_wddm() {
-#ifdef _WIN32
-    return true;
-#else
-    static const bool dxg = std::filesystem::exists("/dev/dxg");
-    return dxg;
-#endif
-}
-
 // #620 #486: " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message (clears the error first)
 std::string vram_free_note() {
     (void) cudaGetLastError();
@@ -836,17 +815,6 @@ struct MemSample {
 };
 MemSample mem_sample() {
     MemSample m;
-#if defined(_WIN32)
-    PROCESS_MEMORY_COUNTERS pmc{};
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) {
-        m.faults = pmc.PageFaultCount;
-        m.rss_mib = pmc.WorkingSetSize >> 20;
-        m.commit_mib = pmc.PagefileUsage >> 20;
-    }
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof ms;
-    if (GlobalMemoryStatusEx(&ms)) m.avail_mib = ms.ullAvailPhys >> 20;
-#else
     if (std::FILE* f = std::fopen("/proc/self/stat", "r")) {
         char buf[4096];
         const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
@@ -870,7 +838,6 @@ MemSample mem_sample() {
     m.rss_mib = kb("/proc/self/status", "VmRSS:") >> 10;
     m.commit_mib = kb("/proc/self/status", "VmSwap:") >> 10;
     m.avail_mib = kb("/proc/meminfo", "MemAvailable:") >> 10;
-#endif
     return m;
 }
 
@@ -882,7 +849,6 @@ std::string stage_text() {
     return s;
 }
 
-#if !defined(_WIN32)
 // #605: whether `path` is on a rotational disk (1), not (0) or unknown (-1), from sysfs; `dev` is the disk's name
 int on_rotational_disk(const std::string& path, std::string& dev) {
     struct stat st{};
@@ -929,7 +895,6 @@ void disk_wait_threads(std::FILE* f) {
                  waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
                                "direct (#605: --ple-io ram), or a drive too slow for the reads asked of it" : "");
 }
-#endif
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
@@ -944,40 +909,14 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         }
         if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
         if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
-#if !defined(_WIN32)
         disk_wait_threads(f);
-#endif
         const MemSample m = mem_sample();
         std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
                      m.commit_mib,
-#if defined(_WIN32)
-                     "committed", m.avail_mib, m.faults, "page faults so far"
-#else
                      "in swap", m.avail_mib, m.faults, "major page faults so far"
-#endif
         );
         std::fflush(f);
     }
-#if defined(_WIN32)
-    // every thread's stack, to read against this build's PDB: a few MB beside the engine's working directory
-    if (HMODULE dbg = LoadLibraryA("dbghelp.dll")) {
-        using Fn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
-        if (auto write = (Fn) GetProcAddress(dbg, "MiniDumpWriteDump")) {
-            char path[64];
-            std::snprintf(path, sizeof path, "strata-stall-%lu.dmp", (unsigned long) GetCurrentProcessId());
-            HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (h != INVALID_HANDLE_VALUE) {
-                const int kThreadInfo = 0x1000;   // MiniDumpWithThreadInfo; MiniDumpNormal = 0
-                const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), h, kThreadInfo, nullptr, nullptr, nullptr);
-                CloseHandle(h);
-                char full[MAX_PATH];
-                if (!GetFullPathNameA(path, MAX_PATH, full, nullptr)) std::snprintf(full, sizeof full, "%s", path);
-                std::fprintf(f, "  %s the thread stacks to %s (attach it to the issue)\n", ok ? "wrote" : "could not write",
-                             full);
-            }
-        }
-    }
-#endif
 }
 
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
@@ -1200,11 +1139,7 @@ int main(int argc, char** argv) {
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
-#if defined(_WIN32)
-        _putenv_s("CUDA_MODULE_LOADING", "EAGER");
-#else
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
-#endif
     }
     Options o;
     bool have_tokens = false;
@@ -1686,12 +1621,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
         return 2;
     }
-#if defined(_WIN32)
-    if (o.ple_io == "ram") {
-        std::fprintf(stderr, "strata generate: --ple-io ram is not available on Windows (no mlock); use --ple-io mmap\n");
-        return 2;
-    }
-#endif
     if (o.kv == "q4") o.kv = "q4_0";
     if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
         std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
@@ -2411,18 +2340,16 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-#if !defined(_WIN32)
         if (pio.mode == strata::kernels::PleIo::Direct) {
             // #605: --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational disk
             // can take longer than the stall watchdog's 60 s for one prompt chunk's rows.  Recommended, not forced.
             std::string dev;
-            if (!under_wddm() && on_rotational_disk(o.ple_gguf, dev) == 1)   // (WSL's virtual disk says rotational)
+            if (on_rotational_disk(o.ple_gguf, dev) == 1)
                 std::fprintf(stderr, "strata generate: WARNING: the n-gram table (%s) is on a rotational disk (%s): "
                                      "--ple-io direct reads it at random and can stall a prompt for minutes (#605). "
                                      "--ple-io ram (it then needs RAM for the table) or the model on an SSD is "
                                      "recommended\n", o.ple_gguf.c_str(), dev.c_str());
         }
-#endif
         if (pio.lock)
             std::fprintf(stderr, "strata generate: PLE table %s (--ple-io ram) in %.1f s\n",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
@@ -3138,20 +3065,12 @@ int main(int argc, char** argv) {
         srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
-        // Under WDDM (Windows, WSL2), a multi-GPU run (a layer split, or remote experts) starts with at most 8 GiB of
-        // mapped host pages: pinning all of it into two contexts leaves WDDM refusing every later allocation -
-        // measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail.  Unregistered layers remain
-        // in the resident arena; their streamed experts go through the pinned staging ring.  A Linux driver has no
-        // such limit, so there the whole arena is pinned (#253).  STRATA_ARENA_PIN_GIB overrides both ways.
-        const int pin_env = strata::core::arena_pin_cap_gib();   // -1 unset, -2 "auto" (#243, Windows sliced pin)
-        const bool pin_wddm_cap = pin_env < 0 && (o.expert_cache_remote[0] > 0 || multi_gpu) && under_wddm();
-        const uint64_t pin_limit = pin_env >= 0 ? (uint64_t) pin_env << 30 : pin_wddm_cap ? (8ull << 30) : 0;
+        // The whole arena is pinned unless STRATA_ARENA_PIN_GIB caps it.
+        const int pin_env = strata::core::arena_pin_cap_gib();   // -1 unset
+        const uint64_t pin_limit = pin_env >= 0 ? (uint64_t) pin_env << 30 : 0;
         if (pin_env >= 0)
             std::fprintf(stderr, "strata generate: STRATA_ARENA_PIN_GIB=%d: %s\n", pin_env,
                          pin_env == 0 ? "the whole expert arena is pinned" : "the expert arena's pinning is capped");
-        else if (pin_wddm_cap)
-            std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
-                                 "(STRATA_ARENA_PIN_GIB changes it)\n");
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3163,21 +3082,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
-        // A rate under ~0.2 GiB/s is not the hardware.  Task Scheduler / service contexts throttle this
-        // read+fill about 24x (measured 0.05 vs 1.42 GiB/s for the same binary, args and cache state; the
-        // scheduler's defaults - Below normal priority and a least-privilege token - were the only
-        // difference between the runs).  Say so instead of letting the user blame the disk; see
-        // docs/DETAILS.md, "Running it at startup (Task Scheduler)".
-#ifdef _WIN32   // a Windows launch context; elsewhere a load this slow is the disk
-        if (arena_src.load_gib_per_second() > 0.0 && arena_src.load_gib_per_second() < 0.2) {
-            std::fprintf(stderr,
-                         "strata generate: hint: ~24x below what this hardware streams from a normal "
-                         "launch. If Strata is started by Task Scheduler or a service, register the task "
-                         "with Priority 4 (Normal) and 'Run with highest privileges' - the scheduler's "
-                         "defaults (Below normal + a least-privilege token) throttle the load. See "
-                         "docs/DETAILS.md ('Running it at startup').\n");
-        }
-#endif
         srcp = &arena_src;
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker, o.pool_affinity);
@@ -3368,13 +3272,6 @@ int main(int argc, char** argv) {
                 // so with a small page file the cache's one big cudaMalloc fails while the VRAM is free.  An auto
                 // cache then tries three quarters of the size, a few times, instead of stopping the engine.
                 char commit[96] = "";
-#if defined(_WIN32)
-                MEMORYSTATUSEX ms{};
-                ms.dwLength = sizeof ms;
-                if (GlobalMemoryStatusEx(&ms))
-                    std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file)",
-                                  (double) ms.ullAvailPageFile / 1073741824.0);
-#endif
                 if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
                     ++failed;
                     std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
@@ -3382,11 +3279,6 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-#if defined(_WIN32)
-                std::fprintf(stderr, "strata generate: on Windows the graphics card's memory also needs room in the page "
-                                     "file: set it to \"System managed\" (System > About > Advanced system settings > "
-                                     "Performance > Advanced > Virtual memory), or lower --expert-cache\n");
-#endif
                 return 1;
             }
             if (!auto_cache || attempt - failed >= 6) break;
@@ -4605,15 +4497,6 @@ int main(int argc, char** argv) {
         // copy is built, decide again from the RAM it really holds and the expert bytes outside it (on a 96 GB PC
         // the file cache keeps those, and every refill after a prompt read the drive instead).  Windows only: the
         // unbuffered reads exist there alone
-#if defined(_WIN32)
-        if (o.mmap_experts && o.resident_budget > 0) {
-            std::string why;
-            const bool was = src.unbuffered();
-            const bool ub = src.recheck_unbuffered(why);
-            std::fprintf(stderr, "strata generate: the file tier reads %s%s (%s)\n",
-                         ub ? "unbuffered" : "through the file cache", ub == was ? "" : " (changed)", why.c_str());
-        }
-#endif
     }
     if (o.serve) {
         if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
@@ -5810,12 +5693,8 @@ int main(int argc, char** argv) {
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
-#if defined(_WIN32)
-                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
-#else
                     const ssize_t n = ::read(0, chunk, sizeof chunk);
                     if (n < 0 && errno == EINTR) continue;
-#endif
                     if (n <= 0) {
                         if (buf.empty()) return false;
                         out.swap(buf);

@@ -1,6 +1,5 @@
 #pragma once
 
-#if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
 
@@ -66,4 +65,3 @@ inline int pin_thread_to_cpu(int core) {
 }
 
 }  // namespace strata::kernels::cpu::detail
-#endif

@@ -31,9 +31,7 @@ class _Nvml:
 
     def __init__(self, index=0):
         self.lib = self.dev = None
-        names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
-                                          "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
-            else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
+        names = ["libnvidia-ml.so.1", "libnvidia-ml.so"]
         for n in names:
             try:
                 self.lib = ctypes.CDLL(n)
@@ -200,14 +198,7 @@ def free_vram_mib(index=0, amd=False):
 
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
-    if os.name == "nt":
-        try:
-            import winreg
-            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
-            return winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
-        except OSError:
-            pass
-    elif os.path.exists("/proc/cpuinfo"):
+    if os.path.exists("/proc/cpuinfo"):
         for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
             if line.startswith("model name"):
                 return line.split(":", 1)[1].strip()
@@ -221,11 +212,6 @@ class _CpuRamFallback:
         self.prev = self._times()
 
     def _times(self):
-        if os.name == "nt":
-            idle, kern, user = (ctypes.c_ulonglong() for _ in range(3))
-            if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
-                return idle.value, kern.value + user.value           # kernel time includes idle
-            return None
         try:
             f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
             return f[3] + f[4], sum(f)
@@ -241,18 +227,6 @@ class _CpuRamFallback:
 
     @staticmethod
     def ram():
-        if os.name == "nt":
-            class MS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-            m = MS()
-            m.dwLength = ctypes.sizeof(MS)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
-                return m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys
-            return None, None
         try:
             info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
             total = int(info["MemTotal"].split()[0]) * 1024

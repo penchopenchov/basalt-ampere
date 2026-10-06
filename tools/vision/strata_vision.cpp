@@ -18,10 +18,8 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
-#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
-#endif
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -83,18 +81,13 @@ int main(int argc, char** argv) {
     // On the CPU the GPU stays unseen: a CUDA build otherwise opens a context there (measured: 0.4-0.7 GB of VRAM,
     // 150-260 expert slots less for the engine beside it).  Before anything reaches the CUDA runtime.
     if (!gpu) {
-#ifdef _WIN32
-        _putenv_s("CUDA_VISIBLE_DEVICES", "-1");
-#else
         setenv("CUDA_VISIBLE_DEVICES", "-1", 1);
-#endif
     }
     llama_log_set(quiet_log, nullptr);
     mtmd_helper_log_set(quiet_log, nullptr);
     llama_backend_init();
 
     const auto load_t0 = std::chrono::steady_clock::now();
-#if !defined(_WIN32)
     // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
     // STRATA_READ_AHEAD=0 turns it off, as in the engine
     if (const char* ra = std::getenv("STRATA_READ_AHEAD"); ra == nullptr || std::atoi(ra) != 0) {
@@ -106,7 +99,6 @@ int main(int argc, char** argv) {
             close(fd);
         }
     }
-#endif
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     llama_model* text = llama_model_load_from_file(model.c_str(), mp);

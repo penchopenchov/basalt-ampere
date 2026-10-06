@@ -15,15 +15,8 @@
 
 // Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB), and the 64-bit
 // spelling is not the same on the two platforms the engine builds for.
-#ifdef _WIN32
-#define STRATA_FSEEK64(f, o) _fseeki64((f), (long long) (o), SEEK_SET)
-#else
 #define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
-#endif
 
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -31,7 +24,6 @@
 #include <linux/mman.h>
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
-#endif
 #endif
 
 namespace strata::core {
@@ -59,58 +51,6 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
               uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
-#ifdef _WIN32
-    if (!shared_file.empty()) {
-        note = "shared-file arena backing is not implemented on Windows";
-        return nullptr;
-    }
-    // MEM_LARGE_PAGES needs SeLockMemoryPrivilege.  Having it assigned to the account is not enough: the
-    // PROCESS must enable it in its own token (AdjustTokenPrivileges) before VirtualAlloc, or the call fails.
-    // An account without the assignment, or a failure to enable, leaves the process as it was: VirtualAlloc
-    // then refuses and the 4 KB fallback below runs - that is the EXPECTED outcome on a desktop.
-    {
-        HANDLE tok = nullptr;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
-            TOKEN_PRIVILEGES tp{};
-            tp.PrivilegeCount = 1;
-            if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
-                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                if (!AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() != ERROR_NOT_ALL_ASSIGNED)
-                    (void) 0;   // nothing actionable: the large-page attempt below reports the outcome
-            }
-            CloseHandle(tok);
-        }
-    }
-    // MEM_LARGE_PAGES needs SeLockMemoryPrivilege; a normal account does not have it and VirtualAlloc then
-    // fails with ERROR_PRIVILEGE_NOT_HELD.  That is the EXPECTED outcome on a desktop, not an error.
-    SIZE_T large = GetLargePageMinimum();
-    // A/B switch: STRATA_NO_LARGEPAGES=1 skips the large-page attempt, same run, same boot.
-    if (large > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr) {
-        // MEM_LARGE_PAGES requires the allocation size to be an exact multiple of the large page size -
-        // anything else is ERROR_INVALID_PARAMETER (87), which reads like a privilege problem but is not.
-        // Round up: the slack is under 2 MB and the tail stays unused.
-        const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
-        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
-                               PAGE_READWRITE);
-        if (p) {
-            got = PageBacking::LargePages;
-            note = "large pages (" + std::to_string((unsigned long long) large) + " B)";
-            return p;
-        }
-        // 1450 (ERROR_NO_SYSTEM_RESOURCES) is the large-page pool saying no, 87 is a size that is not a
-        // multiple of the minimum, 1314 is the privilege: without the byte count the three read as one bug.
-        note = "large pages refused for " + std::to_string((unsigned long long) lbytes) + " B (GetLargePageMinimum=" +
-               std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
-               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
-    } else if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
-        note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
-    } else {
-        note = "this system has no large-page minimum; using 4 KB pages";
-    }
-    void* p = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    got = PageBacking::NormalPages;
-    return p;
-#else
     if (!shared_file.empty()) {
         if (shared_pack_hash == 0) {
             note = "shared arena requires a nonzero pack hash";
@@ -245,17 +185,11 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         note += "; transparent huge pages requested (MADV_HUGEPAGE)";
     }
     return p;
-#endif
 }
 
 void release(void* p, uint64_t bytes) {
     if (!p) return;
-#ifdef _WIN32
-    (void) bytes;
-    VirtualFree(p, 0, MEM_RELEASE);
-#else
     munmap(p, bytes);
-#endif
 }
 
 }  // namespace
@@ -282,36 +216,6 @@ int arena_pin_cap_gib() {
 }
 
 namespace {
-#ifdef _WIN32
-// #243: how much of the arena the sliced registration may pin on Windows when the whole arena was refused.
-// Page-locked memory the GPU maps is charged to its shared (non-local) WDDM segment; pinned slice by slice until
-// the driver refused one (28 GiB of a 63 GB PC), that segment was left full and every later cudaMalloc failed
-// "out of memory".  4 GiB of the budget stay free for what the engine allocates after the arena; without the DXGI
-// numbers, RAM/2 - 8 GiB (the budget is about half the RAM).  False: no limit could be worked out.
-bool sliced_pin_limit(uint64_t& limit, std::string& why) {
-    constexpr uint64_t GiB = 1ull << 30;
-    char buf[256];
-    int dev = 0;
-    cudaDeviceProp p{};
-    uint64_t budget = 0, usage = 0;
-    std::string err = "no CUDA device properties";
-    if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-        strata::platform::gpu_shared_memory_budget(p.luid, budget, usage, err)) {
-        limit = budget > usage + 4 * GiB ? budget - usage - 4 * GiB : 0;
-        std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget %.1f GiB - %.1f GiB in use - 4 GiB",
-                      (double) budget / GiB, (double) usage / GiB);
-        why = buf;
-        return true;
-    }
-    (void) cudaGetLastError();
-    const uint64_t ram = strata::platform::total_physical_memory();
-    if (ram == 0) return false;
-    limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
-    std::snprintf(buf, sizeof buf, "%s: RAM/2 - 8 GiB of %.1f GiB", err.c_str(), (double) ram / GiB);
-    why = buf;
-    return true;
-}
-#endif
 }  // namespace
 
 namespace {
@@ -362,12 +266,6 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             bool limited = capped;
             uint64_t limit = cap;
             std::string limit_why;
-#ifdef _WIN32
-            // #243 (opt-in, STRATA_ARENA_PIN_GIB=auto): not up to the driver's refusal but below the shared-memory
-            // budget, for a PC where the full sliced pin leaves WDDM refusing later allocations.  Not the default: a
-            // 64 GB PC pins 30 GiB past that budget without trouble, and capping it at 26 cost ~20% prompt speed.
-            if (!capped && env_gib == -2) limited = sliced_pin_limit(limit, limit_why);
-#endif
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
@@ -452,71 +350,7 @@ LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk) {
     LoadStats st;
     st.ok = false;
-#ifdef _WIN32
-    constexpr uint64_t kAlign = 4096;
-    if (((uintptr_t) dst % kAlign) != 0 || chunk == 0 || chunk % kAlign != 0) return st;
-    struct Piece { uint64_t off, n; };
-    std::vector<Piece> pieces;
-    uint64_t bytes = 0;
-    for (size_t L = 0; L < layer_off.size(); ++L) {
-        if (layer_off[L] % kAlign != 0 || layer_bytes[L] % kAlign != 0) return st;
-        for (uint64_t p = 0; p < layer_bytes[L]; p += chunk)
-            pieces.push_back({layer_off[L] + p, std::min<uint64_t>(chunk, layer_bytes[L] - p)});
-        bytes += layer_bytes[L];
-    }
-    if (threads < 1) threads = 1;
-    const auto t0 = std::chrono::steady_clock::now();
-    std::atomic<size_t> next{0};
-    std::mutex err_mu;
-    std::string err;
-    const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    std::vector<wchar_t> wpath((size_t) (std::max)(wide, 1), L'\0');
-    if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
-    auto worker = [&]() {
-        HANDLE h = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {
-            std::lock_guard<std::mutex> g(err_mu);
-            if (err.empty())
-                err = "cannot open " + path + " unbuffered (error " + std::to_string((unsigned long long) GetLastError()) + ")";
-            next = pieces.size();
-            return;
-        }
-        for (;;) {
-            const size_t i = next.fetch_add(1);
-            if (i >= pieces.size()) break;
-            OVERLAPPED ov{};
-            ov.Offset = (DWORD) pieces[i].off;
-            ov.OffsetHigh = (DWORD) (pieces[i].off >> 32);
-            DWORD got = 0;
-            if (!ReadFile(h, dst + pieces[i].off, (DWORD) pieces[i].n, &got, &ov) || got != pieces[i].n) {
-                std::lock_guard<std::mutex> g(err_mu);
-                if (err.empty())
-                    err = "short unbuffered read at offset " + std::to_string(pieces[i].off) + ": got " + std::to_string(got) +
-                          " of " + std::to_string(pieces[i].n) + " B (error " +
-                          std::to_string((unsigned long long) GetLastError()) + ")";
-                next = pieces.size();
-                break;
-            }
-        }
-        CloseHandle(h);
-    };
-    std::vector<std::thread> pool;
-    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
-    worker();
-    for (auto& t : pool) t.join();
-    st.layers = layer_off.size();
-    if (!err.empty()) {
-        st.seconds = -1.0;
-        st.error = err;
-        return st;
-    }
-    st.ok = true;
-    st.bytes = bytes;
-    st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-#else
     (void) path; (void) dst; (void) layer_off; (void) layer_bytes; (void) threads; (void) chunk;
-#endif
     return st;
 }
 
@@ -527,66 +361,9 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
         why = std::string("STRATA_UNBUFFERED_LOAD=") + env;
         return env[0] != '0';
     }
-#ifdef _WIN32
-    LARGE_INTEGER freq{}, a{}, b{};
-    QueryPerformanceFrequency(&freq);
-    constexpr DWORD kRead = 64 << 10;
-    constexpr int kSamples = 16;
-    std::vector<uint8_t> buf(kRead);
-    uint64_t total_bytes = 0;
-    int fast = 0, n = 0;
-    uint64_t seed = (uint64_t) GetTickCount64() * 6364136223846793005ull + 1442695040888963407ull;
-    for (const std::string& f : files) {
-        const int wide = MultiByteToWideChar(CP_UTF8, 0, f.c_str(), -1, nullptr, 0);
-        std::vector<wchar_t> w((size_t) (std::max)(wide, 1), L'\0');
-        if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, f.c_str(), -1, w.data(), wide);
-        HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS,
-                               nullptr);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        LARGE_INTEGER size{};
-        GetFileSizeEx(h, &size);
-        total_bytes += (uint64_t) size.QuadPart;
-        // random offsets: a probe must not find the blocks an earlier probe put into the cache
-        for (int i = 0; i < kSamples && (uint64_t) size.QuadPart > 2ull * kRead; ++i) {
-            seed = seed * 6364136223846793005ull + 1442695040888963407ull;
-            const uint64_t off = ((seed >> 17) % ((uint64_t) size.QuadPart - kRead)) / kRead * kRead;
-            OVERLAPPED ov{};
-            ov.Offset = (DWORD) off;
-            ov.OffsetHigh = (DWORD) (off >> 32);
-            DWORD got = 0;
-            QueryPerformanceCounter(&a);
-            const BOOL ok = ReadFile(h, buf.data(), kRead, &got, &ov);
-            QueryPerformanceCounter(&b);
-            if (!ok) continue;
-            ++n;
-            fast += (double) (b.QuadPart - a.QuadPart) * 1e6 / (double) freq.QuadPart < 30.0;
-        }
-        CloseHandle(h);
-    }
-    const bool cached = n > 0 && fast * 4 >= n * 3;
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof ms;
-    GlobalMemoryStatusEx(&ms);
-    const uint64_t avail = ms.ullAvailPhys;
-    // what the cache could keep beside the arena (~4 GiB for everything else)
-    const uint64_t need = read_bytes == kAllFileBytes ? total_bytes : read_bytes;
-    const bool keepable = strata::platform::file_cache_keeps(avail, arena_bytes, need);
-    char msg[256];
-    if (read_bytes == kAllFileBytes)
-        std::snprintf(msg, sizeof msg, "%d of %d probe reads from the file cache; %.1f GiB available, %.1f GiB of files",
-                      fast, n, (double) avail / (1ull << 30), (double) total_bytes / (1ull << 30));
-    else
-        std::snprintf(msg, sizeof msg, "%.1f GiB available, %.1f GiB of it still to be taken by the RAM copy, %.1f GiB "
-                      "of experts read from the files: the file cache %s keep them",
-                      (double) avail / (1ull << 30), (double) arena_bytes / (1ull << 30), (double) need / (1ull << 30),
-                      keepable ? "can" : "cannot");
-    why = msg;
-    return (!cached || !cache_counts) && !keepable;
-#else
     (void) files; (void) arena_bytes; (void) cache_counts; (void) read_bytes;
     why = "buffered (not Windows)";
     return false;
-#endif
 }
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,

@@ -6,12 +6,6 @@
 #include <sstream>
 #include <string>
 
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace strata::core {
 
@@ -34,18 +28,9 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
 }
 
 std::optional<uint64_t> conversation_available_memory() {
-#if defined(_WIN32)
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof status;
-    if (GlobalMemoryStatusEx(&status)) return status.ullAvailPhys;
-    return {};
-#elif defined(__linux__)
     std::ifstream meminfo("/proc/meminfo");
     if (!meminfo) return {};
     return conversation_mem_available(meminfo);
-#else
-    return {};
-#endif
 }
 
 } // namespace strata::core

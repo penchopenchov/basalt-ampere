@@ -5,13 +5,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <psapi.h>
-#pragma comment(lib, "psapi.lib")
-#endif
 
 namespace {
 uint64_t gib(double g) { return (uint64_t) (g * 1073741824.0); }
@@ -59,12 +52,6 @@ int main() {
     std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
                 r.note.c_str());
     int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
-#if defined(_WIN32)
-    PROCESS_MEMORY_COUNTERS pmc{};
-    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
-    std::printf("working set %llu MiB\n", (unsigned long long) (pmc.WorkingSetSize >> 20));
-    fail |= pmc.WorkingSetSize < bytes;
-#endif
     strata::platform::unlock_resident(p, bytes);
     std::free(p);
     std::printf("platform_memory_test: %s\n", fail ? "FAILED" : "OK");

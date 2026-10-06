@@ -32,26 +32,14 @@
 #include <utility>
 #include <vector>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX   // std::numeric_limits<T>::max() below
-#endif
-#include <windows.h>
-#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 // a 64-bit seek (as in pinned.cu): the 32-bit `fseek` wraps past 4 GiB, and the spelling differs per platform
 #ifndef STRATA_FSEEK64
-#ifdef _WIN32
-#define STRATA_FSEEK64(f, o) _fseeki64((f), (long long) (o), SEEK_SET)
-#else
 #define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
-#endif
 #endif
 
 namespace strata::core {
@@ -181,7 +169,6 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 
 namespace {
 
-#if defined(__linux__)
 bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current,
                              detail::CgroupMemoryStat& stat) {
     std::ifstream input(path / "memory.stat");
@@ -216,7 +203,6 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
     stat.valid = true;
     return true;
 }
-#endif
 
 }  // namespace
 
@@ -225,14 +211,6 @@ namespace detail {
 bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
                            const std::string& cgroup_root) {
     m = HostMemory{};
-#if defined(_WIN32)
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    if (!GlobalMemoryStatusEx(&status)) return false;
-    m.available = (uint64_t) status.ullAvailPhys;
-    return m.available > 0;
-#elif defined(__linux__)
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
     std::ifstream info(meminfo);
     std::string line;
@@ -309,15 +287,6 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     }
     m.available = bytes;
     return true;
-#else
-    (void) meminfo; (void) self_cgroup; (void) cgroup_root;
-    const long pages = sysconf(_SC_AVPHYS_PAGES);
-    const long page_bytes = sysconf(_SC_PAGESIZE);
-    if (pages <= 0 || page_bytes <= 0 ||
-        (uint64_t) pages > std::numeric_limits<uint64_t>::max() / (uint64_t) page_bytes) return false;
-    m.available = (uint64_t) pages * (uint64_t) page_bytes;
-    return m.available > 0;
-#endif
 }
 
 }  // namespace detail
@@ -420,63 +389,6 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         return true;
     }
 
-#if defined(_WIN32)
-    // UTF-8 -> UTF-16: the pack may live under a path with non-ASCII characters, and `CreateFileA` would
-    // silently mangle it into a file-not-found.
-    const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1));
-    if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
-    // **`FILE_FLAG_RANDOM_ACCESS` WAS HERE AND IT COST 14x.**
-    //
-    // The design depends on the OS page cache holding the whole 34 GB expert set, because this machine has
-    // 64 GB of DDR5 and `L9` measured the CPU path at 44.14 GB/s from DRAM.  `FILE_FLAG_RANDOM_ACCESS` tells
-    // the cache manager the opposite: it disables read-ahead AND it lets the manager drop the pages again
-    // quickly, on the assumption that a large randomly-accessed file will not be re-read.  Measured, on
-    // `strata generate --max-new 24`: **1.93 GB/s** - disk speed, 344 ms/token, and it never warmed up over 25
-    // tokens, because the pages were being evicted as fast as they were faulted in.
-    //
-    // The correct flag is NO flag.  The access pattern IS random (10 of 512 experts per layer, a different 10
-    // each layer), but every byte read is read again on the next token, so retention is the whole game.
-    HANDLE f = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) {
-        err = "FileExpertSource: cannot open " + path;
-        return false;
-    }
-    LARGE_INTEGER sz{};
-    if (!GetFileSizeEx(f, &sz)) {
-        CloseHandle(f);
-        err = "FileExpertSource: cannot size " + path;
-        return false;
-    }
-    if ((uint64_t) sz.QuadPart != want) {
-        char buf[400];
-        std::snprintf(buf, sizeof buf,
-                      "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
-                      "the pack this geometry came from",
-                      path.c_str(), (unsigned long long) sz.QuadPart, (unsigned long long) want);
-        CloseHandle(f);
-        err = buf;
-        return false;
-    }
-    HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (m == nullptr) {
-        CloseHandle(f);
-        err = "FileExpertSource: CreateFileMapping failed on " + path;
-        return false;
-    }
-    void* view = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
-    if (view == nullptr) {
-        CloseHandle(m);
-        CloseHandle(f);
-        err = "FileExpertSource: MapViewOfFile failed on " + path;
-        return false;
-    }
-    file_ = f;
-    mapping_ = m;
-    base_ = (const uint8_t*) view;
-    paths_.assign(1, path);
-#else
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     struct stat st{};
@@ -496,7 +408,6 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
     fd_ = fd;
     base_ = (const uint8_t*) view;
-#endif
     blobs_ = (int64_t) blob_count;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
@@ -543,14 +454,8 @@ void FileExpertSource::close() {
     complement_lent_slots_ = 0;
     if (!maps_.empty()) {
         for (Map& m : maps_) {
-#if defined(_WIN32)
-            if (m.base != nullptr) UnmapViewOfFile((LPCVOID) m.base);
-            if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
-            if (m.file != nullptr) CloseHandle((HANDLE) m.file);
-#else
             if (m.base != nullptr) munmap((void*) m.base, (size_t) m.bytes);
             if (m.fd >= 0) ::close(m.fd);
-#endif
         }
         maps_.clear();
         base_ = nullptr;   // one of the views above
@@ -559,9 +464,6 @@ void FileExpertSource::close() {
     role_bytes_.clear();
     role_file_.clear();
     paths_.clear();
-#if defined(_WIN32)
-    for (void* h : direct_) CloseHandle((HANDLE) h);
-#endif
     direct_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -584,17 +486,9 @@ void FileExpertSource::close() {
     file_read_bytes_.store(0);
     file_blob_bytes_.store(0);
     file_us_.store(0);
-#if defined(_WIN32)
-    if (base_ != nullptr) UnmapViewOfFile((LPCVOID) base_);
-    if (mapping_ != nullptr) CloseHandle((HANDLE) mapping_);
-    if (file_ != nullptr) CloseHandle((HANDLE) file_);
-    mapping_ = nullptr;
-    file_ = nullptr;
-#else
     if (base_ != nullptr) munmap((void*) base_, (size_t) mapped_bytes_);
     if (fd_ >= 0) ::close(fd_);
     fd_ = -1;
-#endif
     base_ = nullptr;
     blobs_ = 0;
     n_layers_ = 0;
@@ -639,31 +533,6 @@ bool FileExpertSource::open_gguf(std::string& err) {
             auto it = index.find(path);
             if (it == index.end()) {
                 Map m;
-#if defined(_WIN32)
-                const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-                std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1));
-                if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wide);
-                HANDLE f = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                       FILE_ATTRIBUTE_NORMAL, nullptr);
-                LARGE_INTEGER sz{};
-                if (f == INVALID_HANDLE_VALUE || !GetFileSizeEx(f, &sz)) {
-                    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
-                    err = "FileExpertSource: cannot open " + path;
-                    return false;
-                }
-                HANDLE mh = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
-                void* view = mh != nullptr ? MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0) : nullptr;
-                if (view == nullptr) {
-                    if (mh != nullptr) CloseHandle(mh);
-                    CloseHandle(f);
-                    err = "FileExpertSource: cannot map " + path;
-                    return false;
-                }
-                m.file = f;
-                m.mapping = mh;
-                m.bytes = (uint64_t) sz.QuadPart;
-                m.base = (const uint8_t*) view;
-#else
                 const int fd = ::open(path.c_str(), O_RDONLY);
                 struct stat st{};
                 if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0) {
@@ -676,7 +545,6 @@ bool FileExpertSource::open_gguf(std::string& err) {
                 m.fd = fd;
                 m.bytes = (uint64_t) st.st_size;
                 m.base = (const uint8_t*) view;
-#endif
                 maps_.push_back(m);
                 paths_.push_back(path);
                 it = index.emplace(path, maps_.size() - 1).first;
@@ -901,30 +769,6 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
         for (auto& t : th) t.join();
         return;
     }
-#if defined(_WIN32)
-    // One PrefetchVirtualMemory call for every slice about to be copied: the memory manager reads them in large
-    // requests, all queued at once, where the copies' page faults would read a few clusters each.  The copies below
-    // then find the pages resident (or in flight).  STRATA_FETCH_PVM=0 is the A/B arm.
-    {
-        using Pvm = BOOL(WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-        static const Pvm pvm = [] {
-            const char* v = std::getenv("STRATA_FETCH_PVM");
-            if (v != nullptr && std::atoi(v) == 0) return (Pvm) nullptr;
-            return (Pvm) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
-        }();
-        if (pvm != nullptr) {
-            std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
-            ranges.reserve(todo.size() * 3);
-            for (const Fill& f : todo)
-                for (int r = 0; r < 3; ++r) {
-                    const size_t i = (size_t) (3 * f.layer + r);
-                    ranges.push_back({(PVOID) (role_ptr_[i] + (size_t) ((uint64_t) f.e * role_bytes_[i])),
-                                      (SIZE_T) role_bytes_[i]});
-                }
-            (void) pvm(GetCurrentProcess(), (ULONG_PTR) ranges.size(), ranges.data(), 0);
-        }
-    }
-#endif
     // the page faults of a mapped read are one outstanding request each: several threads keep the SSD's queue full
     std::atomic<size_t> next{0};
     auto work = [&] {
@@ -945,203 +789,24 @@ uint64_t FileExpertSource::expert_bytes() const {
 }
 
 bool FileExpertSource::open_direct(std::string& why) {
-#if defined(_WIN32)
-    for (const std::string& path : paths_) {
-        const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-        std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
-        if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide);
-        HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {
-            why += "; cannot open " + path + " unbuffered (error " + std::to_string((unsigned long long) GetLastError()) +
-                   "), read through the file cache";
-            for (void* d : direct_) CloseHandle((HANDLE) d);
-            direct_.clear();
-            return false;
-        }
-        direct_.push_back(h);
-    }
-    if (role_ptr_.empty()) {   // experts.bin: blob() now assembles into the stage buffers, sized for the largest blob
-        std::lock_guard<std::mutex> lk(stage_mu_);
-        for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
-    }
-    return true;
-#else
     (void) why;
     return false;
-#endif
 }
 
 bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
-#if defined(_WIN32)
-    if (base_ == nullptr || paths_.empty() || !direct_.empty()) {
-        why = !direct_.empty() ? "already unbuffered" : "no expert files open";
-        return !direct_.empty();
-    }
-    // #577: the file tier reads the experts outside the RAM copy, not every byte of the shards (dense weights, the
-    // PLE table), and the copy holds at most every expert - the budget asked for can be more than that
-    const uint64_t experts = expert_bytes();
-    const uint64_t arena = std::min(ram_bytes, experts);
-    if (!experts_unbuffered(paths_, arena, why, /*cache_counts=*/false, experts - arena)) return false;
-    return open_direct(why);
-#else
     (void) ram_bytes;
     why = "through the file cache (not Windows)";
     return false;
-#endif
 }
 
 bool FileExpertSource::recheck_unbuffered(std::string& why) {
-#if defined(_WIN32)
-    if (const char* env = std::getenv("STRATA_UNBUFFERED_LOAD"); env != nullptr && env[0] != '\0') {
-        why = std::string("STRATA_UNBUFFERED_LOAD=") + env;
-        return !direct_.empty();
-    }
-    if (base_ == nullptr || paths_.empty()) {
-        why = "no expert files open";
-        return false;
-    }
-    // #577: the RAM copy is built (and already out of the available RAM), so what the file cache would have to keep
-    // is exactly the experts outside it - the GPU cache's (refilled after a prompt borrowed their slots) and the
-    // ones neither holds
-    const uint64_t experts = expert_bytes();
-    const uint64_t read = experts > complement_bytes_ ? experts - complement_bytes_ : 0;
-    std::string w;
-    const bool ub = experts_unbuffered(paths_, 0, w, /*cache_counts=*/false, read);
-    char head[96];
-    std::snprintf(head, sizeof head, "re-checked with the RAM copy built (%.2f GiB): ",
-                  (double) complement_bytes_ / 1073741824.0);
-    why = head + w;
-    if (ub == !direct_.empty()) return ub;
-    if (ub) return open_direct(why);
-    // through the file cache after all: the mapped reads take over (staged() stays true for the GGUF in place)
-    for (void* d : direct_) CloseHandle((HANDLE) d);
-    direct_.clear();
-    return false;
-#else
     why = "through the file cache (not Windows)";
     return false;
-#endif
 }
 
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
-#if defined(_WIN32)
-    // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
-    // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
-    // queue depth 48 make 10.4 GB/s on a file nobody maps and 3.4 GB/s on a mapped one, 8 MiB reads 8.6 GB/s.  So
-    // windows less than kGap apart (the same role of nearby experts) are merged into requests of up to kMerge bytes.
-    constexpr uint64_t kSector = 4096, kGap = 1ull << 20, kMerge = 32ull << 20;
-    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
-    struct Req { HANDLE h; uint64_t a0, size, pos; };
-    // this thread's aligned buffer and events, kept for its next batch
-    struct Scratch {
-        uint8_t* buf = nullptr;
-        size_t cap = 0;
-        std::vector<HANDLE> ev;
-        std::vector<OVERLAPPED> ov;
-        std::vector<Window> win;
-        std::vector<size_t> order;
-        std::vector<Req> req;
-        std::vector<DWORD> got;
-        ~Scratch() {
-            if (buf != nullptr) VirtualFree(buf, 0, MEM_RELEASE);
-            for (HANDLE e : ev) CloseHandle(e);
-        }
-    };
-    thread_local Scratch sc;
-    sc.win.clear();
-    for (size_t k = 0; k < n; ++k) {
-        const Fill& f = fills[k];
-        if (f.dst == nullptr || f.layer < 0 || f.e < 0 || f.layer >= n_layers_ || f.e >= n_expert_) return false;
-        if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
-            const uint64_t per = layer_blob_bytes_[(size_t) f.layer];
-            const uint64_t off = layer_offsets_[(size_t) f.layer] + (uint64_t) f.e * per;
-            const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
-            sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
-            continue;
-        }
-        uint64_t at = 0;
-        for (int r = 0; r < 3; ++r) {
-            const size_t i = (size_t) (3 * f.layer + r);
-            const uint64_t per = role_bytes_[i];
-            const Map& m = maps_[(size_t) role_file_[i]];
-            const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
-            const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
-            sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
-            at += per;
-        }
-    }
-    sc.order.resize(sc.win.size());
-    for (size_t w = 0; w < sc.win.size(); ++w) sc.order[w] = w;
-    std::sort(sc.order.begin(), sc.order.end(), [&](size_t a, size_t b) {
-        return sc.win[a].file != sc.win[b].file ? sc.win[a].file < sc.win[b].file : sc.win[a].a0 < sc.win[b].a0;
-    });
-    sc.req.clear();
-    uint64_t total = 0;
-    int last_file = -1;
-    for (size_t w : sc.order) {
-        Window& x = sc.win[w];
-        if (!sc.req.empty() && x.file == last_file) {
-            Req& q = sc.req.back();
-            const uint64_t end = q.a0 + q.size, xend = x.a0 + x.size;
-            if (x.a0 <= end + kGap && std::max(end, xend) - q.a0 <= kMerge) {
-                if (xend > end) {
-                    total += xend - end;
-                    q.size = xend - q.a0;
-                }
-                x.req = sc.req.size() - 1;
-                x.in_req = x.a0 - q.a0;
-                continue;
-            }
-        }
-        sc.req.push_back({(HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
-        total += x.size;
-        last_file = x.file;
-        x.req = sc.req.size() - 1;
-        x.in_req = 0;
-    }
-    if (total > sc.cap) {
-        if (sc.buf != nullptr) VirtualFree(sc.buf, 0, MEM_RELEASE);
-        sc.cap = (size_t) ((total + (1u << 20) - 1) >> 20 << 20);
-        sc.buf = (uint8_t*) VirtualAlloc(nullptr, sc.cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (sc.buf == nullptr) { sc.cap = 0; return false; }
-    }
-    while (sc.ev.size() < sc.req.size()) {
-        HANDLE e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (e == nullptr) return false;
-        sc.ev.push_back(e);
-    }
-    sc.ov.assign(sc.req.size(), OVERLAPPED{});
-    // every request in flight before the first wait: the drive sees the whole batch as one queue
-    size_t issued = 0;
-    bool ok = true;
-    for (size_t q = 0; q < sc.req.size(); ++q) {
-        const Req& r = sc.req[q];
-        OVERLAPPED& o = sc.ov[q];
-        o.Offset = (DWORD) r.a0;
-        o.OffsetHigh = (DWORD) (r.a0 >> 32);
-        o.hEvent = sc.ev[q];
-        if (!ReadFile(r.h, sc.buf + r.pos, (DWORD) r.size, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) {
-            ok = false;
-            break;
-        }
-        ++issued;
-    }
-    std::vector<DWORD>& got = sc.got;
-    got.assign(sc.req.size(), 0);
-    for (size_t q = 0; q < issued; ++q)
-        if (!GetOverlappedResult(sc.req[q].h, &sc.ov[q], &got[q], TRUE)) ok = false;
-    if (!ok || issued < sc.req.size()) return false;
-    for (const Window& x : sc.win) {
-        // a request may run past the end of the file: only the role's own bytes have to arrive
-        if ((uint64_t) got[x.req] < x.in_req + x.skip + x.n) return false;
-        std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
-    }
-    return true;
-#else
     (void) fills; (void) n;
     return false;
-#endif
 }
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
@@ -1151,11 +816,6 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stamp = (uint32_t) epoch_ + 1;
     }
-#if defined(_WIN32)
-    using Pvm = BOOL(WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-    static const Pvm pvm = (Pvm) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
-    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
-#endif
     for (int64_t j = 0; j < n; ++j) {
         const int64_t e = experts[j];
         if (e < 0 || e >= n_expert_) continue;
@@ -1167,17 +827,10 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * role_bytes_[i]);
-#if defined(_WIN32)
-            ranges.push_back({(PVOID) p, (SIZE_T) role_bytes_[i]});
-#else
             const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
             (void) madvise((void*) a, (size_t) ((uintptr_t) p + role_bytes_[i] - a), MADV_WILLNEED);
-#endif
         }
     }
-#if defined(_WIN32)
-    if (pvm != nullptr && !ranges.empty()) (void) pvm(GetCurrentProcess(), (ULONG_PTR) ranges.size(), ranges.data(), 0);
-#endif
 }
 
 RouterLookahead::~RouterLookahead() {
@@ -1385,21 +1038,6 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t bytes = 0;
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
                                             additional_gpu_pairs, offsets, bytes, err)) return false;
-#if defined(_WIN32)
-    // #467: the GPU cache's pre-fill touched its experts through the mapping (~19 GiB on a 24 GB card), and Windows
-    // counts those file pages in this process's working set, not as available: a 32 GB PC read 0.44 GiB here
-    // (20.7 GiB before the start).  Trimmed, they move to the standby list (still cached, counted as available).
-    // Resident mode only: nothing else calls this function.  Locked/pinned pages stay; the rest fault back softly.
-    {
-        uint64_t before = 0, after = 0;
-        const bool read_before = available_memory_bytes(before);
-        (void) SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T) -1, (SIZE_T) -1);
-        if (read_before && available_memory_bytes(after))
-            std::fprintf(stderr, "FileExpertSource: available RAM %.2f GiB, %.2f GiB after the mapped experts left the "
-                                 "process working set (#467)\n",
-                         (double) before / 1073741824.0, (double) after / 1073741824.0);
-    }
-#endif
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
     uint64_t budget_physical = 0;   // #403: the RAM reading a budget was sized from (0: no budget)
     if (budget_bytes > 0) {
@@ -1627,14 +1265,12 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     // Copied layer by layer on a few threads: the page faults of the mapped file are the cost, and they overlap.
-#if !defined(_WIN32)
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         err = "FileExpertSource: cannot determine page size for mapped-page release";
         release();
         return false;
     }
-#endif
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
     std::atomic<bool> failed{false};
@@ -1695,7 +1331,6 @@ bool FileExpertSource::pin_cache_complement(
                 fail("FileExpertSource: an expert could not be read while building the cache complement");
                 return;
             }
-#if !defined(_WIN32)
             if (role_ptr_.empty()) {   // experts.bin; the GGUF in place leaves its pages to the OS
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
             const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
@@ -1715,7 +1350,6 @@ bool FileExpertSource::pin_cache_complement(
                 return;
             }
             }
-#endif
             const int64_t done = layers_done.fetch_add(1) + 1;
             if (done % 8 == 0 || done == n_layers_)
                 std::fprintf(stderr, "FileExpertSource: copied cache complement through layer %lld/%lld (%.2f GiB, %.0f s)\n",
@@ -1736,12 +1370,6 @@ bool FileExpertSource::pin_cache_complement(
         release();
         return false;
     }
-#if defined(_WIN32)
-    // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set for the
-    // standby list: VirtualUnlock on pages that are not locked does exactly that (it then reports ERROR_NOT_LOCKED).
-    if (maps_.empty()) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
-    for (const Map& m : maps_) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
-#endif
 
     complement_arena_ = arena;
     complement_host_ = host;
@@ -2664,95 +2292,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     const auto t0 = std::chrono::steady_clock::now();
     std::atomic<int64_t> next{0};
     std::atomic<bool> bad{false};
-#if defined(_WIN32)
-    if (unbuffered) {
-        uint64_t max_chunk = 0;
-        for (int64_t l = 0; l < lay.n_layers; ++l) {
-            const auto& fm = lay.fmt[(size_t) l];
-            max_chunk = std::max<uint64_t>(max_chunk, std::max<uint64_t>(fm.up_off, lay.bytes[(size_t) l] - fm.down_off) * 16);
-        }
-        std::mutex err_mu;
-        std::string err;
-        auto worker = [&]() {
-            constexpr uint64_t kSector = 4096;
-            const uint64_t cap = (max_chunk + 2 * kSector + kSector - 1) / kSector * kSector;
-            uint8_t* buf = (uint8_t*) VirtualAlloc(nullptr, (size_t) cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            HANDLE h = INVALID_HANDLE_VALUE;
-            std::string open_name;
-            auto fail = [&](const std::string& what) {
-                std::lock_guard<std::mutex> g(err_mu);
-                if (err.empty()) err = what;
-                bad = true;
-            };
-            if (buf == nullptr) fail("cannot allocate a read buffer");
-            for (;;) {
-                const int64_t l = next.fetch_add(1);
-                if (l >= lay.n_layers || bad) break;
-                const auto& fm = lay.fmt[(size_t) l];
-                const uint64_t blob = lay.bytes[(size_t) l];
-                const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
-                const uint64_t at[3] = {0, fm.up_off, fm.down_off};
-                for (int r = 0; r < 3 && !bad; ++r) {
-                    // the handle is kept while consecutive roles share a file (every layer of a v3 pack)
-                    const std::string name = expert_gguf_file(gguf, lay, l, r);
-                    if (name != open_name) {
-                        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-                        const int wide = MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, nullptr, 0);
-                        std::vector<wchar_t> w((size_t) std::max(wide, 1), L'\0');
-                        if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, name.c_str(), -1, w.data(), wide);
-                        h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                        FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-                        if (h == INVALID_HANDLE_VALUE) {
-                            fail("cannot open " + name + " (error " + std::to_string((unsigned long long) GetLastError()) + ")");
-                            break;
-                        }
-                        open_name = name;
-                    }
-                    const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
-                    const uint64_t total = per[r] * (uint64_t) lay.n_expert;
-                    const uint64_t chunk = per[r] * 16;           // 16 experts per read
-                    for (uint64_t done = 0; done < total; done += chunk) {
-                        const uint64_t n = std::min<uint64_t>(chunk, total - done);
-                        const uint64_t a0 = (src + done) / kSector * kSector;
-                        const uint64_t a1 = (src + done + n + kSector - 1) / kSector * kSector;
-                        OVERLAPPED ov{};
-                        ov.Offset = (DWORD) a0;
-                        ov.OffsetHigh = (DWORD) (a0 >> 32);
-                        DWORD got = 0;
-                        // the window may run past the end of the file: only the tensor's own bytes have to arrive
-                        if (!ReadFile(h, buf, (DWORD) (a1 - a0), &got, &ov) || (uint64_t) got < src + done - a0 + n) {
-                            fail("short unbuffered read of layer " + std::to_string(l) + " in " + name + " (error " +
-                                 std::to_string((unsigned long long) GetLastError()) + ")");
-                            break;
-                        }
-                        const uint8_t* q = buf + (src + done - a0);
-                        for (uint64_t k = 0; k < n / per[r]; ++k) {
-                            const uint64_t e = done / per[r] + k;
-                            std::memcpy(dst + lay.blob_offset(l, (int64_t) e) + at[r], q + k * per[r], (size_t) per[r]);
-                        }
-                    }
-                }
-            }
-            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-            if (buf != nullptr) VirtualFree(buf, 0, MEM_RELEASE);
-        };
-        std::vector<std::thread> pool;
-        for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
-        worker();
-        for (auto& t : pool) t.join();
-        if (bad) {
-            st.seconds = -1.0;
-            st.ok = false;
-            st.error = err.empty() ? "unreadable shard while reading the experts from the GGUF" : err;
-            return st;
-        }
-        st.bytes = lay.total;
-        st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        return st;
-    }
-#else
     (void) unbuffered;
-#endif
     auto worker = [&]() {
         // #230: `fread` on a `FILE*`, as load_experts_ranges (#89): MSVC's `std::ifstream::read` splits a request
         // into 4095-byte freads, which took this path to 0.02 GiB/s on a Windows install without experts.bin.
@@ -2859,9 +2399,6 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // dropped is re-read from the file, so a result never depends on what is resident.  The GPUs then get no
     // mapped alias: run with --pcie-frac 0.  The first start writes experts.bin (arena layout, padded by one blob
     // so a whole-slot copy may start at any expert), later ones map it.
-#if defined(_WIN32)
-    static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
-#else
     static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
     if (arena_mmap) {
         const uint64_t file_bytes = want + (uint64_t) blob;
@@ -2890,7 +2427,6 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             return true;
         }
     }
-#endif
 
     // #633: THE RAM BEFORE THE ALLOCATION.  On Linux the arena is an anonymous mapping that succeeds whatever the host
     // has; its pages are committed as the load writes them, so a container whose memory limit is below the arena was
@@ -3035,9 +2571,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
-#if !defined(_WIN32)
     if (map_ != nullptr) munmap(map_, (size_t) map_bytes_);
-#endif
     map_ = nullptr;
     map_bytes_ = 0;
     if (arena_ != nullptr) {
@@ -3050,15 +2584,11 @@ void ArenaExpertSource::close() {
 }
 
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
-#if defined(_WIN32)
-    (void) layer; (void) expert;
-#else
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
     const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
     madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
-#endif
 }
 
 // Only the pages wholly inside the blob: a page shared with a neighbour the CPU may still read stays.  MADV_DONTNEED
@@ -3068,10 +2598,6 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
 // faults a second in decode, +8 ms a window.  The memory the arena used to hold was never the cache itself but
 // ROCclr's pin-in-place locks on it (see main) - locked pages are the ones the kernel cannot take back.
 uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
-#if defined(_WIN32)
-    (void) layer; (void) expert;
-    return 0;
-#else
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
@@ -3079,7 +2605,6 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
     if (end <= off) return 0;
     if (madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_DONTNEED) != 0) return 0;
     return end - off;
-#endif
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {

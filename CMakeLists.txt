@@ -10,17 +10,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.39 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
-# issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
-# be read back to the exact source line
-if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zi>)
-  add_link_options(/DEBUG /OPT:REF /OPT:ICF)
-endif()
 
-# The prebuilt release (setup.py downloads it, so users need no compiler): ggml's CPU backend for any AVX2 CPU
-# instead of this machine's (Strata's own AVX-512 kernels are per-file and chosen at run time either way), and
-# the MSVC runtime linked in, so no Visual C++ redistributable is needed.
-option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
 # EXPERIMENTAL, opt-in: an engine for CPUs without AVX2 (#394, #595, #623), compiled on that PC.  ggml-cpu, which then
 # computes every CPU expert row, is built for this floor instead of AVX2 or the build host: "avx" (Sandy/Ivy Bridge:
 # AVX, no FMA/F16C/AVX2) or "none" (SSE4.2 + POPCNT: Nehalem/Westmere).  Strata's own AVX2/AVX-512 kernels stay in the
@@ -29,12 +19,6 @@ set(STRATA_ISA_FLOOR "" CACHE STRING "experimental older-CPU build: empty (defau
 set_property(CACHE STRATA_ISA_FLOOR PROPERTY STRINGS "" avx none)
 if(NOT STRATA_ISA_FLOOR STREQUAL "" AND NOT STRATA_ISA_FLOOR STREQUAL "avx" AND NOT STRATA_ISA_FLOOR STREQUAL "none")
   message(FATAL_ERROR "STRATA_ISA_FLOOR must be empty, avx or none (got '${STRATA_ISA_FLOOR}')")
-endif()
-if(STRATA_ISA_FLOOR AND STRATA_PORTABLE)
-  message(FATAL_ERROR "STRATA_ISA_FLOOR (an older-CPU build) and STRATA_PORTABLE (the AVX2 release build) exclude each other")
-endif()
-if(STRATA_PORTABLE AND MSVC)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -70,13 +54,6 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
 endif()
 
 if(STRATA_ENABLE_CUDA)
-  # #585: CMake links CUDA code with the STATIC runtime by default, and the targets below also link CUDA::cudart (the
-  # DLL's import library).  MSVC with a CUDA 12.x toolkit - the experimental Pascal/Volta build - then fails with
-  # LNK1169 (every cudart symbol defined twice); GNU ld lets it pass.  That build links the shared runtime alone.  The
-  # ready-made engine (CUDA 13, no STRATA_EXPERIMENTAL_SM60) is unchanged; -DCMAKE_CUDA_RUNTIME_LIBRARY overrides.
-  if(MSVC AND STRATA_EXPERIMENTAL_SM60 AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
-    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
-  endif()
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
@@ -129,21 +106,13 @@ endif()
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
 # globally they would also hit FetchContent'd Catch2, whose -W4 warnings are not this project's to fix and
 # whose /WX failures would be indistinguishable from our own.
-#
-# Every flag is guarded by COMPILE_LANGUAGE:CXX.  Without that guard nvcc receives bare `/W4 /utf-8` and dies
-# with "A single input file is required for a non-link phase" - it parses them as inputs rather than host
-# flags.  Host flags for CUDA must go through -Xcompiler, which is what COMPILE_LANGUAGE:CUDA does below.
+# The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs.
 add_library(strata_warnings INTERFACE)
 target_compile_options(strata_warnings INTERFACE
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/W4>)
+  $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+  $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
 if(STRATA_WERROR)
-  target_compile_options(strata_warnings INTERFACE
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>)
+  target_compile_options(strata_warnings INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-Werror>)
 endif()
 
 # ---- strata_artifact -------------------------------------------------------
@@ -334,10 +303,6 @@ if(STRATA_ENABLE_CUDA)
       target_link_libraries(${parity}_parity PRIVATE "${${variable}}")
     endforeach()
     add_test(NAME ${parity}_parity COMMAND ${parity}_parity --selftest)
-    if(WIN32)
-      set_tests_properties(${parity}_parity PROPERTIES
-        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${STRATA_ORACLE_BUILD_DIR}/bin")
-    endif()
     endforeach()
   endif()
 
@@ -780,12 +745,12 @@ endif()
 
 # ---- strata_kernels_cpu (P2.S3) ----
 #
-# A SEPARATE LIBRARY from `strata_kernels`, and `/arch:AVX512` is set on the SOURCE rather than on the target
-# so that the flag applies only to the TU that needs it.  Both parts matter:
+# A SEPARATE LIBRARY from `strata_kernels`, and the AVX-512 flags are set on the SOURCE rather than on the target
+# so that they apply only to the TU that needs them.  Both parts matter:
 #
 #   * the CPU expert kernel uses `_mm256_dpbusd_epi32` (AVX512-VNNI) and `_mm256_multishift_epi64_epi8`
-#     (AVX512-VBMI); without the flag MSVC reports undeclared intrinsics and never mentions AVX-512;
-#   * a TU compiled WITH `/arch:AVX512` may use AVX-512 in ANY of its code, so the scalar fallback and the
+#     (AVX512-VBMI);
+#   * a TU compiled WITH AVX-512 may use AVX-512 in ANY of its code, so the scalar fallback and the
 #     test drivers must NOT be in it - otherwise the fallback is not a fallback, it is the same bet with
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
@@ -823,15 +788,10 @@ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
-if(MSVC)
-  set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-  set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-else()
-  # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
-  set_source_files_properties(src/kernels/cpu/expert.cpp
-                              PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-  set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-endif()
+# `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
+set_source_files_properties(src/kernels/cpu/expert.cpp
+                            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -857,12 +817,7 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  if(STRATA_PORTABLE)
-    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-    foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
-      set(${_f} ON CACHE BOOL "" FORCE)
-    endforeach()
-  elseif(STRATA_ISA_FLOOR)
+  if(STRATA_ISA_FLOOR)
     # the experimental older-CPU build (STRATA_ISA_FLOOR above): one ggml-cpu for the floor, ggml's "sandybridge"
     # feature set (SSE4.2 + AVX) or SSE4.2 alone - not the build host's, which may be newer than the PC it runs on.
     # From the Strata_Dirigo fork (rwkeyes).  ggml's defaults turn the rest on when GGML_NATIVE is off: all off here.
@@ -901,19 +856,12 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                            src/kernels/cpu/kq_avx1.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
-  if(MSVC)
-    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-    set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-    # the router lookahead's AVX1 dot (older CPUs; called behind cpu_avx1_ok): no FMA, no 256-bit integer ops
-    set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
-  else()
-    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-    set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-    set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
-  endif()
+  set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                              "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
+  set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
   if(STRATA_ISA_FLOOR STREQUAL "avx")
     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_AVX=1)
   elseif(STRATA_ISA_FLOOR STREQUAL "none")
@@ -960,9 +908,6 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
                                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
-    if(MSVC)
-      target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
-    endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
@@ -1048,15 +993,9 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_
 endif()
 
 if(STRATA_BUILD_TESTS)
-  if(WIN32)
-    add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_test.cpp)
-    target_link_libraries(pool_affinity_test PRIVATE strata_kernels_cpu)
-    add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
-  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_linux_test.cpp)
-    target_link_libraries(pool_affinity_test PRIVATE strata_kernels_cpu)
-    add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
-  endif()
+  add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_linux_test.cpp)
+  target_link_libraries(pool_affinity_test PRIVATE strata_kernels_cpu)
+  add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
   # Plan v0.3 P6: one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # plan v0.3 P5: the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
   # the 38 GB model; run it by hand or from tools/gpu_session.py)

@@ -86,13 +86,8 @@ double rel_l1(const float* a, const float* b, size_t n, double* mag_out = nullpt
 long long file_size(const char* path) {
     std::FILE* f = std::fopen(path, "rb");
     if (!f) return -1;
-#if defined(_MSC_VER)
-    _fseeki64(f, 0, SEEK_END);
-    const long long n = _ftelli64(f);
-#else
     std::fseek(f, 0, SEEK_END);
     const long long n = std::ftell(f);
-#endif
     std::fclose(f);
     return n;
 }
@@ -102,11 +97,7 @@ std::vector<uint8_t> read_at(const char* path, long long off, size_t n) {
     std::vector<uint8_t> v(n);
     std::FILE* f = std::fopen(path, "rb");
     if (!f) return {};
-#if defined(_MSC_VER)
-    if (_fseeki64(f, off, SEEK_SET) != 0) { std::fclose(f); return {}; }
-#else
     if (std::fseek(f, (long) off, SEEK_SET) != 0) { std::fclose(f); return {}; }
-#endif
     const size_t got = std::fread(v.data(), 1, n, f);
     std::fclose(f);
     if (got != n) return {};

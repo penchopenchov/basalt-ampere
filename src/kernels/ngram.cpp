@@ -11,18 +11,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#if !defined(_WIN32)
 #include <sys/mman.h>
-#endif
 #include <vector>
 #include <stdexcept>
 
-#if defined(_WIN32)
-// `PrefetchVirtualMemory` (memoryapi.h, Windows 8+) is the whole point of the change in `gather` below.
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#endif
 
 namespace strata::kernels {
 
@@ -260,7 +252,6 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         impl_->n_rows = n_rows;
     }
     if (io.mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
-#if !defined(_WIN32)
         const uint64_t page = 4096;
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
@@ -274,7 +265,6 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
             (void) sink;
         }
-#endif
     }
     impl_->mode = io.mode;
     return true;
@@ -297,19 +287,6 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
         impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
         return;
     }
-#if defined(_WIN32)
-    if (impl_->data != nullptr && g_ple_prefetch) {
-        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
-        ULONG_PTR n = 0;
-        for (int h = 0; h < PLE_N_HEADS; ++h) {
-            if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
-            ranges[n].NumberOfBytes = impl_->rb;
-            ++n;
-        }
-        if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
-    }
-#endif
 }
 
 void PleTable::close() {
@@ -364,19 +341,6 @@ bool PleTable::issue(const uint32_t* rows16) {
         impl_->pending = true;
         return true;
     }
-#if defined(_WIN32)
-    if (impl_->data != nullptr && g_ple_prefetch) {
-        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
-        ULONG_PTR n = 0;
-        for (int h = 0; h < PLE_N_HEADS; ++h) {
-            if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
-            ranges[n].NumberOfBytes = impl_->rb;
-            ++n;
-        }
-        if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
-    }
-#endif
     impl_->pending = true;
     return true;
 }
@@ -483,20 +447,6 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
     // `PrefetchVirtualMemory` issues all sixteen in ONE call and lets them complete in parallel.  It is a hint
     // and cannot change the answer - a range it does not fetch is simply faulted in by the read that follows -
     // so the only risk is that it does nothing.
-#if defined(_WIN32)
-    if (impl_->data != nullptr && g_ple_prefetch) {
-        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
-        ULONG_PTR n = 0;
-        for (int h = 0; h < PLE_N_HEADS; ++h) {
-            // Out-of-range rows are handled by `read_row` as zeros and have no address to prefetch.
-            if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
-            ranges[n].NumberOfBytes = impl_->rb;
-            ++n;
-        }
-        if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
-    }
-#endif
     // HEAD-SLOWEST, which is what `ggml_get_rows` does and what the source's own comment says: head h's 160
     // values occupy [h*160, (h+1)*160).  A head-fastest layout would put element (d, h) at d*16 + h and needs
     // a real transpose - a reshape of the same flat buffer compares equal and would make the check vacuous.

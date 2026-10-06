@@ -14,10 +14,8 @@
 #include <future>
 #include <string>
 #include <vector>
-#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
-#endif
 
 namespace strata::program {
 
@@ -64,9 +62,7 @@ public:
     bool finish(std::string& err) {
         const bool ok = wait(err);
         std::fflush(out_);
-#ifndef _WIN32
         posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
-#endif
         return ok;
     }
 
@@ -75,9 +71,7 @@ private:
         const char* base = std::getenv("STRATA_PPL_BASE");
         const char* out = std::getenv("STRATA_PPL_OUT");
         if (base == nullptr || out == nullptr) return;
-#ifndef _WIN32
         fd_ = ::open(base, O_RDONLY);
-#endif
         char magic[8];
         uint32_t n_ctx = 0;
         int32_t nv[2] = {0, 0};
@@ -102,13 +96,10 @@ private:
         close_fd();
     }
     void close_fd() {
-#ifndef _WIN32
         if (fd_ >= 0) ::close(fd_);
-#endif
         fd_ = -1;
     }
     bool read_at(void* dst, size_t bytes, uint64_t off) const {
-#ifndef _WIN32
         uint8_t* p = (uint8_t*) dst;
         while (bytes > 0) {
             const ssize_t r = ::pread(fd_, p, bytes, (off_t) off);
@@ -118,10 +109,6 @@ private:
             bytes -= (size_t) r;
         }
         return true;
-#else
-        (void) dst; (void) bytes; (void) off;
-        return false;
-#endif
     }
 
     // the same arithmetic as llama-perplexity's KL-divergence pass

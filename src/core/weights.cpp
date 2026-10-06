@@ -12,11 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(_WIN32)
-#include <io.h>
-#else
 #include <unistd.h>
-#endif
 
 namespace strata::core {
 namespace {
@@ -76,11 +72,7 @@ const char* file_name(int id) {
 /// path.  The pack lives beside the executable in practice, but a pack under a user directory with a
 /// non-ASCII name would silently fail to open, so the caller gets the errno rather than a null pointer.
 bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
-#if defined(_WIN32)
-    if (_fseeki64(f, (long long) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
-#else
     if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
-#endif
     if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }
     return true;
 }
@@ -280,12 +272,10 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             cur = std::fopen(p.c_str(), "rb");
             if (!cur) { err = "cannot open " + p; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
             cur_file = r.file;
-#if !defined(_WIN32)
             // ask for this file's remaining rows up front so their reads overlap
             for (size_t j = row_i; j < rows.size(); ++j)
                 if (rows[j].file == r.file && !skipped[j])
                     strata::platform::advise_willneed(fileno(cur), rows[j].src_off, rows[j].src_bytes);
-#endif
         }
 
         // ---- the segment list: what this tensor's bytes are, plane by plane, in both forms

@@ -21,7 +21,7 @@
 
 // `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
 // spin is just less polite to the pipeline.
-#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #define STRATA_SPIN_PAUSE() _mm_pause()
 #else

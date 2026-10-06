@@ -44,11 +44,7 @@ void ck(cudaError_t e, const char* what) {
 }
 
 void set_env(const char* name, const char* value) {
-#if defined(_WIN32)
-    _putenv_s(name, value);
-#else
     setenv(name, value, 1);
-#endif
 }
 
 template <typename T> struct Dev {

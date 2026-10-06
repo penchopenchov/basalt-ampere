@@ -14,7 +14,6 @@
 #include <thread>
 #include <vector>
 
-#if defined(__linux__)
 #include "pool_affinity_linux.hpp"
 
 #include <pthread.h>
@@ -280,11 +279,3 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-#else
-
-int main() {
-    std::puts("SKIP Linux affinity test: Linux is required");
-    return 0;
-}
-
-#endif
