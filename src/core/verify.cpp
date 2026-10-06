@@ -79,6 +79,7 @@ struct DecMoe {
     unsigned int* m3ctr = nullptr;           ///< its slice counters
     float* m3part = nullptr;                 ///< the shared gate's partial sums (dec_moe_route)
     unsigned long long* wstat = nullptr;     ///< STRATA_DM_WAIT_STATS: the per-layer wait counters (device)
+    unsigned long long* ptab0 = nullptr;     ///< STRATA_DEC_GLUE: [n_layers * n_expert] CUDA0 blob address or 0
     int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
@@ -141,6 +142,13 @@ int dec_pk_mask() {
     return m;
 }
 bool dec_pk() { return dec_pk_mask() != 0; }
+// STRATA_DEC_GLUE (bit mask): 1 = in windows of 2+ tokens with STRATA_DEC_PK & 4, no route launch on the main stream:
+// the hc read's router items write the FFN input's q8_1 rows, the gate/up launch builds CUDA0's plan itself
+// (dec_moe_glue: co-resident blocks, each plans once) and the ring's launch the tiers' kinds
+int dec_glue_mask() {
+    static const int m = [] { const char* e = std::getenv("STRATA_DEC_GLUE"); return e ? std::atoi(e) : 0; }();
+    return m;
+}
 // STRATA_DEC_COMMIT: 1 = the commit graph in two launches; 2 = its GDN part from STRATA_DEC_COMMIT_CTAS persistent
 // blocks (default 32) so it trickles beside the draft instead of filling the card
 int dec_commit_mode() {
@@ -434,6 +442,9 @@ bool Verifier::dm_init(std::string& err) {
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
              cudaMemcpy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (ok && (dec_glue_mask() & 1))
+        ok = cudaMalloc((void**) &d->ptab0, (size_t) LE * 8) == cudaSuccess &&
+             cudaMemset(d->ptab0, 0, (size_t) LE * 8) == cudaSuccess;
     if (ok && env_on("STRATA_DM_WAIT_STATS"))
         ok = cudaMalloc((void**) &d->wstat, kDmStatWords * 8) == cudaSuccess &&
              cudaMemset(d->wstat, 0, kDmStatWords * 8) == cudaSuccess;
@@ -497,6 +508,19 @@ bool Verifier::dm_sync(std::string& err) {
         err = "verify: STRATA_DEC_MOE residency upload";
         return false;
     }
+    if (d->ptab0 != nullptr && a < b) {   // the same span as blob addresses (a < b only after an upload above)
+        std::vector<unsigned long long> p(b - a);
+        for (size_t i = a; i < b; ++i) {
+            const int32_t slot = d->shadow0[i];
+            p[i - a] = slot >= 0 ? (unsigned long long) (hits_.cache_base + (hits_.slot_off ? (size_t) hits_.slot_off[slot]
+                                                                                             : (size_t) slot * hits_.blob))
+                                 : 0ull;
+        }
+        if (cudaMemcpyAsync(d->ptab0 + a, p.data(), p.size() * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+            err = "verify: STRATA_DEC_GLUE table upload";
+            return false;
+        }
+    }
     if (d->pdev >= 0 && span(peer_->residency().data(), d->shadow1, a, b)) {
         if (cudaMemcpyAsync(d->res1 + a, d->shadow1.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "verify: STRATA_DEC_MOE peer residency upload";
@@ -524,7 +548,8 @@ void Verifier::dm_free() {
             if (p) cudaFree(p);
     }
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
-                    (void*) d->vsync, d->xq_pub, d->m3scr, (void*) d->m3ctr, (void*) d->m3part, (void*) d->wstat})
+                    (void*) d->vsync, d->xq_pub, d->m3scr, (void*) d->m3ctr, (void*) d->m3part, (void*) d->wstat,
+                    (void*) d->ptab0})
         if (p) cudaFree(p);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
         if (h) cudaFreeHost(h);
@@ -967,6 +992,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork[2] = {false, false};   // STRATA_DEC_PK & 4: the group's ring stream is joined in post
+    bool glue_on[2] = {false, false};     // STRATA_DEC_GLUE & 1: post's gate/up launch plans the group's VRAM share
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
@@ -1417,6 +1443,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         const bool router_multi = dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
         bool routed = false;   // the fused read ran the router too
+        static const bool sh_stream_env = [] {
+            const char* e = std::getenv("STRATA_SH_STREAM");
+            return !e || e[0] != '0';
+        }();
+        DmM3Args m3a;
+        const uint16_t* m3_gi = nullptr;
+        const bool m3 = m3_of(l, m3a, &m3_gi);
+        const bool sh_fork = !shx && !m3 && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
+                             ev_join_ != nullptr;
+        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) && n >= 2 ? sh_hi_ : sh_cs_) : cs;
+        // STRATA_DEC_PK & 4: the ring on its own stream, forked after the router, joined where the side branch is
+        const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && ring_hi_ != nullptr;
+        ring_fork[grp] = pk_ring;
+        // STRATA_DEC_GLUE & 1: the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
+        glue_on[grp] = false;
+        if ((dec_glue_mask() & 1) && pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
+            const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+            glue_on[grp] = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
+        }
         {
             PdlScope ps(pdl);   // after the out projection's kernel
             if (dec_hc) {
@@ -1424,6 +1469,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (router_multi) {
                     h.w_router = (const uint16_t*) w_router->data;
                     h.logits = logits_ + tb * NE; h.ids = ids_ + tb * K; h.weights = w_ + tb * K;
+                    if (glue_on[grp]) h.xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
                     routed = true;
                 }
                 const WeightRef *next_norm = nullptr, *next_down = nullptr, *next_up = nullptr;
@@ -1448,19 +1494,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 gr_read_group(1, true, inj_, inj2_);
             }
         }
-        static const bool sh_stream_env = [] {
-            const char* e = std::getenv("STRATA_SH_STREAM");
-            return !e || e[0] != '0';
-        }();
-        DmM3Args m3a;
-        const uint16_t* m3_gi = nullptr;
-        const bool m3 = m3_of(l, m3a, &m3_gi);
-        const bool sh_fork = !shx && !m3 && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
-                             ev_join_ != nullptr;
-        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) && n >= 2 ? sh_hi_ : sh_cs_) : cs;
-        // STRATA_DEC_PK & 4: the ring on its own stream, forked after the router, joined where the side branch is
-        const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && ring_hi_ != nullptr;
-        ring_fork[grp] = pk_ring;
         if (sh_fork) {
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_stream, ev_fork_, 0);
@@ -1513,7 +1546,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 cudaEventRecord(ev_ring_, cs);
                 cudaStreamWaitEvent(ring_hi_, ev_ring_, 0);
                 DmRouteArgs rp = ra;
-                rp.mode = 2; rp.xq_pub = dm_->xq_pub;
+                rp.mode = 2; rp.xq_pub = dm_->xq_pub; rp.kinds = glue_on[grp];
                 {
                     PdlScope pp(false);
                     dec_moe_route(rp, ring_hi_);
@@ -1521,7 +1554,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 cudaEventRecord(ev_ring_join_, ring_hi_);
                 ra.mode = 1;
             }
-            dec_moe_route(ra, cs);
+            if (!glue_on[grp]) dec_moe_route(ra, cs);
         } else if (all_resident_) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1654,7 +1687,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const auto& f = lay.fmt[(size_t) l];
             const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             DmPlan* P = dm_->plan;
-            if (dm_->vram >= 0)
+            if (glue_on[grp]) {
+                DmGlueArgs ga;
+                ga.ids = ids_ + tb * K; ga.ptab = dm_->ptab0 + l * g.n_expert;
+                ga.n_tok = n; ga.k = (int) K; ga.n_expert = (int) g.n_expert;
+                ga.plan = P; ga.xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
+                dec_moe_glue(L, ga, hit_scratch_, parts_out, (int) cap, cs);
+            } else if (dm_->vram >= 0)
                 dec_moe_vram(L, P, nat_xq_ + (size_t) tb * (N / 32) * 36, dm_->vscr, parts_out, dm_->vsync, cs, dm_->vram,
                              (int) cap);
             else

@@ -44,6 +44,9 @@ struct HcFusedArgs {
     float* logits = nullptr;            ///< [T][512]
     int32_t* ids = nullptr;             ///< [T][10]
     float* weights = nullptr;           ///< [T][10]
+    /// STRATA_DEC_GLUE: mixed's q8_1 rows (36-byte blocks, [T][n_embd / 32]) written by the router items, or null;
+    /// only the read with router items takes it (hc_fused_q8_rows_ok)
+    void* xq = nullptr;
     const void* pf[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t pf_bytes[4] = {0, 0, 0, 0};
     /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null = the
@@ -59,6 +62,8 @@ struct HcFusedArgs {
 /// STRATA_DEC_HC8=1: the read uses 8-bit copies of its matrices (not bitwise; every token's outputs stay independent
 /// of T and column).  STRATA_DEC_HC8_PRE=<n> (default 3): down stages requested before the norm is done.
 bool hc8_enabled();
+/// Whether a read with a router writes HcFusedArgs::xq (it has router items: not split-K, not STRATA_DEC_HCX=2 / 4).
+bool hc_fused_q8_rows_ok();
 /// Quantize the bf16 matrix w [rows][cols] (cols a multiple of 32) to an 8-bit copy on the current device, once per
 /// pointer, outside any stream capture.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
 /// scales are one allocation (one prefetch range).

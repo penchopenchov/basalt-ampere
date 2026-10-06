@@ -65,10 +65,28 @@ struct DmRouteArgs {
     float* sh_part = nullptr;        ///< device: its gate's partial sums, n_embd / 256 per token in order
     unsigned long long* stats = nullptr;   ///< STRATA_DM_WAIT_STATS (kDmStatWords, device) or null: the doorbell's time
     int peer_cap = 0;                ///< STRATA_PEER_CAP: the peer's groups past this many go to the CPU pool (0: no cap)
+    bool kinds = false;              ///< mode 2: also every entry's tier into plan->kind and counts[2], counts[3]
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
 void dec_moe_route(const DmRouteArgs& a, void* stream);
+
+/// STRATA_DEC_GLUE & 1: CUDA0's grouped gate/up, SwiGLU and down launches (native_expert_grouped's STRATA_DEC_GU2=2
+/// chain, the same bits) with the route's VRAM plan built inside the gate/up launch: every block groups the entries
+/// itself (dm_route_kernel's grouping) from `ids` and `ptab`, block (0, 0) also writes the plan's VRAM part for the
+/// later launches before it lets them start.  The q8_1 rows come from the hc read (HcFusedArgs::xq); the tiers'
+/// kinds from a mode-2 route launch with `kinds`.  A programmatic dependent of the hc read.
+struct DmGlueArgs {
+    const int32_t* ids = nullptr;                ///< device: n_tok * k routed experts
+    const unsigned long long* ptab = nullptr;    ///< device: this layer's [n_expert] CUDA0 blob address or 0
+    int n_tok = 0, k = 0, n_expert = 0;
+    DmPlan* plan = nullptr;
+    const void* xq = nullptr;                    ///< device: n_tok q8_1 rows
+};
+/// Whether dec_moe_glue covers L (the STRATA_DEC_GU2=2 chain's formats and settings).
+bool dec_moe_glue_ok(const NativeExpertLayout& L);
+/// `scratch` / `out` / `cap` as native_expert_grouped's (entries cap, rows into out at the entry's index).
+void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratch, float* out, int cap, void* stream);
 
 /// The peer card's window: one persistent kernel serves `steps` rings.
 struct DmPeerArgs {

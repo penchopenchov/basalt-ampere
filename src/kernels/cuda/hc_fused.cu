@@ -5,6 +5,7 @@
 // operations are spelled out as the flush-to-zero PTX instructions that build emits.
 #include "strata/kernels/hc_fused.hpp"
 #include "strata/kernels/pdl.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -48,6 +49,23 @@ constexpr int MIN_NU = 86;           // up CTAs needed for an up slice (30 colum
 static_assert(D % (QB * 256) == 0, "whole stages");
 
 constexpr int NCOPY = 8;             // copies of xn: the down CTAs read different copies, spreading the L2 load
+
+// One q8_1 block (iq_kernels.cu's block_q8_1) and its q8_1_store: lane i holds value i of block ib.
+struct HcQ81 {
+    half2 ds;
+    int8_t qs[32];
+};
+__device__ __forceinline__ void hc_q8_1_store(float xi, HcQ81* __restrict__ y, int ib, int lane) {
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    }
+    const float d = q8_1_finite(amax / 127.0f);
+    y[ib].qs[lane] = q8_1_quant(xi, d, amax);
+    if (lane == 0) y[ib].ds = q8_1_ds(d, sum);
+}
 
 // each counter in its own 256-byte block: the CTAs polling one do not queue behind the atomics on another
 struct alignas(256) HcCtr {
@@ -1606,6 +1624,12 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             if (it.end > it.t10) {   // the top-10 item waits on the count
                 cta_signal(&sy->router.v, tid);
                 if (tid == 0) s_last = 0;
+                if (a.xq != nullptr) {   // the item's share of mixed's q8_1 blocks, while the top-10 runs
+                    const int nq = T * (N / 32), q0 = r * nq / ND, q1 = (r + 1) * nq / ND;
+                    for (int q = q0 + (tid >> 5); q < q1; q += WARPS)
+                        hc_q8_1_store(__ldcg(a.mixed + (size_t) q * 32 + (tid & 31)), static_cast<HcQ81*>(a.xq), q,
+                                      tid & 31);
+                }
             } else {
                 __syncthreads();
                 if (tid == 0) {
@@ -1856,6 +1880,11 @@ const SkConf& sk_conf() {
 
 unsigned long long* g_dbg = nullptr;
 int g_slot = 0;
+}  // namespace
+
+bool hc_fused_q8_rows_ok() { return !sk_conf().on && sk_conf().hcx == 1; }
+
+namespace {
 
 struct DevInfo {
     bool checked = false, ok = false;

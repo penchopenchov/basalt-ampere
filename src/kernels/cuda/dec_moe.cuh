@@ -130,6 +130,11 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         if (tid < n) {
             a.ring_m->ids[tid] = s_ids[tid];
             a.ring_m->kind[tid] = s_kind[tid];
+            if (a.kinds) a.plan->kind[tid] = s_kind[tid];
+        }
+        if (a.kinds && tid == 0) {
+            a.plan->counts[2] = s_npeer;
+            a.plan->counts[3] = s_ncpu;
         }
         if (tid == 0) {
             int ne = 0;
@@ -250,6 +255,89 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
     if (plan->counts[2] > 0) while (*peer_done < ring) strata_spin_pause();
     if (plan->counts[3] > 0) while (*host_flag < ring) strata_spin_pause();
     __threadfence_system();
+}
+
+// ---------------------------------------------------------------- STRATA_DEC_GLUE & 1: the route inside gate/up
+// native_gu2_kernel's rows with the VRAM plan built in the block (dm_route_kernel's kinds and dm_group for the VRAM
+// tier: an entry is CUDA0's when its id is valid, not repeated within its token and ptab holds its blob).  The blocks
+// are co-resident and loop over native_gu2_kernel's (row block, group row) items, gy group rows, so each plans once.
+template<int TG>
+__global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L, float* __restrict__ gate,
+                                                         float* __restrict__ up, int gy) {
+    __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
+    __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap], s_start[kDmCap + 1], s_tok[kDmCap];
+    __shared__ unsigned long long s_p[kDmCap], s_ptr[kDmCap];
+    __shared__ int32_t s_ng, s_ne;
+    __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
+    const int tid = threadIdx.x, n = a.n_tok * a.k;
+    const bool lead = blockIdx.x == 0;
+    if (!lead) pdl_trigger();   // the lead block lets the SwiGLU and down launches start once the plan is out
+    const uint32_t* s_grid = gu2::stage_grid<TG>(s_grid_buf, tid);
+    if (tid == 0 && (int) blockIdx.x * 16 < a.n_expert)   // the layer's table into L2
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + blockIdx.x * 16));
+    pdl_wait();
+    if (tid < n) s_ids[tid] = __ldcg(a.ids + tid);
+    __syncthreads();
+    if (tid < n) {
+        const int32_t e = s_ids[tid];
+        bool ok = e >= 0 && e < a.n_expert;
+        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
+        const unsigned long long p = ok ? a.ptab[e] : 0ull;
+        s_p[tid] = p;
+        s_kind[tid] = p != 0ull ? 0 : -1;
+    }
+    __syncthreads();
+    dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
+    if (tid < n && s_kind[tid] == 0) {
+        s_tok[s_pos[tid]] = tid / a.k;
+        if (s_first[tid]) s_ptr[s_gidx[tid]] = s_p[tid];
+    }
+    __syncthreads();
+    const int ng = s_ng;
+    if (lead) {
+        DmPlan* P = a.plan;
+        if (tid < n && s_kind[tid] == 0) {
+            P->dst[s_pos[tid]] = tid;
+            P->tok[s_pos[tid]] = tid / a.k;
+        }
+        if (tid < ng) P->ptr[tid] = s_ptr[tid];
+        if (tid <= ng) P->start[tid] = s_start[tid];
+        if (tid == 0) {
+            P->counts[0] = ng;
+            P->counts[1] = s_ne;
+        }
+        __threadfence();
+        __syncthreads();
+        pdl_trigger();
+    }
+    const int warp = tid >> 5, lane = tid & 31, nx = (int) (2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS;
+    const int items = nx * min(gy, ng);
+    const auto* xq = (const block_q8_1*) a.xq;
+    for (int it = blockIdx.x; it < items; it += gridDim.x) {
+        const int bx = it % nx, by = it / nx;
+        const int row = bx * GU2_ROWS + 2 * warp;   // rows row, row + 1: both gate or both up
+        if (row >= 2 * L.n_ff) continue;
+        for (int g = by; g < ng; g += gy)
+            gu2::pair<TG>((const uint8_t*) s_ptr[g], row, s_start[g], s_start[g + 1], s_tok, xq, L, gate, up, s_grid,
+                          lane);
+    }
+}
+
+// co-resident blocks on the current device, an eighth of the SMs left to the side streams (shared expert, ring)
+template<int TG> int dm_glue_blocks() {
+    static int b[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
+    if (b[dev] == 0) {
+        int sms = 0, per = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_glue_gu_kernel<TG>, 256, 0) != cudaSuccess) {
+            cudaGetLastError();
+            return 0;
+        }
+        b[dev] = std::max(1, (sms - sms / 8) * per);
+    }
+    return b[dev];
 }
 
 // ---------------------------------------------------------------- the grouped rows, one work item at a time
@@ -1343,6 +1431,60 @@ void dec_moe_route(const DmRouteArgs& a, void* stream) {
     if (pdl2_mask() & 32) launch_pdl(dm_route_kernel, grid, dim3(kDmThreads), 0, (cudaStream_t) stream, a);
     else dm_route_kernel<<<grid, kDmThreads, 0, (cudaStream_t) stream>>>(a);
     check("dec_moe_route");
+}
+
+bool dec_moe_glue_ok(const NativeExpertLayout& L) {
+    const bool tg = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22;
+    bool td = false;
+    switch (L.d_type) {
+#define STRATA_DM_OK(T) case T: td = kSplit<T>; break;
+        STRATA_DM_D_FMTS(STRATA_DM_OK)
+#undef STRATA_DM_OK
+        default: break;
+    }
+    return tg && td && gu2_usable(L) && L.n_ff == 640 && g_gu2 >= 2 && !g_old_kernels && !g_grouped_v1 &&
+           g_exp_phase == 0;
+}
+
+void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratch, float* out, int cap, void* stream) {
+    if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap) {
+        std::fprintf(stderr, "dec_moe_glue: %d entries, cap %d\n", a.n_tok * a.k, cap);
+        std::exit(1);
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    const size_t f = (size_t) cap * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
+    float* gate = (float*) scratch;
+    float* up = (float*) ((uint8_t*) scratch + fa);
+    block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
+    const int gy = g_dec_gy > 0 ? std::min(cap, g_dec_gy) : cap;
+    const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * gy;
+    static const int blocks_env = [] { const char* v = std::getenv("STRATA_DEC_GLUE_BLOCKS"); return v ? std::atoi(v) : 0; }();
+    auto go = [&](auto kernel, int resident) {
+        const int nb = std::max(1, std::min(items, blocks_env > 0 ? blocks_env : resident));
+        launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, gy);
+    };
+    switch (L.gu_type) {
+        case 16: go(dm_glue_gu_kernel<16>, dm_glue_blocks<16>()); break;
+        case 17: go(dm_glue_gu_kernel<17>, dm_glue_blocks<17>()); break;
+        case 18: go(dm_glue_gu_kernel<18>, dm_glue_blocks<18>()); break;
+        case 21: go(dm_glue_gu_kernel<21>, dm_glue_blocks<21>()); break;
+        default: go(dm_glue_gu_kernel<22>, dm_glue_blocks<22>()); break;
+    }
+    check("dec_moe_glue/gu");
+    const DmPlan* P = a.plan;
+    const long long nh = (long long) cap * L.n_ff;
+    launch_dependent(swiglu_q8_1_entries_pdl_kernel, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
+                     (const float*) up, (const int32_t*) P->start, (const int32_t*) P->counts, (int) L.n_ff, hq);
+    check("dec_moe_glue/swiglu");
+    const int d_rows = L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8);
+    const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
+    switch (L.d_type) {
+#define STRATA_DM_DOWN(T) case T: launch_down<T>(gd, s, P->ptr, P->start, P->counts, P->dst, hq, L, out, true); break;
+        STRATA_DM_D_FMTS(STRATA_DM_DOWN)
+#undef STRATA_DM_DOWN
+        default: std::fprintf(stderr, "dec_moe_glue: down %d\n", L.d_type); std::exit(1);
+    }
+    check("dec_moe_glue/down");
 }
 
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,

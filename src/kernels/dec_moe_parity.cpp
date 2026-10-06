@@ -700,6 +700,54 @@ int main(int argc, char** argv) {
                 std::printf("  bench: combine T=%d (%d peer, %d cpu rows of %d): %.2f us per launch\n", T, np, nc, n, uc);
             }
 
+            // STRATA_DEC_GLUE: the plan built in the gate/up launch (+ the ring launch's kinds) vs the route's plan,
+            // its rows vs native_expert_grouped's (d_parts2); needs STRATA_DEC_GU2=2
+            if (K::dec_moe_glue_ok(L)) {
+                std::vector<unsigned long long> pt(NE);
+                for (int e = 0; e < NE; ++e)
+                    pt[e] = res0[e] >= 0 ? (unsigned long long) (dv[0].blob + (size_t) res0[e] * L.bytes) : 0ull;
+                unsigned long long* d_pt = dmal<unsigned long long>(NE);
+                ck(cudaMemcpy(d_pt, pt.data(), NE * 8, cudaMemcpyHostToDevice), "ptab");
+                float* d_p4 = dmal<float>((size_t) K::kDmCap * H);
+                void* d_pub = dmal<uint8_t>(xq_stride);
+                ck(cudaMemset(d_plan, 0xee, sizeof(K::DmPlan)), "memset");
+                K::DmRouteArgs r2 = ra;
+                r2.mode = 2; r2.xq_pub = d_pub; r2.kinds = true;
+                K::dec_moe_route(r2, s0);
+                K::DmGlueArgs ga;
+                ga.ids = d_ids; ga.ptab = d_pt; ga.n_tok = T; ga.k = (int) KK; ga.n_expert = (int) NE;
+                ga.plan = d_plan; ga.xq = d_xq2;
+                K::dec_moe_glue(L, ga, dv[0].scr, d_p4, n, s0);
+                ck(cudaStreamSynchronize(s0), "glue");
+                K::DmPlan P2;
+                ck(cudaMemcpy(&P2, d_plan, sizeof P2, cudaMemcpyDeviceToHost), "plan");
+                size_t bad3 = std::memcmp(P.counts, P2.counts, sizeof P.counts) != 0;
+                for (int g = 0; g <= P.counts[0]; ++g) bad3 += P.start[g] != P2.start[g] || (g < P.counts[0] && P.ptr[g] != P2.ptr[g]);
+                for (int e = 0; e < P.counts[1]; ++e) bad3 += P.dst[e] != P2.dst[e] || P.tok[e] != P2.tok[e];
+                for (int i = 0; i < n; ++i) bad3 += P.kind[i] != P2.kind[i];
+                std::snprintf(what, sizeof what, "glue plan T=%d", T);
+                report(what, l, bad3, (size_t) n);
+                const auto a4 = down(d_parts2, (size_t) n * H), b4 = down(d_p4, (size_t) n * H);
+                std::vector<int> rows;
+                for (int i = 0; i < n; ++i) if (kind[i] == 0) rows.push_back(i);
+                std::snprintf(what, sizeof what, "glue rows T=%d (%d groups)", T, P.counts[0]);
+                report(what, l, ndiff_rows(a4, b4, rows), rows.size() * H);
+                if (bench) {
+                    const double ug = time_us(s0, 200, [&] { K::dec_moe_glue(L, ga, dv[0].scr, d_p4, n, s0); });
+                    const double ur = time_us(s0, 200, [&] {
+                        K::DmRouteArgs r1 = ra;
+                        r1.mode = 1;
+                        K::dec_moe_route(r1, s0);
+                        K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok,
+                                                 n, n, d_xq2, dv[0].scr, d_parts2, s0);
+                    });
+                    std::printf("  bench: T=%d route + grouped %.2f us, glue %.2f us\n", T, ur, ug);
+                }
+                cudaFree(d_pt); cudaFree(d_p4); cudaFree(d_pub);
+            } else {
+                std::printf("  glue: skipped (STRATA_DEC_GU2=2 not set or formats)\n");
+            }
+
             // the fused VRAM call vs native_expert_grouped (d_parts2 holds the grouped rows)
             {
                 float* d_p3 = dmal<float>((size_t) K::kDmCap * H);
