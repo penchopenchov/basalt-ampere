@@ -1145,6 +1145,26 @@ class StartNarrator(unittest.TestCase):
 class LoadProgress(unittest.TestCase):
     """The engine's `basalt load:` lines become one bar per target."""
 
+    def test_bars_replace_the_step_lines(self):
+        import contextlib
+        import io
+        from serve.server import narrate_start
+        d = tempfile.mkdtemp()
+        log = Path(d) / "engine.log"
+        log.write_text("basalt load: cuda0 0 100\nbasalt generate: expert arena: resident, 31.64 GiB\n"
+                       "basalt load: cuda0 100 100\nbasalt generate: session is up (engine 1)\n", encoding="utf-8")
+        done, out = threading.Event(), io.StringIO()
+        with contextlib.redirect_stdout(out):
+            t = threading.Thread(target=narrate_start, args=(str(log), 0, [], done))
+            t.start()
+            time.sleep(0.6)
+            done.set()
+            t.join(5)
+        said = out.getvalue()
+        self.assertIn("loading into cuda0", said)
+        self.assertNotIn("loading experts into RAM", said)
+        self.assertNotIn("almost ready", said)
+
     def test_parse(self):
         from serve.server import load_progress
         self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100))
@@ -1174,11 +1194,11 @@ class LoadProgress(unittest.TestCase):
         bars = LoadBars(out)
         bars.update("cuda0", 1 << 30, 4 << 30)
         bars.update("cuda1", 0, 2 << 30)
-        bars.say("[server] almost ready")
+        bars.say("[server] engine starting")
         text = out.getvalue()
         self.assertIn("\x1b[2A", text)                         # moved back over two bars
         self.assertTrue(text.rstrip("\n").endswith("0.0/2.0 GiB"))   # the bars stay last
-        self.assertIn("[server] almost ready\n", text)
+        self.assertIn("[server] engine starting\n", text)
 
 
 class CancelledRead(unittest.TestCase):

@@ -353,9 +353,9 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
     t0 = last = time.time()
     said = set()
 
-    def say(key, text):
+    def say(key, text):   # the step lines stand in for the bars when the engine prints none
         nonlocal last
-        if key not in said:
+        if key not in said and not bars.bars:
             said.add(key)
             last = time.time()
             bars.say(text)
@@ -384,9 +384,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
                     say("cache", f"[server] filling GPU expert cache ({n})")
-                elif "session is up" in line:
-                    say("up", "[server] almost ready")
-        if time.time() - last > heartbeat:
+        if time.time() - last > heartbeat and not bars.bars:
             last = time.time()
             bars.say(f"[server] still starting, {time.time() - t0:.0f} s")
 
