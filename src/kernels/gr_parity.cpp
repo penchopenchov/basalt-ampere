@@ -332,9 +332,8 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         check(cudaMemcpy(s.mixed.data(), d_mixed, s.mixed.size() * sizeof(float), cudaMemcpyDeviceToHost), "multi read mixed");
         return s;
     };
-    // the split read (STRATA_GR_V3=1) sums in another order than the single-token kernel: equal within float
-    // rounding, not to the bit, so it is compared with a relative tolerance; the default kernels bit for bit
-    static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
+    // the multi read's kernels are compared with the single-token kernel bit for bit
+    constexpr bool v3 = false;
     auto close = [](const std::vector<float>& x, const std::vector<float>& y) {
         double worst = 0.0, mag = 1e-30;
         for (size_t i = 0; i < x.size(); ++i) {

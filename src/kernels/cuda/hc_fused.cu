@@ -15,12 +15,10 @@
 
 #include <algorithm>
 #include <cfloat>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -981,119 +979,6 @@ __device__ void cn_lo(const HcFusedArgs& a, const float* cnp, const float* cns, 
 // the plain read's warp, i.e. chunks 16h + l + 32 q (256-byte runs of every row): it forms those lanes' sums in their
 // order, CTA 1 hands its 16 sums per (row, token) to CTA 0 through distributed shared memory, and CTA 0 runs the xor
 // tree from its first step (offset 16: lane l with lane l + 16) on.
-constexpr int SK_QB = 8;                          // q-steps per stage
-constexpr int SK_NSTAGE = D / (SK_QB * 32 * 8);   // 5
-constexpr int SK_CAP = SK_NSTAGE;                 // every stage in flight when it fits
-constexpr int SK_XCH = ROWS * MAXT * 16 * 4;      // the handed-over sums, bytes
-static_assert(ROWS * SK_QB * 16 * 16 == STAGE_W && SK_QB * 16 * 8 * 4 == STAGE_X1, "stage sizes as the plain ring");
-template <int T>
-struct SkRing {
-    static constexpr int BYTES = STAGE_W + T * STAGE_X1;
-    static constexpr int S0 = SMEM / BYTES;
-    static constexpr int S1 = S0 > SK_NSTAGE ? SK_NSTAGE : S0;
-    static constexpr int S = S1 > SK_CAP ? SK_CAP : S1;
-    static constexpr int XCH = S * BYTES;   // offset of the exchange buffer
-    static_assert(XCH + SK_XCH <= SMEM, "exchange buffer after the ring");
-};
-__device__ __forceinline__ int sk_chunk(int s, int jj, int h) {   // jj = q * 16 + l within the stage
-    return (s * SK_QB + (jj >> 4)) * 32 + 16 * h + (jj & 15);
-}
-__device__ __forceinline__ void sk_issue_w(const uint16_t* w, int s, int h, char* slot, int tid) {
-    uint4* W = reinterpret_cast<uint4*>(slot);
-#pragma unroll
-    for (int m = 0; m < 2; ++m) {
-        const int i = tid + THREADS * m, r = i >> 7, jj = i & 127;
-        cp_async16(W + i, w + (size_t) r * D + (size_t) sk_chunk(s, jj, h) * 8);
-    }
-}
-template <int T>
-__device__ __forceinline__ void sk_issue_x(const float* xn, int s, int h, char* slot, int tid) {
-    float4* X = reinterpret_cast<float4*>(slot + STAGE_W);
-#pragma unroll
-    for (int m = 0; m < T; ++m) {
-        const int i = tid + THREADS * m, k = i >> 8, s4 = i & 255, jj = s4 >> 1;
-        cp_async16(X + k * 256 + (s4 & 1) * 128 + jj, xn + (size_t) k * D + (size_t) sk_chunk(s, jj, h) * 8 + (s4 & 1) * 4);
-    }
-}
-template <int T>
-__device__ void sk_down_prologue(const HcFusedArgs& a, int d, int h, int tid, char* ring) {
-    const uint16_t* w = down_rows(a, d);
-    if (w == nullptr) return;
-#pragma unroll
-    for (int s = 0; s < SkRing<T>::S; ++s) sk_issue_w(w, s, h, ring + s * SkRing<T>::BYTES, tid);
-    cp_async_commit();
-}
-// Warp (row r = w & 3, token parity p = w >> 2), lane l: own lane 16h + (l & 15), tokens p + 2 (l >> 4) + 4 i.
-template <int T>
-__device__ void sk_down_main(const HcFusedArgs& a, const float* xn, int d, int h, int tid, char* ring) {
-    constexpr int S = SkRing<T>::S, BYTES = SkRing<T>::BYTES;
-    constexpr int TW = (T + 3) / 4;
-    namespace cg = cooperative_groups;
-    const cg::cluster_group cl = cg::this_cluster();
-    const uint16_t* w = down_rows(a, d);
-    if (w == nullptr) return;   // both CTAs of the pair
-    const int lane = tid & 31, warp = tid >> 5, r = warp & 3, p = warp >> 2, l = lane & 15;
-    const int k0 = p + 2 * (lane >> 4);
-#pragma unroll
-    for (int s = 0; s < S; ++s) {
-        sk_issue_x<T>(xn, s, h, ring + s * BYTES, tid);
-        cp_async_commit();
-    }
-    float acc[TW];
-#pragma unroll
-    for (int i = 0; i < TW; ++i) acc[i] = 0.0f;
-#pragma unroll
-    for (int s = 0; s < SK_NSTAGE; ++s) {
-        cp_async_wait<S - 1>();
-        __syncthreads();
-        const char* slot = ring + (s % S) * BYTES;
-        const uint4* W = reinterpret_cast<const uint4*>(slot) + r * 128;
-        const float4* X = reinterpret_cast<const float4*>(slot + STAGE_W);
-#pragma unroll
-        for (int q = 0; q < SK_QB; ++q) {
-            const int j = q * 16 + l;
-            const uint4 wv = W[j];
-#pragma unroll
-            for (int i = 0; i < TW; ++i) {
-                const int k = k0 + 4 * i;
-                if (k < T) acc[i] += dot8v(wv, X[k * 256 + j], X[k * 256 + 128 + j]);
-            }
-        }
-        __syncthreads();
-        if (s + S < SK_NSTAGE) {
-            char* dst = ring + (s % S) * BYTES;
-            sk_issue_w(w, s + S, h, dst, tid);
-            sk_issue_x<T>(xn, s + S, h, dst, tid);
-        }
-        cp_async_commit();
-    }
-    float* xch = reinterpret_cast<float*>(ring + SkRing<T>::XCH);   // [ROWS][MAXT][16]
-    if (h == 1) {
-        float* rx = cl.map_shared_rank(xch, 0);
-#pragma unroll
-        for (int i = 0; i < TW; ++i) {
-            const int k = k0 + 4 * i;
-            if (k < T) rx[(r * MAXT + k) * 16 + l] = acc[i];
-        }
-    }
-    cl.sync();
-    if (h == 1) return;
-#pragma unroll
-    for (int i = 0; i < TW; ++i) {
-        const int k = k0 + 4 * i;
-        float v = acc[i] + (k < T ? xch[(r * MAXT + k) * 16 + l] : 0.0f);
-#pragma unroll
-        for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-        if (l != 0 || k >= T) continue;
-        if (d < ND - 1) {
-            const float x = v / (float) HC;
-            a.lo[(size_t) k * LR + d * ROWS + r] = x / (1.0f + __expf(-x));
-        } else {
-            a.inject_out[k * HC + r] = v;
-        }
-    }
-}
-
 // The up CTA u of nu: columns [c0, c1) of every stream; its w_up rows [4][nc][40] uint4 in shared memory.
 struct UpSlice {
     int c0, nc;
@@ -2257,149 +2142,6 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
 
 // The split-K read: clusters of two CTAs claim tickets in order - a pair of norm tasks, one down item (split-K over
 // the pair), a pair of up slices, a pair of router items - so the down rows spread over twice the SMs.
-constexpr int SK_NR = 160;                        // router items
-constexpr int SK_RMAX = (NE + SK_NR - 1) / SK_NR; // router rows per item
-template <int T>
-struct SkItems {
-    int ncopy, ntask, nu, down, up, rt, end;   // ticket boundaries
-    __device__ SkItems(int nb, int nu_, bool router) {
-        ncopy = nb / (4 * T) < NCOPY ? nb / (4 * T) : NCOPY;
-        ntask = 4 * T * ncopy;
-        nu = nu_;
-        down = ntask / 2;
-        up = down + ND;
-        rt = up + nu / 2;
-        end = rt + (router ? SK_NR / 2 : 0);
-    }
-};
-
-template <int T>
-__global__ void __launch_bounds__(THREADS, 1) hc_fused_sk_kernel(HcLaunch L) {
-    namespace cg = cooperative_groups;
-    extern __shared__ __align__(128) char smem[];
-    __shared__ __align__(8) uint64_t bars[UP_PIECES + 1];
-    __shared__ float part[WARPS];
-    __shared__ float s_rs;
-    __shared__ int s_tk[2], s_last;
-    const cg::cluster_group cl = cg::this_cluster();
-    const HcFusedArgs& a = L.a;
-    const int b = blockIdx.x, tid = threadIdx.x, nb = L.nb, h = (int) cl.block_rank();
-    unsigned long long* dbg = L.dbg;
-    HcSync* sy = &g_hc_sync[L.slot];
-    const SkItems<T> it(nb, L.nu, a.w_router != nullptr);
-    int* const tk_src = h == 0 ? s_tk : cl.map_shared_rank(s_tk, 0);
-    stamp(dbg, b, 0, tid);
-    if (tid == 0) {
-        for (int p = 0; p <= UP_PIECES; ++p) mbar_init(&bars[p], 1);
-        if (h == 0) s_tk[0] = (int) atomicAdd(&sy->q.v, 1u);
-    }
-    cl.sync();
-    int par = 0;
-    int tk = tk_src[0];
-    NormRegs nr;
-    if (tk < it.down) hc_norm_pre(a, (2 * tk + h) & 3, tid, nr);
-    pdl_wait();
-    stamp(dbg, b, 1, tid);
-    unsigned up_ph = 0, rt_ph = 0;
-    bool first = true;
-    while (tk < it.end) {
-        if (tk < it.down) {
-            const int j = 2 * tk + h;
-            if (!first) hc_norm_pre(a, j & 3, tid, nr);
-            hc_norm_task(a, L.xc, (j >> 2) % T, j & 3, j / (4 * T), tid, nr, part, &s_rs, &sy->nload.v);
-            stamp(dbg, b, 10, tid);
-            cta_signal(&sy->norm.v, tid);
-            stamp(dbg, b, 11, tid);
-        } else if (tk < it.up) {
-            const int d = tk - it.down;
-            if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 1;
-            cta_wait(&sy->nload.v, (unsigned) it.ntask, tid);
-            sk_down_prologue<T>(a, d, h, tid, smem);
-            if (L.pf == 1 && tid == 0) {   // the up and router weights into L2 behind this CTA's down weights
-                const int sh = 2 * d + h, nsh = 2 * ND;
-                const size_t mat = (size_t) LR * D * 2, rtb = a.w_router != nullptr ? (size_t) NE * N * 2 : 0;
-                const size_t m16 = mat / 16, r16 = rtb / 16;
-                const size_t u0 = (size_t) sh * m16 / nsh, u1 = (size_t) (sh + 1) * m16 / nsh;
-                if (u1 > u0) prefetch_l2(reinterpret_cast<const char*>(a.w_up) + u0 * 16, (u1 - u0) * 16);
-                const size_t q0 = (size_t) sh * r16 / nsh, q1 = (size_t) (sh + 1) * r16 / nsh;
-                if (q1 > q0) prefetch_l2(reinterpret_cast<const char*>(a.w_router) + q0 * 16, (q1 - q0) * 16);
-            }
-            cta_wait(&sy->norm.v, (unsigned) it.ntask, tid);
-            stamp(dbg, b, 2, tid);
-            sk_down_main<T>(a, L.xc + (size_t) (d % it.ncopy) * MAXT * D, d, h, tid, smem);
-            cp_async_wait<0>();
-            if (h == 0) cta_signal(&sy->down.v, tid);
-            stamp(dbg, b, 3, tid);
-        } else if (tk < it.rt) {
-            const UpSlice sl = up_slice(2 * (tk - it.up) + h, it.nu);
-            if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 2;
-            hc_up_pre<T>(a, sl, tid, smem);
-            if (tid == 0) hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph);
-            up_ph ^= 1u;
-            __syncthreads();
-            stamp(dbg, b, 2, tid);
-            if (L.ups) hc_up_main<T, true>(a, sl, tid, smem, true, dbg, b);
-            else hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
-            cta_signal(&sy->up.v, tid);
-            stamp(dbg, b, 3, tid);
-        } else {
-            const int r = 2 * (tk - it.rt) + h, e0 = r * NE / SK_NR, e1 = (r + 1) * NE / SK_NR;
-            char* const rt_p = smem + SK_RMAX * N * 2;
-            if (tid == 0) {
-                const unsigned bytes = (unsigned) (e1 - e0) * N * 2;
-                mbar_expect_tx(&bars[UP_PIECES], bytes);
-                bulk_g2s(smem, a.w_router + (size_t) e0 * N, bytes, &bars[UP_PIECES]);
-            }
-            cta_wait(&sy->up.v, (unsigned) it.nu, tid);
-            mbar_wait(&bars[UP_PIECES], rt_ph);
-            rt_ph ^= 1u;
-            stamp(dbg, b, 4, tid);
-            hc_router_rows<T, SK_RMAX>(a, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p));
-            stamp(dbg, b, 5, tid);
-            __syncthreads();
-            if (tid == 0) {
-                __threadfence();
-                s_last = atomicAdd(&sy->router.v, 1u) == (unsigned) SK_NR - 1;
-                if (s_last) __threadfence();
-            }
-            __syncthreads();
-            if (s_last) {
-                stamp(dbg, b, 8, tid);
-                if ((tid >> 5) < T)
-                    hc_top10(a.logits + (size_t) (tid >> 5) * NE, a.ids + (size_t) (tid >> 5) * KT,
-                             a.weights + (size_t) (tid >> 5) * KT, tid & 31,
-                             reinterpret_cast<uint32_t*>(rt_p + SK_RMAX * MAXT * WARPS * 4) + (tid >> 5) * (2 * NE + 2 * KT),
-                             tid < 32 ? dbg : nullptr, b);
-                __syncthreads();
-                stamp(dbg, b, 6, tid);
-            }
-        }
-        first = false;
-        __syncthreads();
-        par ^= 1;
-        if (h == 0 && tid == 0) s_tk[par] = (int) atomicAdd(&sy->q.v, 1u);
-        cl.sync();
-        tk = tk_src[par];
-    }
-
-    if (tid == 0) {
-#pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            if (a.pf[r] == nullptr || a.pf_bytes[r] < 16) continue;
-            const size_t n16 = a.pf_bytes[r] / 16, lo16 = (size_t) b * n16 / nb, hi16 = (size_t) (b + 1) * n16 / nb;
-            if (hi16 > lo16) prefetch_l2((const char*) a.pf[r] + lo16 * 16, (hi16 - lo16) * 16);
-        }
-    }
-    stamp(dbg, b, 7, tid);
-    if (tid == 0) {
-        __threadfence();
-        if (atomicAdd(&sy->exit.v, 1u) == (unsigned) nb - 1) {
-            sy->q.v = 0; sy->norm.v = 0; sy->down.v = 0; sy->up.v = 0; sy->router.v = 0; sy->nload.v = 0; sy->exit.v = 0;
-            __threadfence();
-        }
-    }
-}
-
 __global__ void hc_l2_prefetch_kernel(const void* p0, size_t n0, const void* p1, size_t n1, const void* p2, size_t n2,
                                       const void* p3, size_t n3) {
     if (threadIdx.x != 0) return;
@@ -2420,69 +2162,20 @@ constexpr KernelFn kKernels[MAXT] = {hc_fused_kernel<1, false>, hc_fused_kernel<
 constexpr KernelFn kKernels8[MAXT] = {hc_fused_kernel<1, true>, hc_fused_kernel<2, true>, hc_fused_kernel<3, true>,
                                        hc_fused_kernel<4, true>, hc_fused_kernel<5, true>, hc_fused_kernel<6, true>,
                                        hc_fused_kernel<7, true>, hc_fused_kernel<8, true>};
-constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel<2>, hc_fused_sk_kernel<3>,
-                                        hc_fused_sk_kernel<4>, hc_fused_sk_kernel<5>, hc_fused_sk_kernel<6>,
-                                        hc_fused_sk_kernel<7>, hc_fused_sk_kernel<8>};
-// STRATA_DEC_HC_UPS=1: each up row's second chunks formed by the lanes that have none (the same products, fewer
-// instructions).  STRATA_DEC_HC_SK=1: the split-K read.  STRATA_DEC_HC_RPF=1: the down CTAs prefetch the router rows (and, split-K,
-// w_up) into L2 behind their weights.  STRATA_DEC_HC_NU=<n>: the up slices (the down CTAs take the ones past nb - 81).
-// STRATA_DEC_HCX=1: the top-10 as one item after the router rows, claimed by an up CTA that ran its code once while
-// waiting (bitwise).  =2: the router logits formed by the up slices instead (fixed-point sums, no router items).
-// =3: 1 with the up rows on tensor cores; =4: 2 with the up rows on tensor cores (not bitwise, T-independent).
-// STRATA_DEC_HC_XH=1: the norm writes xn in fp16 for the down rows (not bitwise, T-independent).
-// STRATA_DEC_HC2 (bits; the 8-bit read with HCX=3): 1 = down items over half-streams that form R' and x themselves, no
-// norm tasks (cn_rows; not bitwise, T-independent); 4 = the 8-bit mma up pass's B fragments formed once per item
-// (bitwise); with 1: 8 = the down items' rows, 16 = the up items' slices by cp.async instead of bulk copies; with 1 and
-// 4: 32 = lo as one f16 part in the up pass (half the mma; not bitwise, T-independent).
-// STRATA_DEC_HC2_UPW=<percent> (with 1): the up items request w_up once that share of the w_down rows is in.
-// STRATA_DEC_HC2_COPIES=<n> (with 1, default 1): copies of the down items' sums.
-// STRATA_DEC_HC3 (bits, with HC2 & 1; bitwise): 1 = each warp's w_down rows by two 2D tensor copies instead of eight
-// bulk copies, or 2 = a w_down item's rows by two tensor copies of thread 0 (not with HC2 & 8); 4 = an up slice by two
-// tensor copies in a chunk layout instead of ~45 bulk copies (not with HC2 & 16); with 4: 8 = the first up slice
-// requested before the previous kernel is waited on; 16 = the up items skip the top-10 dry run (its global loads queue
-// behind the weight copies and hold the up pass's start); with 16: 32 = an up item's copy of the down items' sums by
-// two bulk copies into shared memory (where it fits) instead of every thread's loads; with 4: 128 = the slice's copy
-// waited on after lo is formed (the lo phase overlaps the weights' landing); 256 = the up, router and top-10 items'
-// waits without a full fence after the acquire poll (the barrier after it orders the CTA).
-struct SkConf {
-    bool on = false;
-    int pf = 0, nu = 0, ups = 0, hcx = 0, upmma = 0, xh = 0, hc2 = 0, upw = 0, copies = 1, hc3 = 0;
+// The read's configuration: the router top-10 as one item claimed by an up CTA (hcx 1), the up rows on tensor cores,
+// the norm's xn in fp16 for the down rows.  With the 8-bit copies, the down items run over half-streams and form R'
+// and x themselves (cn), w_down rows by 2D tensor copies per warp, an up slice by tensor copies in a chunk layout, no
+// top-10 dry run in the up items, and an up item's copy of the down items' sums by bulk copies into shared memory.
+struct HcConf {
+    int hcx = 1, upmma = 1, xh = 1;
 };
-const SkConf& sk_conf() {
-    static const SkConf c = [] {
-        SkConf k;
-        const char* e = std::getenv("STRATA_DEC_HC_SK");
-        k.on = e && e[0] == '1';
-        e = std::getenv("STRATA_DEC_HC_RPF");
-        k.pf = e ? std::atoi(e) : 0;
-        e = std::getenv("STRATA_DEC_HC_NU");
-        k.nu = e ? std::atoi(e) : 0;
-        e = std::getenv("STRATA_DEC_HC_UPS");
-        k.ups = e && e[0] == '1' ? 1 : 0;
-        e = std::getenv("STRATA_DEC_HCX");
-        const int x = e && e[0] >= '1' && e[0] <= '4' ? e[0] - '0' : 0;
-        k.hcx = x > 2 ? x - 2 : x;
-        k.upmma = x > 2 ? 1 : 0;
-        e = std::getenv("STRATA_DEC_HC_XH");
-        k.xh = e && e[0] == '1' ? 1 : 0;
-        e = std::getenv("STRATA_DEC_HC2");
-        k.hc2 = e ? (int) std::strtol(e, nullptr, 0) : 0;
-        e = std::getenv("STRATA_DEC_HC2_UPW");
-        k.upw = std::min(std::max(e ? std::atoi(e) : 0, 0), 100);
-        e = std::getenv("STRATA_DEC_HC2_COPIES");
-        k.copies = std::min(std::max(e ? std::atoi(e) : 1, 1), CN_MAXCOPY);
-        e = std::getenv("STRATA_DEC_HC3");
-        k.hc3 = e ? (int) std::strtol(e, nullptr, 0) : 0;
-        return k;
-    }();
-    return c;
-}
+constexpr HcConf kConf{};
 
 unsigned long long* g_dbg = nullptr;
 int g_slot = 0;
 }  // namespace
 
-bool hc_fused_q8_rows_ok() { return !sk_conf().on && sk_conf().hcx == 1; }
+bool hc_fused_q8_rows_ok() { return true; }
 
 namespace {
 
@@ -2531,8 +2224,6 @@ const DevInfo& dev_info() {
         for (int t = 0; t < MAXT && d.ok; ++t)
             d.ok = cudaFuncSetAttribute(kKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess &&
                    cudaFuncSetAttribute(kKernels8[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
-        for (int t = 0; t < MAXT && d.ok && sk_conf().on; ++t)
-            d.ok = cudaFuncSetAttribute(kSkKernels[t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
         cudaGetLastError();
         d.checked = true;
     }
@@ -2595,17 +2286,8 @@ bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
     }
     c.s = reinterpret_cast<uint16_t*>(c.q + n);
     cudaMemset(c.s, 0, (size_t) rows * srow * 2);
-    static const bool stats = std::getenv("STRATA_DEC_HC8_STATS") != nullptr;
-    double* derr = nullptr;
-    if (stats && cudaMalloc((void**) &derr, 2 * sizeof(double)) == cudaSuccess) cudaMemset(derr, 0, 2 * sizeof(double));
-    hc8_quant_kernel<<<(unsigned) ((groups + 255) / 256), 256>>>(w, groups, gpr, srow, c.q, c.s, derr);
+    hc8_quant_kernel<<<(unsigned) ((groups + 255) / 256), 256>>>(w, groups, gpr, srow, c.q, c.s, nullptr);
     cudaDeviceSynchronize();
-    if (derr != nullptr) {
-        double h[2];
-        cudaMemcpy(h, derr, sizeof h, cudaMemcpyDeviceToHost);
-        cudaFree(derr);
-        std::fprintf(stderr, "strata hc8: %d x %d: relative rms error %.3e\n", rows, cols, std::sqrt(h[1] / h[0]));
-    }
     return true;
 }
 
@@ -2628,18 +2310,9 @@ __global__ void hc8_dequant_bf16_kernel(const int8_t* q, const uint16_t* s, int 
 
 }  // namespace
 
-bool hc8_enabled() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_DEC_HC8"); return e && e[0] == '1'; }();
-    return on;
-}
+bool hc8_enabled() { return true; }
 
-bool hc8_only() {
-    static const bool on = [] {
-        const char* k = std::getenv("STRATA_DEC_HC8_KEEP");
-        return hc8_enabled() && !sk_conf().on && !(k && k[0] == '1');
-    }();
-    return on;
-}
+bool hc8_only() { return true; }
 
 void hc8_prepare(const uint16_t* w, int rows, int cols) {
     if (w == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return;
@@ -2701,103 +2374,9 @@ size_t hc8_bytes() {
 }
 
 bool hc_fused_supported() { return dev_info().ok; }
-void dbg_init(int nb);
-void hc_fused_init() {
-    const DevInfo& d = dev_info();
-    if (d.ok) dbg_init(d.sms);
-}
+void hc_fused_init() { (void) dev_info(); }
 
 void hc_fused_set_debug(unsigned long long* dbg) { g_dbg = dbg; }
-
-// STRATA_DEC_HC_DBG=<file>: every captured read stamps its CTAs' phases into its own slot; a thread writes the
-// median over slots (per T and kind) of each phase's min/max over CTAs, relative to the slot's first CTA start.
-constexpr int DBG_SLOTS = 1024;
-struct DbgState {
-    int dev = -1, nb = 0, n = 0;
-    unsigned long long* d = nullptr;
-    int meta[DBG_SLOTS];   // T * 2 + router
-    std::mutex mu;
-};
-DbgState g_insitu;
-void dbg_dump(const char* path) {
-    static const char* const ph[16] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit",
-                                       "ticket", "up-lo", "norm-wr/w-in", "norm-sig/dn-in", "t10-smax", "t10-cand", "t10-rank", "role"};
-    cudaSetDevice(g_insitu.dev);
-    cudaStream_t s;
-    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-    std::vector<unsigned long long> h;
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        int n, nb;
-        { std::lock_guard<std::mutex> lk(g_insitu.mu); n = g_insitu.n; nb = g_insitu.nb; }
-        h.resize((size_t) n * nb * 16);
-        cudaMemcpyAsync(h.data(), g_insitu.d, h.size() * 8, cudaMemcpyDeviceToHost, s);
-        cudaStreamSynchronize(s);
-        FILE* f = std::fopen(path, "w");
-        if (!f) continue;
-        for (int key = 2; key <= 2 * MAXT + 1; ++key) {
-            // per slot: [phase][grp][min,max]
-            std::vector<double> v[16][3][2];
-            int cnt = 0;
-            for (int sl = 0; sl < n; ++sl) {
-                if (g_insitu.meta[sl] != key) continue;
-                const unsigned long long* x = h.data() + (size_t) sl * nb * 16;
-                unsigned long long t0 = ~0ull;
-                for (int b = 0; b < nb; ++b) if (x[b * 16] && x[b * 16] < t0) t0 = x[b * 16];
-                if (t0 == ~0ull) continue;
-                ++cnt;
-                for (int i = 0; i < 16; ++i)
-                    for (int g = 0; g < 3; ++g) {
-                        double mn = 1e30, mx = -1;
-                        for (int b = 0; b < nb; ++b) {
-                            if ((x[b * 16 + 15] >= 2 ? (int) x[b * 16 + 15] - 1 : 0) != g) continue;
-                            if (i == 15 || !x[b * 16 + i] || x[b * 16 + i] < t0) continue;
-                            const double t = (double) (x[b * 16 + i] - t0) / 1e3;
-                            mn = std::min(mn, t); mx = std::max(mx, t);
-                        }
-                        if (mx >= 0) { v[i][g][0].push_back(mn); v[i][g][1].push_back(mx); }
-                    }
-            }
-            if (!cnt) continue;
-            std::fprintf(f, "T %d %s: %d reads (median over reads of min/max over CTAs, us)\n", key / 2,
-                         key & 1 ? "read+router" : "read", cnt);
-            for (int g = 0; g < 3; ++g) {
-                bool any = false;
-                for (int i = 0; i < 16; ++i) any = any || !v[i][g][0].empty();
-                if (!any) continue;
-                std::fprintf(f, "  %s:", g == 2 ? "t10 " : g ? "up  " : "down");
-                for (int i = 0; i < 16; ++i) {
-                    if (v[i][g][0].empty()) continue;
-                    double m[2];
-                    for (int j = 0; j < 2; ++j) {
-                        auto& w = v[i][g][j];
-                        std::nth_element(w.begin(), w.begin() + w.size() / 2, w.end());
-                        m[j] = w[w.size() / 2];
-                    }
-                    std::fprintf(f, " %s %.1f/%.1f", ph[i], m[0], m[1]);
-                }
-                std::fprintf(f, "\n");
-            }
-        }
-        std::fclose(f);
-    }
-}
-void dbg_init(int nb) {   // outside any capture
-    const char* path = std::getenv("STRATA_DEC_HC_DBG");
-    if (path == nullptr || path[0] == 0 || g_insitu.d != nullptr) return;
-    cudaGetDevice(&g_insitu.dev);
-    g_insitu.nb = nb;
-    if (cudaMalloc((void**) &g_insitu.d, (size_t) DBG_SLOTS * nb * 16 * 8) != cudaSuccess) { g_insitu.d = nullptr; return; }
-    cudaMemset(g_insitu.d, 0, (size_t) DBG_SLOTS * nb * 16 * 8);
-    cudaDeviceSynchronize();
-    std::thread(dbg_dump, path).detach();
-}
-unsigned long long* dbg_slot(int T, bool router) {
-    std::lock_guard<std::mutex> lk(g_insitu.mu);
-    if (g_insitu.d == nullptr || g_insitu.n >= DBG_SLOTS) return nullptr;
-    g_insitu.meta[g_insitu.n] = T * 2 + (router ? 1 : 0);
-    return g_insitu.d + (size_t) (g_insitu.n++) * g_insitu.nb * 16;
-}
 
 // cuTensorMapEncodeTiled from the driver; the maps of a read's 8-bit matrices, kept per q_down.
 using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
@@ -2872,10 +2451,6 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         std::fprintf(stderr, "hc_fused_read: invalid arguments or unsupported device\n");
         std::exit(1);
     }
-    if (a.xq != nullptr && !hc_fused_q8_rows_ok()) {
-        std::fprintf(stderr, "hc_fused_read: xq needs the read's up or router items (not split-K, STRATA_DEC_HCX 1 / 3)\n");
-        std::exit(1);
-    }
     HcLaunch L{};
     L.a = a;
     L.nb = d.sms;
@@ -2883,23 +2458,20 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     g_slot = (g_slot + 1) % NSLOT;
     L.xc = d.xc;
     L.dbg = g_dbg;
-    L.ups = sk_conf().ups;
-    L.hcx = sk_conf().hcx;
-    L.upmma = sk_conf().upmma;
-    L.xh = sk_conf().xh && !sk_conf().on;
+    L.ups = 0;
+    L.hcx = kConf.hcx;
+    L.upmma = kConf.upmma;
+    L.xh = kConf.xh;
     L.t10_dummy = d.t10;
     L.t10_scratch = reinterpret_cast<float*>(d.t10 + NE) + NE;
     L.racc = d.racc + (size_t) L.slot * MAXT * NE;
     L.early = pdl2_mask() & (a.T <= 4 ? 3 : 2);   // from 5 tokens the next kernel's early blocks slow the read
     if (a.next_early) L.early |= 1;
-    if (L.dbg == nullptr) L.dbg = dbg_slot(a.T, a.w_router != nullptr);
-    const SkConf& sk = sk_conf();
-    // the 8-bit copies when every matrix of the read has one (the split-K read stays bf16); the prefetches then take
-    // the copies too
+    // the 8-bit copies when every matrix of the read has one; the prefetches then take the copies too
     {
         HcFusedArgs& h = L.a;
         bool q8 = false;
-        if (!sk.on && h.q_down == nullptr && hc8_enabled()) {
+        if (h.q_down == nullptr) {
             q8 = hc8_lookup(a.w_down, &h.q_down, &h.s_down) && hc8_lookup(a.w_up, &h.q_up, &h.s_up) &&
                  (a.w_inject == nullptr || hc8_lookup(a.w_inject, &h.q_inject, &h.s_inject));
             for (int r = 0; q8 && r < 4; ++r) {
@@ -2908,7 +2480,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
                 size_t bytes = 0;
                 if (h.pf[r] != nullptr && hc8_lookup(h.pf[r], &q, &sc, &bytes)) { h.pf[r] = q; h.pf_bytes[r] = bytes; }
             }
-        } else if (!sk.on && h.q_down != nullptr) {
+        } else {
             q8 = h.q_up != nullptr && h.s_down != nullptr && h.s_up != nullptr &&
                  (a.w_inject == nullptr || (h.q_inject != nullptr && h.s_inject != nullptr));
         }
@@ -2923,61 +2495,27 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         if (a.w_inject == nullptr) h.q_inject = nullptr;
     }
     const bool q8 = L.a.q_down != nullptr;
-    L.cn = (sk.hc2 & 1) && q8 && !sk.on && L.upmma && L.hcx == 1 && sk.nu == 0 && L.nb - CN_ND >= CN_MIN_NU;
-    if (L.cn && (sk.hc2 & 8)) L.cn |= 2;
-    if (L.cn && (sk.hc2 & 16)) L.cn |= 4;
-    L.bf = (sk.hc2 & 4) && q8 && !sk.on && L.upmma && L.hcx == 1;
-    if (L.bf && L.cn && (sk.hc2 & 32)) L.bf = 2;
-    L.cn_upw = sk.upw * CN_G * CN_HS * WARPS / 100;
+    L.cn = q8 && L.nb - CN_ND >= CN_MIN_NU ? 1 : 0;
+    L.bf = 0;
+    L.cn_upw = 0;
     L.cnp = d.cn + (size_t) L.slot * CN_SLOT;
     L.cns = L.cnp + (size_t) CN_MAXCOPY * CN_PART;
-    L.cn_copies = sk.copies;
-    L.no_dry = L.cn && (sk.hc3 & 16) ? 1 : 0;
-    L.lo_stage = L.no_dry && (sk.hc3 & 32) ? 1 : 0;
-    L.no_fence = sk.hc3 & 256 ? 1 : 0;
-    if (L.cn && (sk.hc3 & 7)) {
+    L.cn_copies = 1;
+    L.no_dry = L.cn;
+    L.lo_stage = L.cn;
+    L.no_fence = 0;
+    if (L.cn) {
         bool up = false;
         const bool down = cn_maps(L.a, L.tm, up);
-        L.tma = down && (L.cn & 3) == 1 ? sk.hc3 & 3 : 0;
-        if (L.tma == 3) L.tma = 0;
-        L.up_tma = up && (sk.hc3 & 4) && !(L.cn & 4) ? (sk.hc3 & 8 ? 2 : 1) : 0;
-        L.late_w = L.up_tma && (sk.hc3 & 128) ? 1 : 0;
+        L.tma = down ? 1 : 0;
+        L.up_tma = up ? 1 : 0;
+        L.late_w = 0;
     }
-    static const int pre8 = [] { const char* e = std::getenv("STRATA_DEC_HC8_PRE"); return e ? std::atoi(e) : 3; }();
-    L.pre8 = std::min(std::max(pre8, 0), NSTAGE);
-    if (sk.on) {
-        L.nb = d.sms & ~1;
-        const int nu = std::max(MIN_NU, sk.nu > 0 ? sk.nu : L.nb - ND);
-        L.nu = (nu + 1) & ~1;
-        L.pf = sk.pf;
-        const KernelFn fn = kSkKernels[a.T - 1];
-        cudaLaunchAttribute at[2];
-        at[0].id = cudaLaunchAttributeClusterDimension;
-        at[0].val.clusterDim.x = 2; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
-        int na = 1;
-        PdlState& ps = pdl_state();
-        bool pdl = false;
-        if (ps.on) {
-            if (ps.plain > 0) --ps.plain;
-            else pdl = pdl_kernel_ok((const void*) fn);
-        }
-        if (pdl) {
-            at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            at[1].val.programmaticStreamSerializationAllowed = 1;
-            na = 2;
-        }
-        cudaLaunchConfig_t cfg{};
-        cfg.gridDim = dim3((unsigned) L.nb);
-        cfg.blockDim = dim3(THREADS);
-        cfg.dynamicSmemBytes = (size_t) SMEM;
-        cfg.stream = (cudaStream_t) stream;
-        cfg.attrs = at;
-        cfg.numAttrs = na;
-        if (cudaLaunchKernelEx(&cfg, fn, L) == cudaSuccess && pdl) ++pdl_count();
-    } else {
-        L.nu = sk.nu >= MIN_NU && sk.nu <= L.nb ? sk.nu : 0;
+    L.pre8 = std::min(3, NSTAGE);
+    {
+        L.nu = 0;
         if (L.cn && a.xq != nullptr && a.w_router == nullptr && L.nu == 0) L.nu = CN_MIN_NU;   // whole q8_1 blocks
-        L.pf = sk.pf;
+        L.pf = 0;
         launch_pdl((q8 ? kKernels8 : kKernels)[a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM,
                    (cudaStream_t) stream, L);
     }
