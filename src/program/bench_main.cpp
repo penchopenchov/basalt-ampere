@@ -36,6 +36,9 @@
 #ifndef BASALT_BENCH_FIXTURES
 #define BASALT_BENCH_FIXTURES "data/bench"
 #endif
+#if __has_include("basalt_git.h")
+#include "basalt_git.h"
+#endif
 #ifndef BASALT_BENCH_GIT
 #define BASALT_BENCH_GIT "unknown"
 #endif

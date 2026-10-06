@@ -287,19 +287,23 @@ target_link_libraries(basalt PRIVATE engine prefill spec ${_gpu_runtime_target})
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # The standard benchmark: a host-only program that drives the engine over its stdin/stdout protocol.
-execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short=10 HEAD
-                OUTPUT_VARIABLE _bench_git OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-if(NOT _bench_git)
-  set(_bench_git unknown)
-endif()
+# The commit stamp is refreshed on every build (not only at configure time), by a target that rewrites the header
+# only when the commit changed.
+set(_git_stamp ${CMAKE_BINARY_DIR}/stamp/basalt_git.h)
+add_custom_target(git_stamp
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake
+  BYPRODUCTS ${_git_stamp}
+  COMMENT "Refreshing the commit stamp")
+execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 add_executable(basalt-bench src/program/bench_main.cpp)
 set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
-add_dependencies(basalt-bench basalt)
+add_dependencies(basalt-bench basalt git_stamp)
+target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE warnings ${CMAKE_DL_LIBS})
 target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
-  BASALT_BENCH_GIT="${_bench_git}"
   BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   BASALT_BENCH_CUDA="${CMAKE_CUDA_COMPILER_VERSION}")
 
