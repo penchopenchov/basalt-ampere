@@ -1,5 +1,4 @@
 // src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
-#include "strata/core/emulate.hpp"
 #include <cstdlib>
 #include <cstring>
 #include "strata/kernels/qsa_prompt_attn.hpp"
@@ -712,39 +711,11 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
-    bool turing = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
-    {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
-        // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
-        // keeps the old kernel.
-        // #371: the compute capability with its minor - sm_70 (V100) has no m16n8k8 (the kernels trap below sm_75)
-        static int cc[64] = {};
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
-        if (cc[dev] == 0) {
-            int major = 0, minor = 0;
-            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-                cudaGetLastError();
-                return false;
-            }
-            // STRATA_QSA_WARP=1|attn (an A/B arm): the pre-sm_80 kernels on any card, as RTX 20 runs them
-            const char* w = std::getenv("STRATA_QSA_WARP");
-            cc[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) ? 75
-                      : 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
-        }
-        if (cc[dev] < 75) return false;
-        turing = cc[dev] < 80;
-    }
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
-    if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4.  STRATA_PROMPT_ATTN_Q4=0: the old kernel (A/B)
-        static const bool q4_off = [] {
-            const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
-            return v != nullptr && v[0] == '0';
-        }();
-        // sm_80+ only: on Turing mode 4 would run as pairs of m16n8k8 MMAs, which no parity run has checked yet
-        if (q4_off || turing || pools.v_q4 == nullptr) return false;
+    if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4
+        if (pools.v_q4 == nullptr) return false;
         return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V
@@ -753,11 +724,6 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
     if (pools.k_q != nullptr) {
         if (!pools.v_q || !pools.k_scale || !pools.v_scale) return false;
-        // STRATA_PROMPT_ATTN_V1=1 (debug): the first version, same accuracy, another summation order - the control
-        // for how far the model amplifies an FP32-level change.  Turing always takes it: v2's cp.async does not
-        // exist before sm_80.
-        static const bool v1 = std::getenv("STRATA_PROMPT_ATTN_V1") != nullptr;
-        if (v1 || turing) return launch<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (!pools.k_pool || !pools.v_pool) return false;

@@ -280,16 +280,8 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
         std::exit(1);
     }
     const long long nb = n / QK8_0;
-    // STRATA_DEC_DRAFT >= 2: a warp per block (the same bytes)
-    static const bool warp = [] { const char* e = std::getenv("STRATA_DEC_DRAFT"); return e && std::atoi(e) >= 2; }();
-    if (warp) {
-        const unsigned grid = (unsigned) ((nb * 32 + 255) / 256);
-        quantize_q8_0_scaled_warp_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, blocks, scales, nb);
-    } else {
-        const int threads = 128;
-        const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-        quantize_q8_0_scaled_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, blocks, scales, nb);
-    }
+    const unsigned grid = (unsigned) ((nb * 32 + 255) / 256);   // a warp per block
+    quantize_q8_0_scaled_warp_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, blocks, scales, nb);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "quantize_q8_0_scaled launch: %s\n", cudaGetErrorString(e));

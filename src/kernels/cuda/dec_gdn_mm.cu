@@ -126,22 +126,12 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
 struct XSm {
     const int* qs;
     const float* d;
-    const int* s;   // the sum of each block's codes (the relaxed K-format dots)
+    const int* s;   // the sum of each block's codes
     __device__ XSm col(int j, int nb32) const { return XSm{qs + 8 * nb32 * j, d + nb32 * j, s + nb32 * j}; }
     __device__ int isum(int b, int4, int4) const { return s[b]; }
     __device__ int u(int b, int k) const { return qs[8 * b + k]; }
     __device__ int4 u4(int b, int h) const { return reinterpret_cast<const int4*>(qs + 8 * b)[h]; }
     __device__ float d8(int b) const { return d[b]; }
-};
-// bench probe: the same loads, at addresses that do not conflict (wrong values)
-struct XSmProbe {
-    const int* qs;
-    const float* d;
-    __device__ XSmProbe col(int j, int nb32) const { return XSmProbe{qs + 8 * nb32 * j, d + nb32 * j}; }
-    __device__ int isum(int b, int4, int4) const { return b; }
-    __device__ int u(int b, int k) const { return qs[(threadIdx.x & 31) + 32 * (b & 1)]; }
-    __device__ int4 u4(int b, int h) const { return reinterpret_cast<const int4*>(qs)[(threadIdx.x & 31) * 2 + h]; }
-    __device__ float d8(int b) const { return d[b & 7]; }
 };
 struct XGl {
     const Q81Block* x;
@@ -468,117 +458,6 @@ __device__ __forceinline__ void row_dot(int type, const uint8_t* row, const X& x
     }
 }
 
-// ---------------------------------------------------------------- relaxed dots (STRATA_DEC_GDN=2)
-// Lane L takes the 32-value blocks b = L, L + 32, ... of the row: one exact integer dot per block (per 16-value
-// scale group for Q6_K), its float term added to the lane's sum in ascending b, then the butterfly.  The terms are
-// the reference's math with fewer roundings; only IQ3_S (whose reference already sums whole blocks in this order) is
-// bitwise.  A column's value does not depend on the other columns.
-__device__ __forceinline__ int dot8(const int (&c)[8], int4 lo, int4 hi) {
-    int a = STRATA_DP4A(c[0], lo.x, STRATA_DP4A(c[1], lo.y, 0));
-    int b = STRATA_DP4A(c[2], lo.z, STRATA_DP4A(c[3], lo.w, 0));
-    a = STRATA_DP4A(c[4], hi.x, STRATA_DP4A(c[5], hi.y, a));
-    b = STRATA_DP4A(c[6], hi.z, STRATA_DP4A(c[7], hi.w, b));
-    return a + b;
-}
-
-// Q4_K / Q5_K sub-block j of a super-block: the 6-bit scale and min (get_scale_min_k4)
-__device__ __forceinline__ void k4_scale_min(const uint8_t* q, int j, int& sc, int& m) {
-    if (j < 4) {
-        sc = q[j] & 63;
-        m = q[j + 4] & 63;
-    } else {
-        sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
-    }
-}
-
-template<int NC, int NB32, typename X>
-__device__ __forceinline__ void row_relaxed(int type, const uint8_t* row, const X& x, int nb32_rt, int lane,
-                                            float (&acc)[NC]) {
-    const int nb32 = NB32 > 0 ? NB32 : nb32_rt;
-    X xc[NC];
-#pragma unroll
-    for (int j = 0; j < NC; ++j) { xc[j] = x.col(j, nb32); acc[j] = 0.0f; }
-    constexpr int ITERS = NB32 > 0 ? (NB32 + 31) / 32 : 1;
-#pragma unroll
-    for (int it = 0; it < (NB32 > 0 ? ITERS : 1); ++it) {
-        for (int b = lane + 32 * it; b < nb32; b += (NB32 > 0 ? nb32 : 32)) {
-            const int kb = b / 8, j = b % 8;
-            int c[8];
-            if (type == 12 || type == 13) {   // Q4_K / Q5_K: d * sc * q - dmin * m
-                const auto* B = reinterpret_cast<const Q4KBlock*>(row + (size_t) kb * (type == 12 ? 144 : 176));
-                const uint8_t* qs = type == 12 ? B->qs : reinterpret_cast<const Q5KBlock*>(B)->qs;
-                const int* q4 = reinterpret_cast<const int*>(qs + 32 * (j / 2));
-#pragma unroll
-                for (int t = 0; t < 8; ++t) c[t] = (q4[t] >> (4 * (j & 1))) & 0x0f0f0f0f;
-                if (type == 13) {
-                    const int* qh = reinterpret_cast<const int*>(reinterpret_cast<const Q5KBlock*>(B)->qh);
-#pragma unroll
-                    for (int t = 0; t < 8; ++t) c[t] |= ((qh[t] >> j) & 0x01010101) << 4;
-                }
-                int sc, m;
-                k4_scale_min(B->scales, j, sc, m);
-                const float2 dm = __half22float2(B->dm);
-                const float dsc = dm.x * (float) sc, dmm = dm.y * (float) m;
-#pragma unroll
-                for (int q = 0; q < NC; ++q) {
-                    const int4 lo = xc[q].u4(b, 0), hi = xc[q].u4(b, 1);
-                    const int idot = dot8(c, lo, hi);
-                    const int is = xc[q].isum(b, lo, hi);
-                    acc[q] = fmaf(xc[q].d8(b), dsc * (float) idot - dmm * (float) is, acc[q]);
-                }
-            } else if (type == 14) {   // Q6_K: d * sc16 * (q - 32)
-                const auto* B = reinterpret_cast<const Q6KBlock*>(row + (size_t) kb * 210);
-                const int n = j / 4, g = j % 4;
-                const uint8_t* ql = B->ql + 64 * n + 32 * (g & 1);
-                const uint8_t* qh = B->qh + 32 * n;
-#pragma unroll
-                for (int t = 0; t < 8; ++t) {
-                    const int l = (load_int_b2(ql, t) >> (4 * (g >> 1))) & 0x0f0f0f0f;
-                    const int h = ((load_int_b2(qh, t) >> (2 * g)) & 0x03030303) << 4;
-                    c[t] = __vsub4(l | h, 0x20202020);
-                }
-                const int sc0 = B->scales[8 * n + 2 * g], sc1 = B->scales[8 * n + 2 * g + 1];
-                const float d = __half2float(B->d);
-#pragma unroll
-                for (int q = 0; q < NC; ++q) {
-                    const int4 lo = xc[q].u4(b, 0), hi = xc[q].u4(b, 1);
-                    int a0 = STRATA_DP4A(c[0], lo.x, STRATA_DP4A(c[1], lo.y, 0));
-                    int a1 = STRATA_DP4A(c[2], lo.z, STRATA_DP4A(c[3], lo.w, 0));
-                    int b0 = STRATA_DP4A(c[4], hi.x, STRATA_DP4A(c[5], hi.y, 0));
-                    int b1 = STRATA_DP4A(c[6], hi.z, STRATA_DP4A(c[7], hi.w, 0));
-                    const int isc = sc0 * (a0 + a1) + sc1 * (b0 + b1);
-                    acc[q] = fmaf(xc[q].d8(b) * d, (float) isc, acc[q]);
-                }
-            } else if (type == 23) {   // IQ4_XS: the reference's block term
-                const auto* B = reinterpret_cast<const IQ4XSBlock*>(row + (size_t) kb * 136);
-                const int* q4 = reinterpret_cast<const int*>(B->qs) + 4 * j;
-#pragma unroll
-                for (int t = 0; t < 4; ++t) {
-                    const int2 v = iq4_table_lookup(q4[t]);
-                    c[t] = v.x;
-                    c[t + 4] = v.y;
-                }
-                const int ls = (((B->scales_l[j / 2] >> (4 * (j % 2))) & 0xf) | (((B->scales_h >> (2 * j)) & 3) << 4)) - 32;
-                const float dw = __half2float(B->d);
-#pragma unroll
-                for (int q = 0; q < NC; ++q) {
-                    const int4 lo = xc[q].u4(b, 0), hi = xc[q].u4(b, 1);
-                    const int sumi = dot8(c, lo, hi) * ls;
-                    const float d = dw * xc[q].d8(b);
-                    acc[q] += d * sumi;
-                }
-            } else {   // IQ3_S: the reference's call k = b, in its order
-                const IQ3SF::W w = IQ3SF::load(row, kb, 2 * j);
-#pragma unroll
-                for (int q = 0; q < NC; ++q) acc[q] += IQ3SF::apply(w, xc[q], b);
-            }
-        }
-    }
-#pragma unroll
-    for (int j = 0; j < NC; ++j) acc[j] = warp_sum(acc[j]);
-}
-
 // ---------------------------------------------------------------- bulk copies into shared memory
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
@@ -627,8 +506,6 @@ struct DenseArgs {
     const uint8_t* xprep;    // their quant_x_kernel layout, copied into shared memory, or
     const Q81Block* xq;      // q8_1 columns in global memory
     int nslot, slot_bytes;   // the ring
-    int probe;               // bench: 1 stream the rows only, 3 compute only, 4 neither
-    int relaxed;             // the relaxed dots
 };
 
 __device__ __forceinline__ void row_of(const DenseArgs& a, int g, int& m, int& r) {
@@ -680,7 +557,7 @@ __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nbl
     const int x_bytes = SMX ? NC * nb32 * ((int) sizeof(Q81Block) + 4) : 0;
     uint8_t* slots = smem + NW * kSlotsPerWarp * 8 + x_bytes + (size_t) warp * a.nslot * a.slot_bytes;
     const int gw = blk * NW + warp, nwt = nblk * NW;
-    const int nrows = a.probe == 4 ? 0 : a.rows > gw ? (a.rows - gw + nwt - 1) / nwt : 0;
+    const int nrows = a.rows > gw ? (a.rows - gw + nwt - 1) / nwt : 0;
     const uint64_t policy = evict_first_policy();
     auto issue = [&](int k) {
         int m, r;
@@ -696,8 +573,7 @@ __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nbl
         for (int s = 0; s < a.nslot; ++s) mbar_init(bars + s, 1);
         if (SMX && warp == 0) mbar_init(xbar, 1);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-        if (a.probe != 3)
-            for (int k = 0; k < a.nslot && k < nrows; ++k) issue(k);
+        for (int k = 0; k < a.nslot && k < nrows; ++k) issue(k);
     }
     if constexpr (SMX) __syncthreads();   // xbar initialized
     pdl_trigger();
@@ -713,22 +589,15 @@ __device__ __forceinline__ void dense_block(const DenseArgs& a, int blk, int nbl
     }();
     for (int k = 0; k < nrows; ++k) {
         const int s = k % a.nslot;
-        if (a.probe != 3) mbar_wait(bars + s, (uint32_t) (k / a.nslot) & 1u);
+        mbar_wait(bars + s, (uint32_t) (k / a.nslot) & 1u);
         int m, r;
         row_of(a, gw + k * nwt, m, r);
         const uintptr_t src = (uintptr_t) (a.w[m] + (size_t) r * a.row_bytes[m]);
         const uint8_t* row = slots + (size_t) s * a.slot_bytes + (src & 15);
         float acc[NC];
-        if (a.probe == 1) {
-#pragma unroll
-            for (int j = 0; j < NC; ++j) acc[j] = (float) row[lane];
-        } else if (a.relaxed) {
-            row_relaxed<NC, NB * 8>(a.type[m], row, x, nb32, lane, acc);
-        } else {
-            row_dot<NC, NB>(a.type[m], row, x, nb32, a.n_in / QK, lane, acc);
-        }
+        row_dot<NC, NB>(a.type[m], row, x, nb32, a.n_in / QK, lane, acc);
         __syncwarp();
-        if (lane == 0 && k + a.nslot < nrows && a.probe != 3) {
+        if (lane == 0 && k + a.nslot < nrows) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             issue(k + a.nslot);
         }
@@ -765,9 +634,6 @@ int sm_count() {
     return n;
 }
 
-// shared memory the dense kernel leaves free for the next kernel's blocks (STRATA_DEC_GDN_RESERVE, bytes)
-const int g_reserve = [] { const char* v = std::getenv("STRATA_DEC_GDN_RESERVE"); return v ? std::atoi(v) : 0; }();
-
 int smem_optin() {
     static const int n = [] {
         int dev = 0, v = 0;
@@ -783,7 +649,7 @@ void launch_nb(DenseArgs a, cudaStream_t s) {
     constexpr int NW = NC <= 3 ? 16 : 8;
     const int x_bytes = a.x ? NC * (a.n_in / Q8K) * ((int) sizeof(Q81Block) + 4) : 0;
     const int fixed = NW * kSlotsPerWarp * 8 + x_bytes;
-    const int budget = smem_optin() - 1024 - g_reserve;
+    const int budget = smem_optin() - 1024;
     a.nslot = (budget - fixed) / (NW * a.slot_bytes);
     if (a.nslot > kSlotsPerWarp - 1) a.nslot = kSlotsPerWarp - 1;   // the last barrier of the block is the x copy's
     if (a.nslot < 1) { std::fprintf(stderr, "dec_gdn: rows too wide for shared memory\n"); std::exit(1); }
@@ -851,9 +717,6 @@ DenseArgs make_args(const DecMat* m, int n_mats, int n_in) {
         if (a.row_bytes[i] > widest) widest = a.row_bytes[i];
     }
     a.slot_bytes = (widest + 15 + 15) & ~15;
-    static const int probe = [] { const char* v = std::getenv("STRATA_DEC_GDN_PROBE"); return v ? std::atoi(v) : 0; }();
-    a.probe = probe;
-    a.relaxed = dec_gdn_mode() == 2;
     return a;
 }
 
@@ -880,13 +743,7 @@ void dec_dense(const void* xq, int n_in, int n_tok, const DecMat& m, void* strea
     launch(a, n_tok, (cudaStream_t) stream);
 }
 
-int dec_gdn_mode() {
-    static const int m = [] {
-        const char* v = std::getenv("STRATA_DEC_GDN");
-        return v != nullptr ? std::atoi(v) : 0;
-    }();
-    return m;
-}
+int dec_gdn_mode() { return 0; }
 
 bool dec_gdn_enabled() { return dec_gdn_mode() != 0; }
 
