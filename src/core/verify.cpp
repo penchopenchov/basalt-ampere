@@ -1244,6 +1244,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
                     ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
                     ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                    ra.early_trigger = pdl && (pdl2_mask() & 64);   // PDL2: the out projection stages its weights
                     {
                         PdlScope pr(pdl);
                         dec_gdn_rec(ra, n, cs);
