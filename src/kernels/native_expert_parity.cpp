@@ -522,6 +522,62 @@ int check_bf16_embd(cudaStream_t s) {
     return failures;
 }
 
+// the Q6_K token embedding - iq_embed_rows and iq_dequant_f32 on random blocks against ggml's dequantize_row_q6_K
+int check_q6k_embd(cudaStream_t s) {
+    constexpr int kQ6K = 14;
+    const int64_t H = 2560, V = 61, NT = 97;
+    if (!basalt::kernels::embed_type_supported(kQ6K) || basalt::kernels::iq_supported(kQ6K) ||
+        basalt::kernels::iq_row_bytes(kQ6K, H) != (size_t) (H / 256) * 210) {
+        std::printf("q6_K embedding: type support / row bytes wrong\n");
+        return 1;
+    }
+    const size_t rb = basalt::kernels::iq_row_bytes(kQ6K, H);
+    std::mt19937 rng(614);
+    std::vector<uint8_t> table(V * rb);
+    for (auto& b : table) b = (uint8_t) (rng() & 0xff);
+    for (size_t blk = 0; blk < table.size() / 210; ++blk) {   // d (the last two bytes of a block): a finite half
+        const ggml_fp16_t d = ggml_fp32_to_fp16(((float) (rng() % 2000) - 1000.0f) / 4096.0f);
+        std::memcpy(&table[blk * 210 + 208], &d, 2);
+    }
+    std::vector<float> ref((size_t) (V * H));
+    const auto* tg = ggml_get_type_traits(GGML_TYPE_Q6_K);
+    tg->to_float(table.data(), ref.data(), V * H);
+    std::vector<int32_t> tok((size_t) NT);
+    for (auto& t : tok) t = (int32_t) (rng() % V);
+    void* dt = nullptr;
+    int32_t* dtok = nullptr;
+    float* dout = nullptr;
+    cudaMalloc(&dt, table.size());
+    cudaMalloc((void**) &dtok, tok.size() * 4);
+    cudaMalloc((void**) &dout, (size_t) ((NT > V ? NT : V) * H) * 4);
+    cudaMemcpy(dt, table.data(), table.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dtok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice);
+    std::vector<float> got((size_t) ((NT > V ? NT : V) * H));
+    basalt::kernels::iq_embed_rows(kQ6K, dt, rb, dtok, NT, H, dout, s);
+    cudaStreamSynchronize(s);
+    cudaMemcpy(got.data(), dout, (size_t) (NT * H) * 4, cudaMemcpyDeviceToHost);
+    size_t gather_differ = 0;
+    double max_diff = 0.0;
+    for (int64_t r = 0; r < NT; ++r)
+        for (int64_t d = 0; d < H; ++d) {
+            const float a = got[(size_t) (r * H + d)], b = ref[(size_t) (tok[(size_t) r] * H + d)];
+            gather_differ += std::memcmp(&a, &b, 4) != 0;
+            max_diff = (std::max)(max_diff, (double) std::fabs(a - b));
+        }
+    basalt::kernels::iq_dequant_f32(kQ6K, dt, V * H, dout, s);
+    cudaStreamSynchronize(s);
+    cudaMemcpy(got.data(), dout, ref.size() * 4, cudaMemcpyDeviceToHost);
+    size_t flat_differ = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        flat_differ += std::memcmp(&got[i], &ref[i], 4) != 0;
+        max_diff = (std::max)(max_diff, (double) std::fabs(got[i] - ref[i]));
+    }
+    cudaFree(dt); cudaFree(dtok); cudaFree(dout);
+    std::printf("q6_K embedding: %lld gathered rows, %zu values differ; dequant of %lld values, %zu differ; max abs diff %.3g\n",
+                (long long) NT, gather_differ, (long long) (V * H), flat_differ, max_diff);
+    return gather_differ || flat_differ ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -530,7 +586,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
                              "       native_expert_parity --q5_1-min\n"
-                             "       native_expert_parity --bf16-embd\n");
+                             "       native_expert_parity --bf16-embd\n"
+                             "       native_expert_parity --q6k-embd\n");
         return 2;
     }
     int failures = 0;
@@ -541,6 +598,8 @@ int main(int argc, char** argv) {
         failures += check_q5_1_min(s);
     } else if (mode == "--bf16-embd") {
         failures += check_bf16_embd(s);
+    } else if (mode == "--q6k-embd") {
+        failures += check_q6k_embd(s);
     } else if (mode == "--synthetic") {
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];
