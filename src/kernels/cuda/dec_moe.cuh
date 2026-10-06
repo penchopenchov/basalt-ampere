@@ -245,7 +245,8 @@ __device__ void dm_poll_tiers(const DmPlan* plan, const volatile uint32_t* peer_
 }
 
 __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
-                               uint32_t ring, unsigned long long* stats, int layer) {
+                               uint32_t ring, unsigned long long* stats, int layer, int trigger) {
+    if (trigger) pdl_trigger();
     if (stats != nullptr) {
         stats[1] = dm_clock();
         dm_poll_tiers(plan, peer_done, host_flag, ring, stats);
@@ -1576,8 +1577,8 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratc
 }
 
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
-                  uint32_t ring, void* stream, unsigned long long* stats, int layer) {
-    dm_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(plan, peer_done_m, host_flag_m, ring, stats, layer);
+                  uint32_t ring, void* stream, unsigned long long* stats, int layer, bool trigger) {
+    dm_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(plan, peer_done_m, host_flag_m, ring, stats, layer, trigger ? 1 : 0);
     check("dec_moe_wait");
 }
 

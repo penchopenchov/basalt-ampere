@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -120,14 +121,84 @@ __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* 
     if (shared) sum += shared[tk * n_embd + col];
     output[tk * n_embd + col] = sum;
 }
+// STRATA_DEC_GLUE & 4: the same sums, four columns a thread with every row loaded before the first add; DEP: a
+// programmatic dependent of dec_moe_wait - CUDA0's rows, the weights and the shared row (all final once the wait
+// kernel runs) are loaded before pdl_wait, only the mapped tiers' rows after it
+template<int KM, bool DEP>
+__global__ void dm_combine4_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
+                                   const DmPlan* __restrict__ plan, const float* __restrict__ weights,
+                                   const float* __restrict__ shared, float* __restrict__ output, int64_t n_embd, int k) {
+    __shared__ int s_kind[16];
+    const int64_t tk = blockIdx.y;
+    if (threadIdx.x < k) s_kind[threadIdx.x] = plan->kind[tk * k + threadIdx.x];
+    __syncthreads();
+    const int64_t col = 4 * (int64_t(blockIdx.x) * blockDim.x + threadIdx.x);
+    if (col >= n_embd) return;
+    weights += tk * k;
+    float4 v[KM];
+    float w[KM];
+#pragma unroll
+    for (int j = 0; j < KM; ++j) {
+        if (j >= k) break;
+        w[j] = weights[j];
+        if (s_kind[j] == 0) {
+            const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
+            v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
+        }
+    }
+    const float4 h = shared ? *reinterpret_cast<const float4*>(shared + tk * n_embd + col) : make_float4(0.f, 0.f, 0.f, 0.f);
+    if constexpr (DEP) pdl_wait();
+#pragma unroll
+    for (int j = 0; j < KM; ++j) {
+        if (j >= k) break;
+        const int kd = s_kind[j];
+        if (kd != 0) v[j] = __ldcv(reinterpret_cast<const float4*>((kd == 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col));
+    }
+    float sx = v[0].x * w[0], sy = v[0].y * w[0], sz = v[0].z * w[0], sw = v[0].w * w[0];
+#pragma unroll
+    for (int j = 1; j < KM; ++j) {
+        if (j >= k) break;
+        sx += v[j].x * w[j];
+        sy += v[j].y * w[j];
+        sz += v[j].z * w[j];
+        sw += v[j].w * w[j];
+    }
+    if (shared) { sx += h.x; sy += h.y; sz += h.z; sw += h.w; }
+    *reinterpret_cast<float4*>(output + tk * n_embd + col) = make_float4(sx, sy, sz, sw);
+}
+bool dm_combine4_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DEC_GLUE"); return e && (std::atoi(e) & 4); }();
+    return on;
+}
 }  // namespace
 
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
-                     void* stream) {
+                     void* stream, bool dep) {
     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
         throw std::invalid_argument("dec_moe_combine requires a stream, width, 1..15 experts, tokens");
+    if (dm_combine4_on() && peer_done_m == nullptr && n_embd % 4 == 0 && k <= 10) {
+        cudaLaunchAttribute at[1];
+        at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        at[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(unsigned((n_embd / 4 + 127) / 128), (unsigned) n_tok);
+        cfg.blockDim = dim3(128);
+        cfg.stream = static_cast<cudaStream_t>(stream);
+        cfg.attrs = at;
+        cfg.numAttrs = dep ? 1 : 0;
+        const int ki = int(k);
+        if (dep)
+            (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
+                                      shared, output, n_embd, ki);
+        else
+            (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false>, parts, peer_rows_m, cpu_rows_m, plan, weights,
+                                      shared, output, n_embd, ki);
+        const auto error = cudaGetLastError();
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+        return;
+    }
     dm_combine_kernel<<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0,
                         static_cast<cudaStream_t>(stream)>>>(parts, peer_rows_m, cpu_rows_m, plan, weights, shared,
                                                              output, n_embd, int(k), peer_done_m, host_flag_m, ring,

@@ -145,7 +145,8 @@ bool dec_pk() { return dec_pk_mask() != 0; }
 // STRATA_DEC_GLUE (bit mask): 1 = in windows of 2+ tokens with STRATA_DEC_PK & 4, no route launch on the main stream:
 // the hc read's router items write the FFN input's q8_1 rows, the gate/up launch builds CUDA0's plan itself
 // (dec_moe_glue: co-resident blocks, each plans once) and the ring's launch the tiers' kinds; 2 = with 1, the ring's
-// work in one more block of that launch (no ring launch beside)
+// work in one more block of that launch (no ring launch beside); 4 = the combine four columns a thread, launched as
+// the wait kernel's programmatic dependent (its CUDA0 rows loaded while the wait spins)
 int dec_glue_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_GLUE"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -1761,11 +1762,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (m3) {
             stamp(l, 23, grp);
         } else if (dm) {
-            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l);
+            const bool cdep = (dec_glue_mask() & 4) != 0;   // the combine as the wait's programmatic dependent
+            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, cdep);
             stamp(l, 23, grp);
             try {
                 dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
-                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs);
+                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs, cdep);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {

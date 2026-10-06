@@ -699,6 +699,24 @@ int main(int argc, char** argv) {
                 });
                 std::printf("  bench: combine T=%d (%d peer, %d cpu rows of %d): %.2f us per launch\n", T, np, nc, n, uc);
             }
+            {   // the combine without its own wait (verify's call; STRATA_DEC_GLUE & 4 takes the four-column kernel)
+                float* d_bo3 = dmal<float>((size_t) MT * H);
+                K::dec_moe_combine(d_parts, h_peer, h_cpu, d_plan, d_w, d_sh, d_bo3, H, KK, T, nullptr, nullptr, 6, s0);
+                ck(cudaStreamSynchronize(s0), "combine");
+                const auto c3 = down(d_bo3, (size_t) T * H);
+                size_t nd3 = 0;
+                for (size_t i = 0; i < a.size(); ++i) nd3 += std::memcmp(&a[i], &c3[i], 4) != 0;
+                std::snprintf(what, sizeof what, "combine, no wait T=%d", T);
+                report(what, l, nd3, a.size());
+                if (bench) {
+                    const double uc = time_us(s0, 200, [&] {
+                        K::dec_moe_combine(d_parts, h_peer, h_cpu, d_plan, d_w, d_sh, d_bo3, H, KK, T, nullptr, nullptr, 6, s0);
+                    });
+                    std::printf("  bench: combine, no wait T=%d (%d peer, %d cpu rows of %d): %.2f us per launch\n", T, np,
+                                nc, n, uc);
+                }
+                cudaFree(d_bo3);
+            }
 
             // STRATA_DEC_GLUE: the plan built in the gate/up launch (+ the ring launch's kinds) vs the route's plan,
             // its rows vs native_expert_grouped's (d_parts2); needs STRATA_DEC_GU2=2
