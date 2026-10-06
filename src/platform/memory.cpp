@@ -2,7 +2,13 @@
 #include "basalt/platform/memory.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <string>
+#include <thread>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -26,6 +32,60 @@ void unlock_resident(void* p, uint64_t bytes) {
 uint64_t total_physical_memory() {
     const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
     return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
+}
+
+namespace {
+// One "<key>: <n> kB" line of /proc/meminfo in bytes (0 when absent).
+uint64_t meminfo_bytes(const char* key) {
+    std::ifstream in("/proc/meminfo");
+    std::string line;
+    const std::string k = std::string(key) + ":";
+    while (std::getline(in, line))
+        if (line.compare(0, k.size(), k) == 0) return std::strtoull(line.c_str() + k.size(), nullptr, 10) * 1024;
+    return 0;
+}
+}  // namespace
+
+uint64_t available_memory() { return meminfo_bytes("MemAvailable"); }
+
+uint64_t ram_margin() {
+    return std::max<uint64_t>(2ull << 30, meminfo_bytes("MemTotal") / 20);
+}
+
+uint64_t ram_budget(bool* known) {
+    const uint64_t avail = available_memory();
+    if (known) *known = avail > 0;
+    if (avail == 0) return UINT64_MAX;
+    const uint64_t margin = ram_margin();
+    return avail > margin ? avail - margin : 0;
+}
+
+namespace {
+std::atomic<bool> g_watch_stop{false};
+std::atomic<bool> g_watch_on{false};
+}  // namespace
+
+void start_memory_watchdog(uint64_t floor_bytes) {
+    if (g_watch_on.exchange(true)) return;
+    g_watch_stop = false;
+    std::thread([floor_bytes] {
+        while (!g_watch_stop.load()) {
+            const uint64_t avail = available_memory();
+            if (avail > 0 && avail < floor_bytes) {
+                std::fprintf(stderr, "basalt error: RAM ran out while loading (%llu MiB available); stopped to keep the "
+                                     "machine usable. Use --resident-experts or --mmap-experts, or free memory\n",
+                             (unsigned long long) (avail >> 20));
+                std::fflush(stderr);
+                _exit(1);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }).detach();   // never joined: the process may end while it sleeps
+}
+
+void stop_memory_watchdog() {
+    g_watch_stop = true;
+    g_watch_on = false;
 }
 
 namespace {
