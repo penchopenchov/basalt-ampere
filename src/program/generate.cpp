@@ -1604,7 +1604,7 @@ int main(int argc, char** argv) {
     // is a one-token window through the verify path.
     const bool no_spec = o.serve && o.spec < 2;
     if (no_spec) {
-        o.spec = 1;
+        o.spec = 1;   // one-token windows; the verifier is still sized for 2 or more tokens
         o.suffix_draft = 0;
         o.mtp.clear();
     }
@@ -4504,7 +4504,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err);
+                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const basalt::core::OnDevice on(gs.dev);
@@ -4516,7 +4516,7 @@ int main(int argc, char** argv) {
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
                     gs.ver.set_remote_expert_opt(remote_opt.get());
-                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max(o.spec, o.batch), err);
+                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max({o.spec, o.batch, 2}), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -4535,7 +4535,7 @@ int main(int argc, char** argv) {
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err) ||
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
             (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
             std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
             return 1;
