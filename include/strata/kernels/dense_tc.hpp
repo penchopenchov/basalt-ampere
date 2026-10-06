@@ -32,7 +32,8 @@ bool dense_tc_pair_supported(int type0, int type1, int n_in) noexcept;
 void dense_tc_pair(int type0, const void* w0, float* y0, int n_out0, int type1, const void* w1, float* y1, int n_out1,
                    const void* x_q8_1, int n_in, int ncols, void* stream);
 
-/// STRATA_DEC_PAIR (bits, default 0): 16 the hc read before the GDN qkv+z pair lets the pair in at its start, so the
+/// STRATA_DEC_PAIR (bits, default 0): 1 dense_tc_pair with 16 warps per block where 8 leave one block per SM (bitwise
+/// the same sums), 16 the hc read before the GDN qkv+z pair lets the pair in at its start, so the
 /// pair's blocks stage their first tiles on the SMs the read leaves.
 int dense_tc_pair_mask();
 

@@ -95,12 +95,18 @@ struct XFrag {
     float d8[4][2];
 };
 
+// adds each term to its (row, column) sum: acc[q] += mul * val
+struct AccSink {
+    float (&acc)[4];
+    __device__ __forceinline__ void operator()(int, int q, float mul, float val) const { acc[q] += mul * val; }
+};
+
 // Half super-block n (blocks 4n..4n + 3) of the super-blocks at p[0] (row g) and p[1] (row g + 8): the four
-// (row, column) terms added to acc.
-template<int TYPE>
-__device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* const (&p)[2], int n, int t,
-                                              const XFrag& x, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3,
-                                              const uint32_t* grid = nullptr) {
+// (row, column) sums' terms, in order, as sink(block, q, mul, val) (block 0 where one term covers the half).
+template<int TYPE, class Sink>
+__device__ __forceinline__ void half_sb_sink(const Sink& sink, const uint8_t* const (&p)[2], int n, int t,
+                                             const XFrag& x, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3,
+                                             const uint32_t* grid) {
     if constexpr (TYPE == 12 || TYPE == 13) {
         uint32_t qw[2][4], hw[2][2], sw[2][3];
         float2 dm[2];
@@ -150,7 +156,7 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
             const int isum[2] = {__shfl_sync(0xffffffffu, is, 8 * t), __shfl_sync(0xffffffffu, is, 8 * t + 4)};
 #pragma unroll
             for (int q = 0; q < 4; ++q)
-                acc[q] += x.d8[i][q & 1] * (f1[q >> 1] * (float) d[q] - f2[q >> 1] * (float) isum[q & 1]);
+                sink(i, q, x.d8[i][q & 1], f1[q >> 1] * (float) d[q] - f2[q >> 1] * (float) isum[q & 1]);
         }
     } else if constexpr (TYPE == 14) {
         uint32_t lw[2][4], hw[2][2], sw[2][2];
@@ -190,7 +196,7 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
                 part[q] += x.d8[i][q & 1] * (float) (sc0[q >> 1] * e0[q] + sc1[q >> 1] * e1[q]);
         }
 #pragma unroll
-        for (int q = 0; q < 4; ++q) acc[q] += dd[q >> 1] * part[q];
+        for (int q = 0; q < 4; ++q) sink(0, q, dd[q >> 1], part[q]);
     } else if constexpr (TYPE == 21) {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]; 2-byte aligned
         float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         float dw[2];
@@ -216,7 +222,7 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
             for (int q = 0; q < 4; ++q) part[q] += x.d8[i][q & 1] * (float) (d[q] * ls[q >> 1]);
         }
 #pragma unroll
-        for (int q = 0; q < 4; ++q) acc[q] += dw[q >> 1] * part[q];
+        for (int q = 0; q < 4; ++q) sink(0, q, dw[q >> 1], part[q]);
     } else {   // IQ4_XS
         uint32_t qw[2][4];
         int sl[2], shh[2];
@@ -248,8 +254,16 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
             for (int q = 0; q < 4; ++q) part[q] += x.d8[i][q & 1] * (float) (d[q] * ls[q >> 1]);
         }
 #pragma unroll
-        for (int q = 0; q < 4; ++q) acc[q] += dw[q >> 1] * part[q];
+        for (int q = 0; q < 4; ++q) sink(0, q, dw[q >> 1], part[q]);
     }
+}
+
+// the terms added to acc
+template<int TYPE>
+__device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* const (&p)[2], int n, int t,
+                                              const XFrag& x, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3,
+                                              const uint32_t* grid = nullptr) {
+    half_sb_sink<TYPE>(AccSink{acc}, p, n, t, x, t0, t1, t2, t3, grid);
 }
 #endif
 
@@ -773,6 +787,221 @@ __global__ void __launch_bounds__(256) dense_tc_pair_kernel(PairMat m0, PairMat 
 #endif
 }
 
+// dense_tc_pair with 16 warps (STRATA_DEC_PAIR & 1): warps 0-7 as in dense_tc_pair_block; warp w + 8 computes the last
+// chunk of warp w's chunks and hands its terms over through shared memory, which warp w adds after its own chunks in
+// the same order (Q4_K / Q5_K: val per block, mul reloaded; others: mul and val), so every sum is bitwise the same.
+struct FacSink {
+    float* f;   // this lane's terms, 32 floats apart
+    bool q45;
+    __device__ __forceinline__ void operator()(int i, int q, float mul, float val) const {
+        if (q45) {
+            f[(4 * i + q) * 32] = val;
+        } else {
+            f[q * 32] = val;
+            f[(4 + q) * 32] = mul;
+        }
+    }
+};
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+// chunks c0, c0 + 2, .. < c1 of rows g, g + 8 into sink
+template<int TYPE, class Sink>
+__device__ __forceinline__ void pair_chunks(const Sink& sink, const uint8_t* rowA, const uint8_t* rowB, int c0, int c1,
+                                            int hb, int n, int g, int t, const uint8_t* __restrict__ x, int nb32,
+                                            int ncols, const uint32_t* grid, int probe) {
+    constexpr int CB = 2 * Fmt<TYPE>::SB;
+    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    if constexpr (TYPE == 23) {
+        const uint32_t* tbl = reinterpret_cast<const uint32_t*>(dtc_iq4nl);
+        t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3];
+    }
+    rowA += (hb >> 1) * Fmt<TYPE>::SB;
+    rowB += (hb >> 1) * Fmt<TYPE>::SB;
+    for (int c = c0; c < c1; c += 2) {
+        XFrag xf;
+#pragma unroll
+        for (int k4 = 0; k4 < 4; ++k4) {
+            const int k = 16 * c + 4 * hb + k4;
+            xf.b0[k4] = xf.b1[k4] = 0;
+            if (g < ncols) {
+                const uint8_t* xb = x + ((size_t) g * nb32 + k) * kQ81;
+                xf.b0[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 4) + t);
+                xf.b1[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 20) + t);
+            }
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int col = 2 * t + e;
+                xf.d8[k4][e] = col < ncols ? __low2float(__ldg(reinterpret_cast<const half2*>(
+                                                 x + ((size_t) col * nb32 + k) * kQ81)))
+                                           : 0.0f;
+            }
+        }
+        const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
+        if (!(probe & 1)) half_sb_sink<TYPE>(sink, p, n, t, xf, t0, t1, t2, t3, grid);
+    }
+}
+
+// owner warp wp (0-7): its chunks but the last where it has two or more (a helper's)
+template<int TYPE>
+__device__ __forceinline__ void pair_owner(float (&acc)[4], const uint8_t* rowA, const uint8_t* rowB, int wp, int hb,
+                                           int n, int g, int t, const uint8_t* __restrict__ x, int nb32, int nchunk,
+                                           int ncols, const uint32_t* grid, int probe) {
+    const int c0 = wp >> 2, cl = c0 + 2 * ((nchunk - 1 - c0) >> 1);   // first and last chunk
+    pair_chunks<TYPE>(AccSink{acc}, rowA, rowB, c0, cl == c0 ? nchunk : cl, hb, n, g, t, x, nb32, ncols, grid, probe);
+}
+
+// then the helper's terms of the last chunk from fl (this lane's)
+template<int TYPE>
+__device__ __forceinline__ void pair_fold(float (&acc)[4], int wp, int hb, int t, const uint8_t* __restrict__ x,
+                                          int nb32, int nchunk, int ncols, const float* fl) {
+    const int c0 = wp >> 2, cl = c0 + 2 * ((nchunk - 1 - c0) >> 1);
+    if (cl == c0) return;
+    if constexpr (TYPE == 12 || TYPE == 13) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int k = 16 * cl + 4 * hb + i;
+            float d8[2];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int col = 2 * t + e;
+                d8[e] = col < ncols ? __low2float(__ldg(reinterpret_cast<const half2*>(x + ((size_t) col * nb32 + k) * kQ81)))
+                                    : 0.0f;
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[q] += d8[q & 1] * fl[(4 * i + q) * 32];
+        }
+    } else {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) acc[q] += fl[(4 + q) * 32] * fl[q * 32];
+    }
+}
+
+template<int TYPE>
+__device__ __forceinline__ void pair_helper(const uint8_t* rowA, const uint8_t* rowB, int wp, int hb, int n, int g,
+                                            int t, const uint8_t* __restrict__ x, int nb32, int nchunk, int ncols,
+                                            const uint32_t* grid, float* f, int probe) {
+    const int c0 = wp >> 2, cl = c0 + 2 * ((nchunk - 1 - c0) >> 1);
+    if (cl == c0) return;
+    pair_chunks<TYPE>(FacSink{f, TYPE == 12 || TYPE == 13}, rowA, rowB, cl, cl + 1, hb, n, g, t, x, nb32, ncols, grid,
+                      probe);
+}
+
+// block blk of nblk (512 threads); smem: 128 + 4096 + 2048 + 16384 (the helpers' terms) + 2 slots of the larger tile
+__device__ __forceinline__ void dense_tc_pair_h_block(int blk, int nblk, uint8_t* smem, PairMat m0, PairMat m1,
+                                                      const uint8_t* __restrict__ x, int n_in, int ncols, int probe) {
+    uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
+    float* red = reinterpret_cast<float*>(smem + 128);   // [warp][row][column], owner warps
+    uint32_t* grid = reinterpret_cast<uint32_t*>(smem + 128 + 8 * 16 * kMaxCols * 4);
+    float* fac = reinterpret_cast<float*>(smem + 128 + 8 * 16 * kMaxCols * 4 + 2048);   // [owner warp][16][lane]
+    uint8_t* slots = smem + 128 + 8 * 16 * kMaxCols * 4 + 2048 + 8 * 16 * 32 * 4;
+    const int tid = threadIdx.x, wq = tid >> 5, wp = wq & 7, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const bool helper = wq >= 8;
+    const int hb = wp & 3, n = hb & 1;
+    const int nchunk = n_in / 512, nb32 = n_in / 32;
+    const int nt0 = (m0.n_out + 15) / 16, ntiles = nt0 + (m1.n_out + 15) / 16;
+    const int tb0 = 16 * (n_in / 256) * sb_bytes(m0.type), tb1 = 16 * (n_in / 256) * sb_bytes(m1.type);
+    const int slot_bytes = tb0 > tb1 ? tb0 : tb1;
+    const int mine = blk < ntiles ? (ntiles - 1 - blk) / nblk + 1 : 0;
+    float* f = fac + wp * 16 * 32;   // owner wp's terms from its helper
+    if (m0.type == 21 || m1.type == 21)
+        for (int i = tid; i < 512; i += 512) grid[i] = iq3s_grid[i];
+    auto issue = [&](int i) {
+        const int tile = blk + i * nblk;
+        const bool second = tile >= nt0;
+        const PairMat& m = second ? m1 : m0;
+        const int lt = second ? tile - nt0 : tile;
+        const int row_bytes = (n_in / 256) * sb_bytes(m.type);
+        const int rows = min(16, m.n_out - lt * 16);
+        const uint32_t bytes = (uint32_t) ((rows * row_bytes + 15) & ~15);
+        const uint32_t sb = (uint32_t) __cvta_generic_to_shared(slots + (size_t) (i & 1) * slot_bytes);
+        const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1));
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bb), "r"(bytes) : "memory");
+        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                     ::"r"(sb), "l"(m.w + (size_t) lt * 16 * row_bytes), "r"(bytes), "r"(bb) : "memory");
+    };
+    if (tid == 0) {
+        for (int q = 0; q < 2; ++q)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"((uint32_t) __cvta_generic_to_shared(bar + q)));
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        if (!(probe & 2))
+            for (int i = 0; i < 2 && i < mine; ++i) issue(i);
+    }
+    __syncthreads();
+    pdl_wait();
+    for (int i = 0; i < mine; ++i) {
+        const int tile = blk + i * nblk;
+        const bool second = tile >= nt0;
+        const PairMat& m = second ? m1 : m0;
+        const int row0 = (second ? tile - nt0 : tile) * 16;
+        const int row_bytes = (n_in / 256) * sb_bytes(m.type);
+        if (!(probe & 2)) {
+            uint32_t done = 0;
+            const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1)), par = (uint32_t) (i >> 1) & 1u;
+            do {
+                asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+                             " selp.u32 %0, 1, 0, p;\n}" : "=r"(done) : "r"(bb), "r"(par) : "memory");
+            } while (!done);
+        }
+        const uint8_t* slot = slots + (size_t) (i & 1) * slot_bytes;
+        const uint8_t* rowA = slot + g * row_bytes;
+        const uint8_t* rowB = slot + (g + 8) * row_bytes;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#define DTC_PAIR_H(TY)                                                                                              \
+    if (helper) pair_helper<TY>(rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, f + lane, probe);        \
+    else pair_owner<TY>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe)
+        switch (m.type) {
+            case 12: DTC_PAIR_H(12); break;
+            case 13: DTC_PAIR_H(13); break;
+            case 14: DTC_PAIR_H(14); break;
+            case 21: DTC_PAIR_H(21); break;
+            default: DTC_PAIR_H(23); break;
+        }
+#undef DTC_PAIR_H
+        __syncthreads();   // the slot is read and the helpers' terms are in
+        if (tid == 0 && i + 2 < mine && !(probe & 2)) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            issue(i + 2);
+        }
+        if (!helper) {
+            if (!(probe & 1)) {
+                switch (m.type) {
+                    case 12: pair_fold<12>(acc, wp, hb, t, x, nb32, nchunk, ncols, f + lane); break;
+                    case 13: pair_fold<13>(acc, wp, hb, t, x, nb32, nchunk, ncols, f + lane); break;
+                    default: pair_fold<14>(acc, wp, hb, t, x, nb32, nchunk, ncols, f + lane); break;
+                }
+            }
+            float* rw = red + wp * 16 * kMaxCols;
+            rw[g * kMaxCols + 2 * t] = acc[0];
+            rw[g * kMaxCols + 2 * t + 1] = acc[1];
+            rw[(g + 8) * kMaxCols + 2 * t] = acc[2];
+            rw[(g + 8) * kMaxCols + 2 * t + 1] = acc[3];
+        }
+        if (i == mine - 1) pdl_launch_dependents();
+        __syncthreads();   // the warp sums are in (the next tile's writes of red and the terms follow its first barrier)
+        if (tid < 16 * kMaxCols) {
+            const int row = tid / kMaxCols, col = tid % kMaxCols;
+            if (col < ncols && row0 + row < m.n_out) {
+                const float* rr = red + row * kMaxCols + col;
+                constexpr int WS = 16 * kMaxCols;   // one warp's sums
+                const float v = ((rr[0] + rr[4 * WS]) + (rr[WS] + rr[5 * WS])) +
+                                ((rr[2 * WS] + rr[6 * WS]) + (rr[3 * WS] + rr[7 * WS]));
+                m.y[(size_t) col * m.n_out + row0 + row] = v;
+            }
+        }
+    }
+}
+#endif
+
+__global__ void __launch_bounds__(512) dense_tc_pair_h_kernel(PairMat m0, PairMat m1, const uint8_t* __restrict__ x,
+                                                              int n_in, int ncols, int probe) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    extern __shared__ __align__(128) uint8_t smem[];
+    dense_tc_pair_h_block((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
+#elif defined(__CUDA_ARCH__)
+    __trap();
+#endif
+}
+
 // A matrix into L2 for a later kernel: bulk prefetches, then the next kernel let in; the grid ends only after the
 // kernel before it (pdl_wait), so a dependent's pdl_wait still covers that kernel.
 __global__ void __launch_bounds__(32) dense_tc_l2_kernel(const uint8_t* __restrict__ w, size_t bytes) {
@@ -973,6 +1202,19 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
         std::exit(1);
     }
     const int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
+    const PairMat m0{(const uint8_t*) w0, y0, t0, n_out0}, m1{(const uint8_t*) w1, y1, t1, n_out1};
+    const int ntiles = (n_out0 + 15) / 16 + (n_out1 + 15) / 16;
+    // STRATA_DEC_PAIR & 1: 16 warps per block where 8 leave one block per SM
+    if ((g_pair & 1) && 2 * (smem + 1024) > 100 * 1024 && smem + 16384 <= 99 * 1024) {
+        static bool hattr = false;
+        if (!hattr) {
+            cudaFuncSetAttribute(dense_tc_pair_h_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
+            hattr = true;
+        }
+        const int grid = ntiles < sm_count() ? ntiles : sm_count();
+        launch_pdl(dense_tc_pair_h_kernel, dim3((unsigned) grid), dim3(512), (size_t) (smem + 16384),
+                   (cudaStream_t) stream, m0, m1, (const uint8_t*) x_q8_1, n_in, ncols, g_probe);
+    } else {
     static bool attr = false;
     if (!attr) {
         cudaFuncSetAttribute(dense_tc_pair_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
@@ -982,11 +1224,10 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_pair_kernel, 256, smem);
     if (g_bps > 0 && g_bps < occ) occ = g_bps;
     if (occ < 1) occ = 1;
-    const int ntiles = (n_out0 + 15) / 16 + (n_out1 + 15) / 16;
     const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
-    const PairMat m0{(const uint8_t*) w0, y0, t0, n_out0}, m1{(const uint8_t*) w1, y1, t1, n_out1};
     launch_pdl(dense_tc_pair_kernel, dim3((unsigned) grid), dim3(256), (size_t) smem, (cudaStream_t) stream, m0, m1,
                (const uint8_t*) x_q8_1, n_in, ncols, g_probe);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dense_tc_pair: %s\n", cudaGetErrorString(e));
