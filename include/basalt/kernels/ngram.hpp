@@ -184,14 +184,13 @@ private:
 
 // ================================ THE PLE GATHER'S PREFETCH, AND ITS A/B ARM ================================
 //
-// `gather` issues its sixteen row reads as sixteen SEPARATE page faults into a 26.8 GB mapping, which measured
-// **2.10-2.61 ms per token** and is second only to the layer loop among the token's avoidable terms. The table
-// is 90 B per row, so the sixteen rows are 1,440 B - 0.5 MB/s, which is latency and not bandwidth, and it is
-// because the sixteen pages are taken one at a time. `PrefetchVirtualMemory` issues them in one call.
+// `gather` issues its sixteen row reads as sixteen SEPARATE page faults into a 26.8 GB mapping.  The table
+// is 90 B per row, so the sixteen rows are 1,440 B per token: the cost is latency, not bandwidth, and it comes
+// from taking the sixteen pages one at a time.  A prefetch issues them together.
 //
-// **THIS SWITCH EXISTS SO THE CLAIM CAN BE MEASURED RATHER THAN ASSERTED.** Cross-build comparisons in this
-// project have repeatedly turned out to be machine drift - `LAYERS` alone moves 48.9 -> 52.3 between runs of
-// one binary - so the two arms are alternated inside one session. Off is `--no-ple-prefetch`.
+// **THIS SWITCH EXISTS SO THE CLAIM CAN BE MEASURED RATHER THAN ASSERTED.**  Cross-build comparisons are
+// unreliable (run-to-run drift is large), so the two arms are alternated inside one session.  Off is
+// `--no-ple-prefetch`.
 void ple_prefetch_enable(bool on);
 bool ple_prefetch_enabled();
 

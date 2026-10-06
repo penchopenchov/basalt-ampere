@@ -3,7 +3,7 @@
 //
 // The native path spends six kernels per `gr_read` (norm, down MMVF, silu, up MMVF, gate+mean, inject MMVF) and
 // one per `gr_write`, 96 + 96 times per token, and its up projection (10240 rows of 320) runs one 160-thread
-// block per row: 20.6 us for 6.5 MB.  Here:
+// block per row.  Here:
 //
 //   fused_gr_down : R' = R + bo_prev * 2 sigmoid(inj_prev / hc)  (only when `apply`, computed on the fly)
 //                   rs[c] = rsqrt(mean(R'[c]^2) + eps),  xn = R' * w_norm * rs

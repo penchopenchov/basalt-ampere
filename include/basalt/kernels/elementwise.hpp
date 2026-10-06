@@ -48,7 +48,7 @@ void scale_inplace(float* x, int64_t n, float s, void* stream);
 ///
 /// The alternative - having the hit kernel write straight into `parts` - costs the whole overlap, because
 /// the copy of the misses into `parts` cannot happen until the pool has produced them, and the kernel is
-/// then ordered behind that copy.  Measured: the drain fell 18.2 -> 10.2 ms and the token did not move.
+/// then ordered behind that copy.  The CPU drain gets shorter and the token does not move.
 void add_inplace(float* dst, const float* src, int64_t n, void* stream);
 
 /// `y[i] = f16(x[i])`, round-to-nearest-even, using the shared conversion in `f16_bits.hpp`.
@@ -98,9 +98,9 @@ void doorbell_ring(uint32_t* d_seq, void* stream);
 /// hold the whole token (a handoff needs no driver call).
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
 
-/// Plan v0.3 P3 token graph: copy `n` floats from MAPPED pinned host memory (`src` is its device pointer) into
+/// Token graph: copy `n` floats from MAPPED pinned host memory (`src` is its device pointer) into
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
-/// operation, which WDDM submits separately and which measured 67 flushes per token).
+/// operation, which is submitted separately and costs a flush per node).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).

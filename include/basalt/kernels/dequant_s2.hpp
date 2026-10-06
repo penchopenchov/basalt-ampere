@@ -1,7 +1,7 @@
 // include/basalt/kernels/dequant_s2.hpp - the S2 decode, host-callable.
 //
-// S2 is Q2_0's canonical form and 31.64 GiB of the artifact is Q2_0, so this is the hottest decode in the
-// engine.  Plane layout is the pack format: codes packed 4 per byte LSB-first (element i at byte i/4,
+// S2 is Q2_0's canonical form and most of the artifact is Q2_0, so this is the hottest decode in the
+// engine.  Plane layout is: codes packed 4 per byte LSB-first (element i at byte i/4,
 // bits (i%4)*2) and one FP32 scale per group of 64.  Decode is `(code - 1) * scale` with the subtraction in
 // the INTEGER domain, which is what makes it bit-exact.
 #pragma once

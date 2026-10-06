@@ -23,8 +23,8 @@
 //    graph, not the memory.
 //
 // What the registry is FOR: a layer's ops are the same every token, so recording them once and replaying
-// removes the per-call host cost of submitting them individually.  Measured, that cost is 10-22 us PER CALL
-// into the driver on this machine, and a layer with 8 submissions is ~0.1 ms of round trip.
+// removes the per-call host cost of submitting them individually.  Each submission is a driver call, so a layer with
+// many of them pays a round trip per call.
 #pragma once
 
 #include <cstdint>

@@ -74,7 +74,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
 /// Experimental CPU-order implementation. Eight CUDA lanes reproduce the CPU VNNI accumulator lanes,
 /// fused multiply-add order, separate correction, and final horizontal reduction. The input must use
 /// the CPU quantization contract and fp32 scales. SiLU uses accurate CUDA expf, which can differ from
-/// the CPU math library by last bits. End-to-end correctness must be checked against the C1 oracle.
+/// the CPU math library by last bits. End-to-end correctness must be checked against the reference oracle.
 /// Validate both intermediate quantization and final outputs.
 /// Optional gate_up_trace receives [all gates | all ups] before SiLU, for parity diagnostics only.
 /// Plan v0.3 P4 token graph: the hit path with NO host step.  `moe_hit_select` builds this layer's hit list

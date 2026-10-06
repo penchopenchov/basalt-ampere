@@ -434,7 +434,7 @@ struct BlockBuffers {
     uint8_t* head_q8k = nullptr;              ///< `q8k_bytes(n_embd)`: the head's Q8_K activation image
     basalt::kernels::GrWorkspace gr;          ///< `gr_read`'s scratch
 
-    /// THE HALF-LEVEL C1 ORACLE, and it is a HOST buffer of `(2 * n_embd + 2 * hc + n_head * head_dim)` floats
+    /// THE HALF-LEVEL ORACLE, and it is a HOST buffer of `(2 * n_embd + 2 * hc + n_head * head_dim)` floats
     /// PER LAYER: `[0, n_embd)` the attention half's `block_out`, `[n_embd, 2*n_embd)` the MoE half's, the two
     /// `hc`-vectors of `inject`, and finally the QSA layers' PRE-GATE attention (`n_head * head_dim`, unused by
     /// GDN).  The residual ladder (`session_loop`'s `dump_layers`) says WHICH LAYER diverges; this says which
@@ -512,20 +512,19 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
 /// is what lets it be produced DURING this layer rather than before it.
 // ================================ THE PLE (LAYER 1'S PER-LAYER EMBEDDING) ================================
 //
-// **THIS MODULE EXISTED, WAS PARITY-TESTED, AND WAS NEVER CALLED - WHICH IS WHY GATE C1 FAILED.**  Layer 1 is
-// the only layer with `blk.1.ple_*` tensors (six of them) and `block_layer` ran GDN/QSA + GR + MoE without it,
-// so the engine computed a different model.  `ple_parity` verifies all three pieces against things that are
+// **THIS MODULE MUST BE CALLED.**  Layer 1 is the only layer with `blk.1.ple_*` tensors (six of them) and
+// `block_layer` without it runs GDN/QSA + GR + MoE alone, which is a different model.  `ple_parity` verifies all three pieces against things that are
 // not this project's code - the hash against a numpy reference with the artifact's own constants, the IQ4_NL row
 // read against numpy over the original GGUF, and the block against ggml's own graph - and none of that helps
 // if nothing calls it.
 //
-// THE TABLE IS NOT IN THE PACK.  `per_layer_token_embd.weight` is 51.2e9 elements (28.8 GB) of IQ4_NL in the
-// ORIGINAL second GGUF shard, and it is the only tensor this engine reads from the GGUF rather than from the
-// canonical pack.  It is also why the PLE is cheap: sixteen 90-byte rows per token is 1440 bytes of traffic,
+// THE TABLE IS NOT IN THE DENSE POOL.  `per_layer_token_embd.weight` is 51.2e9 elements (28.8 GB) of IQ4_NL,
+// read from the source GGUF section, and it is the only tensor this engine reads from the GGUF rather than from the
+// dense pool.  It is also why the PLE is cheap: sixteen 90-byte rows per token is 1440 bytes of traffic,
 // against the experts' 664 MB.
 struct PleRun {
-    /// Null when the PLE is not wired (no table, or a pack without `blk.1.ple_*`).  Then `block_layer_pre`
-    /// SKIPS the module entirely, which is what every measurement before this change did.
+    /// Null when the PLE is not wired (no table, or a model without `blk.1.ple_*`).  Then `block_layer_pre`
+    /// SKIPS the module entirely.
     basalt::kernels::PleTable* table = nullptr;
     basalt::kernels::PleWeights w;
     /// The session's PLE state, by pointer so `block_layer_pre` needs no `SessionState`.

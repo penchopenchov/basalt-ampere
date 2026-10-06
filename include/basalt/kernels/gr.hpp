@@ -7,10 +7,9 @@
 // puts the mixer's output back into every stream, weighted per stream.
 //
 // WEIGHTS ARE BF16, stored as the high 16 bits of an f32 in a `uint16_t`.  That is not a shortcut: every one
-// of these tensors has source type BF16 in the pack (288 of the shard's 483 BF16 tensors are `hc_*`), so the
-// pack's 32-bit promotion is lossless padding and re-rounding to 16 bits costs nothing.  It is also worth
-// 1.374 GiB of the 5.305 GiB dense file, which is the difference between the dense weights fitting in VRAM
-// beside the expert cache and not fitting at all.
+// of these tensors has source type BF16, so the dense section's 32-bit promotion is lossless padding and
+// re-rounding to 16 bits costs nothing.  It is also worth a large share of the dense weights, which is the
+// difference between them fitting in VRAM beside the expert cache and not fitting at all.
 //
 // The default activation contract is the historical BF16-rounded reference.  The opt-in FP32 contract
 // matches the pinned llama.cpp CUDA single-token BF16 MMVF input precision: BF16 weights multiply FP32

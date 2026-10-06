@@ -31,7 +31,7 @@ struct SamplerParams {
 //
 // **`logits` AND `out` ARE DEVICE POINTERS.**  This is a CUDA kernel launch, not a host function, and nothing
 // in the parameter names or the types says so - `const float* logits` reads exactly like a host buffer.
-// Measured: passing host memory for `logits` faults inside the kernel with an ILLEGAL MEMORY ACCESS that is
+// Passing host memory for `logits` faults inside the kernel with an ILLEGAL MEMORY ACCESS that is
 // reported by whatever synchronising call happens NEXT, which will be somewhere else entirely and will name a
 // buffer that has nothing to do with it.  A sticky async fault does not know where it came from.
 //

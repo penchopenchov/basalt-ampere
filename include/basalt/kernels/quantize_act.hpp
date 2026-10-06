@@ -5,9 +5,9 @@
 // kernels take FP16 activations.  Leaving the two inconsistent means the same token computes different
 // numbers for different experts, so this is the GPU half of the same rule.
 //
-// Q2_0 -> Q8_0 is the case that matters most: the routed experts are all Q2_0, which is 31.64 GiB of the 38
-// GiB pack.  Q8_K is the OTHER HALF of `VEC_DOT_TYPE` (Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS) and covers 2.89 GiB of
-// dense weights - the attention projections and `ssm_out`, i.e. the numerically sensitive ones.
+// Q2_0 -> Q8_0 is the case that matters most: the routed experts are all Q2_0, which is most of the model.
+// Q8_K is the OTHER HALF of `VEC_DOT_TYPE` (Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS) and covers the attention projections
+// and `ssm_out`, i.e. the numerically sensitive dense weights.
 //
 // the activation contract records the decision that BOTH must exist and be used: an FP16 activation
 // against a quantized weight disagrees with the oracle by 0.6-0.9%, which is far outside the 1e-3 tolerance.

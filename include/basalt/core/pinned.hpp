@@ -121,10 +121,10 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed = 14695981039346656
 //
 // THIS IS THE NUMBER THE OBJECTIVE DEPENDS ON.  With one expert per stream, the design's own arithmetic is:
 //
-//     per token: E = 663.6 MB of expert weights, of which only the MISSES cross the bus
-//     miss fraction (1 - h) x 663.6 MB / measured bandwidth = milliseconds per token
+//     per token: E = the expert weights routed, of which only the MISSES cross the bus
+//     miss fraction (1 - h) x E / measured bandwidth = milliseconds per token
 //
-// So `h` (the VRAM hit rate, ~0.167 by design) is only worth anything if a per-expert transfer can actually
+// So `h` (the VRAM hit rate) is only worth anything if a per-expert transfer can actually
 // reach the bus's bandwidth.  A 1,382,400-byte copy is SMALL, and if small copies run at a fraction of large
 // ones then the architecture's central constant is wrong and no kernel optimisation can fix it.  That is what
 // this measures: the same total bytes at several granularities, so the difference is visible.

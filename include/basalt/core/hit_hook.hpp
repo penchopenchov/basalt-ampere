@@ -20,22 +20,20 @@ namespace basalt::core {
 ///          -> hits(Combine)  [GPU: parts += hit_out]
 ///          -> post[l]
 ///
-/// **MEASURED, AND WHY IT IS NOT THE OBVIOUS ORDER.**  The first version called the hit path once, after the
-/// pool, writing straight into `parts`.  The drain duly fell **18.2 -> 10.2 ms** - the CPU really was doing
-/// half the experts - and **the token did not move at all**, because the GPU's half had simply been moved onto
-/// the critical path behind the CPU's instead of beside it.  A second buffer and one `add_inplace` buy the
+/// **WHY IT IS NOT THE OBVIOUS ORDER.**  Calling the hit path once, after the pool, writing straight into
+/// `parts`, shortens the CPU's drain but leaves the token unchanged, because the GPU's half is then on the
+/// critical path behind the CPU's instead of beside it.  A second buffer and one `add_inplace` buy the
 /// overlap back.
 enum class HitPhase { Launch, Combine };
 
 /// `ids` AND `k` ARE THE ROUTER'S OWN OUTPUT, AND THEY ARE WHY THIS HOOK TAKES ARGUMENTS AT ALL.
 ///
-/// The first version took only `(user, stream, phase)` and left the hit/miss decision inside the pool
-/// callback - which runs AFTER `Launch`.  So `Launch` read the hit list from the PREVIOUS layer and computed
-/// the previous layer's experts into the current layer's rows.  It produced a token, the timings looked
-/// plausible, and **C1 moved from mean KL 9.69e-02 to 1.03e+00 and top-1 from 0.867 to 0.333.**  The decision
+/// Leaving the hit/miss decision inside the pool callback - which runs AFTER `Launch` - would make `Launch`
+/// read the hit list from the PREVIOUS layer and compute the previous layer's experts into the current
+/// layer's rows.  That produces a token with plausible timings and a wrecked distribution.  The decision
 /// has to happen in `Launch`, on the ids the doorbell published for THIS layer, and the pool then consumes it.
 ///
-/// A null `HitFn` means "no VRAM tier" - the default, and what every caller had before R4.
+/// A null `HitFn` means "no VRAM tier" - the default.
 using HitFn = void (*)(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k);
 
 }  // namespace basalt::core

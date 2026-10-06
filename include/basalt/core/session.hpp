@@ -261,9 +261,8 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
 /// **WHY THIS EXISTS: TO RULE OUT THE PREFIX TABLE'S OWN BIAS.**  The five-stage table differences prefix
 /// times measured with FIVE DIFFERENT GRAPHS LAUNCHED PER LAYER.  Stage 4's interval therefore contains the
 /// launch of `execs[l]` - the full five-stage graph - while stage 3's contains `preP[3][l]`, a four-stage one.
-/// A launch cost that scales with graph size would inflate stage 4 specifically, and stage 4 is the router,
-/// which is the thing under investigation.  This sweep launches ONE graph type per layer, so there is nothing
-/// to switch between and nothing to attribute wrongly.
+/// A launch cost that scales with graph size would inflate stage 4 specifically.  This sweep launches ONE graph
+/// type per layer, so there is nothing to switch between and nothing to attribute wrongly.
 ///
 /// Five separate sweeps give five totals; their consecutive differences are the stage times on the same
 /// arithmetic as before, and **if the two methods disagree the difference is the bias and the sweep is right.**

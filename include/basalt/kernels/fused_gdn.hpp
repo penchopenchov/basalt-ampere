@@ -2,7 +2,7 @@
 //
 // The native step (after llama.cpp's gated_delta_net.cu) gives each warp one (head, column) and strides its 32
 // lanes over the 128 ROWS of the state, which is stored `[row][head][col]`: every lane's load is 24.5 KB from its
-// neighbour's, so each 32 B sector delivers 4 useful bytes - 47.6 us per layer for 6.3 MB of state traffic.  Here a
+// neighbour's, so each 32 B sector delivers 4 useful bytes.  Here a
 // block owns one whole head, its 512 threads are (row group of 32, column), and a row's 128 columns are one
 // contiguous 512 B load.  With the head in one block, the per-head RMS norm, the norm weight and the sigmoid(z)
 // gate of `gdn_out_norm` run in the same kernel.

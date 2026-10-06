@@ -1,8 +1,8 @@
 // include/basalt/kernels/qsa_decode_attn.hpp - split-K decode attention over the selected cells.
 //
-// The first attention kernel runs one block per query head (24 blocks on a 48-SM part), reads each key row with one
-// thread (uncoalesced) and walks every selected cell serially for the values; at a 4K context (2,051 selected
-// cells) that costs ~0.3-0.5 ms per QSA layer.  This one reads the KV POOLS directly through the page table and the
+// A simple attention kernel runs one block per query head (24 blocks on a 48-SM part), reads each key row with one
+// thread (uncoalesced) and walks every selected cell serially for the values, which is slow at long context.
+// This one reads the KV POOLS directly through the page table and the
 // selection ids (no gather copy), in chunks of CHUNK cells per block, and serves all `n_head / n_head_kv` query
 // heads that share a KV head from one read of the chunk:
 //

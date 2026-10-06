@@ -2,8 +2,8 @@
 // for many queries at once and at long context.
 //
 // The per-token path scores every pooled block with one FP64 block per row (qsa_index_kernel) and selects with a
-// single-block kernel that makes 32 bit-serial passes over every CELL (topk_kernel): ~0.1-0.2 ms per query at 32K,
-// once per QSA layer and token - 1-2 ms of a decode token and most of a 32K prompt's time.  Here:
+// single-block kernel that makes 32 bit-serial passes over every CELL (topk_kernel), once per QSA layer and token - a
+// large share of a decode token and of a long prompt's time.  Here:
 //
 //   qsa_block_scores : one warp per (query, block), FP32; relu per indexer head, summed; block n_bid (the
 //                      incomplete tail) scores the `dead` key and gets +1e9 when it has cells - which is exactly

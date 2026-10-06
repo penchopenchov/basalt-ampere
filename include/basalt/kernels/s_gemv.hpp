@@ -49,8 +49,8 @@ void s_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, const 
 // row, each accumulating a strided subset, reduced through shared memory.
 //
 // WHY BOTH EXIST.  `s_gemv` gives one thread per output row, so its parallelism is the OUTPUT WIDTH - and the
-// expert gate/up shape is [2560 x 640], which is 640 threads over 48 SMs, 13 per SM.  Measured, that
-// orientation ran 4.6x slower than [640 x 2560] with identical weights.  This variant
+// expert gate/up shape is [2560 x 640], which is 640 threads over 48 SMs, 13 per SM.  That
+// orientation runs several times slower than [640 x 2560] with identical weights.  This variant
 // makes the parallelism independent of the output width.
 //
 // It is NOT bit-identical to `s_gemv`: the partial sums are added in a different order, so the parity test
@@ -72,8 +72,8 @@ void s_gemv_split_async(const uint16_t* x, const uint8_t* codes, const float* sc
 ///
 /// the activation contract settles this: `ggml_mul_mat` converts the activation to the weight's
 /// `vec_dot_type`, and for Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS that type is Q8_K - NOT fp16.  The two differ by
-/// 0.6-0.9% per GEMV against a 1e-3 tolerance, and the K-quants are 2.89 GiB of the dense weights: the
-/// attention projections and `ssm_out`, i.e. the numerically sensitive ones.
+/// about 0.6-0.9% per GEMV against a 1e-3 tolerance, and the K-quants are the attention projections and
+/// `ssm_out`, i.e. the numerically sensitive dense weights.
 ///
 /// `x` is the block_q8_K layout, 292 bytes per 256 elements: `{ f32 d ; int8_t qs[256] ; int16_t bsums[16] }`.
 /// `bsums` is NOT read here - it exists for ggml's AVX2 path - but the STRIDE includes it, so a buffer

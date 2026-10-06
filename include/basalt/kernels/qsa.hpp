@@ -108,7 +108,7 @@ inline QsaShapes qsa_real_shapes() {
     s.n_head = 24; s.n_head_kv = 2; s.head_dim = 256; s.n_rot = 64;
     s.idx_n_head = 4; s.idx_dim = 128; s.idx_block = 4; s.idx_top_k = 2048;
     // one page = one indexer block (4 cells): the granule KV streaming keeps resident (kv_stream.hpp). The readers
-    // resolve a row per cell anyway, so the page size costs them nothing (measured: identical output and speed).
+    // resolve a row per cell anyway, so the page size costs them nothing (identical output and speed).
     s.page_size = 4;
     return s;
 }
@@ -310,10 +310,8 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
 /// THE SAME MULTIPLY WITHOUT THE fp16 ROUND, for the caller whose weight wants Q8_K.
 ///
 /// `attn_output` is a K-quant (Q4_K/Q5_K/Q6_K in every QSA layer of this artifact) and its `vec_dot_type` is
-/// **Q8_K, not fp16** - the activation contract is explicit, and the measured cost of getting it wrong is
-/// 0.66-1.41% per GEMV against a 1e-3 tolerance, which is above what Gate C1 allows.  The fp16 form exists
-/// because that is what the engine did first; this one exists because that was a gap, and the caller quantizes
-/// to Q8_K between the two calls.
+/// **Q8_K, not fp16** - the activation contract is explicit, and getting it wrong costs about 1% per GEMV against a 1e-3
+/// tolerance.  The caller quantizes to Q8_K between the two calls.
 ///
 /// The arithmetic is IDENTICAL to `qsa_gate_apply`'s up to the last step, and the multiply is in double in both
 /// - so switching between them changes exactly one rounding, which is the point.
