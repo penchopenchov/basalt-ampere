@@ -105,27 +105,6 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
-namespace {
-struct Fp8Table {
-    float v[256];
-    Fp8Table() {
-        for (int x = 0; x < 256; ++x) {
-            const int s = x >> 7, e = (x >> 3) & 15, m = x & 7;
-            float f;
-            if (e == 15 && m == 7) f = 0.0f;                     // NaN in e4m3fn; never in a real table, read as 0
-            else if (e == 0) f = std::ldexp((float) m / 8.0f, -6);
-            else f = std::ldexp(1.0f + (float) m / 8.0f, e - 7);
-            v[x] = s ? -f : f;
-        }
-    }
-};
-const Fp8Table kFp8;
-}  // namespace
-
-void fp8_e4m3_dequant_row(const uint8_t* row, float scale, float* out160) {
-    for (int j = 0; j < PLE_HEAD_DIM; ++j) out160[j] = kFp8.v[row[j]] * scale;
-}
-
 // ---------------------------------------------------------------------------------------------------
 struct PleTable::Impl {
     GgufFile* file = nullptr;
@@ -147,12 +126,9 @@ struct PleTable::Impl {
     basalt::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
-    bool fp8 = false;                 // F8_E4M3 rows (tools/ple_fp8_pack.py); else IQ4_NL
-    float scale = 1.0f;               // the FP8 table's one scale
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
     void decode(const uint8_t* row, float* out160) const {
-        if (fp8) fp8_e4m3_dequant_row(row, scale, out160);
-        else if (q5_0)
+        if (q5_0)
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
         else iq4nl_dequant_row(row, out160);
     }
@@ -185,34 +161,16 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL (ISTA-DASLab's shard 2, the original's own GGUF), Q5_0 (#296: OrcaRouter's GGUF), or the FP8 table as
-    // shipped: I8 bytes marked strata.ple.format = f8_e4m3 with strata.ple.scale (tools/ple_fp8_pack.py)
-    impl_->fp8 = false;
+    // IQ4_NL or Q5_0 rows
     impl_->q5_0 = std::strcmp(t->type_name(), "Q5_0") == 0;
-    impl_->rb = impl_->q5_0 ? (PLE_HEAD_DIM / 32) * 22 : PLE_ROW_BYTES;
-    if (std::strcmp(t->type_name(), "I8") == 0) {
-        // the keys are "ple.format" / "ple.scale" under the file's own prefix: basalt. (a model file), or the
-        // prefix the older tools/ple_fp8_pack.py files carry
-        const MetaValue* f = impl_->file->get("basalt.ple.format");
-        const MetaValue* s = impl_->file->get("basalt.ple.scale");
-        if (f == nullptr) f = impl_->file->get("strata.ple.format");
-        if (s == nullptr) s = impl_->file->get("strata.ple.scale");
-        if (f == nullptr || f->s != "f8_e4m3" || s == nullptr || !(s->num() > 0.0)) {
-            err = "per_layer_token_embd.weight is I8 without ple.format = f8_e4m3 and a positive ple.scale";
-            close();
-            return false;
-        }
-        impl_->fp8 = true;
-        impl_->scale = (float) s->num();
-        impl_->rb = PLE_ROW_BYTES_FP8;
-    } else if (!impl_->q5_0 && std::strcmp(t->type_name(), "IQ4_NL") != 0) {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0 or FP8 (I8)";
+    impl_->rb = impl_->q5_0 ? PLE_ROW_BYTES_Q5_0 : PLE_ROW_BYTES;
+    if (!impl_->q5_0 && std::strcmp(t->type_name(), "IQ4_NL") != 0) {
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL or Q5_0";
         close();
         return false;
     }
-    // PleReader's row_bytes has been a runtime parameter since the FP8 table (160 B rows) needed it; Q5_0's
-    // 110 B rows go through the exact same generic path (ple_reader_test --selftest covers both 90 and 110 B
-    // rows: straddling, caching, in-flight tickets, keep-alive). This refusal was stale.
+    // PleReader's row_bytes is a runtime parameter: Q5_0's 110 B rows go through the same generic path as the 90 B
+    // IQ4_NL rows (ple_reader_test --selftest covers both: straddling, caching, in-flight tickets, keep-alive).
     impl_->n_rows = t->shape[1];
     impl_->data = impl_->file->tensor_data(*t);
 
@@ -305,12 +263,11 @@ void PleTable::close() {
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
     impl_->q5_0 = false;
-    impl_->fp8 = false;
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
 bool PleTable::locked() const { return impl_->locked; }
-const char* PleTable::format() const { return impl_->fp8 ? "F8_E4M3" : impl_->q5_0 ? "Q5_0" : "IQ4_NL"; }
+const char* PleTable::format() const { return impl_->q5_0 ? "Q5_0" : "IQ4_NL"; }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
