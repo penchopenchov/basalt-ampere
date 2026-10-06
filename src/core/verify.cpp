@@ -1,4 +1,5 @@
 // src/core/verify.cpp - see include/basalt/core/verify.hpp.
+#include "basalt/core/load_progress.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/remote_expert_opt.hpp"
@@ -533,13 +534,27 @@ std::vector<Hc8Tensor> hc8_tensors(const WeightTable& wt, const ModelGeometry& g
 void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
     if (!basalt::kernels::hc8_enabled()) return;
     size_t from_table = 0;
-    for (const Hc8Tensor& t : hc8_tensors(wt, g)) {
+    // the copies' size: the int8 codes and one fp16 scale per 32 values
+    auto copy_bytes = [](const Hc8Tensor& t) { return (uint64_t) t.rows * (uint64_t) t.cols * 9 / 8; };
+    const std::vector<Hc8Tensor> tensors = hc8_tensors(wt, g);
+    uint64_t total = 0;
+    for (const Hc8Tensor& t : tensors)
+        if (wt.find(t.name) != nullptr) total += copy_bytes(t);
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    LoadProgress progress(LoadProgress::cuda(dev), total);
+    for (const Hc8Tensor& t : tensors) {
         const WeightRef* r = wt.find(t.name);
         if (r == nullptr) continue;
         const uint16_t* w = (const uint16_t*) r->data;
-        if (w != nullptr && hc8_table_adopt(t.name, w, t.rows, t.cols) != nullptr) { ++from_table; continue; }
-        basalt::kernels::hc8_prepare(w, t.rows, t.cols);
+        if (w != nullptr && hc8_table_adopt(t.name, w, t.rows, t.cols) != nullptr) {
+            ++from_table;
+        } else {
+            basalt::kernels::hc8_prepare(w, t.rows, t.cols);
+        }
+        progress.add(copy_bytes(t));
     }
+    progress.finish();
     (void) from_table;
     std::fprintf(stderr, "basalt hc8: 8-bit hyper-connection copies, %.0f MiB of VRAM\n",
                  (double) basalt::kernels::hc8_bytes() / 1048576.0);

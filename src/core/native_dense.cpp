@@ -1,4 +1,5 @@
 #include "basalt/core/native_dense.hpp"
+#include "basalt/core/load_progress.hpp"
 #include <cstdlib>
 #include "basalt/core/weights.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
@@ -89,6 +90,23 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     try {
         std::vector<Pending> pending;
         std::set<std::string> seen;
+        // the bytes the uploads below will write (for the progress lines): the same filters, headers only
+        uint64_t plan_total = 0;
+        for (const auto& path : shards) {
+            basalt::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
+                if (!basalt::kernels::native_mmvq_supported(tensor.type) || tensor.shape.size() != 2 ||
+                    tensor.shape[0] == 0 || tensor.shape[0] > INT_MAX || tensor.shape[1] == 0 || tensor.shape[1] > INT_MAX)
+                    continue;
+                plan_total += basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
+                                                                        (int) tensor.shape[1]);
+            }
+        }
+        int load_dev = 0;
+        if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
+        LoadProgress progress(LoadProgress::cuda(load_dev), plan_total);
         int max_in = 0;
         uint64_t total = 0;
         uint64_t split_count = 0, split_tensors = 0;
@@ -187,6 +205,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
+                progress.add(bytes);
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
             }
         }
@@ -205,6 +224,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         }
         scratch_ = scratch.release();
         bytes_ = total;
+        progress.finish();
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();

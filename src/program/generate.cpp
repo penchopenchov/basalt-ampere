@@ -6,6 +6,7 @@
 // There is no tokenizer here: the prompt arrives as ids via `--tokens`, so a logit comparison against a reference runs
 // on the same ids on both sides.
 
+#include "basalt/core/load_progress.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -3148,6 +3149,10 @@ int main(int argc, char** argv) {
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
+        uint64_t fill_total = 0;
+        for (int64_t i = 0; i < want; ++i)
+            fill_total += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+        basalt::core::LoadProgress fill_progress(basalt::core::LoadProgress::cuda(0), fill_total);
         for (int64_t i = 0; i < want; ++i) {
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
@@ -3163,8 +3168,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            fill_progress.add(basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first));
             ++prefilled;
         }
+        fill_progress.finish();
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
@@ -3209,6 +3216,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         int64_t filled = 0;
+        uint64_t stage_fill_total = 0;
+        for (size_t i = 0; i < st.profile.size() && (int64_t) i < st.cache.slots(); ++i)
+            stage_fill_total += lay.blob_bytes(st.profile[i].first);
+        basalt::core::LoadProgress stage_progress(basalt::core::LoadProgress::cuda(st.dev), stage_fill_total);
         for (const auto& pr : st.profile) {
             if (filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
@@ -3219,8 +3230,10 @@ int main(int argc, char** argv) {
                              st.dev, (long long) filled, err.c_str());
                 return 1;
             }
+            stage_progress.add(lay.blob_bytes(pr.first));
             ++filled;
         }
+        stage_progress.finish();
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
                                                  srcp->blob(st.profile[0].first, st.profile[0].second), err,
                                                  (int64_t) lay.blob_bytes(st.profile[0].first))) {

@@ -1,4 +1,5 @@
 // src/core/peer_experts.cpp - see include/basalt/core/peer_experts.hpp.
+#include "basalt/core/load_progress.hpp"
 #include "basalt/core/peer_experts.hpp"
 
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -170,6 +171,9 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     // mapped reads: advise the next kAhead pairs so their reads overlap
     constexpr size_t kAhead = 256;
     const bool advise = src.advise_pairs(pick.data(), (int64_t) std::min(kAhead, pick.size()));
+    uint64_t fill_total = 0;
+    for (const auto& pr : pick) fill_total += lay.blob_bytes(pr.first);
+    LoadProgress progress(LoadProgress::cuda(device), fill_total);
     for (size_t i = 0; i < pick.size(); ++i) {
         const auto& pr = pick[i];
         if (advise && i + kAhead < pick.size()) (void) src.advise_pairs(&pick[i + kAhead], 1);
@@ -181,8 +185,10 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
             return false;
         }
         res_[(size_t) (pr.first * n_expert + pr.second)] = slot;
+        progress.add(lay.blob_bytes(pr.first));
     }
     if (!ck(cudaStreamSynchronize(refill_), "fill", err)) { close(); return false; }
+    progress.finish();
     const auto& f0 = pick.front();
     if (!cache_.verify_slot(res_[(size_t) (f0.first * n_expert + f0.second)], src.blob(f0.first, f0.second), err,
                             (int64_t) lay.blob_bytes(f0.first))) {

@@ -1,3 +1,4 @@
+#include "basalt/core/load_progress.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/remote_expert_opt.hpp"
 
@@ -169,6 +170,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                                      : cache_.open((int64_t) selected.size(), layers, experts,
                                                    (int64_t) lay.max_blob, err);
     if (!cache_ok) { err = "CUDA" + std::to_string(device) + " experts: " + err; close(); return false; }
+    uint64_t fill_total = 0;
+    for (const auto& pair : selected) fill_total += lay.blob_bytes(pair.first);
+    LoadProgress progress(LoadProgress::cuda(device), fill_total);
     for (const auto& pair : selected) {
         const int32_t slot = cache_.admit(pair.first, pair.second);
         const uint8_t* blob = source.blob(pair.first, pair.second);
@@ -177,7 +181,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                   (err.empty() ? "cache fill failed" : err);
             close(); return false;
         }
+        progress.add(lay.blob_bytes(pair.first));
     }
+    progress.finish();
     const auto& first = selected.front();
     if (!cache_.verify_slot(cache_.slot_of(first.first, first.second), source.blob(first.first, first.second),
                             err, (int64_t) lay.blob_bytes(first.first))) {

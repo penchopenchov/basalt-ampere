@@ -1,4 +1,5 @@
 // src/core/pinned.cu - the pinned host arena and the parallel expert load.
+#include "basalt/core/load_progress.hpp"
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -340,6 +341,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
     if (threads < 1) threads = 1;
 
     const auto t0 = std::chrono::steady_clock::now();
+    LoadProgress progress("ram", st.bytes);
     std::vector<uint64_t> layer_hash((size_t) layers, 1469598103934665603ull);
     std::atomic<uint64_t> next_layer{0};
     std::atomic<uint64_t> read_ns_sum{0};   // summed over the threads: see LoadStats::read_seconds
@@ -401,6 +403,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                                std::chrono::steady_clock::now() - t_copy).count();
                 pos += n;
                 remaining -= n;
+                progress.add(n);
             }
             layer_hash[(size_t) L] = h;
         }
@@ -420,6 +423,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
         st.error = err;
         return st;
     }
+    progress.finish();
     st.read_seconds = (double) read_ns_sum.load() / 1e9;
     st.copy_seconds = (double) copy_ns_sum.load() / 1e9;
     st.layer_checksums = std::move(layer_hash);

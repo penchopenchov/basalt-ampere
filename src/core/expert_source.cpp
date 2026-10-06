@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/load_progress.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -751,6 +752,7 @@ bool FileExpertSource::pin_cache_complement(
     }
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
+    LoadProgress progress("ram", bytes);
     std::atomic<bool> failed{false};
     std::mutex fail_mu;
     const auto copy_t0 = std::chrono::steady_clock::now();
@@ -786,6 +788,7 @@ bool FileExpertSource::pin_cache_complement(
                     return;
                 }
                 copied.fetch_add(blob_bytes);
+                progress.add(blob_bytes);
             }
             {   // the layer's pages are not kept in the file cache once copied
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
@@ -826,6 +829,7 @@ bool FileExpertSource::pin_cache_complement(
         release();
         return false;
     }
+    progress.finish();
 
     complement_arena_ = arena;
     complement_host_ = host;

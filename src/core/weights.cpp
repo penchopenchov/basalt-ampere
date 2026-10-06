@@ -1,5 +1,6 @@
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
 #include "basalt/core/weights.hpp"
+#include "basalt/core/load_progress.hpp"
 
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/platform/memory.hpp"
@@ -240,6 +241,9 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     table_.clear();
     report_ = LoadReport{};
 
+    int load_dev = 0;
+    if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
+    LoadProgress progress(LoadProgress::cuda(load_dev), pool);
     const double t_read0 = now_ms();
     double upload_ms = 0;
     for (size_t row_i = 0; row_i < rows.size(); ++row_i) {
@@ -448,6 +452,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                     return false;
                 }
                 upload_ms += now_ms() - u0;
+                progress.add(out_bytes);
                 done += n;
             }
         }
@@ -483,6 +488,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     if (cur) std::fclose(cur);
     cudaFreeHost(stage_in);
     cudaFreeHost(stage_out);
+    progress.finish();
 
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
