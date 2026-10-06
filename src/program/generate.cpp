@@ -1767,8 +1767,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-    // The model's experts are always in their source formats: verify windows only, no per-layer graphs to replay.
-    constexpr bool native_pack = true;
     // Only CUDA1's context is created here, before the large allocations: the later helpers' come after the arena.
     for (int r = 0; r < 1; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
         // Keep CUDA1's proven startup order: initialise its context before
@@ -3469,17 +3467,6 @@ int main(int argc, char** argv) {
 
     // ---- the graphs
     basalt::core::SessionGraphs gr;
-    if (!o.no_capture && !native_pack) {   // a native pack runs verify windows only
-        // a layer split's CUDA0 session owns only [0, split_at[0]), so its graphs cover that range; the
-        // whole-model replay paths (`session_loop`, the plain generate loop) refuse rather than read another
-        // stage's state - a split runs its layers on the stages' verifiers (serve) or prefill stage chain
-        if (!basalt::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, 0,
-                                           multi_gpu ? split_at[0] : -1)) {
-            std::fprintf(stderr, "basalt generate: session_capture: %s\n", err.c_str());
-            return 1;
-        }
-    }
-
     // **`--no-capture` AND THE EXPERTS ARE MUTUALLY EXCLUSIVE, AND SILENTLY SO.**
     //
     // The CPU expert pool is wired into `session_loop` - the host loop around the captured graphs - and
@@ -3651,11 +3638,11 @@ int main(int argc, char** argv) {
         basalt::core::doorbell_reset(db);
         double mix = 0, ffn = 0, post = 0;
         if (!basalt::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
-            // a native (IQ) pack captures no per-layer graphs; the serve path times its window's stages
+            // no per-layer graphs are captured; the serve path times its window's stages
             std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(),
-                         native_pack ? " - a native (IQ) pack has no per-layer graphs to replay. Its decode window's GPU "
-                                       "stages are printed per request by the serve path instead: --profile "
-                                       "--decode-timing with --serve" : "");
+                         " - there are no per-layer graphs to replay. The decode window's GPU "
+                         "stages are printed per request by the serve path instead: --profile "
+                         "--decode-timing with --serve");
             return 1;
         }
         const int reps = 20;
@@ -3957,15 +3944,6 @@ int main(int argc, char** argv) {
         drive.d.host_res = host_res.data();
         std::fprintf(stderr, "basalt generate: token graph hit path: %lld resident experts, decided on the device\n",
                      (long long) resident);
-    }
-    if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&
-        (hit_fn == nullptr || thits.on()) && !native_pack && !multi_gpu) {   // a split's token graph cannot span stages
-        if (!basalt::core::session_capture_token(wt, g, ss, d_parts, loop_scratch.y_miss, loop_scratch.parts_bytes,
-                                                 tgraph, err, thits.on() ? &thits : nullptr)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
-        }
-        std::fprintf(stderr, "basalt generate: token graph captured (48 layers, one launch per token)\n");
     }
 
     // ================================ WHERE THE HOST TERM GOES, PER TOKEN ================================
@@ -4882,7 +4860,6 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         // the peer's experts are candidates too, so the ones a workload routes most move to
         // CUDA0 (from their RAM copy, as any other swap) and its coldest go to the CPU
-        constexpr bool peer_promote = true;
         // routings a peer expert needs above CUDA0's victim before it moves
         constexpr float promote_margin = 10.0f;
         // the round's swaps, best first: per layer the most-routed missing experts against the least-routed resident ones
@@ -4910,7 +4887,7 @@ int main(int argc, char** argv) {
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) {
                         const bool on_peer = peer.valid() && peer.has(l, e);
-                        if (u[e] >= 2.0f && !(on_peer && !peer_promote) && !(remote_opt && remote_opt->owns(l, e)))
+                        if (u[e] >= 2.0f && !(remote_opt && remote_opt->owns(l, e)))
                             cand.emplace_back(on_peer ? u[e] - margin : u[e], e);
                     }
                     else vict.emplace_back(u[e], e);
@@ -4961,7 +4938,7 @@ int main(int argc, char** argv) {
                 host_res[out] = basalt::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
-                if (peer_promote && peer.valid() && peer.has(s.layer, s.in)) promoted.push_back({s.layer, s.in, s.out});
+                if (peer.valid() && peer.has(s.layer, s.in)) promoted.push_back({s.layer, s.in, s.out});
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             (void) main_live;
@@ -5028,7 +5005,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 xq.push_back({s.layer, s.in, s.out, slot, off, xchg,
-                              peer_promote && peer.valid() && peer.has(s.layer, s.in)});
+                              peer.valid() && peer.has(s.layer, s.in)});
             }
             if (!xq.empty()) {
                 cudaEventRecord(adapt_ev, adapt_stream);
@@ -7089,222 +7066,8 @@ int main(int argc, char** argv) {
                      (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
     }
 
-    for (int64_t pos = pos_start;; ++pos) {
-        // a native pack's last prompt token is the first verify window (T = 1)
-        if (native_pack) { spec_pos = pos; break; }
-        if (pos >= o.max_context) {
-            std::fprintf(stderr, "basalt generate: ran out of context at position %lld\n", (long long) pos);
-            return 2;
-        }
-        // THE TOKEN TIMER STARTS HERE, BEFORE ANY OF THE TOKEN'S WORK: the reported rate is a WALL-CLOCK rate,
-        // everything one token costs, PLE advance to sampled id, including the embedding and the PLE window advance
-        // and up to the NaN scan, the logits dump and the sampler.
-        const Clock::time_point t0 = Clock::now();
-        // **THE PLE'S TOKEN WINDOW ADVANCES HERE, ONCE PER TOKEN, AND `ple_stage_token` RUNS OUTSIDE THE
-        // CAPTURE.**  Both are the driver's job: `ngram_rows` is a host hash over the last three tokens and the
-        // table gather is a host read, so either one inside a captured graph would run once at capture time and
-        // replay forever.  `ple_prev` is OLDEST FIRST and `-1` means "no predecessor", which `ngram_rows`
-        // treats as the EOS cut - a sequence boundary.
-        ss.ple_token = (int32_t) tok;
-        Clock::time_point tp = Clock::now();
-        // The SSD reads start here and complete while the embedding is staged; `ms_ple` is the issue plus the time
-        // still spent WAITING afterwards, i.e. the part the embedding did not hide.
-        if (ss.ple.ready() && !basalt::core::ple_issue_token(ss.ple, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
-        }
-        {
-            const Clock::time_point n = Clock::now();
-            ms_ple += std::chrono::duration<double, std::milli>(n - tp).count();
-            tp = n;
-        }
-        if (!put_input(tok, pos)) return 1;
-        {
-            const Clock::time_point n = Clock::now();
-            ms_embed += std::chrono::duration<double, std::milli>(n - tp).count();
-            tp = n;
-        }
-        if (ss.ple.ready() && !basalt::core::ple_finish_token(ss.ple, token_stream, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
-        }
-        {
-            const Clock::time_point n = Clock::now();
-            ms_ple += std::chrono::duration<double, std::milli>(n - tp).count();
-            tp = n;
-        }
-
-        if (pos % 256 == 0 || pos + 1 >= n_prompt - 1)
-            std::fprintf(stderr, "basalt generate: position %lld, token %lld%s\n", (long long) pos, (long long) tok,
-                         pos < n_prompt ? " (prompt)" : "");
-        // **`d.layers` IS THE BLOB'S LAYER AXIS, NOT A COUNTER.**  The adapter uses it to index
-        // the experts section as `layer * n_expert + expert`, so it MUST restart at 0 for every token.  Leaving it
-        // running across tokens asks for layer 48 of a 48-layer file on the second token - which
-        // `FileExpertSource` REFUSES rather than wrapping into layer 0's experts, and that refusal is the only
-        // reason this was a clean error instead of a silently wrong second token.
-        drive.d.layers = 0;
-        drive.d.experts = 0;
-        drive.d.failed = false;
-        err.clear();
-        if (o.no_capture) {
-            if (!basalt::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
-                                             o.sync_every_layer, err)) {
-                std::fprintf(stderr, "basalt generate: session_token: %s\n", err.c_str());
-                return 1;
-            }
-        } else {
-            basalt::core::doorbell_reset(db);
-            if (tgraph.captured) {
-                if (!basalt::core::session_run_token(g, pos, /*pos_base=*/0, ss, tgraph, pool_fn, pool_user,
-                                                     loop_scratch.y_miss, main_cs, err)) {
-                    std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                    return 1;
-                }
-            } else if (!basalt::core::session_loop(g, pos, /*pos_base=*/0, ss, gr, pool_fn, hit_fn, pool_user, /*overlap=*/true, main_cs,
-                                        err, layer_stage, &loop_scratch)) {
-                std::fprintf(stderr, "basalt generate: session_loop: %s\n", err.c_str());
-                return 1;
-            }
-        }
-        if (final_r != nullptr) {
-            cudaMemcpy(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float), cudaMemcpyDeviceToHost);
-            const int64_t posrec[2] = {pos, tok};
-            std::fwrite(posrec, sizeof posrec, 1, final_r);
-            std::fwrite(final_r_host.data(), sizeof(float), final_r_host.size(), final_r);
-        }
-        if (drive.d.failed) {
-            std::fprintf(stderr, "basalt generate: the expert pool failed at layer %lld expert %lld: %s\n",
-                         (long long) drive.d.fail_layer, (long long) drive.d.fail_expert,
-                         drive.d.fail ? drive.d.fail : "(no message)");
-            return 1;
-        }
-        {
-            // **THE LAYER LOOP ITSELF, WHICH IS WHAT `--gpu-only-full` HAS TO BE COMPARED AGAINST.**
-            const Clock::time_point n = Clock::now();
-            ms_layers += std::chrono::duration<double, std::milli>(n - tp).count();
-            tp = n;
-        }
-        // ---- the ladder for THIS position, in the order `session_loop` filled it: layer 0 first.
-        if (layer_dump != nullptr) std::fwrite(layer_stage, sizeof(float), layer_floats, layer_dump);
-        if (half_dump != nullptr) {
-            std::fwrite(half_stage, sizeof(float), (size_t) g.n_layers * (size_t) half_stride, half_dump);
-        }
-        if (!run_head(token_stream)) {
-            std::fprintf(stderr, "basalt generate: lm_head: %s\n", err.c_str());
-            return 1;
-        }
-        // **A CHECKPOINT AFTER THE HEAD, BECAUSE AN ASYNC FAULT IS STICKY AND LIES ABOUT WHERE IT HAPPENED.**
-        // Without this, `embed_row`'s D2H on the NEXT token reported "an illegal
-        // memory access" at a plane offset that has nothing to do with the fault, and the layer that actually
-        // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
-        // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.
-        if (!o.stream_token && cudaDeviceSynchronize() != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: the device faulted in lm_head at position %lld: %s\n",
-                         (long long) pos, cudaGetErrorString(cudaGetLastError()));
-            return 1;
-        }
-        {
-            const Clock::time_point n = Clock::now();
-            ms_head += std::chrono::duration<double, std::milli>(n - tp).count();
-            tp = n;
-        }
-        const bool emit_logits = dump != nullptr &&
-            basalt::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
-        const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
-        if (read_logits && (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4,
-                                           cudaMemcpyDeviceToHost, (cudaStream_t) token_stream) != cudaSuccess ||
-                            cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess)) {
-            std::fprintf(stderr, "basalt generate: reading the logits back failed\n");
-            return 1;
-        }
-        int bad = 0;
-        if (read_logits) for (float v : logits) if (!std::isfinite(v)) ++bad;
-        if (bad != 0) {
-            std::fprintf(stderr, "basalt generate: %d of %lld logits are not finite at position %lld\n", bad,
-                         (long long) n_vocab, (long long) pos);
-            return 1;
-        }
-        // the header with the first row (see `hdr`): a run that dumps nothing leaves an empty file
-        if (emit_logits && !hdr_written && std::fwrite(hdr, sizeof hdr, 1, dump) != 1) {
-            std::fprintf(stderr, "basalt generate: cannot write logits header\n");
-            std::fclose(dump);
-            return 1;
-        }
-        if (emit_logits) hdr_written = true;
-        if (emit_logits && std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
-            std::fprintf(stderr, "basalt generate: cannot write logits at position %lld\n", (long long) pos);
-            std::fclose(dump);
-            return 1;
-        }
-        {
-            // A SYNCHRONOUS D2H OF THE LOGITS AND A HOST SCAN OVER THEM, EVERY TOKEN.  Putting the dump and the scan
-            // behind flags does not make the token faster: a large blocking readback is also what flushes the pipeline
-            // for the sampler that follows.  Timed so the claim can be re-checked rather than remembered.
-            const Clock::time_point n = Clock::now();
-            ms_readback += std::chrono::duration<double, std::milli>(n - tp).count();
-            tp = n;
-        }
-
-        int next = 0;
-        // The draw is Philox(seed, position), as in a verify window (row t at pos0 draws pos0 + t): a seed gives
-        // the same text whether a token comes from this path or from the speculative loop below.
-        sp.counter = (uint64_t) pos;
-        basalt::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
-        if (cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost,
-                            (cudaStream_t) token_stream) != cudaSuccess ||
-            cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: reading the sampled token back failed: %s\n",
-                         cudaGetErrorString(cudaGetLastError()));
-            return 1;
-        }
-        // The sampled-token synchronization also completes every captured QSA
-        // status readback. Retain one status per layer so a later layer cannot
-        // hide an earlier failure; no extra synchronization or token allocation.
-        if (o.native_flash_attn_short) for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
-            const int64_t i = ss.qsa_ord0 + j;   // the global ordinal, as the session's carve names it
-            const int32_t status = ss.qsa_states[i].host_step[basalt::kernels::kStepCount];
-            if (status != 0) {
-                std::fprintf(stderr, "basalt generate: native attention status %d at QSA layer %lld, position %lld\n",
-                             status, (long long) i, (long long) pos);
-                return 1;
-            }
-        }
-        if (next < 0 || next >= n_vocab) {
-            std::fprintf(stderr, "basalt generate: the sampler returned %d, outside 0..%lld\n", next,
-                         (long long) (n_vocab - 1));
-            return 1;
-        }
-        {
-            // **TWO DEVICE-WIDE SYNCS FOR FOUR BYTES.**  `sample_tokens(nullptr)` ends in
-            // `cudaDeviceSynchronize()` (`sampler.cu:245`) and the blocking 4-byte read below is the second.
-            const Clock::time_point n = Clock::now();
-            ms_sample += std::chrono::duration<double, std::milli>(n - tp).count();
-            ++phase_tokens;
-        }
-        // CHARGED HERE, AFTER THE SAMPLER, so the wall-clock rate covers the whole token including the embedding,
-        // the NaN scan, the logits readback and the sample (A7).  Only DECODE positions count; prefill is
-        // measured separately.
-        if (pos >= n_prompt - 1) total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-        else prefill_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-        if (pos == n_prompt - 1) ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
-        // **THE PREDICTION AT THE LAST PROMPT POSITION *IS* THE FIRST GENERATED TOKEN.**  Sampling on every
-        // position and recording only from `n_prompt - 1` onward is what keeps the two cases from needing
-        // separate handling - and the version that "obviously" only samples after the prompt loses exactly one
-        // token's worth of conditioning.
-        if (pos >= n_prompt - 1) produced.push_back(next);
-        if ((int64_t) produced.size() >= o.max_new) break;
-        if (o.stop_eos && pos >= n_prompt - 1 &&
-            std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) next) != o.eos_ids.end()) break;
-        // TEACHER FORCING while the prompt lasts: the next input is the prompt's own next token, not the
-        // model's guess.  Feeding the guess would make the run depend on the model's own errors from position
-        // 1, which is a different (and worse) measurement of the same prompt.
-        // and the window advances: the token just decoded becomes the newest predecessor.
-        ss.ple_prev[0] = ss.ple_prev[1];
-        ss.ple_prev[1] = (int32_t) tok;
-        tok = (pos + 1 < n_prompt) ? o.tokens[(size_t) (pos + 1)] : next;
-        // from the first generated token on, the speculative loop below takes over.
-        if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; break; }
-    }
+    // The last prompt token is the first verify window (T = 1).
+    spec_pos = pos_start;
 
     // ================================ SPECULATIVE DECODING ================================
     //
@@ -7452,14 +7215,9 @@ int main(int argc, char** argv) {
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
-        // with a native pack the first window is the last prompt token alone (it produces the first generated token
-        // and the MTP's first cell); otherwise the token loop already did that.
-        bool first_window = native_pack;
-        if (use_mtp && !first_window &&
-            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
-        }
+        // the first window is the last prompt token alone (it produces the first generated token and the MTP's
+        // first cell)
+        bool first_window = true;
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
