@@ -1,7 +1,7 @@
 // include/strata/core/mtp.hpp - plan v0.3 P6: the MTP draft layer on the GPU.
 //
-// The model ships one multi-token-prediction layer (vLLM 0.30.0 `qwen4_exp` MTP; transcribed and validated in
-// `tools/mtp_probe.py`, where it accepts 0.89 / 0.86 / 0.85 of greedy drafts at steps 1-3).  Cell i of its
+// The model ships one multi-token-prediction layer (transcribed and validated in
+// `tools/mtp_probe.py`).  Cell i of its
 // sequence pairs the main model's final multi-stream residual at position i with the token at position i+1, at
 // rope position i (vLLM's convention); its output predicts the token at position i+2, and its own residual feeds
 // the next draft step.
@@ -50,7 +50,7 @@ public:
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     uint64_t vram_bytes() const { return vram_; }
-    /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
+    /// The draft layer's K/V state (read-only: the serve state check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
@@ -75,7 +75,7 @@ public:
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
-    /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
+    /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
     /// the target's Philox draw for the verifying row, and `probs` is the draft's probability under that chain; a
     /// greedy one keeps the argmax drafts and their graphs.  A no-op when the switch is off.
@@ -91,7 +91,7 @@ public:
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
 
-    /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
+    /// the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
     /// state, the first cell a round can still read, its device, and a wait for its own stream.
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
@@ -105,21 +105,20 @@ public:
     }
 
 private:
-    /// reuse_row: the full layer's row 0 from the catch-up's row *row_ (STRATA_MTP_REUSE_ROW; full, T == 1)
+    /// reuse_row: the full layer's row 0 from the catch-up's row *row_ (full, T == 1)
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool reuse_row = false);
     void record_hidden(const float* R, int T, uint8_t* xq, cudaStream_t cs);
     void end_branches();
-    void l2_window();   ///< joins an open branch and clears the STRATA_DEC_DRAFT=2 recording state
     bool capture_prefill(int T, std::string& err);
-    bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
+    bool capture_prefill_dev(int T, std::string& err);   ///< without the mapped staging (inputs copied on device)
     /// all_rows: copy every step / position record (the chain's too) and the min_p bits, for a graph without per-step
-    /// copies (STRATA_MTP_COND)
+    /// copies
     bool record_round(int T, bool coupled, bool all_rows, std::string& err);
     bool record_step(int j, bool coupled, bool copy_records, std::string& err);
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
     cudaGraphExec_t step_exec_[2][9] = {};   ///< [tier_]
-    /// STRATA_MTP_COND: the round and `steps - 1` chain steps in one graph, step j an IF node on draft j-1's
+    /// The round and `steps - 1` chain steps in one graph, step j an IF node on draft j-1's
     /// probability >= min_p; false (with the per-step path from then on) where it cannot be built
     bool capture_cond(int T, bool coupled, int steps);
     cudaGraphExec_t cond_exec_[2][2][9] = {};   ///< [tier_][coupled]
@@ -154,7 +153,7 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
-    // STRATA_DEC_DRAFT=2: the branch stream of the round and chain graphs, its fork / join events, its Q8_1 input;
+    // the branch stream of the round and chain graphs, its fork / join events, its Q8_1 input;
     // par_ while those graphs are recorded, pre_next_ / have_pre_ for the next step's hidden input computed beside the
     // head, fork_open_ while that branch is not joined yet
     cudaStream_t cs2_ = nullptr;
@@ -165,7 +164,7 @@ private:
     void join(cudaStream_t cs) { cudaEventRecord(ev_join_, cs2_); cudaStreamWaitEvent(cs, ev_join_, 0); }
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
-    int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
+    int32_t* pf_dev_ = nullptr;   ///< a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
     cudaGraphExec_t round_exec_[2][9] = {};   ///< [tier_]
 
@@ -173,7 +172,7 @@ private:
         std::string name, kind;
         int64_t rows = 0, cols = 0;
         uint64_t off = 0, bytes = 0;
-        const void* dev = nullptr;   ///< set: the tensor lives here instead of in dense_ (an 8-bit copy, STRATA_DEC_HC8)
+        const void* dev = nullptr;   ///< set: the tensor lives here instead of in dense_ (an 8-bit copy)
     };
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
@@ -193,14 +192,14 @@ private:
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
-    // STRATA_DEC_DRAFT: the subset's leading base rows (n_tier1_) serve the argmax drafts unless the text just held a
+    // the subset's leading base rows (n_tier1_) serve the argmax drafts unless the text just held a
     // token of the added rows; tier_ 0 = base rows only, 1 = every row (the graphs are captured per tier)
     int64_t n_tier1_ = 0;
     int tier_ = 1;
     int tier2_recent_ = 0;
     std::vector<uint8_t> tier2_;   ///< token id -> 1 when only the added rows hold it
-    void* top_scratch_ = nullptr;   ///< STRATA_DEC_DRAFT: the head's fused argmax partials
-    unsigned long long* gstamp_ = nullptr;   ///< STRATA_VERIFY_PROFILE: the round's first and the draft's last GPU time
+    void* top_scratch_ = nullptr;   ///< the head's fused argmax partials
+    unsigned long long* gstamp_ = nullptr;   ///< --profile: the round's first and the draft's last GPU time
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
