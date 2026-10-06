@@ -383,6 +383,7 @@ struct Prefill::Impl {
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
+    core::PeerExperts* ring_peer = nullptr;  // --peer-exclusive: experts held only there are copied from its memory
 };
 
 namespace {
@@ -903,6 +904,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     mtp.ms_prefill += ms_since(t0);
     return true;
 }
+
+void Prefill::set_ring_peer(core::PeerExperts* peer) {
+    impl_->ring_peer = peer != nullptr && peer->valid() ? peer : nullptr;
+}
+
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
@@ -1234,7 +1240,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 p_issue_until(P.pk + (size_t) P.RP);
             }
         };
-        struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
+        struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* pdev; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t consumed = 0;
@@ -1256,6 +1262,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
+                    if (m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e)) {   // no host copy: from the peer
+                        seq.push_back({(int32_t) l, e, nullptr, -1, m.ring_peer->slot_ptr(l, e)});
+                        continue;
+                    }
                     {
                         b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
@@ -1273,7 +1283,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             js.push_back({b, (size_t) lay0.blob_bytes(l)});
                         }
                     }
-                    seq.push_back({(int32_t) l, e, b, job});
+                    seq.push_back({(int32_t) l, e, b, job, nullptr});
                 }
             }
             for (int64_t l = LE; l <= g.n_layers; ++l) {
@@ -1313,7 +1323,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                    if (en.job < 0) {
+                    if (en.pdev != nullptr) {
+                        cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, en.pdev, m.ring_peer->device(), bytes, m.copy);
+                        ++iss_dma;
+                    } else if (en.job < 0) {
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                         ++iss_dma;
                     } else {
@@ -1828,6 +1841,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             p_release_to(l, (int32_t) m.g->n_expert, m.pp->s);
                             cudaSetDevice(pd);
                         }
+                        // --peer-exclusive: an expert only the peer holds has no host copy.  It is copied from the peer's
+                        // memory into a staging slot, or (with direct access between the cards) read in place.
+                        auto peer_ring = [&](int32_t e) {
+                            return m.ring_peer && m.ring_peer->exclusive() && m.ring_peer->has(l, e) &&
+                                   !(m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0);
+                        };
+                        auto peer_direct = [&](int32_t e) { return peer_ring(e) && m.ring_peer->p2p(); };
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
                         std::vector<int> stage_of(order.size(), -1);
@@ -1838,6 +1858,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (peer_ring(e)) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 const uint8_t* b = m.src->blob(l, e);
@@ -1850,14 +1871,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                            if (resident) return true;
+                            if (resident || peer_direct(e)) return true;
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % STAGE;
                             const auto th = Clock::now();
-                            const bool pinned = m.src->pinned(l, e);
+                            const bool via_peer = peer_ring(e);
+                            const bool pinned = !via_peer && m.src->pinned(l, e);
                             const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
-                            if (pinned) {
+                            if (via_peer) {
+                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                                cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, m.ring_peer->slot_ptr(l, e),
+                                                    m.ring_peer->device(), (size_t) lay.blob_bytes(l), m.copy);
+                                ++stats_.experts_dma;
+                            } else if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
@@ -1983,7 +2010,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int32_t e = order[j];
                                 if (stage_of[j] < 0) {
                                     ++stats_.experts_resident;
-                                    if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                    const int32_t rs = m.host_res ? m.host_res[(size_t) l * m.g->n_expert + e] : -1;
+                                    const uint8_t* bd = rs >= 0 && m.cache ? m.cache->device_slot(rs) : m.ring_peer->slot_ptr(l, e);
+                                    if (!compute(j, bd, -1)) return false;
                                 } else {
                                     cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;

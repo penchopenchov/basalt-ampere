@@ -79,6 +79,7 @@ void PeerExperts::close() {
         if (h_out_) cudaFreeHost(h_out_);
         if (h_meta_) cudaFreeHost(h_meta_);
         if (refill_ev_) cudaEventDestroy(refill_ev_);
+        if (evict_ev_) cudaEventDestroy(evict_ev_);
         if (stream_) cudaStreamDestroy(stream_);
         if (refill_) cudaStreamDestroy(refill_);
     }
@@ -86,7 +87,10 @@ void PeerExperts::close() {
     d_meta_ = h_meta_ = d_scratch_ = nullptr;
     d_q8_ = nullptr;
     stream_ = refill_ = nullptr;
-    refill_ev_ = nullptr;
+    refill_ev_ = evict_ev_ = nullptr;
+    fsrc_ = nullptr;
+    evicting_.clear();
+    pending_.clear();
     device_ = -1;
 }
 
@@ -106,6 +110,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     n_expert_ = n_expert;
     src_ = &src;
     res_.assign((size_t) (n_layers * n_expert), kNotResident);
+    hold_.assign((size_t) (n_layers * n_expert), 0);
     {   // direct access both ways (NVLink or another P2P path): the prompt path copies activations and results over it
         int a = 0, b = 0;
         cudaDeviceCanAccessPeer(&a, 0, device);
@@ -133,6 +138,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
         ck(cudaEventCreateWithFlags(&refill_ev_, cudaEventDisableTiming), "event", err) &&
+        ck(cudaEventCreateWithFlags(&evict_ev_, cudaEventDisableTiming), "event", err) &&
         ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
         ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
         ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
@@ -291,7 +297,7 @@ bool PeerExperts::finish(float* out, std::string& err) {
 }
 
 bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err) {
-    if (!pending_.empty() || max_swaps <= 0) return true;
+    if (!pending_.empty() || !evicting_.empty() || max_swaps <= 0) return true;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     struct Swap { float gain; int32_t layer, in, out; };
     std::vector<Swap> swaps;
@@ -303,7 +309,9 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         const int32_t* r0 = res0 + l * n_expert_;
         const int32_t* r1 = res_.data() + l * n_expert_;
         for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
-            if (r1[e] >= 0) vict.emplace_back(u[e], e);
+            if (r1[e] >= 0) {
+                if (!hold_[(size_t) (l * n_expert_ + e)]) vict.emplace_back(u[e], e);
+            }
             else if (r0[e] < 0 && u[e] >= 2.0f) cand.emplace_back(u[e], e);
         }
         if (cand.empty() || vict.empty()) continue;
@@ -320,6 +328,24 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
     if ((int) swaps.size() > max_swaps) swaps.resize((size_t) max_swaps);
     On on(device_);
+    if (fsrc_ != nullptr) {
+        // exclusive: the victim has no RAM place, so it is copied into a free one first (it stays resident and
+        // computing meanwhile); the slot is refilled at apply_pending, once that copy has landed
+        for (const Swap& s : swaps) {
+            const int32_t slot = res_[(size_t) (s.layer * n_expert_ + s.out)];
+            if (slot < 0 || !fsrc_->has_resident(s.layer, s.in)) continue;
+            uint64_t off = 0;
+            uint8_t* dst = fsrc_->spare_take(s.layer, off);
+            if (dst == nullptr) continue;
+            if (!ck(cudaMemcpyAsync(dst, cache_.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
+                                    cudaMemcpyDeviceToHost, refill_), "evict", err)) {
+                fsrc_->spare_return(s.layer, off);
+                return false;
+            }
+            evicting_.push_back({s.layer, s.in, s.out, slot, off});
+        }
+        return evicting_.empty() || ck(cudaEventRecord(evict_ev_, refill_), "evict event", err);
+    }
     for (const Swap& s : swaps) {
         const size_t in = (size_t) (s.layer * n_expert_ + s.in), out = (size_t) (s.layer * n_expert_ + s.out);
         const int32_t slot = res_[out];
@@ -338,6 +364,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
 bool PeerExperts::reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err) {
     const size_t i_in = (size_t) (layer * n_expert_ + in), i_out = (size_t) (layer * n_expert_ + out);
     const int32_t slot = res_[i_in];
+    hold_[i_in] = 0;
     if (slot < 0) return true;
     res_[i_in] = kNotResident;                 // the primary computes it from now on
     if (res_[i_out] >= 0 || blob == nullptr) return true;
@@ -353,14 +380,46 @@ bool PeerExperts::reassign(int64_t layer, int32_t in, int32_t out, const uint8_t
     return ck(cudaEventRecord(refill_ev_, refill_), "reassign event", err);
 }
 
+bool PeerExperts::copy_to(int64_t layer, int64_t expert, uint8_t* dst, cudaStream_t stream, std::string& err) {
+    const uint8_t* p = slot_ptr(layer, expert);
+    if (p == nullptr) { err = "peer experts: an expert to copy out is not resident"; return false; }
+    return ck(cudaMemcpyPeerAsync(dst, 0, p, device_, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer),
+                                  stream), "copy to the primary", err);
+}
+
 void PeerExperts::apply_pending(bool wait) {
+    if (!evicting_.empty()) {
+        On on(device_);
+        if (wait) cudaEventSynchronize(evict_ev_);
+        else if (cudaEventQuery(evict_ev_) != cudaSuccess) return;
+        // the victims are in RAM now: they are computed from there while their slots take the incoming experts
+        const auto& lay = basalt::kernels::cpu::expert_layout();
+        for (const Evict& x : evicting_) {
+            const uint8_t* b = src_->blob(x.layer, x.in);
+            if (!fsrc_->spare_land(x.layer, x.out, x.off) || b == nullptr ||
+                cudaMemcpyAsync(cache_.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer), cudaMemcpyHostToDevice,
+                                refill_) != cudaSuccess) {
+                std::fprintf(stderr, "peer experts: an exclusive swap failed (layer %d, expert %d)\n", (int) x.layer,
+                             (int) x.in);
+                continue;
+            }
+            res_[(size_t) (x.layer * n_expert_ + x.out)] = kNotResident;
+            pending_.emplace_back((int32_t) (x.layer * n_expert_ + x.in), x.slot);
+            ++swaps_;
+        }
+        evicting_.clear();
+        if (!pending_.empty() && cudaEventRecord(refill_ev_, refill_) != cudaSuccess) return;
+    }
     if (pending_.empty()) return;
     {
         On on(device_);
         if (wait) cudaEventSynchronize(refill_ev_);
         else if (cudaEventQuery(refill_ev_) != cudaSuccess) return;
     }
-    for (const auto& [i, slot] : pending_) res_[(size_t) i] = slot;
+    for (const auto& [i, slot] : pending_) {
+        res_[(size_t) i] = slot;
+        if (fsrc_ != nullptr) fsrc_->spare_release((int64_t) i / n_expert_, (int64_t) i % n_expert_);   // peer-only now
+    }
     pending_.clear();
 }
 

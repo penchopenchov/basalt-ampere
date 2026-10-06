@@ -650,8 +650,8 @@ void usage() {
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
                  "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
-                 "                       also in RAM (less RAM).  The peer is filled from the file, and swaps of\n"
-                 "                       peer-held experts read the file.\n"
+                 "                       also in RAM (less RAM).  The peer is filled from the file; swaps move\n"
+                 "                       peer-held experts between the GPUs and RAM over P2P.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
@@ -1708,8 +1708,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt generate: --remote-expert-opt requires --serve\n");
         return 2;
     }
-    if (o.peer_exclusive && (o.peer_device < 1 || !o.resident_cpu_experts)) {
-        std::fprintf(stderr, "basalt generate: --peer-exclusive needs --peer-device and --resident-experts\n");
+    if (o.peer_exclusive && (o.peer_device < 1 || !o.resident_cpu_experts || !o.serve)) {
+        std::fprintf(stderr, "basalt generate: --peer-exclusive needs --peer-device, --resident-experts and --serve\n");
         return 2;
     }
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
@@ -4147,7 +4147,9 @@ int main(int argc, char** argv) {
         }
         // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
         const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
-        if (adapt_fast_on) src.set_spares(o.adapt_swaps);
+        // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
+        if (adapt_fast_on)
+            src.set_spares(o.peer_exclusive ? o.adapt_swaps + std::max(o.peer_adapt_swaps, o.adapt_swaps) : o.adapt_swaps);
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, lend_from, o.resident_headroom,
                                                     o.resident_budget, &profile);
         std::string whole_err;
@@ -4206,6 +4208,8 @@ int main(int argc, char** argv) {
         basalt::core::LoadProgress::plan("ram", 0);
     }
     // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
+    // the peer's swaps keep their experts in RAM or on a GPU, never only in the file
+    if (o.peer_exclusive && peer.valid() && srcp == &src && src.complement_ready()) peer.set_exclusive(&src);
     // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
     if (o.peer_device >= 1 && !peer.valid() && !open_peer(false)) return 1;
     drive.d.peer = peer.valid() ? &peer : nullptr;
@@ -4498,6 +4502,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (peer.valid() && basalt::core::prompt_peer()) {
+        if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "basalt serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
@@ -5067,7 +5072,8 @@ int main(int argc, char** argv) {
         // (--adapt-decay when given, else 0.93): the routing counts stay large enough for the thresholds and the peer
         // margin.
         const float fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.93f;
-        struct XSwap { int32_t layer, in, out, slot; uint64_t off; bool xchg, promo; };
+        struct XSwap { int32_t layer, in, out, slot; uint64_t off; bool xchg, promo, p2p; };
+        const bool peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
         std::vector<XSwap> xq;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
         auto xq_round = [&]() -> bool {
@@ -5080,10 +5086,28 @@ int main(int argc, char** argv) {
             xq.clear();
             size_t n_noplace = 0;
             const auto& lay = basalt::kernels::cpu::expert_layout();
-            for (const Swap& s : swaps) {
+            std::set<size_t> taken;   // the round's victims
+            for (const Swap& s : swaps) taken.insert((size_t) s.layer * g.n_expert + s.out);
+            for (Swap s : swaps) {
+                // an expert only the peer holds is copied from its VRAM; it needs a RAM place for the one it replaces
+                const bool p2p = peer_excl && peer.has(s.layer, s.in) && !src.has_resident(s.layer, s.in);
+                if (p2p && src.has_resident(s.layer, s.out)) {
+                    // a lent slot's expert keeps its RAM place, which the incoming one would not have: the layer's
+                    // least-routed expert without one goes instead, if that is still a gain
+                    const float* u = drive.d.usage.data() + (size_t) s.layer * g.n_expert;
+                    int32_t best = -1;
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                        const size_t k = (size_t) s.layer * g.n_expert + e;
+                        if (host_res[k] < 0 || src.has_resident(s.layer, e) || taken.count(k)) continue;
+                        if (best < 0 || u[e] < u[best]) best = e;
+                    }
+                    if (best < 0 || u[s.in] - promote_margin < u[best] + 1.5f) continue;
+                    taken.insert((size_t) s.layer * g.n_expert + best);
+                    s.out = best;
+                }
                 const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
                 if (slot < 0) continue;
-                const bool xchg = src.complement_ready() && src.has_resident(s.layer, s.in) &&
+                const bool xchg = src.complement_ready() && (p2p || src.has_resident(s.layer, s.in)) &&
                                   !src.has_resident(s.layer, s.out);
                 uint64_t off = 0;
                 if (xchg) {
@@ -5097,7 +5121,8 @@ int main(int argc, char** argv) {
                     }
                 }
                 xq.push_back({s.layer, s.in, s.out, slot, off, xchg,
-                              peer.valid() && peer.has(s.layer, s.in)});
+                if (p2p) peer.hold(s.layer, s.in);
+                              peer.valid() && peer.has(s.layer, s.in), p2p});
             }
             if (!xq.empty()) {
                 cudaEventRecord(adapt_ev, adapt_stream);
@@ -5132,6 +5157,14 @@ int main(int argc, char** argv) {
                 }
                 for (const XSwap& x : xq) {   // stream order keeps each behind its slot's eviction copy
                     const uint8_t* b = srcp->blob(x.layer, x.in);
+                    std::string perr;
+                    if (x.p2p) {
+                        if (!peer.copy_to(x.layer, x.in, xcache.device_slot(x.slot), adapt_stream, perr)) {
+                            std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                            return false;
+                        }
+                        continue;
+                    }
                     if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer),
                                                         cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
                         std::fprintf(stderr, "basalt serve: adaptive swap copy failed (layer %d, slot %d): %s\n",
@@ -5146,7 +5179,7 @@ int main(int argc, char** argv) {
             }
             for (const XSwap& x : xq) {
                 host_res[(size_t) x.layer * g.n_expert + x.in] = x.slot;
-                if (x.xchg) src.spare_release(x.layer, x.in);
+                if (x.xchg && !x.p2p) src.spare_release(x.layer, x.in);
                 srcp->release(x.layer, x.in);
             }
             res_upload();

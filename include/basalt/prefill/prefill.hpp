@@ -93,6 +93,9 @@ public:
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
+    /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path reads them from its memory
+    /// over P2P (into the ring, or in place).  Independent of set_peer.
+    void set_ring_peer(core::PeerExperts* peer);
 
     /// Called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its

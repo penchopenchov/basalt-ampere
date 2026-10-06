@@ -81,6 +81,16 @@ public:
     /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
     void apply_pending(bool wait);
+    /// --peer-exclusive, once the RAM copy is built: the peer's experts have no RAM place.  Swaps then keep every
+    /// expert somewhere: an evicted one goes to a free RAM place before its slot is reused, and a RAM place is freed
+    /// once its expert is resident on the peer.  Nothing is read from the file for them.
+    void set_exclusive(FileExpertSource* fsrc) { fsrc_ = fsrc; }
+    bool exclusive() const { return fsrc_ != nullptr; }
+    /// Keeps (layer, expert) in its slot (adapt does not evict it) until `reassign` takes the slot: its bytes are
+    /// being copied out over P2P.
+    void hold(int64_t layer, int64_t expert) { hold_[(size_t) (layer * n_expert_ + expert)] = 1; }
+    /// Copies (layer, expert)'s bytes from the peer's slot into `dst` on device 0 (queued on `stream`).
+    bool copy_to(int64_t layer, int64_t expert, uint8_t* dst, cudaStream_t stream, std::string& err);
     /// PEER_PROMOTE: `in` moved to the primary, which gave up `out` (`blob`: its bytes in host memory).  The
     /// slot `in` held takes `out`, resident at `apply_pending`.  Call only between verify windows.
     bool reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err);
@@ -102,6 +112,11 @@ private:
     ExpertSource* src_ = nullptr;
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
+    FileExpertSource* fsrc_ = nullptr;                ///< set with --peer-exclusive
+    std::vector<uint8_t> hold_;                       ///< [n_layers * n_expert]: not to be evicted
+    struct Evict { int32_t layer, in, out, slot; uint64_t off; };
+    std::vector<Evict> evicting_;                     ///< exclusive swaps whose victim is still being copied to RAM
+    cudaEvent_t evict_ev_ = nullptr;
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
