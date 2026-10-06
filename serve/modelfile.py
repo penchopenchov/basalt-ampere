@@ -91,10 +91,10 @@ def vision_config(mf: ModelFile, exe: str) -> dict | None:
     if "vision/mmproj" not in mf.sections:
         return None
     if not side.is_file():
-        print(f"[server] {side} not found: running text-only (build the vision sidecar for image input)", flush=True)
+        print(f"[server] warning: {side} not found, text-only (build the vision sidecar)", flush=True)
         return None
     if "vision/text_vocab" not in mf.sections:
-        print(f"[server] {mf.path} has no vision/text_vocab section: running text-only", flush=True)
+        print(f"[server] warning: {mf.path} has no vision/text_vocab section, text-only", flush=True)
         return None
     vdir = cache_dir(mf) / "vision"
     mmproj, vocab = vdir / "mmproj.gguf", vdir / "text_vocab.gguf"

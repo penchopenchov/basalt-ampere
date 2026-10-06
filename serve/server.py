@@ -253,15 +253,12 @@ def experts_loading_words(args: list, size: str) -> str:
             n = f"up to {float(args[args.index('--resident-budget-gib') + 1]):g} GiB"
         except (IndexError, ValueError):
             n = "a RAM budget"
-        return (f"loading the most-used experts into RAM ({n}; the rest are read from the model files as needed) "
-                "and locking part of them for the GPU.")
+        return f"loading the most-used experts into RAM ({n}), the rest stay on disk"
     if "--resident-experts" in args:
-        return (f"loading the experts the GPU does not hold into RAM (of {size}) and locking part of them for the "
-                "GPU.")
+        return f"loading the experts the GPU does not hold into RAM (of {size})"
     if "--mmap-experts" in args:
-        return (f"mapping the experts from the model files ({size}, --mmap-experts): they are not loaded into RAM - "
-                "the OS file cache reads them as the GPU's expert cache fills and as requests need them.")
-    return f"loading the experts into RAM ({size}) and locking part of them for the GPU."
+        return f"mapping the experts from the model files ({size}, --mmap-experts), not loaded into RAM"
+    return f"loading the experts into RAM ({size})"
 
 
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
@@ -286,7 +283,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             last = time.time()
             print(text, flush=True)
 
-    say("weights", "[server] starting the engine: reading the model's weights ...")
+    say("weights", "[server] starting the engine, reading the weights")
     pos = offset
     while not done.wait(0.5):
         try:
@@ -300,18 +297,18 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
-                    say("arena", f"[server] {loading[:-1]}; this takes a few minutes and the system may feel slow")
+                    say("arena", f"[server] {loading}, this can take a few minutes")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[server] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[server] filling the GPU's expert cache ({n}) ...")
+                    say("cache", f"[server] filling the GPU expert cache ({n})")
                 elif "session is up" in line:
-                    say("up", "[server] almost ready ...")
+                    say("up", "[server] almost ready")
         if time.time() - last > heartbeat:
             last = time.time()
-            print(f"[server] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+            print(f"[server] still starting, {time.time() - t0:.0f} s", flush=True)
 
 
 # Diagnostics, off unless the matching server flag is given (main sets them).
@@ -428,8 +425,7 @@ class ProcessEngine:
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
-            print(f"[server] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
-                  "(its log says why)", flush=True)
+            print(f"[server] warning: {asked} parallel requests asked, the engine runs {self.batch or 'one'}", flush=True)
         groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
@@ -482,16 +478,12 @@ class ProcessEngine:
             pass
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
-                return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
-                        "line: " + line.strip() + " - please report it.")
+                return "the engine's watchdog stopped it: " + line.strip()
         rc = self.proc.poll()
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("basalt", "ERR"))), "")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why
-            return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
-                    "report it with the log.")
-        return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
-                "grep -i -E 'killed process|out of memory'). Close other programs or use a "
-                "smaller model (Q2_0 / IQ2_XS).")
+            return f"the engine exited (code {rc}), last log line: {last}"
+        return "probably out of RAM (sudo dmesg | grep -i 'out of memory')"
 
     def alive(self) -> bool:
         return self.proc is not None and not getattr(self, "ended", False) and self.proc.poll() is None
@@ -535,7 +527,7 @@ class ProcessEngine:
                         pass
                     if i == tries - 1:
                         raise
-                    print(f"[server] the engine did not start (try {i + 1} of {tries}); again in "
+                    print(f"[server] warning: the engine did not start (try {i + 1} of {tries}), retrying in "
                           f"{self.RESTART_RETRY_S:g} s", flush=True)
                     time.sleep(self.RESTART_RETRY_S)
         finally:
@@ -1112,9 +1104,7 @@ class ProcessEngine:
     def _silent(self, what: str) -> EngineSilent:
         """End an engine that lost step with the server (its main thread waits for a command the server never
         sends), so the next request starts it again: killed now, its GPU and RAM go back with the process."""
-        self.silent_note = ("The engine and the server lost step (a very slow PC can raise "
-                            "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, keep "
-                            "the end of the engine log.")
+        self.silent_note = "the engine and the server lost step (engine_silence_s, 0 = wait forever)"
         self.ended = True                               # not alive from now: the next request restarts it
         proc = self.proc
         try:
@@ -1296,7 +1286,7 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     other than "start" / "end"."""
     pos = cfg.get("effort_position", "start")
     if pos not in ("start", "end"):
-        raise ValueError(f'"effort_position" must be "start" (the default) or "end", not {pos!r}')
+        raise ValueError(f'effort_position must be start or end, not {pos!r}')
     if pos == "start":
         return None
     try:
@@ -1306,11 +1296,9 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         known = False
     role = tok.encode("system", parse_special=True)
     if not known or len(role) != 1:
-        print("[server] effort_position \"end\" needs an engine with --tail-role-token: the reasoning "
-              "effort stays at the top of the prompt", flush=True)
+        print("[server] warning: effort_position end needs an engine with --tail-role-token, effort stays at the top", flush=True)
         return None
-    print("[server] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
-          "changing it keeps the cached conversation", flush=True)
+    print("[server] effort_position end: reasoning effort goes before the answer, so changing it keeps the cache", flush=True)
     return ["--tail-role-token", str(role[0])]
 
 
@@ -1340,7 +1328,7 @@ def engine_silence_s(cfg: dict) -> float:
     if v is None:
         return ENGINE_SILENCE_S
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
-        raise ValueError(f'"engine_silence_s" must be a number of seconds >= 0 (0 = no limit), not {v!r}')
+        raise ValueError(f'engine_silence_s must be seconds >= 0 (0 = no limit), not {v!r}')
     return float(v)
 
 
@@ -1365,9 +1353,8 @@ def layer_split_value(cfg: dict) -> str:
             break
     want = max(n - 1, 1)
     example = ",".join(str(round(48 * (i + 1) / (want + 1))) for i in range(want))
-    hint = (f'"layer_split" is the first layer of each later GPU, one rising number per GPU after the first '
-            f'({want} for {n} GPUs), not a count of layers per card - e.g. "{example}" (or [{example.replace(",", ", ")}])'
-            f' for an even share of 48 layers, or "auto" (the default) to place them by each card\'s free VRAM')
+    hint = (f'layer_split is the first layer of each later GPU, {want} rising number(s) for {n} GPUs, '
+            f'e.g. "{example}", or "auto"')
     if not vals:
         raise ValueError(f"{hint}; got {v!r}")
     if n > 1 and len(vals) != n - 1:
@@ -1411,14 +1398,13 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
     if n is None or n is False:
         return []
     if isinstance(n, bool) or not isinstance(n, int):
-        print(f'[server] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
+        print(f'[server] warning: "parallel" must be a whole number, 2..{PARALLEL_MAX} (got {n!r}), ignored',
               flush=True)
         return []
     if n <= 1:
         return []
     if n > PARALLEL_MAX:
-        print(f'[server] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
-              f"{PARALLEL_MAX}", flush=True)
+        print(f'[server] warning: "parallel" {n} is over the limit, using {PARALLEL_MAX}', flush=True)
     return ["--batch", str(n)]
 
 
@@ -1606,7 +1592,7 @@ class Service:
         if isinstance(aliases, str):
             aliases = aliases.split(",")
         if not isinstance(aliases, list) or not all(isinstance(x, str) for x in aliases):
-            raise ValueError(f"aliases={aliases!r}: expected a list of model names")
+            raise ValueError(f"aliases: expected a list of names, not {aliases!r}")
         names = []
         for x in (x.strip() for x in aliases):
             if x and x != self.model and x not in names:
@@ -1632,7 +1618,7 @@ class Service:
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
+            raise ValueError(f"reasoning_budget_tokens: expected a whole number (0 = none), not {value!r}")
         return value if value > 0 else None
 
     def _vision_down(self) -> bool:
@@ -1659,11 +1645,11 @@ class Service:
             return
         if self.before_load:
             cmd = self.before_load
-            print(f"[server] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+            print(f"[server] before_load: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
             try:
                 subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError) as e:
-                print(f"[server] the before_load command failed ({e}); loading anyway", flush=True)
+                print(f"[server] warning: before_load command failed ({e}), loading anyway", flush=True)
         if self.min_free_vram_mib:
             free = self.free_vram_mib()
             deadline = time.time() + 15                 # memory another process just gave back can take a moment
@@ -1674,23 +1660,22 @@ class Service:
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
-            print("[server] starting the vision encoder again ...", flush=True)   # the engine sizes its cache
+            print("[server] restarting the vision encoder", flush=True)   # the engine sizes its cache
             self.vision.restart()
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
-            print("[server] loading the model again (it was unloaded) ...", flush=True)
+            print("[server] loading the model again", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            print(f"[server] the engine had stopped (exit code {code}); starting it again "
-                  "(a minute or two) ...", flush=True)
+            print(f"[server] warning: the engine stopped (exit code {code}), restarting it", flush=True)
         self.engine.restart()
-        print("[server] the engine is running again", flush=True)
+        print("[server] engine running again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
-                print(f"[server] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+                print(f"[server] warning: VRAM reserve of {self.vram_reserve} MiB not applied ({e})", flush=True)
 
     vram_wait_s = 300.0                                  # how long POST /v1/vram waits for a running request
 
@@ -1716,7 +1701,7 @@ class Service:
                         "note": "applied when the model loads"}
             out = self.engine.vram(reserve_mib)
             self.vram_reserve = reserve_mib
-            print(f"[server] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
+            print(f"[server] vram: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
         finally:
@@ -1728,8 +1713,8 @@ class Service:
         """The server window's line for an engine that died (or was ended) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
-        print(f"[server] {e}. {note} The next request starts the engine again."
-              f"{' Its log: ' + log if log else ''}", flush=True)
+        why = f"{e}: {note}" if note else str(e)
+        print(f"[server] warning: {why} (the next request restarts it{', log ' + log if log else ''})", flush=True)
 
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
@@ -1758,8 +1743,7 @@ class Service:
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
-            print(f"[server] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
+            print(f"[server] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}, the next request loads it", flush=True)
             return "unloaded"
         finally:
             self.fifo.release()
@@ -1767,7 +1751,7 @@ class Service:
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
-        print(f"[server] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        print(f"[server] model unloads after {self.idle_unload_s} s idle", flush=True)
 
         def loop():
             while True:
@@ -1775,7 +1759,7 @@ class Service:
                 try:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
-                    print(f"[server] idle unload: {e}", flush=True)
+                    print(f"[server] warning: idle unload failed ({e})", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def start_telemetry(self):
@@ -2016,7 +2000,7 @@ class Service:
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read
-            print(f"[server] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            print(f"[server] reading the prompt: {done} tokens, {el:.0f} s", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
             print(f"[server] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
@@ -2109,7 +2093,7 @@ class Service:
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
-                            print(f"[server] the engine reported an error: {e}", flush=True)
+                            print(f"[server] error: engine reported {e}", flush=True)
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this
@@ -2133,7 +2117,7 @@ class Service:
                         extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        print(f"[server] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                        print(f"[server] thinking budget reached ({thought} tokens), wrapping up",
                               flush=True)
                         for t in extra:
                             n += 1
@@ -2147,10 +2131,8 @@ class Service:
                     if cancel.is_set():
                         finish = "cancel"
                     elif repeated:
-                        print(f"[server] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
-                              f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
-                              "<model>.json; 0 turns this off). If a new request with a short prompt does the "
-                              "same, restart the server and report it", flush=True)
+                        print(f"[server] warning: the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                              f"{run_len} times, stopped as length (repeat_stop_tokens, 0 = off)", flush=True)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -2198,9 +2180,8 @@ class Service:
                             print(f"[server] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state == "reasoning":   # 0
-                                print("[server] the reply reached max tokens while still thinking, so it has no "
-                                      "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
-                                      "<model>.json for every request) leaves room to answer", flush=True)
+                                print("[server] warning: max tokens reached while thinking, no answer "
+                                      "(set reasoning_budget_tokens)", flush=True)
                             if DEBUG and raw_ids:
                                 print(f"[server] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
@@ -2500,8 +2481,8 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
-            print(f"[server] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
-                  f"answers to (add it to \"allowed_hosts\" in the config, or set an API key)",
+            print(f"[server] refused Host {host!r} from {self.client_address[0]} "
+                  f"(--api-key KEY, or allowed_hosts)",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
                              f"Host {host!r} is not allowed (DNS rebinding protection). Reaching the server under this "
@@ -2518,8 +2499,8 @@ def make_handler(svc: Service):
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
-                print(f"[server] refused an API request from the web page {origin!r} (no API key; add its host to "
-                      f"\"allowed_hosts\" or its origin to \"cors_origins\" in the config)", flush=True)
+                print(f"[server] refused a request from web page {origin!r} "
+                      f"(--api-key KEY, or allowed_hosts / cors_origins)", flush=True)
                 self._json(403, {"error": {"type": "forbidden", "message":
                                  f"web pages of {origin} may not use this server without an API key; set \"api_key\", "
                                  f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") "
@@ -3019,8 +3000,7 @@ def make_handler(svc: Service):
                                      "unsupported_parameter")
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
-                print(f"[server] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
-                      f"(this server cannot run them)", flush=True)
+                print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)
                 noted.update(skipped)
             try:
                 svc.reasoning_budget(req)                    # a bad value is a 400 before anything is sent
@@ -3088,6 +3068,12 @@ class Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
+
+
+def fail(msg: str) -> None:
+    """Prints a startup error as a console line and exits with status 2."""
+    print(f"[server] error: {msg}", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def warn_tight_ram(arena_mib) -> None:
@@ -3176,7 +3162,7 @@ def allowed_hosts_of(value) -> list[str]:
         dot = x.startswith(".")
         name = host_name(x[1:] if dot else x)
         if not name:
-            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like host.example.com")
+            raise ValueError(f"allowed_hosts: {raw!r} is not a host name")
         out.append("." + name if dot else name)
     return list(dict.fromkeys(out))
 
@@ -3249,7 +3235,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
         return []
     items = [value] if isinstance(value, str) else value
     if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
-        raise SystemExit(f"[server] {key}: expected an origin or a list of origins")
+        raise SystemExit(f"[server] error: {key}: expected an origin or a list of origins")
     out = []
     for x in items:
         x = x.strip().rstrip("/")
@@ -3258,8 +3244,8 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
             continue
         scheme, sep, rest = x.partition("://")
         if scheme not in ("http", "https") or not sep or not rest or "/" in rest or "*" in rest:
-            raise SystemExit(f"[server] {key}: {x!r} is not an origin like https://chat.example.com"
-                             + ("" if wildcard else " (no wildcards here)"))
+            raise SystemExit(f"[server] error: {key}: {x!r} is not an origin like https://chat.example.com"
+                             + ("" if wildcard else " (no wildcards)"))
         out.append(x)
     return out
 
@@ -3278,47 +3264,47 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "temperature":
             if not number or value < 0:
-                raise SystemExit(f"[server] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+                raise SystemExit(f"[server] error: sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
             out[key] = float(value)
         elif key == "top_p":
             if not number or not 0 < value <= 1:
-                raise SystemExit(f"[server] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
+                raise SystemExit(f"[server] error: sampling.top_p={value!r}: expected 0 < top_p <= 1")
             out[key] = float(value)
         elif key == "min_p":
             if not number or not 0 <= value <= 1:
-                raise SystemExit(f"[server] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
+                raise SystemExit(f"[server] error: sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
             if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[server] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+                raise SystemExit(f"[server] error: sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[server] config sampling.presence_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[server] error: sampling.presence_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "frequency_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[server] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[server] error: sampling.frequency_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "repetition_penalty":
             if not number or value <= 0:
-                raise SystemExit(f"[server] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+                raise SystemExit(f"[server] error: sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
             if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[server] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+                raise SystemExit(f"[server] error: sampling.penalty_last_n={value!r}: expected a non-negative integer")
             out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
-                raise SystemExit(f"[server] config sampling.seed={value!r}: expected a positive integer")
+                raise SystemExit(f"[server] error: sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
-                raise SystemExit(f"[server] config sampling.experimental_speed_projection={value!r}: expected true or "
+                raise SystemExit(f"[server] error: sampling.experimental_speed_projection={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
             out[key] = value
         else:
-            print(f"[server] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+            print(f"[server] warning: sampling.{key} is not a known key, ignored", flush=True)
     return out
 
 
@@ -3363,7 +3349,7 @@ def main() -> int:
                                           "server's model; also \"before_load\" in the config, a string or a list)")
     a = ap.parse_args()
     if a.model and a.config:
-        ap.error("--model replaces --config; give one of them")
+        fail("--model replaces --config, give one")
     global DEBUG, REQUEST_LINES
     DEBUG, REQUEST_LINES = a.debug, a.request_lines
     logs = LogBuffer()                                  # GET /api/logs: this process's output, and the engine's
@@ -3373,7 +3359,7 @@ def main() -> int:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     if a.model:
         if not a.exe:
-            ap.error("--model needs --exe (the basalt binary)")
+            fail("--model needs --exe BINARY")
         from serve import modelfile
         listed = gpu_list(cfg)
         try:
@@ -3381,21 +3367,20 @@ def main() -> int:
                 a.model, a.exe, gpus=len(listed) if listed else None, vision=a.engine == "engine").items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
-            ap.error(f"{a.model}: {e}")
+            fail(f"{a.model}: {e}")
     if a.alias:
         cfg["model_name"] = a.alias
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
-        ap.error(f"port {a.port} is already in use - is the server (or another) already running? "
-                 f"Close it, or start this one with a different --port")
+        fail(f"port {a.port} is in use (--port N)")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
     if a.engine == "engine" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'})")
+        fail(f"tokenizer missing: {tpath / 'vocab.json'}")
     if (tpath / "vocab.json").exists():
         import tokenizer as ST
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
@@ -3407,45 +3392,45 @@ def main() -> int:
         tok = ST.Tokenizer(tokens, merges, types)
     if a.engine == "engine":
         if not cfg:
-            ap.error("--engine engine needs --config, or --model with --exe")
+            fail("--engine engine needs --model and --exe, or --config")
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[server] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[server] sampling defaults: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if lazy and cfg.get("vision") and a.model:
-            print("[server] lazy loading is text-only: the vision encoder stays off", flush=True)
+            print("[server] warning: lazy loading is text-only, vision off", flush=True)
             del cfg["vision"]
         if lazy and cfg.get("vision"):
-            ap.error("lazy loading is text-only; disable vision in the config")
+            fail("lazy loading is text-only, turn vision off")
         if cfg.get("vision"):
-            print("[server] loading the vision encoder ...", flush=True)
+            print("[server] loading the vision encoder", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env))
-        print("[server] model unloaded; the first request loads it ..." if lazy else
-              "[server] loading the model ...", flush=True)
+        print("[server] model unloaded, the first request loads it" if lazy else
+              "[server] loading the model", flush=True)
         if len(gpu_list(cfg)) > 1:
             try:
                 split = layer_split_value(cfg)          # before the (minutes-long) start
             except ValueError as e:
-                raise SystemExit(f"[server] config {e}")
-            print(f"[server] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+                raise SystemExit(f"[server] error: {e}")
+            print(f"[server] layer split over GPUs {gpu_list(cfg)} ({split})", flush=True)
         # a relative "exe" is the config's cwd's
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
             silence = engine_silence_s(cfg)             # checked before the (minutes-long) start
         except ValueError as e:
-            raise SystemExit(f"[server] config {e}")
+            raise SystemExit(f"[server] error: {e}")
         try:
             effort_end = effort_end_args(cfg, exe, tok)  # 8
         except ValueError as e:
-            raise SystemExit(f"[server] config {e}")
+            raise SystemExit(f"[server] error: {e}")
         if cfg.get("log"):                              # the engine's stderr goes to its log file: follow it
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
@@ -3468,13 +3453,13 @@ def main() -> int:
     try:
         svc.set_aliases(cfg.get("aliases"))             # other names the model answers to
     except ValueError as e:
-        raise SystemExit(f"[server] config {e}")
+        raise SystemExit(f"[server] error: {e}")
     if svc.aliases:
         print(f"[server] model aliases: {', '.join(svc.aliases)}", flush=True)
     if any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(sys.argv)):
         # an empty key would switch authentication off without a word
-        print("[server] an API key was given but it is empty: set a key, or leave --api-key out", file=sys.stderr)
+        print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
         return 2
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
@@ -3482,25 +3467,25 @@ def main() -> int:
     try:
         svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"))
     except ValueError as e:
-        raise SystemExit(f"[server] config {e}")
+        raise SystemExit(f"[server] error: {e}")
     if svc.allowed_hosts:
-        print("[server] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
-              else f"[server] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
+        print("[server] warning: Host check off, any name is accepted (allowed_hosts *)" if "*" in svc.allowed_hosts
+              else f"[server] extra host names: {', '.join(svc.allowed_hosts)}", flush=True)
     if svc.cors_origins:
         print(f"[server] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
-                 "; warning: any web page may use the model (no API key)"), flush=True)
+                 "; warning: any web page can use the model (--api-key KEY)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
     mode = str(cfg.get("anthropic_thinking") or "model")   # "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
-        raise SystemExit(f"[server] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
+        raise SystemExit(f"[server] error: anthropic_thinking must be model or on_request, not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
-        raise SystemExit(f"[server] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
+        raise SystemExit(f"[server] error: repeat_stop_tokens must be a whole number >= 0, not {rs!r}")
     svc.repeat_stop_tokens = rs
     svc.effort_end = bool(effort_end)                   # "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # a default thinking budget for every request
@@ -3508,9 +3493,9 @@ def main() -> int:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
             budget = svc.reasoning_budget({})
         except ValueError as e:
-            raise SystemExit(f"[server] config {e}")
+            raise SystemExit(f"[server] error: {e}")
         if budget:
-            print(f"[server] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
+            print(f"[server] thinking budget: {budget} tokens",
                   flush=True)
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if a.engine == "engine" else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
@@ -3520,14 +3505,14 @@ def main() -> int:
     print(f"[server] ready: http://{here}:{a.port}/v1 (OpenAI /v1/chat/completions, Anthropic /v1/messages), "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''}", flush=True)
-    print(f"[server] stats page: http://{here}:{a.port}/ (Ctrl+C stops the model)", flush=True)
+    print(f"[server] stats: http://{here}:{a.port}/ (Ctrl+C stops)", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
-            print(f"[server] from other devices: http://{ip}:{a.port}/ (API http://{ip}:{a.port}/v1)", flush=True)
+            print(f"[server] network: http://{ip}:{a.port}/v1", flush=True)
         if not ips:
-            print(f"[server] from other devices: http://<this machine's address>:{a.port}/", flush=True)
+            print(f"[server] network: port {a.port}", flush=True)
         if not svc.api_key:
             print("[server] warning: no API key, open to the network (--api-key KEY)", flush=True)
     if a.open and cfg.get("open_browser") is not False:   # the config's "open_browser": false wins
@@ -3546,7 +3531,7 @@ def main() -> int:
         while True:
             time.sleep(1)                               # a timed wait keeps Ctrl+C deliverable
     except KeyboardInterrupt:
-        print("\n[server] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        print("[server] stopping (Ctrl+C again to force)", flush=True)
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
         for close in filter(None, closers):
             try:
