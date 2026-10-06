@@ -377,7 +377,6 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict
 }
 // gdn_rec_cols_kernel with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this token
 // computes (software pipelining).  The same arithmetic in the same order: the same bits, and the same CB-column split.
-// STRATA_GDN_PIPELINE=0: gdn_rec_cols_kernel.
 __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                       const float* __restrict__ gate,
                                                                       const float* __restrict__ beta,
@@ -559,8 +558,6 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__
 // 1.28-1.31x / 1.28-1.30x at 39 to 47, 1.53-1.57x / 1.54-1.55x at 32 to 38.  Per call, from the current device (a
 // layer split can mix cards).
 bool gdn_keyhead_ok() {
-    static const bool off = [] { const char* v = std::getenv("STRATA_GDN_KEYHEAD"); return v != nullptr && std::atoi(v) == 0; }();
-    if (off) return false;
     static int known[64] = {};   // per device: 0 not asked yet, 1 yes, 2 no
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -576,7 +573,7 @@ bool gdn_keyhead_ok() {
     }
     return known[dev] == 1;
 }
-// STRATA_GDN_REC_WARP=1: the recurrence with each column's sums over the 128 key rows inside one warp.  Lane (rg, cl)
+// The recurrence with each column's sums over the 128 key rows inside one warp.  Lane (rg, cl)
 // of warp w: column 4 w + cl of the block's GDN_WC, rows 4 (rg + 8 m) + e (m, e < 4) of the three value heads of key
 // head qh.  A sum over a column's rows is each lane's 16-row chain, then a butterfly over the 8 row-group lanes (lane
 // bits 0-2; every lane ends with the same bits), so a token has no __syncthreads and no shared-memory round trip; the
@@ -683,10 +680,8 @@ __global__ void __launch_bounds__(GDN_WC * 8) gdn_rec_wl_kernel(float* __restric
             for (int e = 0; e < 4; ++e)
                 state[(size_t) (4 * rg + 32 * m + e) * rs + (size_t) (qh + j * HK) * S + col] = s[j][4 * m + e];
 }
-// gdn_rec_wl_kernel when asked for (STRATA_GDN_REC_WARP=1) on a card with cp.async that holds all its blocks at once
+// gdn_rec_wl_kernel on a card with cp.async that holds all its blocks at once
 bool gdn_warp_ok() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_GDN_REC_WARP"); return v != nullptr && std::atoi(v) == 1; }();
-    if (!on) return false;
     static int known[64] = {};   // per device: 0 not asked yet, 1 yes, 2 no
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -699,7 +694,7 @@ bool gdn_warp_ok() {
                          (int64_t) per_sm * sms >= (int64_t) HK * GDN_WNCB;
         if (!yes) {
             cudaGetLastError();
-            std::fprintf(stderr, "strata: STRATA_GDN_REC_WARP: not on this card (sm_80+ holding %d blocks at once)\n",
+            std::fprintf(stderr, "basalt: the warp GDN recurrence does not fit this card (needs sm_80+ holding %d blocks at once)\n",
                          HK * GDN_WNCB);
         }
         known[dev] = yes ? 1 : 2;
@@ -1005,8 +1000,7 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
     check("gdn_gates");
 }
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
-    static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
-    if (serial || T <= CONV_TILE) {
+    if (T <= CONV_TILE) {
         gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
     } else {
         gdn_conv_tiled_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
@@ -1018,20 +1012,15 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
-    if (serial || T <= 0) {
+    if (T <= 0) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     } else {
-        static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
-        if (gdn_warp_ok())   // the row sums inside a warp (opt-in; not the same bits)
+        if (gdn_warp_ok())   // the row sums inside a warp (not the same bits)
             gdn_rec_wl_kernel<<<HK * GDN_WNCB, GDN_WC * 8, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-        else if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
+        else if (gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
             gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-        else
-        if (pipe)   // the software-pipelined loads (same bits)
+        else   // the software-pipelined loads (same bits)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-        else
-            gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16);
     }
     check("gdn_recurrence");

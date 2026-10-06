@@ -1,4 +1,4 @@
-// prefill_fused_iq_test - #136: the fused int8 expert kernels for the native packs (moe_fused_iq.hpp, STRATA_PF_FUSED=1)
+// prefill_fused_iq_test - #136: the fused int8 expert kernels for the native packs (moe_fused_iq.hpp)
 // on random native expert blobs ([gate rows | up rows | down rows], GGUF blocks) and random routing, per format pair,
 // against
 //   - a double-precision reference: the weights dequantized by ggml's own to_float, times the FP32 activations
@@ -13,7 +13,7 @@
 // different expert ranges.  Part 2 (timing): one layer at the engine's chunks (2048, 3584, 8192 tokens; 512 experts,
 // top 10) on both paths and on MMQ's products alone (no gathers), for the IQ2_XS, IQ3_XXS and IQ3_S packs' most
 // common layers, with the grouping checked and a sample of rows against the reference.  The v2 kernels
-// (STRATA_PF_FUSED_V2: IQ3_XXS gate/up, IQ4_NL down) in both parts where a pair has them: against the reference as
+// (the v2 kernels: IQ3_XXS gate/up, IQ4_NL down) in both parts where a pair has them: against the reference as
 // above, within a tenth of the fused path's own error of its outputs, and timed next to it.  --no-ref, --no-timing,
 // --only=NAME, --chunks=A,B.  Exit 77 without a CUDA device of sm_80 or newer.
 #include "strata/prefill/moe_fused_iq.hpp"
@@ -373,7 +373,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
     if (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst)
         throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's");
 
-    // v2 (STRATA_PF_FUSED_V2: IQ3_XXS gate/up, IQ4_NL down): against the reference as above, and next to the kernels
+    // v2 (the v2 kernels: IQ3_XXS gate/up, IQ4_NL down): against the reference as above, and next to the kernels
     // above it differs only in the rounding order (H's int8 codes may move by one)
     if (p.gu == GGML_TYPE_IQ3_XXS || p.d == GGML_TYPE_IQ4_NL) {
         fused::native_v2_override(1);
@@ -633,11 +633,6 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
 
 int main(int argc, char** argv) {
     try {
-#ifdef _WIN32
-        _putenv_s("STRATA_PF_FUSED", "1");
-#else
-        setenv("STRATA_PF_FUSED", "1", 1);
-#endif
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
         if (!fused::available()) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }

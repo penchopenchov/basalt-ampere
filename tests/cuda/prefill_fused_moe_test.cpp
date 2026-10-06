@@ -1,4 +1,4 @@
-// prefill_fused_moe_test - #136: the fused int8 expert kernels of the prompt path (moe_fused.hpp, STRATA_PF_FUSED=1)
+// prefill_fused_moe_test - #136: the fused int8 expert kernels of the prompt path (moe_fused.hpp)
 // on random Strata Q2_0 expert blobs and random routing, against
 //   - a double-precision reference: the dequantized weights times the FP32 activations (gate/up, SwiGLU, down), and
 //   - the MMQ path in prefill.cpp's sequence (gather_strata_q2 into 16-expert groups, q8_1 of the slots' activations,

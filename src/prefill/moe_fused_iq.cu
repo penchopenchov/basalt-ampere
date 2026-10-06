@@ -20,7 +20,7 @@
 // ldmatrix.  The products are mma.sync m16n8k32 (m16n8k16 for the formats with a scale per 16 values); the epilogues
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
 //
-// v2 (STRATA_PF_FUSED_V2=1; IQ3_XXS gate/up, IQ4_NL down).  The kernels above decode a stage's weights into shared
+// v2 (IQ3_XXS gate/up, IQ4_NL down).  The kernels above decode a stage's weights into shared
 // memory for 64 routed rows, read each weight from global memory with 16-bit loads that touch one line per row, and
 // pay three float operations per output and 32 values.  v2 instead:
 //   - copies each weight row's raw GGUF bytes with 16-byte cp.async (from the 16-byte aligned chunks around them;
@@ -898,15 +898,11 @@ const DevInfo& dev_info() {
     return d;
 }
 
-// STRATA_PF_FUSED_V2=1 (read once), or a test's override
+// the v2 kernels are used unless a test overrides it
 std::atomic<int> g_v2_override{-1};
 bool v2_wanted() {
-    static const bool env = [] {
-        const char* v = std::getenv("STRATA_PF_FUSED_V2");
-        return v != nullptr && v[0] == '1';
-    }();
     const int o = g_v2_override.load();
-    return o >= 0 ? o == 1 : env;
+    return o >= 0 ? o == 1 : true;
 }
 // the v2 kernels' blocks per SM when they are wanted and run on the current device, else 0
 int v2_occ() {
@@ -922,8 +918,7 @@ int v2_occ() {
             d.v2 = 1;
             d.v2_occ = occ;
         } else {
-            std::fprintf(stderr, "strata: STRATA_PF_FUSED_V2: the v2 kernels do not run on this device; the native "
-                                 "kernels stay\n");
+            std::fprintf(stderr, "basalt: the v2 fused prompt kernels do not run on this device; the native kernels stay\n");
         }
         cudaGetLastError();
     }
@@ -957,17 +952,8 @@ void launch_v2(unsigned grid, const Batch& b, const NativeGeom& g, const Tables&
 }
 
 // The work item's shape for a layer of `n` routed rows over `n_expert` experts: 128 routed rows when an expert has
-// about one such tile (56 to 112 rows on average), else 64.  Measured on the RTX 5070 (tests/cuda/prefill_fused_iq_test,
-// a layer of 2048 / 3584 / 8192 tokens, ms, 64 -> 128): IQ2_S 5.2 -> 6.7, 9.5 -> 9.3, 17.5 -> 19.5; IQ2_XXS 4.2 ->
-// 5.8, 7.4 -> 7.6, 13.6 -> 16.5; IQ3_S 5.6 -> 6.6, 10.2 -> 8.8, 18.4 -> 19.0; IQ3_XXS 5.1 -> 6.3, 9.1 -> 8.3, 16.5 ->
-// 17.5 (256 rows was slower still).  STRATA_PF_FUSED_TILE=64|128 forces one.
+// about one such tile (56 to 112 rows on average), else 64.
 int pick_ww(int64_t n, int n_expert) {
-    static const int forced = [] {
-        const char* v = std::getenv("STRATA_PF_FUSED_TILE");
-        const int t = v ? std::atoi(v) : 0;
-        return t == 64 ? 4 : t == 128 ? 2 : 0;
-    }();
-    if (forced) return forced;
     const double avg = (double) n / std::max(n_expert, 1);
     return avg > 56.0 && avg <= 112.0 ? 2 : 4;
 }
@@ -975,11 +961,7 @@ int pick_ww(int64_t n, int n_expert) {
 }  // namespace
 
 bool native_supported(int gu_type, int d_type) {
-    static const bool off = [] {   // STRATA_PF_FUSED_NATIVE=0: the native packs keep MMQ under STRATA_PF_FUSED=1 (A/B)
-        const char* v = std::getenv("STRATA_PF_FUSED_NATIVE");
-        return v != nullptr && v[0] == '0';
-    }();
-    return !off && requested() && gu_covered(gu_type) && d_covered(d_type) && dev_info().ok;   // opt-in (=1)
+    return requested() && gu_covered(gu_type) && d_covered(d_type) && dev_info().ok;
 }
 
 void native_v2_override(int mode) { g_v2_override.store(mode); }
@@ -1017,7 +999,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         ck(cudaMemsetAsync(ctr, 0, 2 * sizeof(int), s), "v2 counters");
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
-            std::fprintf(stderr, "strata: prompt experts on the v2 native kernels (STRATA_PF_FUSED_V2=1)\n");
+            std::fprintf(stderr, "basalt: prompt experts on the v2 native kernels\n");
     }
     if (v2_gu) {
         const unsigned gr = (unsigned) std::min<int64_t>(tiles * V2<true>::NFB, (int64_t) d.sms * occ2);
