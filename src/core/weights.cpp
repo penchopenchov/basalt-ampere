@@ -176,7 +176,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         if (n != 19) {
             // A malformed index line is a WRONG BYTE OFFSET waiting to happen, and a wrong offset decodes to
             // a plausible weight.  Refuse loudly instead of loading the rows that happened to parse.
-            err = "index.txt: could not parse a row (" + std::to_string(n) + " of 19 fields)";
+            err = "dense index: could not parse a row (" + std::to_string(n) + " of 19 fields)";
             return false;
         }
         r.name = name;
@@ -190,7 +190,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         rows.push_back(r);
     }
 
-    if (pool == 0 || rows.empty()) { err = "index.txt has no header or no rows"; return false; }
+    if (pool == 0 || rows.empty()) { err = "the dense index has no header or no rows"; return false; }
     // Plan v0.3 P1: a skip set compacts the arena.  Kept rows are re-placed in index order at the index's
     // alignment; skipped rows keep their metadata and get no bytes.
     std::vector<bool> skipped(rows.size(), false);

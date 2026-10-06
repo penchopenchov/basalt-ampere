@@ -198,7 +198,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             std::istringstream is(line);
             Tensor t;
             is >> t.name >> t.kind >> t.rows >> t.cols >> t.off >> t.bytes;
-            if (!is) { err = "mtp: malformed dense.txt line: " + line; return false; }
+            if (!is) { err = "mtp: malformed dense index line: " + line; return false; }
             tensors_.push_back(t);
         }
         std::vector<uint8_t> blob;
@@ -207,7 +207,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             std::vector<uint8_t> kept;
             size_t staged = 0;
             for (Tensor& t : tensors_) {
-                if (t.off + t.bytes > blob.size()) { err = "mtp: dense.txt names bytes past dense.bin: " + t.name; return false; }
+                if (t.off + t.bytes > blob.size()) { err = "mtp: the dense index names bytes past the dense section: " + t.name; return false; }
                 const bool hc = t.kind == "bf16" && t.name.find("hyper_connection") != std::string::npos &&
                                 t.name.find("input_mix_weight_") != std::string::npos &&
                                 (uint64_t) t.rows * (uint64_t) t.cols * 2 == t.bytes;
@@ -269,7 +269,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         std::vector<uint8_t> chunk(64u << 20);
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
+            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: the experts section is truncated"; return false; }
             cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
             off += n;
         }

@@ -1653,8 +1653,8 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
         }
     }
 
-    uint64_t pack_hash = 0;
-    if (!shared_arena_file.empty() && !shared_arena_range_hash(files_in, lay, pack_hash, err)) return false;
+    uint64_t arena_hash = 0;
+    if (!shared_arena_file.empty() && !shared_arena_range_hash(files_in, lay, arena_hash, err)) return false;
 
     // one layer per registration slice, so no expert straddles two registrations.  The arena is one blob
     // longer than the file: a copy of a whole VRAM slot (the largest blob) may then start at any expert.
@@ -1666,7 +1666,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     }
     bounds.push_back(want);
     PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
-                                     shared_arena_file, pack_hash);
+                                     shared_arena_file, arena_hash);
     if (!a->valid()) {
         const std::string why = a->note;
         delete a;

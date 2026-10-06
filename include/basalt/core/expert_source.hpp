@@ -348,9 +348,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k);
 /// The pool half of the same decision; see `ExpertDispatch::is_hit`.
 
-/// **A FILE-BACKED SOURCE: `experts.bin`, memory-mapped, no cache.**
+/// **A FILE-BACKED SOURCE: the experts section, memory-mapped, no cache.**
 ///
-/// `experts.bin` holds exactly `n_layers x n_expert` blobs of `BLOB` bytes, so the index is `layer * n_expert + expert`
+/// The experts section holds exactly `n_layers x n_expert` blobs of `BLOB` bytes, so the index is `layer * n_expert + expert`
 /// with NO padding.  A mapping is therefore the whole implementation: the blob pointer is base plus a multiply, and
 /// the page fault that follows is the read.
 ///
@@ -515,9 +515,9 @@ private:
 //
 // A mapped file's pages are file-backed, and file-backed pages are exactly the ones the OS drops from the standby list
 // when it wants memory.  The expert stream then re-faults from disk, and the engine's rate depends on whether the
-// cache happens to hold `experts.bin`.
+// cache happens to hold the experts section.
 //
-// This class reads `experts.bin` into a `PinnedArena` once at startup, so the expert stream comes from anonymous
+// This class reads the experts section into a `PinnedArena` once at startup, so the expert stream comes from anonymous
 // memory the OS has no cheaper reason to evict.  `PinnedArena` also tries `cudaHostRegister`, which the GPU needs for
 // the cache fills and the CPU/PCIe miss split - but registration is best-effort and reported, not assumed.
 class ArenaExpertSource : public ExpertSource {

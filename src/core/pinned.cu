@@ -35,7 +35,7 @@ struct SharedArenaHeader {
     uint32_t version;
     uint32_t header_bytes;
     uint64_t arena_bytes;
-    uint64_t pack_hash;
+    uint64_t arena_hash;
     uint64_t reserved[4];
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
@@ -45,12 +45,12 @@ static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
     if (!shared_file.empty()) {
-        if (shared_pack_hash == 0) {
-            note = "shared arena requires a nonzero pack hash";
+        if (shared_hash == 0) {
+            note = "shared arena requires a nonzero model hash";
             return nullptr;
         }
         if (bytes > UINT64_MAX - kSharedArenaHeaderBytes) {
@@ -84,7 +84,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             hdr.version = 1;
             hdr.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
             hdr.arena_bytes = bytes;
-            hdr.pack_hash = shared_pack_hash;
+            hdr.arena_hash = shared_hash;
             const ssize_t written = pwrite(fd, &hdr, sizeof hdr, 0);
             if (written != (ssize_t) sizeof hdr) {
                 const int e = errno;
@@ -110,13 +110,13 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
                 note = "shared arena " + shared_file + " has an incompatible or missing header";
                 return nullptr;
             }
-            if (hdr.pack_hash != shared_pack_hash) {
+            if (hdr.arena_hash != shared_hash) {
                 close(fd);
                 char b[256];
                 std::snprintf(b, sizeof b,
-                              "shared arena %s was written for pack hash %016llx, expected %016llx",
-                              shared_file.c_str(), (unsigned long long) hdr.pack_hash,
-                              (unsigned long long) shared_pack_hash);
+                              "shared arena %s was written for model hash %016llx, expected %016llx",
+                              shared_file.c_str(), (unsigned long long) hdr.arena_hash,
+                              (unsigned long long) shared_hash);
                 note = b;
                 return nullptr;
             }
@@ -132,7 +132,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         mapping_base = map;
         mapping_bytes = file_bytes;
         got = PageBacking::NormalPages;
-        note = "MAP_SHARED file " + shared_file + " (pack hash checked)";
+        note = "MAP_SHARED file " + shared_file + " (model hash checked)";
         return (uint8_t*) map + kSharedArenaHeaderBytes;
     }
 
@@ -220,9 +220,9 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
-                         uint64_t shared_pack_hash) : capacity(bytes) {
+                         uint64_t shared_hash) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    base = reserve(bytes, backing, note, shared_file, shared_hash, mapping_base, mapping_bytes);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;

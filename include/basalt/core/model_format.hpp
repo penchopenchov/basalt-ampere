@@ -16,9 +16,9 @@
 //                            files, sizes, sha256, converter version) and the license / attribution text
 //   tokenizer/<file>         the tokenizer directory's files (tokenizer.json, vocab.json, merges.txt,
 //                            token_type.json, chat_template.jinja)
-//   dense                    the dense weight pool (a pack's dense.bin)
+//   dense                    the dense weight pool
 //   dense.index              its tensor index (text, first line "# dense index v3")
-//   experts                  the routed experts' blobs (a pack's experts.bin)
+//   experts                  the routed experts' blobs
 //   experts.layout           their per-layer layout (text, first line "# experts v3"; offsets relative to `experts`)
 //   gguf                     every non-expert tensor of the source GGUFs (token_embd.weight,
 //                            per_layer_token_embd.weight, ...), raw bytes, each starting at a multiple of

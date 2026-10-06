@@ -94,7 +94,7 @@ inline const float kProbeTail[][8] = {
 inline const double kProbeSum[] = {2.011959553e+00, 9.968549609e-01, 0.000000000e+00};
 inline constexpr float kInterleavedSeparation = 1.253766603e+00f;
 
-// pack/full/dense.bin regions for the two quantized PLE weights
+// dense section regions for the two quantized PLE weights
 inline constexpr uint64_t kKeyCodesOffset = 1017723776ull;
 inline constexpr uint64_t kKeyCodesBytes  = 6553600ull;
 inline constexpr uint64_t kKeyScalesOffset = 1024277376ull;

@@ -257,7 +257,7 @@ struct Options {
     bool resident_cpu_explicit = false;   // --resident-cpu-experts given by itself (not only implied)
     /// CS-T `--resident-budget-gib N`: the resident mode with a RAM budget - the N GiB of experts the GPU cache does
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
-    /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
+    /// (the GGUF shards when the model file has no experts section).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (`src/kernels/cuda/s2_expert_grouped.cu`, wired via `expert_hit_run`); the admission policy that
@@ -2814,7 +2814,7 @@ int main(int argc, char** argv) {
     // the low-RAM mode, not the fast one.
     //
     // `FileExpertSource` maps the pack's file, and mapped file pages are the first thing the OS reclaims; the engine's
-    // rate then depends on whether the page cache happens to hold `experts.bin`.  The arena is anonymous memory the
+    // rate then depends on whether the page cache happens to hold the experts file.  The arena is anonymous memory the
     // engine owns, so the pool's rate does not depend on the page cache.
     //
     // It is pinned (registered with CUDA) when the driver allows it, and the GPU's DMA out of it feeds the cache
@@ -4076,7 +4076,7 @@ int main(int argc, char** argv) {
         return 0;
     };
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
-    // hold are copied from experts.bin into RAM once, so no decode or prompt step reads the file (the plain mmap
+    // hold are copied from the experts section into RAM once, so no decode or prompt step reads the file (the plain mmap
     // mode reads them through the OS file cache, which a small-RAM PC keeps giving back to the SSD).  Built here,
     // after the prompt path's lend plan is known: the slots it may lend (the cache's last ones) have their experts
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
@@ -6938,7 +6938,7 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
-            // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
+            // the resident RAM mode, cumulative: experts read from the experts section since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())
                 std::fprintf(stderr, "basalt serve: resident RAM: %.2f GiB of experts in RAM, %lld exchanged with the "
@@ -7138,7 +7138,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt generate: position %lld, token %lld%s\n", (long long) pos, (long long) tok,
                          pos < n_prompt ? " (prompt)" : "");
         // **`d.layers` IS THE BLOB'S LAYER AXIS, NOT A COUNTER.**  The adapter uses it to index
-        // `experts.bin` as `layer * n_expert + expert`, so it MUST restart at 0 for every token.  Leaving it
+        // the experts section as `layer * n_expert + expert`, so it MUST restart at 0 for every token.  Leaving it
         // running across tokens asks for layer 48 of a 48-layer file on the second token - which
         // `FileExpertSource` REFUSES rather than wrapping into layer 0's experts, and that refusal is the only
         // reason this was a clean error instead of a silently wrong second token.

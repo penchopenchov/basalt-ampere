@@ -49,7 +49,7 @@ double now_ms() {
 
 int main(int argc, char** argv) {
     bool selftest = false;
-    const char* path = "pack/full/experts.bin";
+    const char* path = "experts.bin";
     long long layer = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
