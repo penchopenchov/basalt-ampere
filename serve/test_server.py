@@ -1141,6 +1141,12 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(text.rstrip("\n").endswith("0.0/2.0 GiB"))   # cuda1's bar still last
         self.assertEqual(list(bars.bars), ["cuda1"])
 
+    def test_names_follow_the_picked_cards(self):
+        from serve.server import LoadBars
+        self.assertEqual(LoadBars(gpus=[2, 3]).name("cuda1"), "cuda3")
+        self.assertEqual(LoadBars().name("cuda1"), "cuda1")
+        self.assertEqual(LoadBars().name("ram"), "system ram")
+
     def test_narrator_shows_only_progress(self):
         import contextlib
         import io

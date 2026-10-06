@@ -252,17 +252,21 @@ class LoadBars:
 
     WIDTH = 30
 
-    def __init__(self, out=None):
+    def __init__(self, out=None, gpus=None):
         self.out = out or sys.stdout
+        self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number, when --gpu picked cards
         self.tty = self.out.isatty()
         self.bars: dict[str, tuple[int, int]] = {}    # loading now
         self.t0: dict[str, float] = {}
         self.finished: set[str] = set()
         self.drawn = 0
 
-    @staticmethod
-    def name(target: str) -> str:
-        return "system ram" if target == "ram" else target
+    def name(self, target: str) -> str:
+        if target == "ram":
+            return "system ram"
+        if target.startswith("cuda") and target[4:].isdigit() and int(target[4:]) < len(self.gpus):
+            return f"cuda{self.gpus[int(target[4:])]}"
+        return target
 
     def line(self, target: str) -> str:
         done, total = self.bars[target]
@@ -324,9 +328,10 @@ def load_progress(line: str):
         return None
 
 
-def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0, out=None) -> None:
+def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0, out=None,
+                  gpus=None) -> None:
     """Show the engine's load progress from its log (LoadBars), and a heartbeat while nothing moves."""
-    bars = LoadBars(out)
+    bars = LoadBars(out, gpus)
     t0 = last = time.time()
     pos = offset
     while not done.wait(0.25):
@@ -414,8 +419,10 @@ class ProcessEngine:
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
         self.log_start = log_start
         if log:
+            visible = (env or os.environ).get("CUDA_VISIBLE_DEVICES", "")
+            gpus = [int(x) for x in visible.split(",") if x.strip().isdigit()]
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
-                             daemon=True).start()
+                             kwargs={"gpus": gpus}, daemon=True).start()
             # once per log: the follower keeps reading the same (appended) log across restarts and reloads
             if REQUEST_LINES and os.path.abspath(log) not in _echoing:
                 _echoing.add(os.path.abspath(log))
