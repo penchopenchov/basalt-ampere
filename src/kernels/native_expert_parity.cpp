@@ -534,10 +534,6 @@ int main(int argc, char** argv) {
                              "       native_expert_parity --bf16-embd\n");
         return 2;
     }
-    // #152's width check tests the opt-in rule (the multi-token kernels from one token on)
-    if (std::getenv("STRATA_IQ_MT_MIN") == nullptr) {
-        setenv("STRATA_IQ_MT_MIN", "1", 1);
-    }
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);

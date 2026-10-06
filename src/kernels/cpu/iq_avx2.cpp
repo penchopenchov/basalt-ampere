@@ -89,27 +89,15 @@ inline float hsum8(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
-// E-2 (iq_avx512.cpp) on the AVX-2 path: the pool streams the expert rows from DRAM at ~25 GB/s (4 KB pages
-// when large pages are refused), so ask for the bytes a few blocks before the decode needs them - 2048 B is
-// two gate/up rows ahead, a row is ~1 KB.  Same switch as the AVX-512 kernels: STRATA_IQ_PREFETCH is the
-// distance in bytes, 0 = off, default 2048.  Measured on a Zen 3 5700X3D (no AVX-512) on IQ3_S decode: -4% on
-// the gate/up phase, +1.0 GB/s over the rows, -1.3% ms/round end to end.  The non-temporal hint measured
-// worse than T0 at the same distance, so this keeps T0.
-const int prefetch_ahead = [] {
-    const char* v = std::getenv("STRATA_IQ_PREFETCH");
-    return v ? std::atoi(v) : 2048;
-}();
+// Software prefetch on the AVX-2 path: the pool streams the expert rows from DRAM, so ask for the bytes a few blocks
+// before the decode needs them (in bytes: two gate/up rows ahead).
+constexpr int prefetch_ahead = 2048;
 
 inline void rows_ahead(const uint8_t* p) {
     if (prefetch_ahead <= 0) return;
     _mm_prefetch((const char*) p, _MM_HINT_T0);
     _mm_prefetch((const char*) p + 64, _MM_HINT_T0);
 }
-
-// E-2 on the AVX-2 path (the AVX-512 kernels' STRATA_IQ_GATHER): the IQ3 grids by one AVX2 gather instead of eight
-// scalar loads assembled with set_epi32.  AVX2 gather is a different instruction with worse throughput on some cores
-// (opt-in, as on AVX-512); on the i7-12850HX it measures ~1.3x on the two 32-bit-grid formats, bit-exact.
-static const bool gather = [] { const char* v = std::getenv("STRATA_IQ256_GATHER"); return v != nullptr && std::atoi(v) != 0; }();
 
 // ---- per format: one 32-value half (values 64*j + 32*half .. +31) -> grid magnitudes, sign vector, scales
 template <int TY> struct Fmt32;
@@ -168,13 +156,8 @@ template <> struct Fmt32<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 
     static constexpr float K = 0.25f;
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
         const uint8_t* q = b + 2 + 16 * j + 8 * half;
-        if (gather) {
-            const __m256i idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) q));
-            g = _mm256_i32gather_epi32((const int*) iq3xxs_grid, idx, 4);
-        } else {
-            g = _mm256_set_epi32((int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
-                                 (int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]], (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
-        }
+        g = _mm256_set_epi32((int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
+                             (int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]], (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
         const uint32_t w = u32(b + 2 + 64 + 8 * j + 4 * half);
         sgn = _mm256_set_epi64x((long long) even_signs.v[(w >> 21) & 127], (long long) even_signs.v[(w >> 14) & 127],
                                 (long long) even_signs.v[(w >> 7) & 127], (long long) even_signs.v[w & 127]);
@@ -188,17 +171,9 @@ template <> struct Fmt32<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4
     static inline void decode(const uint8_t* b, int j, int half, __m256i& g, __m256i& sgn, __m256i& sc) {
         const uint8_t* q = b + 2 + 16 * j + 8 * half;
         const uint32_t h = b[66 + 2 * j + half];
-        if (gather) {
-            const __m256i bits = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-            __m256i idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) q));
-            idx = _mm256_add_epi32(idx, _mm256_slli_epi32(
-                _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int) h), bits), _mm256_set1_epi32(1)), 8));
-            g = _mm256_i32gather_epi32((const int*) iq3s_grid, idx, 4);
-        } else {
 #define G3(k) (int) iq3s_grid[q[k] | (((h >> k) & 1u) << 8)]
-            g = _mm256_set_epi32(G3(7), G3(6), G3(5), G3(4), G3(3), G3(2), G3(1), G3(0));
+        g = _mm256_set_epi32(G3(7), G3(6), G3(5), G3(4), G3(3), G3(2), G3(1), G3(0));
 #undef G3
-        }
         const uint64_t m = u64(b + 74 + 8 * j);
         sgn = sgn_vec(half ? (uint32_t) (m >> 32) : (uint32_t) m);
         const uint8_t s = b[106 + j];

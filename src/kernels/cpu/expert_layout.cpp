@@ -16,25 +16,10 @@ ExpertLayout g_layout;
 
 const ExpertLayout& expert_layout() { return g_layout; }
 
-int cpu_isa_cap() {
-    // STRATA_FORCE_ISA (tests, the experimental older-CPU builds): the engine's own dispatch acts as if this CPU
-    // stopped at that level.  ggml-cpu is not affected: it runs what the build compiled it for.
-    static const int cap = [] {
-        const char* f = std::getenv("STRATA_FORCE_ISA");
-        if (f == nullptr || f[0] == '\0') return 3;
-        const std::string v(f);
-        if (v == "avx2") return 2;
-        if (v == "avx") return 1;
-        if (v == "sse" || v == "sse4.2" || v == "none") return 0;
-        std::fprintf(stderr, "strata: STRATA_FORCE_ISA=%s is not avx2, avx or sse; ignored\n", f);
-        return 3;
-    }();
-    return cap;
-}
+int cpu_isa_cap() { return 3; }   // no cap
 
 bool cpu_avx512_ok() {
     static const bool ok = [] {
-        if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
         if (cpu_isa_cap() < 3) return false;
         unsigned r[4] = {0, 0, 0, 0};
         auto cpuid = [&](unsigned leaf, unsigned sub) {
@@ -57,7 +42,6 @@ bool cpu_avx512_ok() {
 
 bool cpu_avx512bw_ok() {
     static const bool ok = [] {
-        if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
         unsigned r[4] = {0, 0, 0, 0};
         auto cpuid = [&](unsigned leaf, unsigned sub) {
             __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);

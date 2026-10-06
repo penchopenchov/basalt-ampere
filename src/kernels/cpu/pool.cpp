@@ -216,8 +216,6 @@ void ExpertPool::diag(std::FILE* f) const {
 
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity)
     : host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
-    if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
-        spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     if (n_workers > 0) {
         n_ = n_workers;
     } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
