@@ -1599,6 +1599,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     basalt::core::qsa_set_kv_resident(o.kv_resident);
+    // --serve with --spec 0 or 1: no speculation.  The drafter is not loaded, prompt lookup is off, and every step
+    // is a one-token window through the verify path.
+    const bool no_spec = o.serve && o.spec < 2;
+    if (no_spec) {
+        o.spec = 1;
+        o.suffix_draft = 0;
+        o.mtp.clear();
+    }
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (basalt/spec/draft_policy.hpp) takes one only where it pays.
     // --suffix-draft 0 turns it off.
@@ -1907,9 +1915,9 @@ int main(int argc, char** argv) {
     }
     basalt::core::NativeEmbed native_embed;
     {
-        if (o.spec < 2 || (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
-            std::fprintf(stderr, "basalt generate: %s runs its experts in verify windows: it needs --spec T (T >= 2) "
-                                 "and --prefill CHUNK\n", o.model.c_str());
+        if ((o.spec < 2 && !no_spec) || (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
+            std::fprintf(stderr, "basalt generate: %s runs its experts in verify windows: it needs --spec T (T >= 2; "
+                                 "--serve also takes 0) and --prefill CHUNK\n", o.model.c_str());
             return 2;
         }
         const basalt::core::ModelGeometry g0;
@@ -2776,6 +2784,8 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
+    const bool mtp_on = !o.mtp.empty();
+    const basalt::core::QsaState* const mtp_kv = mtp_on ? &mtp.kv_state() : nullptr;   // the draft layer's K/V, if any
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  Loaded first, the cache is sized around the native
     // head, and the head is not refused after the expert arena has registered tens of GiB of host pages, like the
@@ -4175,9 +4185,10 @@ int main(int argc, char** argv) {
         }
     }
     if (o.serve) {
-        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
+        if ((!no_spec && (o.spec < 2 || o.mtp.empty())) || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
-            std::fprintf(stderr, "basalt serve: needs --spec T, --mtp DIR and --prefill CHUNK (and a fillable "
+            std::fprintf(stderr, "basalt serve: needs --spec T (0 for none; T >= 2 also needs the model's draft layer) "
+                                 "and --prefill CHUNK (and a fillable "
                                  "--expert-cache; the graphed hit path additionally needs an expert profile)\n");
             return 2;
         }
@@ -4557,7 +4568,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err) ||
-            !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err)) {
+            (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
             std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
             return 1;
         }
@@ -4621,8 +4632,8 @@ int main(int argc, char** argv) {
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const basalt::core::QsaState* draft0 = n_st > 0 ? nullptr : &mtp.kv_state();
-            auto draft_of = [&](size_t k) -> const basalt::core::QsaState* { return k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            const basalt::core::QsaState* draft0 = n_st > 0 ? nullptr : mtp_kv;
+            auto draft_of = [&](size_t k) -> const basalt::core::QsaState* { return k + 1 == n_st ? mtp_kv : nullptr; };
             basalt::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = basalt::core::conversation_checkpoints_split(std::move(checks), n_st);
             struct MergeBack {
@@ -4799,8 +4810,8 @@ int main(int argc, char** argv) {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
-            if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            const bool batched = mtp_on && !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            if (!e.empty() || (mtp_on && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
@@ -5291,7 +5302,7 @@ int main(int argc, char** argv) {
         int64_t rounds = 0;
         const int S = o.spec;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
-        if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
+        if (mtp_on && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         basalt::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
@@ -6035,7 +6046,7 @@ int main(int argc, char** argv) {
             if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
                 const basalt::core::OnDevice on(stages[i]->dev);
                 if (!basalt::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
-                        i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
+                        i + 1 == stages.size() ? mtp_kv : nullptr, err)) {   // the draft: the last stage's
                     std::fprintf(stderr, "basalt serve: conversation cache: discard invalid stage snapshot (%s)\n",
                                  err.c_str());
                     incoming.reset();
@@ -6044,7 +6055,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (incoming && !basalt::core::conversation_snapshot_validate(*incoming, ss, g,
-                    stages.empty() ? &mtp.kv_state() : nullptr, err)) {
+                    stages.empty() ? mtp_kv : nullptr, err)) {
                 std::fprintf(stderr, "basalt serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
                 err.clear();
@@ -6095,7 +6106,7 @@ int main(int argc, char** argv) {
             if (incoming) {
                 const auto t0 = Clock::now();
                 if (basalt::core::conversation_snapshot_restore(*incoming, ss, g,
-                        stages.empty() ? &mtp.kv_state() : nullptr, err) !=
+                        stages.empty() ? mtp_kv : nullptr, err) !=
                     basalt::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
@@ -6105,7 +6116,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const basalt::core::OnDevice on(stages[i]->dev);
                     if (basalt::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            i + 1 == stages.size() ? mtp_kv : nullptr, err) !=
                         basalt::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());
@@ -6174,8 +6185,10 @@ int main(int argc, char** argv) {
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
-            if (resume > 0) mtp.kv_restore(resume);
-            mtp.set_prompt_len(n);
+            if (mtp_on) {
+                if (resume > 0) mtp.kv_restore(resume);
+                mtp.set_prompt_len(n);
+            }
             const int64_t read_from = resume;
             conversations.limit_reuse(read_from);
             pp_total = n;
@@ -6228,7 +6241,7 @@ int main(int argc, char** argv) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
-                    if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
+                    if (!ver.commit(T, e) || (mtp_on && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
                     q += T;
                     pp_reached = q;
                 }
@@ -6438,7 +6451,7 @@ int main(int argc, char** argv) {
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
-            mtp.set_draft_sampling(req_sp);   // sampled drafts (a no-op without --coupled-draft)
+            if (mtp_on) mtp.set_draft_sampling(req_sp);   // sampled drafts (a no-op without --coupled-draft)
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
@@ -6743,11 +6756,11 @@ int main(int argc, char** argv) {
                     };
                     ++rounds;
                     const Clock::time_point tw2 = Clock::now();
-                    if (hist_n > 0 && mtp.coupled() && will_draft)
+                    if (hist_n > 0 && mtp_on && mtp.coupled() && will_draft)
                         mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                     basalt::core::decode_gaps().mark(5);
                     bool drafted = true;
-                    if (will_draft) {
+                    if (will_draft && mtp_on) {
                         mtp.set_launch_hook(after_launch);
                         drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                         mtp.set_launch_hook(nullptr);
@@ -6814,10 +6827,10 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's commit,
                 // outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                if (hist_n > 0 && mtp_on && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 basalt::core::decode_gaps().mark(5);
-                const bool drafted = eos || produced_n >= max_new ||
+                const bool drafted = eos || produced_n >= max_new || !mtp_on ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
                     const Clock::time_point tw3 = Clock::now();
