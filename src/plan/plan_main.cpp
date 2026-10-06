@@ -12,7 +12,7 @@
 
 int main(int argc, char** argv) {
     uint64_t ctx = 20480;
-    uint64_t free_vram = 12ull * 1000 * 1000 * 1000; // RTX 5070 nominal; overridden by --vram
+    uint64_t free_vram = 12ull * 1000 * 1000 * 1000; // a small card; overridden by --vram
     basalt::plan::Costs costs;
     bool state_given = false;
     for (int i = 1; i < argc; ++i) {
@@ -45,8 +45,8 @@ int main(int argc, char** argv) {
             std::printf("usage: basalt-plan [--max-context N] [--vram BYTES] [--dense B] [--embd B]\n"
                         "                   [--workspace B] [--state B] [--pool B]\n"
                         "  --state defaults to the geometry's own GDN recurrence + conv history, NOT to 0:\n"
-                        "  the flag used to default to zero and nothing passed it, so the planner silently\n"
-                        "  planned without 117.7 MB (85 expert slots) of non-evictable state.\n");
+                        "  a planner fed zero would silently plan without 117.7 MB (85 expert slots) of\n"
+                        "  non-evictable state.\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());

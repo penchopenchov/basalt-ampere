@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
             if (checked == 0) {
                 // A folded checksum over the FIRST 64 blocks, for cross-checking against the Python
                 // implementation on identical bytes. A single implementation being self-consistent
-                // proves little - two disagreeing is what finds bugs (round 67).
+                // proves little - two disagreeing is what finds bugs.
                 double sum = 0, sumabs = 0;
                 const uint8_t* base = g.tensor_data(t);
                 for (uint64_t b = 0; b < nblocks && b < 64; ++b) {

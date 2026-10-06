@@ -1,4 +1,4 @@
-// src/ngram/ple_reader_test.cpp - plan v0.3 P2: the direct SSD row reader against ground truth.
+// src/ngram/ple_reader_test.cpp - the direct SSD row reader against ground truth.
 //
 //   ple_reader_test --selftest [--dir D]        synthetic table file; CPU and disk only, no model, no GPU
 //   ple_reader_test --gguf SHARD2 [--rows N]    the real table: Direct vs Mmap bytes for N random rows (+ the
@@ -75,9 +75,9 @@ bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n
     return true;
 }
 
-// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (#296, OrcaRouter's Q5_0 PLE rows) is
+// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0 PLE rows) is
 // run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific, so a second row
-// size run here is the correctness evidence for lifting ngram.cpp's "Q5_0 PLE requires --ple-io mmap" refusal.
+// size is the correctness evidence for the generic path.
 int selftest(const std::string& dir, uint32_t rb) {
     const uint32_t N = 500000;                          // 45 MB: large enough for thousands of distinct pages
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
@@ -286,7 +286,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) {
-        // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (#296, OrcaRouter's Q5_0 PLE rows) through the
+        // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (Q5_0 PLE rows) through the
         // same generic row_bytes path -- see the comment on selftest().
         const int r90 = selftest(dir, ng::ROW_BYTES);
         const int r110 = selftest(dir, 110);

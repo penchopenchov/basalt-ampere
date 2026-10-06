@@ -33,9 +33,9 @@ void DirectFile::free_aligned(void* p) {
 }
 
 namespace {
-/// A queued read: `submit` only queues it; the pool's threads issue it (perf-review C-4 / F-2).  One thread
-/// issuing every read was the limit of the n-gram table's prompt reads: ~12 us of kernel time per read, ~80K
-/// reads/s, while an NVMe drive serves several times that at depth.
+/// A queued read: `submit` only queues it; the pool's threads issue it .  One thread
+/// issuing every read would limit the n-gram table's prompt reads to the kernel time per read, while an NVMe
+/// drive serves several times that at depth.
 struct Pending {
     uint64_t offset;
     void* buffer;
@@ -49,9 +49,8 @@ int io_threads(int dflt) { return std::clamp(dflt, 1, 64); }
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------ POSIX
-// perf-review F-2: a pool of threads, each doing blocking O_DIRECT preads, so reads run in parallel (the thread
-// count is the queue depth).  It replaced one synchronous pread inside `submit`, which read the n-gram table's
-// rows one at a time.
+// A pool of threads, each doing blocking O_DIRECT preads, so reads run in parallel (the thread
+// count is the queue depth).
 struct DirectFile::Impl {
     int fd = -1;
     uint64_t size = 0;

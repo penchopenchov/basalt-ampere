@@ -7,8 +7,7 @@
 //      lookup that silently picks by position.
 //
 // The fixture is a minimal GGUF v3 written here (header, no metadata, two F32[8] tensors, 32-byte
-// alignment), so the test needs neither gguf-py nor a shard.  The file is closed before it is removed:
-// on Windows an open mapping keeps it.
+// alignment), so the test needs neither gguf-py nor a shard.  The file is closed before it is removed.
 #include "basalt/artifact/gguf_reader.hpp"
 
 #include <cstdint>

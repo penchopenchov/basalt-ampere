@@ -1,4 +1,4 @@
-// src/spec/controller_test.cpp - plan v0.3 P6: the speculation controller's decisions (no model, no GPU).
+// src/spec/controller_test.cpp - the speculation controller's decisions (no model, no GPU).
 #include "basalt/spec/controller.hpp"
 
 #include <cstdio>

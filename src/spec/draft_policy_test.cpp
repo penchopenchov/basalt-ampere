@@ -1,6 +1,6 @@
 // src/spec/draft_policy_test.cpp - DraftPolicy: when does a lookup window beat the MTP's?
 //
-// Simulated rounds with the costs measured on the RTX 5070 (window-cost: ~10 ms more per token) check that
+// Simulated rounds with measured window costs (about 10 ms more per token) check that
 //   1. with no lookup proposal the MTP window is kept;
 //   2. lookup drafts that are mostly rejected stop being taken (their bucket's rate falls);
 //   3. lookup drafts that are always accepted are taken, and the window grows with them;

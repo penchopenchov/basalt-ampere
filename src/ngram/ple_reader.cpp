@@ -92,8 +92,8 @@ struct TicketState {
 }  // namespace
 
 // THREADING. With `io_thread` (the default) one worker thread owns every DirectFile call: it submits queued jobs
-// and reaps completions, so `issue` on the caller's thread only builds jobs and wakes it (~11 us per ReadFile
-// no longer lands on the host loop). `mu` guards everything below except `file`, which only the worker touches
+// and reaps completions, so `issue` on the caller's thread only builds jobs and wakes it (the per-read call
+// cost stays off the host loop). `mu` guards everything below except `file`, which only the worker touches
 // (plus `wake`, which is thread-safe). Without `io_thread` the caller does all of it, as before.
 struct PleReader::Impl {
     DirectFile file;

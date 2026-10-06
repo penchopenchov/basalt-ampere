@@ -18,8 +18,8 @@ double CostModel::step_ms(int k, bool mtp) const {
 }
 
 Controller::Controller(CostModel cost, double min_gain, double ema) : cost_(cost), min_gain_(min_gain), ema_(ema) {
-    // Priors: MTP per-position acceptance from flyweight's measurement on this model (0.86 per draft); lookup by
-    // match length from the offline replay (2026-09-23-suffix-lookup). Both are then learned per session.
+    // Priors: MTP per-position acceptance (0.86 per draft); lookup acceptance by
+    // match length. Both are then learned per session.
     mtp_p_.fill(0.86);
     lookup_q_ = {0.35, 0.6, 0.8, 0.92};
 }
