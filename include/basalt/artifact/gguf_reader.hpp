@@ -1,5 +1,4 @@
-// include/basalt/artifact/gguf_reader.hpp - generated from src/artifact/gguf_reader.cpp by
-// scripts/split_artifact.py.  Header-only on purpose: the reader is one translation unit's worth of
+// include/basalt/artifact/gguf_reader.hpp - the GGUF reader.  Header-only on purpose: the reader is one translation unit's worth of
 // code with no state to hide, and a header-only split cannot introduce a duplicate-symbol or
 // missing-declaration bug in code that is already validated.
 #pragma once

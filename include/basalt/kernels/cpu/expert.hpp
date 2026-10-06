@@ -21,7 +21,7 @@
 
 namespace basalt::kernels::cpu {
 
-// ---- geometry, all of it fixed by the artifact (tools/verify_q2_0_geometry.py: 202/202 tensors at QK=64) ----
+// ---- geometry, all of it fixed by the artifact (every Q2_0 tensor has QK=64) ----
 inline constexpr int H = 2560;      // n_embd
 inline constexpr int FF = 640;      // expert intermediate width
 inline constexpr int NE = 512;      // routed experts per layer

@@ -759,7 +759,7 @@ if(BUILD_TESTING)
   add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
   # one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
-  # the 38 GB model; run it by hand or from tools/gpu_session.py)
+  # the full model; run it by hand)
   add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
   target_link_libraries(dequant_bf16_test PRIVATE kernels artifact ${_gpu_runtime_target})
 

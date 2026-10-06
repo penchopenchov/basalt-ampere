@@ -5,8 +5,7 @@
 // stop reading those bytes: put some of the 48 x 512 experts in VRAM and let the GPU compute them, so the CPU reads
 // only the misses.
 //
-// **THE DESIGN IS SIZED AGAINST MEASUREMENTS.**  The expert hit rate is a held-out figure (ten-fold leave-one-out in
-// `tools/routing_kfold.py`), the VRAM is what is free on a live run rather than at startup, and only a small share of
+// **THE DESIGN IS SIZED AGAINST MEASUREMENTS.**  The expert hit rate is a held-out figure, the VRAM is what is free on a live run rather than at startup, and only a small share of
 // (layer, token) pairs have all ten experts resident - so this cannot be a per-layer grouped kernel and the three-way
 // split is not an optimisation.
 //

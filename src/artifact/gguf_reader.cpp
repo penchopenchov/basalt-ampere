@@ -27,8 +27,8 @@ int main(int argc, char** argv) {
                         (unsigned long long)g.count_type("BF16"), (unsigned long long)g.count_type("F32"));
 
             // Every tensor's byte size must land inside the gap to the next tensor's offset, since
-            // GGUF aligns every tensor. That is the same bracket test tools/verify_q2_0_geometry.py
-            // uses, and it validates block_geometry() against the file rather than asserting it.
+            // GGUF aligns every tensor. This bracket test
+            // validates block_geometry() against the file rather than asserting it.
             std::vector<const basalt::TensorInfo*> ordered;
             for (const auto& t : g.tensors()) ordered.push_back(&t);
             std::sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->offset < b->offset; });
@@ -47,8 +47,7 @@ int main(int argc, char** argv) {
                 const uint64_t nb = t->elements() / (uint64_t)el * (uint64_t)by;
                 // The bracket is on the GAP to the next tensor's offset, not on that offset itself -
                 // offsets are relative to data_start, so the gap is a difference. Comparing against
-                // the raw offset flagged almost every tensor (213/214) while the same test in Python
-                // (tools/verify_q2_0_geometry.py) passed.
+                // the raw offset would flag almost every tensor.
                 const uint64_t end = (i + 1 < ordered.size()) ? ordered[i + 1]->offset - t->offset
                                                               : g.file_size() - g.data_start() - t->offset;
                 if (!(nb <= end && end < nb + 32)) ++bad;

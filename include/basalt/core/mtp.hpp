@@ -1,7 +1,6 @@
 // include/basalt/core/mtp.hpp - the MTP draft layer on the GPU.
 //
-// The model ships one multi-token-prediction layer (transcribed and validated in
-// `tools/mtp_probe.py`).  Cell i of its
+// The model ships one multi-token-prediction layer.  Cell i of its
 // sequence pairs the main model's final multi-stream residual at position i with the token at position i+1, at
 // rope position i (vLLM's convention); its output predicts the token at position i+2, and its own residual feeds
 // the next draft step.
@@ -12,7 +11,7 @@
 //
 // Runtime choices, each a trade of exactness for simplicity that only affects DRAFT quality, never the output
 // (the verify window decides every emitted token):
-//   * the large projections run as Q8_0 through the multi-column MMVQ (`tools/mtp_rt.py` quantizes them);
+//   * the large projections run as Q8_0 through the multi-column MMVQ (the converter quantizes them);
 //   * the attention is DENSE over every cell the layer has seen - identical to the model's sparse selection
 //     below 2,051 cells - so speculative cells (draft steps, rejected window rows) never touch indexer state and
 //     are simply overwritten when their positions are processed again;

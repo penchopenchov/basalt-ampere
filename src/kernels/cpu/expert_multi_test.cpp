@@ -5,7 +5,7 @@
 //                                  far beyond the last-level cache, so the blob comes from DRAM as it does in the engine); 1 thread
 //
 // The bench measures the speculation model's `extra_use_cost`: the CPU time of each extra token routed to an
-// expert, as a fraction of reading the expert once (tools/spec_economics.py assumes 0.2).
+// expert, as a fraction of reading the expert once.
 #include "basalt/kernels/cpu/expert.hpp"
 
 #include <chrono>
