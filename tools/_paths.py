@@ -1,11 +1,9 @@
 """tools/_paths.py - where the tools find llama.cpp's gguf-py (for the MTP packer and the fixtures).
 
-Order: $STRATA_GGUF_PY, then <engine>/third_party/llama.cpp/gguf-py (a llama.cpp checkout), then the development
-tree's ../../.ref/llama.cpp/gguf-py.
+It lives in a llama.cpp checkout at <repo>/third_party/llama.cpp.
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -13,13 +11,10 @@ ENGINE = Path(__file__).resolve().parents[1]
 
 
 def gguf_py() -> str:
-    cands = [os.environ.get("STRATA_GGUF_PY"), ENGINE / "third_party" / "llama.cpp" / "gguf-py",
-             ENGINE.parents[min(1, len(ENGINE.parents) - 1)] / ".ref" / "llama.cpp" / "gguf-py"]   # the dev tree
-    for c in cands:
-        if c and (Path(c) / "gguf").is_dir():
-            return str(c)
-    sys.exit("llama.cpp's gguf-py was not found: put a llama.cpp checkout in third_party/llama.cpp, "
-             "or set STRATA_GGUF_PY")
+    p = ENGINE / "third_party" / "llama.cpp" / "gguf-py"
+    if (p / "gguf").is_dir():
+        return str(p)
+    sys.exit("llama.cpp's gguf-py was not found: put a llama.cpp checkout in third_party/llama.cpp")
 
 
 def add_gguf_py() -> None:

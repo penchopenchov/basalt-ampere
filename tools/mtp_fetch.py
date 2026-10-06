@@ -26,19 +26,19 @@ import time
 import urllib.error
 import urllib.request
 
-# #214: a fixed commit of the checkpoint (its `sha` from https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next
-# on 2026-09-30), so every install reads the same tensors; STRATA_MTP_REVISION overrides it (e.g. main).  When the
-# repository no longer has it, the current files are read instead, with a message (resolve_repo).
+# A fixed commit of the checkpoint (its `sha` from https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next), so every
+# install reads the same tensors; --revision overrides it (e.g. main).  When the repository no longer has it, the
+# current files are read instead, with a message (resolve_repo).
 PINNED_REVISION = "de4b8e4d43b917e7706784d8bb445c9af86a3540"
-REVISION = os.environ.get("STRATA_MTP_REVISION") or PINNED_REVISION
-# #495: HF_ENDPOINT (a mirror, e.g. https://hf-mirror.com) serves the same revision; the SHA256 checks below still apply
+REVISION = PINNED_REVISION
+# HF_ENDPOINT (a mirror, e.g. https://hf-mirror.com) serves the same revision; the SHA256 checks below still apply
 HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
 REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
 PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # SHA256's revision
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 BAD = 3                                             # `verify`'s exit code: a tensor is missing or corrupt
 
-# #327: sha256 of every MTP tensor's bytes at PINNED_REVISION (two independent fetches agree, and 29 of them were read
+# sha256 of every MTP tensor's bytes at PINNED_REVISION (two independent fetches agree, and 29 of them were read
 # again from that revision; the two expert tensors' first and last 16 MiB), so a mirror that ignored the
 # Range header (it sent the shard's start: its JSON header) is caught, and an install it corrupted is fetched again.
 SHA256 = {
@@ -257,8 +257,8 @@ def fetch(out, only):
 
 
 def verify(out):
-    """#327: the fetched tensors against SHA256 -> the names that are missing or wrong.  [] when they are right, or
-    when there is nothing to check (no tensors/, or STRATA_MTP_REVISION names another revision).  A tensor's verdict
+    """The fetched tensors against SHA256 -> the names that are missing or wrong.  [] when they are right, or
+    when there is nothing to check (no tensors/, or --revision names another one).  A tensor's verdict
     is kept in tensors/verified.json by size and mtime, so a later run hashes only what changed."""
     tdir = os.path.join(out, "tensors")
     if not pinned() or not os.path.isdir(tdir):
@@ -294,7 +294,13 @@ def main():
     ap.add_argument("cmd", choices=["inventory", "fetch", "verify"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
+    ap.add_argument("--revision", help="read this revision of the checkpoint instead of the pinned one (e.g. main); "
+                                       "its tensors are not hash-checked")
     a = ap.parse_args()
+    if a.revision:
+        global REVISION, REPO
+        REVISION = a.revision
+        REPO = REPO.replace("/resolve/%s/" % PINNED_REVISION, "/resolve/%s/" % a.revision)
     if a.cmd == "verify":                           # offline: the hashes are the pinned revision's
         bad = verify(a.out)
         for name in bad:

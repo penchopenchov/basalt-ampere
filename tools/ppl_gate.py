@@ -3,9 +3,8 @@
 
 The base is the file `llama-perplexity --kl-divergence-base` writes (wikitext-2, n_ctx 512 chunks, the second half
 of each chunk scored).  The engine is started the way serve/server.py starts it from a config (the vision encoder
-first, so the expert tiers are sized as in daily use), with STRATA_PPL_BASE/STRATA_PPL_OUT set and any STRATA_*
-flags of the caller's environment.  Per chunk it reads the first half as a prompt and teacher-forces the rest
-through verify windows of T tokens (every token committed); see include/strata/program/ppl_gate.hpp.
+first, so the expert tiers are sized as in daily use), with --ppl-base and --ppl-out added to its arguments.  Per chunk it reads the first half as a prompt and teacher-forces the rest
+through verify windows of T tokens (every token committed); see the engine's ppl_gate.hpp.
 
   python3 tools/ppl_gate.py --exe build/strata --config cfg.json --base base.kld --out DIR [--chunks 20] [--t 3]
                             [--set="--spec 5 --spec-min-p 0.7"]
@@ -102,8 +101,6 @@ def start_vision(cfg: dict, env: dict, log):
     if v.get("cuda_device") is not None:   # serve/server.py vision_env
         venv["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         venv["CUDA_VISIBLE_DEVICES"] = str(v["cuda_device"])
-    for k in [k for k in venv if k.startswith("STRATA_PPL")]:
-        del venv[k]
     p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, env=venv)
     line = p.stdout.readline()
     if not line.startswith("READY"):
@@ -126,11 +123,9 @@ def run(a) -> int:
     rows = out / "rows.tsv"
     rows.unlink(missing_ok=True)
     env = engine_env(cfg)
-    env["STRATA_PPL_BASE"] = a.base
-    env["STRATA_PPL_OUT"] = str(rows)
+    args += ["--ppl-base", a.base, "--ppl-out", str(rows)]
     log = open(out / "engine.log", "w")
-    flags = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items()) if k.startswith("STRATA_"))
-    log.write(f"ppl_gate: exe={a.exe} T={a.t} chunks={a.chunks} args={' '.join(args)}\nenv: {flags}\n")
+    log.write(f"ppl_gate: exe={a.exe} T={a.t} chunks={a.chunks} args={' '.join(args)}\n")
     log.flush()
     t0 = time.time()
     vis = start_vision(cfg, env, log)
@@ -187,7 +182,7 @@ def run(a) -> int:
                                       f"peer GPU/PCIe {100.0 * off / max(1, look + off):.1f}%, "
                                       f"CPU {100.0 * (look - hits) / max(1, look + off):.1f}%"}
     rep = summary(str(rows), extra)
-    (out / "report.txt").write_text(f"exe {a.exe}\nenv {flags}\n{rep}\n")
+    (out / "report.txt").write_text(f"exe {a.exe}\nargs {' '.join(args)}\n{rep}\n")
     print(rep)
     return 0
 

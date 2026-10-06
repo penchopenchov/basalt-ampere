@@ -41,9 +41,7 @@ try:
 except ImportError as e:  # a missing numpy or vendored gguf-py must be explicit, not a traceback
     sys.stderr.write(f"iq_fixture: missing dependency: {e}\n"
                      "numpy and the repository's vendored gguf-py (third_party/llama.cpp/gguf-py) are "
-                     "required.  The vendored copy comes with setup's llama.cpp download (the pinned "
-                     "LLAMA_CPP_COMMIT zip); on a fresh checkout run setup once, or fetch that zip and "
-                     "unpack its gguf-py there.\n")
+                     "required: put a llama.cpp checkout's gguf-py there.\n")
     sys.exit(3)
 
 QT = gguf.GGMLQuantizationType
