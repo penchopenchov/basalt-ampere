@@ -255,7 +255,7 @@ struct Options {
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM resident mode): `--resident-cpu-experts` with the copy
-    /// page-locked when the driver allows (else locked in the working set), 4 GiB of RAM headroom, and plain mmap
+    /// page-locked when the driver allows (else locked in the working set), the RAM margin as headroom, and plain mmap
     /// (with a warning) when even the experts no slot holds do not fit.
     bool resident_pin = false;
     uint64_t resident_headroom = 8ull << 30;
@@ -1370,14 +1370,14 @@ int main(int argc, char** argv) {
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
-            o.resident_headroom = 4ull << 30;
+            o.resident_headroom = 0;
         }
         else if (a == "--resident-budget-gib") {
             const double gib = std::atof(next("--resident-budget-gib"));
             if (!(gib > 0.0)) { std::fprintf(stderr, "basalt generate: --resident-budget-gib needs N > 0\n"); return 2; }
             o.resident_budget = (uint64_t) (gib * 1073741824.0);
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
-            o.resident_headroom = 4ull << 30;
+            o.resident_headroom = 0;
         }
         else if (a == "--stats") o.stats = true;
         else if (a == "--profile") basalt::core::diagnostics().profile = true;
@@ -2026,7 +2026,8 @@ int main(int argc, char** argv) {
             if (o.mmap_experts && cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_ram) {
                 const uint64_t vram = (uint64_t) free_vram > ((uint64_t) o.vram_reserve_mib << 20)
                                           ? (uint64_t) free_vram - ((uint64_t) o.vram_reserve_mib << 20) : 0;
-                const uint64_t ram = *free_ram > o.resident_headroom ? *free_ram - o.resident_headroom : 0;
+                const uint64_t headroom = std::max(o.resident_headroom, basalt::platform::ram_margin());
+                const uint64_t ram = *free_ram > headroom ? *free_ram - headroom : 0;
                 ssd_warned = model_bytes > vram + ram;
                 if (ssd_warned)
                     std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
