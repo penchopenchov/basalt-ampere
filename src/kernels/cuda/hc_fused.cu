@@ -127,7 +127,10 @@ struct HcLaunch {
     int cn_copies;   // cn: copies of the sums (up item u reads copy u % cn_copies)
     int tma;         // cn: 1 = each warp's rows by two tensor copies (tm[0..3]); 2 = the item's rows by one thread's
                      // tensor copies (tm[4..5], w_inject's by tm[2..3])
-    int up_tma;      // 1: the 8-bit mma up slices by two tensor copies (tm[6..7], hc_up_tma)
+    int up_tma;      // 1: the 8-bit mma up slices by two tensor copies (tm[6..7], hc_up_tma); 2: the first one before
+                     // the previous kernel is waited on
+    int lo_stage;    // cn: an up item's copy of the down items' sums by bulk copies into shared memory (cn_lo's lbar)
+    int no_dry;      // cn: the up items skip the top-10 dry run (a down item's CTA claims the top-10 and warms itself)
     CUtensorMap tm[8];   // q_down, s_down, q_inject, s_inject by four rows; q_down, s_down by CN_RG rows; q_up, s_up
 };
 
@@ -859,23 +862,29 @@ __device__ void cn_dot(const CnRows& w, int tid, const char* smem, uint64_t* bar
 // epilogue; `out`: also the read's lo, rs and inject outputs.
 // bf non-null: lo as the mma pass's B fragments (lo_frag_store) instead of lo_s.
 template <int T>
+// lbar non-null: cnp and cns are a copy in shared memory that completes on lbar (phase lph).
 __device__ void cn_lo(const HcFusedArgs& a, const float* cnp, const float* cns, int tid, float* lo_s, int ls,
-                      float* rs_s, bool out, uint16_t* bf = nullptr) {
+                      float* rs_s, bool out, uint16_t* bf = nullptr, unsigned long long* dbg = nullptr, int b = 0,
+                      uint64_t* lbar = nullptr, unsigned lph = 0) {
     constexpr int NI = (T * LR + THREADS - 1) / THREADS;
+    const bool sm = lbar != nullptr;
+    const auto ld = [sm](const float* q) { return sm ? *q : __ldcg(q); };
+    if (sm) mbar_wait(lbar, lph);
     float p[NI][CN_HS];
 #pragma unroll
     for (int i = 0; i < NI; ++i) {
         const int idx = tid + THREADS * i, k = idx / LR, row = idx - k * LR;
 #pragma unroll
         for (int h = 0; h < CN_HS; ++h)
-            p[i][h] = idx < T * LR ? __ldcg(cnp + ((size_t) k * CN_HS + h) * CN_ROWS + row) : 0.0f;
+            p[i][h] = idx < T * LR ? ld(cnp + ((size_t) k * CN_HS + h) * CN_ROWS + row) : 0.0f;
     }
     if (tid < T * HC) {
         const int k = tid / HC, c = tid - k * HC;
-        const float s = __ldcg(cns + k * CN_HS + 2 * c) + __ldcg(cns + k * CN_HS + 2 * c + 1);
+        const float s = ld(cns + k * CN_HS + 2 * c) + ld(cns + k * CN_HS + 2 * c + 1);
         rs_s[tid] = rsqrtf(s / (float) N + a.eps);
     }
     __syncthreads();
+    stamp(dbg, b, 12, tid);
 #pragma unroll
     for (int i = 0; i < NI; ++i) {
         const int idx = tid + THREADS * i, k = idx / LR, row = idx - k * LR;
@@ -889,6 +898,7 @@ __device__ void cn_lo(const HcFusedArgs& a, const float* cnp, const float* cns, 
         else lo_s[k * ls + row] = l;
         if (out) a.lo[idx] = l;
     }
+    stamp(dbg, b, 14, tid);
     if (out && tid < T * HC) {
         a.rs[tid] = rs_s[tid];
         if (a.inject_out != nullptr && a.q_inject != nullptr) {
@@ -896,8 +906,8 @@ __device__ void cn_lo(const HcFusedArgs& a, const float* cnp, const float* cns, 
             float v = 0.0f;
 #pragma unroll
             for (int c = 0; c < HC; ++c)
-                v = fmaf(rs_s[k * HC + c], __ldcg(cnp + ((size_t) k * CN_HS + 2 * c) * CN_ROWS + LR + r) +
-                                               __ldcg(cnp + ((size_t) k * CN_HS + 2 * c + 1) * CN_ROWS + LR + r), v);
+                v = fmaf(rs_s[k * HC + c], ld(cnp + ((size_t) k * CN_HS + 2 * c) * CN_ROWS + LR + r) +
+                                               ld(cnp + ((size_t) k * CN_HS + 2 * c + 1) * CN_ROWS + LR + r), v);
             a.inject_out[tid] = v;
         }
     }
@@ -1407,14 +1417,14 @@ __device__ __forceinline__ void split_f16(float a, float b, uint32_t& hi, uint32
 template <int T, bool BF = false, bool HI1 = false>
 __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, unsigned long long* dbg, int b,
                                 const float* cnp = nullptr, const float* cns = nullptr, bool out = false,
-                                uint16_t* bf = nullptr, bool cm = false) {
+                                uint16_t* bf = nullptr, bool cm = false, uint64_t* lbar = nullptr, unsigned lph = 0) {
     static_assert(T <= 8, "one mma column per token");
     const int lane = tid & 31, warp = tid >> 5, nc = sl.nc, c0 = sl.c0, g = lane >> 2, t4 = lane & 3;
     const UpSmem u = up_smem(smem, nc, T, true, true);
     __shared__ float s_rsv8[MAXT * HC];
     if constexpr (BF) lo_frag_zero(T, tid, bf);
     if (cnp != nullptr) {
-        cn_lo<T>(a, cnp, cns, tid, u.lo, LOS, s_rsv8, out, BF ? bf : nullptr);
+        cn_lo<T>(a, cnp, cns, tid, u.lo, LOS, s_rsv8, out, BF ? bf : nullptr, dbg, b, lbar, lph);
     } else {
         for (int i = tid; i < T * LR; i += THREADS) {
             const int k = i / LR;
@@ -1869,6 +1879,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
     extern __shared__ __align__(128) char smem[];
     __shared__ __align__(8) uint64_t bars[UP_PIECES + 1];   // the w_up pieces, the router rows
     __shared__ __align__(8) uint64_t dbars[Q8 ? NSTAGE + 1 : 1];   // 8-bit down stages, their scales
+    __shared__ __align__(8) uint64_t lbar;   // cn: an up item's copy of the down items' sums
     __shared__ float part[WARPS];
     __shared__ float s_ssp[Q8 ? MAXT * WARPS : 1];   // cn: the sums of squares per (token, warp)
     __shared__ float s_rs;
@@ -1884,6 +1895,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
         for (int p = 0; p <= UP_PIECES; ++p) mbar_init(&bars[p], 1);
         if constexpr (Q8)
             for (int p = 0; p <= NSTAGE; ++p) mbar_init(&dbars[p], cn ? 1 : ROWS);
+        mbar_init(&lbar, 1);
         s_item = (int) atomicAdd(&sy->q.v, 1u);
     }
     __syncthreads();
@@ -1898,6 +1910,12 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
         if constexpr (Q8) cn_bars = cn_issue(a, item - it.down, tid, smem, dbars, L.cn & 2, L.tma, L.tm);
         staged = true;
     }
+    bool up_staged = false;   // the first up item's slice requested before the wait
+    if (Q8 && cn && L.up_tma == 2 && item >= it.up && item < it.rt) {
+        const UpSlice sl = up_slice(item - it.up, it.nu);
+        if (tid == 0) hc_up_tma(sl, smem, up_smem(smem, sl.nc, T, true, true).sc, &L.tm[6], &bars[0]);
+        up_staged = true;
+    }
     if (L.early) {
         if (!staged && (L.early & 2) && item >= it.down && item < it.up) {
             if constexpr (Q8) hc_down8_issue(a, item - it.down, tid, smem, dbars, 0, L.pre8);
@@ -1909,7 +1927,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
     }
     pdl_wait();
     stamp(dbg, b, 1, tid);
-    unsigned up_ph = 0, rt_ph = 0, dn_ph = 0;
+    unsigned up_ph = 0, rt_ph = 0, dn_ph = 0, lo_ph = 0;
     bool first = true;
     while (item < it.end) {
         if (item < it.ntask) {
@@ -1974,17 +1992,30 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             const bool cp = Q8 && mma && (L.cn & 4);   // the slice by every thread's cp.async
             const bool ut = Q8 && mma && L.up_tma && !cp;   // the slice by tensor copies (hc_up_tma)
             if (cp) hc_up_cp8(a, sl, smem, sc8, tid);
-            else if (ut && tid == 0) hc_up_tma(sl, smem, sc8, &L.tm[6], &bars[0]);
+            else if (ut && !up_staged && tid == 0) hc_up_tma(sl, smem, sc8, &L.tm[6], &bars[0]);
             else if (Q8 && !ut && tid == 0)   // ahead of R'; cn: once enough w_down rows are in
                 hc_up_issue8(a, sl, smem, bars, &sy->nload.v, cn ? (unsigned) L.cn_upw : (unsigned) it.ntask, mma, sc8);
             hc_up_pre<T>(a, sl, tid, smem, mma);
             const int bf_off = (up_smem_bytes<T>(sl.nc, mma, Q8) + 15) & ~15;
             const int t10_off = bf_off + (Q8 && mma && L.bf ? BF_BYTES : 0);
-            const bool dry = it.end > it.t10 && t10_off + 3 * CAND_WORDS * 4 <= SMEM;
+            const bool dry = !L.no_dry && it.end > it.t10 && t10_off + 3 * CAND_WORDS * 4 <= SMEM;
             warm = warm || dry;
+            const int cpy = cn ? (item - it.up) % L.cn_copies : 0;
+            const float *cnp = L.cnp + (size_t) cpy * CN_PART, *cns = L.cns + (size_t) cpy * CN_SSN;
+            // cn: the down items' sums by two bulk copies once they are done (after the top-10 area)
+            const int lst_off = (t10_off + 127) & ~127;
+            const unsigned lst_p = (unsigned) (T * CN_HS * CN_ROWS * 4), lst_s = (unsigned) (T * CN_HS * 4);
+            const bool lst = Q8 && mma && cn && L.lo_stage && !dry && lst_off + (int) (lst_p + lst_s) <= SMEM;
+            float* const lsm = reinterpret_cast<float*>(smem + lst_off);
             if (tid == 0) {
                 hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph, mma, !(Q8 && !mma),
                              sc8, cp || ut ? -1 : Q8 ? UP_PIECES : 0, (unsigned) it.nd, dbg, b);
+                if (lst) {
+                    asm volatile("fence.proxy.async;" ::: "memory");
+                    mbar_expect_tx(&lbar, lst_p + lst_s);
+                    bulk_g2s(lsm, cnp, lst_p, &lbar);
+                    bulk_g2s(lsm + T * CN_HS * CN_ROWS, cns, lst_s, &lbar);
+                }
             } else if (dry) {
                 // while the down projection runs, warps 1..3 run the top-10 on fixed logits: its code is then in this
                 // SM's instruction caches if this CTA claims the top-10 item
@@ -2018,16 +2049,20 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             uint32_t rw[RQ];   // the router weights stream in while the up pass runs (after the w_up copies)
             if (rx) hcx_router_load(a, sl, tid, rw);
             uint16_t* const bfp = reinterpret_cast<uint16_t*>(smem + bf_off);
-            const int cpy = cn ? (item - it.up) % L.cn_copies : 0;
-            const float *cnp = L.cnp + (size_t) cpy * CN_PART, *cns = L.cns + (size_t) cpy * CN_SSN;
-            if (Q8 && mma && cn && L.bf == 2) hc_up_main_mma8<T, true, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp, ut);
-            else if (Q8 && mma && cn && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp, ut);
-            else if (Q8 && mma && cn) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, nullptr, ut);
+            uint64_t* const lb = lst ? &lbar : nullptr;
+            if (lst) {
+                cnp = lsm;
+                cns = lsm + T * CN_HS * CN_ROWS;
+            }
+            if (Q8 && mma && cn && L.bf == 2) hc_up_main_mma8<T, true, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp, ut, lb, lo_ph);
+            else if (Q8 && mma && cn && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp, ut, lb, lo_ph);
+            else if (Q8 && mma && cn) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, nullptr, ut, lb, lo_ph);
             else if (Q8 && mma && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, nullptr, nullptr, false, bfp, ut);
             else if (Q8 && mma) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, nullptr, nullptr, false, nullptr, ut);
             else if (mma) hc_up_main_mma<T>(a, sl, tid, smem, dbg, b);
             else if (L.ups) hc_up_main<T, true>(a, sl, tid, smem, true, dbg, b);
             else hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
+            if (lst) lo_ph ^= 1u;
             if (rx) {
                 // the slice's mixed columns again (hc_up_main's expression) into shared memory, then the logit shares
                 const UpSmem u = up_smem(smem, sl.nc, T, mma, Q8);
@@ -2114,6 +2149,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
         }
         first = false;
         staged = false;
+        up_staged = false;
         __syncthreads();
         if (tid == 0) s_item = (int) atomicAdd(&sy->q.v, 1u);
         __syncthreads();
@@ -2322,7 +2358,10 @@ constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel
 // STRATA_DEC_HC2_COPIES=<n> (with 1, default 1): copies of the down items' sums.
 // STRATA_DEC_HC3 (bits, with HC2 & 1; bitwise): 1 = each warp's w_down rows by two 2D tensor copies instead of eight
 // bulk copies, or 2 = a w_down item's rows by two tensor copies of thread 0 (not with HC2 & 8); 4 = an up slice by two
-// tensor copies in a chunk layout instead of ~45 bulk copies (not with HC2 & 16).
+// tensor copies in a chunk layout instead of ~45 bulk copies (not with HC2 & 16); with 4: 8 = the first up slice
+// requested before the previous kernel is waited on; 16 = the up items skip the top-10 dry run (its global loads queue
+// behind the weight copies and hold the up pass's start); with 16: 32 = an up item's copy of the down items' sums by
+// two bulk copies into shared memory (where it fits) instead of every thread's loads.
 struct SkConf {
     bool on = false;
     int pf = 0, nu = 0, ups = 0, hcx = 0, upmma = 0, xh = 0, hc2 = 0, upw = 0, copies = 1, hc3 = 0;
@@ -2806,12 +2845,14 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.cnp = d.cn + (size_t) L.slot * CN_SLOT;
     L.cns = L.cnp + (size_t) CN_MAXCOPY * CN_PART;
     L.cn_copies = sk.copies;
+    L.no_dry = L.cn && (sk.hc3 & 16) ? 1 : 0;
+    L.lo_stage = L.no_dry && (sk.hc3 & 32) ? 1 : 0;
     if (L.cn && (sk.hc3 & 7)) {
         bool up = false;
         const bool down = cn_maps(L.a, L.tm, up);
         L.tma = down && (L.cn & 3) == 1 ? sk.hc3 & 3 : 0;
         if (L.tma == 3) L.tma = 0;
-        L.up_tma = up && (sk.hc3 & 4) && !(L.cn & 4) ? 1 : 0;
+        L.up_tma = up && (sk.hc3 & 4) && !(L.cn & 4) ? (sk.hc3 & 8 ? 2 : 1) : 0;
     }
     static const int pre8 = [] { const char* e = std::getenv("STRATA_DEC_HC8_PRE"); return e ? std::atoi(e) : 3; }();
     L.pre8 = std::min(std::max(pre8, 0), NSTAGE);
