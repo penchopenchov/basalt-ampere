@@ -32,10 +32,9 @@ const ggml_cuda_device_info & ggml_cuda_info() {
             cudaDeviceProp prop;
             CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
             auto & d = in.devices[id];
-            // #542: the fields MMQ's choices read come from cudaDeviceGetAttribute, which is ABI-stable: a
-            // cudaDeviceProp filled by an older libcudart than the headers (a CUDA 13 build that links a CUDA 12
-            // libcudart.so) is shifted - sharedMemPerBlockOptin read 1 there, and every i-quant lost MMQ (#420's
-            // fits()).  In a matched build both give the same values.
+            // The fields MMQ's choices read come from cudaDeviceGetAttribute, which is ABI-stable: a
+            // cudaDeviceProp filled by an older libcudart than the headers is shifted - sharedMemPerBlockOptin can
+            // read 1, and every i-quant would lose MMQ (see fits()).  In a matched build both give the same values.
             auto attr = [id](cudaDeviceAttr a) {
                 int v = 0;
                 CUDA_CHECK(cudaDeviceGetAttribute(&v, a, id));

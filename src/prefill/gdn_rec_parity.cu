@@ -351,7 +351,7 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
     y16[at] = hf(v);
 }
 
-// ------------------------------------------------------------------ the output norm before (0.1.31)
+// ------------------------------------------------------------------ the previous output norm
 __global__ void __launch_bounds__(S) gdn_out_norm_old_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                              float eps, float* __restrict__ y,
                                                              uint16_t* __restrict__ y16) {
@@ -867,7 +867,7 @@ void fewer_sms(int64_t T) {
         all += (unsigned long long) (sms - n);
         hold_sm<<<sms - n, 1, optin, s_hold>>>(sitting, release, gen, where, late);
         ck(cudaGetLastError(), "hold_sm");
-        const cudaError_t q = cudaStreamQuery(s_hold);   // hands the launch to the GPU now (Windows collects launches)
+        const cudaError_t q = cudaStreamQuery(s_hold);   // hands the launch to the GPU now
         if (q != cudaErrorNotReady) ck(q, "hold_sm");
         (void) cudaGetLastError();   // not ready is no error
         wait_sitting<<<1, 1, 0, s_run>>>(sitting, all, late);

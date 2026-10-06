@@ -1,4 +1,4 @@
-// #477: --expert-profile-save's profile - rank_learned_profile's order (resident first, then the counted routing, then
+// --expert-profile-save's profile - rank_learned_profile's order (resident first, then the counted routing, then
 // the profile the engine started from) and write_expert_profile's file, byte for byte the profile format,
 // read back by read_expert_profile.  CPU only: no device is touched.
 #include "basalt/core/expert_cache.hpp"

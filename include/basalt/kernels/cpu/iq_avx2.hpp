@@ -1,7 +1,7 @@
 // include/basalt/kernels/cpu/iq_avx2.hpp - AVX-2 multi-token dot products for the i-quant expert
 // formats (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS) against Q8_K activations (ggml's block_q8_K).
 //
-// The AVX-512 kernel's scheme on the CPUs without it (AMD Zen 2/3, Intel Core 12th-14th gen): the weights of a
+// The AVX-512 kernel's scheme on the CPUs without it: the weights of a
 // 32-value chunk are decoded once per verify window and every token applies them with five instructions.
 #pragma once
 

@@ -137,7 +137,7 @@ bool fits(int t, int64_t w_rows) {
                 said[t] = true;
                 std::fprintf(stderr, "basalt: prompt kernels: llama.cpp's MMQ has no tile for %s (%lld rows) on GPU %d "
                                      "(cc %d, %zu bytes of shared memory per block): that product takes the non-MMQ path "
-                                     "(#420)\n", ggml_type_name((ggml_type) t), (long long) w_rows, id, cc, smpbo);
+                                     "\n", ggml_type_name((ggml_type) t), (long long) w_rows, id, cc, smpbo);
             }
             return false;
         }

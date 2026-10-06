@@ -454,12 +454,11 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__
         for (int r = 0; r < RPG; ++r) base[r * rs] = s[j][r];
     }
 }
-// gdn_rec_kh_kernel where it pays: a CUDA card with cp.async (sm_80+) that holds all 64 of its blocks at once (each
+// gdn_rec_kh_kernel where it pays: a CUDA card with cp.async that holds all 64 of its blocks at once (each
 // walks the whole chunk, so blocks left for a second wave would double the time).  The busiest SM sets the pace: from
 // 64 SMs up this kernel has one block per SM, below that two on some SMs, while the kernel before has ceil(192 / SMs).
-// With the engine's grids on fewer SMs (gdn_rec_parity --bench), on a 4080 SUPER / a 3090: 1.40-1.42x / 1.28-1.29x at
-// 64 SMs and more, 1.02-1.04x / 1.03-1.06x at 48 to 63 (two blocks against four: a draw, slower on neither),
-// 1.28-1.31x / 1.28-1.30x at 39 to 47, 1.53-1.57x / 1.54-1.55x at 32 to 38.  Per call, from the current device (a
+// gdn_rec_parity --bench measures it at other SM counts: a draw at 48 to 63 SMs (two blocks against
+// four), a win elsewhere.  Per call, from the current device (a
 // layer split can mix cards).
 bool gdn_keyhead_ok() {
     static int known[64] = {};   // per device: 0 not asked yet, 1 yes, 2 no
@@ -598,7 +597,7 @@ bool gdn_warp_ok() {
                          (int64_t) per_sm * sms >= (int64_t) HK * GDN_WNCB;
         if (!yes) {
             cudaGetLastError();
-            std::fprintf(stderr, "basalt: the warp GDN recurrence does not fit this card (needs sm_80+ holding %d blocks at once)\n",
+            std::fprintf(stderr, "basalt: the warp GDN recurrence does not fit this card (needs cp.async and room for %d blocks at once)\n",
                          HK * GDN_WNCB);
         }
         known[dev] = yes ? 1 : 2;
@@ -734,8 +733,8 @@ __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__
     for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) r[c] = s * r[c] * w[c];
 }
 // TAB: the angles from the session's float64 table.  The host launches <false> whenever
-// no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
-// with it merely skipped at run time, the compiled default path changed its results).
+// no table applies - the default - so the default kernel does not contain the table read (merely skipping it at run time
+// would change the compiled default path's results).
 template <bool TAB>
 __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
                             float theta_scale, float freq_scale, float corr_low, float corr_high,

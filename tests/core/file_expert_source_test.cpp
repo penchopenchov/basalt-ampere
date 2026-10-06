@@ -242,7 +242,7 @@ void test_cgroup_memory_budget() {
 }
 
 // The host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
-// (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
+// (a limit, unlimited), and no cgroup line at all.
 void test_host_memory() {
     using namespace basalt::core::detail;
     constexpr uint64_t GiB = 1ull << 30;

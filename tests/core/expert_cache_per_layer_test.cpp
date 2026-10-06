@@ -1,4 +1,4 @@
-// #369: per-layer admission on a sized cache (open_sized, every native pack) - each layer admits into its own slot
+// Per-layer admission on a sized cache (open_sized, every native layout) - each layer admits into its own slot
 // range, as on the uniform cache, so no two layers write the same slot.  Needs a CUDA device (exits 77 without one).
 #include "basalt/core/expert_cache.hpp"
 

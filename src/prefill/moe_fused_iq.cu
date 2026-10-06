@@ -1,4 +1,4 @@
-// src/prefill/moe_fused_iq.cu - see include/basalt/prefill/moe_fused_iq.hpp (#136: the native packs' prompt experts on
+// src/prefill/moe_fused_iq.cu - see include/basalt/prefill/moe_fused_iq.hpp (the native prompt experts on
 // the fused int8 kernels of moe_fused.cu).
 //
 // The arithmetic.  An activation block of 32 values is x = d_x * a, a = round(x / d_x) in -127..127, stored in natural
@@ -504,8 +504,7 @@ native_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_
                 }
             }
             // the next stage's weights (into the other buffer, read after the next barrier).  (Decoding them before
-            // this stage's products instead was slower on the RTX 5070: a layer of 2048 / 3584 / 8192 tokens, IQ2_S
-            // 5.2 / 9.5 / 17.5 ms -> 6.0 / 10.2 / 18.3.)
+            // this stage's products instead was slower.)
             if (s + 1 < NS) {
                 put(raw, (s + 1) & 1);
                 if (dec && s + 2 < NS) load_unit<WT>(unit(s + 2), sub(s + 2), raw);
@@ -840,7 +839,7 @@ v2_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* _
 
 unsigned blocks(int64_t n, int per) { return (unsigned) ((n + per - 1) / per); }
 
-// per device: whether every kernel here runs (sm_80+, device code in this build, fits), and their occupancy
+// per device: whether every kernel here runs (int8 tensor cores, device code in this build, fits), and their occupancy
 struct DevInfo {
     bool done = false, ok = false;
     int sms = 0, occ = 1;

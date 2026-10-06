@@ -1,4 +1,4 @@
-// prefill_fused_iq_test - #136: the fused int8 expert kernels for the native packs (moe_fused_iq.hpp)
+// prefill_fused_iq_test - the fused int8 expert kernels for the native experts (moe_fused_iq.hpp)
 // on random native expert blobs ([gate rows | up rows | down rows], GGUF blocks) and random routing, per format pair,
 // against
 //   - a double-precision reference: the weights dequantized by ggml's own to_float, times the FP32 activations
@@ -15,7 +15,7 @@
 // common layers, with the grouping checked and a sample of rows against the reference.  The v2 kernels
 // (the v2 kernels: IQ3_XXS gate/up, IQ4_NL down) in both parts where a pair has them: against the reference as
 // above, within a tenth of the fused path's own error of its outputs, and timed next to it.  --no-ref, --no-timing,
-// --only=NAME, --chunks=A,B.  Exit 77 without a CUDA device of sm_80 or newer.
+// --only=NAME, --chunks=A,B.  Exit 77 without a CUDA device with int8 tensor cores.
 #include "basalt/prefill/moe_fused_iq.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
@@ -310,7 +310,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
     ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
     ck(cudaMemcpy(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice), "src");
     // (the uploads above are on the legacy stream and the work below on a non-blocking one: a cudaMemcpy from pageable
-    // memory may return before its DMA lands - on Windows it can wait in the queue until the next synchronous call)
+    // memory may return before its DMA lands)
     ck(cudaDeviceSynchronize(), "uploads");
     mmq::Context ctx;
     MmqBufs mb(p, rows, E);
@@ -591,7 +591,7 @@ int main(int argc, char** argv) {
     try {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
-        if (!fused::available()) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }
+        if (!fused::available()) { std::printf("the fused kernels need int8 tensor cores: skipped\n"); return 77; }
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
         const std::vector<Pair> pairs = {
             {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},

@@ -74,7 +74,7 @@ void native_grouped_set_mma_hint(bool on);
 /// kernel (bitwise the same; not with v1).  Set before graph capture.
 void native_grouped_set_gu2(int mode);
 
-/// The bench only: the AMD kernel layout (EXP_MODE values; -1 = the environment's) and the phase
+/// The bench only: the kernel layout (EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
 void native_expert_set_mode(int mode, int phase);
 /// `iq_mmvq` and `native_expert_grouped` decode each weight part once and apply it to every column / entry;

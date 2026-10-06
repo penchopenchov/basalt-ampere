@@ -28,7 +28,7 @@ void ck(cublasStatus_t s, const char* what) {
     }
 }
 
-// A setup call whose failure the engine survives (the handle keeps its defaults), as before #240 - but said.
+// A setup call whose failure the engine survives (the handle keeps its defaults), but says so.
 void note(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d (continuing)\n", what, (int) s);
 }
@@ -71,7 +71,7 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
 }
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
-    // #240: every failure names the call and the real status, so "no VRAM" can be told from a broken install
+    // every failure names the call and the real status, so "no VRAM" can be told from a broken install
     cublasHandle_t h = nullptr;
     if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
         err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);

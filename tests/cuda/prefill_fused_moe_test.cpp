@@ -1,5 +1,5 @@
-// prefill_fused_moe_test - #136: the fused int8 expert kernels of the prompt path (moe_fused.hpp)
-// on random the engine Q2_0 expert blobs and random routing, against
+// prefill_fused_moe_test - the fused int8 expert kernels of the prompt path (moe_fused.hpp)
+// on random Q2_0 expert blobs and random routing, against
 //   - a double-precision reference: the dequantized weights times the FP32 activations (gate/up, SwiGLU, down), and
 //   - the MMQ path in prefill.cpp's sequence (gather_q2 into 16-expert groups, q8_1 of the slots' activations,
 //     gate/up, SwiGLU, q8_1 of H, down).
@@ -8,7 +8,7 @@
 // Part 1 (reference): 256 tokens over 64 experts, skewed routing - experts with 0 rows, with one, with several 64-row
 // tiles - an all-zero token, per-expert blobs at unrelated addresses, three launches of different expert ranges.
 // Part 2 (timing): one layer at a real chunk (2048 tokens, 512 experts, top 10) on both paths, with their agreement.
-// Exit 77 without a CUDA device of sm_80 or newer.
+// Exit 77 without a CUDA device with int8 tensor cores.
 #include "basalt/prefill/moe_fused.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
@@ -404,7 +404,7 @@ int main(int argc, char** argv) {
     try {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
-        if (!fused::available()) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }
+        if (!fused::available()) { std::printf("the fused kernels need int8 tensor cores: skipped\n"); return 77; }
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");

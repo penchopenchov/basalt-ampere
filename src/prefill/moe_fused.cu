@@ -1,4 +1,4 @@
-// src/prefill/moe_fused.cu - see include/basalt/prefill/moe_fused.hpp (#136: the Q2_0 pack's prompt experts on
+// src/prefill/moe_fused.cu - see include/basalt/prefill/moe_fused.hpp (the Q2_0 prompt experts on
 // the engine's own int8 tensor-core kernels, with the grouping on the GPU).
 //
 // The arithmetic.  A Q2_0 block is 64 weights w = d_w * (q - 1), q in 0..3, four codes per byte, weight j of a block
@@ -370,7 +370,7 @@ const DevInfo& dev_info() {
     cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
     d.cc = 10 * major + minor;
     if (d.cc < 80) return d;
-    // the device code of this card's arch must have the kernels (a build without an sm_80+ target has an empty body)
+    // the device code of this card's arch must have the kernels (a build without a tensor-core target has an empty body)
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, expert_kernel<true>) != cudaSuccess || fa.ptxVersion < 80) {
         cudaGetLastError();
