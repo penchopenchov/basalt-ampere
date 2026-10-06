@@ -31,19 +31,18 @@ It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped dow
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --build build -j        # bin/basalt, bin/basalt-bench
 ctest --test-dir build        # the parity tests need a GPU
 ```
 
 ## Run
 
-Build a pack from the model with the tools in `tools/`, then start the server:
-
 ```sh
-python -m serve.server --engine engine --config config.json --port 8095
+bin/basalt serve --model /path/to/model.basalt --host 127.0.0.1 --port 8080 [--alias NAME]
 ```
 
-`config.json` names the engine executable and its arguments. The server listens on 127.0.0.1 by default; do not expose
+The `.basalt` file holds the weights, tokenizer, drafter, expert profile and vision projector; `tools/convert.py`
+builds one from a GGUF and its pack. The server listens on 127.0.0.1 by default; do not expose
 it beyond that without `--api-key`.
 
 Diagnostics are engine command-line flags (`--profile`, `--wait-stats`, `--decode-timing`, `--draft-log FILE`); no

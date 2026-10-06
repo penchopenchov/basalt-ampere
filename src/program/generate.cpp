@@ -463,7 +463,7 @@ bool for_each_index_name(const basalt::core::FileRange& index, const std::functi
 /// `basalt serve MODEL.basalt [--host H] [--port P] [--python PY] [server args...]`: runs the Python server over this
 /// binary and the model.  Only returns on failure.
 int serve_subcommand(int argc, char** argv) {
-    std::string model, host = "127.0.0.1", port = "8080", python;
+    std::string model, host = "127.0.0.1", port = "8080", python, alias;
     std::vector<std::string> extra;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -474,11 +474,13 @@ int serve_subcommand(int argc, char** argv) {
         if (a == "--host") value(host);
         else if (a == "--port") value(port);
         else if (a == "--python") value(python);
+        else if (a == "--model") value(model);
+        else if (a == "--alias") value(alias);
         else if (model.empty() && !a.empty() && a[0] != '-') model = a;
         else extra.push_back(a);
     }
     if (model.empty()) {
-        std::fprintf(stderr, "usage: basalt serve MODEL.basalt [--host H] [--port P] [--python PY] [server args...]\n");
+        std::fprintf(stderr, "usage: basalt serve [--model] MODEL.basalt [--alias NAME] [--host H] [--port P] [--python PY] [server args...]\n");
         return 2;
     }
     char exe[4096];
@@ -502,6 +504,7 @@ int serve_subcommand(int argc, char** argv) {
     }
     std::vector<std::string> args = {python, "-m", "serve.server", "--engine", "engine", "--model", real,
                                      "--exe", exe, "--host", host, "--port", port};
+    if (!alias.empty()) args.insert(args.end(), {"--alias", alias});
     args.insert(args.end(), extra.begin(), extra.end());
     std::vector<char*> cargs;
     for (std::string& s : args) cargs.push_back(s.data());
@@ -513,8 +516,9 @@ int serve_subcommand(int argc, char** argv) {
 
 void usage() {
     std::fprintf(stderr,
-                 "basalt serve MODEL.basalt [--host H] [--port P] [--python PY] [server args...]\n"
+                 "basalt serve [--model] MODEL.basalt [--alias NAME] [--host H] [--port P] [--python PY] [server args...]\n"
                  "    runs the Python server (serve/) over this binary and the model: host 127.0.0.1, port 8080;\n"
+                 "    --alias sets the model name the API reports (default: the name stored in the file);\n"
                  "    --python defaults to .venv/bin/python in the source tree, else python3; the other arguments\n"
                  "    go to the server.  It runs in the source tree, so give paths to it as absolute ones.\n"
                  "basalt generate (--model FILE.basalt | --pack DIR) --tokens \"1,2,3\" [options]\n"

@@ -272,6 +272,7 @@ target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
 add_executable(basalt src/program/generate.cpp)
+set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE engine prefill spec ${_gpu_runtime_target})
 # `basalt serve` runs the Python server from the source tree
@@ -284,6 +285,7 @@ if(NOT _bench_git)
   set(_bench_git unknown)
 endif()
 add_executable(basalt-bench src/program/bench_main.cpp)
+set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 add_dependencies(basalt-bench basalt)
 target_link_libraries(basalt-bench PRIVATE warnings ${CMAKE_DL_LIBS})
 target_compile_definitions(basalt-bench PRIVATE

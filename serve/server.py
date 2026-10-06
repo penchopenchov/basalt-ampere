@@ -2,7 +2,7 @@
 
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
     python -m serve.server --engine engine --config config.json --port 8080   (the real engine, resident)
-    python -m serve.server --engine engine --model m.basalt --exe build/basalt   (the same from a .basalt model file)
+    python -m serve.server --engine engine --model m.basalt --exe bin/basalt     (the same from a .basalt model file)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /metrics and GET /api/logs (the stats page's feeds). One sequence at a time behind a
@@ -301,8 +301,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
                     say("arena", f"[server] {loading}\n"
-                                 "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
-                                 "         Please wait and don't close this window; the browser opens when it is ready.")
+                                 "         This takes a few minutes and the system may feel slow meanwhile.")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[server] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
@@ -3333,6 +3332,7 @@ def main() -> int:
     ap.add_argument("--model", help="a .basalt model file: the engine, tokenizer, sampling and vision come from it "
                                     "(with --exe, instead of --config)")
     ap.add_argument("--exe", help="the basalt binary to run the model with (with --model)")
+    ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -3385,6 +3385,8 @@ def main() -> int:
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
             ap.error(f"{a.model}: {e}")
+    if a.alias:
+        cfg["model_name"] = a.alias
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
