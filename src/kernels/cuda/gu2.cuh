@@ -1,5 +1,5 @@
 // src/kernels/cuda/gu2.cuh - STRATA_DEC_GU2=1: the grouped gate/up rows of the grid formats (IQ2_XXS, IQ2_XS,
-// IQ2_S, IQ3_XXS, IQ3_S) with n_embd 2560, two rows a warp.  Included by iq_kernels.cu (its Split / Fmt / grid
+// IQ2_S, IQ3_XXS, IQ3_S) and Q2_0 with n_embd 2560, two rows a warp.  Included by iq_kernels.cu (its Split / Fmt / grid
 // helpers).
 //
 // Bitwise native_gu_multi_kernel's: each lane sums the calls k = lane, lane + 32, lane + 64 of a row in that order
@@ -220,9 +220,27 @@ template<> struct Fmt2<21> {   // IQ3_S: 110-byte blocks (d, 64 grid bytes, qh[8
     }
 };
 
+template<> struct Fmt2<42> {   // Q2_0: 18-byte blocks of 64 values, two calls a block; Split<42>'s words
+    static constexpr int kGridWords = 4;   // no grid
+    using W = Split<42>::W;
+    __device__ static W load(const uint8_t* row, int k, const uint32_t*) { return Split<42>::load(row, k >> 1, k & 1); }
+    __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
+        int s = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            s = ggml_cuda_dp4a(get_int_b4(x->qs, 2 * j), r.qx[j], s);
+            s = ggml_cuda_dp4a(get_int_b4(x->qs, 2 * j + 1), r.qy[j], s);
+        }
+        d = r.d2 * __low2float(x->ds);
+        f = (float) s;
+    }
+};
+
 template<int TY>
 __device__ __forceinline__ const uint32_t* stage_grid(uint32_t* s, int tid) {
-    if constexpr (TY == 21) {
+    if constexpr (TY == 42) {
+        return s;
+    } else if constexpr (TY == 21) {
         for (int i = tid; i < 512; i += 256) s[i] = iq3s_grid[i];
         __syncthreads();
         return s;
@@ -312,7 +330,7 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
 
 }  // namespace gu2
 
-template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22;
+template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22 || TG == 42;
 constexpr int GU2_ROWS = 16;   // rows per block: two a warp
 
 // native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride

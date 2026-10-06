@@ -1523,7 +1523,8 @@ void dec_moe_route(const DmRouteArgs& a, void* stream) {
 }
 
 bool dec_moe_glue_ok(const NativeExpertLayout& L) {
-    const bool tg = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22;
+    const bool tg = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
+                    L.gu_type == 42;
     bool td = false;
     switch (L.d_type) {
 #define STRATA_DM_OK(T) case T: td = kSplit<T>; break;
@@ -1557,6 +1558,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratc
         case 17: go(dm_glue_gu_kernel<17>, dm_glue_blocks<17>()); break;
         case 18: go(dm_glue_gu_kernel<18>, dm_glue_blocks<18>()); break;
         case 21: go(dm_glue_gu_kernel<21>, dm_glue_blocks<21>()); break;
+        case 42: go(dm_glue_gu_kernel<42>, dm_glue_blocks<42>()); break;
         default: go(dm_glue_gu_kernel<22>, dm_glue_blocks<22>()); break;
     }
     check("dec_moe_glue/gu");

@@ -387,7 +387,7 @@ int main(int argc, char** argv) {
     {   // STRATA_DEC_GU2=1: the new launches take native_gu2_kernel (2560-value rows only), v1 the multi kernel
         const char* g = std::getenv("STRATA_DEC_GU2");
         if (g != nullptr && (g[0] == '1' || g[0] == '2')) {
-            for (int gu : {16, 17, 18, 21, 22})
+            for (int gu : {16, 17, 18, 21, 22, 42})
                 for (int dt : {20, 42}) check(gu, dt, 2560, 640, s, rng, gu == 18 ? 8 : 6);
             check(22, 20, 2560, 512, s, rng, 3);
         }
