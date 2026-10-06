@@ -717,15 +717,16 @@ __device__ __forceinline__ void pair_terms_xr(float (&acc)[4], const uint8_t* ro
     }
 }
 
-// block blk of nblk (256 threads); smem: 128 + 4096 + 2048 (IQ3_S grid) + 2 slots of the larger tile.  XR: the x
-// fragments in registers (n_in <= 3072)
-template<bool XR>
+// block blk of nblk (256 threads); smem: 128 + 4096 (DB: 8192) + 2048 (IQ3_S grid) + 2 slots of the larger tile.  XR:
+// the x fragments in registers (n_in <= 3072); DB: two warp-sum buffers, one barrier per tile less
+template<bool XR, bool DB>
 __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* smem, PairMat m0, PairMat m1,
                                                     const uint8_t* __restrict__ x, int n_in, int ncols, int probe) {
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
-    float* red = reinterpret_cast<float*>(smem + 128);   // [warp][row][column]
-    uint32_t* grid = reinterpret_cast<uint32_t*>(smem + 128 + 8 * 16 * kMaxCols * 4);
-    uint8_t* slots = smem + 128 + 8 * 16 * kMaxCols * 4 + 2048;
+    constexpr int RB = (DB ? 2 : 1) * 8 * 16 * kMaxCols * 4;
+    float* red0 = reinterpret_cast<float*>(smem + 128);   // [buffer][warp][row][column]
+    uint32_t* grid = reinterpret_cast<uint32_t*>(smem + 128 + RB);
+    uint8_t* slots = smem + 128 + RB + 2048;
     const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int hb = wp & 3, n = hb & 1;
     const int nchunk = n_in / 512, nb32 = n_in / 32;
@@ -799,6 +800,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                 default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
             }
         }
+        float* red = red0 + (DB ? (i & 1) * 8 * 16 * kMaxCols : 0);
         float* rw = red + wp * 16 * kMaxCols;
         rw[g * kMaxCols + 2 * t] = acc[0];
         rw[g * kMaxCols + 2 * t + 1] = acc[1];
@@ -820,17 +822,17 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                 m.y[(size_t) col * m.n_out + row0 + row] = v;
             }
         }
-        __syncthreads();   // the sums are read
+        if (!DB) __syncthreads();   // the sums are read (DB: the next tile writes the other buffer)
     }
 }
 #endif
 
-template<bool XR>
+template<bool XR, bool DB>
 __global__ void __launch_bounds__(256) dense_tc_pair_kernel(PairMat m0, PairMat m1, const uint8_t* __restrict__ x,
                                                             int n_in, int ncols, int probe) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_pair_block<XR>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
+    dense_tc_pair_block<XR, DB>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -1035,17 +1037,24 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
         std::fprintf(stderr, "dense_tc_pair: types %d/%d n_in %d not supported\n", t0, t1, n_in);
         std::exit(1);
     }
-    const int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
+    int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(dense_tc_pair_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
-        cudaFuncSetAttribute(dense_tc_pair_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
+        for (auto k : {dense_tc_pair_kernel<false, false>, dense_tc_pair_kernel<true, false>,
+                       dense_tc_pair_kernel<true, true>})
+            cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
         attr = true;
     }
-    // STRATA_DEC_PAIR & 2: each warp's x fragments in registers across its tiles
-    const auto kern = (g_pair & 2) && n_in <= 3072 ? dense_tc_pair_kernel<true> : dense_tc_pair_kernel<false>;
+    // STRATA_DEC_PAIR & 2: each warp's x fragments in registers across its tiles; & 4 (with 2): two warp-sum buffers
+    // where the block is alone on its SM either way
+    const bool xr = (g_pair & 2) && n_in <= 3072;
+    auto kern = xr ? dense_tc_pair_kernel<true, false> : dense_tc_pair_kernel<false, false>;
     int occ = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, 256, smem);
+    if (xr && (g_pair & 4) && occ == 1 && smem + 4096 <= 99 * 1024) {
+        kern = dense_tc_pair_kernel<true, true>;
+        smem += 4096;
+    }
     if (g_bps > 0 && g_bps < occ) occ = g_bps;
     if (occ < 1) occ = 1;
     const int ntiles = (n_out0 + 15) / 16 + (n_out1 + 15) / 16;
