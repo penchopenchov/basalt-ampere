@@ -106,19 +106,19 @@ basalt::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
     return s;
 }
 
-bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
+    if (r.empty() || !r.exists()) return false;
     // `fread` passes a request bigger than the stream buffer straight to the read call.
-    FILE* f = std::fopen(path.c_str(), "rb");
+    FILE* f = std::fopen(r.path.c_str(), "rb");
     if (f == nullptr) return false;
     // A `FILE*` has no destructor and the short-read path below returns early: the guard closes on every path.
     struct Closer {
         FILE* f;
         ~Closer() { if (f != nullptr) std::fclose(f); }
     } closer{f};
-    if (fseeko(f, 0, SEEK_END) != 0) return false;
-    const long long n = (long long) ftello(f);
-    if (n < 0 || fseeko(f, 0, SEEK_SET) != 0) return false;
-    basalt::platform::advise_willneed(fileno(f), 0, (uint64_t) n);
+    const uint64_t n = r.size();
+    if (fseeko(f, (off_t) r.offset, SEEK_SET) != 0) return false;
+    basalt::platform::advise_willneed(fileno(f), r.offset, n);
     out.resize((size_t) n);
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
@@ -178,22 +178,28 @@ const void* MtpDrafter::q8(const char* name) const {
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window) {
+    return load(MtpFiles::dir(rt_dir), g, ss, max_t, err, window);
+}
+
+bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
+                      int64_t window) {
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;
     ss_ = &ss;
     if (ple_ss_ == nullptr) ple_ss_ = &ss;
     max_t_ = max_t;
-    rt_dir_ = rt_dir;
+    draft_vocab_ = files.draft_vocab;
     if (max_t < 1 || max_t > basalt::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
     // the two reads below are the whole "drafter files" cost; reported apart from the rest of the stage
     const auto t_files = std::chrono::steady_clock::now();
     // ---- the index and the dense weights
     {
-        std::ifstream idx(rt_dir + "/dense.txt");
-        if (!idx) { err = "mtp: cannot open " + rt_dir + "/dense.txt (run tools/mtp_rt.py)"; return false; }
+        std::vector<uint8_t> idx_text;
+        if (!read_file(files.index, idx_text)) { err = "mtp: cannot open " + files.index.path + " (run tools/mtp_rt.py)"; return false; }
+        std::istringstream idx(std::string(idx_text.begin(), idx_text.end()));
         std::string line;
         while (std::getline(idx, line)) {
-            if (line.empty()) continue;
+            if (line.empty() || line[0] == '#') continue;
             std::istringstream is(line);
             Tensor t;
             is >> t.name >> t.kind >> t.rows >> t.cols >> t.off >> t.bytes;
@@ -201,7 +207,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             tensors_.push_back(t);
         }
         std::vector<uint8_t> blob;
-        if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
+        if (!read_file(files.dense, blob)) { err = "mtp: cannot read " + files.dense.path; return false; }
         if (basalt::kernels::hc8_only()) {   // the hyper-connection matrices as 8-bit copies only: out of the blob
             std::vector<uint8_t> kept;
             size_t staged = 0;
@@ -211,11 +217,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                                 t.name.find("input_mix_weight_") != std::string::npos &&
                                 (uint64_t) t.rows * (uint64_t) t.cols * 2 == t.bytes;
                 if (hc) {
-                    void* tmp = nullptr;
-                    if (cudaMalloc(&tmp, t.bytes) != cudaSuccess) { err = "mtp: no VRAM to stage " + t.name; return false; }
-                    cudaMemcpy(tmp, blob.data() + t.off, t.bytes, cudaMemcpyHostToDevice);
-                    t.dev = basalt::kernels::hc8_adopt((const uint16_t*) tmp, (int) t.rows, (int) t.cols);
-                    cudaFree(tmp);
+                    // the 8-bit copy from the model file's table when it has one, else quantized from the bf16 matrix
+                    t.dev = hc8_table_adopt("mtp." + t.name, nullptr, (int) t.rows, (int) t.cols);
+                    if (t.dev == nullptr) {
+                        void* tmp = nullptr;
+                        if (cudaMalloc(&tmp, t.bytes) != cudaSuccess) { err = "mtp: no VRAM to stage " + t.name; return false; }
+                        cudaMemcpy(tmp, blob.data() + t.off, t.bytes, cudaMemcpyHostToDevice);
+                        t.dev = basalt::kernels::hc8_adopt((const uint16_t*) tmp, (int) t.rows, (int) t.cols);
+                        cudaFree(tmp);
+                    }
                     if (t.dev == nullptr) { err = "mtp: no VRAM for the 8-bit copy of " + t.name; return false; }
                     staged += t.bytes;
                     continue;
@@ -245,14 +255,22 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // ---- the 512 routed experts, one blob each
     {
         const uint64_t bytes = (uint64_t) g.n_expert * basalt::kernels::cpu::BLOB;
-        FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
-        if (f == nullptr) { err = "mtp: cannot open experts.bin"; return false; }
+        if (files.experts.empty() || !files.experts.exists() || files.experts.size() < bytes) {
+            err = "mtp: " + files.experts.path + " is missing or shorter than the draft layer's experts";
+            return false;
+        }
+        FILE* f = std::fopen(files.experts.path.c_str(), "rb");
+        if (f == nullptr || fseeko(f, (off_t) files.experts.offset, SEEK_SET) != 0) {
+            if (f != nullptr) std::fclose(f);
+            err = "mtp: cannot open " + files.experts.path;
+            return false;
+        }
         struct Closer {
             FILE* f;
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
         if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-        basalt::platform::advise_willneed(fileno(f), 0, bytes);
+        basalt::platform::advise_willneed(fileno(f), files.experts.offset, bytes);
         std::vector<uint8_t> chunk(64u << 20);
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
@@ -370,9 +388,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
             for (const char* p : {"attn_hyper_connection.", "mlp_hyper_connection.", "hyper_connection_mixer."}) {
                 const std::string s(p);
-                basalt::kernels::hc8_prepare(bf16((s + "input_mix_weight_down.weight").c_str()), LR, D);
-                basalt::kernels::hc8_prepare(bf16((s + "input_mix_weight_up.weight").c_str()), D, LR);
-                basalt::kernels::hc8_prepare(bf16((s + "block_inject_weight.weight").c_str()), HCn, D);
+                // (a copy read from the model file's table is registered the same way)
+                auto prepare = [&](const std::string& n, int rows, int cols) {
+                    const uint16_t* w = bf16(n.c_str());
+                    if (w != nullptr && hc8_table_adopt("mtp." + n, w, rows, cols) != nullptr) return;
+                    basalt::kernels::hc8_prepare(w, rows, cols);
+                };
+                prepare(s + "input_mix_weight_down.weight", LR, D);
+                prepare(s + "input_mix_weight_up.weight", D, LR);
+                prepare(s + "block_inject_weight.weight", HCn, D);
             }
         }
     }
@@ -387,13 +411,19 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     return true;
 }
 
+std::vector<std::pair<std::string, const void*>> MtpDrafter::hc8_keys() const {
+    std::vector<std::pair<std::string, const void*>> out;
+    for (const Tensor& t : tensors_)
+        if (t.kind == "bf16" && t.name.find("hyper_connection") != std::string::npos)
+            out.emplace_back("mtp." + t.name, t.dev ? t.dev : (const void*) (dense_ + t.off));
+    return out;
+}
+
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
     if (dhead_ == nullptr) {
-        if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
-            fseeko(f, 0, SEEK_END);
-            const long size = (long) ftello(f);
-            std::fclose(f);
+        if (!draft_vocab_.empty() && draft_vocab_.exists()) {
+            const long size = (long) draft_vocab_.size();
             if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
         }
     }
@@ -513,7 +543,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     // the draft head's token subset, when tools/draft_vocab.py wrote one
     if (dhead_ == nullptr) {
         std::vector<uint8_t> raw;
-        if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
+        if (read_file(draft_vocab_, raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||

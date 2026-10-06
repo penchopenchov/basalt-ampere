@@ -70,6 +70,10 @@ bool hc_fused_q8_rows_ok();
 /// pointer, outside any stream capture.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
 /// scales are one allocation (one prefetch range).
 void hc8_prepare(const uint16_t* w, int rows, int cols);
+/// Registers a copy made elsewhere (a hc8 table): `q` [rows][cols] int8 and the f16 scales [rows][srow] (the layout
+/// hc8_prepare makes), uploaded to the current device.  Keyed by the bf16 matrix `w` like hc8_prepare, or, with
+/// w == nullptr, by the copy itself like hc8_adopt (the key is returned).  nullptr: no VRAM, or a bad shape.
+const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, int rows, int cols);
 /// The 8-bit copy of w (q, its scales, the bytes of both), or false when there is none.
 bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes = nullptr);
 /// Bytes held by the 8-bit copies.

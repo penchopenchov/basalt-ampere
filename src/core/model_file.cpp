@@ -432,6 +432,7 @@ void model_sources(const ModelFile& m, ModelSources& s) {
     s.experts = m.range("experts");
     s.experts_layout = m.range("experts.layout");
     s.profile = m.range("profile");
+    s.profile_magic = false;
     s.hc8 = m.range("hc8");
     s.mtp_dense = m.range("mtp/dense");
     s.mtp_dense_index = m.range("mtp/dense.index");
@@ -441,6 +442,21 @@ void model_sources(const ModelFile& m, ModelSources& s) {
 }
 
 // ================================ the hc8 table ================================
+
+namespace {
+std::map<std::string, Hc8Copy>& hc8_table() {
+    static std::map<std::string, Hc8Copy> t;
+    return t;
+}
+}  // namespace
+
+void hc8_set_table(std::map<std::string, Hc8Copy> table) { hc8_table() = std::move(table); }
+
+const Hc8Copy* hc8_find(const std::string& name, int rows, int cols) {
+    const auto it = hc8_table().find(name);
+    if (it == hc8_table().end() || (int) it->second.rows != rows || (int) it->second.cols != cols) return nullptr;
+    return &it->second;
+}
 
 bool hc8_write(const std::string& path, const std::vector<Hc8Copy>& copies, std::string& err) {
     std::vector<Hc8Entry> entries(copies.size());

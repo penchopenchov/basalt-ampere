@@ -20,6 +20,7 @@
 #pragma once
 
 #include "basalt/core/layer.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/core/session.hpp"
 #include "basalt/kernels/sampler.hpp"
 
@@ -34,6 +35,27 @@ namespace basalt::core {
 
 class NativeHead;
 
+/// The drafter's files: an mtp runtime directory's, or the `mtp/...` sections of a .basalt.
+struct MtpFiles {
+    FileRange dense, index, experts, draft_vocab;   ///< dense.bin, dense.txt, experts.bin, draft_vocab.bin (optional)
+    static MtpFiles dir(const std::string& rt_dir) {
+        MtpFiles f;
+        f.dense = FileRange(rt_dir + "/dense.bin");
+        f.index = FileRange(rt_dir + "/dense.txt");
+        f.experts = FileRange(rt_dir + "/experts.bin");
+        f.draft_vocab = FileRange(rt_dir + "/draft_vocab.bin");
+        return f;
+    }
+    static MtpFiles from(const ModelSources& s) {
+        MtpFiles f;
+        f.dense = s.mtp_dense;
+        f.index = s.mtp_dense_index;
+        f.experts = s.mtp_experts;
+        f.draft_vocab = s.mtp_draft_vocab;
+        return f;
+    }
+};
+
 class MtpDrafter {
 public:
     MtpDrafter() = default;
@@ -45,6 +67,11 @@ public:
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
+    bool load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
+              int64_t window = 32768);
+    /// The draft layer's hyper-connection matrices that have 8-bit copies, as ("mtp." + tensor name, key) for
+    /// hc8_dump.  After `load`.
+    std::vector<std::pair<std::string, const void*>> hc8_keys() const;
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
@@ -200,7 +227,7 @@ private:
     std::vector<uint8_t> tier2_;   ///< token id -> 1 when only the added rows hold it
     void* top_scratch_ = nullptr;   ///< the head's fused argmax partials
     unsigned long long* gstamp_ = nullptr;   ///< --profile: the round's first and the draft's last GPU time
-    std::string rt_dir_;
+    FileRange draft_vocab_;   ///< the draft head's token subset, when the files have one
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
     float* probs_ = nullptr;

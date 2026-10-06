@@ -119,6 +119,8 @@ private:
 struct ModelSources {
     FileRange dense, dense_index, experts, experts_layout, profile, hc8;
     FileRange mtp_dense, mtp_dense_index, mtp_experts, mtp_draft_vocab;
+    /// Whether `profile` starts with the 4-byte profile magic (a profile file does, the .basalt section does not).
+    bool profile_magic = true;
     /// The file that serves the source GGUF tensors and metadata when they come from a .basalt, else empty.
     std::string model_path;
 };
@@ -154,6 +156,11 @@ struct Hc8Copy {
     const int8_t* q() const { return (const int8_t*) data.data(); }
     const uint16_t* s() const { return (const uint16_t*) (data.data() + (size_t) rows * cols); }
 };
+
+/// The table the engine loads copies from at startup (process-wide; empty = quantize from the bf16 matrices).
+void hc8_set_table(std::map<std::string, Hc8Copy> table);
+/// The loaded copy of `name` when its shape is rows x cols, else nullptr.
+const Hc8Copy* hc8_find(const std::string& name, int rows, int cols);
 
 /// Writes the table to `path` (atomically: a ".tmp" beside it, renamed).
 bool hc8_write(const std::string& path, const std::vector<Hc8Copy>& copies, std::string& err);

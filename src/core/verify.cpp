@@ -501,24 +501,76 @@ Verifier::~Verifier() {
         if (h) cudaFreeHost(h);
 }
 
-void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
-    if (!basalt::kernels::hc8_enabled()) return;
+bool hc8_table_has(const std::string& name, int rows, int cols) { return basalt::core::hc8_find(name, rows, cols) != nullptr; }
+
+const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols) {
+    const Hc8Copy* c = hc8_find(name, rows, cols);
+    if (c == nullptr) return nullptr;
+    return basalt::kernels::hc8_upload(w, c->q(), c->s(), rows, cols);
+}
+
+namespace {
+/// The hyper-connection matrices of the weight table, by name: (name, rows, cols).
+struct Hc8Tensor { std::string name; int rows, cols; };
+std::vector<Hc8Tensor> hc8_tensors(const WeightTable& wt, const ModelGeometry& g) {
     const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
-    auto add = [&](const WeightRef* d, const WeightRef* u, const WeightRef* i) {
-        if (d) basalt::kernels::hc8_prepare((const uint16_t*) d->data, LR, D);
-        if (u) basalt::kernels::hc8_prepare((const uint16_t*) u->data, D, LR);
-        if (i) basalt::kernels::hc8_prepare((const uint16_t*) i->data, HCn, D);
-    };
+    std::vector<Hc8Tensor> v;
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        const LayerView v(wt, l);
+        const LayerView lv(wt, l);
         for (const char* p : {"hc_attn_", "hc_ffn_"}) {
             const std::string s(p);
-            add(v.get((s + "down.weight").c_str()), v.get((s + "up.weight").c_str()), v.get((s + "inject.weight").c_str()));
+            v.push_back({lv.name((s + "down.weight").c_str()), LR, D});
+            v.push_back({lv.name((s + "up.weight").c_str()), D, LR});
+            v.push_back({lv.name((s + "inject.weight").c_str()), HCn, D});
         }
     }
-    add(wt.find("output_hc_down.weight"), wt.find("output_hc_up.weight"), nullptr);
+    v.push_back({"output_hc_down.weight", LR, D});
+    v.push_back({"output_hc_up.weight", D, LR});
+    return v;
+}
+}  // namespace
+
+void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
+    if (!basalt::kernels::hc8_enabled()) return;
+    size_t from_table = 0;
+    for (const Hc8Tensor& t : hc8_tensors(wt, g)) {
+        const WeightRef* r = wt.find(t.name);
+        if (r == nullptr) continue;
+        const uint16_t* w = (const uint16_t*) r->data;
+        if (w != nullptr && hc8_table_adopt(t.name, w, t.rows, t.cols) != nullptr) { ++from_table; continue; }
+        basalt::kernels::hc8_prepare(w, t.rows, t.cols);
+    }
+    (void) from_table;
     std::fprintf(stderr, "basalt hc8: 8-bit hyper-connection copies, %.0f MiB of VRAM\n",
                  (double) basalt::kernels::hc8_bytes() / 1048576.0);
+}
+
+bool hc8_dump(const WeightTable& wt, const ModelGeometry& g, const std::vector<std::pair<std::string, const void*>>& extra,
+              const std::string& path, std::string& err) {
+    std::vector<Hc8Copy> copies;
+    auto add = [&](const std::string& name, const void* key) {
+        basalt::kernels::Hc8View v;
+        if (key == nullptr || !basalt::kernels::hc8_view(key, v)) return;
+        Hc8Copy c;
+        c.name = name;
+        c.rows = (uint32_t) v.rows;
+        c.cols = (uint32_t) v.cols;
+        c.srow = (uint32_t) v.srow;
+        c.data.resize(v.bytes);
+        if (cudaMemcpy(c.data.data(), v.q, v.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaGetLastError();
+            c.data.clear();
+            return;
+        }
+        copies.push_back(std::move(c));
+    };
+    for (const Hc8Tensor& t : hc8_tensors(wt, g))
+        if (const WeightRef* r = wt.find(t.name)) add(t.name, r->data);
+    for (const auto& [name, key] : extra) add(name, key);
+    if (copies.empty()) { err = "hc8: there are no 8-bit copies to write"; return false; }
+    if (!hc8_write(path, copies, err)) return false;
+    std::fprintf(stderr, "basalt hc8: wrote %zu copies to %s\n", copies.size(), path.c_str());
+    return true;
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,

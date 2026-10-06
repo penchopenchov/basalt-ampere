@@ -393,4 +393,14 @@ private:
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
+/// The loaded hc8 table (model_file.hpp) has a copy of `name` of this shape.
+bool hc8_table_has(const std::string& name, int rows, int cols);
+/// Registers the table's copy of `name` on the current device, keyed by the bf16 matrix `w` (hc8_prepare's form) or,
+/// with w == nullptr, by the copy itself (hc8_adopt's form; the key is returned).  nullptr: no such copy, or no VRAM.
+const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols);
+/// --dump-hc8: writes the 8-bit copies of the weight table's hyper-connection matrices, and `extra` (name, key) pairs
+/// (the drafter's), to `path` in the layout model_file.hpp describes.
+bool hc8_dump(const WeightTable& wt, const ModelGeometry& g, const std::vector<std::pair<std::string, const void*>>& extra,
+              const std::string& path, std::string& err);
+
 }  // namespace basalt::core
