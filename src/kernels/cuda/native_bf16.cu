@@ -1,6 +1,6 @@
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/pdl.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
 #include <limits>

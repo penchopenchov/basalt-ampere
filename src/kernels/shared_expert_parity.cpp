@@ -14,11 +14,11 @@
 //   2. THE SCALAR GATE.  `ffn_gate_inp_shexp` is (n_embd,) and yields ONE value per token; the two rival
 //      readings are a per-dimension elementwise gate and a per-expert gate.  The elementwise reading is
 //      checked the same way - it is computed and required to differ.
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s_gemv.hpp"
-#include "strata/kernels/shared_expert.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/s_gemv.hpp"
+#include "basalt/kernels/shared_expert.hpp"
 
 #include <cuda_runtime.h>
 

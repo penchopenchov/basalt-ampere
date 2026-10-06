@@ -1,9 +1,9 @@
-#include "strata/core/expert_source.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "basalt/core/expert_source.hpp"
+#include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
 
 #if defined(STRATA_NATIVE_EXPERTS)
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
 #include "ggml.h"
 #endif
 

@@ -1,6 +1,6 @@
 // src/artifact/dequant.cpp - the `strata-dequant` CLI (dequantize a GGUF tensor and dump F32).
-// The dequantizers themselves are header-only in include/strata/artifact/dequant.hpp.
-#include "strata/artifact/dequant.hpp"
+// The dequantizers themselves are header-only in include/basalt/artifact/dequant.hpp.
+#include "basalt/artifact/dequant.hpp"
 
 #ifdef STRATA_DEQUANT_SELFTEST
 int main(int argc, char** argv) {

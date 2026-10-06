@@ -10,8 +10,8 @@
 // Synthetic files at small dimensions; needs a CUDA device for the arena (exits 77 without one).
 #include "gguf_fixture.hpp"
 
-#include "strata/core/native_dense.hpp"
-#include "strata/core/weights.hpp"
+#include "basalt/core/native_dense.hpp"
+#include "basalt/core/weights.hpp"
 
 #include <cuda_runtime.h>
 

@@ -7,8 +7,8 @@
 //   up   : mixed[d] = mean_c xn[c,d] * sigmoid(q_up[c*n_embd + d] . lo)
 //
 // Every token's values come from the same operations in the same order whatever the token count.
-#include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/hc_fused.hpp"
+#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/kernels/hc_fused.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

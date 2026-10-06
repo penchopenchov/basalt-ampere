@@ -1,4 +1,4 @@
-#include "strata/core/conversation_memory.hpp"
+#include "basalt/core/conversation_memory.hpp"
 
 #include <cstdio>
 #include <cstdlib>

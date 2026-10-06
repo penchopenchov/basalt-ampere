@@ -1,5 +1,5 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include <cstdio>
 #include <cstdlib>

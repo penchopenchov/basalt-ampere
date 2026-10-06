@@ -1,5 +1,5 @@
-// src/spec/controller.cpp - see include/strata/spec/controller.hpp.
-#include "strata/spec/controller.hpp"
+// src/spec/controller.cpp - see include/basalt/spec/controller.hpp.
+#include "basalt/spec/controller.hpp"
 
 #include <algorithm>
 

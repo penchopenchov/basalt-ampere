@@ -19,8 +19,8 @@
 //      rounding from reduction order, and graph replay must preserve the precision chosen at capture.
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
-#include "strata/kernels/gr.hpp"
-#include "strata/kernels/fused_gr.hpp"
+#include "basalt/kernels/gr.hpp"
+#include "basalt/kernels/fused_gr.hpp"
 
 #include <cuda_runtime.h>
 

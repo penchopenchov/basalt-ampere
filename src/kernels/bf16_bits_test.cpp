@@ -11,7 +11,7 @@
 //   3. every NaN input gives a quiet NaN of the same sign.
 //
 // And the round trip over all 65,536 bf16 patterns: a non-NaN bf16 survives f32 and back unchanged.
-#include "strata/kernels/bf16_bits.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
 
 #include <cstdint>
 #include <cstdio>

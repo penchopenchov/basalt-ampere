@@ -1,8 +1,8 @@
-// src/kernels/cuda/kv_q4.cu - see include/strata/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
+// src/kernels/cuda/kv_q4.cu - see include/basalt/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
 // (from PR #21 by code-martin; KV-streaming integration and the deterministic group maximum added on merge).
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/kv_stream.hpp"
+#include "basalt/kernels/kv_q4.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/kv_stream.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

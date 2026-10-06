@@ -1,5 +1,5 @@
-// src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
-#include "strata/kernels/fused_gdn.hpp"
+// src/kernels/cuda/fused_gdn.cu - see include/basalt/kernels/fused_gdn.hpp.
+#include "basalt/kernels/fused_gdn.hpp"
 
 #include <cuda_runtime.h>
 

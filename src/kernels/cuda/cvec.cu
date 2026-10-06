@@ -1,5 +1,5 @@
-// src/kernels/cuda/cvec.cu - see include/strata/kernels/cvec.hpp.
-#include "strata/kernels/cvec.hpp"
+// src/kernels/cuda/cvec.cu - see include/basalt/kernels/cvec.hpp.
+#include "basalt/kernels/cvec.hpp"
 
 #include <cuda_runtime.h>
 

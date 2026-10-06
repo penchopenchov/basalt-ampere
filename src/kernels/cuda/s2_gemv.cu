@@ -3,7 +3,7 @@
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
 // vector loads, no __ldg hints.  Phase 3 changes this file; the parity test is what says whether a change is
 // still right.
-#include "strata/kernels/s2_gemv.hpp"
+#include "basalt/kernels/s2_gemv.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

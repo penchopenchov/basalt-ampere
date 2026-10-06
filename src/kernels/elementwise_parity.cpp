@@ -12,9 +12,9 @@
 //      instead of decaying, so the sign is checked as a property and not assumed.
 //   3. `silu` IS COMPUTED IN DOUBLE then cast, because `ref/gdn.py`'s numpy does.  f32 `expf` differs in the
 //      last bits, and the test measures that rather than asserting it away.
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "basalt/kernels/dequant_bf16.hpp"
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 

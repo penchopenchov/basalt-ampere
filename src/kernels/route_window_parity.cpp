@@ -4,8 +4,8 @@
 // n-token top-k.  Speculative decoding is exact only if a token's route does not depend on how many tokens share
 // its window, so both batched kernels must equal their one-token forms exactly - this checks that on random data
 // shaped like the router (2560 -> 256, top-10) and like the shared-expert gate (2560 -> 1).
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/router_top10.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>
 

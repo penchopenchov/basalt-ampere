@@ -1,7 +1,7 @@
 // src/kernels/cuda/bf16_gemv.cu - the BF16 GEMV.  See the header for why it is not `s_gemv`.
-#include "strata/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
 
-#include "strata/kernels/bf16_bits.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
 
 #include <cuda_runtime.h>
 

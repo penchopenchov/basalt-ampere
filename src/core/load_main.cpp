@@ -4,7 +4,7 @@
 // a checksum per layer).  The size is a FLAG rather than hard-coded because the honest way to measure a 34 GB
 // load is to measure a smaller one first and project - and because pinning 34 GB evicts every page of page
 // cache on the machine, which is not something a test should do while other work is running.
-#include "strata/core/pinned.hpp"
+#include "basalt/core/pinned.hpp"
 
 #include <cstdio>
 #include <cstdlib>

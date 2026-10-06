@@ -1,7 +1,7 @@
 // Real-artifact Q5_0 PLE rows against ggml's reference dequantizer.
 #define NOMINMAX
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/ngram.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/kernels/ngram.hpp"
 #include "ggml.h"
 
 #include <algorithm>

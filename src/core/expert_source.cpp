@@ -1,17 +1,17 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
-#include "strata/core/expert_source.hpp"
-#include "strata/core/remote_experts.hpp"
-#include "strata/core/peer_experts.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/artifact/gguf_reader.hpp"
+#include "basalt/core/expert_source.hpp"
+#include "basalt/core/remote_experts.hpp"
+#include "basalt/core/peer_experts.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 
-#include "strata/core/pinned.hpp"
-#include "strata/platform/memory.hpp"
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/cpu/kq_avx1.hpp"
-#include "strata/kernels/cpu/kq_avx2.hpp"
+#include "basalt/core/pinned.hpp"
+#include "basalt/platform/memory.hpp"
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/kernels/cpu/kq_avx1.hpp"
+#include "basalt/kernels/cpu/kq_avx2.hpp"
 
 #include <cuda_runtime.h>
 

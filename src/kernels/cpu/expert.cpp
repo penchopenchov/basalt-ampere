@@ -2,8 +2,8 @@
 //
 // The body is the validated kernel, moved rather than rewritten: it carries the P0.T2 parity result
 // (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
-// include/strata/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
-#include "strata/kernels/cpu/expert.hpp"
+// include/basalt/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
+#include "basalt/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
 #include <cpuid.h>

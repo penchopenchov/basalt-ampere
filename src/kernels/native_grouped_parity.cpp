@@ -15,7 +15,7 @@
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
-#include "strata/kernels/iq_kernels.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
 

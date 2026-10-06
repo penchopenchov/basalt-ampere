@@ -7,7 +7,7 @@
 //
 // Compiled for AVX (/arch:AVX, -mavx; CMakeLists.txt sets that per source); it is only ever called behind
 // cpu_avx1_ok(), so no CPU that lacks AVX can reach it.
-#include "strata/kernels/cpu/kq_avx1.hpp"
+#include "basalt/kernels/cpu/kq_avx1.hpp"
 
 #include <immintrin.h>
 

@@ -1,9 +1,9 @@
-#include "strata/core/native_dense.hpp"
+#include "basalt/core/native_dense.hpp"
 #include <cstdlib>
-#include "strata/core/weights.hpp"
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/platform/memory.hpp"
+#include "basalt/core/weights.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>

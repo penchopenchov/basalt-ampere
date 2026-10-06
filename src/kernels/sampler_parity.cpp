@@ -8,7 +8,7 @@
 // So this builds a fixture where that happens, computes the greedy pick under BOTH orders, and requires them to
 // DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would pass
 // against either order.
-#include "strata/kernels/sampler.hpp"
+#include "basalt/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 

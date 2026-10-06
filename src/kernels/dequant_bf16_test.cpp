@@ -1,13 +1,13 @@
 // src/kernels/dequant_bf16_test.cpp - plan v0.3 P5: the device dequantizers against the artifact's validated CPU
-// dequantizers (`strata/artifact/dequant.hpp`), on one real tensor of every type the model uses.
+// dequantizers (`basalt/artifact/dequant.hpp`), on one real tensor of every type the model uses.
 //
 //     dequant_bf16_test SHARD1.gguf [SHARD2.gguf]
 //
 // For each type: the first 4 rows of the first tensor of that type, FP32 path compared with a relative tolerance of
 // 1e-6 (the products are the reference's, reordered at most), BF16 path within half a BF16 ulp of the CPU value.
-#include "strata/artifact/dequant.hpp"
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
+#include "basalt/artifact/dequant.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/kernels/dequant_bf16.hpp"
 
 #include <cuda_runtime.h>
 

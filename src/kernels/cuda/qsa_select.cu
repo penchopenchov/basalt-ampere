@@ -1,7 +1,7 @@
-// src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
+// src/kernels/cuda/qsa_select.cu - see include/basalt/kernels/qsa_select.hpp.
 #include <cstdlib>
 #include <cstring>
-#include "strata/kernels/qsa_select.hpp"
+#include "basalt/kernels/qsa_select.hpp"
 
 #include <cuda_runtime.h>
 

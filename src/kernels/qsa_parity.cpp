@@ -46,11 +46,11 @@
 //   * the attention against a reference reading the f32 keys: REPORTED and then checked against the phase's
 //     1e-3 for FP16 paths.  That difference is the FP16 CACHE's cost, not the kernel's, and it is kept
 //     separate so a kernel bug cannot hide inside it.
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/native_qsa_indexer.hpp"
+#include "basalt/kernels/qsa.hpp"
+#include "basalt/kernels/native_qsa_indexer.hpp"
 
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/rope.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/rope.hpp"
 
 #include <cuda_runtime.h>
 

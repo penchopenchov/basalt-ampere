@@ -13,8 +13,8 @@
 //      mode the park protocol exists to prevent, so `run()` is called many times in a row.
 //   4. A BATCH BIGGER AND SMALLER THAN THE WORKER COUNT, because `n < workers` leaves most workers claiming
 //      nothing and `n > workers` is the real case (10 experts, 5 workers).
-#include "strata/kernels/cpu/pool.hpp"
-#include "strata/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/kernels/cpu/expert.hpp"
 
 #include <algorithm>
 #include <chrono>

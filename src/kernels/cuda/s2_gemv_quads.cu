@@ -14,7 +14,7 @@
 //
 // S2 IS SPECIALISED DELIBERATELY: it is 31.64 GiB of the 38 GiB pack, so it is the kernel that matters.  The
 // generic `s_gemv_split` still serves S4 and S8.
-#include "strata/kernels/s_gemv.hpp"
+#include "basalt/kernels/s_gemv.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

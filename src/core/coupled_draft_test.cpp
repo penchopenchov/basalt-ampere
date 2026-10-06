@@ -1,4 +1,4 @@
-// src/core/coupled_draft_test.cpp - coupled draft sampling's host-side arithmetic (include/strata/core/coupled_draft.hpp).
+// src/core/coupled_draft_test.cpp - coupled draft sampling's host-side arithmetic (include/basalt/core/coupled_draft.hpp).
 //
 // No GPU.  A simulated decode - windows of random size, random accepted counts, the serve loop's first window of one
 // token and the CLI's `draft_first` - checks that
@@ -8,7 +8,7 @@
 //   3. the penalty window each draft sees in the device ring (the staged base, then the chain's earlier drafts) is
 //      token for token the history row `penalty_rows` gives the verify row that checks it;
 //   4. the penalty window length matches the target's (serve caps the history at 4,096).
-#include "strata/core/coupled_draft.hpp"
+#include "basalt/core/coupled_draft.hpp"
 
 #include <cstdio>
 #include <random>

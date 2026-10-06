@@ -1,5 +1,5 @@
-// src/spec/suffix_drafter.cpp - see include/strata/spec/suffix_drafter.hpp.
-#include "strata/spec/suffix_drafter.hpp"
+// src/spec/suffix_drafter.cpp - see include/basalt/spec/suffix_drafter.hpp.
+#include "basalt/spec/suffix_drafter.hpp"
 
 #include <algorithm>
 

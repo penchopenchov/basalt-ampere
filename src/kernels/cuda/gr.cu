@@ -1,6 +1,6 @@
 // src/kernels/cuda/gr.cu - the gated residual / hyper-connection, `gr_read` and `gr_write`.
 //
-// See include/strata/kernels/gr.hpp for the semantics and for why the weights are bf16.
+// See include/basalt/kernels/gr.hpp for the semantics and for why the weights are bf16.
 //
 // THE SHAPE is that each projection is an ordinary GEMV and is mapped the way the shapes want:
 //
@@ -19,12 +19,12 @@
 // `w_down[k][i]` with i contiguous - the reference's (hc_lr, hc*n_embd) row-major.  `hc_attn_up.weight` is
 // [320, 10240] so it holds `w_up[i][k]` with k contiguous - the reference's (hc*n_embd, hc_lr) row-major.  Both index
 // with no permutation at all.
-#include "strata/kernels/gr.hpp"
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/native_gr_norm.hpp"
-#include "strata/kernels/native_gr_postops.hpp"
+#include "basalt/kernels/gr.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/kernels/native_gr_norm.hpp"
+#include "basalt/kernels/native_gr_postops.hpp"
 
 #include <cuda_runtime.h>
 
@@ -42,7 +42,7 @@ constexpr int WARPS = THREADS / 32;
 bool fp32_activations = false;
 bool native_mmvf = false;
 
-/// The bf16 conversions live in `strata/kernels/bf16_bits.hpp`.  A private copy of a conversion whose failure mode is
+/// The bf16 conversions live in `basalt/kernels/bf16_bits.hpp`.  A private copy of a conversion whose failure mode is
 /// silent wrong bits is one too many, and `bf16` and `fp16` are NOT two spellings of one idea: a routine written for
 /// one and reused for the other is wrong in a way that still produces numbers.
 ///

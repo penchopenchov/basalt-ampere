@@ -1,11 +1,11 @@
-// src/kernels/cuda/verify_kernels.cu - see include/strata/kernels/verify_kernels.hpp.
+// src/kernels/cuda/verify_kernels.cu - see include/basalt/kernels/verify_kernels.hpp.
 //
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
-#include "strata/kernels/verify_kernels.hpp"
-#include "strata/kernels/dp4a.hpp"
-#include "strata/kernels/pdl.hpp"
-#include "strata/core/draft_cum.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/pdl.hpp"
+#include "basalt/core/draft_cum.hpp"
 
 #include <cuda_runtime.h>
 

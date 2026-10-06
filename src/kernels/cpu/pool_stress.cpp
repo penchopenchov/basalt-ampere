@@ -8,8 +8,8 @@
 // hang into a failure instead of a frozen test.
 //
 //   pool_stress [seconds]        (default 20)
-#include "strata/kernels/cpu/pool.hpp"
-#include "strata/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/kernels/cpu/expert.hpp"
 
 #include <atomic>
 #include <chrono>

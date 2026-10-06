@@ -7,7 +7,7 @@
 // F8_E4M3 bytes, times its weight_scale (n a multiple of 16 for the gather_batch check). Every row must match BIT FOR BIT through
 // both I/O modes (Direct and Mmap) and through the prompt path's gather_batch. With the IQ4_NL shard the same rows
 // are compared too: same table, so a correlation near 0.997 - a shifted row order would be ~0.
-#include "strata/kernels/ngram.hpp"
+#include "basalt/kernels/ngram.hpp"
 
 #include <cmath>
 #include <cstdio>

@@ -1,9 +1,9 @@
 // src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/dp4a.hpp"
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/dp4a.hpp"
 
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 

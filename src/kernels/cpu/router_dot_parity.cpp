@@ -3,9 +3,9 @@
 // of one layer's router.  No GPU, no model: random BF16 rows of the model's router shape [512 x 2560], 1..8 tokens.
 //
 //     router_dot_parity
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/kq_avx1.hpp"
-#include "strata/kernels/cpu/kq_avx2.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/kq_avx1.hpp"
+#include "basalt/kernels/cpu/kq_avx2.hpp"
 
 #include <algorithm>
 #include <chrono>

@@ -2,15 +2,15 @@
 // window ran (norm, RoPE, tail copy, INT8 appends with a host copy, indexer appends; q split, norms, RoPEs), bitwise,
 // for windows of 1..8 rows at every block phase; then a microbench of both forms.
 //   qsa_dec_fused_parity [iters]
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/kv_stream.hpp"
-#include "strata/kernels/native_qsa.hpp"
-#include "strata/kernels/native_qsa_indexer.hpp"
-#include "strata/kernels/native_rope.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_dec_fused.hpp"
-#include "strata/kernels/rope_scaling.hpp"
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/kv_q8.hpp"
+#include "basalt/kernels/kv_stream.hpp"
+#include "basalt/kernels/native_qsa.hpp"
+#include "basalt/kernels/native_qsa_indexer.hpp"
+#include "basalt/kernels/native_rope.hpp"
+#include "basalt/kernels/qsa.hpp"
+#include "basalt/kernels/qsa_dec_fused.hpp"
+#include "basalt/kernels/rope_scaling.hpp"
 
 #include <cuda_runtime.h>
 

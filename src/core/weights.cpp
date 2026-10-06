@@ -1,8 +1,8 @@
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
-#include "strata/core/weights.hpp"
+#include "basalt/core/weights.hpp"
 
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/platform/memory.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 

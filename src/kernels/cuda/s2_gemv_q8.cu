@@ -16,7 +16,7 @@
 // Layout: activations are (n_in/32) ggml Q8_0 blocks, 34 bytes each - `fp16 d` then `int8 qs[32]` - produced by
 // `strata::kernels::quantize_q8_0`.  A quad of four elements lies inside one 32-element block, so the block
 // scale is constant across it and is loaded once.
-#include "strata/kernels/s2_gemv_q8.hpp"
+#include "basalt/kernels/s2_gemv_q8.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

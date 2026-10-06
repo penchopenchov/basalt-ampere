@@ -1,7 +1,7 @@
 // src/artifact/gguf_reader.cpp - the `strata-gguf` CLI.  The reader itself is header-only in
-// include/strata/artifact/gguf_reader.hpp; this file is just the entry point, so it cannot drift
+// include/basalt/artifact/gguf_reader.hpp; this file is just the entry point, so it cannot drift
 // from the library it exercises.
-#include "strata/artifact/gguf_reader.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 
 #ifndef STRATA_GGUF_MAIN_DISABLED
 int main(int argc, char** argv) {

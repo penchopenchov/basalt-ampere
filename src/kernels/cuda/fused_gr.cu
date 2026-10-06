@@ -1,8 +1,8 @@
-// src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
-#include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/pdl.hpp"
-#include "strata/kernels/verify_kernels.hpp"
+// src/kernels/cuda/fused_gr.cu - see include/basalt/kernels/fused_gr.hpp.
+#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 

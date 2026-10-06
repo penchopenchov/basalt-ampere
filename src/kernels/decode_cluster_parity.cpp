@@ -15,9 +15,9 @@
 //   decode_cluster_parity --bench        per-call times, old vs new, at 32K / 128K / 262K
 //
 // The one-CTA references are qsa_block_topk_ref and the one-block greedy kernel (greedy_one_block).
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_select.hpp"
-#include "strata/kernels/sampler.hpp"
+#include "basalt/kernels/qsa.hpp"
+#include "basalt/kernels/qsa_select.hpp"
+#include "basalt/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 

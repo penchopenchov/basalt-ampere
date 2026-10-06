@@ -4,7 +4,7 @@
 // Compiled with AVX2 only, so nothing here can fault on those CPUs.  The arithmetic is the AVX-512 kernels':
 // codes 0..3 against the int8 activation per 32-value chunk, times the weight scale and the chunk scale, minus
 // the weight scale times the chunk's `hx` (the -1 code offset); the quantizer is the scalar rule, bit for bit.
-#include "strata/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
 

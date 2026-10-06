@@ -1,7 +1,7 @@
-// src/kernels/cuda/dec_moe.cuh - see include/strata/kernels/dec_moe.hpp.  Included at the end of iq_kernels.cu:
+// src/kernels/cuda/dec_moe.cuh - see include/basalt/kernels/dec_moe.hpp.  Included at the end of iq_kernels.cu:
 // the peer's rows use that file's row dots (Split, row_dot_multi, the sub-warp down dots) and q8_1_store.
-#include "strata/kernels/dec_moe.hpp"
-#include "strata/kernels/verify_kernels.hpp"
+#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 namespace strata::kernels {
 namespace {

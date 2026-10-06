@@ -1,8 +1,8 @@
 // src/kernels/cuda/gdn.cu - P2.S2: the gated delta-net's non-projection parts.
 //
-// See include/strata/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
+// See include/basalt/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.
-#include "strata/kernels/gdn.hpp"
+#include "basalt/kernels/gdn.hpp"
 
 #include <cuda_runtime.h>
 

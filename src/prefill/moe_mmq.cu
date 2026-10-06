@@ -1,7 +1,7 @@
-// src/prefill/moe_mmq.cu - see include/strata/prefill/moe_mmq.hpp.  llama.cpp's MMQ (ggml-cuda, MIT) is compiled
+// src/prefill/moe_mmq.cu - see include/basalt/prefill/moe_mmq.hpp.  llama.cpp's MMQ (ggml-cuda, MIT) is compiled
 // from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
 // few host symbols of ggml-cuda.cu it references.
-#include "strata/prefill/moe_mmq.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 #include "common.cuh"
 #include "mmq.cuh"

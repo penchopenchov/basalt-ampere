@@ -1,4 +1,4 @@
-#include "strata/core/conversation_snapshot.hpp"
+#include "basalt/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 
 #include <algorithm>

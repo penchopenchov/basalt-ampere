@@ -11,10 +11,10 @@
 //   3. --bench: the read's time (weights cold in L2) and the products' time against the bf16 ones.
 //
 //     build/hc8_parity [--bench]
-#include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/gr.hpp"
-#include "strata/kernels/hc_fused.hpp"
-#include "strata/prefill/gemm.hpp"
+#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/kernels/gr.hpp"
+#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/prefill/gemm.hpp"
 
 #include <cuda_runtime.h>
 

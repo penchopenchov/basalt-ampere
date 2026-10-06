@@ -1,9 +1,9 @@
-#include "strata/core/remote_expert_opt.hpp"
-#include "strata/core/remote_experts.hpp"
-#include "strata/core/on_device.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/verify_kernels.hpp"
+#include "basalt/core/remote_expert_opt.hpp"
+#include "basalt/core/remote_experts.hpp"
+#include "basalt/core/on_device.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <algorithm>
 #include <cstring>

@@ -18,14 +18,14 @@
 // The legacy canonical projections use their explicit Q8_0/Q8_K activation images. The optional native
 // BF16 path affects only the scalar gate: it reads the original F32 input and uses pinned CUDA MMVF plus
 // an FP32 sigmoid. Native projection overrides independently select CUDA Q8_1 MMVQ and FP32 SwiGLU.
-#include "strata/kernels/shared_expert.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s2_gemv_q8.hpp"
-#include "strata/kernels/s_gemv.hpp"
-#include "strata/kernels/native_mmvq.hpp"
+#include "basalt/kernels/shared_expert.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/s2_gemv_q8.hpp"
+#include "basalt/kernels/s_gemv.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

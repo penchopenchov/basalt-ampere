@@ -8,12 +8,12 @@
 //   3. the composed gathers bitwise vs the host dequantization of those codes;
 //   4. qsa_decode_attn<3> + output fwht vs a host attention over the SAME dequantized K/V (fp32 math), and
 //      bounded against the fp32-true attention from the unquantized K/V.
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/kv_q4.hpp"
+#include "basalt/kernels/kv_q8.hpp"
+#include "basalt/kernels/qsa.hpp"
+#include "basalt/kernels/qsa_decode_attn.hpp"
+#include "basalt/kernels/qsa_prompt_attn.hpp"
 
 #include <cuda_runtime.h>
 

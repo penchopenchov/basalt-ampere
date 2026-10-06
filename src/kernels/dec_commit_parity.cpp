@@ -7,10 +7,10 @@
 // Every state, conv history and indexer buffer must match bit for bit for n_keep = 0..7 at the model's geometry.
 // Inputs random normal.  --bench: both as CUDA graphs over a window's layers (36 GDN, 12 QSA), in microseconds; the
 // grid-stride GDN form per block count, alone and beside a chain of small copies on another stream.
-#include "strata/kernels/native_qsa_indexer.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/rope_scaling.hpp"
-#include "strata/kernels/verify_kernels.hpp"
+#include "basalt/kernels/native_qsa_indexer.hpp"
+#include "basalt/kernels/qsa.hpp"
+#include "basalt/kernels/rope_scaling.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 

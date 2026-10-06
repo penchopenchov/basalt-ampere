@@ -4,11 +4,11 @@
 // fused read on 8-bit copies of the matrices (run with HC_TOL=1).
 //
 //     build/hc_fused_parity [iters] [T min] [T max]
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/hc_fused.hpp"
-#include "strata/kernels/native_router.hpp"
-#include "strata/kernels/pdl.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/fused_gr.hpp"
+#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/native_router.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
 

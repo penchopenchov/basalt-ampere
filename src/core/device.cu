@@ -1,5 +1,5 @@
 // src/core/device.cu - P2.S1: the CUDA side of the runtime core.
-#include "strata/core/device.hpp"
+#include "basalt/core/device.hpp"
 
 #include <cuda_runtime.h>
 

@@ -13,11 +13,11 @@
 // partials are reduced through shuffle; the CPU walks every chunk in order with its own accumulator shape.
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
-#include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/dp4a.hpp"
+#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/kernels/dp4a.hpp"
 
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/verify_kernels.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -31,7 +31,7 @@
 namespace strata::kernels {
 namespace {
 
-// THE BLOB'S OWN GEOMETRY, from `include/strata/kernels/cpu/expert.hpp`.  Restated as literals because that
+// THE BLOB'S OWN GEOMETRY, from `include/basalt/kernels/cpu/expert.hpp`.  Restated as literals because that
 // header is the CPU path's and this file must not silently follow it if the two ever disagree: the sizes below
 // are what the CPU kernel's indexing computes, and `moe_hit_parity` compares the two end to end.
 constexpr int H = 2560;

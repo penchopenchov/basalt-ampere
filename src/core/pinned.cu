@@ -1,6 +1,6 @@
 // src/core/pinned.cu - the pinned host arena and the parallel expert load.
-#include "strata/core/pinned.hpp"
-#include "strata/platform/memory.hpp"
+#include "basalt/core/pinned.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 

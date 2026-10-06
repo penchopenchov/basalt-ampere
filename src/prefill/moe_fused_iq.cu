@@ -1,4 +1,4 @@
-// src/prefill/moe_fused_iq.cu - see include/strata/prefill/moe_fused_iq.hpp (#136: the native packs' prompt experts on
+// src/prefill/moe_fused_iq.cu - see include/basalt/prefill/moe_fused_iq.hpp (#136: the native packs' prompt experts on
 // the fused int8 kernels of moe_fused.cu).
 //
 // The arithmetic.  An activation block of 32 values is x = d_x * a, a = round(x / d_x) in -127..127, stored in natural
@@ -34,7 +34,7 @@
 //   - hands out items through an atomic counter (items differ in size: their routed rows), and prefetches the next
 //     item's first weights into L2 while the current one runs.
 // Same math as above, rounded in another order: the products agree to the last bits, H's int8 codes almost always.
-#include "strata/prefill/moe_fused_iq.hpp"
+#include "basalt/prefill/moe_fused_iq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

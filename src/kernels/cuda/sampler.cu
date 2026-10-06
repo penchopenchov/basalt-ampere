@@ -15,8 +15,8 @@
 //   - `sampler_one_block_kernel` (the fallback when the split cannot run): one block per token, `top_k` block-argmax
 //     rounds, each over the logits after the previous pick.
 // Both share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
-#include "strata/kernels/sampler.hpp"
-#include "strata/core/coupled_draft.hpp"
+#include "basalt/kernels/sampler.hpp"
+#include "basalt/core/coupled_draft.hpp"
 
 #include <cuda_runtime.h>
 
@@ -668,7 +668,7 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
 }
 
-// ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
+// ---- COUPLED DRAFT SAMPLING (include/basalt/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
 // target's chain and the target's Philox draw.  Everything that varies per request or per round - the chain's
 // parameters, the seed, the counter (from the cell's step record), the penalty history - is read from DEVICE memory:
 // these kernels are captured into the drafter's round/step graphs.  One row, `nv` logits: the draft head's

@@ -9,8 +9,8 @@
 // FMA, which changes the result in the last bits, and nvcc does.  So this asserts a RELATIVE error, measures
 // what it actually is, and prints the number - the phase spec allows 1e-3 for FP16 paths, and if the measured
 // error were near that the tolerance would be hiding something rather than bounding rounding.
-#include "strata/artifact/dequant.hpp"
-#include "strata/kernels/s2_gemv.hpp"
+#include "basalt/artifact/dequant.hpp"
+#include "basalt/kernels/s2_gemv.hpp"
 
 #include <cuda_runtime.h>
 

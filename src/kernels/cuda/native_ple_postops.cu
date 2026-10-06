@@ -18,9 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "strata/kernels/native_ple_postops.hpp"
-#include "strata/kernels/native_gr_norm.hpp"
-#include "strata/kernels/ngram.hpp"
+#include "basalt/kernels/native_ple_postops.hpp"
+#include "basalt/kernels/native_gr_norm.hpp"
+#include "basalt/kernels/ngram.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cmath>

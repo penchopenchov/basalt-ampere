@@ -2,7 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
-#include "strata/kernels/cpu/pool.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
 
 #include <algorithm>
 #include <cerrno>

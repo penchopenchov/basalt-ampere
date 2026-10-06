@@ -10,12 +10,12 @@
 //   window      (two cards) 48 rings through the peer kernel: the peer rows vs native_expert_grouped on the peer
 // All bitwise.  --bench adds: the VRAM share's grouped call (us, GB/s of expert bytes), and per ring on CUDA0 the
 // route + wait with and without peer entries, alone and behind the VRAM call (what CUDA0 waits for the peer).
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/dec_moe.hpp"
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/native_moe.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/native_moe.hpp"
+#include "basalt/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
 

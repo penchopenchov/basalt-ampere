@@ -1,7 +1,7 @@
 // Q5_1 shared-expert projection: Strata CUDA dequantization vs ggml.
 #define NOMINMAX
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/kernels/dequant_bf16.hpp"
 #include "ggml.h"
 
 #include <cuda_runtime.h>

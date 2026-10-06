@@ -1,6 +1,6 @@
-// src/kernels/cuda/kv_q8.cu - see include/strata/kernels/kv_q8.hpp.
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/f16_bits.hpp"
+// src/kernels/cuda/kv_q8.cu - see include/basalt/kernels/kv_q8.hpp.
+#include "basalt/kernels/kv_q8.hpp"
+#include "basalt/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 

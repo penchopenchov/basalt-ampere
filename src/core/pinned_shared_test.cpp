@@ -1,5 +1,5 @@
 // Linux selftest for the optional MAP_SHARED backing of PinnedArena.
-#include "strata/core/pinned.hpp"
+#include "basalt/core/pinned.hpp"
 
 #include <cstdio>
 #include <cstdlib>

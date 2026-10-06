@@ -51,7 +51,7 @@
 //     produced - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
 //     comparisons and that is the right trade here: n = 512, every comparison is independent, and the old
 //     version was O(k*n) with a serial `exp` inside.
-#include "strata/kernels/router_top10.hpp"
+#include "basalt/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>
 

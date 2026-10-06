@@ -2,11 +2,11 @@
 //
 //     build/mmvq_multi_parity
 //
-// WHY IT EXISTS.  `include/strata/kernels/native_mmvq.hpp` says of `native_mmvq_set_multi_exact`:
+// WHY IT EXISTS.  `include/basalt/kernels/native_mmvq.hpp` says of `native_mmvq_set_multi_exact`:
 //
 //     "true (default): the ncols == 1 layout, every column bitwise equal to a single-column call"
 //
-// and `include/strata/core/verify.hpp` counts "multi-column MMVQ in exact mode" among the reasons the verify window
+// and `include/basalt/core/verify.hpp` counts "multi-column MMVQ in exact mode" among the reasons the verify window
 // produces what greedy decode would, bit for bit.  Nothing tested that sentence: `iq_parity` calls `native_mmvq`
 // with two columns and compares against a float64 reference at 2e-2, which cannot see a difference between one
 // column and T columns.
@@ -38,8 +38,8 @@
 // STRATA_MMVQ_MMA=1 in the environment the sweeps above take it for their IQ4_XS case as well.
 //
 //     build/mmvq_multi_parity [--bench]      --bench: the dp4a and tensor-core kernels timed at the model's shapes
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/native_mmvq.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
 

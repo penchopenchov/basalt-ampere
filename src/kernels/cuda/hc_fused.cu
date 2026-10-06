@@ -1,11 +1,11 @@
-// src/kernels/cuda/hc_fused.cu - see include/strata/kernels/hc_fused.hpp.
+// src/kernels/cuda/hc_fused.cu - see include/basalt/kernels/hc_fused.hpp.
 //
 // Built WITHOUT fast math, like fused_gr.cu, so the hc arithmetic below is fused_gr.cu's expressions compiled the
 // same way.  The router part reproduces kernels built WITH fast math (the MMVF GEMV and the native top-10): those
 // operations are spelled out as the flush-to-zero PTX instructions that build emits.
-#include "strata/kernels/hc_fused.hpp"
-#include "strata/kernels/pdl.hpp"
-#include "strata/kernels/q8_1_finite.hpp"
+#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/q8_1_finite.hpp"
 
 #include <cooperative_groups.h>
 #include <cuda.h>

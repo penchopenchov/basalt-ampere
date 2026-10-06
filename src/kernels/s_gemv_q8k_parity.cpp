@@ -10,9 +10,9 @@
 //   3. **THE Q8_K-vs-FP16 GAP IS MEASURED**, because that is the number the whole activation-contract
 //      decision rests on and it has only ever been measured on Q2_0 weights (0.6175%) and on BF16 ones
 //      (0.141-0.156%).  A K-quant weight is a third case and it is the one the dense projections use.
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s_gemv.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/s_gemv.hpp"
 
 #include <cuda_runtime.h>
 

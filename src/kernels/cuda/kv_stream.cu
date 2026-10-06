@@ -1,7 +1,7 @@
-// src/kernels/cuda/kv_stream.cu - see include/strata/kernels/kv_stream.hpp.
-#include "strata/kernels/kv_stream.hpp"
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/kv_q8.hpp"
+// src/kernels/cuda/kv_stream.cu - see include/basalt/kernels/kv_stream.hpp.
+#include "basalt/kernels/kv_stream.hpp"
+#include "basalt/kernels/kv_q4.hpp"
+#include "basalt/kernels/kv_q8.hpp"
 
 #include <cuda_runtime.h>
 

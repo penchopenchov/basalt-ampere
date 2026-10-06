@@ -6,57 +6,57 @@
 // There is no tokenizer here: the prompt arrives as ids via `--tokens`, so a logit comparison against a reference runs
 // on the same ids on both sides.
 
-#include "strata/core/device.hpp"
-#include "strata/core/diag.hpp"
-#include "strata/core/draft_cum.hpp"
-#include "strata/core/remote_expert_opt.hpp"
-#include "strata/core/expert_cache.hpp"
-#include "strata/core/conversation_snapshot.hpp"
-#include "strata/core/conversation_memory.hpp"
-#include "strata/core/coupled_draft.hpp"
-#include "strata/core/expert_source.hpp"
-#include "strata/core/pinned.hpp"
-#include "strata/core/remote_experts.hpp"
-#include "strata/core/on_device.hpp"
-#include "strata/core/peer_experts.hpp"
-#include "strata/core/layer.hpp"
-#include "strata/core/layout.hpp"
-#include "strata/core/session.hpp"
-#include "strata/core/weights.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/pool.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/ngram.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/sampler.hpp"
-#include "strata/kernels/verify_kernels.hpp"
-#include "strata/kernels/shared_expert.hpp"
-#include "strata/kernels/native_moe.hpp"
-#include "strata/kernels/native_gdn.hpp"
-#include "strata/kernels/native_router.hpp"
-#include "strata/kernels/native_qsa.hpp"
-#include "strata/kernels/native_qsa_indexer.hpp"
-#include "strata/kernels/native_rope.hpp"
-#include "strata/kernels/mrope.hpp"
-#include "strata/kernels/kv_q4.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/core/native_head.hpp"
-#include "strata/core/verify.hpp"
-#include "strata/core/mtp.hpp"
-#include "strata/prefill/prefill.hpp"
-#include "strata/core/native_dense.hpp"
-#include "strata/program/logits_selection.hpp"
-#include "strata/program/conv_cache.hpp"
-#include "strata/program/ppl_gate.hpp"
-#include "strata/spec/draft_policy.hpp"
-#include "strata/spec/suffix_drafter.hpp"
-#include "strata/kernels/cvec.hpp"
-#include "strata/kernels/hc_fused.hpp"
-#include "strata/core/progress.hpp"
-#include "strata/core/device.hpp"
-#include "strata/core/draft_cum.hpp"
-#include "strata/artifact/gguf_reader.hpp"
+#include "basalt/core/device.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/core/draft_cum.hpp"
+#include "basalt/core/remote_expert_opt.hpp"
+#include "basalt/core/expert_cache.hpp"
+#include "basalt/core/conversation_snapshot.hpp"
+#include "basalt/core/conversation_memory.hpp"
+#include "basalt/core/coupled_draft.hpp"
+#include "basalt/core/expert_source.hpp"
+#include "basalt/core/pinned.hpp"
+#include "basalt/core/remote_experts.hpp"
+#include "basalt/core/on_device.hpp"
+#include "basalt/core/peer_experts.hpp"
+#include "basalt/core/layer.hpp"
+#include "basalt/core/layout.hpp"
+#include "basalt/core/session.hpp"
+#include "basalt/core/weights.hpp"
+#include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/ngram.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/kernels/sampler.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/shared_expert.hpp"
+#include "basalt/kernels/native_moe.hpp"
+#include "basalt/kernels/native_gdn.hpp"
+#include "basalt/kernels/native_router.hpp"
+#include "basalt/kernels/native_qsa.hpp"
+#include "basalt/kernels/native_qsa_indexer.hpp"
+#include "basalt/kernels/native_rope.hpp"
+#include "basalt/kernels/mrope.hpp"
+#include "basalt/kernels/kv_q4.hpp"
+#include "basalt/kernels/qsa.hpp"
+#include "basalt/core/native_head.hpp"
+#include "basalt/core/verify.hpp"
+#include "basalt/core/mtp.hpp"
+#include "basalt/prefill/prefill.hpp"
+#include "basalt/core/native_dense.hpp"
+#include "basalt/program/logits_selection.hpp"
+#include "basalt/program/conv_cache.hpp"
+#include "basalt/program/ppl_gate.hpp"
+#include "basalt/spec/draft_policy.hpp"
+#include "basalt/spec/suffix_drafter.hpp"
+#include "basalt/kernels/cvec.hpp"
+#include "basalt/kernels/hc_fused.hpp"
+#include "basalt/core/progress.hpp"
+#include "basalt/core/device.hpp"
+#include "basalt/core/draft_cum.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 #include <unistd.h>
 #include <cerrno>
 #include <sys/stat.h>
@@ -424,11 +424,11 @@ struct Options {
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
-    /// pay (strata/spec/draft_policy.hpp).  On by default; 0 = MTP only.
+    /// pay (basalt/spec/draft_policy.hpp).  On by default; 0 = MTP only.
     int suffix_draft = 3;
     /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
-    /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
+    /// A control vector on the residual stream (basalt/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
     std::vector<std::pair<std::string, float>> cvec_files;
@@ -1515,7 +1515,7 @@ int main(int argc, char** argv) {
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
-    // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays.
+    // up to 2 tokens longer; the draft policy (basalt/spec/draft_policy.hpp) takes one only where it pays.
     // --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
@@ -2065,7 +2065,7 @@ int main(int argc, char** argv) {
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
     strata::kernels::native_rope_set_enabled(o.native_rope);
-    // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
+    // The vision path: every rope kernel reads a cell's (t, h, w) from this table (basalt/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
@@ -5780,7 +5780,7 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
-            // ppl=K [ppl_t=T]: quality gate (strata/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
+            // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed
             int req_ppl = -1, req_ppl_t = 3;
             if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its

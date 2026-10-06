@@ -1,5 +1,5 @@
 // src/platform/memory_test.cpp - plan v0.3 P0.1: lock_resident on a 256 MiB region (CPU only, no GPU, no model).
-#include "strata/platform/memory.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <cstdio>
 #include <cstdlib>

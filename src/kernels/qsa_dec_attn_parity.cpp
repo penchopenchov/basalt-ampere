@@ -1,11 +1,11 @@
 // src/kernels/qsa_dec_attn_parity.cpp - qsa_dec_attn against qsa_decode_attn_batch (+ native_qsa_gate_apply), bitwise,
 // on random INT8 and FP16 pools through a permuted page table with masked pages; then a microbench of both.
 //   qsa_dec_attn_parity [iters]
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/native_qsa.hpp"
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/qsa_dec_attn.hpp"
-#include "strata/kernels/qsa_decode_attn.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/native_qsa.hpp"
+#include "basalt/kernels/qsa.hpp"
+#include "basalt/kernels/qsa_dec_attn.hpp"
+#include "basalt/kernels/qsa_decode_attn.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

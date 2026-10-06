@@ -13,7 +13,7 @@
 //   4. a one-slot budget has no room for root and leaf, so the pin is off and the oldest leaves (the
 //      newest point stays, as before);
 //   5. the policy is pure: the same stamps, the same victim.
-#include "strata/program/conv_cache.hpp"
+#include "basalt/program/conv_cache.hpp"
 
 #include <cstdint>
 #include <cstdio>

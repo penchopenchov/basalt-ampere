@@ -9,8 +9,8 @@
 // tiles - an all-zero token, per-expert blobs at unrelated addresses, three launches of different expert ranges.
 // Part 2 (timing): one layer at a real chunk (2048 tokens, 512 experts, top 10) on both paths, with their agreement.
 // Exit 77 without a CUDA device of sm_80 or newer.
-#include "strata/prefill/moe_fused.hpp"
-#include "strata/prefill/moe_mmq.hpp"
+#include "basalt/prefill/moe_fused.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
 

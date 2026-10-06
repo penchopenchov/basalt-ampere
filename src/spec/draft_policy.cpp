@@ -1,5 +1,5 @@
-// src/spec/draft_policy.cpp - see include/strata/spec/draft_policy.hpp.
-#include "strata/spec/draft_policy.hpp"
+// src/spec/draft_policy.cpp - see include/basalt/spec/draft_policy.hpp.
+#include "basalt/spec/draft_policy.hpp"
 
 #include <algorithm>
 

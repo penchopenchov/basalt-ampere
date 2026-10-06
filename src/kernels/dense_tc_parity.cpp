@@ -9,9 +9,9 @@
 //     RMS of the diff over the RMS of ref, per case; it fails above 1e-3 RMS.
 // --bench: native_mmvq and dense_tc timed per T as CUDA graphs over enough weight copies that the L2 holds none
 // (launched as programmatic dependents under STRATA_PDL=1).
-#include "strata/kernels/dense_tc.hpp"
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/pdl.hpp"
+#include "basalt/kernels/dense_tc.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
 

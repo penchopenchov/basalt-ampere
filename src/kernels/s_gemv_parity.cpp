@@ -13,12 +13,12 @@
 // honest move is to say so than to half-build it.
 //
 // THE REFERENCE IS THE CHAIN: for each type the CPU side reconstructs the RAW GGUF block from the canonical
-// planes and decodes it with that type's scalar dequantizer from include/strata/artifact/dequant.hpp - the
+// planes and decodes it with that type's scalar dequantizer from include/basalt/artifact/dequant.hpp - the
 // ones `bench/micro/dequant_xcheck` checks against **ggml's own** dequantizers.  Reconstructing raw from
 // canonical is the inverse of what the packer does, and it is written here independently of the packer so the
 // two are not the same code.
-#include "strata/artifact/dequant.hpp"
-#include "strata/kernels/s_gemv.hpp"
+#include "basalt/artifact/dequant.hpp"
+#include "basalt/kernels/s_gemv.hpp"
 
 #include <cuda_runtime.h>
 

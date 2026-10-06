@@ -23,8 +23,8 @@
 // the projection.  Bitwise equality with the previous kernels is the contract; on top of it a double-precision
 // host reference of every up row and every down row checks that the fixture computes an expert at all - two
 // kernels agreeing on garbage would otherwise pass.
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
 

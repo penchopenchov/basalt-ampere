@@ -1,5 +1,5 @@
 // src/spec/controller_test.cpp - plan v0.3 P6: the speculation controller's decisions (no model, no GPU).
-#include "strata/spec/controller.hpp"
+#include "basalt/spec/controller.hpp"
 
 #include <cstdio>
 

@@ -1,14 +1,14 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
-#include "strata/core/session.hpp"
-#include "strata/kernels/mrope.hpp"
-#include "strata/core/progress.hpp"
+#include "basalt/core/session.hpp"
+#include "basalt/kernels/mrope.hpp"
+#include "basalt/core/progress.hpp"
 
-#include "strata/kernels/qsa.hpp"
-#include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/cpu/pool.hpp"
-#include "strata/kernels/ngram.hpp"
+#include "basalt/kernels/qsa.hpp"
+#include "basalt/kernels/elementwise.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/kernels/ngram.hpp"
 
 #include <cuda_runtime.h>
 

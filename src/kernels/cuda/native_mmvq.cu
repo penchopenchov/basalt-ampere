@@ -23,12 +23,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/dp4a.hpp"
-#include "strata/kernels/q8_1_finite.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/pdl.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/q8_1_finite.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

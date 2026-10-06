@@ -1,7 +1,7 @@
 // src/kernels/cpu/pool.cpp - the CPU expert pool.  Read pool.hpp first; it explains the protocol.
-#include "strata/kernels/cpu/pool.hpp"
-#include "strata/core/progress.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/core/progress.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
 #include <cmath>

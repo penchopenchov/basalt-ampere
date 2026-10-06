@@ -1,5 +1,5 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
-#include "strata/core/expert_cache.hpp"
+#include "basalt/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda.h>   // the virtual memory management types (the functions come through the runtime's entry points)

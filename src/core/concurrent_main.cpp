@@ -13,8 +13,8 @@
 // The CPU side is a READ LOOP over the same pinned arena rather than the real VNNI kernel, and that is
 // deliberate: the question is whether the two paths contend for DRAM BANDWIDTH, and a read loop is a pure
 // measurement of that demand, with no compute that could mask it.
-#include "strata/core/pinned.hpp"
-#include "strata/kernels/s_gemv.hpp"
+#include "basalt/core/pinned.hpp"
+#include "basalt/kernels/s_gemv.hpp"
 
 #include <cuda_runtime.h>
 

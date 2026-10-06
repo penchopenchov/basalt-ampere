@@ -1,11 +1,11 @@
 // src/kernels/ngram.cpp - P2.S4: the PLE n-gram hash and the IQ4_NL table read.
 //
-// See include/strata/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
-#include "strata/kernels/ngram.hpp"
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/artifact/dequant.hpp"
-#include "strata/kernels/f16_bits.hpp"
-#include "strata/ngram/ple_reader.hpp"
+// See include/basalt/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
+#include "basalt/kernels/ngram.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/artifact/dequant.hpp"
+#include "basalt/kernels/f16_bits.hpp"
+#include "basalt/ngram/ple_reader.hpp"
 
 #include <cerrno>
 #include <cmath>

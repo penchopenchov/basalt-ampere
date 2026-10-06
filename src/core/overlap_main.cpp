@@ -9,8 +9,8 @@
 //
 // Measured against a SERIAL baseline in the same process, because the interesting quantity is the ratio and
 // not the absolute figure - and L6 established that absolute figures on this machine move by 20%.
-#include "strata/core/pinned.hpp"
-#include "strata/kernels/s_gemv.hpp"
+#include "basalt/core/pinned.hpp"
+#include "basalt/kernels/s_gemv.hpp"
 
 #include <cuda_runtime.h>
 

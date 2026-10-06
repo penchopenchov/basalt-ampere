@@ -1,5 +1,5 @@
-// src/platform/memory.cpp - see include/strata/platform/memory.hpp.
-#include "strata/platform/memory.hpp"
+// src/platform/memory.cpp - see include/basalt/platform/memory.hpp.
+#include "basalt/platform/memory.hpp"
 
 #include <algorithm>
 #include <cstdlib>

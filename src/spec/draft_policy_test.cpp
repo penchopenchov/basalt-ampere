@@ -6,7 +6,7 @@
 //   3. lookup drafts that are always accepted are taken, and the window grows with them;
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
 //   5. the policy never proposes a window beyond its cap.
-#include "strata/spec/draft_policy.hpp"
+#include "basalt/spec/draft_policy.hpp"
 
 #include <cstdio>
 

@@ -1,4 +1,4 @@
-// src/kernels/cuda/dec_gdn_rec.cu - see include/strata/kernels/dec_gdn.hpp: the recurrence stage.
+// src/kernels/cuda/dec_gdn_rec.cu - see include/basalt/kernels/dec_gdn.hpp: the recurrence stage.
 //
 // Built with the flags of verify_kernels.cu, whose kernels it fuses: gdn_conv_l2_multi (conv1d + SiLU + q/k L2
 // norm), gdn_ab_multi (alpha/beta gates), gdn_step_norm_multi (the recurrence and the gated RMS norm).  The q8_1 of
@@ -10,9 +10,9 @@
 // adds the four warps' butterflies in rank order through distributed shared memory; rank 0 computes alpha, rank 1
 // beta, and the others read them the same way.  The state and every constant are loaded before the grid
 // dependency wait (the window never writes the state).
-#include "strata/kernels/dec_gdn.hpp"
-#include "strata/kernels/pdl.hpp"
-#include "strata/kernels/q8_1_finite.hpp"
+#include "basalt/kernels/dec_gdn.hpp"
+#include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/q8_1_finite.hpp"
 
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>

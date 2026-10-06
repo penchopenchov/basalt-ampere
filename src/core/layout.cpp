@@ -1,5 +1,5 @@
 // src/core/layout.cpp - the shape checks.  See the header for why this exists.
-#include "strata/core/layout.hpp"
+#include "basalt/core/layout.hpp"
 
 #include <cstdio>
 

@@ -1,9 +1,9 @@
-// src/kernels/cuda/dequant_bf16.cu - see include/strata/kernels/dequant_bf16.hpp.
+// src/kernels/cuda/dequant_bf16.cu - see include/basalt/kernels/dequant_bf16.hpp.
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
 // The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/iq_kernels.hpp"
+#include "basalt/kernels/dequant_bf16.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

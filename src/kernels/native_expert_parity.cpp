@@ -10,15 +10,15 @@
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
 // The synthetic mode and (d) follow eddoursul/Strata 8029fa9.
-#include "strata/artifact/gguf_reader.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
-#include "strata/kernels/cpu/expert.hpp"
-#include "strata/kernels/cpu/iq_avx512.hpp"
-#include "strata/kernels/cpu/iq_avx2.hpp"
-#include "strata/kernels/cpu/kq_avx2.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
+#include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/iq_avx512.hpp"
+#include "basalt/kernels/cpu/iq_avx2.hpp"
+#include "basalt/kernels/cpu/kq_avx2.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
 #include "ggml-cpu.h"
-#include "strata/kernels/iq_kernels.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 
 #include "ggml.h"
 

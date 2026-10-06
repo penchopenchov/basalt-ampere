@@ -1,9 +1,9 @@
-// src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
+// src/kernels/cuda/qsa_prompt_attn.cu - see include/basalt/kernels/qsa_prompt_attn.hpp.
 #include <cstdlib>
 #include <cstring>
-#include "strata/kernels/qsa_prompt_attn.hpp"
-#include "strata/kernels/kv_q8.hpp"
-#include "strata/kernels/kv_q4.hpp"
+#include "basalt/kernels/qsa_prompt_attn.hpp"
+#include "basalt/kernels/kv_q8.hpp"
+#include "basalt/kernels/kv_q4.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

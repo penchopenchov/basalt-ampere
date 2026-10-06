@@ -4,7 +4,7 @@
 // to q8_1 by design, so this is a screen for layout, stride, expert-bound and row-id errors (the bounds of
 // tests/hip/prefill_mmq_parity.cpp), not a bit-exactness test.  Several experts per product, permuted rows, an
 // all-zero row; the formats the build does not cover (Q6_K) must say so.
-#include "strata/prefill/moe_mmq.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
 

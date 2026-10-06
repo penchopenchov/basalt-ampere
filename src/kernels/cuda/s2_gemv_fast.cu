@@ -26,7 +26,7 @@
 // Both changes alter the summation order or the expression, so this kernel is checked against the naive
 // reference like every other one - being faster is never a reason to be trusted, and being neutral is not
 // either.
-#include "strata/kernels/s_gemv.hpp"
+#include "basalt/kernels/s_gemv.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

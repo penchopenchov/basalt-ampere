@@ -1,8 +1,8 @@
-// src/kernels/cuda/q5k_head.cu - see include/strata/kernels/q5k_head.hpp.
+// src/kernels/cuda/q5k_head.cu - see include/basalt/kernels/q5k_head.hpp.
 //
 // Built with --use_fast_math like native_mmvq.cu, whose Q5_K x q8_1 dot this repeats.
-#include "strata/kernels/q5k_head.hpp"
-#include "strata/kernels/dp4a.hpp"
+#include "basalt/kernels/q5k_head.hpp"
+#include "basalt/kernels/dp4a.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

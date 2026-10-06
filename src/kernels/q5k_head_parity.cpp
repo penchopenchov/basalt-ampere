@@ -1,9 +1,9 @@
 // src/kernels/q5k_head_parity.cpp - q5k_head_mmvq against native_mmvq (Q5_K, the exact layout), bitwise, on random
 // Q5_K rows and quantized random columns, 1..8 columns; then a microbench of both at the head's shape.
 //   q5k_head_parity [rows] [iters]
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/q5k_head.hpp"
-#include "strata/kernels/sampler.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/q5k_head.hpp"
+#include "basalt/kernels/sampler.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

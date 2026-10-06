@@ -4,7 +4,7 @@
 // in the data section, and the tensors' payloads, each filled with a pattern the test can recognise.
 #pragma once
 
-#include "strata/artifact/gguf_reader.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 
 #include <cstdint>
 #include <cstring>

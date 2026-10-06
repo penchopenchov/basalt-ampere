@@ -1,7 +1,7 @@
 // #533: the segmented expert cache (--vram-elastic).  A shrink gives the last segments' VRAM back to the driver and
 // keeps every slot left exactly as it was (same address, same bytes); a grow maps them again at the same addresses.
 // Uniform and sized slots.  Needs a CUDA device with virtual memory management (exits 77 without one).
-#include "strata/core/expert_cache.hpp"
+#include "basalt/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
 

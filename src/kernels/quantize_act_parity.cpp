@@ -11,8 +11,8 @@
 //     d16 = fp16(d32)                           (stored, and used to DEQUANTIZE)
 //     q   = clip(rint(x / (double)d32), -128, 127)
 //     round trip = q * d16
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 

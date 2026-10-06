@@ -1,7 +1,7 @@
-// src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
-#include "strata/prefill/gemm.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/hc_fused.hpp"
+// src/prefill/gemm.cu - see include/basalt/prefill/gemm.hpp.
+#include "basalt/prefill/gemm.hpp"
+#include "basalt/kernels/dequant_bf16.hpp"
+#include "basalt/kernels/hc_fused.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>

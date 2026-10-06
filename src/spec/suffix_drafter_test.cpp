@@ -10,7 +10,7 @@
 //   continue  history = first half of the prompt; generate its second half (natural continuation)
 //   copy      history = the whole prompt; generate its middle third again (output quoting input: edits)
 // No model runs; this measures the drafter on text, not on the model's own outputs.
-#include "strata/spec/suffix_drafter.hpp"
+#include "basalt/spec/suffix_drafter.hpp"
 
 #include <cstdio>
 #include <cstdlib>

@@ -1,10 +1,10 @@
-#include "strata/core/remote_experts.hpp"
-#include "strata/core/remote_expert_opt.hpp"
+#include "basalt/core/remote_experts.hpp"
+#include "basalt/core/remote_expert_opt.hpp"
 
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-#include "strata/kernels/quantize_act.hpp"
-#include "strata/kernels/s2_expert_grouped.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/quantize_act.hpp"
+#include "basalt/kernels/s2_expert_grouped.hpp"
 
 #include <algorithm>
 #include <chrono>

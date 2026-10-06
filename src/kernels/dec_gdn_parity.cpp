@@ -14,10 +14,10 @@
 //
 // --bench: the reference and the three modes timed as CUDA graphs over enough layers' distinct weights that the L2
 // holds none of them, per stage and whole, in microseconds per layer and GB/s over the bytes each must move.
-#include "strata/kernels/dec_gdn.hpp"
-#include "strata/kernels/native_mmvq.hpp"
-#include "strata/kernels/pdl.hpp"
-#include "strata/kernels/verify_kernels.hpp"
+#include "basalt/kernels/dec_gdn.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 

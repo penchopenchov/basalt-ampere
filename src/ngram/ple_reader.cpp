@@ -1,5 +1,5 @@
-// src/ngram/ple_reader.cpp - see include/strata/ngram/ple_reader.hpp.
-#include "strata/ngram/ple_reader.hpp"
+// src/ngram/ple_reader.cpp - see include/basalt/ngram/ple_reader.hpp.
+#include "basalt/ngram/ple_reader.hpp"
 
 #include <algorithm>
 #include <chrono>

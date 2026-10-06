@@ -1,5 +1,5 @@
-#include "strata/core/conversation_snapshot.hpp"
-#include "strata/kernels/kv_q4.hpp"
+#include "basalt/core/conversation_snapshot.hpp"
+#include "basalt/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include <cuda_runtime.h>
 

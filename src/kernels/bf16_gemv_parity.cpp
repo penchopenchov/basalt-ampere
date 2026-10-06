@@ -10,9 +10,9 @@
 //      f32 instead is a 2^-9 = 1.95e-03 relative change, which is above any 1e-3 tolerance.  An fp16
 //      activation is the rival reading, computed and required to differ, because it is what the engine did
 //      before the activation contract settled the question and it produces perfectly plausible output.
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "basalt/kernels/bf16_bits.hpp"
+#include "basalt/kernels/bf16_gemv.hpp"
+#include "basalt/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
 

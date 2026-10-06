@@ -13,10 +13,10 @@
 //      truncated file, a role named in the wrong file, a type or a shape the pack does not say, a missing file.
 #include "gguf_fixture.hpp"
 
-#include "strata/core/expert_source.hpp"
-#include "strata/core/pinned.hpp"
-#include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "basalt/core/expert_source.hpp"
+#include "basalt/core/pinned.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
 
 #include <algorithm>
 #include <chrono>
