@@ -358,7 +358,7 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &ddbg, (size_t) sms * 16 * 8);
         std::vector<unsigned long long> h((size_t) sms * 16);
         static const char* const ph[15] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit",
-                                           "ticket", "up-lo", "norm-wr", "norm-sig", "t10-smax", "t10-cand", "t10-rank"};
+                                           "ticket", "up-lo", "norm-wr/w-in", "norm-sig/dn-in", "t10-smax", "t10-cand", "t10-rank"};
         // HC_STAMP_REPS=<n>: the median over n reads of each phase's min/max over CTAs
         const char* re = std::getenv("HC_STAMP_REPS");
         const int reps = re ? std::max(1, std::atoi(re)) : 1;
@@ -396,7 +396,7 @@ int main(int argc, char** argv) {
                     if (!any) continue;
                     std::printf("  %s:", grp == 2 ? "t10 " : grp ? "up  " : "down");
                     for (int i = 0; i < 15; ++i) {
-                        if ((i >= 10 && i <= 11) || acc[grp][i][0].empty()) continue;
+                        if ((grp != 1 && i >= 10 && i <= 11) || acc[grp][i][0].empty()) continue;
                         double m[2];
                         for (int j = 0; j < 2; ++j) {
                             auto& w = acc[grp][i][j];
