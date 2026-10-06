@@ -145,7 +145,7 @@ class Tokenizer:
 
         A word longer than HEAP_MIN symbols (a long CJK run, a minified blob: one pre-token piece of thousands of
         bytes) goes to _bpe_heap, which applies the same merges in the same order without rescanning every pair
-        after each merge (#268: that rescan is O(n^2) and took seconds on an 8K-character CJK run).
+        after each merge (that rescan is O(n^2), slow on long CJK runs).
         """
         if len(word) > self.HEAP_MIN:
             return self._bpe_heap(word)
@@ -219,7 +219,7 @@ class Tokenizer:
         The split happens on the RAW text, before the byte mapping, because a special token's string is a
         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.  A match that starts
-        inside one of the `plain` (start, end) spans is left to the text around it (#537).
+        inside one of the `plain` (start, end) spans is left to the text around it.
         """
         if pat is None:
             return self._encode_plain(text)
@@ -242,7 +242,7 @@ class Tokenizer:
         `parse_special` controls only the type-3 CONTROL literals such as `<|im_end|>`; the type-4
         USER_DEFINED ones such as `<think>` are matched either way.  See the note in `__init__`.
         `plain`: (start, end) spans of `text` that are ordinary text even where they spell a literal - a
-        `</think>` quoted in a message (#537) - and are tokenized with the text around them.
+        `</think>` quoted in a message - and are tokenized with the text around them.
         """
         return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
 

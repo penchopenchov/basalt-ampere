@@ -2,7 +2,7 @@
 
 `--expert-cache auto` fills the VRAM slots it can afford with the profile's pairs in order, so the ranking decides
 which experts start resident (the adaptive tier then swaps in what a conversation routes most).  A profile that
-ranks fewer pairs than a card can hold caps the cache (issue #46: a 32 GB card stopped at 8,000 slots); this tool
+ranks fewer pairs than a card can hold caps the cache; this tool
 writes one that ranks all 24,576.
 
 The order: the base profile's ranking (default: the shipped data/expert-profile.bin), then the pairs your routing

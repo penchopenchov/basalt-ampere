@@ -11,7 +11,7 @@ at the start of each shard, so HTTP range requests can read the headers and then
 `fetch` writes one raw file per tensor plus `mtp-manifest.json` (dtype, shape, source shard, byte range,
 sha256). It never downloads anything but the ranges named in the headers. Nothing here runs a model.
 
-#327: a mirror or proxy that ignores the Range header answers 200 with the whole shard - its JSON header and
+a mirror or proxy that ignores the Range header answers 200 with the whole shard - its JSON header and
 unrelated tensors - and a proxy may cut that to the requested length, so neither the size nor a hash of what was
 downloaded catches it (the drafter then accepts nothing, silently).  A range read therefore needs a 206 whose
 Content-Range is the range asked for, and every tensor of the pinned revision is checked against SHA256 below.
@@ -128,7 +128,7 @@ def get(url, start=None, end=None, retries=4):
 
 
 def check_range(status, content_range, start, end):
-    """#327: a range read is only what was asked for when the server says so: 206 and `bytes START-END/...`."""
+    """A range read is only what was asked for when the server says so: 206 and `bytes START-END/...`."""
     if status != 206:
         raise IOError("range request not honoured: HTTP %s instead of 206 (a mirror or proxy that ignores the Range "
                       "header sends the whole file)" % status)
@@ -246,7 +246,7 @@ def fetch(out, only):
             digest = sha256_of(path)
             if want is None or digest == want:
                 break
-            os.remove(path)                         # wrong bytes (#327): the whole tensor again, once
+            os.remove(path)                         # wrong bytes: the whole tensor again, once
             if attempt:
                 sys.exit("%s: sha256 %s is not the checkpoint's %s - the download source sends wrong data (a mirror "
                          "that ignores Range requests?)" % (r["name"], digest, want))

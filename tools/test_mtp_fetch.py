@@ -1,6 +1,6 @@
-"""Tests for tools/mtp_fetch.py (#327): a range read needs a 206 with the asked Content-Range, the pinned revision's
+"""Tests for tools/mtp_fetch.py: a range read needs a 206 with the asked Content-Range, the pinned revision's
 tensors are checked against their sha256 (a wrong one is fetched again; a corrupt install is found by `verify` and
-setup fetches it again), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
+a rerun fetches it again), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
 urlopen - nothing is downloaded.
 
     python -m unittest tools.test_mtp_fetch
@@ -56,7 +56,7 @@ class Response(io.BytesIO):
 
 class Mirror:
     """urlopen for the fake checkpoint.  `ignore_range`: 200 and the whole file (`cut`: cut to the asked length, as
-    the proxy in #327 did); `wrong`: the bytes of these tensors' ranges are flipped (a source that sends bad data)."""
+    such a proxy does); `wrong`: the bytes of these tensors' ranges are flipped (a source that sends bad data)."""
 
     def __init__(self, ignore_range=False, cut=False, wrong=()):
         self.ignore_range, self.cut, self.wrong, self.ranges = ignore_range, cut, set(wrong), []
@@ -116,7 +116,7 @@ class Ranges(FetchCase):
                 M.check_range(status, cr, 10, 19)
 
     def test_a_mirror_that_ignores_range_is_refused(self):
-        for cut in (False, True):                 # the whole file, or cut to the asked length (#327's proxy)
+        for cut in (False, True):                 # the whole file, or cut to the asked length (such a proxy)
             with self.subTest(cut=cut), mock.patch.object(M.urllib.request, "urlopen", Mirror(True, cut)), \
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(IOError, "not honoured"):
                 M.get(M.REPO + "model-1.safetensors", 8, 15)
@@ -130,10 +130,10 @@ class Ranges(FetchCase):
 
     def test_wrong_bytes_are_fetched_again_once_then_refused(self):
         self.fetch(Mirror())
-        bad = bytes(len(A))                       # an install the #327 mirror corrupted: right size, wrong bytes
+        bad = bytes(len(A))                       # an install a bad mirror corrupted: right size, wrong bytes
         (self.out / "tensors" / "mtp.a.bin").write_bytes(bad)
         self.assertEqual(M.verify(str(self.out)), ["mtp.a"])
-        err = self.fetch(Mirror())                # setup runs fetch again: the bad one is fetched again
+        err = self.fetch(Mirror())                # fetch runs again: the bad one is fetched again
         self.assertIn("mtp.a: wrong bytes", err)
         self.assertEqual(self.tensor("mtp.a"), A)
         self.assertEqual(M.verify(str(self.out)), [])

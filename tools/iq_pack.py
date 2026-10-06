@@ -66,7 +66,7 @@ NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read
 # tensor stored otherwise is converted, and every conversion is recorded in conversions.json:
 #   F32 -> BF16 whose values are exactly BF16 (low 16 bits zero)    exact, by default
 #   F32 with other values, F16 or a quantized type -> BF16          rounds (nearest-even): only with --compat-bf16
-#   F32 -> F16 (ple_conv1d)                                         index kind 3, narrowed by the loader (#255),
+#   F32 -> F16 (ple_conv1d)                                         index kind 3, narrowed by the loader,
 #                                                                   by default - the kernel reads nothing else
 #   F16 / BF16 -> F32                                               exact widening, by default
 # Tensors not named here are written as stored (floats) or served from the GGUF (quantized), as before.
@@ -257,7 +257,7 @@ def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
         rec.update(exact=bool(np.array_equal(h.astype(np.float32), values)), max_abs_err=err)
         if type_name == "F32":
             # The F32 bytes go into dense.bin as index kind 3 and the loader narrows them to F16 (nearest-even), the
-            # form the PLE conv kernel reads (#255, gopinath87607): 4 B/elem in, 2 B/elem out.
+            # form the PLE conv kernel reads: 4 B/elem in, 2 B/elem out.
             rec.update(method="f32->f16 by the loader (index kind 3, round-to-nearest-even)")
             return "3", raw.tobytes(), raw.nbytes // 2, rec
         rec.update(method="%s->f16 round-to-nearest-even (--compat-bf16)" % type_name.lower())
@@ -338,7 +338,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
         "tensors": records,
     }, indent=1) + "\n", encoding="utf-8")
     # published together, and the completion marker (native_experts.txt, written last by main) goes first: a stop
-    # from here on leaves a pack that setup and the engine see as unfinished, never a new dense.bin under an old
+    # from here on leaves a pack that the engine sees as unfinished, never a new dense.bin under an old
     # index or the reverse
     (out / "native_experts.txt").unlink(missing_ok=True)
     (out / "dense.bin.tmp").replace(out / "dense.bin")
@@ -430,7 +430,7 @@ def expert_layout(model: Model, src: pathlib.Path):
     """The pack's expert table: (layout rows, native_experts.txt text, n_expert, total bytes), or an error string.
     Each role is resolved by name in whichever shard holds it, and its offset is absolute in THAT shard: two
     shards do not start their data section at the same byte, so one role's data_start must not be used for
-    another's (per-role data_start as in #255, gopinath87607)."""
+    another's (per-role data_start)."""
     T = {n: w[1] for n, w in model.where.items()}
     exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
     if not exps:
@@ -567,8 +567,8 @@ def main() -> int:
                        check=True)   # writes <out>/tokenizer/
 
     # ---- the experts.  native_experts.txt is written to a temporary name and renamed only when every layer is
-    # in: a stop part-way (a layer split across shards, #171) left a partial native_experts.txt that the next setup
-    # run took as a finished pack (#172).  It is the pack's completion marker, so it is published last.
+    # in: a stop part-way (a layer split across shards) left a partial native_experts.txt that the next run
+    # run took as a finished pack.  It is the pack's completion marker, so it is published last.
     tmp = out / "native_experts.txt.tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fo:
         fo.write(text)

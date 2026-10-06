@@ -3,7 +3,7 @@
 The engine reads rt/draft_vocab.bin (int32 token ids) when the draft layer binds and computes the draft logits over
 those rows only: a smaller head is faster and takes less VRAM, but a token outside the subset can never be drafted.
 The shipped subset was built from English and code and had 27 of the vocabulary's 55,328 Han tokens, so an answer in
-Chinese drafted almost nothing (#137).  This adds whole scripts to a subset:
+Chinese drafted almost nothing.  This adds whole scripts to a subset:
 
     python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab.bin --add cjk \
         --out data/draft_vocab.bin
@@ -13,7 +13,7 @@ id order.  --stats prints what a subset holds.
 
 A language written in a script the base already holds (French, Spanish, German... in Latin letters) needs specific
 words and word pieces, not a whole script.  --corpus adds the tokens of a text corpus in that language: the most
-frequent ones that together cover --coverage (default 0.99) of the corpus's token occurrences (#597):
+frequent ones that together cover --coverage (default 0.99) of the corpus's token occurrences:
 
     python tools/draft_vocab.py --gguf <model>-00001-of-0000N.gguf --base data/draft_vocab_en.bin \
         --corpus fr1.txt fr2.txt ... --coverage 0.99 --out data/draft_vocab_fr.bin
@@ -93,7 +93,7 @@ def main() -> int:
     ap.add_argument("--gguf", required=True, help="the model's (first) GGUF file: its vocabulary")
     ap.add_argument("--base", help="the subset to extend (int32 ids)")
     ap.add_argument("--add", default="", help="comma list: han, kana, hangul, cjk_punct, cjk, cyrillic")
-    ap.add_argument("--corpus", nargs="+", default=[], help="UTF-8 text files in the language to add (#597)")
+    ap.add_argument("--corpus", nargs="+", default=[], help="UTF-8 text files in the language to add")
     ap.add_argument("--coverage", type=float, default=0.99,
                     help="with --corpus: the share of its token occurrences the added tokens cover (default 0.99)")
     ap.add_argument("--out", help="where to write the new subset")

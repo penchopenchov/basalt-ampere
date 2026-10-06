@@ -1,4 +1,4 @@
-"""Tests for tools/draft_vocab.py's corpus coverage mode (#597): the most frequent tokens of a corpus that together cover
+"""Tests for tools/draft_vocab.py's corpus coverage mode: the most frequent tokens of a corpus that together cover
 a given share of its occurrences.  No model, no GPU.
 
     python -m unittest tools.test_draft_vocab
