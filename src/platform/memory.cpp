@@ -63,7 +63,14 @@ uint64_t ram_budget(bool* known) {
 namespace {
 std::atomic<bool> g_watch_stop{false};
 std::atomic<bool> g_watch_on{false};
+std::atomic<bool> g_resident_mode{false};
+std::atomic<uint64_t> g_resident_copy{0};
 }  // namespace
+
+void watch_resident_ram(bool resident, uint64_t copy_bytes) {
+    g_resident_mode = resident;
+    g_resident_copy = copy_bytes;
+}
 
 void start_memory_watchdog(uint64_t floor_bytes) {
     if (g_watch_on.exchange(true)) return;
@@ -72,9 +79,19 @@ void start_memory_watchdog(uint64_t floor_bytes) {
         while (!g_watch_stop.load()) {
             const uint64_t avail = available_memory();
             if (avail > 0 && avail < floor_bytes) {
-                std::fprintf(stderr, "basalt error: RAM ran out while loading (%llu MiB available); stopped to keep the "
-                                     "machine usable. Use --resident-experts or --mmap-experts, or free memory\n",
-                             (unsigned long long) (avail >> 20));
+                const unsigned long long mib = (unsigned long long) (avail >> 20);
+                if (g_resident_mode.load()) {
+                    // the copy shrunk by what the margin is short of leaves the margin free again
+                    const uint64_t copy = g_resident_copy.load(), margin = ram_margin();
+                    const uint64_t keep = copy - std::min(copy, margin > avail ? margin - avail : 0);
+                    std::fprintf(stderr, "basalt error: RAM ran out while loading (%llu MiB available): the RAM copy of "
+                                         "the experts left too little room; cap it with --resident-budget-gib %llu, or "
+                                         "free memory\n", mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
+                } else {
+                    std::fprintf(stderr, "basalt error: RAM ran out while loading (%llu MiB available); stopped to keep "
+                                         "the machine usable. Use --resident-experts or --mmap-experts, or free "
+                                         "memory\n", mib);
+                }
                 std::fflush(stderr);
                 _exit(1);
             }

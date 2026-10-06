@@ -1531,6 +1531,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
         return 2;
     }
+    if (o.serve) basalt::platform::watch_resident_ram(o.resident_cpu_experts, 0);
     // the helper-GPU expert caches (--expert-cache-remote): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
@@ -4173,6 +4174,7 @@ int main(int argc, char** argv) {
                 err = whole_err + "; " + err;
         }
         if (resident_ok) {
+            if (o.serve) basalt::platform::watch_resident_ram(true, src.resident_bytes());
             if (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on &&
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
                 std::fprintf(stderr, "basalt error: CPU expert residency: %s\n", err.c_str());
@@ -5353,10 +5355,12 @@ int main(int argc, char** argv) {
             const uint64_t add = src.top_up(profile, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
             }, o.resident_pin, n_top);
-            if (add > 0)
+            if (add > 0) {
+                basalt::platform::watch_resident_ram(true, src.resident_bytes() + add);
                 std::fprintf(stderr, "basalt generate: RAM top-up: +%.2f GiB, %lld experts (total %.2f GiB)\n",
                              (double) add / 1073741824.0, (long long) n_top,
                              (double) (src.resident_bytes() + add) / 1073741824.0);
+            }
         }
         basalt::platform::stop_memory_watchdog();
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP

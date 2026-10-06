@@ -30,6 +30,10 @@ uint64_t available_memory();
 /// The RAM left alone by anything that locks or fills memory: the larger of 2 GiB and 5% of the machine's RAM.
 uint64_t ram_margin();
 
+/// Host RAM the engine takes after the resident expert copy is sized and before it serves: the GPU libraries' own
+/// host memory, the prompt path's and the verifier's staging.  A resident copy leaves this much beside the margin.
+inline constexpr uint64_t kLateHostBytes = 2ull << 30;
+
 /// The RAM a page-locked or fully resident allocation may take now: MemAvailable less ram_margin().  `known` is
 /// false when /proc/meminfo cannot be read (nothing is refused then).
 uint64_t ram_budget(bool* known = nullptr);
@@ -37,6 +41,9 @@ uint64_t ram_budget(bool* known = nullptr);
 /// Polls MemAvailable until `stop_memory_watchdog`.  Below `floor_bytes` it prints a `basalt error:` line and
 /// _exit(1)s, so a load that is exhausting RAM ends before the machine starts to swap.
 void start_memory_watchdog(uint64_t floor_bytes);
+/// Tells the watchdog the load builds a resident RAM copy of the experts (`resident`) and how big it is so far, so
+/// its error names the copy's cap instead of the resident mode.
+void watch_resident_ram(bool resident, uint64_t copy_bytes);
 void stop_memory_watchdog();
 
 /// Whether the OS file cache could keep the `read_bytes` the expert file is read for, beside
