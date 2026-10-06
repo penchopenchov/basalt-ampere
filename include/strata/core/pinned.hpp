@@ -1,17 +1,13 @@
-// include/strata/core/pinned.hpp - P2.S1: the host arena the expert weights live in.
+// include/strata/core/pinned.hpp - the host arena the expert weights live in.
 //
-// 33.97 GB of expert weights cannot fit in a 12 GB card, so they stay in host memory and are streamed.  That
-// makes this arena the engine's real working set: it must be PAGE-LOCKED for the copy engine to reach full
-// bandwidth, and it must say which backing it got, because the two options differ by more than twice in TLB
-// reach:
+// The expert weights are too large for a card, so they stay in host memory and are streamed.  That makes this arena
+// the engine's real working set: it must be PAGE-LOCKED for the copy engine to reach full bandwidth, and it must say
+// which backing it got, because the two options differ by more than twice in TLB reach:
 //
-//   * LARGE PAGES (2 MB) - `mmap(MAP_HUGETLB)` / hugetlbfs on Linux, `VirtualAlloc(MEM_LARGE_PAGES)` on
-//     Windows.  33.97 GB at 4 KB pages is 8.3 million TLB entries, which does not fit in any TLB, so every
-//     block of every expert matvec takes TLB misses.
-//   * NORMAL PAGES - the fallback.  Correct, slower, and it must be REPORTED rather than silently accepted:
-//     "the engine adapts to the machine it is on" is only true if the engine says what it got.  On Windows
-//     large pages additionally need SeLockMemoryPrivilege, which a normal user account does not have, so this
-//     fallback is the common case and not an error path.
+//   * LARGE PAGES (2 MB) - `mmap(MAP_HUGETLB)` / hugetlbfs.  Tens of GB at 4 KB pages is millions of TLB entries,
+//     which does not fit in any TLB, so every block of every expert matvec takes TLB misses.
+//   * NORMAL PAGES - the fallback.  Correct, slower, and it must be REPORTED rather than silently accepted: "the
+//     engine adapts to the machine it is on" is only true if the engine says what it got.
 #pragma once
 
 #include <cstdint>
@@ -29,8 +25,8 @@ struct PinnedArena {
     PageBacking backing = PageBacking::NormalPages;
     std::string note;              // why the backing is what it is, for the startup print
     uint64_t locked_bytes = 0;     // resident via the working-set lock when CUDA could not pin it
-    /// Plan v0.3 P5: when the whole arena cannot be registered, it is registered in `slice`-byte pieces from the
-    /// start; this is the pinned prefix (a copy that stays inside one slice can then DMA straight from the arena).
+    /// when the whole arena cannot be registered, it is registered in `slice`-byte pieces from the start; this is the
+    /// pinned prefix (a copy that stays inside one slice can then DMA straight from the arena).
     uint64_t registered_bytes = 0;
     uint64_t slice_bytes = 0;
     int registered_slices = 0;
@@ -38,13 +34,13 @@ struct PinnedArena {
     PinnedArena() = default;
     /// `slice`: the piece size for the per-slice registration fallback (0 = none).
     explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
-    /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
-    /// followed by the end of the last one.  `slice_starts` holds the registered ones.
+    /// slices of different sizes (one per layer of a native pack), given as their start offsets followed by the end of
+    /// the last one.  `slice_starts` holds the registered ones.
     /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
-    /// `shared_file`: on Linux, use a file-backed MAP_SHARED mapping instead of anonymous memory.
-    /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a
-    /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
-    /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
+    /// `shared_file`: use a file-backed MAP_SHARED mapping instead of anonymous memory.
+    /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a small
+    /// header and is refused when its stored hash does not match.  Empty `shared_file` preserves the existing
+    /// allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
                 const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
     std::vector<uint64_t> slice_starts;
@@ -84,37 +80,34 @@ struct LoadStats {
 };
 
 // Load `layers` layers of the expert arena into `dst` with `threads` readers, `chunk` bytes at a time.
-// Each thread opens its OWN handle and seeks, which is the portable form of parallel pread: a shared handle
-// needs a lock around the seek and defeats the parallelism on Windows.
+// Each thread opens its OWN handle and seeks, which is the portable form of parallel pread: a shared handle needs a
+// lock around the seek and defeats the parallelism.
 //
-// The reads go through `fread()` on a per-thread `FILE*`, NOT through `std::ifstream`.  MSVC's
-// `basic_filebuf::xsgetn` splits every request larger than `_INTERNAL_BUFSIZ - 1` into 4095-byte `fread()`
-// calls, so an 8 MiB `chunk` reached the disk as ~2048 4 KiB operations and the chunking did nothing at all
-// (measured on a 42.9 GB pack: 1222 s, 4096 bytes per operation, 0.03 GiB/s).  `fread()` hands a request
-// larger than the stream buffer straight to `_read()`/`ReadFile()`, which is what `chunk` is for.  The
-// control flow, the copy, the per-layer FNV-1a and therefore the checksums are unchanged, so a pack loaded
-// by the old and the new reader must produce identical `layer_checksums`.
+// The reads go through `fread()` on a per-thread `FILE*`, not through `std::ifstream`: `fread()` hands a request
+// larger than the stream buffer straight to the read call, which is what `chunk` is for.  The control flow, the copy,
+// the per-layer FNV-1a and therefore the checksums do not depend on the reader, so a pack loaded by either must
+// produce identical `layer_checksums`.
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,
                        uint64_t layers, int threads, uint64_t chunk);
-/// Plan v0.3 P6: the same with one byte range per layer (`layer_off[L]`, `layer_bytes[L]`).
+/// The same with one byte range per layer (`layer_off[L]`, `layer_bytes[L]`).
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk);
 
-/// The same ranges read UNBUFFERED straight into `dst` (Windows): no staging buffer and no file-cache copy - the
-/// drive's DMA lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok =
-/// false with an empty `error` when they are not (or off Windows), and the caller falls back to load_experts_ranges.
+/// The same ranges read UNBUFFERED straight into `dst`: no staging buffer and no file-cache copy - the drive's DMA
+/// lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok = false with an
+/// empty `error` when they are not (or where unbuffered reads are not available), and the caller falls back to
+/// load_experts_ranges.
 LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk);
 
-/// Whether the expert files are better read unbuffered (Windows; false elsewhere): a timed probe of random 64 KiB
-/// reads says they are not in the OS file cache (a cached read takes ~10 us, the drive ~80), and the RAM left
-/// beside the arena (`arena_bytes`) could not keep them cached for the next start either - so a warm restart after
-/// an idle unload never gets slower, and only a start that reads the drive anyway skips the cache's copy.
-/// `why` says what decided.
+/// Whether the expert files are better read unbuffered (false on this platform): a timed probe of random 64 KiB reads
+/// says they are not in the OS file cache, and the RAM left beside the arena (`arena_bytes`) could not keep them cached
+/// for the next start either - so a warm restart never gets slower, and only a start that reads the drive anyway skips
+/// the cache's copy.  `why` says what decided.
 /// `cache_counts` false (the file tier with a RAM budget): only whether the files could be kept decides - their mapped
 /// pages land in the process's working set, so a partly cached file would still take the RAM the budget was sized for.
-/// `read_bytes` (#577): the bytes the files are read for, when that is less than the files (the file tier reads only
-/// the experts outside its RAM copy); `kAllFileBytes` = every byte of `files`.  See platform::file_cache_keeps.
+/// `read_bytes`: the bytes the files are read for, when that is less than the files (the file tier reads only the
+/// experts outside its RAM copy); `kAllFileBytes` = every byte of `files`.  See platform::file_cache_keeps.
 constexpr uint64_t kAllFileBytes = ~0ull;
 bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
                         bool cache_counts = true, uint64_t read_bytes = kAllFileBytes);

@@ -2,7 +2,7 @@
 #include "strata/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
-#include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
+#include <cuda.h>   // the virtual memory management types (the functions come through the runtime's entry points)
 
 #include <algorithm>
 #include <cstdio>
@@ -143,9 +143,9 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
 
 ExpertCache::~ExpertCache() { close(); }
 
-// ---- #533: the segmented arena (--vram-elastic).  The driver API's virtual memory functions, looked up through the
-// runtime (no link against the driver library): one address range for the whole arena, backed by physical segments,
-// and the tail's segments unmapped / mapped again later.  Nothing here runs unless a segment size was set.
+// ---- the segmented arena (--vram-elastic).  The driver API's virtual memory functions, looked up through the runtime
+// (no link against the driver library): one address range for the whole arena, backed by physical segments, and the
+// tail's segments unmapped / mapped again later.  Nothing here runs unless a segment size was set.
 namespace {
 struct Vmm {
     CUresult (CUDAAPI* device_get)(CUdevice*, int) = nullptr;
@@ -392,7 +392,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
+    if (seg_req_ > 0) {   // --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
     } else if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
         base_ = nullptr;
@@ -446,8 +446,8 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     live_slots_ = slots_;
     blob_ = mx;
     off_ = std::move(off);
-    // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
-    // "slots", so its seeds are not slot indices
+    // each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized "slots",
+    // so its seeds are not slot indices
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
     for (int64_t l = 0; l < n_layers; ++l) {
         int64_t lo = 0, hi = 0;

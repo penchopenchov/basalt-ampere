@@ -37,11 +37,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-// a 64-bit seek (as in pinned.cu): the 32-bit `fseek` wraps past 4 GiB, and the spelling differs per platform
-#ifndef STRATA_FSEEK64
-#define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
-#endif
-
 namespace strata::core {
 
 namespace detail {
@@ -2266,7 +2261,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                 for (uint64_t done = 0; done < total; done += chunk) {
                     const uint64_t n = std::min<uint64_t>(chunk, total - done);
                     // 64-bit seek: a shard is tens of GB
-                    if (STRATA_FSEEK64(f, src + done) != 0) { bad = true; return; }
+                    if (fseeko(f, (off_t) (src + done), SEEK_SET) != 0) { bad = true; return; }
                     if (std::fread(buf.data(), 1, (size_t) n, f) != (size_t) n) { bad = true; return; }
                     for (uint64_t k = 0; k < n / per[r]; ++k) {
                         const uint64_t e = done / per[r] + k;

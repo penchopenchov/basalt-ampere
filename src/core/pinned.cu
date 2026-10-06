@@ -1,4 +1,4 @@
-// src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
+// src/core/pinned.cu - the pinned host arena and the parallel expert load.
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
 
@@ -12,10 +12,6 @@
 #include <fstream>
 #include <mutex>
 #include <thread>
-
-// Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB), and the 64-bit
-// spelling is not the same on the two platforms the engine builds for.
-#define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -243,8 +239,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
         } else if (bounds.size() >= 2 && (capped || clear_error())) {
-            // Plan v0.3 P5: the whole range is refused, so pin it slice by slice from the start.  The rest stays
-            // resident through the working-set lock below.  (P6: slices may differ in size, one per layer.)
+            // the whole range is refused, so pin it slice by slice from the start.  The rest stays resident through the
+            // working-set lock below.  (Slices may differ in size, one per layer.)
             slice_bytes = 1;   // sliced; the uniform constructor records the size
             bool limited = capped;
             uint64_t limit = cap;
@@ -353,13 +349,10 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 
     auto worker = [&]() {
         std::vector<uint8_t> buf((size_t) chunk);
-        // One handle per thread, seeked once per layer: a shared handle would need a lock around the seek and
-        // would serialise the very thing the threads are here to parallelise.  `fread` on a `FILE*` rather than
-        // `std::ifstream`: see the header - MSVC's `basic_filebuf::xsgetn` splits any request larger than
-        // `_INTERNAL_BUFSIZ - 1` into 4095-byte freads, which turned one 8 MiB chunk into ~2048 4 KiB reads.
-        // `fread` sees a request bigger than the stream buffer and passes it to `_read()`/
-        // `ReadFile()` unchanged, so the chunk size reaches the disk.  Buffered, not `FILE_FLAG_NO_BUFFERING`:
-        // the cache should still hold what it can.
+        // One handle per thread, seeked once per layer: a shared handle would need a lock around the seek and would
+        // serialise the very thing the threads are here to parallelise.  `fread` on a `FILE*` rather than
+        // `std::ifstream`: `fread` sees a request bigger than the stream buffer and passes it to the read call
+        // unchanged, so the chunk size reaches the disk.  Buffered: the cache should still hold what it can.
         FILE* f = std::fopen(path.c_str(), "rb");
         if (f == nullptr) {
             std::lock_guard<std::mutex> g(err_mu);
@@ -381,7 +374,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
             uint64_t pos = 0;
             uint64_t h = 1469598103934665603ull;
             // 64-bit seek: the pack is 42.9 GB, so the 32-bit `fseek` would wrap past 4 GiB
-            if (STRATA_FSEEK64(f, off) != 0) {
+            if (fseeko(f, (off_t) off, SEEK_SET) != 0) {
                 std::lock_guard<std::mutex> g(err_mu);
                 err = "seek to " + std::to_string(off) + " B failed in layer " + std::to_string(L);
                 return;
