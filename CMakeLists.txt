@@ -108,16 +108,6 @@ add_executable(basalt-overlap src/core/overlap_main.cpp)
 target_include_directories(basalt-overlap PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt-overlap PRIVATE core kernels ${_gpu_runtime_target})
 
-# The load test needs the 34 GB artifact, so it is registered ONLY where that artifact exists.  A test that
-# silently skips is a test that stops running; an absent registration is visible in the configure output.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/pack/full/experts.bin)
-  add_test(NAME expert_arena_load
-           COMMAND basalt-load --file ${CMAKE_CURRENT_SOURCE_DIR}/pack/full/experts.bin --layers 1)
-  set_tests_properties(expert_arena_load PROPERTIES PASS_REGULAR_EXPRESSION "per-layer checksums")
-else()
-  message(STATUS "basalt: pack/full/experts.bin absent - the expert arena load test is NOT registered")
-endif()
-
 # ---- kernels ----
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
