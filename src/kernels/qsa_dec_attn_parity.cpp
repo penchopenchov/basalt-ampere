@@ -1,6 +1,7 @@
 // src/kernels/qsa_dec_attn_parity.cpp - qsa_dec_attn against qsa_decode_attn_batch (+ native_qsa_gate_apply), bitwise,
 // on random INT8 and FP16 pools through a permuted page table with masked pages; then a microbench of both.
 //   qsa_dec_attn_parity [iters]
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_dec_attn.hpp"
@@ -88,6 +89,11 @@ int main(int argc, char** argv) {
     float* out_new = dalloc<float>((size_t) MAXQ * NH * D);
     float* gated_ref = dalloc<float>((size_t) MAXQ * NH * D);
     float* gated_new = dalloc<float>((size_t) MAXQ * NH * D);
+    float* out_fm = dalloc<float>((size_t) MAXQ * NH * D);
+    float* gated_fm = dalloc<float>((size_t) MAXQ * NH * D);
+    const size_t q8b = k::native_q8_1_bytes(NH * D, MAXQ);
+    uint8_t* xq_ref = dalloc<uint8_t>(q8b);
+    uint8_t* xq_fm = dalloc<uint8_t>(q8b);
     cudaStream_t st;
     ck(cudaStreamCreate(&st), "stream");
 
@@ -124,7 +130,23 @@ int main(int argc, char** argv) {
         k::qsa_decode_attn_batch(q, a, ids, steps, cap, s, scr_ref, out_ref, n_q, st);
         k::native_qsa_gate_apply(out_ref, qfull, gated_ref, NH * n_q, D, st);
         k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_new, n_q, st, qfull, gated_new);
+        k::native_quantize_q8_1(gated_ref, xq_ref, NH * D, (int) n_q, st);
+        k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_fm, n_q, st, qfull, gated_fm, xq_fm);
         ck(cudaStreamSynchronize(st), "sync");
+        {   // the merge writing the q8_1 rows too
+            const size_t nn = (size_t) n_q * NH * D, nb = k::native_q8_1_bytes(NH * D, (int) n_q);
+            const auto r0 = down(out_ref, nn), x0 = down(out_fm, nn), g0 = down(gated_ref, nn), g1 = down(gated_fm, nn);
+            const auto q0 = down(xq_ref, nb), q1 = down(xq_fm, nb);
+            size_t b0 = 0, b1 = 0, b2 = 0;
+            for (size_t i = 0; i < nn; ++i) {
+                b0 += std::memcmp(&r0[i], &x0[i], 4) != 0;
+                b1 += std::memcmp(&g0[i], &g1[i], 4) != 0;
+            }
+            for (size_t i = 0; i < nb; ++i) b2 += q0[i] != q1[i];
+            if (b0 || b1 || b2) ++g_fail;
+            std::printf("%-34s merge + q8_1 rows: %s (attn %zu / gated %zu / q8_1 bytes %zu differ)\n", label,
+                        b0 || b1 || b2 ? "FAIL" : "bitwise", b0, b1, b2);
+        }
         const size_t n = (size_t) n_q * NH * D;
         const auto r = down(out_ref, n), x = down(out_new, n), gr = down(gated_ref, n), gx = down(gated_new, n);
         size_t bad = 0, gbad = 0;
@@ -160,6 +182,14 @@ int main(int argc, char** argv) {
                 cudaEventSynchronize(e1);
                 cudaEventElapsedTime(&ms_new, e0, e1);
             }
+            float ms_fm = 0;
+            cudaEventRecord(e0, st);
+            for (int it = 0; it < iters; ++it)
+                k::qsa_dec_attn(q, a, ids, steps, cap, s, scr_new, out_fm, n_q, st, qfull, gated_fm, xq_fm);
+            cudaEventRecord(e1, st);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&ms_fm, e0, e1);
+            std::printf("   bench: with the q8_1 rows %7.2f us\n", 1e3 * ms_fm / iters);
             const double ur = 1e3 * ms_ref / iters, un = 1e3 * ms_new / iters;
             std::printf("   bench: ref (attn+merge+gate) %7.2f us %6.1f GB/s | new %7.2f us %6.1f GB/s | %.2fx\n", ur,
                         bytes / ur / 1e3, un, bytes / un / 1e3, ur / un);

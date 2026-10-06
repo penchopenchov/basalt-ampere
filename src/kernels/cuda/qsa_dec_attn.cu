@@ -95,6 +95,7 @@ struct AttnArgs {
     float* attn;
     const float* q_full;       // non-null: the gated output too
     float* attn_gated;
+    void* xq;                  // non-null (with the gated output): the gated rows' q8_1 blocks
 };
 
 // k8 of the row's dimensions [d0, d0+8) as the reference's load8 computes them
@@ -295,6 +296,35 @@ __device__ __forceinline__ float gate_fast(float x, float raw) {
     return y;
 }
 
+// native_quantize_q8_1_kernel's block (fast-math operations spelled out): lane l holds element l of the block
+struct AttnQ81 {
+    half2 ds;
+    int8_t qs[32];
+};
+__device__ __forceinline__ float fm_max(float a, float b) { float y; asm("max.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y; }
+__device__ __forceinline__ float fm_abs(float a) { float y; asm("abs.ftz.f32 %0, %1;" : "=f"(y) : "f"(a)); return y; }
+__device__ __forceinline__ float fm_add(float a, float b) { float y; asm("add.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y; }
+__device__ __forceinline__ float fm_div(float a, float b) { float y; asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y; }
+__device__ __forceinline__ void q8_1_store_fm(float xi, AttnQ81* y, size_t ib, int lane) {
+    float amax = fm_abs(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fm_max(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum = fm_add(sum, __shfl_xor_sync(0xffffffffu, sum, o));
+    float d = fm_div(amax, 127.0f);
+    d = fabsf(d) > 65504.0f ? copysignf(65504.0f, d) : d;
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        const float r = roundf(fm_div(xi, d));
+        q = (int8_t) (r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r);
+    }
+    y[ib].qs[lane] = q;
+    if (lane == 0) {
+        const float sc = fabsf(sum) > 65504.0f ? copysignf(65504.0f, sum) : sum;
+        y[ib].ds = make_half2(__float2half(d), __float2half(sc));
+    }
+}
+
 // One query head of one query: merge the chunks the width reaches, as attn_merge_kernel (which skips the rest).
 __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi, float* s_w, float* s_l, float* s_red) {
     const float* part_acc = a.scratch + (size_t) qi * (size_t) a.stride;
@@ -350,7 +380,9 @@ __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi,
     a.attn[((size_t) qi * n_head + h) * HD + d] = o;
     if (a.attn_gated != nullptr) {
         const float raw = a.q_full[((size_t) qi * n_head + h) * 2 * HD + HD + d];
-        a.attn_gated[((size_t) qi * n_head + h) * HD + d] = gate_fast(o, raw);
+        const float gv = gate_fast(o, raw);
+        a.attn_gated[((size_t) qi * n_head + h) * HD + d] = gv;
+        if (a.xq != nullptr) q8_1_store_fm(gv, static_cast<AttnQ81*>(a.xq), (((size_t) qi * n_head + h) * HD + d) / 32, d & 31);
     }
 }
 
@@ -393,7 +425,7 @@ bool qsa_dec_attn_supported(const QsaAttnPools& pools, const QsaShapes& s) {
 
 void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                   const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream, const float* q_full,
-                  float* attn_gated) {
+                  float* attn_gated, void* xq) {
     if (n_q <= 0) return;
     if (!qsa_dec_attn_supported(pools, s) || cap <= 0 || !scratch || !ids || !steps || n_q > 65535) {
         std::fprintf(stderr, "qsa_dec_attn: unsupported geometry, pools or buffers\n");
@@ -410,6 +442,7 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     a.q_full = attn_gated != nullptr ? q_full : nullptr;
     a.attn_gated = q_full != nullptr ? attn_gated : nullptr;
     cudaStream_t st = (cudaStream_t) stream;
+    a.xq = a.attn_gated != nullptr ? xq : nullptr;
     const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     if (mode == 1) {
         constexpr size_t bytes = sizeof(ChunkSmem<1>);
