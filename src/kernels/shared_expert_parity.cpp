@@ -5,7 +5,7 @@
 // here is set by that conversion (~1e-3) and NOT by the structure.  Round 193 measured the activation-format
 // choice at 0.6175% against the reference, which is the floor this test inherits and states.
 //
-// WHAT IT PINS DOWN TIGHTLY IS THE STRUCTURE, which is what `docs/semantics.md` records as having been believed
+// WHAT IT PINS DOWN TIGHTLY IS THE STRUCTURE, which is what the model definition records as having been believed
 // wrong for many rounds:
 //
 //   1. SILU ON GATE, not on up.  Both readings have the right shapes and give similar magnitudes, so the test

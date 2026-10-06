@@ -11,7 +11,7 @@ writer is its companion - so this is that writer in Python, where it can be vali
 against `tools/gguf_reader.py` and against llama.cpp.
 
 Scope: enough to build the P1.S1 tiny model. It is NOT a general-purpose quantizer; the only
-quantizer implemented is `Q2_0`, and its contract is `docs/q2_0-contract.md`:
+quantizer implemented is `Q2_0`, and its contract is the Q2_0 contract:
     block = 64 elements, fp16 scale, 16 bytes of 2-bit codes, LSB-first, 4 codes per byte
     d = amax, code = clamp(round(w/d) + 1, 0, 3), symbol = code - 1  ->  {-1, 0, +1, +2}
 
@@ -38,7 +38,7 @@ _META_IDS = {"u8": 0, "i8": 1, "u16": 2, "i16": 3, "u32": 4, "i32": 5, "f32": 6,
              "bool": 7, "string": 8, "array": 9, "u64": 10, "i64": 11, "f64": 12}
 
 
-# ------------------------------------------------------------------ Q2_0, per docs/q2_0-contract.md
+# ------------------------------------------------------------------ Q2_0, per the Q2_0 contract
 def quantize_q2_0(w: np.ndarray) -> bytes:
     """(n,) float32 -> concatenated 18-byte blocks. n must be a multiple of 64."""
     w = np.asarray(w, dtype=np.float32).reshape(-1)

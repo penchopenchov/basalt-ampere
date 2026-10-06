@@ -161,7 +161,7 @@ __global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* 
 /// `silu(gate) * up`, in place, over a GATE-MAJOR buffer: `[0, n_pairs)` is every hit's gate and
 /// `[n_pairs, 2*n_pairs)` is every hit's up, so hit `h`'s row `r` meets itself at `h*FF + r`.
 ///
-/// SiLU on the GATE and multiplied by up - the reading `docs/semantics.md` records, and the one that is wrong
+/// SiLU on the GATE and multiplied by up - the reading the model definition records, and the one that is wrong
 /// the other way round in a way that still produces a finite number.
 __global__ void swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;

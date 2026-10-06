@@ -9,7 +9,7 @@
 //   3. **THE ACTIVATION CONTRACT IS OBSERVABLE.**  A BF16 weight sees a BF16 activation; feeding it fp16 or
 //      f32 instead is a 2^-9 = 1.95e-03 relative change, which is above any 1e-3 tolerance.  An fp16
 //      activation is the rival reading, computed and required to differ, because it is what the engine did
-//      before `docs/activation-contract.md` settled the question and it produces perfectly plausible output.
+//      before the activation contract settled the question and it produces perfectly plausible output.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"

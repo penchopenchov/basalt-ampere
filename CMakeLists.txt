@@ -31,7 +31,7 @@ endif()
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
 # CUDA: MMQ prompt kernels for Q4_K / Q5_K / Q5_1 (Unsloth's UD-Q4_K_XL experts).  Off by default: the engine loads
 # every kernel when it starts (CUDA_MODULE_LOADING=EAGER), so these took ~5 MB of VRAM - 1-3 expert slots - from every
-# model, and the UD-Q4_K_XL prompt is SSD-bound with or without them (docs/UNSLOTH_Q4.md)
+# model, and the UD-Q4_K_XL prompt is SSD-bound with or without them
 option(STRATA_MMQ_KQUANTS "Build the CUDA MMQ prompt kernels for Q4_K / Q5_K / Q5_1 experts" OFF)
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
 # The test suite and the micro benchmarks live in tests/ and bench/micro/, which the published source leaves out.
@@ -407,7 +407,7 @@ if(STRATA_ENABLE_CUDA)
   # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
   # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
   find_package(Python3 COMPONENTS Interpreter QUIET)
-  # the generator needs an interpreter WITH numpy: probe the configured one, the setup's .venv, and the
+  # the generator needs an interpreter WITH numpy: probe the configured one, a .venv, and the
   # system python3; -DIQ_FIXTURE_PYTHON=... overrides the search outright.
   set(_iq_python "")
   set(_iq_candidates "")
@@ -418,7 +418,6 @@ if(STRATA_ENABLE_CUDA)
       list(APPEND _iq_candidates ${Python3_EXECUTABLE})
     endif()
     list(APPEND _iq_candidates "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python"
-                                "${CMAKE_CURRENT_SOURCE_DIR}/.venv/Scripts/python.exe"
                                 /usr/bin/python3
                                 python3)
   endif()
@@ -656,7 +655,7 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(q5k_head_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME q5k_head_parity COMMAND q5k_head_parity 20000 5)
 
-  # KV streaming (docs/kv-streaming-design.md): streamed vs resident attention, bitwise (GPU, synthetic, no model).
+  # KV streaming: streamed vs resident attention, bitwise (GPU, synthetic, no model).
   add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
   target_include_directories(kv_stream_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_stream_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -896,7 +895,7 @@ if(STRATA_NATIVE_EXPERTS)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
-    # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
+    # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (the dispatch
     # follows eddoursul/Strata 7706c1b)
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
     if(STRATA_MMQ_KQUANTS)
@@ -974,7 +973,7 @@ if(STRATA_NATIVE_EXPERTS)
       set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
     endif()
   endif()
-  # #296's real-weight checks (OrcaRouter Q4_K_S files; docs/ORCA_Q4_K_S.md) - test programs, not part of a release
+  # #296's real-weight checks (OrcaRouter Q4_K_S files) - test programs, not part of a release
   if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
     add_executable(ple_q5_parity src/kernels/ple_q5_parity.cpp)
     target_link_libraries(ple_q5_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})

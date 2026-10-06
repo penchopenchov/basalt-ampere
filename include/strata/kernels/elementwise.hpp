@@ -12,7 +12,7 @@
 //     `ref/gdn.py` says the two llama.cpp paths apply it in DIFFERENT places, so the caller has to own the
 //     choice rather than have it buried in a kernel.
 //   * `f32_to_f16_bulk` is what lets the f32 arithmetic of the mixer feed the fp16-activation GEMVs.
-//     `docs/activation-contract.md` is explicit that this is NOT the contract for a quantized weight - it is
+//     the activation contract is explicit that this is NOT the contract for a quantized weight - it is
 //     the bridge between two stages that both already exist, and the contract decision is a separate one.
 //
 // `silu_inplace` is here because `shared_expert` has its own copy inline and `gdn` needs one for the conv

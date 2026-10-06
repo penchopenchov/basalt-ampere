@@ -459,7 +459,7 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
                                 blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
         const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
                                 blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU);
-        // SiLU on the GATE, multiplied by up - the same reading `docs/semantics.md` records for the shared
+        // SiLU on the GATE, multiplied by up - the same reading the model definition records for the shared
         // expert, and the one that is wrong the other way round in a way that still produces a number.
         ws.ff[r] = (g / (1.f + std::exp(-g))) * u;
     }

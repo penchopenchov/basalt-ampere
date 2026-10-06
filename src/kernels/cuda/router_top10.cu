@@ -1,6 +1,6 @@
 // src/kernels/cuda/router_top10.cu - P2.S2: the MoE router.
 //
-// P2.S2's spec: "BF16 GEMV, softmax / top-k / renormalize per docs/semantics.md; emits (expert_id, weight) x 10
+// P2.S2's spec: "BF16 GEMV, softmax / top-k / renormalize per the model definition; emits (expert_id, weight) x 10
 // per token".  This is the softmax/top-k/renormalize half; the BF16 GEMV that produces the logits is a
 // separate kernel and is NOT here.
 //

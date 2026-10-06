@@ -136,7 +136,7 @@ uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuff
 ///     is a different expert reading a different weight.
 ///   * the shared expert's weights are Q3_K/IQ4_XS/Q5_0 IQ-quants whose contract is Q8_K, which
 ///     `shared_expert` does not implement; it takes fp16.  That is the known gap its own header documents and
-///     `docs/activation-contract.md` names as outstanding.
+///     the activation contract names as outstanding.
 bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                const float* x, const float* parts, float* out, void* stream, std::string& err,
                const Doorbell* db = nullptr);
@@ -227,7 +227,7 @@ struct QsaState {
     int64_t n_pages = 0;
     int64_t max_cells = 0;
 
-    /// KV STREAMING (docs/kv-streaming-design.md, `kv_stream.hpp`). `kv_mode` 0: every page in VRAM, identity
+    /// KV STREAMING (`kv_stream.hpp`). `kv_mode` 0: every page in VRAM, identity
     /// table (n_slots == n_pages, no host copy). 1: streamed - the authoritative K/V in `host`, `n_slots` pages
     /// in VRAM, `map` resolves the selection's blocks on device. 2: a ring (the MTP drafter's window) - `n_slots`
     /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
@@ -355,7 +355,7 @@ struct QsaBuffers {
     uint16_t* attn16 = nullptr;    ///< n_head * head_dim, for a fp16-activation consumer
     /// `attn * sigmoid(gate)` in f32 and then in Q8_K - what `attn_output` ACTUALLY wants.  Its weights are
     /// Q4_K/Q5_K/Q6_K, whose `vec_dot_type` is Q8_K, and the fp16 path is worth 0.66-1.41% against the
-    /// reference.  `docs/activation-contract.md`.
+    /// reference.
     float* attn32 = nullptr;
     uint8_t* attn_q8k = nullptr;
     float* attn_scratch = nullptr;   ///< plan v0.3 P3: split-K decode attention partials
@@ -376,7 +376,7 @@ uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base,
 ///   * `q_full` is split into q and gate by HALVES of each head's 2*head_dim block, contiguous, not
 ///     interleaved - `qsa_gate_apply` reads the second half and `qcur` is copied out of the first.
 ///
-/// THE THREE ACTIVATION FORMATS FOLLOW `docs/activation-contract.md`, and they are not interchangeable:
+/// THE THREE ACTIVATION FORMATS FOLLOW the activation contract, and they are not interchangeable:
 /// `attn_q` is Q2_0 (Q8_0 activation), `attn_k`/`attn_v`/`attn_output` are K-quants (Q8_K), and the two
 /// indexer projections are BF16 (bf16).
 bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,

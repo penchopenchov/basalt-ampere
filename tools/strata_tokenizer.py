@@ -3,7 +3,7 @@
 WHY THIS EXISTS AND WHERE IT SITS.  The GGUF carries the whole tokenizer in metadata: `tokenizer.ggml.model`
 = `gpt2`, 248,320 `tokens`, 247,587 `merges`, `token_type`, `pre` = `qwen35`, and a Jinja `chat_template`.
 None of that needs the 35 GB of weights, so it is extracted into the pack's `tokenizer/` directory
-(docs/pack-format.md §6) and this module is what reads it back.  A C++ port follows and is tested against
+(the pack format) and this module is what reads it back.  A C++ port follows and is tested against
 this one.
 
 THE DECISIVE PROPERTY IS THE ROUND TRIP.  Byte-level BPE maps each BYTE to a printable unicode character so

@@ -1,7 +1,7 @@
 """Strata P1.S6/S7 - the pack builder and verifier.
 
 This is `strata-pack build` / `strata-pack verify` / `strata-pack info`.  It is the Python implementation of
-`docs/pack-format.md`; the C++ `tools/strata-pack` is a port of it, and if the two disagree the C++ is wrong.
+the pack format; the C++ `tools/strata-pack` is a port of it, and if the two disagree the C++ is wrong.
 
 WHY PYTHON FIRST.  The canonicalisation in `tools/canonical_xcheck.py` is measured bit-exact over every block
 of every tensor (757,139,840 blocks across 1021 tensors, plus Q2_0), against gguf-py and, for Q2_0, backed by

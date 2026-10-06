@@ -579,7 +579,7 @@ void usage() {
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8),\n"
-                 "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
+                 "                       each slot with its own session (VRAM like the main one)\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
@@ -1517,7 +1517,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
         return 2;
     }
-    // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
+    // the helper-GPU expert caches (--expert-cache-remote): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
     if (multi_gpu) {
@@ -1835,8 +1835,7 @@ int main(int argc, char** argv) {
     if (!strata::kernels::cpu::cpu_avx2_ok() && isa_floor[0] == '\0') {
         std::fprintf(stderr, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
                              "CPU expert kernels need; Strata runs on Intel Haswell (2013), AMD Zen (2017) or newer. "
-                             "Older CPUs are EXPERIMENTAL and slow: setup compiles an engine for them on this PC "
-                             "(STRATA_ISA_FLOOR, see \"Older CPUs\" in docs/INSTALL.md)\n",
+                             "Older CPUs are EXPERIMENTAL and slow (STRATA_ISA_FLOOR builds)\n",
                      strata::kernels::cpu::cpu_name().c_str());
         return 2;
     }
@@ -2924,7 +2923,7 @@ int main(int argc, char** argv) {
         } else {
             o.batch = fit;
             if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
-            // the sessions' VRAM is the expert cache's: say what it costs (docs/BATCHING.md has the measured trade)
+            // the sessions' VRAM is the expert cache's: say what it costs
             std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
                                  "expert cache would otherwise hold\n", o.batch,
                          (double) bytes0 * o.batch / 1073741824.0);
@@ -3910,8 +3909,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(),
                          native_pack ? " - a native (IQ) pack has no per-layer graphs to replay. Its decode window's GPU "
                                        "stages are printed per request by the serve path instead: STRATA_VERIFY_PROFILE=1 "
-                                       "STRATA_DECODE_TIMING=1 with --serve (docs/DETAILS.md, \"Where a decode window's "
-                                       "time goes\")" : "");
+                                       "STRATA_DECODE_TIMING=1 with --serve" : "");
             return 1;
         }
         const int reps = 20;
@@ -4693,8 +4691,7 @@ int main(int argc, char** argv) {
                                  (long long) part_slots(p, alone), pct.c_str());
                     // the helper tiers start at CUDA1 without a split (and are enabled in order)
                     std::fprintf(stderr, "strata serve:   a card this small can serve as a helper expert cache "
-                                         "instead of a split stage: without --layer-split, with %s "
-                                         "(docs/SECOND_GPU.md)\n",
+                                         "instead of a split stage: without --layer-split, with %s\n",
                                  dev == 1 ? "--expert-cache-device1 N" : "--expert-cache-device1..3 N, in order");
                 }
             }

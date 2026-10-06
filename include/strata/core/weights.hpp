@@ -11,7 +11,7 @@
 //   * GROWING.  90 of the 303 quantized tensors carry fp16 SCALES in the pack (all 58 Q2_0 expert tensors, plus
 //     Q4_0, Q5_0, Q8_0 and IQ4_NL) because that is what the source block holds.  Every kernel here takes
 //     `const float* scales`, and fp16 is a subset of f32, so this loader WIDENS them - exactly, changing no
-//     value - for 11,407,360 B.  See `docs/pack-format.md` Â§2.4; assuming 4 bytes per scale instead of reading
+//     value - for 11,407,360 B; assuming 4 bytes per scale instead of reading
 //     `scales_fp16` is what made the plane arithmetic disagree with the pack for a whole round.
 //
 //     pack      5.305 GiB dense + 0.444 GiB embd
@@ -79,7 +79,7 @@ struct WeightRef {
 
     /// WHICH ACTIVATION THIS WEIGHT WANTS - 0 for Q8_0, 1 for Q8_K.  Decided by 	ools/pack_index.py from
     /// source_type and carried here, because **the S-form CANNOT express it**: Q5_0 and Q5_K are both 8-bit
-    /// with bias -16, and IQ4_NL and IQ4_XS differ in nothing the S-form holds.  docs/activation-contract.md.
+    /// with bias -16, and IQ4_NL and IQ4_XS differ in nothing the S-form holds.
     int act_kind = 0;
     bool wants_q8k() const { return act_kind == 1; }
 

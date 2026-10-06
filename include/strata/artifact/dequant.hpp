@@ -5,7 +5,7 @@
 // path (the routed experts are all Q2_0) plus the trivial element types, and is structured so the
 // rest drop in. Source of truth per encoding is quoted in each function.
 //
-// Q2_0 is the one that matters, and its contract is settled from source in docs/q2_0-contract.md:
+// Q2_0 is the one that matters, and its contract is settled from source in the Q2_0 contract:
 //   block = { fp16 d; uint8 qs[16] }  = 64 elements, 18 bytes
 //   code {0,1,2,3} -> symbol {-1,0,+1,+2};  v = (code - 1) * d
 //   4 codes per byte, LSB-first: byte j/4, bits (j%4)*2

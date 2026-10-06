@@ -123,7 +123,7 @@ void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weight
 ///     attn_q       Q3_K x6,   IQ4_XS x4, Q2_0 x2                (12 QSA layers)
 //
 //
-// `docs/activation-contract.md` fixes the rule per TYPE, and it is short:
+// the activation contract fixes the rule per TYPE, and it is short:
 //
 //
 //     code_bits == 2           ->  Q8_0,  via `quantize_q8_0` + `s2_gemv_q8`
@@ -511,7 +511,7 @@ struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>   
 }
 // namespace
 namespace {
-// KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
+// KV streaming: 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
 

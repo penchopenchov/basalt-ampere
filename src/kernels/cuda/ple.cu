@@ -170,7 +170,7 @@ __global__ void add3_kernel(const float* __restrict__ hidden, const float* __res
 }
 
 /// `y[o] = sum_i bf16(x[i]) * bf16(w[o*n_in + i])`.  The weight is BF16 and so is the ACTIVATION, which is
-/// the contract for a BF16 tensor (`docs/activation-contract.md`); with both sides bf16 the products are
+/// the contract for a BF16 tensor; with both sides bf16 the products are
 /// exact in f32 and only the summation order differs from ggml's.
 __global__ void bf16_gemv_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                                  float* __restrict__ y, int n_in, int n_out) {

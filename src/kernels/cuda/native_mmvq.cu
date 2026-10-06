@@ -1,6 +1,6 @@
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{quantize.cu,vecdotq.cuh,mmvq.cu,common.cuh}
-// and ggml/src/ggml-common.h. See docs/native-mmvq.md for exact scope.
+// and ggml/src/ggml-common.h.
 //
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors

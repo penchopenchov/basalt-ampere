@@ -7,7 +7,7 @@
 //     g = sigmoid(x @ gate_inp_shexp)                     (nt,) ONE SCALAR PER TOKEN
 //     return h * g[:, None]
 //
-// TWO THINGS HERE WERE BELIEVED WRONG FOR MANY ROUNDS and `docs/semantics.md` records both.  SILU GOES ON THE
+// TWO THINGS HERE WERE BELIEVED WRONG FOR MANY ROUNDS and the model definition records both.  SILU GOES ON THE
 // GATE TENSOR: the opposite reading is plausible, produces the right shapes, and is wrong.  And
 // `ffn_gate_inp_shexp` is `(n_embd,)` whose output is "one value per token" - a SCALAR gate obtained by dotting
 // that vector with the hidden state, NOT a per-expert gate and NOT a per-dimension elementwise one.  Both were
@@ -93,8 +93,8 @@ __global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict
 // tree-reduce.  Through a sigmoid, a 1e-16 relative difference in the dot is not a difference.
 //
 // **BOTH OPERANDS ARE BF16, AND THAT IS THE REFERENCE'S CONTRACT, NOT A STORAGE DETAIL.**  `gate_inp_shexp` is a
-// BF16 weight, so ggml converts the activation to its `vec_dot_type` - BF16 - exactly as it does for the router
-// (`docs/activation-contract.md`).  This kernel used to take `const float* w` while the LOADER had already
+// BF16 weight, so ggml converts the activation to its `vec_dot_type` - BF16 - exactly as it does for the router.
+//  This kernel used to take `const float* w` while the LOADER had already
 // re-rounded the tensor to 2 B/elem, so it read 2560 floats out of a 5120-byte buffer: 5120 B past the end of
 // the tensor, inside the 4.5 GiB arena, where nothing faults.  The dot came out astronomically large, sigmoid
 // saturated to 1.0, and `scale_kernel` multiplied the shared expert's output by it - which is why the FIRST

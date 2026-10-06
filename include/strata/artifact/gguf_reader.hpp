@@ -110,7 +110,7 @@ inline const char* ggml_type_name(uint32_t t) {
 }
 
 // Block geometry: (elements per block, bytes per block). Q2_0 is 64/18 - proven from this artifact's
-// own offset brackets in P0.S6 and recorded in docs/q2_0-contract.md.
+// own offset brackets in P0.S6.
 inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     switch (t) {
     case 0:

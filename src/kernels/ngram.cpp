@@ -27,7 +27,7 @@ void ple_prefetch_enable(bool on) { g_ple_prefetch = on; }
 bool ple_prefetch_enabled() { return g_ple_prefetch; }
 
 PleConsts ple_artifact_consts() {
-    // docs/gguf-dump-shard1.txt, verbatim.  Written once here rather than derived, because `head_offsets` is
+    // the GGUF metadata, verbatim.  Written once here rather than derived, because `head_offsets` is
     // ALSO in the metadata as its own array - and deriving one from the other would hide a mismatch between
     // them instead of surfacing it.  The parity test checks the two agree.
     PleConsts c{};

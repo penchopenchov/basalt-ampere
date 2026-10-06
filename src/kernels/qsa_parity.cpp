@@ -40,7 +40,7 @@
 //     the reference's float64 rotation, the class round 189 measured at ~1e-7.
 //   * the indexer scores: 1e-6 against Sum|dot_h| + |bias|, set by the fp32 storage of the pooled keys -
 //     2^-24 per element over a 128-term dot.
-//   * the selected ids: EXACT.  `docs/capture-format.md` L127 gives `indexer_ids` no tolerance.
+//   * the selected ids: EXACT.  the capture format gives `indexer_ids` no tolerance.
 //   * the attention against a reference reading the SAME fp16 cache: 1e-5, set by f32 accumulation over
 //     256-term dots plus `expf`'s 2 ulp.  This is the KERNEL's number.
 //   * the attention against a reference reading the f32 keys: REPORTED and then checked against the phase's

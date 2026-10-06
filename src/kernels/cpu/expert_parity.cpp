@@ -6,7 +6,7 @@
 //      values, so the only difference is FP32 evaluation ORDER.  This is the check that proves the KERNEL -
 //      the VNNI unpack, the 32-element chunk split, the scalar correction term - and P2.S3 asks for 3e-3.
 //   2. VNNI vs the oracle with `quant_acts = false`.  Now the oracle uses exact FP32 activations, so the gap
-//      IS the activation contract (`docs/activation-contract.md`).  It is REPORTED, not asserted tightly,
+//      IS the activation contract.  It is REPORTED, not asserted tightly,
 //      because it is a property of the model's quantisation and not of this code.
 //
 // The activation contract is asserted OBSERVABLE between the two: if rounding the activation to Q8_1 made no

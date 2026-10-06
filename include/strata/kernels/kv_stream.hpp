@@ -1,4 +1,4 @@
-// include/strata/kernels/kv_stream.hpp - KV streaming for the QSA layers (docs/kv-streaming-design.md).
+// include/strata/kernels/kv_stream.hpp - KV streaming for the QSA layers.
 //
 // A streamed QSA layer keeps its AUTHORITATIVE K/V in pinned, device-mapped host memory, laid out exactly as a
 // fully resident pool with the identity page table would be. VRAM holds a pool of `n_slots` pages (one page =

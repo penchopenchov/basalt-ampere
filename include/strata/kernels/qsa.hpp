@@ -77,7 +77,7 @@
 // granule cannot leak into the result.
 //
 // INDEXER KEYS: FP32, not fp16 and not the plan's INT8.  These carry no tolerance anywhere in the contract:
-// `docs/capture-format.md` L127 makes `indexer_ids` an EXACT key, because a different selected cell is a
+// the capture format makes `indexer_ids` an EXACT key, because a different selected cell is a
 // different attention input.  The key is a pooled MEAN of four raw keys followed by a norm and a rotation, so
 // an fp16 store perturbs every score by ~2^-11 relative, and the selection boundary is exactly where that
 // matters.  The cost of fp32 is 512 B per block per layer = 128 B/token/layer = 1.5 KiB/token over the 12 QSA
@@ -273,7 +273,7 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
 /// the same rule, implemented independently of the kernel's threshold search.
 ///
 /// `cap` is the caller's buffer size in ids and must be >= the width; the kernel writes EXACTLY `width` and
-/// refuses rather than truncating.  The `-1` padding that `docs/capture-format.md` L66-73 describes is the
+/// refuses rather than truncating.  The `-1` padding that the capture format describes is the
 /// capture writer's job, not this kernel's: the padded width is a property of the run, not of one token.
 ///
 /// `n_kv` must be <= 32768 (`kTopkMaxCells`): the selection runs in ONE block, which is what makes the
@@ -294,7 +294,7 @@ void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_
 /// - with 24 and 2 the two give [0 x12, 1 x12] and [0,1,0,1,...], and both produce a well-formed result.
 ///
 /// `attn` is (n_head, head_dim) f32 and NOT yet gated; `weights`, when non-null, is (n_head, n_ids) f32, which
-/// is what `docs/capture-format.md`'s `L{n}.qsa_scores` records.  Produced here rather than recomputed by the
+/// is what the capture format `L{n}.qsa_scores` records.  Produced here rather than recomputed by the
 /// caller so the capture cannot drift from the attention it claims to describe.  An EMPTY `ids` is legal and
 /// gives a zero `attn` (no selected cell has no softmax to take).
 void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch, int64_t n_ids,
@@ -314,7 +314,7 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
 /// THE SAME MULTIPLY WITHOUT THE fp16 ROUND, for the caller whose weight wants Q8_K.
 ///
 /// `attn_output` is a K-quant (Q4_K/Q5_K/Q6_K in every QSA layer of this artifact) and its `vec_dot_type` is
-/// **Q8_K, not fp16** - `docs/activation-contract.md` is explicit, and the measured cost of getting it wrong is
+/// **Q8_K, not fp16** - the activation contract is explicit, and the measured cost of getting it wrong is
 /// 0.66-1.41% per GEMV against a 1e-3 tolerance, which is above what Gate C1 allows.  The fp16 form exists
 /// because that is what the engine did first; this one exists because that was a gap, and the caller quantizes
 /// to Q8_K between the two calls.

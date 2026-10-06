@@ -42,7 +42,7 @@
 
 namespace strata::core {
 
-/// The two attention families.  `docs/semantics.md`: 36 GDN layers and 12 QSA, at indices 3, 7, ... 47.
+/// The two attention families.  the model definition: 36 GDN layers and 12 QSA, at indices 3, 7, ... 47.
 enum class LayerType : int { GDN = 0, QSA = 1 };
 inline const char* to_string(LayerType t) { return t == LayerType::GDN ? "GDN" : "QSA"; }
 

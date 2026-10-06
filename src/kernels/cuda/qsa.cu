@@ -5,7 +5,7 @@
 //
 // 1. THE THRESHOLD SEARCH IN `topk_512` RATHER THAN A SORT.  The selection has to reproduce `ggml_top_k` on the
 //    masked per-cell scores with the reference's tie rule (ascending index), and it has to be EXACT: a
-//    different selected set is a different attention input, and `docs/capture-format.md` L127 gives
+//    different selected set is a different attention input, and the capture format gives
 //    `indexer_ids` no tolerance.  The kernel therefore computes the width-th largest score as a 32-bit
 //    "order key" by binary lifting (32 monotone passes with `count(key >= cand) >= width`), and then emits -
 //    in ONE ascending walk - every cell strictly above it and the first `width - c_gt` cells equal to it.  That

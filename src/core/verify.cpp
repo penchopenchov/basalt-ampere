@@ -2717,7 +2717,7 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
                      (double) row[tgt] - lse, (long long) top, maxv - lse, (int) (top == (int64_t) tgt), extra,
                      without);
         // STRATA_LOGPOS_TOPK=K: the K most likely tokens and their log-probabilities too (`id:logprob`), for a
-        // top-k comparison with another engine on the same tokens (docs/UNSLOTH_Q4.md)
+        // top-k comparison with another engine on the same tokens
         static const int topk = [] {
             const char* v = std::getenv("STRATA_LOGPOS_TOPK");
             return v != nullptr ? std::max(0, std::min(256, std::atoi(v))) : 0;

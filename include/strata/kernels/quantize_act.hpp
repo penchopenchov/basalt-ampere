@@ -9,7 +9,7 @@
 // GiB pack.  Q8_K is the OTHER HALF of `VEC_DOT_TYPE` (Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS) and covers 2.89 GiB of
 // dense weights - the attention projections and `ssm_out`, i.e. the numerically sensitive ones.
 //
-// `docs/activation-contract.md` records the decision that BOTH must exist and be used: an FP16 activation
+// the activation contract records the decision that BOTH must exist and be used: an FP16 activation
 // against a quantized weight disagrees with the oracle by 0.6-0.9%, which is 6-9x P2.S2's 1e-3 tolerance.
 #pragma once
 

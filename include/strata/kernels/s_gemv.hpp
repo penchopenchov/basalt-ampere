@@ -1,6 +1,6 @@
 // include/strata/kernels/s_gemv.hpp - the S-family GEMV, host-callable (P2.S2).
 //
-// ONE kernel for S2, S4 and S8, because `docs/pack-format.md` gives them ONE decode:
+// ONE kernel for S2, S4 and S8, because the pack format gives them ONE decode:
 //
 //     value = cb[code] * scale + offset
 //
@@ -30,7 +30,7 @@ struct SForm {
     /// **IT IS AN ATTRIBUTE OF THE CANONICAL FORM AND IT CANNOT BE DERIVED FROM THE OTHERS.**  Q5_0 and Q5_K
     /// are both 8-bit with bias -16 (only `has_offset` differs); IQ4_NL and IQ4_XS are both 4-bit with the
     /// IQ4NL codebook and no offset, and differ in NOTHING this struct otherwise holds.  So it is CARRIED from
-    /// the manifest's `source_type` rather than reconstructed - see `docs/activation-contract.md` and the
+    /// the manifest's `source_type` rather than reconstructed - see the activation contract and the
     /// `act_kind` column `tools/pack_index.py` writes.
     int act_kind = 0;
 };
@@ -84,7 +84,7 @@ void s_gemv_split_async(const uint16_t* x, const uint8_t* codes, const float* sc
 
 /// THE SAME GEMV OVER **Q8_K** ACTIVATIONS, which is the contract for every K-quant and IQ-quant weight.
 ///
-/// `docs/activation-contract.md` settles this: `ggml_mul_mat` converts the activation to the weight's
+/// the activation contract settles this: `ggml_mul_mat` converts the activation to the weight's
 /// `vec_dot_type`, and for Q3_K/Q4_K/Q5_K/Q6_K/IQ4_XS that type is Q8_K - NOT fp16.  The two differ by
 /// 0.6-0.9% per GEMV against a 1e-3 tolerance, and the K-quants are 2.89 GiB of the dense weights: the
 /// attention projections and `ssm_out`, i.e. the numerically sensitive ones.

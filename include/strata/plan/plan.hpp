@@ -46,7 +46,7 @@ struct Geometry {
     int indexer_key_heads = 1;  // k_proj is [n_embd, 128]: ONE shared key head
     int indexer_key_dim = 128;  // the key width, and the width of the thing that IS cached
 
-    /// GDN geometry.  `docs/semantics.md`: `ssm.state_size = 128`, `ssm.time_step_rank = 48` (the v heads),
+    /// GDN geometry.  the model definition: `ssm.state_size = 128`, `ssm.time_step_rank = 48` (the v heads),
     /// `ssm.conv_kernel = 4`, and `n_embd_r() = (d_conv-1) * (ssm_d_inner + 2*n_group*d_state) = 3 * 10240`.
     int ssm_state_size = 128;
     int ssm_v_heads = 48;

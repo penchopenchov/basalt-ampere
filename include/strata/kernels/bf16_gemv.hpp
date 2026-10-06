@@ -10,7 +10,7 @@
 //     ffn_gate_inp.weight                               handled inside `router_top10`
 //
 // The original entry points take BF16 activation bits for the historical CPU-derived contract. The explicit
-// FP32 entry point below follows the pinned CUDA single-token MMVF contract. See docs/activation-contract.md
+// FP32 entry point below follows the pinned CUDA single-token MMVF contract.
 // for why activation precision depends on backend and batch geometry rather than weight type alone.
 #pragma once
 

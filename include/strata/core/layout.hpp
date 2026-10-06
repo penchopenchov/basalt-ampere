@@ -7,7 +7,7 @@
 //   * round 194 sized the indexer key store from `indexer.head_count = 4`, which counts QUERY heads.  The
 //     cached key is ONE shared head of 128 (`indexer.k_proj` is [2560, 128]), so the term was 4x too big and
 //     the error survived a round because it moved in the direction that TIGHTENS the budget.
-//   * `docs/semantics.md` and the tensor manifest agree on every dimension here, but nothing CHECKED that a
+//   * the model definition and the tensor manifest agree on every dimension here, but nothing CHECKED that a
 //     named tensor had the shape the kernel reading it assumes.
 //
 // So this header does two things: it names the tensors per layer type, and it asserts every shape the
@@ -22,7 +22,7 @@
 
 namespace strata::core {
 
-/// The model's geometry, taken from `docs/semantics.md` and the artifact's own metadata.  Every field here
+/// The model's geometry, taken from the model definition and the artifact's own metadata.  Every field here
 /// is a number a kernel depends on, so a change is a change to a kernel contract and not a tuning knob.
 struct ModelGeometry {
     int64_t n_embd = 2560;
@@ -58,7 +58,7 @@ struct ModelGeometry {
     int64_t n_gdn_layers() const { return n_layers - n_qsa_layers(); }
 };
 
-/// True for the full-attention layers.  `docs/semantics.md` gives this twice over - `full_attention_interval
+/// True for the full-attention layers.  the model definition gives this twice over - `full_attention_interval
 /// = 4` and an explicit `attention.compress_ratios` array - and this is the first of the two.
 inline bool is_qsa_layer(const ModelGeometry& g, int64_t layer) {
     return layer % g.qsa_interval == g.qsa_interval - 1;

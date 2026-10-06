@@ -27,7 +27,7 @@
 
 namespace strata::kernels {
 
-// ---- geometry, every value confirmed against the artifact (docs/gguf-metadata.txt) ----
+// ---- geometry, every value confirmed against the artifact ----
 inline constexpr int NG_N_EMBD = 2560;          // n_embd
 inline constexpr int PLE_HEAD_DIM = 160;        // qwen4exp.embedding_length_per_layer_input
 inline constexpr int NGRAM_SIZE = 3;            // qwen4exp.ple.ngram_size
@@ -48,7 +48,7 @@ inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90: 
 inline constexpr int PLE_ROW_BYTES_FP8 = PLE_HEAD_DIM;                   // 160: an F8_E4M3 row, one byte a value
 inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_FP8;
 
-/// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
+/// The artifact's own hash constants, transcribed from the GGUF metadata:
 ///
 ///     layer_multipliers = [23703573157769, 20109073645365, 8052911324071]
 ///     head_vocab_sizes  = [20000003, 20000023, ...]          16 entries, NOT an arithmetic sequence

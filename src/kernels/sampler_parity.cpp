@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- fixture 3: greedy consumes NO random number.  Two runs with different seeds must agree, or the
-    // seeded streams diverge between greedy and sampled runs - which docs/sampling.md §3 calls out.
+    // seeded streams diverge between greedy and sampled runs - which the sampling contract calls out.
     {
         strata::kernels::SamplerParams a; a.top_k = 20; a.top_p = 0.95f; a.temperature = 1.0f; a.greedy = true; a.seed = 1;
         strata::kernels::SamplerParams b = a; b.seed = 999999;

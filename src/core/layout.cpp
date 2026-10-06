@@ -156,7 +156,7 @@ bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& er
             ++n_gdn;
         }
     }
-    // The split is derived twice over in `docs/semantics.md` - the interval and an explicit ratio array -
+    // The split is derived twice over in the model definition - the interval and an explicit ratio array -
     // and both give 36 GDN and 12 QSA.  Counting them here is the check that the LAYER TYPE PREDICATE and
     // the pack agree, which no per-tensor shape check can see.
     if (n_qsa != g.n_qsa_layers() || n_gdn != g.n_gdn_layers()) {

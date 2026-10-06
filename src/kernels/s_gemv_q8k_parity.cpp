@@ -35,7 +35,7 @@ void check(cudaError_t e, const char* what) {
     }
 }
 
-/// The host decode, transcribed from `docs/pack-format.md`'s rule: `value = cb[code] * scale + offset`, with
+/// The host decode, transcribed from the pack format rule: `value = cb[code] * scale + offset`, with
 /// the integer bias applied INSIDE the integer domain before the one multiply.
 const signed char kIq4Nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
