@@ -61,8 +61,15 @@ FINGERPRINT_BYTES = 64 << 20
 ENGINE_ARGS = ["--expert-cache", "auto", "--prefill", "auto", "--spec", "7", "--spec-min-p", "0.5",
                "--max-context", "262144", "--kv", "int8", "--resident-experts", "--vram-reserve-mib", "700"]
 SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0}
-LICENSE = {"model": "Qwen Community License (Qwen3.8-Flash-Next) and Apache-2.0 (the GSQ-RCO GGUF); see the model card",
-           "engine": "Basalt, MIT"}
+LICENSE_TEXT = (HERE / "qwen-community-license-1.0.txt").read_text(encoding="utf-8")
+
+
+def model_license(kv: dict) -> dict:
+    """The model's license, with its full text (the license requires it in every copy)."""
+    lic = {"name": "Qwen Community License 1.0", "text": LICENSE_TEXT}
+    if kv.get("general.quantized_by"):
+        lic["quantized_by"] = kv["general.quantized_by"]
+    return lic
 
 
 def die(msg: str):
@@ -270,7 +277,7 @@ def convert(a) -> None:
                                 "bytes": nb, "offset": tensor_offsets[n]}
                             for n, _, _, nb, t in tensors},
                 "conversions": {"compat_bf16": a.compat_bf16, "tensors": dense.records},
-                "engine_args": ENGINE_ARGS, "sampling": SAMPLING, "license": LICENSE,
+                "engine_args": ENGINE_ARGS, "sampling": SAMPLING, "license": model_license(kv),
                 "profile": prof,
                 "hc8": {"bytes": Path(a.hc8).stat().st_size} if a.hc8 else None,
                 "mtp": None if mtp is None else {"source_sha256": mtp.source_sha256(),

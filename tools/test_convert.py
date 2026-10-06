@@ -36,6 +36,7 @@ class ConvertTest(unittest.TestCase):
         rng = np.random.default_rng(0)
         g = GGUFWriter()
         g.add("general.architecture", "qwen")
+        g.add("general.quantized_by", "Someone")
         g.add("qwen.block_count", N_LAYERS, "u32")
         g.add("qwen.rope.freqs", [0.5, 1.5], "array:f32")
         g.add("qwen.nan", float("inf"), "f32")
@@ -175,6 +176,11 @@ class ConvertTest(unittest.TestCase):
         self.assertIn("engine_args", meta)
         self.assertEqual(meta["sampling"]["top_k"], 20)
         self.assertIsNone(meta["mtp"])
+        lic = meta["license"]
+        self.assertEqual(lic["name"], "Qwen Community License 1.0")
+        self.assertEqual(lic["text"], (Path(convert.__file__).parent / "qwen-community-license-1.0.txt").read_text())
+        self.assertEqual(lic["quantized_by"], "Someone")
+        self.assertEqual(set(lic), {"name", "text", "quantized_by"})
 
     def test_without_hc8_or_drafter(self):
         convert.convert(self.args(hc8=None))
