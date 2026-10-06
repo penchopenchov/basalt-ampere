@@ -1,4 +1,4 @@
-// include/strata/kernels/dense_tc.hpp - dense projections of a verify window on int8 tensor cores (STRATA_DEC_DTC).
+// include/strata/kernels/dense_tc.hpp - dense projections of a verify window on int8 tensor cores.
 //
 // y[c][r] = sum over the row's 32-value blocks of the format's float term on the block's exact integer dot with
 // column c's q8_1 codes (mma.sync, 16 rows x 8 columns per tile).  Terms per block:
@@ -21,7 +21,7 @@
 namespace strata::kernels {
 
 bool dense_tc_supported(int ggml_type, int n_in) noexcept;
-/// The same for this call's shape and weights: IQ3_S (STRATA_DEC_DTC2 & 4) only where each 16-row tile takes a block
+/// The same for this call's shape and weights: IQ3_S only where each 16-row tile takes a block
 /// of its own (dense_tc.cu's one-tile path).
 bool dense_tc_supported(int ggml_type, int n_in, int n_out, const void* weights) noexcept;
 
@@ -34,20 +34,19 @@ bool dense_tc_pair_supported(int type0, int type1, int n_in) noexcept;
 void dense_tc_pair(int type0, const void* w0, float* y0, int n_out0, int type1, const void* w1, float* y1, int n_out1,
                    const void* x_q8_1, int n_in, int ncols, void* stream);
 
-/// STRATA_DEC_PAIR (bits, default 0): 2 dense_tc_pair holds each warp's x fragments in registers across its tiles
-/// (n_in <= 3072; the same sums), 4 (with 2) two warp-sum buffers where one block per SM, 16 the hc read before the GDN qkv+z pair lets the pair in at its start, so the
-/// pair's blocks stage their first tiles on the SMs the read leaves.
+/// The pair's options (bits): 2 each warp's x fragments in registers across its tiles (n_in <= 3072; the same sums),
+/// 4 two warp-sum buffers where one block per SM, 16 the hc read before the GDN qkv+z pair lets the pair in at its
+/// start, so the pair's blocks stage their first tiles on the SMs the read leaves.
 int dense_tc_pair_mask();
 
 /// The 16-byte aligned `bytes` at w into L2 (bulk prefetches), as a kernel on the stream that lets the next kernel in
 /// at once and ends after the kernel before it.
 void dense_tc_l2_prefetch(const void* w, std::size_t bytes, void* stream);
 
-/// STRATA_DEC_DTC: which verify projections take dense_tc for every window width (bits): 1 GDN qkv, 2 GDN z, 4 GDN
-/// out, 8 QSA q, 16 QSA out, 32 QSA k/v.  0 (default) none.
+/// Which verify projections take dense_tc for every window width (bits): 1 GDN qkv, 2 GDN z, 4 GDN out, 8 QSA q,
+/// 16 QSA out, 32 QSA k/v.
 int dense_tc_mask();
-/// STRATA_DEC_DTC_TYPES: the weight types STRATA_DEC_DTC takes (bits): 1 Q4_K, 2 Q5_K, 4 Q6_K, 8 IQ4_XS, 32 Q3_K,
-/// 64 Q2_0; default all; 16 IQ3_S (also with STRATA_DEC_DTC2 & 4).
+/// The weight types dense_tc takes: Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0.
 bool dense_tc_type_on(int ggml_type) noexcept;
 
 }  // namespace strata::kernels

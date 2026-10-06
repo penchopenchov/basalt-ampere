@@ -335,7 +335,7 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
 template<int TYPE, int S, int MT, int KS>
 __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem, const uint8_t* __restrict__ w,
                                                const uint8_t* __restrict__ x, float* __restrict__ y, int n_in,
-                                               int n_out, int ncols, int probe) {
+                                               int n_out, int ncols) {
     constexpr int SB = Fmt<TYPE>::SB, CB = 2 * KS * SB, RS = row_stride(KS * SB), R = 16 * MT, SLOT = R * RS;
     constexpr int NU = RS / 16, NT = MT * KS * 128;
     uint8_t* ring = smem;
@@ -364,7 +364,7 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
     auto commit = [] { asm volatile("cp.async.commit_group;\n" ::: "memory"); };
 #pragma unroll
     for (int q = 0; q < S - 1; ++q) {
-        if (q < nunits && !(probe & 2)) issue(q);
+        if (q < nunits) issue(q);
         commit();
     }
     pdl_wait();
@@ -394,7 +394,7 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
         }
         asm volatile("cp.async.wait_group %0;\n" ::"n"(S - 2) : "memory");
         __syncthreads();   // unit u is in for every thread; the slot of unit u - 1 is free
-        if (u + S - 1 < nunits && !(probe & 2)) issue(u + S - 1);
+        if (u + S - 1 < nunits) issue(u + S - 1);
         commit();
         const int row0 = tile * R;
         const int rA = min(row0 + 16 * mt + g, n_out - 1), rB = min(row0 + 16 * mt + g + 8, n_out - 1);
@@ -403,7 +403,7 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
             slot + (16 * mt + g) * RS + ((uintptr_t) (w + (size_t) rA * row_bytes + (size_t) c * CB) & 15) + sbi * SB,
             slot + (16 * mt + g + 8) * RS + ((uintptr_t) (w + (size_t) rB * row_bytes + (size_t) c * CB) & 15) +
                 sbi * SB};
-        if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3);
+        half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3);
         if (c == nchunk - 1) {   // the tile: each m-tile's warp sums, added in warp order (hb, then ks)
             float* rw = red + wp * 16 * kMaxCols;
             rw[g * kMaxCols + 2 * t] = acc[0];
@@ -433,10 +433,10 @@ __device__ __forceinline__ void dense_tc_block(int blk, int nblk, uint8_t* smem,
 template<int TYPE, int S, int MT, int KS>
 __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* __restrict__ w,
                                                                  const uint8_t* __restrict__ x, float* __restrict__ y,
-                                                                 int n_in, int n_out, int ncols, int probe) {
+                                                                 int n_in, int n_out, int ncols) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_block<TYPE, S, MT, KS>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols, probe);
+    dense_tc_block<TYPE, S, MT, KS>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -452,7 +452,7 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
 template<int TYPE>
 __device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* smem, const uint8_t* __restrict__ w,
                                                     const uint8_t* __restrict__ x, float* __restrict__ y, int n_in,
-                                                    int n_out, int ncols, int probe, int rs) {
+                                                    int n_out, int ncols, int rs) {
     constexpr int SB = Fmt<TYPE>::SB, CB = 2 * SB;
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
     float* red = reinterpret_cast<float*>(smem + 128);   // [warp][row][column]
@@ -494,7 +494,6 @@ __device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* 
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
         __syncwarp();
-        if (!(probe & 2))
             for (int i = 0; i < 2 && i < mine; ++i) issue(i);
     }
     __syncthreads();
@@ -504,7 +503,7 @@ __device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* 
     if constexpr (TYPE == 23) { t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3]; }
     for (int i = 0; i < mine; ++i) {
         const int row0 = (blk + i * nblk) * 16;
-        if (!(probe & 2)) {
+        {
             uint32_t done = 0;
             const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1)), par = (uint32_t) (i >> 1) & 1u;
             do {
@@ -537,7 +536,7 @@ __device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* 
                 }
             }
             const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
-            if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3);
+            half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3);
         }
         float* rw = red + wp * 16 * kMaxCols;
         rw[g * kMaxCols + 2 * t] = acc[0];
@@ -546,7 +545,7 @@ __device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* 
         rw[(g + 8) * kMaxCols + 2 * t + 1] = acc[3];
         if (i == mine - 1) pdl_launch_dependents();
         __syncthreads();   // the slot is read and the warp sums are in
-        if (wp == 0 && i + 2 < mine && !(probe & 2)) {
+        if (wp == 0 && i + 2 < mine) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             issue(i + 2);
         }
@@ -568,10 +567,10 @@ __device__ __forceinline__ void dense_tc_tile_block(int blk, int nblk, uint8_t* 
 template<int TYPE>
 __global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __restrict__ w,
                                                            const uint8_t* __restrict__ x, float* __restrict__ y,
-                                                           int n_in, int n_out, int ncols, int probe, int rs) {
+                                                           int n_in, int n_out, int ncols, int rs) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_tile_block<TYPE>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols, probe, rs);
+    dense_tc_tile_block<TYPE>((int) blockIdx.x, (int) gridDim.x, smem, w, x, y, n_in, n_out, ncols, rs);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -586,7 +585,7 @@ __global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __res
 template<int TYPE, int NW>
 __device__ __forceinline__ void dense_tc_one_block(int blk, uint8_t* smem, const uint8_t* __restrict__ w,
                                                    const uint8_t* __restrict__ x, float* __restrict__ y, int n_in,
-                                                   int n_out, int ncols, int probe) {
+                                                   int n_out, int ncols) {
     constexpr int SB = Fmt<TYPE>::SB, CB = 2 * SB, NG = NW / 4;
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
     uint8_t* slot = smem + 128;
@@ -604,12 +603,11 @@ __device__ __forceinline__ void dense_tc_one_block(int blk, uint8_t* smem, const
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(bb));
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         // rows past n_out are not copied (and never stored)
-        if (!(probe & 2))
             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bb), "r"((uint32_t) (rows * row_bytes))
                          : "memory");
     }
     __syncthreads();
-    if (tid < rows && !(probe & 2))   // one bulk copy per row, at a stride that spreads the rows over the banks
+    if (tid < rows)   // one bulk copy per row, at a stride that spreads the rows over the banks
         asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                      ::"r"((uint32_t) __cvta_generic_to_shared(slot + tid * rs)),
                      "l"(w + (size_t) (row0 + tid) * row_bytes), "r"((uint32_t) row_bytes), "r"(bb) : "memory");
@@ -640,7 +638,7 @@ __device__ __forceinline__ void dense_tc_one_block(int blk, uint8_t* smem, const
     XFrag xf;
     int c = wp >> 2;
     if (c < nchunk) load_x(xf, c);
-    if (!(probe & 2)) {
+    {
         uint32_t done = 0;
         do {
             asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
@@ -656,7 +654,7 @@ __device__ __forceinline__ void dense_tc_one_block(int blk, uint8_t* smem, const
         XFrag xn;
         if (c + NG < nchunk) load_x(xn, c + NG);
         const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
-        if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3, grid);
+        half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3, grid);
         xf = xn;
     }
     __syncthreads();   // the rows are read
@@ -688,10 +686,10 @@ __device__ __forceinline__ void dense_tc_one_block(int blk, uint8_t* smem, const
 template<int TYPE, int NW>
 __global__ void __launch_bounds__(NW * 32) dense_tc_one_kernel(const uint8_t* __restrict__ w,
                                                               const uint8_t* __restrict__ x, float* __restrict__ y,
-                                                              int n_in, int n_out, int ncols, int probe) {
+                                                              int n_in, int n_out, int ncols) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_one_block<TYPE, NW>((int) blockIdx.x, smem, w, x, y, n_in, n_out, ncols, probe);
+    dense_tc_one_block<TYPE, NW>((int) blockIdx.x, smem, w, x, y, n_in, n_out, ncols);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -726,7 +724,7 @@ __host__ __device__ constexpr int pair_sb(int type) {
 template<int TYPE>
 __device__ __forceinline__ void pair_terms(float (&acc)[4], const uint8_t* rowA, const uint8_t* rowB, int wp, int hb,
                                            int n, int g, int t, const uint8_t* __restrict__ x, int nb32, int nchunk,
-                                           int ncols, const uint32_t* grid, int probe) {
+                                           int ncols, const uint32_t* grid) {
     constexpr int CB = 2 * Fmt<TYPE>::SB;
     uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
     if constexpr (TYPE == 23) {
@@ -755,7 +753,7 @@ __device__ __forceinline__ void pair_terms(float (&acc)[4], const uint8_t* rowA,
             }
         }
         const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
-        if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3, grid);
+        half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3, grid);
     }
 }
 
@@ -785,7 +783,7 @@ __device__ __forceinline__ void pair_xfrag(XFrag& xf, int c, int hb, int g, int 
 template<int TYPE>
 __device__ __forceinline__ void pair_terms_xr(float (&acc)[4], const uint8_t* rowA, const uint8_t* rowB, int wp,
                                               int hb, int n, int t, int nchunk, const XFrag (&xs)[3],
-                                              const uint32_t* grid, int probe) {
+                                              const uint32_t* grid) {
     constexpr int CB = 2 * Fmt<TYPE>::SB;
     uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
     if constexpr (TYPE == 23) {
@@ -799,7 +797,7 @@ __device__ __forceinline__ void pair_terms_xr(float (&acc)[4], const uint8_t* ro
         const int c = (wp >> 2) + 2 * j;
         if (c >= nchunk) break;
         const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
-        if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xs[j], t0, t1, t2, t3, grid);
+        half_sb_terms<TYPE>(acc, p, n, t, xs[j], t0, t1, t2, t3, grid);
     }
 }
 
@@ -808,7 +806,7 @@ __device__ __forceinline__ void pair_terms_xr(float (&acc)[4], const uint8_t* ro
 // tiles too (a build of their own, so the other formats' kernels stay as they were)
 template<bool XR, bool DB, bool LQ>
 __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* smem, PairMat m0, PairMat m1,
-                                                    const uint8_t* __restrict__ x, int n_in, int ncols, int probe) {
+                                                    const uint8_t* __restrict__ x, int n_in, int ncols) {
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
     constexpr int RB = (DB ? 2 : 1) * 8 * 16 * kMaxCols * 4;
     float* red0 = reinterpret_cast<float*>(smem + 128);   // [buffer][warp][row][column]
@@ -841,7 +839,6 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         for (int q = 0; q < 2; ++q)
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"((uint32_t) __cvta_generic_to_shared(bar + q)));
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-        if (!(probe & 2))
             for (int i = 0; i < 2 && i < mine; ++i) issue(i);
     }
     __syncthreads();
@@ -858,7 +855,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         const PairMat& m = second ? m1 : m0;
         const int row0 = (second ? tile - nt0 : tile) * 16;
         const int row_bytes = (n_in / 256) * pair_sb<LQ>(m.type);
-        if (!(probe & 2)) {
+        {
             uint32_t done = 0;
             const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1)), par = (uint32_t) (i >> 1) & 1u;
             do {
@@ -872,39 +869,39 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         if constexpr (XR && LQ) {
             switch (m.type) {
-                case 12: pair_terms_xr<12>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                case 13: pair_terms_xr<13>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                case 14: pair_terms_xr<14>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                case 21: pair_terms_xr<21>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                case 11: pair_terms_xr<11>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                case 42: pair_terms_xr<42>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 12: pair_terms_xr<12>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 13: pair_terms_xr<13>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 14: pair_terms_xr<14>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 21: pair_terms_xr<21>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 11: pair_terms_xr<11>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 42: pair_terms_xr<42>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
             }
         } else if constexpr (XR) {
             switch (m.type) {
-                case 12: pair_terms_xr<12>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                case 13: pair_terms_xr<13>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                case 14: pair_terms_xr<14>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                case 21: pair_terms_xr<21>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
-                default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 12: pair_terms_xr<12>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 13: pair_terms_xr<13>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 14: pair_terms_xr<14>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 21: pair_terms_xr<21>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
             }
         } else if constexpr (LQ) {
             switch (m.type) {
-                case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                case 11: pair_terms<11>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                case 42: pair_terms<42>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 11: pair_terms<11>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 42: pair_terms<42>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
             }
         } else {
             switch (m.type) {
-                case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-                default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
             }
         }
         float* red = red0 + (DB ? (i & 1) * 8 * 16 * kMaxCols : 0);
@@ -915,7 +912,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         rw[(g + 8) * kMaxCols + 2 * t + 1] = acc[3];
         if (i == mine - 1) pdl_launch_dependents();
         __syncthreads();   // the slot is read and the warp sums are in
-        if (tid == 0 && i + 2 < mine && !(probe & 2)) {
+        if (tid == 0 && i + 2 < mine) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             issue(i + 2);
         }
@@ -936,10 +933,10 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
 
 template<bool XR, bool DB, bool LQ>
 __global__ void __launch_bounds__(256) dense_tc_pair_kernel(PairMat m0, PairMat m1, const uint8_t* __restrict__ x,
-                                                            int n_in, int ncols, int probe) {
+                                                            int n_in, int ncols) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_pair_block<XR, DB, LQ>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
+    dense_tc_pair_block<XR, DB, LQ>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -977,21 +974,9 @@ int sm_count() {
     return n;
 }
 
-int env_int(const char* name, int def) {
-    const char* v = std::getenv(name);
-    return v ? std::atoi(v) : def;
-}
-// bench knobs: STRATA_DEC_DTC_BPS blocks per SM (default as many as fit), STRATA_DEC_DTC_SLOTS ring depth (3 or 4;
-// default 3), STRATA_DEC_DTC_MT rows per tile / 16 (1 or 2; default 1), STRATA_DEC_DTC_PROBE 1 skip the
-// dots, 2 skip the weight copies
-const int g_bps = env_int("STRATA_DEC_DTC_BPS", 0);
-const int g_slots = env_int("STRATA_DEC_DTC_SLOTS", 3);
-const int g_mt = env_int("STRATA_DEC_DTC_MT", 0);
-const int g_probe = env_int("STRATA_DEC_DTC_PROBE", 0);
-const int g_ks = env_int("STRATA_DEC_DTC_KS", 0);
-const int g_tile = env_int("STRATA_DEC_DTC_TILE", 1);   // 1: never split a tile's chunks over two warp groups
-const int g_v2 = env_int("STRATA_DEC_DTC2", 0);
-const int g_pair = env_int("STRATA_DEC_PAIR", 0);
+// The live configuration: STRATA_DEC_DTC2 2 | 4 | 8 | 16 and STRATA_DEC_PAIR 2 | 4 | 16 (see verify.cpp).
+constexpr int g_v2 = 30;
+constexpr int g_pair = 22;
 
 template<int TYPE, int S, int MT, int KS>
 void launch_s(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
@@ -1003,26 +988,17 @@ void launch_s(const void* w, const void* x, float* y, int n_in, int n_out, int n
     }
     int occ = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_kernel<TYPE, S, MT, KS>, MT * KS * 128, smem);
-    if (g_bps > 0 && g_bps < occ) occ = g_bps;
     if (occ < 1) occ = 1;
     const int ntiles = (n_out + 16 * MT - 1) / (16 * MT);
     const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
     launch_pdl(dense_tc_kernel<TYPE, S, MT, KS>, dim3((unsigned) grid), dim3(MT * KS * 128), smem, s,
-               (const uint8_t*) w, (const uint8_t*) x, y, n_in, n_out, ncols, g_probe);
-}
-
-template<int TYPE, int MT, int KS>
-void launch_mt(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
-    switch (g_slots) {
-        case 4: launch_s<TYPE, 4, MT, KS>(w, x, y, n_in, n_out, ncols, s); break;
-        default: launch_s<TYPE, 3, MT, KS>(w, x, y, n_in, n_out, ncols, s); break;
-    }
+               (const uint8_t*) w, (const uint8_t*) x, y, n_in, n_out, ncols);
 }
 
 template<int TYPE>
 void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     const int row_bytes = (n_in / 256) * Fmt<TYPE>::SB;
-    const int rs = (g_v2 & 32) && row_bytes % 16 == 0 ? one_row_stride(row_bytes) : row_bytes;
+    const int rs = row_bytes;
     const int smem = 128 + 8 * 16 * kMaxCols * 4 + 2 * 16 * rs;
     static bool attr = false;
     if (!attr) {
@@ -1031,18 +1007,17 @@ void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, in
     }
     int occ = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_tile_kernel<TYPE>, 256, smem);
-    if (g_bps > 0 && g_bps < occ) occ = g_bps;
     if (occ < 1) occ = 1;
     const int ntiles = (n_out + 15) / 16;
     const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
     launch_pdl(dense_tc_tile_kernel<TYPE>, dim3((unsigned) grid), dim3(256), (size_t) smem, s, (const uint8_t*) w,
-               (const uint8_t*) x, y, n_in, n_out, ncols, g_probe, rs);
+               (const uint8_t*) x, y, n_in, n_out, ncols, rs);
 }
 
-// the one-tile path takes the shape (STRATA_DEC_DTC2 & 2; IQ3_S only there)
+// the one-tile path takes the shape
 template<int TYPE>
 bool one_ok(const void* w, int n_in, int n_out) {
-    return ((g_v2 & 2) || TYPE == 21) && ((uintptr_t) w & 15) == 0 && (n_in / 256) * Fmt<TYPE>::SB % 16 == 0 &&
+    return ((uintptr_t) w & 15) == 0 && (n_in / 256) * Fmt<TYPE>::SB % 16 == 0 &&
            (n_out + 15) / 16 <= sm_count() && one_smem_bytes<TYPE, 24>(n_in) <= 99 * 1024;
 }
 
@@ -1055,41 +1030,31 @@ void launch_one(const void* w, const void* x, float* y, int n_in, int n_out, int
     }
     launch_pdl(dense_tc_one_kernel<TYPE, NW>, dim3((unsigned) ((n_out + 15) / 16)), dim3(NW * 32),
                (size_t) one_smem_bytes<TYPE, NW>(n_in), s, (const uint8_t*) w, (const uint8_t*) x, y, n_in, n_out,
-               ncols, g_probe);
+               ncols);
 }
 
-// The layout follows the shape alone (never the column count): whole 16-row tiles where two fit in shared memory and
-// the weights are 16-byte aligned (STRATA_DEC_DTC_TILE=0: never), else 16-row tiles in 512-value chunks, and where
-// those leave SMs idle, two warp groups per tile taking alternate 512-value halves of 1024 (STRATA_DEC_DTC2 & 1: four
-// groups taking the quarters of 2048 where n_in allows; & 2: where every 16-row tile has a block of its own and fits
-// in shared memory, one bulk copy per row, issued before the grid dependency wait; & 32: whole tiles staged by one
-// bulk copy per row at a bank-spreading stride; & 64: IQ4_XS never in whole tiles).
+// The layout follows the shape alone (never the column count): where every 16-row tile has a block of its own and fits
+// in shared memory, one bulk copy per row, issued before the grid dependency wait; else whole 16-row tiles where two
+// fit in shared memory and the weights are 16-byte aligned; else 16-row tiles in 512-value chunks, and where those
+// leave SMs idle, two warp groups per tile taking alternate 512-value halves of 1024.
 template<int TYPE>
 void launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     const bool aligned = ((uintptr_t) w & 15) == 0;
     if (one_ok<TYPE>(w, n_in, n_out)) {
-        static const int nw = env_int("STRATA_DEC_DTC2_NW", 24);
-        if (nw == 16) launch_one<TYPE, 16>(w, x, y, n_in, n_out, ncols, s);
-        else if (nw == 32 && one_smem_bytes<TYPE, 32>(n_in) <= 99 * 1024) launch_one<TYPE, 32>(w, x, y, n_in, n_out, ncols, s);
-        else launch_one<TYPE, 24>(w, x, y, n_in, n_out, ncols, s);
+        launch_one<TYPE, 24>(w, x, y, n_in, n_out, ncols, s);
         return;
     }
     if constexpr (TYPE == 21) {
         std::fprintf(stderr, "dense_tc: IQ3_S n_in %d n_out %d needs the one-tile path\n", n_in, n_out);
         std::exit(1);
     } else {
-    if (g_tile && aligned && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024 && !(TYPE == 23 && (g_v2 & 64))) {
+    if (aligned && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) {
         launch_tile<TYPE>(w, x, y, n_in, n_out, ncols, s);
         return;
     }
-    const int mt = g_mt == 2 ? 2 : 1;
     const bool few = (n_out + 15) / 16 < sm_count();
-    const bool ks4 = mt == 1 && n_in % 2048 == 0 && few && (g_ks == 4 || ((g_v2 & 1) && g_ks == 0));
-    const bool ks2 = mt == 1 && n_in % 1024 == 0 && few && g_ks != 1;
-    if (ks4) launch_mt<TYPE, 1, 4>(w, x, y, n_in, n_out, ncols, s);
-    else if (ks2) launch_mt<TYPE, 1, 2>(w, x, y, n_in, n_out, ncols, s);
-    else if (mt == 2) launch_mt<TYPE, 2, 1>(w, x, y, n_in, n_out, ncols, s);
-    else launch_mt<TYPE, 1, 1>(w, x, y, n_in, n_out, ncols, s);
+    if (n_in % 1024 == 0 && few) launch_s<TYPE, 3, 1, 2>(w, x, y, n_in, n_out, ncols, s);
+    else launch_s<TYPE, 3, 1, 1>(w, x, y, n_in, n_out, ncols, s);
     }
 }
 
@@ -1105,7 +1070,7 @@ bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
 }
 
 bool dense_tc_type_on(int t) noexcept {
-    static const int m = env_int("STRATA_DEC_DTC_TYPES", 15 | 32 | 64) | ((g_v2 & 4) ? 16 : 0);
+    constexpr int m = 127;   // Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0
     return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : t == 21 ? 16 : t == 11 ? 32 : t == 42 ? 64 : 0)) != 0;
 }
 
@@ -1156,8 +1121,8 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
         attr = true;
     }
     const bool lq = t0 == 11 || t0 == 42 || t1 == 11 || t1 == 42;
-    // STRATA_DEC_PAIR & 2: each warp's x fragments in registers across its tiles; & 4 (with 2): two warp-sum buffers
-    // where the block is alone on its SM either way
+    // each warp's x fragments in registers across its tiles, and two warp-sum buffers where the block is alone on its
+    // SM either way
     const bool xr = (g_pair & 2) && n_in <= 3072;
     auto kern = lq ? (xr ? dense_tc_pair_kernel<true, false, true> : dense_tc_pair_kernel<false, false, true>)
                    : (xr ? dense_tc_pair_kernel<true, false, false> : dense_tc_pair_kernel<false, false, false>);
@@ -1167,13 +1132,12 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
         kern = lq ? dense_tc_pair_kernel<true, true, true> : dense_tc_pair_kernel<true, true, false>;
         smem += 4096;
     }
-    if (g_bps > 0 && g_bps < occ) occ = g_bps;
     if (occ < 1) occ = 1;
     const int ntiles = (n_out0 + 15) / 16 + (n_out1 + 15) / 16;
     const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
     const PairMat m0{(const uint8_t*) w0, y0, t0, n_out0}, m1{(const uint8_t*) w1, y1, t1, n_out1};
     launch_pdl(kern, dim3((unsigned) grid), dim3(256), (size_t) smem, (cudaStream_t) stream, m0, m1,
-               (const uint8_t*) x_q8_1, n_in, ncols, g_probe);
+               (const uint8_t*) x_q8_1, n_in, ncols);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dense_tc_pair: %s\n", cudaGetErrorString(e));
@@ -1188,12 +1152,6 @@ void dense_tc_l2_prefetch(const void* w, size_t bytes, void* stream) {
 
 int dense_tc_pair_mask() { return g_pair; }
 
-int dense_tc_mask() {
-    static const int m = [] {
-        const char* v = std::getenv("STRATA_DEC_DTC");
-        return v != nullptr ? (int) std::strtol(v, nullptr, 0) : 0;
-    }();
-    return m;
-}
+int dense_tc_mask() { return 29; }   // STRATA_DEC_DTC 1 | 4 | 8 | 16 (see verify.cpp)
 
 }  // namespace strata::kernels
