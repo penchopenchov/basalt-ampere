@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <cstddef>
 #include <condition_variable>
 #include <memory>
@@ -442,6 +443,11 @@ public:
     bool spare_release(int64_t layer, int64_t in);
     /// A place `spare_take` gave, unused.
     void spare_return(int64_t layer, uint64_t off);
+    /// After loading, before any reader runs: keeps more experts in RAM, in a second region placed after the first
+    /// in the offset space, hottest first (`rank`) as far as available RAM less the RAM margin allows.  `skip(l, e)`
+    /// names experts a GPU holds.  Returns the bytes added (0: nothing done); `count` gets the experts.
+    uint64_t top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,
+                    const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count);
     /// Debug: whether `bytes` equal the expert's bytes in the model files.
     bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
@@ -486,6 +492,13 @@ private:
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;
+    // the top-up region: offsets from complement_bytes_ on lie in it
+    void* top_arena_ = nullptr;
+    const uint8_t* top_device_ = nullptr;
+    uint64_t top_bytes_ = 0, top_locked_ = 0;
+    bool top_pinned_ = false;
+    /// The host address of a blob of `bytes` at offset `off` (either region), or nullptr.
+    const uint8_t* host_at(uint64_t off, uint64_t bytes) const;
     std::vector<uint64_t> complement_offsets_;
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered

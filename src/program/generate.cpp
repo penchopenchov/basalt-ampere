@@ -5347,6 +5347,17 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
+        if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
+            int64_t n_top = 0;
+            const uint64_t add = src.top_up(profile, [&](int32_t l, int32_t e) {
+                return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
+            }, o.resident_pin, n_top);
+            if (add > 0)
+                std::fprintf(stderr, "basalt generate: RAM top-up: +%.2f GiB, %lld experts (total %.2f GiB)\n",
+                             (double) add / 1073741824.0, (long long) n_top,
+                             (double) (src.resident_bytes() + add) / 1073741824.0);
+        }
         basalt::platform::stop_memory_watchdog();
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);

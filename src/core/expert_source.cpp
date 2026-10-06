@@ -413,6 +413,17 @@ void FileExpertSource::close() {
             std::free(complement_arena_);
         }
     }
+    if (top_arena_ != nullptr) {
+        if (top_pinned_) (void) cudaFreeHost(top_arena_);
+        else {
+            if (top_locked_ > 0) basalt::platform::unlock_resident(top_arena_, top_locked_);
+            std::free(top_arena_);
+        }
+    }
+    top_arena_ = nullptr;
+    top_device_ = nullptr;
+    top_bytes_ = top_locked_ = 0;
+    top_pinned_ = false;
     if (xstage_ != nullptr) {
         if (xstage_pinned_) (void) cudaFreeHost(xstage_);
         else std::free(xstage_);
@@ -477,9 +488,7 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
         // an expert held in RAM is not read from the file
-        if (complement_ready_ &&
-            detail::cache_complement_blob_or_fallback((size_t) l * (size_t) n_expert_ + (size_t) e, complement_offsets_,
-                                                      complement_host_, nullptr) != nullptr)
+        if (complement_ready_ && complement_offsets_[(size_t) l * (size_t) n_expert_ + (size_t) e] != kNoComplement)
             continue;
         if (const uint8_t* b = mapped_blob(l, e)) basalt::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
     }
@@ -498,8 +507,8 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
     if (complement_ready_) {
-        const uint8_t* held =
-            detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+        const uint8_t* held = complement_offsets_[index] != kNoComplement
+                                  ? host_at(complement_offsets_[index], bytes) : nullptr;
         if (held == nullptr && !override_.empty()) held = override_[index];
         if (held != nullptr) {
             std::memcpy(dst, held, (size_t) bytes);
@@ -899,6 +908,98 @@ bool FileExpertSource::pin_cache_complement(
     return true;
 }
 
+const uint8_t* FileExpertSource::host_at(uint64_t off, uint64_t bytes) const {
+    if (off < complement_bytes_)
+        return complement_host_ != nullptr && bytes <= complement_bytes_ - off ? complement_host_ + (size_t) off : nullptr;
+    const uint64_t o2 = off - complement_bytes_;
+    return top_arena_ != nullptr && o2 <= top_bytes_ && bytes <= top_bytes_ - o2 ? (const uint8_t*) top_arena_ + (size_t) o2
+                                                                                 : nullptr;
+}
+
+uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,
+                                  const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count) {
+    count = 0;
+    if (!complement_ready_ || top_arena_ != nullptr || !override_.empty() || !staged_.empty()) return 0;
+    bool known = false;
+    const uint64_t budget = basalt::platform::ram_budget(&known);
+    if (!known) return 0;
+    const uint64_t guard = 256ull << 20;   // the engine's own allocations after this reading
+    const uint64_t room = budget > guard ? budget - guard : 0;
+    // the experts no tier holds, hottest first, as many as fit
+    std::vector<std::pair<int32_t, int32_t>> pick;
+    std::vector<uint64_t> at;
+    std::vector<uint8_t> seen(complement_offsets_.size(), 0);
+    uint64_t total = 0;
+    auto consider = [&](int32_t l, int32_t e) {
+        if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return true;
+        const size_t i = (size_t) l * (size_t) n_expert_ + (size_t) e;
+        if (seen[i]) return true;
+        seen[i] = 1;
+        if (complement_offsets_[i] != kNoComplement || skip(l, e)) return true;
+        const uint64_t b = layer_blob_bytes_[(size_t) l];
+        if (b > room - total) return false;
+        pick.emplace_back(l, e);
+        at.push_back(total);
+        total += b;
+        return true;
+    };
+    bool more = true;
+    for (const auto& pr : rank) if (!(more = consider(pr.first, pr.second))) break;
+    for (int32_t l = 0; more && l < (int32_t) n_layers_; ++l)
+        for (int32_t e = 0; more && e < (int32_t) n_expert_; ++e) more = consider(l, e);
+    if (total == 0) return 0;
+    void* arena = nullptr;
+    const uint8_t* device = nullptr;
+    bool pinned_ok = false;
+    uint64_t locked = 0;
+    if (pin && cudaHostAlloc(&arena, (size_t) total, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+        void* alias = nullptr;
+        if (cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
+            device = (const uint8_t*) alias;
+            pinned_ok = true;
+        } else {
+            (void) cudaFreeHost(arena);
+            arena = nullptr;
+        }
+    }
+    (void) cudaGetLastError();
+    if (arena == nullptr) {
+        arena = std::malloc((size_t) total);
+        if (arena == nullptr) return 0;
+        if (pin) locked = basalt::platform::lock_resident(arena, total).locked_bytes;
+    }
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    auto worker = [&]() {
+        for (size_t k; (k = next.fetch_add(1)) < pick.size() && !failed.load();)
+            if (!copy_from_files(pick[k].first, pick[k].second, (uint8_t*) arena + (size_t) at[k])) failed.store(true);
+    };
+    {
+        const size_t threads = std::min<size_t>(6, pick.size());
+        std::vector<std::thread> pool;
+        for (size_t i = 1; i < threads; ++i) pool.emplace_back(worker);
+        worker();
+        for (auto& t : pool) t.join();
+    }
+    if (failed.load()) {
+        if (pinned_ok) (void) cudaFreeHost(arena);
+        else {
+            if (locked > 0) basalt::platform::unlock_resident(arena, locked);
+            std::free(arena);
+        }
+        return 0;
+    }
+    top_arena_ = arena;
+    top_device_ = device;
+    top_bytes_ = total;
+    top_locked_ = locked;
+    top_pinned_ = pinned_ok;
+    for (size_t k = 0; k < pick.size(); ++k)
+        complement_offsets_[(size_t) pick[k].first * (size_t) n_expert_ + (size_t) pick[k].second] = complement_bytes_ + at[k];
+    count = (int64_t) pick.size();
+    return total;
+}
+
 bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -939,7 +1040,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
 }
 
 uint8_t* FileExpertSource::spare_take(int64_t layer, uint64_t& off) {
-    if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || layer >= n_layers_) return nullptr;
+    if (!complement_ready_ || layer < 0 || layer >= n_layers_) return nullptr;
     const uint64_t need = layer_blob_bytes_[(size_t) layer];
     size_t pick = spare_free_.size();
     for (size_t i = spare_free_.size(); i-- > 0;)
@@ -948,14 +1049,14 @@ uint8_t* FileExpertSource::spare_take(int64_t layer, uint64_t& off) {
     off = spare_free_[pick].first;
     spare_free_[pick] = spare_free_.back();
     spare_free_.pop_back();
-    return (uint8_t*) complement_host_ + (size_t) off;
+    return (uint8_t*) host_at(off, need);
 }
 
 bool FileExpertSource::spare_land(int64_t layer, int64_t out, uint64_t off) {
     if (!complement_ready_ || layer < 0 || out < 0 || layer >= n_layers_ || out >= n_expert_) return false;
     const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i >= complement_offsets_.size() || complement_offsets_[i] != kNoComplement ||
-        off + layer_blob_bytes_[(size_t) layer] > complement_bytes_) return false;
+        host_at(off, layer_blob_bytes_[(size_t) layer]) == nullptr) return false;
     complement_offsets_[i] = off;
     ++exchanges_;
     return true;
@@ -1005,9 +1106,9 @@ bool FileExpertSource::copy_exchanges(uint64_t max_bytes) {
         const uint64_t lo = std::max(base, xcopy_at_), hi = std::min(base + x.bytes, end);
         const uint8_t* src = override_[x.out];
         const uint64_t at = complement_offsets_[x.in];
-        if (lo < hi && src != nullptr && at != kNoComplement && at <= complement_bytes_ &&
-            x.bytes <= complement_bytes_ - at && complement_host_ != nullptr)
-            std::memcpy((uint8_t*) complement_host_ + (size_t) (at + lo - base), src + (lo - base), (size_t) (hi - lo));
+        const uint8_t* dst = at != kNoComplement ? host_at(at, x.bytes) : nullptr;
+        if (lo < hi && src != nullptr && dst != nullptr)
+            std::memcpy((uint8_t*) dst + (size_t) (lo - base), src + (lo - base), (size_t) (hi - lo));
         base += x.bytes;
     }
     xcopy_at_ = std::min(end, base);
@@ -1026,9 +1127,9 @@ int64_t FileExpertSource::commit_exchanges() {
     for (const Exchange& x : staged_) {
         const uint8_t* src = override_[x.out];
         const uint64_t at = complement_offsets_[x.in];
-        if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr) {
-            if (!done) std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
+        const uint8_t* dst = at != kNoComplement ? host_at(at, x.bytes) : nullptr;
+        if (src != nullptr && dst != nullptr) {
+            if (!done) std::memcpy((uint8_t*) dst, src, (size_t) x.bytes);
             if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
         }
         override_[x.out] = nullptr;
@@ -1044,7 +1145,8 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     const uint8_t* result = nullptr;
     bool from_files = true;
     if (complement_ready_) {
-        result = detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+        result = complement_offsets_[index] != kNoComplement
+                     ? host_at(complement_offsets_[index], layer_blob_bytes_[(size_t) layer]) : nullptr;
         if (result != nullptr) {
             ram_reads_.fetch_add(1, std::memory_order_relaxed);
             from_files = false;
@@ -1064,19 +1166,22 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
 }
 
 bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (!complement_ready_ || !complement_pinned_ || complement_host_ == nullptr || layer < 0 || expert < 0 ||
-        layer >= n_layers_ || expert >= n_expert_) return false;
+    if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (index >= complement_offsets_.size() || complement_offsets_[index] == kNoComplement) return false;
+    if (complement_offsets_[index] >= complement_bytes_) return top_pinned_;
+    if (!complement_pinned_ || complement_host_ == nullptr) return false;
     // a partial pin (CS-T): only the registered prefix
     return !complement_partial_ ||
            complement_offsets_[index] + layer_blob_bytes_[(size_t) layer] <= complement_pin_limit_;
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
-    if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
+    if (!pinned(layer, expert)) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    return complement_device_ + (size_t) complement_offsets_[index];
+    const uint64_t off = complement_offsets_[index];
+    if (off < complement_bytes_ && complement_device_ == nullptr) return nullptr;
+    return off >= complement_bytes_ ? top_device_ + (size_t) (off - complement_bytes_) : complement_device_ + (size_t) off;
 }
 
 bool FileExpertSource::pcie_layer(int64_t layer) const {
