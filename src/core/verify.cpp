@@ -21,6 +21,7 @@
 #include "strata/kernels/dec_gdn.hpp"
 #include "strata/kernels/dense_tc.hpp"
 #include "strata/kernels/gr.hpp"
+#include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -150,6 +151,14 @@ bool dec_pk() { return dec_pk_mask() != 0; }
 // the wait kernel's programmatic dependent (its CUDA0 rows loaded while the wait spins)
 int dec_glue_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_GLUE"); return e ? std::atoi(e) : 0; }();
+    return m;
+}
+// STRATA_DEC_QSAF (bit mask): 1 = a QSA layer's indexer key, K/V projections, K/V post and indexer query projection
+// on the side stream beside the query projection; 2 = with 1, the indexer query projection after the query projection
+// on the main stream instead; 4 = the block scores skip a window whose selections are all the identity; 8 = the head's
+// hyper-connection read for every column in one launch
+int dec_qsaf_mask() {
+    static const int m = [] { const char* e = std::getenv("STRATA_DEC_QSAF"); return e ? std::atoi(e) : 0; }();
     return m;
 }
 // STRATA_DEC_COMMIT: 1 = the commit graph in two launches; 2 = its GDN part from STRATA_DEC_COMMIT_CTAS persistent
@@ -766,6 +775,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
         hist_snap_ = b.take<float>(T * HS);
+        ple_win_ = b.take<float>(2 * T * HC * N);
     };
     Bump count;
     carve(count);
@@ -1034,18 +1044,43 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const bool ple_batch_kv = ple_batch_env && dec_batch && n > 1 && ss.ple.w.key_bf16 != nullptr &&
                                       ss.ple.w.value_bf16 != nullptr && ple_native_bf16_enabled() &&
                                       ple_native_postops_enabled();
+            // STRATA_DEC_QSAF & 16: the rows' write, post-ops, history advance and snapshots in two launches, the
+            // value projection on the side stream beside the key's
+            const bool ple_win = (dec_qsaf_mask() & 16) && ple_batch_kv && !batch_rec_ && gr_native_mmvf_enabled();
+            cudaStream_t pside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
+            const bool ple_fork = ple_win && pside != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
             if (ple_batch_kv) {
                 try {
+                    if (ple_fork) {
+                        cudaEventRecord(ev_fork_, cs);
+                        cudaStreamWaitEvent(pside, ev_fork_, 0);
+                        bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.value_bf16,
+                                                  z_ + (size_t) tb * N, N, N, N, n, pside);
+                        cudaEventRecord(ev_join_, pside);
+                    }
                     bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.key_bf16,
                                               xn_ + (size_t) tb * HC * N, HC * N, N, HC * N, n, cs);
-                    bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.value_bf16,
-                                              z_ + (size_t) tb * N, N, N, N, n, cs);
+                    if (ple_fork) cudaStreamWaitEvent(cs, ev_join_, 0);
+                    else bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.value_bf16,
+                                                   z_ + (size_t) tb * N, N, N, N, n, cs);
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE multi: ") + e.what();
                     return false;
                 }
             }
-            for (int t = tb; t < te; ++t) {
+            if (ple_win) {
+                PleWindowArgs pa;
+                pa.R = Rt(tb); pa.block_out = bo_ + (size_t) tb * N; pa.inject = inj2_ + (size_t) tb * HC;
+                pa.key = xn_ + (size_t) tb * HC * N; pa.value = z_ + (size_t) tb * N; pa.history = ss.ple.hist;
+                pa.hist_snap = hist_snap_ + (size_t) tb * HS; pa.scratch = ple_win_; pa.T = n;
+                try {
+                    native_ple_window(pa, ss.ple.w, cs);
+                } catch (const std::exception& e) {
+                    err = std::string("verify PLE window: ") + e.what();
+                    return false;
+                }
+            }
+            for (int t = tb; t < te && !ple_win; ++t) {
                 gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                 PleOut po;
                 po.normalized = normalized;
@@ -1278,6 +1313,68 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
+                // STRATA_DEC_QSA=1: the K norm + RoPE, the INT8 appends, the tail snapshot and the indexer appends of the
+                // group's rows in one launch, the same bits
+                const bool fused_pre = dec_qsa && !batch_rec_ && st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
+                                       native_qsa_enabled() && native_rope_enabled() && qsa_dec_fused_supported(s);
+                auto kv_post_args = [&] {
+                    QsaDecKvPost kp;
+                    kp.kcur = kcur_ + tb * NKV * HD; kp.vcur = vcur_ + tb * NKV * HD; kp.pos_k = pos_k + tb * NKV;
+                    kp.k_norm = (const float*) wkn->data; kp.steps = step_ + tb * kStepCount;
+                    kp.k_q = st.k_q; kp.v_q = st.v_q; kp.k_scale = st.k_scale; kp.v_scale = st.v_scale;
+                    kp.page_table = st.page_table; kp.host = st.host;
+                    kp.idx_raw = idx_raw + tb * ID; kp.idx_k_norm = (const float*) wikn->data;
+                    kp.tail = st.idx_tail; kp.dead = st.idx_dead; kp.pooled = st.idx_pooled; kp.block_pos = st.idx_block_pos;
+                    kp.tail_snap = grp == 0 ? tail_snap_ + (size_t) qi * TS : nullptr;
+                    kp.max_cells = (int) st.max_cells; kp.eps = EPS;
+                    return kp;
+                };
+                auto q_post_args = [&] {
+                    QsaDecQPost qp;
+                    qp.q_full = qfull_ + tb * NH * 2 * HD; qp.qcur = qcur_ + tb * NH * HD; qp.pos_q = pos_ + tb * NH;
+                    qp.q_norm = (const float*) wqn->data; qp.q_idx = qidx_ + tb * IQ * ID; qp.pos_i = pos_i + tb * IQ;
+                    qp.idx_q_norm = (const float*) wiqn->data; qp.eps = EPS;
+                    return qp;
+                };
+                // STRATA_DEC_QSAF & 1: the indexer key, K/V and their post kernel (and the indexer query unless & 2) on
+                // the side stream while the main stream runs the query projection; joined before the query post
+                cudaStream_t qside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
+                const bool qsaf_side = (dec_qsaf_mask() & 1) && fused_pre && qb && qside != nullptr && ev_fork_ != nullptr &&
+                                       ev_join_ != nullptr;
+                if (qsaf_side) {
+                    const bool iq_main = (dec_qsaf_mask() & 2) != 0;
+                    {
+                        PdlScope ps(pdl);   // after the hc read
+                        native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                    }
+                    cudaEventRecord(ev_fork_, cs);
+                    cudaStreamWaitEvent(qside, ev_fork_, 0);
+                    {
+                        PdlScope pz(pdl, true);   // the side's first kernel follows the fork
+                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID,
+                                                  n, qside);
+                        dense_proj(32, wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD),
+                                   n, qside);
+                        dense_proj(32, wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD),
+                                   n, qside);
+                        qsa_dec_kv_post(kv_post_args(), n, s, rope_scaling(), qside);
+                        if (!iq_main)
+                            bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                                      IQ * ID, N, IQ * ID, n, qside);
+                    }
+                    cudaEventRecord(ev_join_, qside);
+                    {
+                        PdlScope pq(pdl);   // after the q8_1 kernel
+                        dense_proj(8, wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                   (int) (NH * 2 * HD), n, cs);
+                        if (iq_main)
+                            bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                                      IQ * ID, N, IQ * ID, n, cs);
+                    }
+                    cudaStreamWaitEvent(cs, ev_join_, 0);
+                    for (int i = 7; i <= 9; ++i) stamp(l, i, grp);
+                    qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
+                } else {
                 {
                     PdlScope ps(pdl);   // after the hc read, up to the K/V norms
                     native_quantize_q8_1(xm, xq_, (int) N, n, cs);
@@ -1288,21 +1385,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     dense_proj(32, wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                     dense_proj(32, wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 }
-                // STRATA_DEC_QSA=1: the K norm + RoPE, the INT8 appends, the tail snapshot and the indexer appends of the
-                // group's rows in one launch, the same bits
-                const bool fused_pre = dec_qsa && !batch_rec_ && st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
-                                       native_qsa_enabled() && native_rope_enabled() && qsa_dec_fused_supported(s);
                 if (fused_pre) {
-                    QsaDecKvPost kp;
-                    kp.kcur = kcur_ + tb * NKV * HD; kp.vcur = vcur_ + tb * NKV * HD; kp.pos_k = pos_k + tb * NKV;
-                    kp.k_norm = (const float*) wkn->data; kp.steps = step_ + tb * kStepCount;
-                    kp.k_q = st.k_q; kp.v_q = st.v_q; kp.k_scale = st.k_scale; kp.v_scale = st.v_scale;
-                    kp.page_table = st.page_table; kp.host = st.host;
-                    kp.idx_raw = idx_raw + tb * ID; kp.idx_k_norm = (const float*) wikn->data;
-                    kp.tail = st.idx_tail; kp.dead = st.idx_dead; kp.pooled = st.idx_pooled; kp.block_pos = st.idx_block_pos;
-                    kp.tail_snap = grp == 0 ? tail_snap_ + (size_t) qi * TS : nullptr;
-                    kp.max_cells = (int) st.max_cells; kp.eps = EPS;
-                    qsa_dec_kv_post(kp, n, s, rope_scaling(), cs);
+                    qsa_dec_kv_post(kv_post_args(), n, s, rope_scaling(), cs);
                     stamp(l, 8, grp);
                 } else {
                     if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
@@ -1360,11 +1444,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else for (int t = tb; t < te; ++t)
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qidx_ + t * IQ * ID, (int) N,
                                             (int) (IQ * ID), cs);
-                    QsaDecQPost qp;
-                    qp.q_full = qfull_ + tb * NH * 2 * HD; qp.qcur = qcur_ + tb * NH * HD; qp.pos_q = pos_ + tb * NH;
-                    qp.q_norm = (const float*) wqn->data; qp.q_idx = qidx_ + tb * IQ * ID; qp.pos_i = pos_i + tb * IQ;
-                    qp.idx_q_norm = (const float*) wiqn->data; qp.eps = EPS;
-                    qsa_dec_q_post(qp, n, s, rope_scaling(), cs);
+                    qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
                 } else if (qb) {
                     if (cudaMemcpy2DAsync(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD, (size_t) HD * 2 * 4,
                                           (size_t) HD * 4, (size_t) (n * NH), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
@@ -1393,6 +1473,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
                 }
                 }
+                }
                 stamp(l, 10, grp);
                 bool fused_gate = false;
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
@@ -1410,7 +1491,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 } else {
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs);
+                                 s, scores_ + (size_t) tb * max_blocks_, cs, -1, (dec_qsaf_mask() & 4) != 0);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                sel_ + (size_t) tb * cap_, cs);
                 stamp(l, 11, grp);
@@ -1652,7 +1733,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const char* e = std::getenv("STRATA_FUSE_HEAD_GR");
         return e && e[0] == '1';
     }();
-    const bool fuse_head_gr = fuse_head_gr_env && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
+    const bool fuse_head_gr = (fuse_head_gr_env || (dec_qsaf_mask() & 8)) && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
