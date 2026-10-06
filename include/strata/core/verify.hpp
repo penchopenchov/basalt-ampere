@@ -1,4 +1,4 @@
-// include/strata/core/verify.hpp - plan v0.3 P6: the speculative VERIFY window.
+// include/strata/core/verify.hpp - the speculative VERIFY window.
 //
 // T tokens at consecutive positions p0 .. p0+T-1 - the last accepted token and T-1 drafts - go through all 48
 // layers in ONE captured graph, and the head's argmax is produced for every one of them.  Token t's argmax is
@@ -8,7 +8,7 @@
 // expert rows).  So a draft is accepted exactly when greedy decode would have produced it.
 //
 // What the window costs is the dense weights read ONCE for T tokens and the union of the T tokens' missed
-// experts on the CPU (measured on decode traces: 1.75x one token's misses for T=2, 2.4x for 3, 3.05x for 4).
+// experts on the CPU.
 //
 // STATE.  The window appends K/V and indexer keys for all T positions and leaves the GDN state untouched.
 // `commit(n_keep)` then makes the first `n_keep` tokens permanent: the GDN conv history and recurrent state are
@@ -52,13 +52,13 @@ struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena
-    const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
-    int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
+    const uint64_t* slot_off = nullptr;   // host per-slot offsets when slots differ in size (null: slot * blob)
+    int64_t n_slots = 0;   // how many (for the device copy)
     int64_t blob = 0;
 };
 
-/// STRATA_VERIFY_PROFILE: the GPU's idle time between a verify window and the draft round after it, and back (from
-/// globaltimer stamps of the window's first and last kernels and the drafter's), summed for profile_report.
+/// --profile: the GPU's idle time between a verify window and the draft round after it, and back (from globaltimer
+/// stamps of the window's first and last kernels and the drafter's), summed for profile_report.
 struct DecodeGaps {
     unsigned long long verify_end = 0, draft_end = 0, verify_prev_end = 0;
     double v2d = 0, d2v = 0, draft_gpu = 0;
@@ -83,21 +83,21 @@ public:
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
-    /// STRATA_DEC_MOE=1: the peer expert tier the window drives itself (persistent kernel, mapped rings) instead of
-    /// the pool launching it per layer.  Before init.
+    /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
+    /// per layer.  Before init.
     void set_peer(PeerExperts* peer) { peer_ = peer; }
 
-    /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
+    /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
-    /// STRATA_DEC_MOE: the device plan's words while a window is stalled - the ring CUDA0 last published and its
-    /// tiers, and on the peer card the ring it was rung for, the ring it finished and whether its kernel still runs.
-    /// Empty without the device plan.
+    /// the device plan's words while a window is stalled - the ring CUDA0 last published and its tiers, and on the peer
+    /// card the ring it was rung for, the ring it finished and whether its kernel still runs.  Empty without the
+    /// device plan.
     std::string dm_note() const;
 
-    /// #267: raise every flag the window's spin kernels wait on past any ring (UINT32_MAX), so a window the GPU
-    /// cannot finish drains instead of staying resident, then wait up to `timeout_ms` for its streams.  For the
-    /// paths that give up on the engine (a timed-out window, the serve watchdog): the window then ran on whatever
-    /// the flags guarded, so this verifier refuses every later window.  True when the streams finished.
+    /// raise every flag the window's spin kernels wait on past any ring (UINT32_MAX), so a window the GPU cannot finish
+    /// drains instead of staying resident, then wait up to `timeout_ms` for its streams.  For the paths that give up on
+    /// the engine (a timed-out window, the serve watchdog): the window then ran on whatever the flags guarded, so this
+    /// verifier refuses every later window.  True when the streams finished.
     bool release_gpu_waits(int timeout_ms);
 
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
@@ -118,20 +118,19 @@ public:
         if (next_) next_->set_sampling(sp);
     }
 
-    /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
-    /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
-    /// front slots -1 (the kernel reads only the tail window).  Row t follows the window's drafts 1..t - staging
-    /// row 0 alone (before 0.1.19) left the drafted rows with unwritten histories.  Null disables the penalties
-    /// entirely - the neutral run's sampling call is byte-for-byte what it was.  The engine re-uploads the rows
-    /// before every window; the buffer must hold kVerifyMaxT rows and stay alive across the request.
+    /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
+    /// slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused front slots
+    /// -1 (the kernel reads only the tail window).  Row t follows the window's drafts 1..t.  Null disables the
+    /// penalties entirely - the neutral run's sampling call is byte-for-byte the plain one.  The engine re-uploads the
+    /// rows before every window; the buffer must hold kVerifyMaxT rows and stay alive across the request.
     void set_history(const int32_t* history, int history_len) {
         hist_d_ = history;
         hist_len_ = history_len;
         if (next_) next_->set_history(history, history_len);
     }
-    /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
-    /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
-    /// or sync and never read a history staged for another position.
+    /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose picks are
+    /// discarded - a prompt read through windows commits every token - so they cost no sampler launch or sync and
+    /// never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
@@ -149,16 +148,16 @@ public:
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
-    /// STRATA_DEC_HC8=1: the 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current
-    /// device; called before the expert cache takes the free memory.
+    /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device; called
+    /// before the expert cache takes the free memory.
     static void prepare_hc8(const WeightTable& wt, const ModelGeometry& g);
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  `parts`: 1 launches
     /// the commit graph, 2 advances `ss.ple_prev` (3: both, in that order).
     bool commit(int n_keep, std::string& err, int parts = 3);
-    /// STRATA_DEC_CHAIN=1: the decode loop's host work off the GPU's critical path (see run() and the serve loop)
+    /// The decode loop's host work off the GPU's critical path (see run() and the serve loop)
     static bool chain_on();
-    /// STRATA_DEC_MOE: the residency tables uploaded now (between windows) rather than at the next run()
+    /// the residency tables uploaded now (between windows) rather than at the next run()
     bool dm_presync(std::string& err) { return dm_ == nullptr || dm_sync(err); }
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
@@ -169,7 +168,7 @@ public:
     // Everything that is per row already (hyper-connections, dense projections, router, shared expert, the
     // routed experts on the GPU and the CPU, the head) runs once over the S rows, so the weights are read once
     // per window for all the sequences.  Row s's arithmetic is the single-token window's, so a slot's greedy
-    // tokens are its solo greedy tokens (modulo the multi-token CPU kernel choice: STRATA_IQ_MT_MIN=1).
+    // tokens are its solo greedy tokens (modulo the multi-token CPU kernel choice).
     //
     // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
@@ -207,20 +206,11 @@ public:
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
-    /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
+    /// path, the end of a run) calls wait_commit() first.
     static void set_commit_async(bool on);
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
-
-    /// Measurement hook (STRATA_LOGPOS): after run(), write one line per row t of the last window's head -
-    /// "pos target logprob top top_logprob hit extra_logprob target_logprob_without_extra" - where row t is the
-    /// distribution at pos0 + t, targets[t] is the token at pos0 + t + 1, extra_logprob is the log-probability of
-    /// `extra_id` in the same row, and the last column is the target's log-probability in that row renormalized
-    /// over every token but `extra_id` (both nan when they do not apply).  A layer split's earlier stage forwards
-    /// to the stage that holds the head.
-    bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
-                         std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -229,33 +219,32 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
-    /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
-    /// of the other (default on).  Set before the first `run`.
+    /// Split the window into two token groups and pipeline the CPU experts of one with the GPU work of the other
+    /// (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
-    /// Plan v0.3 P6: how the PCIe share of the misses reaches the GPU: 0 = DMA into staging (the copy engine works
-    /// beside the CPU; best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped
-    /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
-    /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
+    /// How the PCIe share of the misses reaches the GPU: 0 = DMA into staging (the copy engine works beside the CPU;
+    /// best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped arena directly,
+    /// 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when the CPU is
+    /// RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     double ms_launch = 0;   ///< host time inside the window graph's launch
     int64_t windows = 0;
-    /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
-    /// window), as one line; empty when off.
+    /// --profile: GPU stage times of the windows since the last call (ms per window), as one line; empty when off.
     std::string profile_report();
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     PeerExperts* peer_ = nullptr;
-    DecMoe* dm_ = nullptr;                 ///< STRATA_DEC_MOE=1: the device-planned MoE tail (null: off)
+    DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     void dm_free();
     std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)
     bool capture(int T, std::string& err);
-    bool pdl_rec_ = false;                 ///< STRATA_PDL=1: record_window may use programmatic dependent launch
+    bool pdl_rec_ = false;   // record_window may use programmatic dependent launch
     bool pdl_off_ = false;                 ///< ... a window failed to capture with it: the later ones go without
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
@@ -283,7 +272,7 @@ private:
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
-    void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
+    void collect_profile();   // --profile: add the last window's stamps to prof_sum_
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {
@@ -292,15 +281,15 @@ private:
         s.temperature = 0.0f;
         return s;
     }();   ///< greedy by default; per-request via set_sampling
-    const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
+    const int32_t* hist_d_ = nullptr;   // penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
-    std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
+    std::atomic<bool> released_{false};   // release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
-    bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
-    uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
-    unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
+    bool device_plan_ = false;   // resident-only layers planned on the device
+    uint32_t* skip_ = nullptr;   // per group, the ring whose plan the device built (0: the host's)
+    unsigned long long* slot_off_d_ = nullptr;   // the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
@@ -333,11 +322,11 @@ private:
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
-    cudaStream_t sh_hi_ = nullptr;   ///< STRATA_DEC_PK: the shared expert's side stream at the greatest priority
+    cudaStream_t sh_hi_ = nullptr;   // the shared expert's side stream at the greatest priority
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
-    cudaStream_t qs_[3] = {nullptr, nullptr, nullptr};   ///< STRATA_DEC_QSAF & 32: a QSA layer's three branches
+    cudaStream_t qs_[3] = {nullptr, nullptr, nullptr};   // dec_qsaf_mask & 32: a QSA layer's three branches
     cudaEvent_t qev_[4] = {nullptr, nullptr, nullptr, nullptr};
-    cudaStream_t ring_hi_ = nullptr;   ///< STRATA_DEC_PK & 4: the MoE ring's stream at the greatest priority
+    cudaStream_t ring_hi_ = nullptr;   // dec_pk_mask & 4: the MoE ring's stream at the greatest priority
     cudaEvent_t ev_ring_ = nullptr, ev_ring_join_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
@@ -393,14 +382,14 @@ private:
     static constexpr int64_t kStagingBlobs = 16;
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
-    uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+    uint8_t* nat_xq_ = nullptr;   // q8_1 activations for a native pack's grouped experts
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
-    float* ple_win_ = nullptr;                                // 2 * T * NG_HC_DIM (STRATA_DEC_QSAF & 16)
+    float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM (dec_qsaf_mask & 16)
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
