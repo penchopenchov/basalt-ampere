@@ -1,4 +1,4 @@
-// include/strata/kernels/pdl.hpp - programmatic dependent launch (opt-in: STRATA_PDL=1).
+// include/strata/kernels/pdl.hpp - programmatic dependent launch.
 //
 // A kernel started through launch_pdl inside a PdlScope may begin while the kernel before it on the stream is still
 // finishing.  Every such kernel calls pdl_wait() on every path before it reads memory an earlier kernel writes and
@@ -6,42 +6,22 @@
 // kernels before it on the stream have completed and their writes are visible, so the results are those of the plain
 // launch.  Only the launch overlaps.
 //
-// launch_pdl is the plain <<<>>> launch outside a PdlScope, with STRATA_PDL unset, on HIP, before CUDA 12.3, and on a
-// device or a kernel build below compute capability 9.0 (where pdl_wait() compiles to nothing).  pdl_wait() in a
+// launch_pdl is the plain <<<>>> launch outside a PdlScope, before CUDA 12.3, and on a device or a kernel build below
+// compute capability 9.0 (where pdl_wait() compiles to nothing).  pdl_wait() in a
 // kernel launched the plain way returns at once.
 #pragma once
 
-#include <cstdlib>
-
 namespace strata::kernels {
 
-inline bool pdl_requested() {
-    static const bool on = [] {
-        const char* e = std::getenv("STRATA_PDL");
-        return e != nullptr && e[0] == '1';
-    }();
-    return on;
-}
+inline constexpr bool pdl_requested() { return true; }
 
-/// STRATA_DEC_PDL2=1: the decode chain's kernels start their dependents early (pdl_launch_dependents) and stage their
-/// first weights before pdl_wait, so each stage's weight reads begin during the previous stage's tail.
-inline bool pdl2_requested() {
-    static const bool on = [] {
-        const char* e = std::getenv("STRATA_DEC_PDL2");
-        return e != nullptr && e[0] == '1';
-    }();
-    return on && pdl_requested();
-}
-/// The PDL2 parts in use (STRATA_DEC_PDL2_MASK, default all): 1 hc read trigger, 2 hc down weights before the wait,
-/// 4 dense GEMV rows into L2 before the wait, 8 dense GEMV trigger, 16 q8_1 trigger, 32 combine trigger + hc read and
-/// route as dependents, 64 GDN norm trigger.  0 without PDL2.
-inline int pdl2_mask() {
-    static const int m = [] {
-        const char* e = std::getenv("STRATA_DEC_PDL2_MASK");
-        return e != nullptr ? (int) std::strtol(e, nullptr, 0) : 0xff;
-    }();
-    return pdl2_requested() ? m : 0;
-}
+/// The decode chain's kernels start their dependents early (pdl_launch_dependents) and stage their first weights
+/// before pdl_wait, so each stage's weight reads begin during the previous stage's tail.
+inline constexpr bool pdl2_requested() { return true; }
+/// The PDL2 parts in use: 1 hc read trigger, 2 hc down weights before the wait, 4 dense GEMV rows into L2 before the
+/// wait, 8 dense GEMV trigger, 16 q8_1 trigger, 32 combine trigger + hc read and route as dependents, 64 GDN norm
+/// trigger.
+inline constexpr int pdl2_mask() { return 64; }
 
 struct PdlState {
     bool on = false;

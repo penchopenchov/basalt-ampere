@@ -1,4 +1,4 @@
-// include/strata/core/draft_cum.hpp - the cumulative draft-length rule (STRATA_DRAFT_CUM=<threshold>, off by default).
+// include/strata/core/draft_cum.hpp - the cumulative draft-length rule.
 //
 // With a min_p the MTP chain stops after the first draft whose own probability is below min_p.  This rule instead
 // keeps draft j while the estimated chance that drafts 0..j are ALL accepted stays at or above the threshold: the
@@ -8,8 +8,6 @@
 // and the device (the conditional draft graph) evaluate the same products in the same order, so they agree exactly.
 // Only what is proposed changes: acceptance and outputs stay exact.
 #pragma once
-
-#include <cstdlib>
 
 #if defined(__CUDACC__)
 #define STRATA_DRAFT_CUM_HD __host__ __device__
@@ -33,13 +31,7 @@ STRATA_DRAFT_CUM_HD inline bool draft_keep(const float* probs, int j, float min_
     return c >= th;
 }
 
-/// STRATA_DRAFT_CUM's threshold (0: off, the min_p rule).
-inline float draft_cum_env() {
-    static const float th = [] {
-        const char* e = std::getenv("STRATA_DRAFT_CUM");
-        return e != nullptr ? (float) std::atof(e) : 0.0f;
-    }();
-    return th;
-}
+/// The rule's threshold (0 would switch it off, the min_p rule).
+inline constexpr float draft_cum_env() { return 0.35f; }
 
 }  // namespace strata::core
