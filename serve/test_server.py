@@ -20,7 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine,  # noqa: E402
+from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, BasaltEngine,  # noqa: E402
                           engine_args, layer_split_value, prompt_tokens_seen, request_timings, serve,
                           start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -95,14 +95,14 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(b["input_tokens"], n_in)
 
     def test_request_line_parses_the_engine_summary(self):
-        line = ("strata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
+        line = ("basalt serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
         from serve.server import ENGINE_REQUEST
         m = ENGINE_REQUEST.search(line)
         self.assertIsNotNone(m)
         self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
         # #471: a request cancelled while its prompt was read says how far it got
-        m = ENGINE_REQUEST.search("strata serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
+        m = ENGINE_REQUEST.search("basalt serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
                                   "(699.6 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, "
                                   "0 checkpoints (cancelled)")
         self.assertIsNotNone(m)
@@ -311,7 +311,7 @@ class LiteralThinkTags(unittest.TestCase):
         self.assertIn("Hello, </think> is a tag.", self.tok.decode(ids))
 
     def test_the_real_tokenizer_reads_the_tag_as_text(self):
-        import strata_tokenizer as ST
+        import basalt_tokenizer as ST
         b2u = ST.bytes_to_unicode()
         tokens = [b2u[b] for b in range(256)] + ["<think>", "</think>", "<|im_end|>"]
         tok = ST.Tokenizer(tokens, [], [1] * 256 + [4, 4, 3])
@@ -725,7 +725,7 @@ class ClientShapes(unittest.TestCase):
                 raise BrokenPipeError("the encoder is gone")
 
         v = Vision.__new__(Vision)
-        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}
+        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="basalt-vision-test-")), threading.Lock(), {}
         v.proc = mock.Mock(stdin=Gone())
         with mock.patch.object(Vision, "load", return_value=b""), mock.patch.object(Vision, "normalize",
                                                                                    return_value=b"png"):
@@ -773,7 +773,7 @@ class SamplingKeys(unittest.TestCase):
     to fall back to the engine default 20); a penalty always carries its window."""
 
     def keys(self, **sampling):
-        return StrataEngine.sampling_keys(sampling).split()
+        return BasaltEngine.sampling_keys(sampling).split()
 
     def test_top_k(self):
         self.assertIn("top_k=10", self.keys(temperature=0.7, top_k=10))
@@ -960,7 +960,7 @@ class EngineDeath(unittest.TestCase):
 
 
 class DoneLineEngine(MockEngine):
-    """The mock engine whose `last` comes from a DONE line, parsed as StrataEngine parses it."""
+    """The mock engine whose `last` comes from a DONE line, parsed as BasaltEngine parses it."""
 
     def __init__(self, *a, done_lines=(), **kw):
         super().__init__(*a, **kw)
@@ -970,7 +970,7 @@ class DoneLineEngine(MockEngine):
         try:
             yield from super().generate(ids, max_new, sampling, cancel, embeddings)
         finally:
-            StrataEngine._parse_done(self, self.done_lines.pop(0))
+            BasaltEngine._parse_done(self, self.done_lines.pop(0))
 
 
 class DraftCounts(unittest.TestCase):
@@ -1137,24 +1137,24 @@ class DraftHeadHint(unittest.TestCase):
         return str(p), len(before.encode())
 
     def test_the_engines_hint_is_relayed(self):
-        p, off = self.log("strata mtp: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
-                          "strata mtp: hint: a smaller draft vocabulary needs less VRAM: --draft-vocab en (...)\n"
-                          "strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("basalt mtp: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
+                          "basalt mtp: hint: a smaller draft vocabulary needs less VRAM: --draft-vocab en (...)\n"
+                          "basalt serve: mtp: the draft head does not fit\n")
         h = start_failure_hint(p, off)
         self.assertIn("the draft head does not fit", h)
         self.assertIn("348 MiB", h)
         self.assertIn("--draft-vocab en", h)
 
     def test_an_older_engine_gets_the_advice_in_words(self):
-        p, off = self.log("strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("basalt serve: mtp: the draft head does not fit\n")
         self.assertIn("--draft-vocab en", start_failure_hint(p, off))
 
     def test_other_failures_and_earlier_starts_add_nothing(self):
-        p, off = self.log("strata serve: cannot open the pack\n")
+        p, off = self.log("basalt serve: cannot open the pack\n")
         self.assertEqual(start_failure_hint(p, off), "")
         # an earlier start's failure (before this start's offset) is not this one's
-        p, off = self.log("strata serve: cannot open the pack\n",
-                          before="strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("basalt serve: cannot open the pack\n",
+                          before="basalt serve: mtp: the draft head does not fit\n")
         self.assertEqual(start_failure_hint(p, off), "")
         self.assertEqual(start_failure_hint(None, 0), "")
         self.assertEqual(start_failure_hint(str(Path(tempfile.mkdtemp()) / "missing.log"), 0), "")
@@ -1167,9 +1167,9 @@ class StartFailureLog(unittest.TestCase):
         from serve.server import start_log_tail
         d = tempfile.mkdtemp()
         p = Path(d) / "engine.log"
-        before = "strata serve: an earlier start's line\n"
-        p.write_text(before + "".join(f"strata serve: line {i}\n" for i in range(30)) + "\n"
-                     "strata serve: cannot open the pack\n", encoding="utf-8")
+        before = "basalt serve: an earlier start's line\n"
+        p.write_text(before + "".join(f"basalt serve: line {i}\n" for i in range(30)) + "\n"
+                     "basalt serve: cannot open the pack\n", encoding="utf-8")
         tail = start_log_tail(str(p), len(before.encode()))
         self.assertIn("the engine log's last lines:", tail)
         self.assertIn("cannot open the pack", tail)
@@ -1185,9 +1185,9 @@ class StartFailureLog(unittest.TestCase):
 
     def test_the_start_error_has_them(self):
         import serve.server as server
-        fake = "import sys\nsys.stderr.write('strata serve: cannot open the pack packs/x\\n')\nsys.exit(2)\n"
+        fake = "import sys\nsys.stderr.write('basalt serve: cannot open the pack packs/x\\n')\nsys.exit(2)\n"
         with tempfile.TemporaryDirectory() as d:
-            script, log = Path(d) / "fake_strata.py", Path(d) / "strata.log"
+            script, log = Path(d) / "fake_basalt.py", Path(d) / "basalt.log"
             script.write_text(fake, encoding="utf-8")
             log.write_text("an earlier start\n", encoding="utf-8")
             real = server.subprocess.Popen
@@ -1195,7 +1195,7 @@ class StartFailureLog(unittest.TestCase):
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
                     mock.patch.object(server, "narrate_start", lambda *a, **k: None):
                 with self.assertRaises(RuntimeError) as cm:
-                    StrataEngine("strata", [], log=str(log))
+                    BasaltEngine("basalt", [], log=str(log))
             text = str(cm.exception)
             self.assertIn("exited before it was ready", text)
             self.assertIn("cannot open the pack packs/x", text)
@@ -1233,14 +1233,14 @@ class StartNarrator(unittest.TestCase):
         return out.getvalue()
 
     def test_a_mapped_start(self):
-        said = self.narrate(["--mmap-experts"], ["strata generate: experts via mmap (--mmap-experts; the GGUF shards "
+        said = self.narrate(["--mmap-experts"], ["basalt generate: experts via mmap (--mmap-experts; the GGUF shards "
                                                  "in place, no experts.bin)"])
         self.assertIn("mapping the experts from the model files", said)
         self.assertNotIn("loading the experts into RAM", said)
 
     def test_an_arena_start(self):
-        said = self.narrate([], ["strata generate: expert arena: resident, 31.64 GiB",
-                                 "strata generate: loaded 31.64 GiB at 3.17 GiB/s"])
+        said = self.narrate([], ["basalt generate: expert arena: resident, 31.64 GiB",
+                                 "basalt generate: loaded 31.64 GiB at 3.17 GiB/s"])
         self.assertIn("loading the experts into RAM (tens of GB)", said)
         self.assertIn("experts loaded: 31.64 GiB at 3.17 GiB/s", said)
 
@@ -1251,9 +1251,9 @@ class CancelledRead(unittest.TestCase):
 
     def test_parse_done_read_field(self):
         e = SimpleNamespace()
-        StrataEngine._parse_done(e, "DONE 0 98179 17565.0 0.0 cancel 0 0 0 0 0 0 0 0.0 12288")
+        BasaltEngine._parse_done(e, "DONE 0 98179 17565.0 0.0 cancel 0 0 0 0 0 0 0 0.0 12288")
         self.assertEqual((e.last["prompt_tokens"], e.last["prompt_read"], e.last["finish"]), (98179, 12288, "cancel"))
-        StrataEngine._parse_done(e, "DONE 0 98179 17565.0 0.0 cancel 0 0 0 0 0 0 0 0.0")
+        BasaltEngine._parse_done(e, "DONE 0 98179 17565.0 0.0 cancel 0 0 0 0 0 0 0 0.0")
         self.assertNotIn("prompt_read", e.last)
 
     def test_prompt_tokens_seen(self):
@@ -1323,7 +1323,7 @@ class LiveRate(unittest.TestCase):
         import io
         import queue
         from types import SimpleNamespace
-        engine = StrataEngine.__new__(StrataEngine)
+        engine = BasaltEngine.__new__(BasaltEngine)
         engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it (#208)
         engine.lines = queue.Queue()
         engine.can_stop = False
@@ -1435,7 +1435,7 @@ class SharedSettings(unittest.TestCase):
         cls.engine = Sampled(tok, "</think>\n\nhello", max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.svc.shared_path = os.path.join(cls.tmp.name, "strata-x.shared-settings.json")
+        cls.svc.shared_path = os.path.join(cls.tmp.name, "basalt-x.shared-settings.json")
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -1490,7 +1490,7 @@ class SharedSettings(unittest.TestCase):
         self.chat()
         self.assertNotIn("temperature", self.engine.last_sampling)
 
-    def test_only_strata_s_own_page_may_set_them(self):
+    def test_only_basalt_s_own_page_may_set_them(self):
         code, _ = self.req("/settings", None, {"Content-Type": "text/plain"}, raw=b'{"defaults": {"temperature": 1}}')
         self.assertEqual(code, 415)
         code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://evil.example"})
@@ -1512,7 +1512,7 @@ class SharedSettings(unittest.TestCase):
         finally:
             self.svc.api_key = ""
 
-    def test_proxy_headers_do_not_make_a_page_strata_s_own(self):
+    def test_proxy_headers_do_not_make_a_page_basalt_s_own(self):
         # #321: X-Forwarded-*, CF-Ray or CF-Connecting-IP say nothing about the page that sent the request - any web
         # page behind any proxy would otherwise change the settings (or run MCP tools)
         for extra in ({"X-Forwarded-Host": "proxy.example.com"}, {"CF-Ray": "1234567890"},
@@ -1524,11 +1524,11 @@ class SharedSettings(unittest.TestCase):
         code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://127.0.0.1:1"})
         self.assertEqual(code, 403)
 
-    def test_a_trusted_origin_is_strata_s_own_page(self):
+    def test_a_trusted_origin_is_basalt_s_own_page(self):
         # the web app behind a reverse proxy or tunnel: the config's trusted_origins
-        self.svc.trusted_origins = ["https://strata.example.com"]
+        self.svc.trusted_origins = ["https://basalt.example.com"]
         try:
-            code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://strata.example.com"})
+            code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://basalt.example.com"})
             self.assertEqual(code, 200)
             code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://evil.example.com"})
             self.assertEqual(code, 403)
@@ -1643,7 +1643,7 @@ class WebApp(unittest.TestCase):
         try:
             props = json.loads(self.get("/props")[2])
             self.assertEqual(props["model_path"], engine.model_path)
-            self.assertEqual(props["build_info"], "Strata 0.1.21")
+            self.assertEqual(props["build_info"], "basalt 0.1.21")
             for busy in (True, False):
                 with self.svc.status_lock:
                     self.svc.status["busy"] = busy
@@ -1681,7 +1681,7 @@ class WebApp(unittest.TestCase):
 
 
 class ClockedEngine(MockEngine):
-    """The mock engine with StrataEngine's clock: `last` as the engine's DONE line gives it, the conversation cache
+    """The mock engine with BasaltEngine's clock: `last` as the engine's DONE line gives it, the conversation cache
     holding the first REUSED tokens of every prompt."""
     REUSED = 5
 
@@ -1691,7 +1691,7 @@ class ClockedEngine(MockEngine):
             for t in super().generate(ids, max_new, sampling, cancel, embeddings):
                 n += 1
                 yield t
-        finally:          # as StrataEngine reads its DONE line: also when the server closes the request at a stop token
+        finally:          # as BasaltEngine reads its DONE line: also when the server closes the request at a stop token
             self.last = {"generated": n, "prompt_tokens": len(ids), "prompt_ms": 40.0, "decode_ms": 20.0 * n,
                          "finish": "stop", "reused": min(self.REUSED, len(ids)), "hits": 9, "lookups": 10}
 
@@ -1848,7 +1848,7 @@ class TimingsDrafts(unittest.TestCase):
 
 
 class UnloadableEngine(MockEngine):
-    """A mock engine that can be stopped and started again like StrataEngine (alive / unload / restart)."""
+    """A mock engine that can be stopped and started again like BasaltEngine (alive / unload / restart)."""
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -2199,7 +2199,7 @@ class StatusHandover(unittest.TestCase):
         self.assertNotIn("tail", svc.status)
 
 
-FAKE_STRATA = '''import pathlib, sys, time
+FAKE_BASALT = '''import pathlib, sys, time
 gate = pathlib.Path(sys.argv[sys.argv.index("--gate") + 1])
 print("INFO engine=0.0.0", flush=True)
 while not gate.exists():                     # the test says when the engine is "ready"
@@ -2210,12 +2210,12 @@ for line in sys.stdin:
         break
 '''
 
-FAKE_STRATA_FAIL_ONCE = '''import pathlib, sys, time
+FAKE_BASALT_FAIL_ONCE = '''import pathlib, sys, time
 fail = pathlib.Path(sys.argv[sys.argv.index("--fail") + 1])
 if fail.exists():                            # this start fails before READY (as one next to a dying engine did)
     fail.unlink()
     sys.exit(1)
-''' + FAKE_STRATA.split("\n", 1)[1]
+''' + FAKE_BASALT.split("\n", 1)[1]
 
 
 class RestartWindow(unittest.TestCase):
@@ -2226,13 +2226,13 @@ class RestartWindow(unittest.TestCase):
         from unittest import mock
         import serve.server as server
         with tempfile.TemporaryDirectory() as d:
-            script, gate = Path(d) / "fake_strata.py", Path(d) / "ready"
-            script.write_text(FAKE_STRATA, encoding="utf-8")
+            script, gate = Path(d) / "fake_basalt.py", Path(d) / "ready"
+            script.write_text(FAKE_BASALT, encoding="utf-8")
             real = server.subprocess.Popen
             with mock.patch.object(server.subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
                 gate.touch()
-                eng = StrataEngine("strata", ["--gate", str(gate)])
+                eng = BasaltEngine("basalt", ["--gate", str(gate)])
                 try:
                     self.assertEqual(eng.max_context, 4096)
                     self.assertTrue(eng.alive())
@@ -2274,14 +2274,14 @@ class RestartWindow(unittest.TestCase):
         from unittest import mock
         import serve.server as server
         with tempfile.TemporaryDirectory() as d:
-            script, gate, fail = Path(d) / "fake_strata.py", Path(d) / "ready", Path(d) / "fail_once"
-            script.write_text(FAKE_STRATA_FAIL_ONCE, encoding="utf-8")
+            script, gate, fail = Path(d) / "fake_basalt.py", Path(d) / "ready", Path(d) / "fail_once"
+            script.write_text(FAKE_BASALT_FAIL_ONCE, encoding="utf-8")
             real = server.subprocess.Popen
             with mock.patch.object(server.subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
-                 mock.patch.object(StrataEngine, "RESTART_RETRY_S", 0.0):
+                 mock.patch.object(BasaltEngine, "RESTART_RETRY_S", 0.0):
                 gate.touch()
-                eng = StrataEngine("strata", ["--gate", str(gate), "--fail", str(fail)])
+                eng = BasaltEngine("basalt", ["--gate", str(gate), "--fail", str(fail)])
                 try:
                     self.assertEqual(eng.max_context, 4096)
                     self.assertEqual(eng.known_ctx, 4096)
@@ -2424,7 +2424,7 @@ class SilentEngine(unittest.TestCase):
     def bare(self, silence, can_stop=False):
         import io
         import queue
-        engine = StrataEngine.__new__(StrataEngine)
+        engine = BasaltEngine.__new__(BasaltEngine)
         engine.proc = mock.Mock()
         engine.proc.stdin = io.StringIO()
         engine.proc.poll.return_value = None
@@ -2452,7 +2452,7 @@ class SilentEngine(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 5)
         engine.proc.kill.assert_called_once()
         self.assertFalse(engine.alive())                          # the next request restarts it
-        self.assertIn("#481", engine.death_note())
+        self.assertIn("lost step", engine.death_note())
         self.assertNotIn("STOP", engine.proc.stdin.getvalue())    # nothing is listening: no STOP, no drain
 
     def test_prompt_chunks_set_the_wait(self):
@@ -2525,12 +2525,12 @@ class LostStep(unittest.TestCase):
     def run_mode(self, mode, stream):
         import serve.server as server
         with tempfile.TemporaryDirectory() as d:
-            script, mark = Path(d) / "fake_strata.py", Path(d) / "lost"
+            script, mark = Path(d) / "fake_basalt.py", Path(d) / "lost"
             script.write_text(FAKE_LOST_STEP, encoding="utf-8")
             real = server.subprocess.Popen
             with mock.patch.object(server.subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
-                eng = StrataEngine("strata", ["--mark", str(mark), "--mode", mode])
+                eng = BasaltEngine("basalt", ["--mark", str(mark), "--mode", mode])
                 eng.silence_s = 0.5
                 tok = ByteTokenizer()
                 svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
