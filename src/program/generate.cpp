@@ -515,7 +515,7 @@ void usage() {
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-io direct|mmap|ram  n-gram table reads. direct (default): unbuffered SSD\n"
                  "                       reads, the table never enters RAM or the file cache; mmap: A/B arm;\n"
-                 "                       ram: mmap with the whole table locked in RAM at start (Linux/macOS)\n"
+                 "                       ram: mmap with the whole table locked in RAM at start\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
@@ -567,7 +567,7 @@ void usage() {
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
                  "  --dump-layers PATH   write R after EVERY layer, per position: the bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
-                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
+                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from basalt-vision)\n"
@@ -3562,8 +3562,8 @@ int main(int argc, char** argv) {
     }
 
     std::FILE* dump = nullptr;
-    // The logits header is written WITH THE FIRST ROW, not at open: a native pack never reaches the
-    // per-token dump site, and a header promising rows that were never written is worse than no file.
+    // The logits header is written WITH THE FIRST ROW, not at open: a header promising rows that were never
+    // written is worse than no file.
     int32_t hdr[2] = {0, 0};
     bool hdr_written = false;
     const int64_t dump_positions = (int64_t) o.tokens.size() - 1 + o.max_new;
@@ -5100,7 +5100,7 @@ int main(int argc, char** argv) {
         std::thread([&] {
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
-            // std::exit) would hang in exit() on Linux, and the server would wait for it forever
+            // std::exit) would hang in exit(), and the server would wait for it forever
             std::string l, buf;
             char chunk[4096];
             auto getline_fd = [&](std::string& out) -> bool {

@@ -159,9 +159,9 @@ struct Alt {
 
 /// `x*y + z` with the product ROUNDED first, i.e. no FMA contraction.
 ///
-/// MSVC contracts `ss += v*v` into an FMA even under /fp:precise, so the reference was MORE accurate than
-/// the kernel's explicit `__fadd_rn(__fmul_rn(v, v))` and the spare key came out one bit different in 7 of
-/// 128 components.  The kernel's arithmetic is what is under test, so the reference REPRODUCES it instead of
+/// A host compiler may contract `ss += v*v` into an FMA, which makes the reference MORE accurate than
+/// the kernel's explicit `__fadd_rn(__fmul_rn(v, v))` and the spare key come out one bit different in some
+/// components.  The kernel's arithmetic is what is under test, so the reference REPRODUCES it instead of
 /// beating it; `volatile` is what stops the compiler re-fusing the two operations.
 double mul_add_plain(double x, double y, double z) {
     const volatile double p = x * y;

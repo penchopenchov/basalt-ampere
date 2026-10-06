@@ -327,7 +327,7 @@ void cpu_require_expert_support() {
     if (f.usable()) return;
     std::fprintf(stderr,
                  "basalt: this CPU cannot run the expert kernel: %s.\n"
-                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
+                 "        The engine needs AVX512-VNNI and AVX512-VBMI.\n"
                  "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
                  f.reason());
     std::exit(1);

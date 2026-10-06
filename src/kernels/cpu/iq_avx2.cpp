@@ -1,7 +1,6 @@
 // src/kernels/cpu/iq_avx2.cpp - the i-quant expert rows in 256-bit lanes, several tokens at once.
 //
-// The AVX-512 kernels' (iq_avx512.cpp) multi-token scheme on the CPUs without AVX-512 (AMD Zen 2/3, Intel
-// Core 12th-14th gen and Core Ultra): each 32-value chunk is decoded once - grid lookups, one sign vector,
+// The AVX-512 kernels' (iq_avx512.cpp) multi-token scheme on the CPUs without AVX-512: each 32-value chunk is decoded once - grid lookups, one sign vector,
 // one scale vector - and every token of the verify window applies them with a load, a `sign`, a `maddubs`,
 // a `madd` and an `add`.  ggml-cpu's own AVX2 dot products for these formats are single-token: every token
 // re-does the codebook lookups and the sign expansion.  The sign vector is ggml's bit_selector pattern
