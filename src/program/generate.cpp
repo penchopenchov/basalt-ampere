@@ -2784,7 +2784,7 @@ int main(int argc, char** argv) {
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
-    for (int r = 1; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0 && !early_remote) {
+    for (int r = 1; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
         double free_gib = 0;
         if (!strata::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -6310,13 +6310,6 @@ int main(int argc, char** argv) {
                     p.lent_chunk = want;
                 }
                 if (any) res_upload();
-                if (trace) {
-                    int64_t n_lent = 0;
-                    for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
-                    std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
-                                 (long long) want, std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
-                    std::fflush(stderr);
-                }
                 return true;
             };
             // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
@@ -6401,11 +6394,6 @@ int main(int argc, char** argv) {
                     } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
                     ++il_parts;
                     il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
-                    if (trace) {
-                        std::fprintf(stderr, "strata trace: prompt chunk to %lld, then the slots decoded %.0f ms\n",
-                                     (long long) q, std::chrono::duration<double, std::milli>(Clock::now() - td).count());
-                        std::fflush(stderr);
-                    }
                 }
                 return true;
             };
@@ -6482,12 +6470,6 @@ int main(int argc, char** argv) {
                 }
                 const auto tsp = Clock::now();
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
-                if (trace) {
-                    std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
-                                 win ? "windows" : "batched",
-                                 std::chrono::duration<double, std::milli>(Clock::now() - tsp).count());
-                    std::fflush(stderr);
-                }
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
