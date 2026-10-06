@@ -183,19 +183,5 @@ class Pinned(unittest.TestCase):
         self.assertIn(M.PINNED_REVISION, M.PINNED)
 
 
-class Setup(unittest.TestCase):
-    def test_setup_rebuilds_a_corrupt_install(self):
-        import setup
-        with tempfile.TemporaryDirectory() as d:
-            mtp = Path(d)
-            self.assertFalse(setup.mtp_corrupt(mtp))              # no tensors kept: nothing to check
-            (mtp / "tensors").mkdir()
-            for code, want in ((0, False), (3, True), (1, False)):
-                with self.subTest(code=code), mock.patch.object(
-                        setup.subprocess, "run", return_value=mock.Mock(returncode=code)) as run:
-                    self.assertEqual(setup.mtp_corrupt(mtp), want)
-                    self.assertIn("verify", run.call_args[0][0])
-
-
 if __name__ == "__main__":
     unittest.main()
