@@ -118,12 +118,13 @@ constexpr int kDmDiagWords = 16;
 /// The abort record in words (empty when diag[0] is 0).
 std::string dec_moe_peer_diag(const uint32_t* diag);
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff);
-/// Blocks the peer kernel runs with on the current device (all co-resident); 0 when it cannot run there.
-int dec_moe_peer_blocks();
+/// Blocks the peer kernel runs with on the current device (all co-resident); 0 when it cannot run there.  q2: the
+/// kernel for a model with Q2_0 gate/up layers (as dec_moe_peer_launch's).
+int dec_moe_peer_blocks(bool q2 = false);
 /// Whether the persistent kernels cover this layer's expert formats.
 bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Launches the peer window (cooperative) on `stream` of the current device; false on a launch error.
-bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream);
+bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2 = false);
 
 /// STRATA_DM_WAIT_STATS: per layer, the times of the doorbell, CUDA0's own work done and each tier landed (CUDA0's
 /// clock), summed per peer-entry count and per layer.  Words: [0, 4) the layer's times; kDmStatBucket + 8 b + j for

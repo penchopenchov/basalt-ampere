@@ -169,7 +169,7 @@ void stress(const strata::GgufFile& gguf, int l, int gt, int dt, int windows) {
     float* ref1 = dmal<float>((size_t) K::kDmCap * H);
     Groups G;
     G.upload();
-    const int pblocks = K::dec_moe_peer_blocks();
+    const int pblocks = K::dec_moe_peer_blocks(L.gu_type == 42);
     ck(cudaSetDevice(0), "dev0");
     ck(cudaStreamCreateWithFlags(&s0, cudaStreamNonBlocking), "stream");
     uint8_t* blob0 = dmal<uint8_t>((size_t) NX0 * L.bytes);
@@ -204,7 +204,7 @@ void stress(const strata::GgufFile& gguf, int l, int gt, int dt, int windows) {
         pa.done_m = h_words + 32; pa.rows_m = h_peer; pa.ptr = d_ptab; pa.lay = d_lay;
         pa.n_expert = (int) NE; pa.k = (int) KK; pa.n_embd = (int) H; pa.n_ff = (int) FF; pa.steps = steps;
         pa.scratch = pscr; pa.arrive = parr; pa.diag_m = h_diag;
-        if (!K::dec_moe_peer_launch(pa, pblocks, s1)) std::exit(2);
+        if (!K::dec_moe_peer_launch(pa, pblocks, s1, L.gu_type == 42)) std::exit(2);
         ck(cudaSetDevice(0), "dev0");
     };
     auto stream_wait = [&](int dev, cudaStream_t s, double sec) {
@@ -920,7 +920,7 @@ int main(int argc, char** argv) {
             ck(cudaMemcpy(d_lay, lays.data(), 64 * sizeof(K::NativeExpertLayout), cudaMemcpyHostToDevice), "lay");
             void* pscr = dmal<uint8_t>(K::dec_moe_peer_scratch_bytes((int) H, (int) FF));
             unsigned int* parr = dmal<unsigned int>(4);
-            const int pblocks = K::dec_moe_peer_blocks();
+            const int pblocks = K::dec_moe_peer_blocks(L.gu_type == 42);
             ck(cudaSetDevice(0), "dev0");
             const int T = 3, n = T * (int) KK;
             // one routing for every ring; peer entries guaranteed
@@ -941,7 +941,7 @@ int main(int argc, char** argv) {
                     pa.done_m = h_words + 32; pa.rows_m = h_peer; pa.ptr = d_ptab; pa.lay = d_lay;
                     pa.n_expert = (int) NE; pa.k = (int) KK; pa.n_embd = (int) H; pa.n_ff = (int) FF; pa.steps = rings;
                     pa.scratch = pscr; pa.arrive = parr;
-                    if (!K::dec_moe_peer_launch(pa, pblocks, s1)) std::exit(2);
+                    if (!K::dec_moe_peer_launch(pa, pblocks, s1, L.gu_type == 42)) std::exit(2);
                     ck(cudaSetDevice(0), "dev0");
                 }
                 for (int r = 0; r < rings; ++r) {
@@ -1020,7 +1020,7 @@ int main(int argc, char** argv) {
                     pa.done_m = h_words + 32; pa.rows_m = h_peer; pa.ptr = d_ptab; pa.lay = d_lay;
                     pa.n_expert = (int) NE; pa.k = (int) KK; pa.n_embd = (int) H; pa.n_ff = (int) FF; pa.steps = RINGS;
                     pa.scratch = pscr; pa.arrive = parr; pa.stamps_m = h_st;
-                    if (!K::dec_moe_peer_launch(pa, pblocks, s1)) std::exit(2);
+                    if (!K::dec_moe_peer_launch(pa, pblocks, s1, L.gu_type == 42)) std::exit(2);
                     ck(cudaSetDevice(0), "dev0");
                     std::vector<double> rt;
                     for (int r = 0; r < RINGS; ++r) {

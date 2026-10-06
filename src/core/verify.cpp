@@ -102,6 +102,7 @@ struct DecMoe {
     void* pscr = nullptr;
     unsigned int* parr = nullptr;
     int pblocks = 0;
+    bool pq2 = false;   // a layer's gate/up is Q2_0: the peer kernel's Q2_0 build
     bool peer_live = false;                  ///< a peer window was launched and not yet waited for
 };
 
@@ -274,8 +275,6 @@ const int64_t g_test_stall = [] {
     const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
     return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
 }();
-// a dense projection of the window: dense_tc where STRATA_DEC_DTC has the projection's bit and the type, else
-// native_mmvq (either one for every window width, so a column's value never depends on T)
 // one stderr line per distinct fast-path fallback (what, a, b)
 void note_fallback(const char* what, int a, int b) {
     static std::mutex mu;
@@ -284,6 +283,8 @@ void note_fallback(const char* what, int a, int b) {
     if (seen.insert({what, a, b}).second)
         std::fprintf(stderr, "strata verify: fallback: %s (types %d / %d)\n", what, a, b);
 }
+// a dense projection of the window: dense_tc where STRATA_DEC_DTC has the projection's bit and the type, else
+// native_mmvq (either one for every window width, so a column's value never depends on T)
 void dense_proj(int bit, int type, const void* w, const void* xq, float* y, int n_in, int n_out, int n, void* s) {
     if ((kernels::dense_tc_mask() & bit) && kernels::dense_tc_supported(type, n_in, n_out, w) &&
         kernels::dense_tc_type_on(type))
@@ -512,8 +513,9 @@ bool Verifier::dm_init(std::string& err) {
         for (int64_t l = 0; l < g.n_layers; ++l) {
             const auto& f = lay.fmt[(size_t) l];
             ls[(size_t) l] = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            d->pq2 |= f.gu_type == 42;
         }
-        d->pblocks = dec_moe_peer_blocks();
+        d->pblocks = dec_moe_peer_blocks(d->pq2);
         ok = d->pblocks > 0 && cudaStreamCreateWithFlags(&d->ps, cudaStreamNonBlocking) == cudaSuccess &&
              cudaMalloc((void**) &d->ptab, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab, 0, (size_t) LE * 8) == cudaSuccess &&
@@ -2456,7 +2458,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
             pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) strata::kernels::cpu::expert_layout().fmt[0].n_ff;
             pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
-            if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess || !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps)) {
+            if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
+                !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
                 err = "verify: the peer window did not launch";
                 return false;
             }

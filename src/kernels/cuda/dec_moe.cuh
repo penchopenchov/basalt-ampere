@@ -671,17 +671,18 @@ __device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm,
 // counted in done[g] when finished, then down items (group, kDmSpan rows) the same way, a group's first down item
 // on a block waiting until done[g] holds all of its gate/up items.  A block never waits during its gate/up items, so
 // with a co-resident grid every wait ends.  The rows are native_expert_grouped's, bit for bit.
-template<int TG, int TD>
+template<int TG, int TD, bool Q2 = false>
 __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, float* gate,
                            float* up, float* out, unsigned int* done, int b, int nb, bool gu2 = false,
                            const DmWatch* watch = nullptr) {
     const int tid = threadIdx.x;
     if (tid == 0) sm.stop = 0;
     constexpr bool SG = kStageIqGrid<TG>;
-    // gu2: gate/up items of GU2_ROWS rows, two a warp (native_gu2_kernel's rows, the same bits)
-    const bool g2 = kGu2<TG> && gu2 && gu2_usable(L);
+    // gu2: gate/up items of GU2_ROWS rows, two a warp (native_gu2_kernel's rows, the same bits); Q2: Q2_0's too
+    constexpr bool K2 = Q2 ? kGu2Q2<TG> : kGu2<TG>;
+    const bool g2 = K2 && gu2 && gu2_usable(L);
     const uint32_t* s_grid;
-    if constexpr (kGu2<TG>) s_grid = g2 ? gu2::stage_grid<TG>(sm.grid, tid) : stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
+    if constexpr (K2) s_grid = g2 ? gu2::stage_grid<TG>(sm.grid, tid) : stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
     else s_grid = stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
     const int ng = sm.ng;
     const int ir = g2 ? GU2_ROWS : GU_ROWS;
@@ -689,7 +690,7 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     const int warp = tid >> 5, lane = tid & 31;
     for (int it = b; it < ng * nrb; it += nb) {
         const int g = it / nrb, rb = it - g * nrb;
-        if constexpr (kGu2<TG>) {
+        if constexpr (K2) {
             const int row = rb * GU2_ROWS + 2 * warp;
             if (g2) {
                 if (row < 2 * L.n_ff)
@@ -750,11 +751,13 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     X(16, 20) X(17, 20) X(18, 20) X(21, 20) X(22, 20) X(23, 20) X(29, 20) X(42, 20) \
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42)
 
+template<bool Q2 = false>
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
                                float* out, unsigned int* done, int b, int nb, bool gu2 = false,
                                const DmWatch* watch = nullptr) {
     switch (L.gu_type * 100 + L.d_type) {
-#define STRATA_DM_CASE(TG, TD) case TG * 100 + TD: dm_experts<TG, TD>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
+#define STRATA_DM_CASE(TG, TD) \
+        case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
         STRATA_DM_PAIRS(STRATA_DM_CASE)
 #undef STRATA_DM_CASE
         default: break;
@@ -809,6 +812,8 @@ __device__ __forceinline__ bool dm_grid_sync(const DmWatch& w, unsigned int* bar
 // runs its work items with the rows written straight to mapped memory; the last block to finish raises `done`.
 // Every wait inside a ring is bounded: a down wait past kDmWaitLimitNs, a corrupt ring or the host's release aborts
 // the window (a record in diag_m, done_m past every ring) and the kernel exits.
+// Q2: Q2_0 gate/up rows two a warp as well (a build of its own, so the other formats' kernel stays as it was)
+template<bool Q2>
 __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     __shared__ DmShared sm;
     __shared__ uint32_t s_seq;
@@ -898,7 +903,8 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         }
         if (big && tid == 0) dm_abort(w, &sm, 2u, 0u, -1, 0u, 0u);
         stamp(s, 2);
-        if (!bad && !big) dm_experts_any(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w);
+        if (!bad && !big)
+            dm_experts_any<Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w);
         stamp(s, 3);
         __threadfence_system();
         ++served;
@@ -1688,11 +1694,12 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
     return gu && d && n_ff == 640 && n_embd % 256 == 0 && !g_old_kernels && !g_grouped_v1;
 }
 
-int dec_moe_peer_blocks() {
+int dec_moe_peer_blocks(bool q2) {
     int dev = 0, sms = 0, coop = 0, per = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev) != cudaSuccess ||
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_peer_kernel, kDmThreads, 0) != cudaSuccess) {
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, q2 ? dm_peer_kernel<true> : dm_peer_kernel<false>, kDmThreads,
+                                                      0) != cudaSuccess) {
         cudaGetLastError();
         return 0;
     }
@@ -1700,12 +1707,13 @@ int dec_moe_peer_blocks() {
     return sms * per;
 }
 
-bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream) {
+bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2) {
     DmPeerArgs args = a;
     static const int gu2_env = [] { const char* v = std::getenv("STRATA_DEC_GU2"); return v ? std::atoi(v) : 0; }();
     if (gu2_env > 0) args.gu2 = 1;
     void* params[] = {&args};
-    const cudaError_t e = cudaLaunchCooperativeKernel((const void*) dm_peer_kernel, dim3((unsigned) blocks),
+    const cudaError_t e = cudaLaunchCooperativeKernel((const void*) (q2 ? dm_peer_kernel<true> : dm_peer_kernel<false>),
+                                                      dim3((unsigned) blocks),
                                                       dim3(kDmThreads), params, 0, (cudaStream_t) stream);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dec_moe_peer_launch: %s\n", cudaGetErrorString(e));

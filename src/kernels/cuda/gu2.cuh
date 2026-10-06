@@ -330,7 +330,9 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
 
 }  // namespace gu2
 
-template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22 || TG == 42;
+template<int TG> inline constexpr bool kGu2 = TG == 16 || TG == 17 || TG == 18 || TG == 21 || TG == 22;
+// the grid formats and Q2_0 (the grouped launch and the peer kernel's Q2_0 build)
+template<int TG> inline constexpr bool kGu2Q2 = kGu2<TG> || TG == 42;
 constexpr int GU2_ROWS = 16;   // rows per block: two a warp
 
 // native_gu_multi_kernel's rows, GU2_ROWS a block; the same group stride

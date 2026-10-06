@@ -2361,7 +2361,7 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
             return;
         }
     }
-    if constexpr (kGu2<TG>) {
+    if constexpr (kGu2Q2<TG>) {
         if (allow_mma && g_gu2 && !g_old_kernels && gu2_usable(L)) {
             const dim3 g2((unsigned) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS), grid.y);
             native_gu2_kernel<TG><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
