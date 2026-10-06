@@ -1142,6 +1142,45 @@ class StartNarrator(unittest.TestCase):
         self.assertIn("experts loaded: 31.64 GiB at 3.17 GiB/s", said)
 
 
+class LoadProgress(unittest.TestCase):
+    """The engine's `basalt load:` lines become one bar per target."""
+
+    def test_parse(self):
+        from serve.server import load_progress
+        self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100))
+        self.assertIsNone(load_progress("basalt load: cuda0 ten 100"))
+        self.assertIsNone(load_progress("basalt generate: loaded 3 GiB"))
+
+    def test_log_output_prints_quarters(self):
+        import io
+        from serve.server import LoadBars
+        out = io.StringIO()
+        bars = LoadBars(out)
+        for d in range(0, 101, 5):
+            bars.update("ram", d << 30, 100 << 30)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 5)
+        self.assertTrue(lines[0].startswith("[server] loading into system ram:"))
+        self.assertIn("100.0/100.0 GiB", lines[-1])
+
+    def test_terminal_redraws_in_place(self):
+        import io
+        from serve.server import LoadBars
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        out = Tty()
+        bars = LoadBars(out)
+        bars.update("cuda0", 1 << 30, 4 << 30)
+        bars.update("cuda1", 0, 2 << 30)
+        bars.say("[server] almost ready")
+        text = out.getvalue()
+        self.assertIn("\x1b[2A", text)                         # moved back over two bars
+        self.assertTrue(text.rstrip("\n").endswith("0.0/2.0 GiB"))   # the bars stay last
+        self.assertIn("[server] almost ready\n", text)
+
+
 class CancelledRead(unittest.TestCase):
     """A request cancelled while its prompt was read is recorded with the tokens the engine read (the DONE
     line's 15th field), not the whole prompt; an older engine's line (no such field) keeps the whole prompt."""

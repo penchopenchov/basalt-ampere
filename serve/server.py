@@ -274,9 +274,82 @@ def experts_size(args: list) -> str:
     return ""
 
 
-def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
-    """Print the engine's start steps from its log, one line each, so a long start does not look hung."""
+class LoadBars:
+    """The engine's `basalt load: <target> <done> <total>` lines as one progress bar per target.  On a terminal the
+    bars are redrawn in place under the other start lines; otherwise each target prints at 0, 25, 50, 75, 100%."""
+
+    WIDTH = 30
+
+    def __init__(self, out=None):
+        self.out = out or sys.stdout
+        self.tty = self.out.isatty()
+        self.bars: dict[str, tuple[int, int]] = {}
+        self.drawn = 0
+        self.steps: dict[str, int] = {}
+
+    @staticmethod
+    def name(target: str) -> str:
+        return "system ram" if target == "ram" else target
+
+    def line(self, target: str) -> str:
+        done, total = self.bars[target]
+        f = min(1.0, done / total) if total > 0 else 0.0
+        n = int(f * self.WIDTH)
+        bar = "=" * n + (">" if n < self.WIDTH else "") + " " * (self.WIDTH - n - 1)
+        label = f"loading into {self.name(target)}:"
+        return f"[server] {label:<24} [{bar}] {done / 2**30:5.1f}/{total / 2**30:.1f} GiB"
+
+    def _erase(self):
+        if self.tty and self.drawn:
+            self.out.write(f"\x1b[{self.drawn}A")
+            for _ in range(self.drawn):
+                self.out.write("\x1b[2K\n")
+            self.out.write(f"\x1b[{self.drawn}A")
+            self.drawn = 0
+
+    def _draw(self):
+        if self.tty:
+            for t in self.bars:
+                self.out.write("\x1b[2K" + self.line(t) + "\n")
+            self.drawn = len(self.bars)
+        self.out.flush()
+
+    def say(self, text: str) -> None:
+        """A start line, printed above the bars."""
+        self._erase()
+        self.out.write(text + "\n")
+        self._draw()
+
+    def update(self, target: str, done: int, total: int) -> None:
+        self.bars[target] = (done, total)
+        if self.tty:
+            self._erase()
+            self._draw()
+            return
+        step = 4 if total > 0 and done >= total else int(4 * done / total) if total > 0 else 0
+        if step > self.steps.get(target, -1):
+            self.steps[target] = step
+            self.out.write(self.line(target) + "\n")
+            self.out.flush()
+
+
+def load_progress(line: str):
+    """(target, done, total) from an engine `basalt load: <target> <done> <total>` line, else None."""
+    if not line.startswith("basalt load: "):
+        return None
+    parts = line.split()
+    if len(parts) != 5:
+        return None
+    try:
+        return parts[2], int(parts[3]), int(parts[4])
+    except ValueError:
+        return None
+
+
+def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0, out=None) -> None:
+    """Print the engine's start steps from its log, one line each, and its load progress as bars."""
     loading = experts_loading_words(args, experts_size(args))
+    bars = LoadBars(out)
     t0 = last = time.time()
     said = set()
 
@@ -285,11 +358,11 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
         if key not in said:
             said.add(key)
             last = time.time()
-            print(text, flush=True)
+            bars.say(text)
 
     say("weights", "[server] engine starting")
     pos = offset
-    while not done.wait(0.5):
+    while not done.wait(0.25):
         try:
             with open(log_path, "rb") as f:
                 f.seek(pos)
@@ -300,7 +373,10 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             cut = chunk.rfind(b"\n") + 1
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
-                if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
+                if (p := load_progress(line)) is not None:
+                    bars.update(*p)
+                    last = time.time()
+                elif "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
                     say("arena", f"[server] {loading}")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[server] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
@@ -312,7 +388,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     say("up", "[server] almost ready")
         if time.time() - last > heartbeat:
             last = time.time()
-            print(f"[server] still starting, {time.time() - t0:.0f} s", flush=True)
+            bars.say(f"[server] still starting, {time.time() - t0:.0f} s")
 
 
 # Diagnostics, off unless the matching server flag is given (main sets them).
