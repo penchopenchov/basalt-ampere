@@ -13,3 +13,4 @@ __pycache__/
 /packs/
 /mtp/
 /.ccache/
+.DS_Store
