@@ -25,7 +25,6 @@
 
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/dec_shx.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -1882,6 +1881,5 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
 }
 
-#include "dec_shx.cuh"   // STRATA_DEC_SHX: the shared expert in one launch, on this file's row dots
 
 } // namespace strata::kernels

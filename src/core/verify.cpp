@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/diag.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 
 #include "strata/core/native_head.hpp"
@@ -42,7 +43,6 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dec_moe.hpp"
-#include "strata/kernels/dec_shx.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -77,9 +77,6 @@ struct DecMoe {
     void* vscr = nullptr;                    ///< its gate/up rows
     void* xq_pub = nullptr;                  ///< STRATA_DEC_PK & 4: the side stream's q8_1 rows for the ring
     unsigned int* vsync = nullptr;           ///< its counters
-    void* m3scr = nullptr;                   ///< STRATA_DEC_MOE3: dec_moe3's scratch (null: off)
-    unsigned int* m3ctr = nullptr;           ///< its slice counters
-    float* m3part = nullptr;                 ///< the shared gate's partial sums (dec_moe_route)
     unsigned long long* wstat = nullptr;     ///< STRATA_DM_WAIT_STATS: the per-layer wait counters (device)
     unsigned long long* ptab0 = nullptr;     ///< STRATA_DEC_GLUE: [n_layers * n_expert] CUDA0 blob address or 0
     int64_t wstat_windows = 0, wstat_t = 0;
@@ -108,8 +105,6 @@ namespace {
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
-const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
-#define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
 struct Bump {
     uint8_t* base = nullptr;
@@ -121,14 +116,6 @@ struct Bump {
     }
 };
 
-// #649 (HIP, opt-in A/Bs for the gfx1030 verify timeouts; CUDA never reads them)
-//   STRATA_VERIFY_COHERENT=1  the handshake words and rows in explicitly coherent (fine-grained) host memory
-//   STRATA_DOORBELL_STORE=1   the GPU stores each step's ring instead of read-modify-writing it over PCIe
-bool env_on(const char* name) {
-    const char* e = std::getenv(name);
-    return e != nullptr && e[0] != 0 && e[0] != '0';
-}
-const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // STRATA_DEC_PK (bit mask), the same values: 1 = in windows of 2+ tokens, the shared expert's side kernels at the
 // greatest stream priority (their blocks are scheduled ahead of the routed experts' queued blocks, so the branch ends
 // beside them, not after); 2 = in windows of 1-2 tokens, a GDN layer's z projection forked at that priority before
@@ -136,51 +123,30 @@ const bool g_trace = env_on("STRATA_VERIFY_TRACE");
 // (STRATA_DEC_GDNF=1's kernel), no separate norm launch.  Wider windows run slower with either.  4 = with 1, the MoE
 // route split: CUDA0's plan and q8_1 rows on the main stream (the routed experts follow it at once), the ring for the
 // peer card and the CPU pool (mapped rows, system fences, doorbells) on a stream of its own at that priority.
-int dec_pk_mask() {
-    static const int m = [] { const char* e = std::getenv("STRATA_DEC_PK"); return e ? std::atoi(e) : 0; }();
-    return m;
-}
-bool dec_pk() { return dec_pk_mask() != 0; }
+constexpr int dec_pk_mask() { return 7; }
+constexpr bool dec_pk() { return true; }
 // STRATA_DEC_GLUE (bit mask): 1 = in windows of 2+ tokens with STRATA_DEC_PK & 4, no route launch on the main stream:
 // the hc read's router items write the FFN input's q8_1 rows, the gate/up launch builds CUDA0's plan itself
 // (dec_moe_glue: co-resident blocks, each plans once) and the ring's launch the tiers' kinds; 2 = with 1, the ring's
 // work in one more block of that launch (no ring launch beside); 4 = the combine four columns a thread, launched as
 // the wait kernel's programmatic dependent (its CUDA0 rows loaded while the wait spins)
-int dec_glue_mask() {
-    static const int m = [] { const char* e = std::getenv("STRATA_DEC_GLUE"); return e ? std::atoi(e) : 0; }();
-    return m;
-}
+constexpr int dec_glue_mask() { return 7; }
 // STRATA_DEC_QSAF (bit mask): 1 = a QSA layer's indexer key, K/V projections, K/V post and indexer query projection
 // on the side stream beside the query projection; 2 = with 1, the indexer query projection after the query projection
 // on the main stream instead; 4 = the block scores skip a window whose selections are all the identity; 8 = the head's
 // hyper-connection read for every column in one launch (not bitwise); 16 = layer 1's PLE in two launches after its
 // projections (native_ple_window); 32 = in place of 1, K, V and the indexer projections on three branches of their own;
 // 64 = the attention's merge also writes the output projection's q8_1 rows
-int dec_qsaf_mask() {
-    static const int m = [] { const char* e = std::getenv("STRATA_DEC_QSAF"); return e ? std::atoi(e) : 0; }();
-    return m;
-}
+constexpr int dec_qsaf_mask() { return 124; }
 // STRATA_DEC_DTC2 (bit mask; 1, 2 and 4: dense_tc.cu's layouts and IQ3_S): 8 = the attention's hc read writes the
 // projections' q8_1 rows (its up slices), no quantize launch; 16 = a GDN layer's qkv and z projections in one
 // dense_tc_pair launch for every window width (z off the side stream); 128 = the out projection's weights prefetched
 // into L2 behind the in projections (GDN with 16) or the query post (QSA with QSAF & 32)
-int dec_dtc2_mask() {
-    static const int m = [] { const char* e = std::getenv("STRATA_DEC_DTC2"); return e ? std::atoi(e) : 0; }();
-    return m;
-}
-// STRATA_DEC_COMMIT: 1 = the commit graph in two launches; 2 = its GDN part from STRATA_DEC_COMMIT_CTAS persistent
-// blocks (default 32) so it trickles beside the draft instead of filling the card
-int dec_commit_mode() {
-    static const int m = [] { const char* e = std::getenv("STRATA_DEC_COMMIT"); return e ? std::atoi(e) : 0; }();
-    return m;
-}
-int dec_commit_blocks() {
-    static const int b = [] {
-        const char* e = std::getenv("STRATA_DEC_COMMIT_CTAS");
-        return e ? std::max(0, std::atoi(e)) : (dec_commit_mode() == 2 ? 32 : 0);
-    }();
-    return b;
-}
+constexpr int dec_dtc2_mask() { return 30; }
+// The commit graph in two launches, its GDN part from 32 persistent blocks so it trickles beside the draft instead of
+// filling the card (mode 2)
+constexpr int dec_commit_mode() { return 2; }
+constexpr int dec_commit_blocks() { return 32; }
 
 bool mapped(size_t bytes, void** h, void** d) {
     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
@@ -235,30 +201,10 @@ void release_live_verifiers(std::FILE* f) {
         }
     if (f != nullptr) std::fflush(f);
 }
-// #649: the host side of STRATA_VERIFY_TRACE - a ring of the last kTraceN handshake events of every verifier
-struct TraceEv {
-    int64_t t_ns;
-    const void* who;
-    int64_t window, step, layer, aux;
-    uint32_t seq, flag, a, b;
-    const char* what;
-};
-constexpr uint64_t kTraceN = 4096;
-TraceEv g_trace_ring[kTraceN];
-std::atomic<uint64_t> g_trace_next{0};
-int64_t trace_now_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
-}
 std::string released_note(bool drained) {
     return drained ? "; its GPU waits were released and the GPU finished (#267)"
                    : "; its GPU waits were released but the GPU did not finish within 5 s (#267)";
 }
-// #267 test hook: STRATA_TEST_VERIFY_STALL=N withholds the last layer's flag in the N-th window (1-based), so the
-// GPU spins on a flag nobody raises - the bounded window wait and the release are then what ends it.  Unset: never.
-const int64_t g_test_stall = [] {
-    const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
-    return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
-}();
 // one stderr line per distinct fast-path fallback (what, a, b)
 void note_fallback(const char* what, int a, int b) {
     static std::mutex mu;
@@ -282,7 +228,6 @@ void dense_proj(int bit, int type, const void* w, const void* xq, float* y, int 
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
     released_.store(true);
-    trace_ev("RELEASE", -1, -1, timeout_ms);
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
@@ -300,73 +245,12 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
         if (s == nullptr) continue;
         while (cudaStreamQuery(s) == cudaErrorNotReady) {
             if (ms_since(t0) > timeout_ms) {
-                trace_ev("RELEASE-NOT-DRAINED", -1, -1, (int64_t) ms_since(t0));
                 return false;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    trace_ev("RELEASE-DRAINED", -1, -1, (int64_t) ms_since(t0));   // aux: ms the GPU took to finish once released
     return true;
-}
-
-void Verifier::trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const {
-    if (!g_trace) return;
-    auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
-    TraceEv& e = g_trace_ring[g_trace_next.fetch_add(1) % kTraceN];
-    e = {trace_now_ns(), this, windows, step, layer, aux, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_), what};
-}
-
-void Verifier::trace_dump(std::FILE* f) const {
-    if (!g_trace || f == nullptr) return;
-    static const char* names[kProfPer] = {"pre", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "kv-idx",
-                                          "k/v rope", "kv append", "q", "scores+topk", "kv-resolve", "attention",
-                                          "gate", "", "out-proj", "router+ring", "shared", "waitA", "VRAM hits", "waitB",
-                                          "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", ""};
-    const uint64_t end = g_trace_next.load();
-    const uint64_t n = end < 160 ? end : 160;
-    std::fprintf(f, "strata verify trace (#649): the last %llu handshake events (host clock, us before the last; "
-                    "words: seq = GPU rang, flag = CPU served, A = plan, B = copies)\n", (unsigned long long) n);
-    const int64_t t_last = n ? g_trace_ring[(end - 1) % kTraceN].t_ns : 0;
-    for (uint64_t i = end - n; i < end; ++i) {
-        const TraceEv& e = g_trace_ring[i % kTraceN];
-        if (e.what == nullptr) continue;
-        std::fprintf(f, "  %10.1f %-20s v%p window %lld step %lld layer %lld aux %lld | seq %u flag %u A %u B %u\n",
-                     (double) (t_last - e.t_ns) / 1000.0, e.what, e.who, (long long) e.window, (long long) e.step,
-                     (long long) e.layer, (long long) e.aux, e.seq, e.flag, e.a, e.b);
-    }
-    if (trace_h_ == nullptr || g_ == nullptr) return;
-    // the breadcrumbs: every stamp point the GPU passed in this window (ns of the GPU clock after the window's first)
-    unsigned long long t0 = ~0ull;
-    for (size_t i = 0; i < trace_n_; ++i) {
-        const unsigned long long t = *(const volatile unsigned long long*) (trace_h_ + i);
-        if (t != 0 && t < t0) t0 = t;
-    }
-    if (t0 == ~0ull) {
-        std::fprintf(f, "strata verify trace: no GPU breadcrumb in this window (the GPU never started it)\n");
-        return;
-    }
-    int64_t last_l = -1;
-    for (int64_t l = 0; l <= g_->n_layers; ++l)
-        for (int i = 0; i < kProfPer; ++i)
-            for (int grp = 0; grp < 2; ++grp)
-                if (trace_h_[(size_t) ((l * kProfPer + i) * 2 + grp)] != 0) last_l = l;
-    std::fprintf(f, "strata verify trace: GPU breadcrumbs (us after the window's first), the GPU got as far as layer "
-                    "%lld:\n", (long long) last_l);
-    for (int64_t l = std::max<int64_t>(0, last_l - 2); l <= std::min<int64_t>(g_->n_layers, last_l + 1); ++l)
-        for (int grp = 0; grp < 2; ++grp) {
-            std::string line;
-            char b[64];
-            for (int i = 0; i < kProfPer; ++i) {
-                const unsigned long long t = trace_h_[(size_t) ((l * kProfPer + i) * 2 + grp)];
-                if (t == 0) continue;
-                std::snprintf(b, sizeof b, " %s(%d)=%.1f", names[i], i, (double) (t - t0) / 1000.0);
-                line += b;
-            }
-            if (!line.empty())
-                std::fprintf(f, "  layer %lld group %d:%s\n", (long long) l, grp, line.c_str());
-        }
-    std::fflush(f);
 }
 
 std::string Verifier::dm_note() const {
@@ -421,7 +305,6 @@ void Verifier::diag(std::FILE* f) const {
                     "served %u, plan (A) %u, copies (B) %u\n", current ? "" : " (last window, not the current stage)",
                  last_t_, (long long) last_pos0_, cur_layer_ + 1, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
     if (dm_ != nullptr) std::fprintf(f, "  %s\n", dm_note().c_str() + 2);
-    trace_dump(f);   // #649: STRATA_VERIFY_TRACE=1 only
 }
 
 bool Verifier::dm_init(std::string& err) {
@@ -464,30 +347,17 @@ bool Verifier::dm_init(std::string& err) {
               cudaMalloc((void**) &d->vsync, (kDmCap + 1) * 4) == cudaSuccess &&
               cudaMemset(d->vsync, 0, (kDmCap + 1) * 4) == cudaSuccess &&
               cudaMalloc(&d->xq_pub, d->xq_stride) == cudaSuccess;
-    {
-        const char* v = std::getenv("STRATA_DEC_MOE_VRAM");
-        d->vram = v != nullptr ? std::atoi(v) : -1;
-    }
+    d->vram = -1;
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
              cudaMemcpy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8, cudaMemcpyHostToDevice) == cudaSuccess;
     if (ok && (dec_glue_mask() & 1))
         ok = cudaMalloc((void**) &d->ptab0, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab0, 0, (size_t) LE * 8) == cudaSuccess;
-    if (ok && env_on("STRATA_DM_WAIT_STATS"))
+    if (ok && diagnostics().wait_stats)
         ok = cudaMalloc((void**) &d->wstat, kDmStatWords * 8) == cudaSuccess &&
              cudaMemset(d->wstat, 0, kDmStatWords * 8) == cudaSuccess;
     if (!ok) { err = "verify: STRATA_DEC_MOE buffers"; return false; }
-    if (env_on("STRATA_DEC_MOE3")) {
-        ok = cudaMalloc(&d->m3scr, dec_moe3_scratch_bytes((int) lay.fmt[0].n_ff)) == cudaSuccess &&
-             cudaMemset(d->m3scr, 0, dec_moe3_scratch_bytes((int) lay.fmt[0].n_ff)) == cudaSuccess &&
-             cudaMalloc((void**) &d->m3ctr, kDmM3Ctr * 4) == cudaSuccess &&
-             cudaMemset(d->m3ctr, 0, kDmM3Ctr * 4) == cudaSuccess &&
-             cudaMalloc((void**) &d->m3part, (size_t) (T * N / 256 + 64) * 4) == cudaSuccess;
-        if (!ok) { err = "verify: STRATA_DEC_MOE3 buffers"; return false; }
-        std::fprintf(stderr, "strata verify: STRATA_DEC_MOE3 on: the shared expert and the combine inside the MoE "
-                             "launches\n");
-    }
     d->shadow0.assign((size_t) LE, INT32_MIN);
     d->shadow1.assign((size_t) LE, -1);
     if (peer_ != nullptr && peer_->valid()) {
@@ -578,7 +448,7 @@ void Verifier::dm_free() {
             if (p) cudaFree(p);
     }
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
-                    (void*) d->vsync, d->xq_pub, d->m3scr, (void*) d->m3ctr, (void*) d->m3part, (void*) d->wstat,
+                    (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0})
         if (p) cudaFree(p);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
@@ -620,7 +490,6 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (ev_ring_) cudaEventDestroy(ev_ring_);
     if (ev_ring_join_) cudaEventDestroy(ev_ring_join_);
-    if (shx_sync_) cudaFree(shx_sync_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
@@ -663,7 +532,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
-    if (const char* e = std::getenv("STRATA_DEC_HC"); e && e[0] == '1') strata::kernels::hc_fused_init();
+    strata::kernels::hc_fused_init();
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -800,16 +669,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     cudaMemset(arena_, 0, count.used);
-    if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
-        trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
-        if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
-            (void) cudaGetLastError();
-            trace_h_ = trace_m_ = nullptr;
-            trace_n_ = 0;
-        }
-        std::fprintf(stderr, "strata verify trace (#649): on\n");
-    }
-    prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    prof_on_ = diagnostics().profile;
     if (prof_on_) decode_gaps().host_on = true;
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 8;
@@ -862,8 +722,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // wait_flag_ge spins, PCIe empty launches, or moe_hit_add copies.
     all_resident_ = false;
     if (hits.h_res != nullptr && hits.d_res != nullptr && hits.cache_base != nullptr) {
-        const char* v_ar = std::getenv("STRATA_VERIFY_ALL_RESIDENT");
-        if (v_ar == nullptr || std::atoi(v_ar) != 0) {
+        {
             bool all_ok = true;
             for (int64_t l = lb_; l < le_ && all_ok; ++l) {
                 for (int64_t e = 0; e < g.n_expert; ++e) {
@@ -876,12 +735,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             all_resident_ = all_ok;
         }
     }
-    // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
-    // exact, but neutral on RIBPC 1-2 GPUs: off by default)
-    {
-        const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        device_plan_ = !all_resident_ && (v != nullptr && std::atoi(v) != 0);
-    }
+    device_plan_ = false;
     if (all_resident_ || device_plan_) {
         bool ok2 = true;
         if (device_plan_)
@@ -893,15 +747,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
-    if (env_on("STRATA_DEC_MOE") && !dm_init(err)) return false;
-    if (env_on("STRATA_DEC_SHX") && dm_ != nullptr && shx_sync_ == nullptr) {   // the shared expert in one launch
-        if (cudaMalloc(&shx_sync_, strata::kernels::kShxSyncWords * sizeof(unsigned int)) != cudaSuccess ||
-            cudaMemset(shx_sync_, 0, strata::kernels::kShxSyncWords * sizeof(unsigned int)) != cudaSuccess) {
-            err = "verify: STRATA_DEC_SHX buffers";
-            return false;
-        }
-        std::fprintf(stderr, "strata verify: STRATA_DEC_SHX on: the shared expert in one launch\n");
-    }
+    if (!dm_init(err)) return false;
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
@@ -938,23 +784,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const bool dm = dm_ != nullptr && !batch_rec_;   // STRATA_DEC_MOE: the device-planned tail (one group)
     const int G = (split_ && T >= 2 && !batch_rec_ && !dm) ? 2 : 1;   // a batch window is one group
-    const bool shx = dm && shx_sync_ != nullptr;   // STRATA_DEC_SHX: the shared expert in one launch, no side stream
-    static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    static const bool dec_qsa = [] { const char* v = std::getenv("STRATA_DEC_QSA"); return v != nullptr && std::atoi(v) != 0; }();
-    // STRATA_DEC_HC=1: each hyper-connection read (and the FFN read's router) as one kernel, bitwise the kernels it
-    // replaces; the next read's w_norm is prefetched into L2 at its end
-    static const bool dec_hc_env = [] { const char* e = std::getenv("STRATA_DEC_HC"); return e && e[0] == '1'; }();
-    const bool dec_hc = dec_hc_env && hc_fused_supported();
-    // STRATA_DEC_HC_PF=1: each read also prefetches the next read's weight matrices into L2 at its end
-    static const bool dec_hc_pf = [] { const char* e = std::getenv("STRATA_DEC_HC_PF"); return e && e[0] == '1'; }();
+    constexpr bool dec_batch = true;
+    constexpr bool dec_qsa = true;
+    // each hyper-connection read (and the FFN read's router) as one kernel; the next read's w_norm is prefetched into
+    // L2 at its end
+    const bool dec_hc = hc_fused_supported();
+    constexpr bool dec_hc_pf = false;
     // STRATA_PDL=1 (pdl.hpp): the dense chain's kernels may start during the previous kernel's tail.  Only where
-    // that previous kernel is one of them or another plain kernel; never with the profile's or trace's stamps.
-    const bool pdl = pdl_rec_ && !prof_on_ && trace_m_ == nullptr && !batch_rec_;
+    // that previous kernel is one of them or another plain kernel; never with the profile's stamps.
+    const bool pdl = pdl_rec_ && !prof_on_ && !batch_rec_;
     // STRATA_DEC_PDL2=1 (pdl.hpp): the chain's kernels let their dependents in early, which stage their weights
     const bool pdl2 = pdl && pdl2_requested();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
-        if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
     };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     if (!batch_rec_) groups_[T] = G;
@@ -1009,23 +851,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
     }
 
-    // STRATA_DEC_MOE3: layer l's shared expert for dec_moe3 (false: the layer takes the shared stream and combine)
-    auto m3_of = [&](int64_t l, DmM3Args& a, const uint16_t** gate_inp) -> bool {
-        if (!dm || dm_->m3scr == nullptr) return false;
-        const LayerView v(wt, l);
-        const WeightRef *wsg = v.get("ffn_gate_shexp.weight"), *wsu = v.get("ffn_up_shexp.weight"),
-                        *wsd = v.get("ffn_down_shexp.weight"), *wgi = v.get("ffn_gate_inp_shexp.weight");
-        if (!wsg || !wsu || !wsd || !wgi || !wsg->native_data || !wsu->native_data || !wsd->native_data) return false;
-        const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
-        const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-        if (!dec_moe3_ok(L, wsg->native_type, wsu->native_type, wsd->native_type)) return false;
-        a.sg = (const uint8_t*) wsg->native_data; a.su = (const uint8_t*) wsu->native_data;
-        a.sd = (const uint8_t*) wsd->native_data;
-        a.sg_type = wsg->native_type; a.su_type = wsu->native_type; a.sd_type = wsd->native_type;
-        if (gate_inp != nullptr) *gate_inp = (const uint16_t*) wgi->data;
-        return true;
-    };
-
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork[2] = {false, false};   // STRATA_DEC_PK & 4: the group's ring stream is joined in post
     bool glue_on[2] = {false, false};     // STRATA_DEC_GLUE & 1: post's gate/up launch plans the group's VRAM share
@@ -1052,11 +877,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
-            static const bool ple_batch_env = [] {
-                const char* e = std::getenv("STRATA_PLE_BATCH");
-                return !e || e[0] != '0';
-            }();
-            const bool ple_batch_kv = ple_batch_env && dec_batch && n > 1 && ss.ple.w.key_bf16 != nullptr &&
+            const bool ple_batch_kv = dec_batch && n > 1 && ss.ple.w.key_bf16 != nullptr &&
                                       ss.ple.w.value_bf16 != nullptr && ple_native_bf16_enabled() &&
                                       ple_native_postops_enabled();
             // STRATA_DEC_QSAF & 16: the rows' write, post-ops, history advance and snapshots in two launches, the
@@ -1645,14 +1466,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         const bool router_multi = dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
         bool routed = false;   // the fused read ran the router too
-        static const bool sh_stream_env = [] {
-            const char* e = std::getenv("STRATA_SH_STREAM");
-            return !e || e[0] != '0';
-        }();
-        DmM3Args m3a;
-        const uint16_t* m3_gi = nullptr;
-        const bool m3 = m3_of(l, m3a, &m3_gi);
-        const bool sh_fork = !shx && !m3 && sh_stream_env && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
+        const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
         cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) && n >= 2 ? sh_hi_ : sh_cs_) : cs;
         // STRATA_DEC_PK & 4: the ring on its own stream, forked after the router, joined where the side branch is
@@ -1730,11 +1544,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.xq_m = dm_->m_xq + (size_t) r * dm_->xq_stride;
             ra.host_seq_m = m_seq_; ra.peer_seq_m = dm_->m_w;
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
-            if (m3) { ra.sh_gw = m3_gi; ra.sh_part = dm_->m3part; }
             ra.stats = dm_->wstat;
-            // STRATA_PEER_CAP=n: a layer's peer groups past n go to the CPU pool
-            static const int peer_cap = [] { const char* v = std::getenv("STRATA_PEER_CAP"); return v ? std::atoi(v) : 0; }();
-            ra.peer_cap = peer_cap;
+            ra.peer_cap = 0;
             PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
             if (glue_on[grp] && (dec_glue_mask() & 2)) {   // the ring's work inside post's gate/up launch
                 glue_ring[grp] = ra;
@@ -1773,7 +1584,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         stamp(l, 17, grp);
-        if (!m3) {
+        {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
                             *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
             if (!wgi || !wsg || !wsu || !wsd) return false;
@@ -1785,21 +1596,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
-            if (shx && dec_shx_ok(nsw.gate_type, nsw.up_type, nsw.down_type, N, g.n_ff)) {
-                ShxArgs sa;   // xm's own q8_1 rows: the route kernel's (q8_1_store) differ from them in rare blocks
-                sa.gate_w = nsw.gate_data; sa.up_w = nsw.up_data; sa.down_w = nsw.down_data;
-                sa.gate_inp = (const uint16_t*) wgi->data; sa.x = xm; sa.xq = xq_;
-                sa.gate = sh_gate_ + (size_t) tb * g.n_ff; sa.up = sh_up_ + (size_t) tb * g.n_ff; sa.hq = sh_xq_;
-                sa.g = sh_g_ + tb; sa.out = shared_ + tb * N; sa.sync = shx_sync_; sa.n_tok = n;
-                try {
-                    PdlScope ps(pdl);   // after the route kernel
-                    native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                    dec_shx(sa, cs);
-                } catch (const std::exception& e) {
-                    err = std::string("verify shared expert: ") + e.what();
-                    return false;
-                }
-            } else {
+            {
             if (!shared_expert_native_bf16_enabled()) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
@@ -1824,11 +1621,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     };
 
     // ---------------------------------------------------------------- post(l, group): experts, combine
-    static const bool fuse_head_gr_env = [] {
-        const char* e = std::getenv("STRATA_FUSE_HEAD_GR");
-        return e && e[0] == '1';
-    }();
-    const bool fuse_head_gr = (fuse_head_gr_env || (dec_qsaf_mask() & 8)) && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
+    const bool fuse_head_gr = (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
@@ -1860,21 +1653,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
             }
         };
-        DmM3Args m3a;
-        const bool m3 = m3_of(l, m3a, nullptr);
-        if (m3) {   // the shared expert, CUDA0's entries and the combine in three launches
-            stamp(l, 19, grp);
-            const auto& f = lay.fmt[(size_t) l];
-            const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-            m3a.sh_part = dm_->m3part; m3a.shared = shared_ + tb * N; m3a.parts = parts_out;
-            m3a.peer_rows_m = dm_->m_rows; m3a.cpu_rows_m = m_ymiss_; m3a.weights = w_ + tb * K; m3a.output = bo_ + tb * N;
-            m3a.peer_done_m = dm_->m_w + 16; m3a.host_flag_m = m_flag_; m3a.ring = ring; m3a.ctr = dm_->m3ctr;
-            m3a.n_tok = n; m3a.k = (int) K; m3a.stats = dm_->wstat; m3a.layer = (int) l;
-            dec_moe3(L, dm_->plan, nat_xq_ + (size_t) tb * (N / 32) * 36, dm_->m3scr, m3a, (int) cap, cs);
-            stamp(l, 20, grp);
-            stamp(l, 21, grp);
-            stamp(l, 22, grp);
-        } else if (dm) {   // CUDA0's entries straight into their parts rows; the other tiers are read by the combine
+        if (dm) {   // CUDA0's entries straight into their parts rows; the other tiers are read by the combine
             stamp(l, 19, grp);
             const auto& f = lay.fmt[(size_t) l];
             const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
@@ -1940,13 +1719,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
-        if (!shx && !m3 && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
+        if (!prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
             if (ring_fork[grp]) cudaStreamWaitEvent(cs, ev_ring_join_, 0);   // the ring's launch
         }
-        if (m3) {
-            stamp(l, 23, grp);
-        } else if (dm) {
+        if (dm) {
             const bool cdep = (dec_glue_mask() & 4) != 0;   // the combine as the wait's programmatic dependent
             dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, cdep);
             stamp(l, 23, grp);
@@ -2151,35 +1928,6 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
-        size_t nn = 0;
-        cudaGraphGetNodes(graph, nullptr, &nn);
-        std::vector<cudaGraphNode_t> nodes(nn);
-        cudaGraphGetNodes(graph, nodes.data(), &nn);
-        std::map<std::string, int> kinds;
-        for (cudaGraphNode_t nd : nodes) {
-            cudaGraphNodeType ty;
-            cudaGraphNodeGetType(nd, &ty);
-            std::string name = "type" + std::to_string((int) ty);
-            if (ty == cudaGraphNodeTypeKernel) {
-                cudaKernelNodeParams kp{};
-                if (cudaGraphKernelNodeGetParams(nd, &kp) == cudaSuccess) {
-#if CUDART_VERSION >= 12030   // cudaFuncGetName arrived in CUDA 12.3
-                    const char* fn = nullptr;
-                    if (cudaFuncGetName(&fn, kp.func) == cudaSuccess && fn) name = fn;
-#endif
-                }
-            } else if (ty == cudaGraphNodeTypeMemcpy) name = "memcpy";
-            else if (ty == cudaGraphNodeTypeMemset) name = "memset";
-            ++kinds[name];
-        }
-        std::vector<std::pair<int, std::string>> v;
-        for (auto& [k2, c] : kinds) v.push_back({c, k2});
-        std::sort(v.rbegin(), v.rend());
-        std::fprintf(stderr, "strata verify: the %d-token window graph has %zu nodes:", T, nn);
-        for (size_t i = 0; i < v.size() && i < 40; ++i) std::fprintf(stderr, " %d x %.60s;", v[i].first, v[i].second.c_str());
-        std::fprintf(stderr, "\n");
-    }
     const cudaError_t ie = cudaGraphInstantiateWithFlags(&exec_[T], graph, dec_pk() ? cudaGraphInstantiateFlagUseNodePriority : 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
@@ -2381,7 +2129,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
     if (!capture(T, err) || !capture_commit(err)) return false;
-    VDBG("captured; staging\n");
     DecodeGaps& gm = decode_gaps();
     gm.mark(11);
     const Clock::time_point t0 = Clock::now();
@@ -2398,9 +2145,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
         }
     }
-    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     gm.mark(12);
     if (dm_ != nullptr) {   // STRATA_DEC_MOE: this window's residency, then the peer window ahead of CUDA0's
         if (!dm_sync(err)) return false;
@@ -2427,12 +2172,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         gm.mark(14);
     }
     ms_host += ms_since(t0);
-    VDBG("staged; launching\n");
     if (prof_on_) decode_gaps().verify_end = 0;   // set again only by a collected window
     const Clock::time_point tl = Clock::now();
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     ms_launch += ms_since(tl);
-    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     // STRATA_DEC_CHAIN: a sampled or penalized request's head sampling queued behind the window now, not after a sync
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -2444,14 +2187,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     (void) cudaStreamQuery(cs_);
     gm.mark(15);
-    VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
-    const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
-    if (all_resident_ && !test_stall) {
+    if (all_resident_) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
@@ -2479,8 +2220,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 last_flush = now;
                 const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
-                    trace_ev("NEVER-RANG", k, l, (int64_t) q);
-                    trace_dump(stderr);
                     err = "verify: layer " + std::to_string(l) + " never rang (" +
                           (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
                     return false;
@@ -2488,18 +2227,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
             if (now - a > std::chrono::seconds(20)) {
                 // #267: the caller ends the engine; no spin kernel may outlive it
-                trace_ev("TIMEOUT", k, l, (int64_t) cudaStreamQuery(cs_));
                 const std::string words = dm_note();   // read before the release overwrites them
-                if (g_trace) diag(stderr);   // the words and the breadcrumbs before the release ...
                 const bool drained = release_gpu_waits(5000);
-                if (g_trace) trace_dump(stderr);   // ... and after it: did the GPU move once its waits were raised?
                 err = "verify: timed out at layer " + std::to_string(l) + words + released_note(drained) + peer_released();
                 return false;
             }
         }
         const Clock::time_point b = Clock::now();
-        if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
-        VDBG("layer %lld rang\n", (long long) l);
         cur_layer_ = want - 1;
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
@@ -2515,9 +2249,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
         if (remote_opt_) remote_opt_->end();
-        VDBG("layer %lld served\n", (long long) l);
-        if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
-                              (int64_t) ms_since(b));   // aux: ms the CPU experts took
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -2542,7 +2273,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             _mm_sfence();
             ms_host += ms_since(tp);
         }
-        if (!(test_stall && k + 1 == steps)) *flag = want;
+        *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
@@ -2553,9 +2284,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // spin kernel outlives the process - the case that left Windows GPUs "lost" until a power cycle.  The wait
     // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
     // beside the expert workers).
-    trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
-    trace_ev("SYNCED", -1, -1, (int64_t) se);
     gm.mark(-1);
     if (dm_ != nullptr && dm_->peer_live) {   // the peer window ends with CUDA0's last ring
         const OnDevice on(dm_->pdev);
@@ -2566,12 +2295,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
-    static const int64_t wstat_every = [] {   // STRATA_DM_WAIT_EVERY: windows per report (default 200)
-        const char* v = std::getenv("STRATA_DM_WAIT_EVERY");
-        return v && std::atoi(v) > 0 ? (int64_t) std::atoi(v) : (int64_t) 200;
-    }();
+    constexpr int64_t wstat_every = 200;   // windows per report
     if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {
-        // STRATA_DM_WAIT_STATS: the last wstat_every windows' counters
+        // --wait-stats: the last wstat_every windows' counters
         std::vector<unsigned long long> w((size_t) kDmStatWords);
         cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
         cudaMemset(dm_->wstat, 0, w.size() * 8);
@@ -2609,23 +2335,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     gm.mark(2);
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
-    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
-        static bool reported = false;
-        if (!reported) {
-            std::vector<float> h((size_t) T * (size_t) n_vocab_);
-            cudaMemcpy(h.data(), head_logits_, h.size() * 4, cudaMemcpyDeviceToHost);
-            for (int t = 0; t < T && !reported; ++t) {
-                int64_t bad = 0;
-                for (int64_t v = 0; v < n_vocab_; ++v) bad += !std::isfinite(h[(size_t) t * n_vocab_ + v]);
-                if (bad) {
-                    reported = true;
-                    std::fprintf(stderr, "strata dbg: verify window at position %lld, row %d: %lld of %lld logits non-finite "
-                                         "(token out %d)\n", (long long) pos0, t, (long long) bad, (long long) n_vocab_, out[t]);
-                }
-            }
-        }
-    }
-    VDBG("window done\n");
     gm.mark(3);
     ++windows;
     progress_at("decode");
@@ -2716,20 +2425,6 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
         std::fprintf(out, "%lld\t%d\t%.9f\t%lld\t%.9f\t%d\t%.9f\t%.9f", (long long) (pos0 + t), (int) tgt,
                      (double) row[tgt] - lse, (long long) top, maxv - lse, (int) (top == (int64_t) tgt), extra,
                      without);
-        // STRATA_LOGPOS_TOPK=K: the K most likely tokens and their log-probabilities too (`id:logprob`), for a
-        // top-k comparison with another engine on the same tokens
-        static const int topk = [] {
-            const char* v = std::getenv("STRATA_LOGPOS_TOPK");
-            return v != nullptr ? std::max(0, std::min(256, std::atoi(v))) : 0;
-        }();
-        if (topk > 0) {
-            std::vector<int32_t> order((size_t) n_vocab_);
-            for (int64_t v = 0; v < n_vocab_; ++v) order[(size_t) v] = (int32_t) v;
-            std::partial_sort(order.begin(), order.begin() + topk, order.end(),
-                              [&](int32_t a, int32_t b) { return row[a] > row[b]; });
-            for (int j = 0; j < topk; ++j)
-                std::fprintf(out, "\t%d:%.6f", order[(size_t) j], (double) row[order[(size_t) j]] - lse);
-        }
         std::fprintf(out, "\n");
     }
     std::fflush(out);
@@ -2737,12 +2432,9 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 }
 
 namespace { bool g_commit_async = false; }
-void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+void Verifier::set_commit_async(bool on) { g_commit_async = on; }
 
-bool Verifier::chain_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_DEC_CHAIN"); return e && e[0] == '1'; }();
-    return on;
-}
+bool Verifier::chain_on() { return true; }
 
 bool Verifier::commit(int n_keep, std::string& err, int parts) {
     const OnDevice on_device(device_);

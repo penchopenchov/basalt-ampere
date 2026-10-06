@@ -89,9 +89,6 @@ public:
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
-    /// #649 (STRATA_VERIFY_TRACE=1, opt-in): the last windows' host-side handshake events and the GPU's breadcrumbs
-    /// (in mapped memory, so they read while the GPU hangs).  Nothing when the trace is off.
-    void trace_dump(std::FILE* f) const;
     /// STRATA_DEC_MOE: the device plan's words while a window is stalled - the ring CUDA0 last published and its
     /// tiers, and on the peer card the ring it was rung for, the ring it finished and whether its kernel still runs.
     /// Empty without the device plan.
@@ -315,12 +312,6 @@ private:
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
-    // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
-    // per layer and token group, written to mapped memory (null when the trace is off)
-    void trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const;
-    unsigned long long* trace_h_ = nullptr;
-    unsigned long long* trace_m_ = nullptr;
-    size_t trace_n_ = 0;
     double prof_graph0_ = 0;                        // the graph's start to layer 0's first stamp (ns, summed)
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
@@ -389,7 +380,6 @@ private:
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
-    unsigned int* shx_sync_ = nullptr;                        // STRATA_DEC_SHX: dec_shx's sync words
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
     float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
