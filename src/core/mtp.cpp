@@ -190,7 +190,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     // ---- the index and the dense weights
     {
         std::vector<uint8_t> idx_text;
-        if (!read_file(files.index, idx_text)) { err = "mtp: cannot open " + files.index.path + " (run tools/mtp_rt.py)"; return false; }
+        if (!read_file(files.index, idx_text)) { err = "mtp: cannot open " + files.index.path + ""; return false; }
         std::istringstream idx(std::string(idx_text.begin(), idx_text.end()));
         std::string line;
         while (std::getline(idx, line)) {
@@ -484,12 +484,10 @@ void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t 
 }
 
 namespace {
-// What to change when the draft head's token subset does not fit the VRAM left: a smaller subset that setup ships
-// (data/draft_vocab_*.bin; their token counts below), and how to pick it.  Text only, after the failure.
+// What to change when the draft head's token subset does not fit the VRAM left.  Text only, after the failure.
 void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
     size_t free_b = 0, total_b = 0;
     const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
-    auto mib = [&](int64_t n) { return (double) (n * row_bytes) / 1048576.0; };
     std::string free_s;
     if (have_free) {
         char b[64];
@@ -497,27 +495,9 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
         free_s = b;
     }
     std::fprintf(stderr, "basalt mtp: the draft head over %lld tokens needs %.0f MiB of VRAM%s.\n",
-                 (long long) n_tokens, mib(n_tokens), free_s.c_str());
-    struct Subset { const char* name; int64_t tokens; const char* what; };
-    static const Subset smaller[] = {{"cyrillic", 58963, "English, code and the Cyrillic script"},
-                                     {"en", 40525, "English and code"}};
-    std::string opts;
-    for (const Subset& s : smaller)
-        if (s.tokens < n_tokens) {
-            char b[160];
-            std::snprintf(b, sizeof(b), "%s--draft-vocab %s (%s, ~%.0f MiB)", opts.empty() ? "" : " or ", s.name,
-                          s.what, mib(s.tokens));
-            opts += b;
-        }
-    if (!opts.empty())
-        std::fprintf(stderr, "basalt mtp: hint: a smaller draft vocabulary needs less VRAM: %s. Start once with it - "
-                             "./setup.sh --draft-vocab en - and the model "
-                             "keeps it (\"draft_vocab\" in its config); or a smaller --context in "
-                             "setup.\n",
-                     opts.c_str());
-    else
-        std::fprintf(stderr, "basalt mtp: hint: this is already the smallest shipped draft vocabulary: a smaller "
-                             "--context (or closing what else uses the GPU) leaves it room.\n");
+                 (long long) n_tokens, (double) (n_tokens * row_bytes) / 1048576.0, free_s.c_str());
+    std::fprintf(stderr, "basalt mtp: hint: a smaller draft vocabulary (--draft-vocab when converting the model), "
+                         "a smaller --max-context, or closing what else uses the GPU leaves it room.\n");
 }
 }  // namespace
 
@@ -529,13 +509,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     const WeightRef* wo = wt.find("output.weight");
     if (!wo) { err = "mtp: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
-    if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
+    if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head"; return false; }
     if (head_logits_ == nullptr &&
         cudaMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != cudaSuccess) {
         err = "mtp: the draft logits do not fit";
         return false;
     }
-    // the draft head's token subset, when tools/draft_vocab.py wrote one
+    // the draft head's token subset, when the model file carries one
     if (dhead_ == nullptr) {
         std::vector<uint8_t> raw;
         if (read_file(draft_vocab_, raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
@@ -553,8 +533,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "basalt mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
-            // the base rows: the leading ids up to the first descent (tools/draft_vocab.py appends added ids after
-            // the base in id order)
+            // the base rows: the leading ids up to the first descent (added ids follow the base in id order)
             n_tier1_ = n_dvocab_;
             {
                 const int32_t* ids = (const int32_t*) raw.data();
@@ -634,7 +613,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (par_) fork(cs);
             const cudaStream_t ce = par_ ? cs2_ : cs;
             uint8_t* const xqe = par_ ? xq2_ : xq_;
-            if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
+            if (const NativeEmbed* ne = native_embed()) {   // the GGUF-form table
                 ne->gather_dev(tok_, T, emb_, ce);
             } else {
                 const auto* codes = (const uint8_t*) we->data;

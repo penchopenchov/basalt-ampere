@@ -1,4 +1,4 @@
-// src/core/graph.cpp - P2.S5: the GraphRegistry implementation.
+// src/core/graph.cpp - the GraphRegistry implementation.
 #include "basalt/core/graph.hpp"
 
 #include <immintrin.h>
@@ -36,8 +36,8 @@ CapturedGraph& CapturedGraph::operator=(CapturedGraph&& o) noexcept {
 void CapturedGraph::reset() {
     // ORDER MATTERS: destroying a graph exec BLOCKS until the launch it is destroying has completed, so
     // destroying it before the event is harmless but destroying it after a spin that was supposed to observe
-    // completion would silently become the thing that caused it.  `bench/micro/graph_capture.cu` was fooled by
-    // exactly this once - it looked like captured graphs made a doorbell visible and direct launches did not.
+    // completion would silently become the thing that caused it.  A test that destroys the exec first can
+    // wrongly conclude that captured graphs make a doorbell visible and direct launches do not.
     if (exec_) { cudaGraphExecDestroy(exec_); exec_ = nullptr; }
     if (graph_) { cudaGraphDestroy(graph_); graph_ = nullptr; }
     if (done_) { cudaEventDestroy(done_); done_ = nullptr; }
@@ -85,7 +85,7 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
     if (!done_) return false;
     // A BOUNDED wait, and the bound is the point: an unbounded spin turns a protocol bug into a hung run, and
     // a hung run says nothing about which side is stuck.  `cudaEventQuery` is a QUERY - it does not block and
-    // it does not synchronise - so this satisfies P2.X3 while still giving the driver the call it needs to
+    // it does not synchronise - so this makes no blocking synchronization call while still giving the driver the call it needs to
     // flush the submission.  See NOTE 1 in the header: without a driver call here the work never starts.
     //
     // The deadline is a REAL CLOCK, not a count of pause instructions: `_mm_pause` is a few cycles, so

@@ -94,7 +94,7 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
     return true;
 }
 
-// ================================ plan v0.3 P6: THE NATIVE EMBEDDING ================================
+// ================================ THE NATIVE EMBEDDING ================================
 
 namespace {
 const NativeEmbed* g_embed = nullptr;

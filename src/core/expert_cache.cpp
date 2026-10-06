@@ -416,7 +416,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     next_free_ = 0;
     fills_ = 0;
     admitted_ = 0;
-    // R4.2g: each layer starts at the bottom of its own range.  Built here rather than lazily so `admit`
+    // Each layer starts at the bottom of its own range.  Built here rather than lazily so `admit`
     // stays allocation-free on the token path.
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
     for (int64_t l = 0; l < n_layers; ++l) {
@@ -474,7 +474,7 @@ void ExpertCache::close() {
     layer_next_.clear();
 }
 
-/// R4.2g.  Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
+/// Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
 /// left over, so the ranges always cover `0..slots_` exactly and no slot is orphaned by the division.
 void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const {
     lo = 0;
@@ -494,8 +494,8 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);
     if (residency_[at] != kNotResident) return residency_[at];
-    // R4.2g: THE PER-LAYER PATH.  Same "no eviction" rule, but the ceiling is this layer's own range rather
-    // than one counter shared by all 48 - which is what confined the measured hit rate to 2.97%.
+    // THE PER-LAYER PATH.  Same "no eviction" rule, but the ceiling is this layer's own range rather
+    // than one counter shared by all layers, which would confine hits to the first few layers.
     if (per_layer_) {
         if (layer_next_.empty()) return kNotResident;
         int64_t lo = 0, hi = 0;

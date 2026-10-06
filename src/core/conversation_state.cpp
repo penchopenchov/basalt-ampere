@@ -38,7 +38,7 @@ bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
     return false;
 }
 
-// The session's carve (#216): `qsa_states` keeps global ordinals and holds the owned ones
+// The session's carve: `qsa_states` keeps global ordinals and holds the owned ones
 // [qsa_ord0, qsa_ord0 + qsa_alloc); `gdn_state` holds `gdn_alloc` rows. A whole-model session owns every layer.
 size_t owned_qsa(const SessionState& ss) { return (size_t) std::max<int64_t>(ss.qsa_alloc, 0); }
 const QsaState& owned(const SessionState& ss, size_t j) { return ss.qsa_states[(size_t) ss.qsa_ord0 + j]; }

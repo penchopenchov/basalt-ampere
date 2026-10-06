@@ -2,13 +2,12 @@
 //
 // THE ARCHITECTURE'S CENTRAL PREMISE.  Only (1 - h) of a token's expert weights are in VRAM, so the rest must
 // cross the bus while the GPU is working.  If the copy and the compute do not overlap, the per-token cost is
-// their SUM; if they do, it is their MAXIMUM.  L3 measured the stream at 4.07 ms/token (design h) and L5 the
-// matvec at 27.9 ms/token, so serial would be ~32 ms and overlapped ~28 - but those are the STEADY-STATE
-// numbers for a whole token; at one expert's granularity the ratio is completely different and that is what
-// decides how the loop must be built.
+// their SUM; if they do, it is their MAXIMUM.  The whole-token stream and matvec
+// times are STEADY-STATE numbers; at one expert's granularity the ratio is completely different and that is
+// what decides how the loop must be built.
 //
 // Measured against a SERIAL baseline in the same process, because the interesting quantity is the ratio and
-// not the absolute figure - and L6 established that absolute figures on this machine move by 20%.
+// not the absolute figure - absolute figures move between runs.
 #include "basalt/core/pinned.hpp"
 #include "basalt/kernels/s_gemv.hpp"
 

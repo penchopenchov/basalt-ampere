@@ -1,14 +1,10 @@
 // src/core/concurrent_main.cpp - do the CPU expert path and the GPU stream path actually run at once?
 //
-// L9 concluded that the two miss paths are INDEPENDENT RESOURCES - 42.55 GB/s of DRAM bandwidth for the CPU
-// expert kernel and 28.9 GB/s of PCIe for the stream - and that running them together would cover a token's
-// 552.7 MB of misses in 7.74 ms, which is what puts 100 tps inside reach on this Gen4 machine.
-//
-// THAT CLAIM HAS A HOLE.  An H2D copy from PINNED host memory READS HOST DRAM to do it, so the bus path is not
-// free of the resource the CPU path is bound by.  If the two contend, the combined rate is not 42.55 + 28.9 and
-// the 129 tok/s figure is optimistic; if they overlap cleanly, it stands.  This measures it three ways in one
-// process - CPU alone, GPU alone, both - because comparing two separately-measured rates is exactly the
-// inference that has been wrong twice already in this ledger (L2's dependency chain, L8's bus-only ceiling).
+// The two miss paths look like INDEPENDENT RESOURCES - DRAM bandwidth for the CPU expert kernel and PCIe for
+// the stream - but an H2D copy from PINNED host memory READS HOST DRAM to do it, so the bus path is not free of
+// the resource the CPU path is bound by.  If the two contend, the combined rate is less than the sum; if they
+// overlap cleanly, it is the sum.  This measures it three ways in one process - CPU alone, GPU alone, both -
+// because comparing two separately-measured rates is not a valid inference.
 //
 // The CPU side is a READ LOOP over the same pinned arena rather than the real VNNI kernel, and that is
 // deliberate: the question is whether the two paths contend for DRAM BANDWIDTH, and a read loop is a pure
@@ -51,9 +47,8 @@ struct Run {
 
 int main(int argc, char** argv) {
     std::string path;
-    // 4096 planes = 2 GiB, which is 64x the 32 MB L3 on this CPU.  At 0.1 GiB the read loop measured 206 GB/s -
-    // that is CACHE bandwidth, not DRAM, and it would have answered the contention question with a number about
-    // a different resource entirely.
+    // The arena must be far larger than the last-level cache: a small one measures CACHE bandwidth, not DRAM,
+    // and would answer the contention question with a number about a different resource.
     int experts = 4096;
     int cpu_threads = 6;
     int gpu_roles = 256;
@@ -185,7 +180,7 @@ int main(int argc, char** argv) {
     std::printf("    combined vs the sum of the parts           : CPU %6.2f + GPU-equivalent vs %6.2f measured\n",
                 cpu_only.cpu_gb, both.cpu_gb);
     std::printf("\n  NOTE: the CPU side is a READ LOOP, not the VNNI kernel - it measures DRAM DEMAND, which is the\n"
-                "        resource the question is about.  L9's 129 tok/s assumes these two do not contend.\n");
+                "        resource the question is about.  Adding the two rates assumes these two do not contend.\n");
 
     cudaFree(d_codes);
     cudaFree(d_x);

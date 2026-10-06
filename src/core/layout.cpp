@@ -74,7 +74,7 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
         {"attn_v.weight", g.n_embd, g.n_head_kv * g.head_dim, true, false},
         {"attn_output.weight", g.n_head * g.head_dim, g.n_embd, true, false},
         // THE INDEXER.  `q_proj` is the QUERY count and `k_proj` is the KEY width, and they are different
-        // numbers - conflating them is what made the planner's indexer term 4x too big in round 194.
+        // numbers - conflating them makes the planner's indexer term 4x too big.
         {"indexer.q_proj.weight", g.n_embd, g.idx_q_heads * g.idx_key_dim, true, false},
         {"indexer.k_proj.weight", g.n_embd, g.idx_key_dim, true, false},
     };

@@ -73,11 +73,10 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
         return false;
     }
     // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
-    // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
+    // costs more than a small expert batch takes .  Only possible
     // before the device's context exists, so first thing.
     cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
     cudaGetLastError();
-    // HIP has no cudaInitDevice equivalent; retain its default scheduling policy.
     DeviceScope scope(device);
     if (!scope.ok) { err = scope.error(device); return false; }
     size_t free_bytes = 0, total_bytes = 0;

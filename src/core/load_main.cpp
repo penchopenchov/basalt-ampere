@@ -1,7 +1,6 @@
 // src/core/load_main.cpp - `basalt-load`: the expert arena load, measurable at any scale.
 //
-// P2.S1 gives this a target (<= 60 s cold, <= 10 s warm for 33.97 GB) and a method (8 threads, 16 MB chunks,
-// a checksum per layer).  The size is a FLAG rather than hard-coded because the honest way to measure a 34 GB
+// It loads with several threads in large chunks and checksums each layer.  The size is a FLAG rather than hard-coded because the honest way to measure a 34 GB
 // load is to measure a smaller one first and project - and because pinning 34 GB evicts every page of page
 // cache on the machine, which is not something a test should do while other work is running.
 #include "basalt/core/pinned.hpp"
@@ -16,7 +15,7 @@ int main(int argc, char** argv) {
     uint64_t layers = 2;
     int threads = 8;
     uint64_t chunk = 16ull << 20;
-    uint64_t blob_bytes = 1382400;      // architecture §3.2, asserted by tools/pack_layer.py
+    uint64_t blob_bytes = 1382400;      // one expert blob
     uint64_t blobs_per_layer = 512;
     bool pin = true;
     bool stream = false;

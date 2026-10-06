@@ -230,7 +230,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                 return false;
             }
             err.clear();
-            // R0.9: `half` is 0 for every mode except the split capture, where it selects a prefix of the
+            // `half` is 0 for every mode except the split capture, where it selects a prefix of the
             // stages so the mixer and the FFN-front-plus-router can be timed separately.
             const bool ok = post
                                 ? block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*) cs, err)
@@ -579,16 +579,12 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 
     // ================================ THE POSITION, WHICH THIS LOOP NEVER STAGED ================================
     //
-    // **EVERY TOKEN AFTER THE FIRST USED TO REPLAY POSITION 0.**  The QSA layers read their per-token counts from
+    // **THE POSITION MUST BE STAGED BEFORE EVERY REPLAY.**  The QSA layers read their per-token counts from
     // `st.step` and `st.pos_dev`, which are DEVICE buffers filled by an H2D copy captured INTO each graph.  A
     // graph bakes the SOURCE POINTER, not the value - so the copy re-reads the pinned host buffers on every
-    // replay, and those hold whatever was last written there.  `session_capture` left them at position 0.
-    //
-    // `layer.hpp` documents the requirement this loop was missing: "The per-token staging every QSA layer's
-    // captured H2D reads FROM.  Must run before each replay: the graphs captured the SOURCE POINTER, not the
-    // value, and that is exactly why the buffers are pinned and fixed."  `session_replay` calls `stage_token`;
-    // `session_loop` did not.  **A single-token test cannot see a position that never advances** - which is why
-    // the whole suite passed while a 20-token prompt rotated every token at position 0.
+    // replay, and those hold whatever was last written there.  `layer.hpp` documents the requirement: the
+    // per-token staging must run before each replay.  **A single-token test cannot see a position that never
+    // advances**, so a multi-token run is the check.
     stage_token(g, pos, pos_base, s);
 
     // ---- **THE TOKEN PATH ALLOCATES NOTHING.**
@@ -669,12 +665,10 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // otherwise this whole spin collapses into `while (true) { }`.
         volatile uint32_t* const seq = s.db->h_seq;
         for (;;) {
-            // **THE PER-ITERATION DRIVER CALL IS REQUIRED, AND THREE EXPERIMENTS NOW SAY SO.**  Round 287
-            // throttled this to one call in 64 and broke tests 51 and 56; adding `__threadfence_system()` to
-            // `doorbell_ring_kernel` and a volatile read here, then throttling, broke them again.  So the call
-            // is not merely flushing submission (round 195's reading) and it is not a missing fence either: on
-            // this driver, the device's write to mapped pinned memory becomes host-visible only when the driver
-            // is entered.  The fence and the volatile read are kept because they are correct and cost nothing -
+            // **THE PER-ITERATION DRIVER CALL IS REQUIRED.**  Throttling it, with or without
+            // `__threadfence_system()` in `doorbell_ring_kernel` and a volatile read here, breaks the protocol.
+            // The call is not merely flushing submission and it is not a missing fence either: the device's
+            // write to mapped pinned memory becomes host-visible only when the driver is entered.  The fence and the volatile read are kept because they are correct and cost nothing -
             // without them the ring's ordering against `x_f`/`ids`/`weights` is unstated - but they do not
             // remove the need for the call, and nothing here should be read as claiming they do.
             const cudaError_t q = cudaEventQuery(probe);
@@ -696,7 +690,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         gr.ms_to_ring += std::chrono::duration<double, std::milli>(t_ring - t_launch).count();
         if (!rang) {
             // The graph finished without the ring being observed.  `h_seq` is monotonic, so this is not a race
-            // - it means the ring never happened, which is the failure round 199 found in a captured event.
+            // - it means the ring never happened; a captured event record is silently dropped, which looks the same.
             err = "session_loop: layer " + std::to_string(l) + " ended without ringing";
             return false;
         }
@@ -711,12 +705,12 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 
         // ---- **AND THEY ARE COMBINED BY LAYER `l`, NOT BY LAYER `l+1`.**
         //
-        // This copy and the launch below are the whole of the L100 fix.  `moe_combine` multiplies `parts` by
-        // THIS layer's `b.weights`, so `parts` must be THIS layer's expert outputs; the previous form copied
-        // the pool's answer into `parts_dev` for the NEXT layer, which computed
+        // `moe_combine` multiplies `parts` by
+        // THIS layer's `b.weights`, so `parts` must be THIS layer's expert outputs; copying the pool's answer
+        // into `parts_dev` for the NEXT layer would compute
         // `sum_j w_{l+1}[j] * expert_{ids_l,j}(x_l)` - both the selection and the input one layer stale while
-        // the weights were current.  It produced finite, fluent, deterministic tokens that were not the
-        // model's, and no timing test could see it.
+        // the weights were current.  That produces finite, fluent, deterministic tokens that are not the
+        // model's, and no timing test can see it.
         cudaMemcpyAsync(gr.parts_dev, y_miss, parts_bytes, cudaMemcpyHostToDevice, cs);
         // ---- **AND THEN THE COMBINE.**  Stream-ordered after the copy above, so `hit_out` is added to misses
         // that are already in `parts`, and before `post[l]`, whose `moe_combine` reads the sum.  A no-op when
@@ -761,12 +755,12 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
             }
             cudaEventRecord(probe, cs);
         }
-        // ---- **THE SECOND HALF OF THE ROUND TRIP, AND THE HALF NOTHING WAS MEASURING.**
+        // ---- **THE SECOND HALF OF THE ROUND TRIP.**
         //
         // From seeing the ring to having queued the next `pre`.  Everything in here is a driver call, and on
         // the token path the GPU has nothing left to run for most of it - `pre[l]` has already rung, and
         // `post[l]` cannot start until this code launches it.  So this interval is GPU-idle time, and it is
-        // the number that decides whether the fix is R2.4 (fewer launches per layer) or a faster kernel.
+        // the number that decides between fewer launches per layer and a faster kernel.
         //
         // It INCLUDES the `!overlap` synchronisation when that arm is selected, which is deliberate: that arm
         // exists to show what the pipeline is worth, and hiding its cost here would defeat the comparison.

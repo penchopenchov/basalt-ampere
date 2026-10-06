@@ -56,26 +56,17 @@ return true;}
 /// The three canonical planes of a quantized tensor, located INSIDE the loaded region.
 //
 //
-// **THIS FUNCTION USED TO RE-DERIVE THE LAYOUT, AND THAT IS HOW A WIDTH BUG SURVIVED A ROUND.**  It computed
-/// `n_groups = n_in / group_elems` and then `scales_bytes = n_out * n_groups * sizeof(float)` - 4 bytes per
-/// scale for every tensor.  90 of the 303 quantized tensors hold fp16 scales in the pack (all 58 Q2_0 expert
-/// tensors, plus Q4_0, Q5_0, Q8_0 and IQ4_NL), so for those the computed plane was TWICE the real one and the
-/// three planes did not add up to the tensor.  The first diagnosis was "the manifest's `group_elems` must be
-/// wrong, the real group is 64"; it is not, and an audit of all 303 tensors against `scales_fp16` found zero
-/// inconsistencies.  **The unexamined input was the scale WIDTH, not the group COUNT.**
+// **THE SIZES ARE NOT RE-DERIVED HERE.**  Computing `scales_bytes = n_out * n_groups * sizeof(float)` would assume
+/// 4 bytes per scale for every tensor, but tensors holding fp16 scales in the file (all Q2_0 expert tensors, plus
+/// Q4_0, Q5_0, Q8_0 and IQ4_NL) would then get a plane TWICE the real one.  The loader widens fp16 scales to f32
+/// on the way into the arena and records the resulting plane sizes in the `WeightRef`, so this function reads what
+/// was loaded.  The redundancy is deliberate: the sizes come from ONE place (the index, checked against the span by
+/// the loader), and this function only checks that they describe the tensor it was given.
 //
 //
-// The loader now widens fp16 scales to f32 on the way into the arena and records the resulting plane sizes in
-/// the `WeightRef`, so this function has nothing left to derive - it reads what was loaded.  The redundancy is
-/// deliberate: the sizes come from ONE place (the index, checked against the manifest by `pack_index.py` and
-/// against the span by the loader), and this function only checks that they describe the tensor it was given.
-//
-//
-// **THE PLANE KEY IS `offsets`, NOT `mins`, AND THAT COST 136 MiB.**  `tools/pack_index.py` and
-/// `tools/pack_budget.py` both looked for `mins` and both therefore omitted the offset plane of 54 Q4_K/Q5_K
-/// tensors - so the arena was sized without it AND the bytes were never copied.  Two tools agreeing is only
-/// evidence when they do not share the assumption that is wrong.  This function refuses rather than guessing,
-/// which is what caught it.
+// **THE PLANE KEY IS `offsets`, NOT `mins`.**  A tool that looks for `mins` omits the offset plane of the Q4_K/Q5_K
+/// tensors, so the arena is sized without it AND the bytes are never copied.  This function refuses rather than
+/// guessing.
 struct Planes {    const uint8_t* codes = nullptr;    const float* scales = nullptr;    const float* offset = nullptr;
 ///< null when the form has none
 };
@@ -211,7 +202,7 @@ st_begin(layer, 8, stream);
 // ---- 2. qkv = wqkv @ x, with the activation THIS layer's `attn_qkv` asks for
 st_begin(layer, 9, stream);    if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_0, b.x_q8k, b.qkv, g.n_embd, C,                        v.name("attn_qkv.weight"), stream, err, mixed)) return false;    st_end(layer, 9, stream);
 // ---- 3. conv, then SiLU on the WHOLE conv output - before the q|k|v split, which is what
-//         `ref/gdn.py` L262 says and what makes the split a reshape rather than a copy.
+//         the Python reference says and what makes the split a reshape rather than a copy.
 st_begin(layer, 10, stream);
 // Under the native contract, conv + SiLU + both L2 norms are one kernel, and alpha/beta with their epilogues another
 // (`fused_gdn.hpp`).
@@ -323,7 +314,7 @@ q8k_bytes(g.n_embd),
 };    uint64_t total = 0;    for (uint64_t v : parts) total += (v + 15) & ~(uint64_t) 15;    return total;}
 uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        basalt::kernels::shared_expert_scratch_bytes(g.n_ff),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, void* stream, std::string& err, const Doorbell* db) {    using namespace basalt::kernels;    const LayerView v(tables, layer);    const WeightRef* w_router = v.get("ffn_gate_inp.weight");    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
-// ---- the router's activation.  The router's weight is BF16 and that is the one `ref/moe.py` singles out.
+// ---- the router's activation.  The router's weight is BF16 and that is the one the Python reference singles out.
 if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 // ---- logits = ffn_gate_inp @ bf16(x).  The weight is BF16, so this is `bf16_gemv` and not `s_gemv` - and using the
 // fp16 activation here instead is an error that flips a selection.
@@ -620,8 +611,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             // the driver may pin only a small amount of host memory in all, which is less than a long context of
             // 8-bit KV needs
             if (p.mode == 1) std::fprintf(stderr, "basalt: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
-                                 "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
-                                 "WSL the driver pins only about 1 GiB in all)\n", (double) bytes / 1073741824.0,
+                                 "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident)\n", (double) bytes / 1073741824.0,
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
@@ -1178,14 +1168,13 @@ const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    
 if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
 // ---- half 1: the mixer
 float* R = bb.R;
-    // R0.11: WHICH STAGES TO RUN.  `stage_prefix == 0` means "as `half` says", so every caller that predates
-    // this parameter is bit-for-bit unaffected; `stage_prefix == k` runs stages 0..k-1 and ignores `half`.
+    // WHICH STAGES TO RUN.  `stage_prefix == 0` means "as `half` says"; `stage_prefix == k` runs stages
+    // 0..k-1 and ignores `half`.
     const bool run0 = stage_prefix > 0 ? (stage_prefix >= 1) : (half == 0 || half == 1);
     const bool run1 = stage_prefix > 0 ? (stage_prefix >= 2) : (half == 0 || half == 1);
     const bool run2 = stage_prefix > 0 ? (stage_prefix >= 3) : (half == 0 || half == 1);
     const bool run3 = stage_prefix > 0 ? (stage_prefix >= 4) : (half == 0 || half == 2);
-    const bool run4 = stage_prefix > 0 ? (stage_prefix >= 5) : (half == 0 || half == 2);        // R0.9: this is the MIXER half, and `half == 2` skips it entirely.  A `half` of 1 or 0 runs it,
-    // and 0 is what every caller before this used.
+    const bool run4 = stage_prefix > 0 ? (stage_prefix >= 5) : (half == 0 || half == 2);        // `half == 2` skips the mixer entirely; a `half` of 1 or 0 runs it.
     if (run0) {
 st_begin(layer, 0, stream);
     if (fused) {
@@ -1207,7 +1196,7 @@ st_begin(layer, 0, stream);
 // the per-stream injection in `bb.inject`, and BOTH must survive until `block_layer_post` runs - which is
 // the contract the two functions have with each other and with the host loop's ordering.
     }
-    // R0.9: the FFN front and the ROUTER.  It reads `bb.mixed`/`bb.inject`, which the mixer left -
+    // The FFN front and the ROUTER.  It reads `bb.mixed`/`bb.inject`, which the mixer left -
     // the same contract `block_layer_post` has, and the reason the two are only meaningful in order.
     if (run3) {
 st_begin(layer, 3, stream);

@@ -1,7 +1,7 @@
 // src/core/device_main.cpp - `basalt-device`: report the GPU, the plan, and exercise the arena.
 //
-// This is P2.S1's "startup prints the memory plan vs actual cudaMemGetInfo" bullet, on its own so it can run
-// without the model.  It is also the run-time half of the sm_120 policy: CMake refuses to COMPILE for another
+// This prints the memory plan against the actual cudaMemGetInfo, on its own so it can run
+// without the model.  It is also the run-time half of the architecture policy: CMake refuses to COMPILE for another
 // architecture, and this refuses to RUN on one.
 #include "basalt/core/device.hpp"
 #include "basalt/plan/plan.hpp"

@@ -1083,12 +1083,12 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     // so anything cached against it would be layer 0's activation reused 48 times.
     act_quant_q8_1(x_f, H, d.act);
 
-    // ---- R4.2c: THE POOL'S HALF OF THE SPLIT.  **IT DOES NOT DECIDE ANYTHING - `Launch` ALREADY DID.**
+    // ---- THE POOL'S HALF OF THE SPLIT.  **IT DOES NOT DECIDE ANYTHING - `Launch` ALREADY DID.**
     //
     // The decision has to be made on THIS layer's ids, and `Launch` is the only callback that runs before the
     // pool while the ids are known (the doorbell publishes them when the ring fires).  So `expert_hit_run`
-    // decides, and this consumes `d.is_hit`.  The first version decided here instead, which meant `Launch`
-    // computed the PREVIOUS layer's experts into this layer's rows: C1 went from mean KL 9.69e-02 to 1.03e+00.
+    // decides, and this consumes `d.is_hit`.  Deciding here instead would make `Launch` compute the PREVIOUS
+    // layer's experts into this layer's rows.
     //
     // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a hit.
     const bool graph_hits = d.host_res != nullptr;
@@ -1497,15 +1497,14 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         // The activation is quantized HERE rather than reused from `s.moe.x_q8_0`, which `post[l-1]` wrote from
         // the PREVIOUS layer's `mixed`.  `pre[l]` has since overwritten `mixed`, so that buffer is a layer stale
         // - and a stale activation produces a perfectly finite expert for the wrong input.
-        // **R4.2h: THE SCALED QUANTIZER, SO A HIT REPRODUCES A MISS.**  The CPU pool quantizes this same
+        // **THE SCALED QUANTIZER, SO A HIT REPRODUCES A MISS.**  The CPU pool quantizes this same
         // activation with `act_quant_q8_1` and multiplies by the fp32 `ActQ::scale`; `quantize_q8_0` writes
-        // an fp16 `d` instead, and `bench/micro/act_quant_parity.cu` measured **80 of 80 chunks differing by
-        // up to 4.761e-04 relative**.  `quantize_q8_0_scaled` adopts the CPU's rule and scale, and the kernel
-        // takes the fp32 array.  Falling back to the old path would silently reintroduce the divergence, so
-        // the scales are required here rather than optional.
+        // an fp16 `d` instead, which differs by up to 2^-11 relative per chunk.  `quantize_q8_0_scaled` adopts
+        // the CPU's rule and scale, and the kernel takes the fp32 array.  Falling back to fp16 `d` would
+        // reintroduce the divergence, so the scales are required here rather than optional.
         if (d.x_q8_0_hit_scale == nullptr) {
             d.failed = true;
-            d.fail = "the hit path has no fp32 activation scales (R4.2h)";
+            d.fail = "the hit path has no fp32 activation scales";
             return;
         }
         basalt::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, basalt::kernels::cpu::H,
@@ -1537,7 +1536,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
     basalt::kernels::add_inplace(d.parts_out, d.hit_out, d.parts_elems, cs);
 }
 
-// ================================ THE RESIDENT ARENA (R2.1) ================================
+// ================================ THE RESIDENT ARENA ================================
 
 namespace {
 
@@ -1623,7 +1622,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
         }
     }
 
-    // THE RAM BEFORE THE ALLOCATION.  On Linux the arena is an anonymous mapping that succeeds whatever the host has;
+    // THE RAM BEFORE THE ALLOCATION.  The arena is an anonymous mapping that succeeds whatever the host has;
     // its pages are committed as the load writes them, so a container whose memory limit is below the arena would be
     // killed by the OOM killer part-way through the load, without a message.  A hard cgroup limit below it is certain
     // to end that way: refused, with the numbers.  Less RAM available than the arena (another program, an engine

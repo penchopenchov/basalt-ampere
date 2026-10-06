@@ -156,7 +156,7 @@ const WeightRef* need(const LayerView& v, const char* suffix, std::string& err) 
 bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
     if (w == nullptr) return false;
     if (w->native_data == nullptr) {
-        err = "verify: " + name + " is not served natively (run with --native)";
+        err = "verify: " + name + " is not served natively";
         return false;
     }
     return true;
@@ -595,9 +595,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
-        err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
+        err = "verify: needs the profile-filled VRAM expert tier (the model file's profile and --expert-cache); with "
               "--expert-cache auto, no VRAM was left for it - the 'no VRAM is left for the expert cache' line above "
-              "says how much is short and what makes room (a smaller --max-context, --kv q4_0, setup --draft-vocab en, "
+              "says how much is short and what makes room (a smaller --max-context, --kv q4_0, a smaller draft vocabulary, "
               "images on the CPU)";
         return false;
     }

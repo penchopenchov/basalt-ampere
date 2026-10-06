@@ -1,4 +1,4 @@
-// Linux selftest for the optional MAP_SHARED backing of PinnedArena.
+// Selftest for the optional MAP_SHARED backing of PinnedArena.
 #include "basalt/core/pinned.hpp"
 
 #include <cstdio>

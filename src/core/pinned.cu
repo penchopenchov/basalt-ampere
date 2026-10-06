@@ -327,7 +327,7 @@ LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::
 bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
                         bool cache_counts, uint64_t read_bytes) {
     (void) files; (void) arena_bytes; (void) cache_counts; (void) read_bytes;
-    why = "buffered (not Windows)";
+    why = "buffered";
     return false;
 }
 

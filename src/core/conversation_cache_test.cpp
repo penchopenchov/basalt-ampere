@@ -144,7 +144,7 @@ int main() {
         check(!cache.make_room(0, one*2+1), "held larger than budget cannot underflow");
     }
     {
-        // #342: MAIN -> SUB (9 turns) -> MAIN with 4 slots.  Every SUB turn parks the previous turn's live state
+        // MAIN -> SUB (9 turns) -> MAIN with 4 slots.  Every SUB turn parks the previous turn's live state
         // (its reply as generated, which the next request re-rendered) with a chain that holds that turn's
         // boundary checkpoint; the copy a turn back adds only that stale tail and is dropped, so MAIN survives.
         auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };

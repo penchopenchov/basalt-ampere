@@ -142,7 +142,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         check(!conversation_snapshot_validate(image,ss,g,draft.st,error), "missing QSA targets rejected");
         ss.qsa_states = layers.data();
         reject([](auto& s){s.layer_lo = 4;}, "snapshot from another layer range rejected");
-        // #216's carve: a split stage owning layers [4, 8) holds GDN rows 3..5 and QSA ordinal 1 only
+        // The carve: a split stage owning layers [4, 8) holds GDN rows 3..5 and QSA ordinal 1 only
         SessionState stage = ss;
         stage.layer_lo = 4; stage.gdn_alloc = 3; stage.qsa_ord0 = 1; stage.qsa_alloc = 1;
         ConversationStateSizes zs;

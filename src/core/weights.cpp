@@ -35,7 +35,7 @@ struct IndexRow {
     uint64_t codes_bytes = 0, scales_bytes = 0, offset_bytes = 0;
     int scales_fp16 = 0;
     int act_kind = 0;
-    bool raw16 = false;   ///< plan v0.3 P6: already 16-bit in the file (kinds 4/5)
+    bool raw16 = false;   ///< already 16-bit in the file (kinds 4/5)
 };
 
 /// How a segment's bytes must be transformed on the way from the pack to the arena.
@@ -48,9 +48,9 @@ enum class Conv : int {
 
 /// One contiguous run of a tensor's source span with a single destination range and one transform.
 ///
-/// THE SEGMENT LIST IS WHY THIS LOADER CAN CHANGE WIDTHS PLANE BY PLANE.  A quantized tensor used to be one
-/// verbatim span, which is only correct when every plane is already in engine form - and for 90 of the 303
-/// quantized tensors the scale plane is fp16 in the pack and must be f32 in the arena.
+/// THE SEGMENT LIST IS WHY THIS LOADER CAN CHANGE WIDTHS PLANE BY PLANE.  A quantized tensor as one
+/// verbatim span is only correct when every plane is already in engine form - and for tensors whose scale
+/// plane is fp16 in the file it must be f32 in the arena.
 struct Seg {
     uint64_t src_off = 0;   ///< relative to the row's src_off
     uint64_t src_bytes = 0;
@@ -59,9 +59,7 @@ struct Seg {
     Conv conv = Conv::Copy;
 };
 
-/// UTF-16 path for CreateFile-free portability: the loader uses `std::fopen`, which on Windows takes an ANSI
-/// path.  The pack lives beside the executable in practice, but a pack under a user directory with a
-/// non-ASCII name would silently fail to open, so the caller gets the errno rather than a null pointer.
+/// Read `n` bytes at `off`; a failure names what was being read.
 bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
     if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
     if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }
@@ -151,7 +149,7 @@ bool WeightTable::index_code_bits(const PackFiles& pack, const std::string& name
 bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
                        const std::set<std::string>* skip) {
     IndexText idx;
-    if (!idx.open(pack.index, err)) { err = "cannot open " + pack.index.path + " (run tools/pack_index.py)"; return false; }
+    if (!idx.open(pack.index, err)) { err = "cannot open " + pack.index.path; return false; }
 
     uint64_t pool = 0;
     int align = 0;
@@ -167,7 +165,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         IndexRow r;
         char name[256] = {0};
         int kind = 0;
-        // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
+        // The format is written when the model file is built and is space-separated with no quoting; a name with a
         // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
         const int n = std::sscanf(line,
                                   "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
@@ -182,7 +180,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             return false;
         }
         r.name = name;
-        // plan v0.3 P6: a standalone native pack (tools/iq_pack.py) stores 16-bit floats as they are in the GGUF:
+        // 16-bit floats are stored as they are in the GGUF:
         // index kinds 4 (BF16) and 5 (F16) are copied and take the engine forms of kinds 1 and 3
         if (kind == 4 || kind == 5) {
             r.raw16 = true;
@@ -275,8 +273,8 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             continue;
         }
         if (r.code_bits != 0 && r.dst_bytes == 0) {
-            // plan v0.3 P6: a native pack's row that carries a shape only - the GGUF form must serve it
-            err = r.name + ": this pack holds the tensor only in its GGUF form (run with --native SHARD1)";
+            // a row that carries a shape only - the GGUF form must serve it
+            err = r.name + ": the model file holds the tensor only in its GGUF form";
             cudaFreeHost(stage_in); cudaFreeHost(stage_out);
             return false;
         }
@@ -307,7 +305,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         uint64_t sum_src = 0, sum_dst = 0;
         if (r.codes_bytes != 0) {
             // A quantized tensor: codes, then scales, then the optional offset plane, each contiguous in the
-            // source span in that order (pack_index.py verifies the contiguity and refuses otherwise).
+            // source span in that order (the converter verifies the contiguity and refuses otherwise).
             segs[n_segs++] = Seg{0, r.codes_bytes, 0, r.codes_bytes, Conv::Copy};
             if (r.scales_bytes) {
                 const uint64_t src_scale_bytes = r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes;
