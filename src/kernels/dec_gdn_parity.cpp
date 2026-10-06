@@ -459,7 +459,7 @@ void fmt_sweep(cudaStream_t s) {
 }
 
 void bench(cudaStream_t s) {
-    if (std::getenv("DEC_FMT_SWEEP")) { setenv("STRATA_PDL", "1", 1); fmt_sweep(s); return; }
+    if (std::getenv("DEC_FMT_SWEEP")) { fmt_sweep(s); return; }
     rec_phases(s);
     std::mt19937 rng(7);
     constexpr int NL = 12;   // distinct layers per graph: far more weight than the L2 holds
@@ -478,7 +478,6 @@ void bench(cudaStream_t s) {
                 tot / 1e6 / NL, totw[0] / 1e6 / NL, totw[1] / 1e6 / NL, totw[2] / 1e6 / NL);
     Bufs b = make_bufs();
     float* x = upload(randn((size_t) kDecMaxT * N, 1.f, rng));
-    setenv("STRATA_PDL", "1", 1);
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     const char* names[4] = {"in-proj", "conv+ab+rec", "out-proj", "whole"};
@@ -527,7 +526,6 @@ int main(int argc, char** argv) {
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, dev));
     if (p.major < 9) { std::printf("dec_gdn_parity: needs sm_90+ (have %d.%d)\n", p.major, p.minor); return 77; }
-    setenv("STRATA_GDN_AB_UNROLL", "1", 1);
     g_quiet = dec_gdn_mode() == 2;
     std::printf("%s: %d SMs, L2 %d MB, smem/block opt-in %zu KB\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 20,
                 p.sharedMemPerBlockOptin >> 10);

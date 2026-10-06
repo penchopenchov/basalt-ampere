@@ -35,7 +35,6 @@ static uint16_t bf16(float x) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    setenv("STRATA_PDL", "1", 0);
     const int iters = argc > 1 ? std::atoi(argv[1]) : 200;
     const int t_lo = argc > 2 ? std::atoi(argv[2]) : 1, t_hi = argc > 3 ? std::atoi(argv[3]) : 8;
     if (!K::hc_fused_supported()) {
@@ -94,7 +93,6 @@ int main(int argc, char** argv) {
     cudaMemcpy(dwr, wr.data(), wr.size() * 2, cudaMemcpyHostToDevice);
     const bool q8 = K::hc8_enabled();
     if (q8) {
-        setenv("STRATA_DEC_HC8_STATS", "1", 0);
         K::hc8_prepare(dwd, LR, D);
         K::hc8_prepare(dwu, D, LR);
         K::hc8_prepare(dwi, HC, D);

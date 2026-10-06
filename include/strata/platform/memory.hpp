@@ -43,7 +43,7 @@ inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read
     return room >= read_bytes;
 }
 
-/// Whether `advise_willneed` asks the OS for anything: not on Windows, nor with STRATA_READ_AHEAD=0.
+/// Whether `advise_willneed` asks the OS for anything: not on Windows.
 bool read_ahead_enabled();
 /// Asks the OS to start reading [p, p + bytes) of a file mapping, without waiting.  Linux reads at most one
 /// readahead window per request, so the range is asked for in 128 KiB steps.

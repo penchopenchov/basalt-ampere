@@ -196,8 +196,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
 
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
-    static const bool direct_env = [] { const char* v = std::getenv("STRATA_PEER_DIRECT"); return v == nullptr || std::atoi(v) != 0; }();
-    const bool direct = direct_env && out != nullptr;
+    const bool direct = out != nullptr;
     launched_direct_ = false;
     launched_rows_ = 0;
     row_of_.clear();

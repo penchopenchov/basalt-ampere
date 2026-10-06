@@ -68,7 +68,6 @@ void expect(bool ok, const char* what) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    setenv("STRATA_DEC_HC8", "1", 1);
     const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     const int N = 2560, HC = 4, D = N * HC, LR = 320, TM = 8;
     const float EPS = 1e-6f;

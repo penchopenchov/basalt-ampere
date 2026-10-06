@@ -43,13 +43,9 @@ struct Pending {
     uint64_t tag;
 };
 
-/// The number of issuing threads: STRATA_IO_THREADS, else 4 (Windows: overlapped submits) / 16 (Linux: each
-/// thread does one blocking pread, so the thread count is the queue depth).
-int io_threads(int dflt) {
-    const char* v = std::getenv("STRATA_IO_THREADS");
-    const int n = v ? std::atoi(v) : dflt;
-    return std::clamp(n, 1, 64);
-}
+/// The number of issuing threads, clamped to 1..64 (each thread does one blocking pread, so the thread count is
+/// the queue depth).
+int io_threads(int dflt) { return std::clamp(dflt, 1, 64); }
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------ POSIX

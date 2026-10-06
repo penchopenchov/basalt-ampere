@@ -38,13 +38,7 @@ namespace {
 constexpr uint64_t kAdviseStep = 128ull << 10;
 }
 
-bool read_ahead_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_READ_AHEAD");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
-    return on;
-}
+bool read_ahead_enabled() { return true; }
 
 void advise_willneed(const void* p, uint64_t bytes) {
     if (p == nullptr || bytes == 0 || !read_ahead_enabled()) return;

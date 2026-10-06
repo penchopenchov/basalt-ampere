@@ -911,10 +911,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     const cudaError_t le = cudaGraphLaunch(tg.exec, cs);
     if (le != cudaSuccess) { err = std::string("session_run_token: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs);                     // one flush, so WDDM submits the graph now
-    static const int flush_us = [] {
-        const char* e = std::getenv("STRATA_TG_FLUSH_US");
-        return e ? std::atoi(e) : 2000;   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
-    }();
+    constexpr int flush_us = 2000;   // only notices faults
     volatile uint32_t* const seq = s.db->h_seq;
     volatile uint32_t* const flag = s.db->h_flag;
     using Clock = std::chrono::steady_clock;
