@@ -156,6 +156,151 @@ __global__ void history_batch_kernel(float* history, const float* normalized, in
     for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = h[r];
 }
 
+// ---- the verify window: native_gr_post's write, the rows' norms and gate (block per row), then the conv, residual
+// and history (thread per channel); each expression as the per-token kernels write it
+__device__ __forceinline__ float post_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+// weighted_rms_norm<1024>'s scale for a row of n_cols held as x[j] = column tid + 1024 j
+__device__ __forceinline__ float win_rms_scale(const float (&x)[3], int n_cols, float epsilon, float* sums) {
+    const int tid = threadIdx.x;
+    float partial = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int col = tid + j * 1024;
+        if (col < n_cols) {
+            const float value = x[j];
+            partial += value * value;
+        }
+    }
+    partial = norm_warp_sum(partial);
+    const int lane = tid % 32;
+    __syncthreads();   // sums of a previous call are read
+    if (lane == 0) sums[tid / 32] = partial;
+    __syncthreads();
+    partial = 0.0f;
+    if (lane < 1024 / 32) partial = sums[lane];
+    partial = norm_warp_sum(partial);
+    const float mean = partial / n_cols;
+    return rsqrtf(mean + epsilon);
+}
+struct PleWinRows {
+    float* R; const float* bo; const float* inject; const float* key; const float* value;
+    const float *norm_key, *norm_query, *norm_conv;
+    float *gated, *normalized;
+    int n_cols; float epsilon, inv_hc, gate_scale;
+};
+// row (t, h): block (h, t) of 1024 threads
+__device__ __forceinline__ void ple_win_rows_dev(const PleWinRows& a, int h, int t) {
+    __shared__ float sums[32];
+    __shared__ float kq[2][N];
+    __shared__ float s_gate;
+    const int tid = threadIdx.x, n = a.n_cols;
+    const size_t row = size_t(t) * D + size_t(h) * N;
+    const float weight = __fmaf_rn(2.0f, post_sigmoid(__fmaf_rn(a.inject[t * H + h], a.inv_hc, 0.0f)), 0.0f);
+    float hid[3], kx[3], x[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int col = tid + j * 1024;
+        hid[j] = 0.0f; kx[j] = 0.0f;
+        if (col < n) {
+            hid[j] = __fmaf_rn(a.bo[size_t(t) * N + col], weight, a.R[row + col]);
+            a.R[row + col] = hid[j];
+            kx[j] = a.key[row + col];
+        }
+    }
+    float scale = win_rms_scale(kx, n, a.epsilon, sums);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int col = tid + j * 1024;
+        if (col < n) kq[0][col] = scale * kx[j] * a.norm_key[size_t(h) * N + col];
+    }
+    scale = win_rms_scale(hid, n, a.epsilon, sums);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int col = tid + j * 1024;
+        if (col < n) kq[1][col] = scale * hid[j] * a.norm_query[size_t(h) * N + col];
+    }
+    __syncthreads();
+    if (tid < 512) {   // gate_kernel's 512 threads
+        float s8[8] = {};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int d = tid + j * 512;
+            const float p = d < N ? __fmul_rn(kq[0][d], kq[1][d]) : 0.0f;
+            s8[j] += p;
+        }
+        float sum = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sum += s8[j];
+        sum = warp_sum(sum);
+        if (tid % 32 == 0) sums[tid / 32] = sum;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        float sum = tid < 16 ? sums[tid] : 0.0f;
+        sum = warp_sum(sum);
+        if (tid == 0) {
+            const float s = __fmaf_rn(a.gate_scale, sum, 0.0f);
+            const float mag = sqrtf(fmaxf(fabsf(s), 1e-6f));
+            const float sign = float((s > 0.0f) - (s < 0.0f));
+            s_gate = 1.0f / (1.0f + expf(-__fmul_rn(sign, mag)));
+        }
+    }
+    __syncthreads();
+    const float gate = s_gate;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int col = tid + j * 1024;
+        x[j] = 0.0f;
+        if (col < n) {
+            x[j] = __fmul_rn(a.value[size_t(t) * N + col], gate);
+            a.gated[row + col] = x[j];
+        }
+    }
+    scale = win_rms_scale(x, n, a.epsilon, sums);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int col = tid + j * 1024;
+        if (col < n) a.normalized[row + col] = scale * x[j] * a.norm_conv[size_t(h) * N + col];
+    }
+}
+__global__ void __launch_bounds__(1024) ple_win_rows_kernel(PleWinRows a) { ple_win_rows_dev(a, blockIdx.x, blockIdx.y); }
+// channel c: the T rows' conv and residual in order, each row's advanced history copied out, the last kept
+__device__ __forceinline__ void ple_win_conv_dev(float* R, const float* gated, const float* normalized,
+                                                 const uint16_t* weights, float* history, float* snap, int T, int c) {
+    if (c >= D) return;
+    float hist[HISTORY], wk[4];
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) hist[r] = history[size_t(c) * HISTORY + r];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) wk[k] = __half2float(__ushort_as_half(weights[c * 4 + k]));
+    float last[HISTORY];
+    for (int t = 0; t < T; ++t) {
+        float sum = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int p = t - 9 + 3 * k;
+            const float x = p >= 0 ? normalized[size_t(p) * D + c] : hist[9 + p];
+            const float term = __fmul_rn(x, wk[k]);
+            sum = k == 0 ? term : __fadd_rn(sum, term);
+        }
+        const float activation = sum / (1.0f + expf(-sum));
+        const size_t i = size_t(t) * D + c;
+        R[i] = __fadd_rn(R[i], __fadd_rn(gated[i], activation));
+#pragma unroll
+        for (int r = 0; r < HISTORY; ++r) {
+            const int p = t - (HISTORY - 1) + r;
+            last[r] = p >= 0 ? normalized[size_t(p) * D + c] : hist[t + 1 + r];
+            snap[size_t(t) * HISTORY * D + size_t(c) * HISTORY + r] = last[r];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = last[r];
+}
+__global__ void __launch_bounds__(128) ple_win_conv_kernel(float* R, const float* gated, const float* normalized,
+                                                          const uint16_t* weights, float* history, float* snap, int T) {
+    ple_win_conv_dev(R, gated, normalized, weights, history, snap, T, blockIdx.x * blockDim.x + threadIdx.x);
+}
+
 struct Span { const void* p; size_t bytes; size_t alignment; };
 bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
@@ -199,6 +344,21 @@ void native_ple_postops(const float* projected_key, const float* hidden,
     launch_check();
     native_gr_rms_norm_weighted(b.gated,w.norm_conv,b.normalized,N,H,NG_RMS_EPS,stream);
     conv_residual_kernel<<<D/256,256,0,st>>>(history,b.normalized,w.conv1d_f16,hidden,b.gated,b.conv,b.result);
+    launch_check();
+}
+
+void native_ple_window(const PleWindowArgs& a, const PleWeights& w, void* stream) {
+    if (!stream || a.T <= 0 || !a.R || !a.block_out || !a.inject || !a.key || !a.value || !a.history || !a.hist_snap ||
+        !a.scratch || !w.norm_key || !w.norm_query || !w.norm_conv || !w.conv1d_f16)
+        throw std::invalid_argument("native PLE window: null input or empty window");
+    auto st = static_cast<cudaStream_t>(stream);
+    PleWinRows r;
+    r.R = a.R; r.bo = a.block_out; r.inject = a.inject; r.key = a.key; r.value = a.value;
+    r.norm_key = w.norm_key; r.norm_query = w.norm_query; r.norm_conv = w.norm_conv;
+    r.gated = a.scratch; r.normalized = a.scratch + size_t(a.T) * D;
+    r.n_cols = N; r.epsilon = NG_RMS_EPS; r.inv_hc = 1.0f / float(H); r.gate_scale = 1.0f / std::sqrt(float(N));
+    ple_win_rows_kernel<<<dim3(H, unsigned(a.T)), 1024, 0, st>>>(r);
+    ple_win_conv_kernel<<<D / 128, 128, 0, st>>>(a.R, r.gated, r.normalized, w.conv1d_f16, a.history, a.hist_snap, a.T);
     launch_check();
 }
 

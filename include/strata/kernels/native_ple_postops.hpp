@@ -35,4 +35,19 @@ void native_ple_postops(const float* projected_key, const float* hidden,
 void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
                               float* query_norm, float* gated, float* gate, int T, void* stream);
 
+/// A verify window's PLE after its projections, T rows in two launches: per row, element for element, native_gr_post's
+/// pending write into the hidden rows, native_ple_postops, the history advance and a copy of the advanced history.
+struct PleWindowArgs {
+    float* R = nullptr;                 ///< [T][10240] hidden rows: the pending write, then the result
+    const float* block_out = nullptr;   ///< [T][2560] the pending write's block output
+    const float* inject = nullptr;      ///< [T][4] its inject
+    const float* key = nullptr;         ///< [T][10240] projected keys
+    const float* value = nullptr;       ///< [T][2560] projected values
+    float* history = nullptr;           ///< 9 rows per channel, advanced past the T rows
+    float* hist_snap = nullptr;         ///< [T][9 * 10240]: the history after each row
+    float* scratch = nullptr;           ///< 2 * T * 10240 floats
+    int T = 0;
+};
+void native_ple_window(const PleWindowArgs& a, const PleWeights& w, void* stream);
+
 } // namespace strata::kernels
