@@ -143,7 +143,7 @@ class Cli(Tmp):
                 server.main()
         return cm.exception
 
-    def test_model_needs_exe_and_excludes_config(self):
+    def test_model_needs_exe_and_a_valid_gpu(self):
         path = self.build()
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
@@ -152,7 +152,7 @@ class Cli(Tmp):
         self.assertIn("--exe", err.getvalue())
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--engine", "engine", "--model", path, "--exe", str(self.exe), "--config", "x.json")
+            e = self.run_main("--engine", "engine", "--model", path, "--exe", str(self.exe), "--gpu", "x")
         self.assertEqual(getattr(e, "code", None), 2)
 
 

@@ -1,4 +1,4 @@
-"""Run the server from a .basalt model file: the engine config the file implies, its tokenizer and the vision
+"""Run the server from a .basalt model file: the engine settings the file implies, its tokenizer and the vision
 sidecar's inputs, unpacked once into the cache directory."""
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ def vision_config(mf: ModelFile, exe: str) -> dict | None:
 
 
 def model_config(path: str, exe: str, gpus: int | None = None, vision: bool = True) -> dict:
-    """What a `--config` JSON gives, derived from the model file.  A second visible GPU becomes the engine's peer
+    """The engine settings the model file implies.  A second visible GPU becomes the engine's peer
     expert tier unless the file's engine arguments already say."""
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))

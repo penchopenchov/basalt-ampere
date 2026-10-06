@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, Service, ProcessEngine, engine_args, parallel_args, serve
+from serve.server import ByteTokenizer, Service, ProcessEngine, serve
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -138,19 +138,6 @@ while True:
         continue
     window()
 '''
-
-
-class ParallelArgs(unittest.TestCase):
-    def test_parallel_config_key(self):
-        self.assertEqual(parallel_args({"parallel": 4}, []), ["--batch", "4"])
-        self.assertEqual(parallel_args({"parallel": 1}, []), [])
-        self.assertEqual(parallel_args({}, []), [])
-        self.assertEqual(parallel_args({"parallel": 2}, ["--batch", "3"]), [])       # the args' own value wins
-        self.assertEqual(parallel_args({"parallel": "4"}, []), [])                   # said and ignored
-        self.assertEqual(parallel_args({"parallel": True}, []), [])
-        self.assertEqual(parallel_args({"parallel": 12}, []), ["--batch", "12"])     # the engine warns and caps
-        args = engine_args({"args": ["--pack", "p"], "parallel": 2})
-        self.assertEqual(args[-2:], ["--batch", "2"])
 
 
 class PickSlot(unittest.TestCase):

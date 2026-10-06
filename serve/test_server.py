@@ -21,7 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, ProcessEngine,  # noqa: E402
-                          engine_args, layer_split_value, prompt_tokens_seen, request_timings, serve,
+                          prompt_tokens_seen, request_timings, serve,
                           start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
@@ -404,29 +404,6 @@ class EffortAtTheEnd(unittest.TestCase):
         # without it the checkpoint held the effort turn and the next turn reused nothing
         self.assertEqual(self.session([(turn1, low), (turn2, low)], True, False), [0])
 
-    def test_the_config(self):
-        from serve.server import effort_end_args
-
-        class Tok:
-            def encode(self, text, parse_special=False):
-                return [8678] if text == "system" else [1, 2]
-
-        with tempfile.TemporaryDirectory() as d:
-            new, old = Path(d) / "new.exe", Path(d) / "old.exe"
-            new.write_bytes(b"...  --tail-role-token ID --serve: ...")
-            old.write_bytes(b"... --turn-token ID ...")
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                self.assertIsNone(effort_end_args({}, str(new), Tok()))
-                self.assertIsNone(effort_end_args({"effort_position": "start"}, str(new), Tok()))
-                self.assertEqual(effort_end_args({"effort_position": "end"}, str(new), Tok()),
-                                 ["--tail-role-token", "8678"])
-                self.assertIsNone(effort_end_args({"effort_position": "end"}, str(old), Tok()))
-                self.assertIsNone(effort_end_args({"effort_position": "end"}, str(new), ByteTokenizer()))
-            self.assertIn("needs an engine with --tail-role-token", out.getvalue())
-            with self.assertRaises(ValueError):
-                effort_end_args({"effort_position": "middle"}, str(new), Tok())
-
 
 class StatusNeedsTheKey(unittest.TestCase):
     """/status shows the end of the answer being written, so it needs the key like /v1/*."""
@@ -790,7 +767,7 @@ class SamplingKeys(unittest.TestCase):
 
 
 class GpuChoice(unittest.TestCase):
-    """The config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
+    """--gpu reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
     def test_env(self):
         from serve.server import child_env
@@ -802,17 +779,16 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
     def test_vision_device(self):
-        # the image encoder on its own card; the engine's environment stays as it was
+        # with two cards listed the image encoder takes the second; the engine's environment stays as it was
         from serve.server import child_env, vision_env
-        cfg = {"gpu": [0, 1], "vision": {"exe": "v", "cuda_device": 2}}
+        cfg = {"gpu": "0,1"}
         env = child_env(cfg)
         venv = vision_env(cfg, env)
-        self.assertEqual(venv["CUDA_VISIBLE_DEVICES"], "2")
+        self.assertEqual(venv["CUDA_VISIBLE_DEVICES"], "1")
         self.assertEqual(venv["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
-        plain = {"gpu": [0, 1], "vision": {"exe": "v"}}
-        self.assertIs(vision_env(plain, env), env)          # no cuda_device: the engine's environment, unchanged
-
+        self.assertIs(vision_env({"gpu": "0"}, env), env)   # one card, or none listed: the engine's environment
+        self.assertIs(vision_env({}, env), env)
 
 
 class RecordingPrompt(MockEngine):
@@ -1022,48 +998,6 @@ class PcieShare(unittest.TestCase):
         self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
 
 
-class LearnedProfile(unittest.TestCase):
-    """The config's "expert_profile_save": the engine saves its learned profile there, and the next start
-    begins from it when it is a profile of the same model; without the key the arguments are unchanged."""
-
-    def write(self, path, nl=48, ne=512, n=4):
-        sys.path.insert(0, str(ROOT / "tools"))
-        import make_profile
-        old = make_profile.N_LAYER
-        make_profile.N_LAYER = nl
-        try:
-            make_profile.write_profile(path, [(i % nl, i // nl) for i in range(n)], n_expert=ne)
-        finally:
-            make_profile.N_LAYER = old
-
-    def test_without_the_key_nothing_changes(self):
-        args = ["--native", "x", "--expert-profile", "data/expert-profile.bin", "--adapt-every", "4"]
-        self.assertEqual(engine_args({"args": list(args)}), args)
-        self.assertEqual(engine_args({"args": list(args), "expert_profile_save": ""}), args)
-
-    def test_save_and_start_from_it(self):
-        d = Path(tempfile.mkdtemp())
-        self.write(d / "base.bin")
-        cfg = {"args": ["--expert-profile", "base.bin"], "cwd": str(d), "expert_profile_save": "learned.bin",
-               "expert_profile_save_every": 5}
-        # nothing saved yet: the config's profile, and the engine is told where to save
-        self.assertEqual(engine_args(cfg), ["--expert-profile", "base.bin", "--expert-profile-save", "learned.bin",
-                                            "--expert-profile-save-every", "5"])
-        self.write(d / "learned.bin")
-        self.assertEqual(engine_args(cfg)[:2], ["--expert-profile", "learned.bin"])
-        self.write(d / "learned.bin", ne=256)                    # another model's: not used
-        self.assertEqual(engine_args(cfg)[:2], ["--expert-profile", "base.bin"])
-        (d / "learned.bin").write_bytes(b"STRP" + bytes(20))     # not a whole profile
-        self.assertEqual(engine_args(cfg)[:2], ["--expert-profile", "base.bin"])
-        self.write(d / "learned.bin")
-        (d / "learned.bin").write_bytes((d / "learned.bin").read_bytes()[:30])   # truncated
-        self.assertEqual(engine_args(cfg)[:2], ["--expert-profile", "base.bin"])
-
-    def test_no_profile_in_the_args(self):
-        cfg = {"args": ["--native", "x"], "expert_profile_save": "learned.bin"}
-        self.assertEqual(engine_args(cfg), ["--native", "x", "--expert-profile-save", "learned.bin"])
-
-
 class RepeatStop(unittest.TestCase):
     """One token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off."""
 
@@ -1091,38 +1025,6 @@ class RepeatStop(unittest.TestCase):
         self.assertNotIn("repeated one token", log)
         done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens are not one run
         self.assertEqual(done["finish"], "stop")
-
-
-class LayerSplit(unittest.TestCase):
-    """The config's "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are not."""
-
-    def cfg(self, split, gpus=(2, 0, 1, 3)):
-        c = {"args": ["--native", "x"], "gpu": list(gpus)}
-        if split is not ...:
-            c["layer_split"] = split
-        return c
-
-    def test_auto_and_absent(self):
-        for v in (..., None, "", "auto", "AUTO"):
-            self.assertEqual(engine_args(self.cfg(v))[-2:], ["--layer-split", "auto"])
-
-    def test_string_and_list(self):
-        self.assertEqual(engine_args(self.cfg("24,36,42"))[-2:], ["--layer-split", "24,36,42"])
-        self.assertEqual(engine_args(self.cfg(" 24, 36 ,42 "))[-2:], ["--layer-split", "24,36,42"])
-        self.assertEqual(engine_args(self.cfg([24, 36, 42]))[-2:], ["--layer-split", "24,36,42"])
-        self.assertEqual(engine_args(self.cfg(18, gpus=(0, 1)))[-2:], ["--layer-split", "18"])
-        self.assertEqual(engine_args(self.cfg([18], gpus=(0, 1)))[-2:], ["--layer-split", "18"])
-
-    def test_counts_per_card_are_refused_with_the_format(self):
-        for bad in ("24,16,12,12", [24, 16, 12, 12], "24,16,12", "24,36", "x", [24.5, 30, 40], "1,20,30", [True]):
-            with self.assertRaises(ValueError) as e:
-                layer_split_value(self.cfg(bad))
-            self.assertIn("first layer of each later GPU", str(e.exception))
-            self.assertIn('"12,24,36"', str(e.exception))   # the example for 4 GPUs
-
-    def test_one_gpu_ignores_it(self):
-        self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0], "layer_split": "24,16"}),
-                         ["--native", "x"])
 
 
 class DraftHeadHint(unittest.TestCase):
@@ -2426,15 +2328,6 @@ class SilentEngine(unittest.TestCase):
         engine = self.bare(0)
         self.later(engine, 0.5, "T 5", "DONE 1 1 1 1 length")
         self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [5])
-
-    def test_config(self):
-        from serve.server import ENGINE_SILENCE_S, engine_silence_s
-        self.assertEqual(engine_silence_s({}), ENGINE_SILENCE_S)
-        self.assertEqual(engine_silence_s({"engine_silence_s": 0}), 0.0)
-        self.assertEqual(engine_silence_s({"engine_silence_s": 900}), 900.0)
-        for bad in (-1, "300", True):
-            with self.assertRaises(ValueError):
-                engine_silence_s({"engine_silence_s": bad})
 
 
 FAKE_LOST_STEP = '''import pathlib, sys, time

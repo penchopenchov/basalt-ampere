@@ -297,7 +297,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks); False
-    renders it without thinking (the config's "anthropic_thinking": "on_request")."""
+    renders it without thinking."""
     messages = []
     system = req.get("system")
     if system:
@@ -343,7 +343,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
-        # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks, since a
+        # Opt-in (the default thinks, since a
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
         # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.

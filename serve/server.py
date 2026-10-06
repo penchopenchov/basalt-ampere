@@ -1,13 +1,16 @@
 """serve/server.py - plan v0.3 P8: OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
 
+    basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
+    python -m serve.server --engine engine --model FILE.basalt --exe bin/basalt ...   (what basalt serve runs)
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
-    python -m serve.server --engine engine --config config.json --port 8080   (the real engine, resident)
-    python -m serve.server --engine engine --model m.basalt --exe bin/basalt     (the same from a .basalt model file)
+
+--gpu lists the GPUs as nvidia-smi numbers them: the first runs the model, a second is the peer expert tier
+(default: every visible GPU).  See --help for the other flags.
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /metrics and GET /api/logs (the stats page's feeds). One sequence at a time behind a
 FIFO (plan: one resident sequence).
-Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
+Images (optional, when the model file carries a vision encoder): OpenAI image_url parts and Anthropic image blocks (base64
 data, http(s) URLs or local file paths) go through `basalt-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.
@@ -35,7 +38,6 @@ import re
 import select
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -69,8 +71,8 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                          "elaboration."}
 VISION_START = "<|vision_start|>"
 # a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
-# broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
-# sets it; 0 turns it off.
+# broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The Service's
+# repeat_stop_tokens sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
 # what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
@@ -85,7 +87,7 @@ REQUESTS_SHOWN = 12        # the finished requests GET /metrics lists, newest fi
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
 # a running request whose engine prints nothing (no T, PP or any other line) for this long has lost step with the
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
-# the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
+# the next request starts it again.  ProcessEngine.silence_s sets it (0: wait forever).
 ENGINE_SILENCE_S = 300.0
 # ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto)
 # and a slow PC can take minutes over a first chunk before the first line.  Until the first
@@ -168,7 +170,7 @@ _echoing: set[str] = set()      # the logs echo_requests already follows (restar
 DRAFT_HEAD_FAIL = "the draft head does not fit"
 DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic "
                    "script) or --draft-vocab en (English and code, ~215 MiB less than the default), in the engine "
-                   "arguments of the config; or a smaller --context.")
+                   "arguments; or a smaller --context.")
 
 
 def start_failure_hint(log: str | None, offset: int) -> str:
@@ -327,7 +329,7 @@ class ProcessEngine:
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
     """
-    silence_s = ENGINE_SILENCE_S         # main() sets the config's engine_silence_s (survives restart())
+    silence_s = ENGINE_SILENCE_S         # an attribute of its own: restart() keeps it
     silent_note = None                   # why the server ended a silent engine (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     stderr_sink = None                   # callable(line): the engine's stderr when there is no log file (main() sets it)
@@ -1157,12 +1159,6 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
-        if cfg.get("gpu"):
-            args.append("--gpu")
-        if cfg.get("threads"):
-            args += ["--threads", str(cfg["threads"])]
-        if cfg.get("max_tokens"):
-            args += ["--max-tokens", str(cfg["max_tokens"])]
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.stopped = False
@@ -1270,8 +1266,8 @@ class Vision:
 
 
 def gpu_list(cfg: dict) -> list[int]:
-    """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
-    numbers them; [] when it names none."""
+    """The cards --gpu lists ("0,1"), numbered as nvidia-smi numbers them: the first runs the model, the second is the
+    peer expert tier; [] when it names none."""
     g = cfg.get("gpu")
     if g is None or g == "":
         return []
@@ -1279,40 +1275,11 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
-def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
-    """The engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
-    the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
-    default) or the engine is too old for it (said once; the prompt stays the default one).  ValueError for a value
-    other than "start" / "end"."""
-    pos = cfg.get("effort_position", "start")
-    if pos not in ("start", "end"):
-        raise ValueError(f'effort_position must be start or end, not {pos!r}')
-    if pos == "start":
-        return None
-    try:
-        with open(exe, "rb") as f:
-            known = b"--tail-role-token" in f.read()
-    except OSError:
-        known = False
-    role = tok.encode("system", parse_special=True)
-    if not known or len(role) != 1:
-        print("[server] warning: effort_position end needs an engine with --tail-role-token, effort stays at the top", flush=True)
-        return None
-    print("[server] effort_position end: reasoning effort goes before the answer, so changing it keeps the cache", flush=True)
-    return ["--tail-role-token", str(role[0])]
-
-
 def gpus_in_play(cfg: dict, args: list[str]) -> list[int]:
-    """The physical GPUs the engine uses, numbered as nvidia-smi numbers them, first the engine's own card: the
-    config's "gpu" (several for a layer split), or the first card CUDA_VISIBLE_DEVICES in the config's "env" leaves
-    visible, plus the peer card of --peer-device (a CUDA ordinal: the Nth visible card).  [0] when nothing names one."""
-    listed = gpu_list(cfg)
-    visible = []
-    for x in str((cfg.get("env") or {}).get("CUDA_VISIBLE_DEVICES", "")).split(","):
-        if x.strip().isdigit():
-            visible.append(int(x.strip()))
-    visible = visible or listed
-    out = listed if len(listed) > 1 else (visible[:1] or listed or [0])
+    """The physical GPUs the engine uses, numbered as nvidia-smi numbers them, first the engine's own card: the first
+    one --gpu lists, plus the peer card of --peer-device (a CUDA ordinal: the Nth listed card).  [0] when none is named."""
+    visible = gpu_list(cfg)
+    out = visible[:1] or [0]
     peer = next((a.split("=", 1)[1] for a in args if a.startswith("--peer-device=")),
                 args[args.index("--peer-device") + 1] if "--peer-device" in args[:-1] else None)
     if peer is not None and str(peer).strip().lstrip("-").isdigit() and int(peer) >= 0:
@@ -1321,157 +1288,29 @@ def gpus_in_play(cfg: dict, args: list[str]) -> list[int]:
     return list(dict.fromkeys(out))
 
 
-def engine_silence_s(cfg: dict) -> float:
-    """The config's "engine_silence_s" - seconds an engine may print nothing during a request before the server
-    ends it (default ENGINE_SILENCE_S; 0 = wait forever).  ValueError for anything but a number >= 0."""
-    v = cfg.get("engine_silence_s")
-    if v is None:
-        return ENGINE_SILENCE_S
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
-        raise ValueError(f'engine_silence_s must be seconds >= 0 (0 = no limit), not {v!r}')
-    return float(v)
-
-
-def layer_split_value(cfg: dict) -> str:
-    """The config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the FIRST LAYER of
-    each later GPU's share - one rising number per GPU after the first, e.g. "24,36,42" for 4 GPUs (layers 0-23 on the
-    first card, 24-35, 36-41, 42 to the end) - as a string or a JSON list ([24, 36, 42]).  ValueError with the format
-    and an example for anything else, such as per-card layer counts ("24,16,12,12")."""
-    v = cfg.get("layer_split")
-    if v is None or (isinstance(v, str) and v.strip().lower() in ("", "auto")):
-        return "auto"
-    n = len(gpu_list(cfg))
-    items = v if isinstance(v, (list, tuple)) else str(v).split(",") if isinstance(v, (str, int)) else None
-    vals = []
-    for x in items or []:
-        try:
-            if isinstance(x, bool) or isinstance(x, float):
-                raise ValueError
-            vals.append(int(str(x).strip()))
-        except ValueError:
-            vals = None
-            break
-    want = max(n - 1, 1)
-    example = ",".join(str(round(48 * (i + 1) / (want + 1))) for i in range(want))
-    hint = (f'layer_split is the first layer of each later GPU, {want} rising number(s) for {n} GPUs, '
-            f'e.g. "{example}", or "auto"')
-    if not vals:
-        raise ValueError(f"{hint}; got {v!r}")
-    if n > 1 and len(vals) != n - 1:
-        raise ValueError(f"{hint}; got {len(vals)} number(s) ({v!r}) for {n} GPUs")
-    if vals[0] < 2 or any(b <= a for a, b in zip(vals, vals[1:])):
-        raise ValueError(f"{hint}; got {v!r}, which does not rise from 2 or more")
-    return ",".join(str(x) for x in vals)
-
-
 def engine_args(cfg: dict) -> list[str]:
-    """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
-    config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
-    layer_split_value)."""
-    args = list(cfg["args"])
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
-        args += ["--layer-split", layer_split_value(cfg)]
-    # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
-    if len(gpu_list(cfg)) > 1 and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
-        args.append("--split-skip-if-fits")
-    # "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
-    # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512)
-    if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:
-        args.append("--vram-elastic")
-        seg = cfg.get("vram_segment_mib")
-        if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
-            args += ["--vram-segment-mib", str(seg)]
-    args += parallel_args(cfg, args)
-    return learned_profile_args(cfg, args)
-
-
-PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT)
-
-
-def parallel_args(cfg: dict, args: list[str]) -> list[str]:
-    """"parallel": N in the config - up to N requests decode together in the engine's batch slots
-    (--batch N); more wait their turn.  1 or absent: one request at a time, as before.  A value the engine cannot use
-    is said and passed on: the engine warns and adjusts (recommend, never force)."""
-    if "--batch" in args or "--slots" in args:
-        return []
-    n = cfg.get("parallel")
-    if n is None or n is False:
-        return []
-    if isinstance(n, bool) or not isinstance(n, int):
-        print(f'[server] warning: "parallel" must be a whole number, 2..{PARALLEL_MAX} (got {n!r}), ignored',
-              flush=True)
-        return []
-    if n <= 1:
-        return []
-    if n > PARALLEL_MAX:
-        print(f'[server] warning: "parallel" {n} is over the limit, using {PARALLEL_MAX}', flush=True)
-    return ["--batch", str(n)]
-
-
-def profile_shape(path: str) -> tuple[int, int] | None:
-    """An expert profile's (layers, experts per layer), from its header (tools/make_profile.py's format), or None
-    when the file is missing, is not one or is shorter than the pairs its header promises."""
-    try:
-        with open(path, "rb") as f:
-            head = f.read(24)
-            size = os.fstat(f.fileno()).st_size
-    except OSError:
-        return None
-    if len(head) < 24 or head[:4] != b"STRP":
-        return None
-    _, nl, ne, _, n = struct.unpack("<5I", head[4:])
-    return (nl, ne) if size >= 24 + 4 * n else None
-
-
-def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
-    """"expert_profile_save": "<path>" in the config has the engine save what its adaptive
-    tier learned there - on QUIT and every "expert_profile_save_every" minutes (10 by default, 0 = at QUIT only) -
-    and the next start begins from it instead of the config's --expert-profile, when it is a profile of the same
-    model (its header's layers and experts match); otherwise from the config's own, as before.  A relative path is
-    the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
-    save = cfg.get("expert_profile_save")
-    if not isinstance(save, str) or not save.strip() or "--expert-profile-save" in args:
-        return args
-    args = args + ["--expert-profile-save", save]
-    every = cfg.get("expert_profile_save_every")
-    if isinstance(every, (int, float)) and not isinstance(every, bool) and every >= 0:
-        args += ["--expert-profile-save-every", str(every)]
-    if "--expert-profile" in args[:-1]:
-        i = args.index("--expert-profile") + 1
-        here = cfg.get("cwd") or "."
-        learned = profile_shape(save if os.path.isabs(save) else os.path.join(here, save))
-        base = profile_shape(args[i] if os.path.isabs(args[i]) else os.path.join(here, args[i]))
-        if learned is not None and learned == base:
-            args[i] = save
-    return args
+    """The engine's arguments: the ones the model file carries."""
+    return list(cfg["args"])
 
 
 def child_env(cfg: dict) -> dict:
-    """The engine's environment: the CUDA libraries (pip's nvidia packages, or the toolkit that
-    compiled the engine) first on the library search path."""
+    """The engine's environment: --gpu's cards, as the only ones it sees."""
     env = dict(os.environ)
-    if gpu_list(cfg):                              # the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
+    if gpu_list(cfg):                              # numbered as nvidia-smi does; CUDA's own default order
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
-    for k, v in (cfg.get("env") or {}).items():      # environment the config carries for the engine
-        env[str(k)] = str(v)
-    dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
-    if dirs:
-        var = "LD_LIBRARY_PATH"
-        env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     return env
 
 
 def vision_env(cfg: dict, env: dict) -> dict:
-    """The image encoder's environment: the engine's, unless the config's vision section names its own "cuda_device"
-    (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
-    keeps all of its own cards' VRAM.  Without it, nothing changes."""
-    dev = (cfg.get("vision") or {}).get("cuda_device")
-    if dev is None:
+    """The image encoder's environment: the engine's, or with two cards listed the second card alone, so the encoder
+    stays off the card that holds the model."""
+    gpus = gpu_list(cfg)
+    if len(gpus) < 2:
         return env
     env = dict(env)
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    env["CUDA_VISIBLE_DEVICES"] = str(dev)
+    env["CUDA_VISIBLE_DEVICES"] = str(gpus[1])
     return env
 
 
@@ -1537,8 +1376,8 @@ class Service:
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
-        self.aliases: list[str] = []                  # other names of the model (the config's `aliases`)
-        self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.aliases: list[str] = []                  # other names of the model (--alias)
+        self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling block
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -1552,7 +1391,7 @@ class Service:
         # origins that count as the server's own page for the load/unload/VRAM controls, e.g. reached through a
         # reverse proxy or tunnel whose Host differs ("https://host.example.com"); never a wildcard
         self.trusted_origins: list[str] = []
-        # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts;
+        # DNS rebinding: extra Host names this server answers to (--allowed-host;
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
@@ -1575,7 +1414,7 @@ class Service:
         self.min_free_vram_mib = 0
         self.before_load = None
         self.vram_reserve = None                         # the last POST /v1/vram reserve (None: the start's)
-        self.reasoning_budget_tokens = 0                 # the config's default thinking budget (0: none)
+        self.reasoning_budget_tokens = 0                 # a default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -1585,7 +1424,7 @@ class Service:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
     def set_aliases(self, aliases) -> None:
-        """The config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
+        """The model's other names - a list of names (or one comma-separated string), like llama-server's --alias.
         ValueError for anything else."""
         if aliases is None:
             aliases = []
@@ -1609,8 +1448,8 @@ class Service:
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
 
     def reasoning_budget(self, req) -> int | None:
-        """The most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
-        config's.  0 (or less) means no budget, so a request can turn a configured one off.  ValueError (a 400) for
+        """The most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else
+        none.  0 (or less) means no budget.  ValueError (a 400) for
         anything that is not a whole number."""
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
         if value is None:
@@ -1682,7 +1521,7 @@ class Service:
     def vram(self, reserve_mib: int | None) -> dict:
         """, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
-        engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
+        engine started with --vram-elastic  can do it; it never resizes on its own.
         An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
@@ -1916,7 +1755,7 @@ class Service:
         images = images_of(messages)
         if images:
             if self.vision is None:
-                raise ValueError("this server was started without the vision encoder (add \"vision\" to the config), "
+                raise ValueError("this server was started without the vision encoder (no vision encoder), "
                                  "so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
@@ -2486,8 +2325,8 @@ def make_handler(svc: Service):
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
                              f"Host {host!r} is not allowed (DNS rebinding protection). Reaching the server under this "
-                             f"name on purpose? Add it to \"allowed_hosts\" in the config (<model>.json), "
-                             f"or set an API key (\"api_key\"), which turns this check off"}})
+                             f"name on purpose? Start the server with --allowed-host NAME, "
+                             f"or with --api-key KEY, which turns this check off"}})
             return False
 
         def _foreign_page(self) -> bool:
@@ -2502,9 +2341,8 @@ def make_handler(svc: Service):
                 print(f"[server] refused a request from web page {origin!r} "
                       f"(--api-key KEY, or allowed_hosts / cors_origins)", flush=True)
                 self._json(403, {"error": {"type": "forbidden", "message":
-                                 f"web pages of {origin} may not use this server without an API key; set \"api_key\", "
-                                 f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") "
-                                 f"in the config"}})
+                                 f"web pages of {origin} may not use this server without an API key; start the server with --api-key KEY, "
+                                 f"or add the page's host with --allowed-host (or its origin with --cors-origin)"}})
                 return True
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
@@ -2536,7 +2374,7 @@ def make_handler(svc: Service):
             threading.Thread(target=watch, daemon=True, name="client-watch").start()
 
         def _cors(self):
-            """CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
+            """CORS headers for an API path (/v1/*) and an origin --cors-origin lists - nothing
             otherwise, so a browser keeps every other page away from the API and the model controls."""
             if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
                 return
@@ -2831,14 +2669,13 @@ def make_handler(svc: Service):
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return False
-            # The Origin must be this server's own address (host and port), or an origin the config trusts
+            # The Origin must be this server's own address (host and port), or a trusted origin
             # (trusted_origins: the page behind a reverse proxy or tunnel).  Headers a proxy adds (X-Forwarded-*,
             # CF-Ray, CF-Connecting-IP) prove nothing about the page that sent the request, so they open nothing.
             origin = (self.headers.get("Origin") or "").rstrip("/")
             if origin and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
                     origin not in svc.trusted_origins:
-                self._json(403, {"error": {"message": f"{what} only from the server's own page (or an origin in the "
-                                                      f"config's trusted_origins)"}})
+                self._json(403, {"error": {"message": f"{what} only from the server's own page"}})
                 return False
             return True
 
@@ -3125,7 +2962,7 @@ def host_name(value) -> str:
         v, port = v.split(":")
         if not port.isdigit():
             return ""
-    elif ":" in v:                                       # a bare IPv6 address (a config entry)
+    elif ":" in v:                                       # a bare IPv6 address (an --allowed-host entry)
         return v
     v = v.rstrip(".")
     return v if v and all(c.isalnum() or c in "-._" for c in v) else ""
@@ -3146,7 +2983,7 @@ def _name_in(name: str, names) -> bool:
 
 
 def allowed_hosts_of(value) -> list[str]:
-    """The config's allowed_hosts (a name or a list): host names, "*" or
+    """The --allowed-host names (a name or a list): host names, "*" or
     ".example.com" (it and every name below it).  A scheme, port or path is dropped ("https://a.example.com:8443/"
     -> "a.example.com"); a wrong entry stops the start (ValueError)."""
     items = [] if value in (None, "") else [value] if isinstance(value, str) else value
@@ -3168,7 +3005,7 @@ def allowed_hosts_of(value) -> list[str]:
 
 
 def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[str]:
-    """Every name this server answers to besides an IP address: localhost, the address it listens on, the config's
+    """Every name this server answers to besides an IP address: localhost, the address it listens on, the --allowed-host
     allowed_hosts and trusted_origins' hosts, and - listening beyond this PC (0.0.0.0 or a LAN address) - this PC's
     name and LAN addresses (the LAN addresses matter for the Origin check, which takes no IP on trust)."""
     names = set(LOOPBACK_NAMES)
@@ -3202,12 +3039,12 @@ def host_allowed(host, names, any_host=False) -> bool:
 
 def origin_allowed(origin: str, host, names, origins=()) -> bool:
     """A browser page's Origin that may use the model without an API key: this server's own page (the Origin is the
-    request's own Host), a page on one of the names this server answers to (any port), or an origin the config lists
+    request's own Host), a page on one of the names this server answers to (any port), or an origin --cors-origin lists
     (trusted_origins, cors_origins).  Unlike the Host check no IP passes on trust: a page served from any other IP is
     another site.  "null" (a sandboxed frame, a file:// page) does not pass: any site can send it.  An origin of another
     scheme (chrome-extension://, moz-extension://, an Electron app's app://) does: no web site can send one."""
     origin = (origin or "").strip().rstrip("/")
-    if origin in origins or "*" in origins:             # cors_origins ["*"]: the config lets every page in
+    if origin in origins or "*" in origins:             # --cors-origin "*": every page may use it
         return True
     scheme, sep, rest = origin.lower().partition("://")
     if not sep or not scheme:
@@ -3229,7 +3066,7 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
 
 
 def origins_of(value, key: str, wildcard: bool) -> list[str]:
-    """A config's origin list ("https://chat.example.com" or a list of them) - scheme://host[:port], no path;
+    """An origin list ("https://chat.example.com" or a list of them) - scheme://host[:port], no path;
     "*" only where `wildcard` allows it.  A wrong entry stops the start rather than opening less or more than meant."""
     if value is None or value == "" or value == []:
         return []
@@ -3251,11 +3088,11 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
-    """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
-    a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
+    """The model file's optional `sampling` block: defaults for the sampling fields a request leaves out, so
+    a plain client gets the model's sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
     presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
     always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
-    A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
+    A bad value refuses to start the server (a typo'd value should not quietly change sampling); unknown keys
     are named at startup and ignored."""
     out = {}
     for key, value in (cfg.get("sampling") or {}).items():
@@ -3311,52 +3148,52 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "engine"], default="mock")
-    ap.add_argument("--config", help="engine config (JSON: exe, args, cwd, tokenizer, model_name)")
-    ap.add_argument("--model", help="a .basalt model file: the engine, tokenizer, sampling and vision come from it "
-                                    "(with --exe, instead of --config)")
+    ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
     ap.add_argument("--exe", help="the basalt binary to run the model with (with --model)")
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
-    ap.add_argument("--host", default=None,
-                    help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
-                         "on your network (set an API key); also \"host\" in the config")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
+                         "devices on your network (give --api-key)")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8095)
-    ap.add_argument("--gpu", help="the GPU to run on, as nvidia-smi numbers them, or several for a layer split "
-                                  "(\"0,2\"; also \"gpu\" in the config)")
+    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: the first runs the model, a second is "
+                                  "the peer expert tier (\"0,1\"; default: every visible GPU)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
-                    help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
+                    help="tokenizer directory for the mock engine (a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
     ap.add_argument("--fit-max-tokens", action="store_true",
-                    help="clamp max_tokens to the remaining context instead of rejecting the request "
-                         "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
+                    help="clamp max_tokens to the remaining context instead of rejecting the request with 400")
     ap.add_argument("--api-key", default="",
-                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key; also \"api_key\" in the config)")
+                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key)")
+    ap.add_argument("--allowed-host", action="append", default=[], metavar="NAME",
+                    help="also answer to this Host name (repeatable; \"*\" turns the check off)")
+    ap.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
+                    help="let web pages from this origin use /v1/* (repeatable)")
     ap.add_argument("--debug", action="store_true",
                     help="log one line per request and the raw model text after each reply")
     ap.add_argument("--request-lines", action="store_true",
                     help="echo the engine's per-request summary on stdout, for a supervisor that only sees this output")
     ap.add_argument("--lazy", action="store_true", help="start the text-only API unloaded; load on first request")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
-                    help="unload the model after this many seconds without requests, so other programs (games, other "
-                         "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
-                         "in the config; default: never)")
+                    help="unload the model after this many seconds without requests; the next request loads it again")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
-                    help="load an unloaded model only when this much VRAM is free, else answer 503 (also "
-                         "\"min_free_vram_mib\" in the config; default: always load)")
-    ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
-                                          "server's model; also \"before_load\" in the config, a string or a list)")
+                    help="load an unloaded model only when this much VRAM is free, else answer 503")
     a = ap.parse_args()
-    if a.model and a.config:
-        fail("--model replaces --config, give one")
     global DEBUG, REQUEST_LINES
     DEBUG, REQUEST_LINES = a.debug, a.request_lines
     logs = LogBuffer()                                  # GET /api/logs: this process's output, and the engine's
     sys.stdout, sys.stderr = TeeStream(sys.stdout, logs, "srv"), TeeStream(sys.stderr, logs, "srv")
-    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
-    if a.gpu is not None:
-        cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    cfg = {}                                            # what the model file implies (serve/modelfile.py)
+    try:
+        if a.gpu is not None:
+            cfg["gpu"] = a.gpu
+            gpu_list(cfg)
+    except ValueError:
+        fail(f"--gpu {a.gpu}: expected numbers like 0 or 0,1")
+    if a.engine == "engine" and not (a.model and a.exe):
+        fail("--engine engine needs --model and --exe")
     if a.model:
         if not a.exe:
             fail("--model needs --exe BINARY")
@@ -3370,7 +3207,6 @@ def main() -> int:
             fail(f"{a.model}: {e}")
     if a.alias:
         cfg["model_name"] = a.alias
-    a.host = a.host or cfg.get("host") or "127.0.0.1"   # the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
@@ -3391,112 +3227,57 @@ def main() -> int:
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
     if a.engine == "engine":
-        if not cfg:
-            fail("--engine engine needs --model and --exe, or --config")
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[server] sampling defaults: {pretty}", flush=True)
-        lazy = a.lazy or cfg.get("lazy_load") is True
-        if lazy and cfg.get("vision") and a.model:
+        lazy = a.lazy
+        if lazy and cfg.get("vision"):
             print("[server] warning: lazy loading is text-only, vision off", flush=True)
             del cfg["vision"]
-        if lazy and cfg.get("vision"):
-            fail("lazy loading is text-only, turn vision off")
         if cfg.get("vision"):
             print("[server] loading the vision encoder", flush=True)
-            # relative paths are the config's cwd's, as for the engine below
-            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                    for k, v in cfg["vision"].items()}
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+            vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env))
         print("[server] model unloaded, the first request loads it" if lazy else
               "[server] loading the model", flush=True)
-        if len(gpu_list(cfg)) > 1:
-            try:
-                split = layer_split_value(cfg)          # before the (minutes-long) start
-            except ValueError as e:
-                raise SystemExit(f"[server] error: {e}")
-            print(f"[server] layer split over GPUs {gpu_list(cfg)} ({split})", flush=True)
-        # a relative "exe" is the config's cwd's
-        exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
-        try:
-            silence = engine_silence_s(cfg)             # checked before the (minutes-long) start
-        except ValueError as e:
-            raise SystemExit(f"[server] error: {e}")
-        try:
-            effort_end = effort_end_args(cfg, exe, tok)  # 8
-        except ValueError as e:
-            raise SystemExit(f"[server] error: {e}")
         if cfg.get("log"):                              # the engine's stderr goes to its log file: follow it
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
-        engine = ProcessEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
-        engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        engine = ProcessEngine(cfg["exe"], engine_args(cfg), log=cfg.get("log"), env=env, lazy=lazy)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
-        effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
-                  sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens)
     svc.logs = logs
-    try:
-        svc.set_aliases(cfg.get("aliases"))             # other names the model answers to
-    except ValueError as e:
-        raise SystemExit(f"[server] error: {e}")
-    if svc.aliases:
-        print(f"[server] model aliases: {', '.join(svc.aliases)}", flush=True)
     if any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(sys.argv)):
         # an empty key would switch authentication off without a word
         print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
         return 2
-    svc.api_key = a.api_key or cfg.get("api_key", "")
-    svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
-    svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
+    svc.api_key = a.api_key
     try:
-        svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"))
-    except ValueError as e:
-        raise SystemExit(f"[server] error: {e}")
+        svc.cors_origins = origins_of(a.cors_origin, "--cors-origin", wildcard=True)
+        svc.allowed_hosts = allowed_hosts_of(a.allowed_host)
+    except (ValueError, SystemExit) as e:
+        fail(str(e).removeprefix("[server] error: "))
     if svc.allowed_hosts:
-        print("[server] warning: Host check off, any name is accepted (allowed_hosts *)" if "*" in svc.allowed_hosts
+        print("[server] warning: Host check off, any name is accepted (--allowed-host *)" if "*" in svc.allowed_hosts
               else f"[server] extra host names: {', '.join(svc.allowed_hosts)}", flush=True)
     if svc.cors_origins:
         print(f"[server] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  "; warning: any web page can use the model (--api-key KEY)"), flush=True)
-    svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
-    svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
-        int(cfg.get("min_free_vram_mib") or 0)
-    svc.before_load = a.before_load or cfg.get("before_load") or None
-    mode = str(cfg.get("anthropic_thinking") or "model")   # "on_request" = only when the request asks
-    if mode not in ("model", "on_request"):
-        raise SystemExit(f"[server] error: anthropic_thinking must be model or on_request, not {mode!r}")
-    svc.anthropic_think_unasked = mode == "model"
-    rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # opt-out with 0
-    if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
-        raise SystemExit(f"[server] error: repeat_stop_tokens must be a whole number >= 0, not {rs!r}")
-    svc.repeat_stop_tokens = rs
-    svc.effort_end = bool(effort_end)                   # "effort_position": "end" with an engine that has it
-    if cfg.get("reasoning_budget_tokens") is not None:  # a default thinking budget for every request
-        try:
-            svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
-            budget = svc.reasoning_budget({})
-        except ValueError as e:
-            raise SystemExit(f"[server] error: {e}")
-        if budget:
-            print(f"[server] thinking budget: {budget} tokens",
-                  flush=True)
+    svc.idle_unload_s = a.idle_unload or 0
+    svc.min_free_vram_mib = a.min_free_vram_mib or 0
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if a.engine == "engine" else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)
@@ -3515,7 +3296,7 @@ def main() -> int:
             print(f"[server] network: port {a.port}", flush=True)
         if not svc.api_key:
             print("[server] warning: no API key, open to the network (--api-key KEY)", flush=True)
-    if a.open and cfg.get("open_browser") is not False:   # the config's "open_browser": false wins
+    if a.open:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
     # docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after

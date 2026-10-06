@@ -252,17 +252,16 @@ class EngineStderr(unittest.TestCase):
 
 class GpusInPlay(unittest.TestCase):
     def test_the_peer_card_is_read_too(self):
-        cfg = {"gpu": 0, "env": {"CUDA_VISIBLE_DEVICES": "0,1"}}
+        cfg = {"gpu": "0,1"}
         self.assertEqual(gpus_in_play(cfg, ["--peer-device", "1", "--context", "4096"]), [0, 1])
         self.assertEqual(gpus_in_play(cfg, ["--peer-device=1"]), [0, 1])
         self.assertEqual(gpus_in_play(cfg, []), [0])
 
-    def test_the_peer_is_the_nth_visible_card(self):
-        cfg = {"gpu": 1, "env": {"CUDA_VISIBLE_DEVICES": "1,3"}}
-        self.assertEqual(gpus_in_play(cfg, ["--peer-device", "1"]), [1, 3])
+    def test_the_peer_is_the_nth_listed_card(self):
+        self.assertEqual(gpus_in_play({"gpu": "1,3"}, ["--peer-device", "1"]), [1, 3])
 
-    def test_a_layer_split_and_defaults(self):
-        self.assertEqual(gpus_in_play({"gpu": "0,2"}, []), [0, 2])
+    def test_defaults(self):
+        self.assertEqual(gpus_in_play({"gpu": "0,2"}, []), [0])
         self.assertEqual(gpus_in_play({}, []), [0])
         self.assertEqual(gpus_in_play({"gpu": 2}, []), [2])
         self.assertEqual(gpus_in_play({"gpu": 2}, ["--peer-device"]), [2])                  # a flag with no value

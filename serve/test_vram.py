@@ -65,12 +65,8 @@ class EngineCommand(unittest.TestCase):
         with self.assertRaises(EngineDied):
             e.vram(100)
 
-    def test_config_key(self):
-        cfg = {"args": ["--max-context", "8192"]}
-        self.assertEqual(engine_args(cfg), ["--max-context", "8192"])           # off unless asked
-        self.assertEqual(engine_args({**cfg, "vram_elastic": True, "vram_segment_mib": 256}),
-                         ["--max-context", "8192", "--vram-elastic", "--vram-segment-mib", "256"])
-        self.assertEqual(engine_args({**cfg, "vram_elastic": "yes"}), ["--max-context", "8192"])
+    def test_args_pass_through(self):
+        self.assertEqual(engine_args({"args": ["--max-context", "8192"]}), ["--max-context", "8192"])
 
 
 class Route(unittest.TestCase):

@@ -143,7 +143,7 @@ class OverHttp(unittest.TestCase):
                                        {"Content-Type": "application/json"}, host=f"evil.example.com:{self.port}")
             self.assertEqual(code, 403, path)
             if method != "OPTIONS":
-                self.assertIn("allowed_hosts", body["error"]["message"])
+                self.assertIn("--allowed-host", body["error"]["message"])
             self.assertEqual(log.count("\n"), 1, path)                          # one log line each
             self.assertIn("evil.example.com", log)
 
@@ -173,8 +173,8 @@ class OverHttp(unittest.TestCase):
     def test_refusal_names_both_ways_out(self):
         self.start()
         message = self.req("GET", "/status", host="evil.example.com")[1]["error"]["message"]
-        self.assertIn("allowed_hosts", message)
-        self.assertIn("api_key", message)
+        self.assertIn("--allowed-host", message)
+        self.assertIn("--api-key", message)
 
     def test_with_a_key_the_host_check_is_off(self):
         # a rebinding page cannot authenticate; tunnels and proxies that pass their own name on keep working
@@ -208,7 +208,7 @@ class OverHttp(unittest.TestCase):
                 code, body, log = self.req("POST", path, self.chat_body(),
                                            {"Content-Type": ctype, "Origin": "http://evil.example.com"})
                 self.assertEqual(code, 403, (path, ctype))
-                self.assertIn("api_key", body["error"]["message"])
+                self.assertIn("--api-key", body["error"]["message"])
                 self.assertIn("evil.example.com", log)
         self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
                                   {"Content-Type": "text/plain", "Origin": "null"})[0], 403)
