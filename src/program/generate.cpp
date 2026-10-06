@@ -4208,9 +4208,9 @@ int main(int argc, char** argv) {
         basalt::core::LoadProgress::skipped(expert_total_bytes - cache_fill_bytes - peer_only_bytes);
         basalt::core::LoadProgress::plan("ram", 0);
     }
-    // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
     // the peer's swaps keep their experts in RAM or on a GPU, never only in the file
     if (o.peer_exclusive && peer.valid() && srcp == &src && src.complement_ready()) peer.set_exclusive(&src);
+    // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
     // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
     if (o.peer_device >= 1 && !peer.valid() && !open_peer(false)) return 1;
     drive.d.peer = peer.valid() ? &peer : nullptr;
@@ -4502,8 +4502,8 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
-        if (peer.valid() && basalt::core::prompt_peer()) {
         if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
+        if (peer.valid() && basalt::core::prompt_peer()) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "basalt serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
@@ -5121,8 +5121,8 @@ int main(int argc, char** argv) {
                         return false;
                     }
                 }
-                xq.push_back({s.layer, s.in, s.out, slot, off, xchg,
                 if (p2p) peer.hold(s.layer, s.in);
+                xq.push_back({s.layer, s.in, s.out, slot, off, xchg,
                               peer.valid() && peer.has(s.layer, s.in), p2p});
             }
             if (!xq.empty()) {
@@ -5157,7 +5157,6 @@ int main(int argc, char** argv) {
                     host_res[(size_t) x.layer * g.n_expert + x.out] = basalt::core::kNotResident;
                 }
                 for (const XSwap& x : xq) {   // stream order keeps each behind its slot's eviction copy
-                    const uint8_t* b = srcp->blob(x.layer, x.in);
                     std::string perr;
                     if (x.p2p) {
                         if (!peer.copy_to(x.layer, x.in, xcache.device_slot(x.slot), adapt_stream, perr)) {
@@ -5166,6 +5165,7 @@ int main(int argc, char** argv) {
                         }
                         continue;
                     }
+                    const uint8_t* b = srcp->blob(x.layer, x.in);
                     if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer),
                                                         cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
                         std::fprintf(stderr, "basalt serve: adaptive swap copy failed (layer %d, slot %d): %s\n",
