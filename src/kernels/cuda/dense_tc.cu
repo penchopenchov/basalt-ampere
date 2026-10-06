@@ -310,6 +310,114 @@ __global__ void __launch_bounds__(MT * KS * 128) dense_tc_kernel(const uint8_t* 
 #endif
 }
 
+// Whole tiles: a 16-row tile is contiguous in memory, so it lands in one of two shared-memory slots with one bulk
+// copy (the first two before the grid dependency wait).  Warp w takes half super-block w % 4 of the chunks
+// w / 4, w / 4 + 2, ... in order; a row's eight warp sums are added as
+// ((w0 + w4) + (w1 + w5)) + ((w2 + w6) + (w3 + w7)).
+template<int TYPE>
+__global__ void __launch_bounds__(256) dense_tc_tile_kernel(const uint8_t* __restrict__ w,
+                                                           const uint8_t* __restrict__ x, float* __restrict__ y,
+                                                           int n_in, int n_out, int ncols, int probe) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    constexpr int SB = Fmt<TYPE>::SB, CB = 2 * SB;
+    extern __shared__ __align__(128) uint8_t smem[];
+    uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
+    float* red = reinterpret_cast<float*>(smem + 128);   // [warp][row][column]
+    uint8_t* slots = smem + 128 + 8 * 16 * kMaxCols * 4;
+    const int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int hb = wp & 3, sbi = hb >> 1, n = hb & 1;
+    const int nchunk = n_in / 512, nb32 = n_in / 32;
+    const int row_bytes = (n_in / 256) * SB, tb = 16 * row_bytes;
+    const int ntiles = (n_out + 15) / 16;
+    const int mine = (int) blockIdx.x < ntiles ? (ntiles - 1 - (int) blockIdx.x) / (int) gridDim.x + 1 : 0;
+    // tile i into slot i & 1; the last tile's rows past n_out are not copied (and never stored)
+    auto issue = [&](int i) {
+        const int tile = (int) blockIdx.x + i * (int) gridDim.x;
+        const int rows = min(16, n_out - tile * 16);
+        const uint32_t bytes = (uint32_t) ((rows * row_bytes + 15) & ~15);
+        const uint32_t sb = (uint32_t) __cvta_generic_to_shared(slots + (size_t) (i & 1) * tb);
+        const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1));
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bb), "r"(bytes) : "memory");
+        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                     ::"r"(sb), "l"(w + (size_t) tile * tb), "r"(bytes), "r"(bb) : "memory");
+    };
+    if (tid == 0) {
+        for (int q = 0; q < 2; ++q)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"((uint32_t) __cvta_generic_to_shared(bar + q)));
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        if (!(probe & 2))
+            for (int i = 0; i < 2 && i < mine; ++i) issue(i);
+    }
+    __syncthreads();
+    pdl_wait();
+    const uint32_t* tbl = reinterpret_cast<const uint32_t*>(dtc_iq4nl);
+    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    if constexpr (TYPE == 23) { t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3]; }
+    for (int i = 0; i < mine; ++i) {
+        const int row0 = ((int) blockIdx.x + i * (int) gridDim.x) * 16;
+        if (!(probe & 2)) {
+            uint32_t done = 0;
+            const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1)), par = (uint32_t) (i >> 1) & 1u;
+            do {
+                asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
+                             " selp.u32 %0, 1, 0, p;\n}" : "=r"(done) : "r"(bb), "r"(par) : "memory");
+            } while (!done);
+        }
+        const uint8_t* slot = slots + (size_t) (i & 1) * tb;
+        // rows past n_out read the slot's stale bytes: finite or not, they are never stored
+        const uint8_t* rowA = slot + g * row_bytes + sbi * SB;
+        const uint8_t* rowB = slot + (g + 8) * row_bytes + sbi * SB;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int c = wp >> 2; c < nchunk; c += 2) {
+            XFrag xf;
+#pragma unroll
+            for (int k4 = 0; k4 < 4; ++k4) {
+                const int k = 16 * c + 4 * hb + k4;
+                xf.b0[k4] = xf.b1[k4] = 0;
+                if (g < ncols) {
+                    const uint8_t* xb = x + ((size_t) g * nb32 + k) * kQ81;
+                    xf.b0[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 4) + t);
+                    xf.b1[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 20) + t);
+                }
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int col = 2 * t + e;
+                    xf.d8[k4][e] = col < ncols ? __low2float(__ldg(reinterpret_cast<const half2*>(
+                                                     x + ((size_t) col * nb32 + k) * kQ81)))
+                                               : 0.0f;
+                }
+            }
+            const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
+            if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xf, t0, t1, t2, t3);
+        }
+        float* rw = red + wp * 16 * kMaxCols;
+        rw[g * kMaxCols + 2 * t] = acc[0];
+        rw[g * kMaxCols + 2 * t + 1] = acc[1];
+        rw[(g + 8) * kMaxCols + 2 * t] = acc[2];
+        rw[(g + 8) * kMaxCols + 2 * t + 1] = acc[3];
+        if (i == mine - 1) pdl_launch_dependents();
+        __syncthreads();   // the slot is read and the warp sums are in
+        if (tid == 0 && i + 2 < mine && !(probe & 2)) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            issue(i + 2);
+        }
+        if (tid < 16 * kMaxCols) {
+            const int row = tid / kMaxCols, col = tid % kMaxCols;
+            if (col < ncols && row0 + row < n_out) {
+                const float* rr = red + row * kMaxCols + col;
+                constexpr int WS = 16 * kMaxCols;   // one warp's sums
+                const float v = ((rr[0] + rr[4 * WS]) + (rr[WS] + rr[5 * WS])) +
+                                ((rr[2 * WS] + rr[6 * WS]) + (rr[3 * WS] + rr[7 * WS]));
+                y[(size_t) col * n_out + row0 + row] = v;
+            }
+        }
+        __syncthreads();   // the sums are read
+    }
+#elif defined(__CUDA_ARCH__)
+    __trap();
+#endif
+}
+
 template<int TYPE, int S, int MT, int KS>
 size_t smem_bytes() {
     return (size_t) S * 16 * MT * row_stride(KS * Fmt<TYPE>::SB) + (size_t) MT * KS * 4 * 16 * kMaxCols * 4;
@@ -336,7 +444,8 @@ const int g_bps = env_int("STRATA_DEC_DTC_BPS", 0);
 const int g_slots = env_int("STRATA_DEC_DTC_SLOTS", 3);
 const int g_mt = env_int("STRATA_DEC_DTC_MT", 0);
 const int g_probe = env_int("STRATA_DEC_DTC_PROBE", 0);
-const int g_ks = env_int("STRATA_DEC_DTC_KS", 0);   // 1: never split a tile's chunks over two warp groups
+const int g_ks = env_int("STRATA_DEC_DTC_KS", 0);
+const int g_tile = env_int("STRATA_DEC_DTC_TILE", 1);   // 1: never split a tile's chunks over two warp groups
 
 template<int TYPE, int S, int MT, int KS>
 void launch_s(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
@@ -364,10 +473,33 @@ void launch_mt(const void* w, const void* x, float* y, int n_in, int n_out, int 
     }
 }
 
-// The layout follows the shape alone (never the column count): 16-row tiles, and where they leave SMs idle, two warp
-// groups per tile taking alternate 512-value halves of 1024.
+template<int TYPE>
+void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    const int smem = 128 + 8 * 16 * kMaxCols * 4 + 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB;
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(dense_tc_tile_kernel<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
+        attr = true;
+    }
+    int occ = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_tile_kernel<TYPE>, 256, smem);
+    if (g_bps > 0 && g_bps < occ) occ = g_bps;
+    if (occ < 1) occ = 1;
+    const int ntiles = (n_out + 15) / 16;
+    const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
+    launch_pdl(dense_tc_tile_kernel<TYPE>, dim3((unsigned) grid), dim3(256), (size_t) smem, s, (const uint8_t*) w,
+               (const uint8_t*) x, y, n_in, n_out, ncols, g_probe);
+}
+
+// The layout follows the shape alone (never the column count): whole 16-row tiles where two fit in shared memory and
+// the weights are 16-byte aligned (STRATA_DEC_DTC_TILE=0: never), else 16-row tiles in 512-value chunks, and where
+// those leave SMs idle, two warp groups per tile taking alternate 512-value halves of 1024.
 template<int TYPE>
 void launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    if (g_tile && ((uintptr_t) w & 15) == 0 && 2 * 16 * (n_in / 256) * Fmt<TYPE>::SB <= 90 * 1024) {
+        launch_tile<TYPE>(w, x, y, n_in, n_out, ncols, s);
+        return;
+    }
     const int mt = g_mt == 2 ? 2 : 1;
     const bool ks2 = mt == 1 && n_in % 1024 == 0 && (n_out + 15) / 16 < sm_count() && g_ks != 1;
     if (ks2) launch_mt<TYPE, 1, 2>(w, x, y, n_in, n_out, ncols, s);
@@ -379,6 +511,11 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
 
 bool dense_tc_supported(int t, int n_in) noexcept {
     return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23);
+}
+
+bool dense_tc_type_on(int t) noexcept {
+    static const int m = env_int("STRATA_DEC_DTC_TYPES", 15);
+    return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : 0)) != 0;
 }
 
 void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {

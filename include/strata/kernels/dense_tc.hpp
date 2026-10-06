@@ -23,5 +23,7 @@ void dense_tc(int ggml_type, const void* weights, const void* x_q8_1, float* y, 
 /// STRATA_DEC_DTC: which verify projections take dense_tc for every window width (bits): 1 GDN qkv, 2 GDN z, 4 GDN
 /// out, 8 QSA q, 16 QSA out, 32 QSA k/v.  0 (default) none.
 int dense_tc_mask();
+/// STRATA_DEC_DTC_TYPES: the weight types STRATA_DEC_DTC takes (bits): 1 Q4_K, 2 Q5_K, 4 Q6_K, 8 IQ4_XS; default all.
+bool dense_tc_type_on(int ggml_type) noexcept;
 
 }  // namespace strata::kernels

@@ -245,7 +245,7 @@ const int64_t g_test_stall = [] {
 // a dense projection of the window: dense_tc where STRATA_DEC_DTC has the projection's bit and the type, else
 // native_mmvq (either one for every window width, so a column's value never depends on T)
 void dense_proj(int bit, int type, const void* w, const void* xq, float* y, int n_in, int n_out, int n, void* s) {
-    if ((kernels::dense_tc_mask() & bit) && kernels::dense_tc_supported(type, n_in))
+    if ((kernels::dense_tc_mask() & bit) && kernels::dense_tc_supported(type, n_in) && kernels::dense_tc_type_on(type))
         kernels::dense_tc(type, w, xq, y, n_in, n_out, n, s);
     else
         kernels::native_mmvq(type, w, xq, y, n_in, n_out, n, s);
