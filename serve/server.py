@@ -133,6 +133,10 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (on Linux, usually the out-of-memory killer)."""
 
 
+class EngineStartError(RuntimeError):
+    """The engine ended its start with its own `basalt error:` line(s); the message is just their text."""
+
+
 class EngineStarting(RuntimeError):
     """The engine is (re)starting and has not said READY yet: no context size to plan a request with - a 503,
     not a 400 about the prompt."""
@@ -419,6 +423,26 @@ def engine_warning(line: str):
     return None
 
 
+def engine_error(line: str):
+    """The text of an engine `basalt error: <text>` line, else None."""
+    if line.startswith("basalt error: ") and line[14:].strip():
+        return line[14:].strip()
+    return None
+
+
+def start_errors(log: str | None, offset: int) -> list[str]:
+    """The engine's `basalt error:` lines this start wrote to its log."""
+    if not log:
+        return []
+    try:
+        with open(log, "rb") as f:
+            f.seek(offset)
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except (OSError, ValueError):
+        return []
+    return [e for x in lines if (e := engine_error(x.strip())) is not None]
+
+
 def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=20.0, out=None, gpus=None) -> None:
     """Show the engine's load progress from its log (LoadBars) and its warnings, and a heartbeat while nothing
     moves."""
@@ -562,6 +586,8 @@ class ProcessEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            if errors := start_errors(log, log_start):   # its own reason, short, instead of the log tail
+                raise EngineStartError("; ".join(dict.fromkeys(errors)))
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") +
                                start_failure_hint(log, log_start) + start_log_tail(log, log_start))
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
@@ -3404,7 +3430,11 @@ def main() -> int:
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
-        engine = ProcessEngine(cfg["exe"], engine_args(cfg), log=cfg.get("log"), env=env, lazy=lazy)
+        try:
+            engine = ProcessEngine(cfg["exe"], engine_args(cfg), log=cfg.get("log"), env=env, lazy=lazy)
+        except EngineStartError as e:
+            print(f"[server] error: {e}", file=sys.stderr, flush=True)
+            return 1
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [

@@ -1102,6 +1102,31 @@ class StartFailureLog(unittest.TestCase):
             self.assertNotIn("an earlier start", text)
 
 
+    def test_the_engines_own_error_is_the_message(self):
+        import serve.server as server
+        fake = ("import sys\nsys.stderr.write('basalt generate: GPU 0\\n')\n"
+                "sys.stderr.write('basalt error: the experts need 40.0 GiB of RAM, 27.1 GiB is available; use "
+                "--resident-experts or --mmap-experts\\n')\nsys.exit(1)\n")
+        with tempfile.TemporaryDirectory() as d:
+            script, log = Path(d) / "fake_engine.py", Path(d) / "engine.log"
+            script.write_text(fake, encoding="utf-8")
+            log.write_text("basalt error: an earlier start\n", encoding="utf-8")
+            real = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
+                    mock.patch.object(server, "narrate_start", lambda *a, **k: None):
+                with self.assertRaises(server.EngineStartError) as cm:
+                    ProcessEngine("basalt", [], log=str(log))
+            self.assertEqual(str(cm.exception), "the experts need 40.0 GiB of RAM, 27.1 GiB is available; use "
+                                                "--resident-experts or --mmap-experts")
+
+    def test_error_lines(self):
+        from serve.server import engine_error
+        self.assertEqual(engine_error("basalt error: x y"), "x y")
+        self.assertIsNone(engine_error("basalt error: "))
+        self.assertIsNone(engine_error("basalt warning: x"))
+
+
 class Tty(io.StringIO):
     def isatty(self):
         return True
