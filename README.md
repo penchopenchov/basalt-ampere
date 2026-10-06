@@ -1,11 +1,11 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png">
-    <img src="assets/basalt-lockup-light.png" alt="basalt" width="360">
+    <img src="assets/basalt-lockup-light.png" alt="Basalt" width="360">
   </picture>
 </p>
 
-basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing:
+Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing:
 Linux with an NVIDIA Blackwell GPU (sm_120). The experts that do not fit in VRAM live in system RAM (and optionally on
 a second GPU used as a peer expert tier), so a large MoE model runs on a single workstation.
 
@@ -15,7 +15,7 @@ It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped dow
 ## What is in the repository
 
 - `src/`, `include/`: the C++/CUDA engine (one binary, `basalt`).
-- `serve/`: a Python server with an OpenAI- and Anthropic-compatible API, and its web app.
+- `serve/`: a Python server with an OpenAI- and Anthropic-compatible API, and a stats page.
 - `tools/`: pack builders and converters (`iq_pack.py`, `mtp_pack.py`, ...) and the PPL/KLD quality gate (`ppl_gate.py`).
 - `tests/`: parity and unit tests.
 
