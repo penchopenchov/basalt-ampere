@@ -3,6 +3,7 @@
     w = ModelWriter(path)
     w.add_bytes("meta", json_bytes)
     w.add_file("experts", "/path/experts.bin")        # streamed, hashed while copied
+    w.add_chunks("dense", chunk_iterator)             # streamed from a generator
     w.close()
 
     m = ModelFile(path)
@@ -71,6 +72,18 @@ class ModelWriter:
                 left -= len(b)
                 n += len(b)
         self.entries.append((name, off, n, h.digest()))
+
+    def add_chunks(self, name: str, chunks) -> int:
+        """One section from an iterator of byte chunks (streamed, hashed as written).  Returns its size."""
+        off = self._start(name)
+        h = hashlib.sha256()
+        n = 0
+        for b in chunks:
+            h.update(b)
+            self.f.write(b)
+            n += len(b)
+        self.entries.append((name, off, n, h.digest()))
+        return n
 
     def add_parts(self, name: str, parts, align: int = TENSOR_ALIGN) -> list[int]:
         """One section of several parts, each starting at a multiple of `align` within it (zero padding between).
