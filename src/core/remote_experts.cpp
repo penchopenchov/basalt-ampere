@@ -171,7 +171,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     if (!cache_ok) { err = "CUDA" + std::to_string(device) + " experts: " + err; close(); return false; }
     uint64_t fill_total = 0;
     for (const auto& pair : selected) fill_total += lay.blob_bytes(pair.first);
-    LoadProgress progress(LoadProgress::cuda(device), fill_total);
+    LoadProgress progress(LoadProgress::cuda(device), fill_total, true);
     for (const auto& pair : selected) {
         const int32_t slot = cache_.admit(pair.first, pair.second);
         const uint8_t* blob = source.blob(pair.first, pair.second);

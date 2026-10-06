@@ -476,6 +476,11 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
+        // an expert held in RAM is not read from the file
+        if (complement_ready_ &&
+            detail::cache_complement_blob_or_fallback((size_t) l * (size_t) n_expert_ + (size_t) e, complement_offsets_,
+                                                      complement_host_, nullptr) != nullptr)
+            continue;
         if (const uint8_t* b = mapped_blob(l, e)) basalt::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
     }
     return true;
@@ -548,6 +553,8 @@ bool FileExpertSource::pin_cache_complement(
     std::vector<std::pair<int32_t, int32_t>> primary_gpu_pairs;
     std::vector<int32_t> pair_slot;
     std::vector<uint64_t> slot_bytes((size_t) std::max<int64_t>(n_slots, 0), 0);
+    std::vector<uint8_t> on_gpu((size_t) n_layers_ * (size_t) n_expert_, 0);   // held by the cache (counted when filled)
+    uint64_t gpu_bytes = 0;
     primary_gpu_pairs.reserve((size_t) cache.resident());
     pair_slot.reserve((size_t) cache.resident());
     for (int64_t layer = 0; layer < n_layers_; ++layer) {
@@ -555,6 +562,8 @@ bool FileExpertSource::pin_cache_complement(
             const int32_t slot = cache.slot_of(layer, expert);
             if (slot == kNotResident) continue;
             primary_gpu_pairs.emplace_back((int32_t) layer, (int32_t) expert);
+            on_gpu[(size_t) layer * (size_t) n_expert_ + (size_t) expert] = 1;
+            gpu_bytes += layer_blob_bytes_[(size_t) layer];
             pair_slot.push_back(slot);
             if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
         }
@@ -752,7 +761,18 @@ bool FileExpertSource::pin_cache_complement(
     }
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
-    LoadProgress progress("ram", bytes);
+    // Progress counts the experts the GPU cache does not hold (those it holds, kept here for the prompt path's
+    // loan, are already counted by its fill); experts left on the file are not placed at all.
+    uint64_t progress_total = 0;
+    for (int64_t layer = 0; layer < n_layers_; ++layer)
+        for (int64_t expert = 0; expert < n_expert_; ++expert) {
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+            if (offsets[index] != kNoComplement && !on_gpu[index]) progress_total += layer_blob_bytes_[(size_t) layer];
+        }
+    const uint64_t all_experts = expert_bytes();
+    if (all_experts > gpu_bytes + progress_total) LoadProgress::skipped(all_experts - gpu_bytes - progress_total);
+    LoadProgress::plan("ram", progress_total);
+    LoadProgress progress("ram", progress_total);
     std::atomic<bool> failed{false};
     std::mutex fail_mu;
     const auto copy_t0 = std::chrono::steady_clock::now();
@@ -788,7 +808,7 @@ bool FileExpertSource::pin_cache_complement(
                     return;
                 }
                 copied.fetch_add(blob_bytes);
-                progress.add(blob_bytes);
+                if (!on_gpu[index]) progress.add(blob_bytes);
             }
             {   // the layer's pages are not kept in the file cache once copied
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];

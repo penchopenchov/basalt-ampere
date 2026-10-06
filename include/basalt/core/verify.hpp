@@ -21,6 +21,7 @@
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
 
+#include <functional>
 #include <cstdio>
 
 #include "basalt/core/expert_source.hpp"
@@ -151,6 +152,8 @@ public:
     /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device; called
     /// before the expert cache takes the free memory.
     static void prepare_hc8(const WeightTable& wt, const ModelGeometry& g);
+    /// The bytes prepare_hc8 will place when `has` names the tensors the model holds (0 with the copies off).
+    static uint64_t hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g);
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  `parts`: 1 launches
     /// the commit graph, 2 advances `ss.ple_prev` (3: both, in that order).

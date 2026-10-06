@@ -58,6 +58,9 @@ public:
     /// Call before the VRAM expert tier is sized.
     bool load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
+    /// The bytes `load` places on the device (the dense weights and the experts; the K/V and buffers are working
+    /// memory), from the section sizes and the dense index.
+    static bool plan_bytes(const MtpFiles& files, const ModelGeometry& g, uint64_t& out, std::string& err);
     /// The draft layer's hyper-connection matrices that have 8-bit copies, as ("mtp." + tensor name, key) for
     /// hc8_dump.  After `load`.
     std::vector<std::pair<std::string, const void*>> hc8_keys() const;
@@ -191,6 +194,8 @@ private:
         const void* dev = nullptr;   ///< set: the tensor lives here instead of in dense_ (an 8-bit copy)
     };
     std::vector<Tensor> tensors_;
+    static bool parse_index(const FileRange& index, std::vector<Tensor>& out, std::string& err);
+    static bool is_hc8_matrix(const Tensor& t);
     uint8_t* dense_ = nullptr;
     uint64_t dense_bytes_ = 0;
     uint8_t* experts_ = nullptr;

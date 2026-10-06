@@ -20,6 +20,8 @@ public:
     NativeHead& operator=(const NativeHead&) = delete;
 
     bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    /// The bytes `load` uploads for `output.weight`, from the GGUF headers only.
+    static bool plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }

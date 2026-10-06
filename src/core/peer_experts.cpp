@@ -173,7 +173,8 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     const bool advise = src.advise_pairs(pick.data(), (int64_t) std::min(kAhead, pick.size()));
     uint64_t fill_total = 0;
     for (const auto& pr : pick) fill_total += lay.blob_bytes(pr.first);
-    LoadProgress progress(LoadProgress::cuda(device), fill_total);
+    LoadProgress::plan(LoadProgress::cuda(device), fill_total, true);
+    LoadProgress progress(LoadProgress::cuda(device), fill_total, true);
     for (size_t i = 0; i < pick.size(); ++i) {
         const auto& pr = pick[i];
         if (advise && i + kAhead < pick.size()) (void) src.advise_pairs(&pick[i + kAhead], 1);

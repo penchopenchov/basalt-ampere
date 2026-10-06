@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include <unistd.h>
 
@@ -147,7 +148,7 @@ bool WeightTable::index_code_bits(const PackFiles& pack, const std::string& name
 }
 
 bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
-                       const std::set<std::string>* skip) {
+                       const std::set<std::string>* skip, bool report_progress) {
     IndexText idx;
     if (!idx.open(pack.index, err)) { err = "cannot open " + pack.index.path; return false; }
 
@@ -241,7 +242,9 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
 
     int load_dev = 0;
     if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
-    LoadProgress progress(LoadProgress::cuda(load_dev), pool);
+    // a temporary load (staging that is dropped again) is not part of the model's bytes
+    std::optional<LoadProgress> progress;
+    if (report_progress) progress.emplace(LoadProgress::cuda(load_dev), pool);
     const double t_read0 = now_ms();
     double upload_ms = 0;
     for (size_t row_i = 0; row_i < rows.size(); ++row_i) {
@@ -450,7 +453,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                     return false;
                 }
                 upload_ms += now_ms() - u0;
-                progress.add(out_bytes);
+                if (progress) progress->add(out_bytes);
                 done += n;
             }
         }
@@ -486,7 +489,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     if (cur) std::fclose(cur);
     cudaFreeHost(stage_in);
     cudaFreeHost(stage_out);
-    progress.finish();
+    if (progress) progress->finish();
 
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;

@@ -63,6 +63,34 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
+bool NativeDense::plan_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t layer_lo,
+                             int64_t layer_hi, uint64_t& out, std::string& err) {
+    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
+        if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
+        const long l = std::strtol(name.c_str() + 4, nullptr, 10);
+        return l < layer_lo || l >= layer_hi;
+    };
+    out = 0;
+    try {
+        for (const auto& path : shards) {
+            basalt::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
+                if (!basalt::kernels::native_mmvq_supported(tensor.type) || tensor.shape.size() != 2 ||
+                    tensor.shape[0] == 0 || tensor.shape[0] > INT_MAX || tensor.shape[1] == 0 || tensor.shape[1] > INT_MAX)
+                    continue;
+                out += basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
+                                                                 (int) tensor.shape[1]);
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 bool NativeDense::keep_unquantized_ple_key(const PackFiles& pack, std::set<std::string>& skip, std::string& err) {
     const std::string key = "blk.1.ple_key.weight";
@@ -90,20 +118,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     try {
         std::vector<Pending> pending;
         std::set<std::string> seen;
-        // the bytes the uploads below will write (for the progress lines): the same filters, headers only
+        // the bytes the uploads below will write (for the progress lines)
         uint64_t plan_total = 0;
-        for (const auto& path : shards) {
-            basalt::GgufFile gguf(path);
-            for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
-                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
-                if (!basalt::kernels::native_mmvq_supported(tensor.type) || tensor.shape.size() != 2 ||
-                    tensor.shape[0] == 0 || tensor.shape[0] > INT_MAX || tensor.shape[1] == 0 || tensor.shape[1] > INT_MAX)
-                    continue;
-                plan_total += basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
-                                                                        (int) tensor.shape[1]);
-            }
-        }
+        if (!plan_bytes(shards, include_ple_key, layer_lo, layer_hi, plan_total, err)) return false;
         int load_dev = 0;
         if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
         LoadProgress progress(LoadProgress::cuda(load_dev), plan_total);

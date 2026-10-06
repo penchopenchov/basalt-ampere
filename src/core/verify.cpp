@@ -493,35 +493,41 @@ const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows
 }
 
 namespace {
-/// The hyper-connection matrices of the weight table, by name: (name, rows, cols).
+/// The hyper-connection matrices, by name: (name, rows, cols).
 struct Hc8Tensor { std::string name; int rows, cols; };
-std::vector<Hc8Tensor> hc8_tensors(const WeightTable& wt, const ModelGeometry& g) {
+std::vector<Hc8Tensor> hc8_tensors(const ModelGeometry& g) {
     const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
     std::vector<Hc8Tensor> v;
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        const LayerView lv(wt, l);
+        const std::string blk = "blk." + std::to_string(l) + ".";
         for (const char* p : {"hc_attn_", "hc_ffn_"}) {
             const std::string s(p);
-            v.push_back({lv.name((s + "down.weight").c_str()), LR, D});
-            v.push_back({lv.name((s + "up.weight").c_str()), D, LR});
-            v.push_back({lv.name((s + "inject.weight").c_str()), HCn, D});
+            v.push_back({blk + s + "down.weight", LR, D});
+            v.push_back({blk + s + "up.weight", D, LR});
+            v.push_back({blk + s + "inject.weight", HCn, D});
         }
     }
     v.push_back({"output_hc_down.weight", LR, D});
     v.push_back({"output_hc_up.weight", D, LR});
     return v;
 }
+// the copies' size: the int8 codes and one fp16 scale per 32 values
+uint64_t hc8_copy_bytes(const Hc8Tensor& t) { return (uint64_t) t.rows * (uint64_t) t.cols * 9 / 8; }
 }  // namespace
+
+uint64_t Verifier::hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g) {
+    if (!basalt::kernels::hc8_enabled()) return 0;
+    uint64_t total = 0;
+    for (const Hc8Tensor& t : hc8_tensors(g))
+        if (has(t.name)) total += hc8_copy_bytes(t);
+    return total;
+}
 
 void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
     if (!basalt::kernels::hc8_enabled()) return;
     size_t from_table = 0;
-    // the copies' size: the int8 codes and one fp16 scale per 32 values
-    auto copy_bytes = [](const Hc8Tensor& t) { return (uint64_t) t.rows * (uint64_t) t.cols * 9 / 8; };
-    const std::vector<Hc8Tensor> tensors = hc8_tensors(wt, g);
-    uint64_t total = 0;
-    for (const Hc8Tensor& t : tensors)
-        if (wt.find(t.name) != nullptr) total += copy_bytes(t);
+    const std::vector<Hc8Tensor> tensors = hc8_tensors(g);
+    const uint64_t total = hc8_plan_bytes([&](const std::string& n) { return wt.find(n) != nullptr; }, g);
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
     LoadProgress progress(LoadProgress::cuda(dev), total);
@@ -534,7 +540,7 @@ void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
         } else {
             basalt::kernels::hc8_prepare(w, t.rows, t.cols);
         }
-        progress.add(copy_bytes(t));
+        progress.add(hc8_copy_bytes(t));
     }
     progress.finish();
     (void) from_table;
@@ -561,7 +567,7 @@ bool hc8_dump(const WeightTable& wt, const ModelGeometry& g, const std::vector<s
         }
         copies.push_back(std::move(c));
     };
-    for (const Hc8Tensor& t : hc8_tensors(wt, g))
+    for (const Hc8Tensor& t : hc8_tensors(g))
         if (const WeightRef* r = wt.find(t.name)) add(t.name, r->data);
     for (const auto& [name, key] : extra) add(name, key);
     if (copies.empty()) { err = "hc8: there are no 8-bit copies to write"; return false; }

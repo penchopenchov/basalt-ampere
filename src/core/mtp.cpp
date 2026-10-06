@@ -4,6 +4,7 @@
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
+#include "basalt/core/load_progress.hpp"
 #include "basalt/core/on_device.hpp"
 
 #include "basalt/core/native_head.hpp"
@@ -44,6 +45,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <vector>
 #if   defined(__x86_64__)
@@ -176,6 +178,43 @@ const void* MtpDrafter::q8(const char* name) const {
     return nullptr;
 }
 
+bool MtpDrafter::parse_index(const FileRange& index, std::vector<Tensor>& out, std::string& err) {
+    std::vector<uint8_t> idx_text;
+    if (!read_file(index, idx_text)) { err = "mtp: cannot open " + index.path; return false; }
+    std::istringstream idx(std::string(idx_text.begin(), idx_text.end()));
+    std::string line;
+    while (std::getline(idx, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream is(line);
+        Tensor t;
+        is >> t.name >> t.kind >> t.rows >> t.cols >> t.off >> t.bytes;
+        if (!is) { err = "mtp: malformed dense index line: " + line; return false; }
+        out.push_back(t);
+    }
+    return true;
+}
+
+bool MtpDrafter::is_hc8_matrix(const Tensor& t) {
+    return t.kind == "bf16" && t.name.find("hyper_connection") != std::string::npos &&
+           t.name.find("input_mix_weight_") != std::string::npos && (uint64_t) t.rows * (uint64_t) t.cols * 2 == t.bytes;
+}
+
+bool MtpDrafter::plan_bytes(const MtpFiles& files, const ModelGeometry& g, uint64_t& out, std::string& err) {
+    uint64_t dense = files.dense.size();
+    if (basalt::kernels::hc8_only()) {   // the dense blob without the matrices that are held as 8-bit copies only
+        std::vector<Tensor> tensors;
+        if (!parse_index(files.index, tensors, err)) return false;
+        uint64_t kept = 0;
+        for (const Tensor& t : tensors) {
+            if (is_hc8_matrix(t)) continue;
+            kept = ((kept + 255) & ~(uint64_t) 255) + t.bytes;
+        }
+        dense = kept;
+    }
+    out = dense + (uint64_t) g.n_expert * basalt::kernels::cpu::BLOB;
+    return true;
+}
+
 bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window) {
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
@@ -187,20 +226,11 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (max_t < 1 || max_t > basalt::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
     // the two reads below are the whole "drafter files" cost; reported apart from the rest of the stage
     const auto t_files = std::chrono::steady_clock::now();
+    // the draft layer's dense weights and experts, as one load phase
+    std::optional<LoadProgress> progress;
     // ---- the index and the dense weights
     {
-        std::vector<uint8_t> idx_text;
-        if (!read_file(files.index, idx_text)) { err = "mtp: cannot open " + files.index.path + ""; return false; }
-        std::istringstream idx(std::string(idx_text.begin(), idx_text.end()));
-        std::string line;
-        while (std::getline(idx, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            std::istringstream is(line);
-            Tensor t;
-            is >> t.name >> t.kind >> t.rows >> t.cols >> t.off >> t.bytes;
-            if (!is) { err = "mtp: malformed dense index line: " + line; return false; }
-            tensors_.push_back(t);
-        }
+        if (!parse_index(files.index, tensors_, err)) return false;
         std::vector<uint8_t> blob;
         if (!read_file(files.dense, blob)) { err = "mtp: cannot read " + files.dense.path; return false; }
         if (basalt::kernels::hc8_only()) {   // the hyper-connection matrices as 8-bit copies only: out of the blob
@@ -208,9 +238,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             size_t staged = 0;
             for (Tensor& t : tensors_) {
                 if (t.off + t.bytes > blob.size()) { err = "mtp: the dense index names bytes past the dense section: " + t.name; return false; }
-                const bool hc = t.kind == "bf16" && t.name.find("hyper_connection") != std::string::npos &&
-                                t.name.find("input_mix_weight_") != std::string::npos &&
-                                (uint64_t) t.rows * (uint64_t) t.cols * 2 == t.bytes;
+                const bool hc = is_hc8_matrix(t);
                 if (hc) {
                     // the 8-bit copy from the model file's table when it has one, else quantized from the bf16 matrix
                     t.dev = hc8_table_adopt("mtp." + t.name, nullptr, (int) t.rows, (int) t.cols);
@@ -243,7 +271,9 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
                   (info == cudaSuccess ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
             return false;
         }
+        progress.emplace(LoadProgress::cuda(device_), blob.size() + (uint64_t) g.n_expert * basalt::kernels::cpu::BLOB);
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+        progress->add(blob.size());
         vram_ += blob.size();
         dense_bytes_ = blob.size();
     }
@@ -271,8 +301,10 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
             if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: the experts section is truncated"; return false; }
             cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+            progress->add(n);
             off += n;
         }
+        progress->finish();
         vram_ += bytes;
     }
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",

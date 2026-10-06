@@ -1,5 +1,6 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/load_progress.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/platform/memory.hpp"
@@ -15,6 +16,23 @@ namespace basalt::core {
 NativeHead::~NativeHead() {
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
+}
+
+bool NativeHead::plan_bytes(const std::vector<std::string>& shards, uint64_t& out, std::string& err) {
+    try {
+        const basalt::GgufModel model(shards);
+        const basalt::TensorInfo* tensor = model.find("output.weight");
+        if (!tensor || !basalt::kernels::native_mmvq_supported((int) tensor->type) || tensor->shape.size() != 2) {
+            err = "native head: expected a natively supported output.weight";
+            return false;
+        }
+        out = basalt::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) tensor->shape[0],
+                                                        (int) tensor->shape[1]);
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native head: ") + error.what();
+        return false;
+    }
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
@@ -43,6 +61,9 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             err = "native head: truncated output.weight payload";
             return false;
         }
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+        LoadProgress progress(LoadProgress::cuda(dev), bytes);
         void* weights = nullptr;
         void* scratch = nullptr;
         cudaError_t status = cudaMalloc(&weights, bytes);
@@ -57,6 +78,8 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             err = std::string("native head upload: ") + cudaGetErrorString(status);
             return false;
         }
+        progress.add(bytes);
+        progress.finish();
         weights_ = weights;
         scratch_ = scratch;
         bytes_ = bytes;
