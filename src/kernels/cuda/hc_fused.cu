@@ -118,7 +118,7 @@ struct HcLaunch {
                      // | 4: the up slices by cp.async
     float* cnp;      // cn: [MAXT][CN_HS][CN_ROWS] the down items' dot products
     float* cns;      // cn: [MAXT][CN_HS] the half-streams' sums of squares
-    int bf;          // 1: the 8-bit mma up pass's B fragments formed once per item (hc_up_main_mma8's BF)
+    int bf;          // 1: the 8-bit mma up pass's B fragments formed once per item (hc_up_main_mma8's BF); 2: and HI1
     int cn_upw;      // cn: w_down warps whose rows are in before the up items request w_up (of CN_G * CN_HS * WARPS)
     int cn_copies;   // cn: copies of the sums (up item u reads copy u % cn_copies)
 };
@@ -1337,8 +1337,9 @@ __device__ __forceinline__ void split_f16(float a, float b, uint32_t& hi, uint32
 }
 // cnp non-null: lo and rs from the cn down items' sums (cn_lo; `out`: this item writes the read's lo, rs and inject).
 // BF (STRATA_DEC_HC2 & 4): the B fragments formed once per item (lo_frag_store, at `bf`) instead of by every warp in
-// every k-step; the same values, so the same bits.
-template <int T, bool BF = false>
+// every k-step; the same values, so the same bits.  HI1 (with BF): lo as its f16 hi part only - half the mma
+// (fp32-accumulating f16 mma is the pass's limit).
+template <int T, bool BF = false, bool HI1 = false>
 __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, unsigned long long* dbg, int b,
                                 const float* cnp = nullptr, const float* cns = nullptr, bool out = false,
                                 uint16_t* bf = nullptr) {
@@ -1385,7 +1386,7 @@ __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char*
                                         i8x2_h2<true>(q[2 * h + 1])};
                 const uint4 f = B[(s * 2 + h) * 32];
                 mma_f16(gh, af, f.x, f.y);
-                mma_f16(gl, af, f.z, f.w);
+                if (!HI1) mma_f16(gl, af, f.z, f.w);
             }
             const float s0 = h2f(sc0[s]), s1 = h2f(sc1[s]);
             acc[0] = fmaf(s0, gh[0] + gl[0], acc[0]);
@@ -1925,7 +1926,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             uint16_t* const bfp = reinterpret_cast<uint16_t*>(smem + bf_off);
             const int cpy = cn ? (item - it.up) % L.cn_copies : 0;
             const float *cnp = L.cnp + (size_t) cpy * CN_PART, *cns = L.cns + (size_t) cpy * CN_SSN;
-            if (Q8 && mma && cn && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp);
+            if (Q8 && mma && cn && L.bf == 2) hc_up_main_mma8<T, true, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp);
+            else if (Q8 && mma && cn && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp);
             else if (Q8 && mma && cn) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up);
             else if (Q8 && mma && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, nullptr, nullptr, false, bfp);
             else if (Q8 && mma) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b);
@@ -2220,7 +2222,8 @@ constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel
 // STRATA_DEC_HC_XH=1: the norm writes xn in fp16 for the down rows (not bitwise, T-independent).
 // STRATA_DEC_HC2 (bits; the 8-bit read with HCX=3): 1 = down items over half-streams that form R' and x themselves, no
 // norm tasks (cn_rows; not bitwise, T-independent); 4 = the 8-bit mma up pass's B fragments formed once per item
-// (bitwise); with 1: 8 = the down items' rows, 16 = the up items' slices by cp.async instead of bulk copies.
+// (bitwise); with 1: 8 = the down items' rows, 16 = the up items' slices by cp.async instead of bulk copies; with 1 and
+// 4: 32 = lo as one f16 part in the up pass (half the mma; not bitwise, T-independent).
 // STRATA_DEC_HC2_UPW=<percent> (with 1): the up items request w_up once that share of the w_down rows is in.
 // STRATA_DEC_HC2_COPIES=<n> (with 1, default 1): copies of the down items' sums.
 struct SkConf {
@@ -2634,6 +2637,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     if (L.cn && (sk.hc2 & 8)) L.cn |= 2;
     if (L.cn && (sk.hc2 & 16)) L.cn |= 4;
     L.bf = (sk.hc2 & 4) && q8 && !sk.on && L.upmma && L.hcx == 1;
+    if (L.bf && L.cn && (sk.hc2 & 32)) L.bf = 2;
     L.cn_upw = sk.upw * CN_G * CN_HS * WARPS / 100;
     L.cnp = d.cn + (size_t) L.slot * CN_SLOT;
     L.cns = L.cnp + (size_t) CN_MAXCOPY * CN_PART;
