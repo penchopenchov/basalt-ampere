@@ -334,6 +334,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/dec_gdn_mm.cu
                           src/kernels/cuda/dec_gdn_rec.cu
+                          src/kernels/cuda/dense_tc.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
@@ -663,6 +664,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(dec_gdn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME dec_gdn_parity COMMAND dec_gdn_parity)
     set_tests_properties(dec_gdn_parity PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+    # dense_tc (STRATA_DEC_DTC) against native_mmvq: its columns' T contract bitwise, its error vs the dp4a kernels
+    add_executable(dense_tc_parity src/kernels/dense_tc_parity.cpp)
+    target_include_directories(dense_tc_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(dense_tc_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME dense_tc_parity COMMAND dense_tc_parity)
+    set_tests_properties(dense_tc_parity PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     # the STRATA_DEC_SHX launch against shared_expert_multi, bitwise (synthetic, GPU, no model; --bench)
