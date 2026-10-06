@@ -1997,6 +1997,7 @@ class ThinkingEngine(MockEngine):
     at once, the way the model continues after </think>.  Records every prompt it is given."""
     THOUGHT = "Let me think step by step about two plus two. " * 4          # 184 reasoning tokens (one per byte)
     ANSWER = "The answer is 4."
+    end_in_thought = False      # the turn ends inside the thinking (the end token right after THOUGHT)
 
     def __init__(self, tok):
         super().__init__(tok, "x", max_context=CTX)
@@ -2005,7 +2006,7 @@ class ThinkingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
         done = self.tok.decode(ids).endswith("</think>\n\n")
-        text = self.ANSWER if done else self.THOUGHT + "</think>\n\n" + self.ANSWER
+        text = self.ANSWER if done else self.THOUGHT + ("" if self.end_in_thought else "</think>\n\n" + self.ANSWER)
         for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
@@ -2063,6 +2064,19 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)   # a prefix + more
         self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
+
+    def test_a_turn_ended_while_thinking_is_closed_and_answered(self):
+        from serve.server import REASONING_CLOSE
+        self.engine.end_in_thought = True
+        code, b = self.openai()
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"].strip(), ThinkingEngine.THOUGHT.strip())
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        first, second = self.engine.prompts
+        extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT) + extra)   # the end token dropped
 
     def test_anthropic_stream(self):
         from serve.server import REASONING_WRAP_UP

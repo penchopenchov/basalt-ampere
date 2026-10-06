@@ -76,6 +76,8 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 # what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# what closes the thinking when the model ends its turn inside it, so it still answers
+REASONING_CLOSE = "\n</think>\n\n"
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `basalt --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean divides by a span near zero at
@@ -2080,10 +2082,12 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    closed_early = False                # the thinking was closed once after the turn ended in it
                     while True:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        ended_thinking = False          # the turn ended inside the thinking: close it and answer
                         try:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
@@ -2092,6 +2096,11 @@ class Service:
                                     continue
                                 n += 1
                                 if t in self.stop_ids:
+                                    if (parser.state == "reasoning" and not closed_early and not parser.buf
+                                            and not detok.pending()):
+                                        n -= 1              # the end token is dropped, not part of the reply
+                                        ended_thinking = True
+                                        break
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -2135,17 +2144,26 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
-                        if not wrap or cancel.is_set():
+                        if not (wrap or ended_thinking) or cancel.is_set():
                             break
-                        # the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
-                        # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
-                        # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
-                        budget = None
-                        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
-                        if max_new - n - len(extra) < 1:
-                            break                       # no room left to answer: "length", as without a budget
-                        print(f"[server] thinking budget reached ({thought} tokens), wrapping up",
-                              flush=True)
+                        # the thinking reached reasoning_budget_tokens, or the model ended its turn inside it.  Close
+                        # it the way the model would (for the budget, a short wrap-up first) and let it answer: the
+                        # next pass's prompt is this one plus what was generated plus the close, so the engine
+                        # continues from the prefix it already holds.
+                        if ended_thinking:
+                            closed_early = True
+                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            if max_new - n - len(extra) < 1:
+                                finish = "stop"
+                                break
+                            print("[server] the model ended while thinking, closing it for an answer", flush=True)
+                        else:
+                            budget = None
+                            extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+                            if max_new - n - len(extra) < 1:
+                                break                   # no room left to answer: "length", as without a budget
+                            print(f"[server] thinking budget reached ({thought} tokens), wrapping up",
+                                  flush=True)
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
