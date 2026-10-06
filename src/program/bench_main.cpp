@@ -503,6 +503,7 @@ struct Options {
     std::string engine, config, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, lock, power_label;
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
+    std::string spec, spec_min_p;        // --spec N, --spec-min-p P: engine arguments of the same names
     std::vector<std::string> decode;     // -t: conv, struct, prose
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
@@ -534,13 +535,16 @@ void usage() {
         "                     the vision sidecar is not started\n"
         "  --engine EXE       engine binary (default: the one built with this program, else the config's)\n"
         "  --set \"F V ...\"    FLAG VALUE pairs that replace or add engine arguments (repeatable)\n"
+        "  --spec N           speculation window for the engine (--spec N); without it, and without --spec in the\n"
+        "                     config or after --, the run has no speculation (--spec 0): a clean baseline\n"
+        "  --spec-min-p P     the draft cutoff (--spec-min-p P); with N >= 2 and no cutoff given, 0.5\n"
+        "                     MTP: --spec 7 --spec-min-p 0.5 (or -- --spec 7 --spec-min-p 0.5)\n"
         "  -- ARGS...         engine arguments appended last (instead of --config, or with it)\n"
-        "                     --spec 7 and --spec-min-p 0.5 are added when no argument sets them\n"
         "\n"
         "output\n"
         "  -o md|json         a markdown table (default), or the full detail as JSON on stdout: per-repetition\n"
         "                     values, tokens, drafted, accepted, ms/window, verify ms by window width, GPU names,\n"
-        "                     driver, clocks, pack, expert tiers, engine arguments\n"
+        "                     driver, clocks, model, expert tiers, engine arguments\n"
         "  --power-label W    the power limit to print, instead of the one read from the GPU\n"
         "  --logs DIR         keep the engine log, the draft log and the quality rows there\n"
         "  --no-windows       do not ask the engine for the per-window log (no window statistics)\n"
@@ -632,6 +636,8 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             std::exit(0);
         } else if (a == "--config") o.config = next("--config");
         else if (a == "--engine") o.engine = next("--engine");
+        else if (a == "--spec") o.spec = next("--spec");
+        else if (a == "--spec-min-p") o.spec_min_p = next("--spec-min-p");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "-o") o.format = next("-o");
         else if (a == "--power-label") o.power_label = next("--power-label");
@@ -950,9 +956,12 @@ int main(int argc, char** argv) {
         return 2;
     }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
+    if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
+    if (!o.spec_min_p.empty()) set_arg(args, "--spec-min-p", o.spec_min_p);
     for (const auto& a : o.passthrough) args.push_back(a);
-    if (!has_arg(args, "--spec")) set_arg(args, "--spec", "7");
-    if (!has_arg(args, "--spec-min-p")) set_arg(args, "--spec-min-p", "0.5");
+    if (!has_arg(args, "--spec")) set_arg(args, "--spec", "0");
+    if (!has_arg(args, "--spec-min-p") && std::atoi(arg_value(args, "--spec").c_str()) >= 2)
+        set_arg(args, "--spec-min-p", "0.5");
 
     // fixtures, read before anything is started
     std::vector<std::vector<int64_t>> decode_ids(3);
@@ -1184,8 +1193,7 @@ int main(int argc, char** argv) {
 
 
     // ---- report
-    const std::string pack = arg_value(args, "--pack");
-    const std::string native = arg_value(args, "--native");
+    const std::string model = arg_value(args, "--model");
 
     // the power limit of the primary GPU: as set now, or the label the caller gave
     std::string power = "unknown";
@@ -1206,6 +1214,7 @@ int main(int argc, char** argv) {
         std::string test;
         bool decode = false;
         std::vector<double> ts, acc, dlen;
+        bool spec = false;   // some request drafted
     };
     std::vector<Row> rows;
     for (long long depth : o.depths) {
@@ -1224,6 +1233,7 @@ int main(int argc, char** argv) {
                 r.ts.push_back(tok_s(x.d));
                 r.acc.push_back(x.d.offered > 0 ? 100.0 * (double) x.d.accepted / (double) x.d.offered : 0.0);
                 r.dlen.push_back(x.d.offered > 0 ? (double) x.d.offered / window_count(x) : 0.0);
+                r.spec = r.spec || x.d.offered > 0;
             }
         if (!r.ts.empty()) rows.push_back(std::move(r));
     }
@@ -1253,7 +1263,8 @@ int main(int argc, char** argv) {
         cells.push_back({"test", "t/s", "accept %", "draft len"});
         for (const Row& r : rows) {
             std::string ts = o.reps > 1 ? fmt("%.0f \xC2\xB1 %.0f", mean(r.ts), sd(r.ts)) : fmt("%.0f", mean(r.ts));
-            cells.push_back({r.test, ts, r.decode ? fmt("%.1f", mean(r.acc)) : "-", r.decode ? fmt("%.2f", mean(r.dlen)) : "-"});
+            cells.push_back({r.test, ts, r.decode && r.spec ? fmt("%.1f", mean(r.acc)) : "-",
+                             r.decode && r.spec ? fmt("%.2f", mean(r.dlen)) : "-"});
         }
         size_t w[4] = {0, 0, 0, 0};
         for (const auto& c : cells)
@@ -1311,8 +1322,7 @@ int main(int argc, char** argv) {
             j.end_obj();
         }
         j.end_arr();
-        j.key("pack"); j.str(pack);
-        j.key("native"); j.str(native);
+        j.key("model"); j.str(model);
         j.key("engine_info");
         j.begin_obj();
         for (const auto& kv : info) { j.key(kv.first); j.str(kv.second); }
