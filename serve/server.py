@@ -256,8 +256,8 @@ def pump_lines(stream, sink) -> None:
 
 class LoadBars:
     """The engine's `basalt load:` lines, shown as one bar per target, each against that target's own planned size
-    (`plan`).  A target appears as soon as its plan or first progress line arrives; one without a plan yet shows a
-    byte counter.  A `copy` target (experts another tier already holds, written to a second card) is counted apart
+    (`plan`).  A target appears when it starts loading, below the ones that started before it; one without a plan
+    yet shows a byte counter.  A `copy` target (experts another tier already holds, written to a second card) is counted apart
     and never goes into the total.  At the end (finish) the bars become one line with the size, time and split
     across targets; off a terminal only that line is printed."""
 
@@ -268,7 +268,8 @@ class LoadBars:
         self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number, when --gpu picked cards
         self.tty = self.out.isatty()
         self.total = 0                                 # the announced bytes of the whole start (0: not announced)
-        self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, seen, phase_total}
+        self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, last, seen, start}
+        self.started = 0                               # targets that have begun loading
         self.t0 = None
         self.drawn = 0                                 # lines of bars on screen
         self.kv: list[tuple[str, int, int]] = []       # (target, bytes, tokens): allocated, not loaded
@@ -281,7 +282,7 @@ class LoadBars:
         return target
 
     def _target(self, target: str, copy: bool) -> dict:
-        return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0})
+        return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None})
 
     def done(self) -> int:
         return sum(t["done"] + t["last"] for (_, c), t in self.targets.items() if not c)
@@ -294,7 +295,8 @@ class LoadBars:
 
     def lines(self) -> list[str]:
         rows = []
-        for (target, copy), t in self.targets.items():
+        started = [kv for kv in self.targets.items() if kv[1]["start"] is not None]
+        for (target, copy), t in sorted(started, key=lambda kv: kv[1]["start"]):
             have = t["done"] + t["last"]
             if t["plan"] <= 0 and not have:
                 continue                               # planned to hold nothing
@@ -348,6 +350,9 @@ class LoadBars:
         if self.t0 is None:
             self.t0 = time.time()
         t = self._target(target, copy)
+        if t["start"] is None:
+            t["start"] = self.started
+            self.started += 1
         done = min(done, total)
         if t["seen"] != total or done < t["last"]:     # a new phase of this target: the last one is complete
             t["done"] += t["last"] if t["seen"] else 0

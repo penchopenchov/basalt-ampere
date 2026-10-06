@@ -1226,6 +1226,8 @@ class LoadProgress(unittest.TestCase):
         bars.set_plan("cuda1", 1 << 30, copy=True)
         bars.update("cuda0", 0, 3 << 30)                                # the second phase of the target
         bars.update("cuda0", 2 << 30, 3 << 30)
+        bars.update("ram", 0, 2 << 30)
+        bars.update("cuda1", 0, 1 << 30, copy=True)
         rows = [r.split("\x1b[2K")[-1] for r in out.getvalue().splitlines()[-3:]]
         self.assertEqual(rows[0], "[server] loading weights into cuda2      [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB")
         self.assertEqual(rows[1], "[server] loading weights into system ram [>" + " " * 23 + "]   0.0/2.0 GiB")
@@ -1233,6 +1235,19 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(len({r.index("[", 8) for r in rows}), 1)       # the bars line up
         bars.say("[server] warning: x")
         self.assertIn("\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
+
+    def test_bars_follow_the_order_targets_start_loading(self):
+        from serve.server import LoadBars
+        out = Tty()
+        bars = LoadBars(out, gpus=[2, 3])
+        bars.set_plan("cuda0", 1 << 30)
+        bars.set_plan("ram", 2 << 30)
+        bars.update("cuda0", 1 << 30, 1 << 30)
+        bars.set_plan("cuda1", 1 << 30)
+        self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2"])   # ram waits unseen
+        bars.update("cuda1", 0, 1 << 30)                                # planned after ram, loads before it
+        bars.update("ram", 0, 2 << 30)
+        self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2", "cuda3", "ram"])
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
         from serve.server import LoadBars, load_kv, load_progress
@@ -1255,6 +1270,8 @@ class LoadProgress(unittest.TestCase):
         bars = LoadBars(out)
         bars.set_plan("cuda0", 1 << 30)
         bars.set_plan("ram", 0)
+        bars.update("cuda0", 0, 1 << 30)
+        bars.update("ram", 0, 0)
         self.assertEqual(len(bars.lines()), 1)
 
     def test_a_lowered_total_ends_at_full(self):
