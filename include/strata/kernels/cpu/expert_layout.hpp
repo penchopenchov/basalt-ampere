@@ -57,8 +57,6 @@ bool cpu_sse42_ok();
 /// STRATA_FORCE_ISA=avx2|avx|sse caps the probes above (3 = no cap, 2 = AVX2, 1 = AVX, 0 = SSE4.2), so the older-CPU
 /// paths run on any PC: tests and the experimental builds' checks.  ggml-cpu keeps what it was compiled for.
 int cpu_isa_cap();
-/// The experimental older-CPU build this engine is ("avx", "sse4.2"), or "" for the normal build (AVX2 floor).
-const char* isa_floor_build();
 /// Whether a native pack's layer of this ggml type runs on Strata's own Q2_0 kernels (AVX2 / AVX-512).  On a
 /// CPU without AVX2 (a native, non-portable build: ggml-cpu compiled for this CPU's SSE) a Q2_0 layer takes
 /// ggml-cpu's own Q2_0 vec_dot like every other native type: slower, but it runs.

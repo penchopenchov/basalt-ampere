@@ -68,7 +68,7 @@ DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-        throw CudaError("no CUDA device is present; Strata needs an NVIDIA GPU (RTX 20 series or newer)", -1);
+        throw CudaError("no CUDA device is present; Strata needs an NVIDIA Blackwell GPU (compute capability 12.0)", -1);
     }
     if (ordinal < 0 || ordinal >= count) {
         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
@@ -94,22 +94,11 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // The engine supports compute capability 7.5 and newer (Turing: the QSA scorer's tf32 mma has a portable
-    // fp32-FMA fallback below sm_80, the tensor-core prompt kernels refuse and fall back).  Compiling for a
-    // supported arch is enforced by CMake; RUNNING on an older card is caught here, because a binary can be carried
-    // to a machine with an older card and would otherwise silently take whatever path the driver chose.
-    // #236: the experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON: Pascal sm_60, Volta sm_70) runs on the cards it
-    // was built for - refusing them below 7.5 there made the flag useless; the release engine keeps 7.5
-#if defined(STRATA_EXPERIMENTAL_SM60)
-    constexpr int kMinCc = 60;
-    const char* const kNeed = "6.0 or newer (this is the experimental Pascal / Volta build)";
-#else
-    constexpr int kMinCc = 75;
-    const char* const kNeed = "7.5 or newer (RTX 20 / 30 / 40 / 50 series)";
-#endif
-    if (d.cc_major * 10 + d.cc_minor < kMinCc) {
-        throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
-                            "." + std::to_string(d.cc_minor) + "; Strata needs compute capability " + kNeed,
+    // The binary holds sm_120 code only; a card of another compute capability is refused here rather than failing
+    // at its first kernel launch.
+    if (d.cc_major != 12 || d.cc_minor != 0) {
+        throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) + "." +
+                            std::to_string(d.cc_minor) + "; Strata needs an NVIDIA Blackwell GPU (compute capability 12.0)",
                         -1);
     }
     return d;

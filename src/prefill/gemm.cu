@@ -135,16 +135,6 @@ void bf16_to_f16(const uint16_t* in, uint16_t* out, int64_t n, cudaStream_t st) 
     if (n <= 0) return;
     bf16_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, reinterpret_cast<__half*>(out), n);
 }
-#if defined(STRATA_EXPERIMENTAL_SM60)   // Pascal runs only the experimental build
-__global__ void bf16_to_f32_kernel(const uint16_t* __restrict__ in, float* __restrict__ out, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __uint_as_float((uint32_t) in[i] << 16);
-}
-void bf16_to_f32(const uint16_t* in, float* out, int64_t n, cudaStream_t st) {
-    if (n <= 0) return;
-    bf16_to_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, out, n);
-}
-#endif
 // The current device's compute capability as 10 * major + minor, per device (a layer split can mix cards); 0: not
 // known, read as "not an old card" so a failed query keeps the cuBLAS BF16 call.
 int current_cc() {
@@ -207,26 +197,6 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
             return;
         }
     }
-#if defined(STRATA_EXPERIMENTAL_SM60)
-    else if (path == 2) {
-        // Pascal: fp32 copies (2 elements of the 2-byte buffers each).  Every tile is a disjoint block of Y, so each
-        // gets the caller's beta.
-        const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
-        if (grow(tc_w_, tc_w_elems_, 2 * N * K) && grow(tc_x_, tc_x_elems_, 2 * x_rows * K)) {
-            float* const wf = reinterpret_cast<float*>(tc_w_);
-            float* const xf = reinterpret_cast<float*>(tc_x_);
-            bf16_to_f32(W, wf, N * K, (cudaStream_t) stream_);
-            for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
-                const int64_t n = std::min<int64_t>(x_rows, T - t0);
-                bf16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
-                ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &alpha,
-                               wf, (int) K, xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
-                   "cublasSgemm (bf16 on Pascal)");
-            }
-            return;
-        }
-    }
-#endif
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,

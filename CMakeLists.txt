@@ -11,16 +11,6 @@ cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.39 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 
-# EXPERIMENTAL, opt-in: an engine for CPUs without AVX2 (#394, #595, #623), compiled on that PC.  ggml-cpu, which then
-# computes every CPU expert row, is built for this floor instead of AVX2 or the build host: "avx" (Sandy/Ivy Bridge:
-# AVX, no FMA/F16C/AVX2) or "none" (SSE4.2 + POPCNT: Nehalem/Westmere).  Strata's own AVX2/AVX-512 kernels stay in the
-# binary behind their CPU checks; the router lookahead gets an AVX1 kernel.  Empty (the default) changes nothing.
-set(STRATA_ISA_FLOOR "" CACHE STRING "experimental older-CPU build: empty (default, AVX2 floor), avx, or none (SSE4.2)")
-set_property(CACHE STRATA_ISA_FLOOR PROPERTY STRINGS "" avx none)
-if(NOT STRATA_ISA_FLOOR STREQUAL "" AND NOT STRATA_ISA_FLOOR STREQUAL "avx" AND NOT STRATA_ISA_FLOOR STREQUAL "none")
-  message(FATAL_ERROR "STRATA_ISA_FLOOR must be empty, avx or none (got '${STRATA_ISA_FLOOR}')")
-endif()
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -58,44 +48,18 @@ if(STRATA_ENABLE_CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
-  option(STRATA_EXPERIMENTAL_SM60 "community build for GPUs below compute capability 7.5: Pascal sm_60, Volta sm_70 (#236)" OFF)
+  # Blackwell (sm_120) only: the kernels use its instructions and nothing else is tested.
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
   endif()
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
-    # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
-    # portable fp32-FMA fallback, so RTX 20 (75), 30 (86), RTX 40 (89) and RTX 50 (120) build too.
-    # Pre-sm_75 is refused.
-    if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
-      continue()
-    endif()
-    # STRATA_EXPERIMENTAL_SM60: a Pascal (sm_60, GP100-class) or Volta (sm_70, V100 / Titan V, #236) build.
-    # These sit below every architecture the kernels were written for, so two intrinsics are replaced below
-    # their arch - `__dp4a` (6.1+) and `__nanosleep` (7.0+) - in include/strata/kernels/dp4a.hpp, which is
-    # bit-exact for the first and merely a shorter pause for the second (sm_70 has both).  Community-tested,
-    # not in the ready-made engine; RTX 20/30/40/50 cards must use the release engine instead.  It needs a CUDA
-    # 12.x toolkit: CUDA 13 dropped sm_60 and sm_70 (nvcc fails CMake's compiler test with "compute_70").
-    if(_base LESS 75 AND NOT STRATA_EXPERIMENTAL_SM60)
-      message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
-        "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.  (A Pascal sm_60 or Volta sm_70 build is "
-        "-DSTRATA_EXPERIMENTAL_SM60=ON; upstream does not support it.)")
-    endif()
-    if(_base LESS 60)
-      message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES '${CMAKE_CUDA_ARCHITECTURES}': even the experimental build "
-                          "needs compute capability 6.0 (sm_60) or newer")
-    endif()
-    # #220 / #224: RTX 50 engines built with CUDA 12.8 crashed in the prompt path on Linux (13.0 and newer did not)
-    if(_base GREATER_EQUAL 120 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
-      message(WARNING "Building for sm_${_base} (RTX 50) with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: engines built with "
-                      "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
+    string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
+    if(NOT _base STREQUAL "120")
+      message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': Strata builds for sm_120 only")
     endif()
   endforeach()
-  if(STRATA_EXPERIMENTAL_SM60)
-    # every target sees it: the Pascal / Volta code paths (the Volta prompt attention, PR #600) are compiled into this
-    # build only, so the ready-made engine (sm_75+) keeps exactly the code it had
-    add_compile_definitions(STRATA_EXPERIMENTAL_SM60=1)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+    message(FATAL_ERROR "CUDA ${CMAKE_CUDA_COMPILER_VERSION}: Strata needs CUDA 13.0 or newer")
   endif()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
   set(_strata_gpu_runtime_target CUDA::cudart)
@@ -157,10 +121,6 @@ if(STRATA_ENABLE_CUDA)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  if(STRATA_EXPERIMENTAL_SM60)
-    # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236)
-    target_compile_definitions(strata_core PRIVATE STRATA_EXPERIMENTAL_SM60=1)
-  endif()
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
@@ -816,25 +776,7 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  if(STRATA_ISA_FLOOR)
-    # the experimental older-CPU build (STRATA_ISA_FLOOR above): one ggml-cpu for the floor, ggml's "sandybridge"
-    # feature set (SSE4.2 + AVX) or SSE4.2 alone - not the build host's, which may be newer than the PC it runs on.
-    # From the Strata_Dirigo fork (rwkeyes).  ggml's defaults turn the rest on when GGML_NATIVE is off: all off here.
-    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
-    set(GGML_SSE42 ON CACHE BOOL "" FORCE)
-    if(STRATA_ISA_FLOOR STREQUAL "avx")
-      set(GGML_AVX ON CACHE BOOL "" FORCE)
-    else()
-      set(GGML_AVX OFF CACHE BOOL "" FORCE)
-    endif()
-    foreach(_f GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2 GGML_AVX_VNNI GGML_AVX512 GGML_AVX512_VBMI GGML_AVX512_VNNI
-               GGML_AVX512_BF16 GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16)
-      set(${_f} OFF CACHE BOOL "" FORCE)
-    endforeach()
-  else()
-    set(GGML_NATIVE ON CACHE BOOL "" FORCE)
-  endif()
+  set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   if(STRATA_GGML_DIR)
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
@@ -861,11 +803,6 @@ if(STRATA_NATIVE_EXPERTS)
   set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
   set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
-  if(STRATA_ISA_FLOOR STREQUAL "avx")
-    target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_AVX=1)
-  elseif(STRATA_ISA_FLOOR STREQUAL "none")
-    target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_NONE=1)
-  endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
@@ -890,8 +827,7 @@ if(STRATA_NATIVE_EXPERTS)
       set(_strata_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
     endif()
     set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
-    # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; an
-    # sm_75 device or an sm_75-only build reports them unavailable)
+    # the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and

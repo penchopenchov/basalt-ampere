@@ -164,30 +164,16 @@ constexpr int TC_ITER = 4;                // tiles per CTA (the query tile is lo
 constexpr int TC_QS = IDX_HEADS * IDX_DIM + 4;   // query row stride in floats
 constexpr int TC_KS = IDX_DIM + 4;               // key row stride
 
-// TF32 conversion and MMA need sm_80: below it they compile to a trap and qsa_block_scores_tc refuses the device
-#if   !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-#define STRATA_SEL_SM80 1
-#else
-#define STRATA_SEL_SM80 0
-#endif
 __device__ __forceinline__ uint32_t tf32_hi(float x) {
-#if STRATA_SEL_SM80
     uint32_t r;
     asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
     return r;
-#else
-    return __float_as_uint(x);
-#endif
 }
 __device__ __forceinline__ void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
-#if !STRATA_SEL_SM80
-    __trap();
-#else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-#endif
 }
 
 __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __restrict__ pooled,

@@ -125,16 +125,6 @@ bool cpu_sse42_ok() {
     return ok;
 }
 
-const char* isa_floor_build() {
-#if defined(STRATA_ISA_FLOOR_AVX)
-    return "avx";
-#elif defined(STRATA_ISA_FLOOR_NONE)
-    return "sse4.2";
-#else
-    return "";
-#endif
-}
-
 std::string cpu_name() {
     unsigned r[12] = {};
     unsigned a = 0, b = 0, c = 0, d = 0;
