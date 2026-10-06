@@ -110,7 +110,7 @@ SHA256 = {
 def get(url, start=None, end=None, retries=4):
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-mtp-fetch"})
+            req = urllib.request.Request(url, headers={"User-Agent": "basalt-mtp-fetch"})
             if start is not None:
                 req.add_header("Range", "bytes=%d-%d" % (start, end))
             with urllib.request.urlopen(req, timeout=120) as r:
@@ -155,7 +155,7 @@ def resolve_repo():
     global REPO
     try:
         req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
-                                     headers={"User-Agent": "strata-mtp-fetch"})
+                                     headers={"User-Agent": "basalt-mtp-fetch"})
         urllib.request.urlopen(req, timeout=120).close()
     except urllib.error.HTTPError as e:
         if e.code == 404 and "/resolve/main/" not in REPO:

@@ -6,7 +6,7 @@ of each chunk scored).  The engine is started the way serve/server.py starts it 
 first, so the expert tiers are sized as in daily use), with --ppl-base and --ppl-out added to its arguments.  Per chunk it reads the first half as a prompt and teacher-forces the rest
 through verify windows of T tokens (every token committed); see the engine's ppl_gate.hpp.
 
-  python3 tools/ppl_gate.py --exe build/strata --config cfg.json --base base.kld --out DIR [--chunks 20] [--t 3]
+  python3 tools/ppl_gate.py --exe build/basalt --config cfg.json --base base.kld --out DIR [--chunks 20] [--t 3]
                             [--set="--spec 5 --spec-min-p 0.7"]
   python3 tools/ppl_gate.py --report DIR/rows.tsv          # the summary of a finished run again
   python3 tools/ppl_gate.py --diff A/rows.tsv B/rows.tsv   # row by row: identical rows, largest NLL/KLD change

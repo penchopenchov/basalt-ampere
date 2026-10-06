@@ -1,7 +1,7 @@
-"""Strata P1.S6/S7 - the pack builder and verifier.
+"""basalt P1.S6/S7 - the pack builder and verifier.
 
-This is `strata-pack build` / `strata-pack verify` / `strata-pack info`.  It is the Python implementation of
-the pack format; the C++ `tools/strata-pack` is a port of it, and if the two disagree the C++ is wrong.
+This is `basalt-pack build` / `basalt-pack verify` / `basalt-pack info`.  It is the Python implementation of
+the pack format; the C++ `tools/basalt-pack` is a port of it, and if the two disagree the C++ is wrong.
 
 WHY PYTHON FIRST.  The canonicalisation in `tools/canonical_xcheck.py` is measured bit-exact over every block
 of every tensor (757,139,840 blocks across 1021 tensors, plus Q2_0), against gguf-py and, for Q2_0, backed by
@@ -42,8 +42,8 @@ from canonical_xcheck import (MAPPINGS, KV_IQ4NL, open_shard,             # noqa
 FORMAT_VERSION = 1
 ALIGN = 64                       # every plane starts on a 64-byte boundary (P1.S7)
 _HERE = pathlib.Path(__file__).resolve()
-STRATA = _HERE.parents[min(3, len(_HERE.parents) - 1)]   # the development layout; build takes the shard from --gguf
-SHARD2 = STRATA / "Q2_0" / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"
+GGUF_DIR = _HERE.parents[min(3, len(_HERE.parents) - 1)]   # the development layout; build takes the shard from --gguf
+SHARD2 = GGUF_DIR / "Q2_0" / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"
 
 EXPERT_RE = ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
 EMBD_NAME = "token_embd.weight"
@@ -345,7 +345,7 @@ def verify(gguf: pathlib.Path, out_dir: pathlib.Path, limit: int | None, expert_
         got = sha256(gguf)
         if got != want:
             print("%s: sha256 %s, but the pack was built from %s" % (gguf.name, got, want))
-            print("tools/strata_pack.py verify FAIL")
+            print("tools/basalt_pack.py verify FAIL")
             return 1
     g = G.GGUFFile(gguf)
     head, flen = open_shard(gguf)
@@ -376,13 +376,13 @@ def verify(gguf: pathlib.Path, out_dir: pathlib.Path, limit: int | None, expert_
     print("verify: %d tensors, %d elements, %d bad" % (n_t, n_el, bad))
     if expert_every > 0:
         bad += verify_experts(gguf, out_dir, man, expert_every)
-    print("tools/strata_pack.py verify " + ("PASS" if bad == 0 else "FAIL"))
+    print("tools/basalt_pack.py verify " + ("PASS" if bad == 0 else "FAIL"))
     return 0 if bad == 0 else 1
 
 
 def info(out_dir: pathlib.Path) -> int:
     man = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
-    print("strata-pack v%d  layers=%d" % (man["format_version"], man["n_layers"]))
+    print("basalt-pack v%d  layers=%d" % (man["format_version"], man["n_layers"]))
     for f, n in man.get("files", {}).items():
         print("  %-12s %12.3f GiB" % (f, n / 2**30))
     forms = {}
