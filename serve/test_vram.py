@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, Service, BasaltEngine, engine_args, serve
+from serve.server import ByteTokenizer, EngineDied, Service, ProcessEngine, engine_args, serve
 from serve.test_lifecycle import ResidentEngine
 
 
@@ -34,7 +34,7 @@ class VramEngine(ResidentEngine):
 
 class EngineCommand(unittest.TestCase):
     def engine(self, replies):
-        e = BasaltEngine("missing-executable", [], lazy=True)
+        e = ProcessEngine("missing-executable", [], lazy=True)
         e.proc = mock.Mock()
         e.proc.poll.return_value = None
         e.proc.stdin = io.StringIO()

@@ -44,7 +44,7 @@ class Detok(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import json
-        import basalt_tokenizer as ST
+        import tokenizer as ST
         t = find_tokenizer()
         vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
         toks = [None] * len(vocab)
@@ -112,7 +112,7 @@ def real_tokenizer():
             _REAL.append(None)
         else:
             import json
-            import basalt_tokenizer as ST
+            import tokenizer as ST
             vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
             toks = [None] * len(vocab)
             for s, i in vocab.items():
@@ -160,7 +160,7 @@ def encode_with(tok, text, parse_special, heap_min):
 def synthetic_tokenizer(seed=268, n_merges=1500):
     """A small byte-level BPE vocabulary with merges learned (randomly) from random_text, and a few specials of
     both kinds - so the parity test runs without a pack."""
-    import basalt_tokenizer as ST
+    import tokenizer as ST
     rng = random.Random(seed)
     tokens = sorted(set(ST.BYTE_TO_UNICODE.values()))
     have, merges = set(tokens), []
@@ -201,7 +201,7 @@ class HeapBpe(unittest.TestCase):
     def test_words_directly(self):
         tok = synthetic_tokenizer()
         rng = random.Random(1)
-        import basalt_tokenizer as ST
+        import tokenizer as ST
         for _ in range(300):
             for piece in ST.regex.compile(ST.QWEN35_PATTERN).findall(random_text(rng, 8)):
                 word = "".join(ST.BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))

@@ -30,13 +30,13 @@ class HostNames(unittest.TestCase):
         self.assertEqual(host_name("localhost"), "localhost")
         self.assertEqual(host_name("[::1]:8095"), "::1")
         self.assertEqual(host_name("[::1]"), "::1")
-        self.assertEqual(host_name("basalt.example.com."), "basalt.example.com")
+        self.assertEqual(host_name("host.example.com."), "host.example.com")
         for bad in ("", "a:b", "[::1", "[::1]x", "a b", "evil.com/x"):
             self.assertEqual(host_name(bad), "", bad)
 
     def test_allowed_hosts_of(self):
         self.assertEqual(allowed_hosts_of(None), [])
-        self.assertEqual(allowed_hosts_of("basalt.Example.com"), ["basalt.example.com"])
+        self.assertEqual(allowed_hosts_of("host.Example.com"), ["host.example.com"])
         self.assertEqual(allowed_hosts_of(["https://a.example.com:8443/x", ".example.org", "*", "box", "nas.lan"]),
                          ["a.example.com", ".example.org", "*", "box", "nas.lan"])
         for bad in (["bad name"], 5, [3], "http://"):
@@ -52,8 +52,8 @@ class HostNames(unittest.TestCase):
             self.assertIn(socket.gethostname().lower() + ".local", names)
             self.assertIn("192.168.1.20", names)
             self.assertIn("10.0.0.7", host_names_for("10.0.0.7"))
-            names = host_names_for("127.0.0.1", ["basalt.example.com", "*"], ["https://chat.example.net"])
-            self.assertTrue({"basalt.example.com", "chat.example.net"} <= names)
+            names = host_names_for("127.0.0.1", ["host.example.com", "*"], ["https://chat.example.net"])
+            self.assertTrue({"host.example.com", "chat.example.net"} <= names)
             self.assertNotIn("*", names)
 
 
@@ -76,7 +76,7 @@ class HostCheck(unittest.TestCase):
 class OriginCheck(unittest.TestCase):
     def test_accepted(self):
         names = LOCAL | {"box"}
-        self.assertTrue(origin_allowed("http://127.0.0.1:8095", "127.0.0.1:8095", names))      # basalt's own page
+        self.assertTrue(origin_allowed("http://127.0.0.1:8095", "127.0.0.1:8095", names))      # the server's own page
         self.assertTrue(origin_allowed("http://192.168.1.20:8095", "192.168.1.20:8095", names))  # ... by LAN IP
         self.assertTrue(origin_allowed("http://localhost:3000", "127.0.0.1:8095", names))      # a local app
         self.assertTrue(origin_allowed("http://[::1]:3000/", "127.0.0.1:8095", names))
@@ -163,8 +163,8 @@ class OverHttp(unittest.TestCase):
         self.assertTrue(raw.startswith(b"HTTP/1.0 200"), raw[:40])
 
     def test_allowed_hosts_and_wildcard(self):
-        self.start(allowed_hosts=["basalt.example.com", ".home.arpa"])
-        self.assertEqual(self.req("GET", "/status", host="basalt.example.com")[0], 200)
+        self.start(allowed_hosts=["host.example.com", ".home.arpa"])
+        self.assertEqual(self.req("GET", "/status", host="host.example.com")[0], 200)
         self.assertEqual(self.req("GET", "/status", host="nas.home.arpa:8095")[0], 200)
         self.assertEqual(self.req("GET", "/status", host="evil.example.com")[0], 403)
         self.svc.allowed_hosts = ["*"]
@@ -189,8 +189,8 @@ class OverHttp(unittest.TestCase):
         self.assertNotIn("refused", log)
 
     def test_a_trusted_origin_s_host_is_allowed(self):
-        self.start(trusted_origins=["https://basalt.example.com"])
-        self.assertEqual(self.req("GET", "/status", host="basalt.example.com")[0], 200)
+        self.start(trusted_origins=["https://host.example.com"])
+        self.assertEqual(self.req("GET", "/status", host="host.example.com")[0], 200)
 
     # --- Origin on /v1 without an API key
     def test_curl_and_sdks_without_origin(self):
@@ -224,9 +224,9 @@ class OverHttp(unittest.TestCase):
                                   {"Content-Type": "text/plain", "Origin": f"http://127.0.0.1:{self.port}"})[0], 415)
 
     def test_configured_origins_pass(self):
-        self.start(cors_origins=["https://chat.example.com"], trusted_origins=["https://basalt.example.com"],
+        self.start(cors_origins=["https://chat.example.com"], trusted_origins=["https://host.example.com"],
                    allowed_hosts=["webui.lan"])
-        for origin in ("https://chat.example.com", "https://basalt.example.com", "http://webui.lan:3000"):
+        for origin in ("https://chat.example.com", "https://host.example.com", "http://webui.lan:3000"):
             self.assertEqual(self.req("POST", "/v1/chat/completions", self.chat_body(),
                                       {"Content-Type": "application/json", "Origin": origin})[0], 200, origin)
 

@@ -1,10 +1,10 @@
-"""serve/runconfig.py - the web page's Settings view of the run config (basalt-<model>.json).
+"""serve/runconfig.py - the web page's Settings view of the run config (<model>.json).
 
-A short list of documented keys can be read and changed from basalt's own page (GET / POST /config).  Everything
+A short list of documented keys can be read and changed from the server's own page (GET / POST /config).  Everything
 else in the file - the engine and model keys, the network and security keys (host, api_key, cors_origins,
 trusted_origins, allowed_hosts), the MCP servers and before_load (which run programs), sampling keys not listed
 here - is kept as it is: a change touches only the keys it names (the rest of the file is never rewritten).
-The earlier file is kept as basalt-<model>.json.bak.  The server reads the config when it starts, so a change is
+The earlier file is kept as <model>.json.bak.  The server reads the config when it starts, so a change is
 used from the next start on.
 """
 from __future__ import annotations

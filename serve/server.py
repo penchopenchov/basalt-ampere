@@ -1,12 +1,12 @@
 """serve/server.py - plan v0.3 P8: OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
 
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
-    python -m serve.server --engine basalt --config basalt.json --port 8080   (the real engine, resident)
+    python -m serve.server --engine engine --config config.json --port 8080   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
-ask for them with `"basalt_mcp": true` - the web app does; other clients see exactly the API they always saw.
+ask for them with `"mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
 data, http(s) URLs or local file paths) go through `basalt-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
@@ -15,7 +15,7 @@ Requests whose prompt plus max tokens exceed the engine's context are REJECTED w
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
-`BasaltEngine` keeps one `basalt --serve` process resident (weights, expert arena and VRAM tier load once) and
+`ProcessEngine` keeps one `basalt --serve` process resident (weights, expert arena and VRAM tier load once) and
 talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes every API path testable without a GPU.
 """
 from __future__ import annotations
@@ -162,7 +162,7 @@ ENGINE_REQUEST = re.compile(
     r"(?P<gen>\d+) generated in (?P<gen_ms>[\d.]+) ms \((?P<tg>[\d.]+) tok/s\)")
 
 
-_echoing: set[str] = set()      # the logs echo_requests already follows (restart() runs BasaltEngine.__init__ again)
+_echoing: set[str] = set()      # the logs echo_requests already follows (restart() runs ProcessEngine.__init__ again)
 
 DRAFT_HEAD_FAIL = "the draft head does not fit"
 DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic "
@@ -228,7 +228,7 @@ def echo_requests(log_path: str, offset: int) -> None:
             m = ENGINE_REQUEST.search(line)
             if m:
                 read_ms, gen_ms = float(m["read"]), float(m["gen_ms"])
-                print("[basalt] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
+                print("[server] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
                       "tok/s decode %s tok/s" % (m["prompt"], m["reused"], m["gen"], read_ms, read_ms + gen_ms, m["pp"],
                                                  m["tg"]), flush=True)
 
@@ -276,7 +276,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             last = time.time()
             print(text, flush=True)
 
-    say("weights", "[basalt] starting the engine: reading the model's weights ...")
+    say("weights", "[server] starting the engine: reading the model's weights ...")
     pos = offset
     while not done.wait(0.5):
         try:
@@ -290,20 +290,20 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
-                    say("arena", f"[basalt] {loading}\n"
+                    say("arena", f"[server] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
                                  "         Please wait and don't close this window; the browser opens when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
-                    say("loaded", "[basalt] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
+                    say("loaded", "[server] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[basalt] filling the GPU's expert cache ({n}) ...")
+                    say("cache", f"[server] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
-                    say("up", "[basalt] almost ready ...")
+                    say("up", "[server] almost ready ...")
         if time.time() - last > heartbeat:
             last = time.time()
-            print(f"[basalt] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+            print(f"[server] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
 class ConvCacheLog:
@@ -384,7 +384,7 @@ REQUEST_LINES = False    # --request-lines: echo the engine's per-request summar
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 
 
-class BasaltEngine:
+class ProcessEngine:
     """The resident engine: `basalt --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
 
@@ -485,7 +485,7 @@ class BasaltEngine:
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
-            print(f"[basalt] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
+            print(f"[server] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
         groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
@@ -593,7 +593,7 @@ class BasaltEngine:
                         pass
                     if i == tries - 1:
                         raise
-                    print(f"[basalt] the engine did not start (try {i + 1} of {tries}); again in "
+                    print(f"[server] the engine did not start (try {i + 1} of {tries}); again in "
                           f"{self.RESTART_RETRY_S:g} s", flush=True)
                     time.sleep(self.RESTART_RETRY_S)
         finally:
@@ -684,7 +684,7 @@ class BasaltEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        return keys + BasaltEngine.projection_key(sampling)
+        return keys + ProcessEngine.projection_key(sampling)
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1225,7 +1225,7 @@ class BasaltEngine:
             try:
                 self.proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                raise EngineStuck("basalt is still releasing GPU/RAM; retry unloading after it exits") from None
+                raise EngineStuck("the engine is still releasing GPU/RAM; retry unloading after it exits") from None
         except OSError:
             pass
         finally:
@@ -1291,7 +1291,7 @@ class Vision:
         if source.startswith("data:"):
             return base64.b64decode(source.split(",", 1)[1])
         if source.startswith(("http://", "https://")):
-            req = urllib.request.Request(source, headers={"User-Agent": "basalt"})
+            req = urllib.request.Request(source, headers={"User-Agent": "local-server"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 return r.read()
         path = source[7:] if source.startswith("file://") else source
@@ -1387,10 +1387,10 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         known = False
     role = tok.encode("system", parse_special=True)
     if not known or len(role) != 1:
-        print("[basalt] effort_position \"end\" needs an engine with --tail-role-token: the reasoning "
+        print("[server] effort_position \"end\" needs an engine with --tail-role-token: the reasoning "
               "effort stays at the top of the prompt", flush=True)
         return None
-    print("[basalt] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
+    print("[server] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
           "changing it keeps the cached conversation", flush=True)
     return ["--tail-role-token", str(role[0])]
 
@@ -1473,13 +1473,13 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
     if n is None or n is False:
         return []
     if isinstance(n, bool) or not isinstance(n, int):
-        print(f'[basalt] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
+        print(f'[server] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
               flush=True)
         return []
     if n <= 1:
         return []
     if n > PARALLEL_MAX:
-        print(f'[basalt] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
+        print(f'[server] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
               f"{PARALLEL_MAX}", flush=True)
     return ["--batch", str(n)]
 
@@ -1629,8 +1629,8 @@ class Service:
         # browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
         # matters); empty = no CORS headers at all, as before
         self.cors_origins: list[str] = []
-        # origins that count as basalt's own page for /settings and MCP tools, e.g. the web app reached through a
-        # reverse proxy or tunnel whose Host differs ("https://basalt.example.com"); never a wildcard
+        # origins that count as the server's own page for /settings and MCP tools, e.g. the web app reached through a
+        # reverse proxy or tunnel whose Host differs ("https://host.example.com"); never a wildcard
         self.trusted_origins: list[str] = []
         # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts;
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
@@ -1733,11 +1733,11 @@ class Service:
             return
         if self.before_load:
             cmd = self.before_load
-            print(f"[basalt] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+            print(f"[server] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
             try:
                 subprocess.run(cmd, shell=isinstance(cmd, str), timeout=120, stdin=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError) as e:
-                print(f"[basalt] the before_load command failed ({e}); loading anyway", flush=True)
+                print(f"[server] the before_load command failed ({e}); loading anyway", flush=True)
         if self.min_free_vram_mib:
             free = self.free_vram_mib()
             deadline = time.time() + 15                 # memory another process just gave back can take a moment
@@ -1748,23 +1748,23 @@ class Service:
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
-            print("[basalt] starting the vision encoder again ...", flush=True)   # the engine sizes its cache
+            print("[server] starting the vision encoder again ...", flush=True)   # the engine sizes its cache
             self.vision.restart()
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
-            print("[basalt] loading the model again (it was unloaded) ...", flush=True)
+            print("[server] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            print(f"[basalt] the engine had stopped (exit code {code}); starting it again "
+            print(f"[server] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
         self.engine.restart()
-        print("[basalt] the engine is running again", flush=True)
+        print("[server] the engine is running again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
-                print(f"[basalt] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+                print(f"[server] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
 
     vram_wait_s = 300.0                                  # how long POST /v1/vram waits for a running request
 
@@ -1790,7 +1790,7 @@ class Service:
                         "note": "applied when the model loads"}
             out = self.engine.vram(reserve_mib)
             self.vram_reserve = reserve_mib
-            print(f"[basalt] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
+            print(f"[server] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
         finally:
@@ -1802,7 +1802,7 @@ class Service:
         """The server window's line for an engine that died (or was ended) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
-        print(f"[basalt] {e}. {note} The next request starts the engine again."
+        print(f"[server] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
     def load(self):
@@ -1845,7 +1845,7 @@ class Service:
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
-            print(f"[basalt] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+            print(f"[server] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
         finally:
@@ -1854,7 +1854,7 @@ class Service:
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
-        print(f"[basalt] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        print(f"[server] the model unloads after {self.idle_unload_s} s without requests", flush=True)
 
         def loop():
             while True:
@@ -1862,7 +1862,7 @@ class Service:
                 try:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
-                    print(f"[basalt] idle unload: {e}", flush=True)
+                    print(f"[server] idle unload: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -1875,7 +1875,7 @@ class Service:
                 else:
                     Path(self.shared_path).unlink(missing_ok=True)
             except OSError as e:
-                print(f"[basalt] could not save the shared settings: {e}", flush=True)
+                print(f"[server] could not save the shared settings: {e}", flush=True)
         return self.shared
 
     def with_shared(self, req: dict, api: str) -> dict:
@@ -2156,7 +2156,7 @@ class Service:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's basalt-<model>.json to shorten it to the room left")
+                                 "model's <model>.json to shorten it to the room left")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -2189,10 +2189,10 @@ class Service:
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read
-            print(f"[basalt] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            print(f"[server] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
-            print(f"[basalt] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
+            print(f"[server] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -2223,7 +2223,7 @@ class Service:
         with self.status_lock:
             self.status["queued"] += 1
         try:
-            # --batch: the engine runs several requests at once (BasaltEngine.generate_batched orders them)
+            # --batch: the engine runs several requests at once (ProcessEngine.generate_batched orders them)
             with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
                 try:
                     with self.status_lock:
@@ -2290,7 +2290,7 @@ class Service:
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
-                            print(f"[basalt] the engine reported an error: {e}", flush=True)
+                            print(f"[server] the engine reported an error: {e}", flush=True)
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this
@@ -2314,7 +2314,7 @@ class Service:
                         extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        print(f"[basalt] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                        print(f"[server] thinking budget reached ({thought} tokens): wrapping up the thinking",
                               flush=True)
                         for t in extra:
                             n += 1
@@ -2328,9 +2328,9 @@ class Service:
                     if cancel.is_set():
                         finish = "cancel"
                     elif repeated:
-                        print(f"[basalt] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                        print(f"[server] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
-                              "basalt-<model>.json; 0 turns this off). If a new request with a short prompt does the "
+                              "<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it", flush=True)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
@@ -2391,14 +2391,14 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
-                            print(f"[basalt] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                            print(f"[server] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state == "reasoning":   # 0
-                                print("[basalt] the reply reached max tokens while still thinking, so it has no "
+                                print("[server] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
-                                      "basalt-<model>.json for every request) leaves room to answer", flush=True)
+                                      "<model>.json for every request) leaves room to answer", flush=True)
                             if DEBUG and raw_ids:
-                                print(f"[basalt] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                                print(f"[server] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
                         st.pop("tail", None)                     # the answer's end is not kept once it is done
                         st.pop("tool", None)
@@ -2432,7 +2432,7 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
-    (BasaltEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
+    (ProcessEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
     engine keeps no clock (MockEngine)."""
     if last.get("prompt_ms") is None:
         return None
@@ -2459,7 +2459,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
     if isinstance(body, list):
         body = " ".join(p.get("text", "") for p in body if isinstance(p, dict))
     preview = (str(body or "")[:80]).replace("\n", " ")
-    print(f"[basalt] req {api}: msgs={len(messages)} tools={len(tools or [])} "
+    print(f"[server] req {api}: msgs={len(messages)} tools={len(tools or [])} "
           f"max_tokens_raw={req.get('max_tokens')!r}/{req.get('max_completion_tokens')!r} "
           f"max_new={max_new} thinking={thinking} stream={bool(req.get('stream'))} "
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
@@ -2538,7 +2538,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             if "r" not in box:
                 break
             r = box["r"]
-            print(f"[basalt] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+            print(f"[server] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
@@ -2556,7 +2556,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 # ------------------------------------------------------------------------------------------------ OpenAI
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `basalt_mcp` field, which only the web app reads."""
+    an empty delta and a `mcp` field, which only the web app reads."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model_for(req)
 
@@ -2573,7 +2573,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             yield None
         elif kind == "mcp":
             c = chunk({})
-            c["basalt_mcp"] = x
+            c["mcp"] = x
             yield c
         elif kind == "event":
             ev: Event = x
@@ -2623,8 +2623,8 @@ def openai_collect(chunks) -> dict:
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
-        if c.get("basalt_mcp"):
-            mcp.append(c["basalt_mcp"])
+        if c.get("mcp"):
+            mcp.append(c["mcp"])
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -2645,7 +2645,7 @@ def openai_collect(chunks) -> dict:
     if calls:
         msg["tool_calls"] = calls
     if mcp:
-        msg["basalt_mcp"] = mcp
+        msg["mcp"] = mcp
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
            "usage": last["usage"]}
@@ -2796,12 +2796,12 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
-            print(f"[basalt] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
+            print(f"[server] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
                   f"answers to (add it to \"allowed_hosts\" in the config, or set an API key)",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
-                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching basalt under this "
-                             f"name on purpose? Add it to \"allowed_hosts\" in the config (basalt-<model>.json), "
+                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching the server under this "
+                             f"name on purpose? Add it to \"allowed_hosts\" in the config (<model>.json), "
                              f"or set an API key (\"api_key\"), which turns this check off"}})
             return False
 
@@ -2814,7 +2814,7 @@ def make_handler(svc: Service):
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
-                print(f"[basalt] refused an API request from the web page {origin!r} (no API key; add its host to "
+                print(f"[server] refused an API request from the web page {origin!r} (no API key; add its host to "
                       f"\"allowed_hosts\" or its origin to \"cors_origins\" in the config)", flush=True)
                 self._json(403, {"error": {"type": "forbidden", "message":
                                  f"web pages of {origin} may not use this server without an API key; set \"api_key\", "
@@ -2849,7 +2849,7 @@ def make_handler(svc: Service):
                         cancel.set()
                         return
 
-            threading.Thread(target=watch, daemon=True, name="basalt-client-watch").start()
+            threading.Thread(target=watch, daemon=True, name="client-watch").start()
 
         def _note(self, **values):
             """What the monitor shows about this request (nothing when the monitor is off)."""
@@ -3043,7 +3043,7 @@ def make_handler(svc: Service):
                 return
             if path in ("/unload", "/load") and not self._control_body():
                 return
-            # JSON from basalt's own page only, as /settings: else a plain form POST from any site unloads the model
+            # JSON from the server's own page only, as /settings: else a plain form POST from any site unloads the model
             if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
@@ -3206,7 +3206,7 @@ def make_handler(svc: Service):
             origin = (self.headers.get("Origin") or "").rstrip("/")
             if origin and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
                     origin not in svc.trusted_origins:
-                self._json(403, {"error": {"message": f"{what} only from basalt's own page (or an origin in the "
+                self._json(403, {"error": {"message": f"{what} only from the server's own page (or an origin in the "
                                                       f"config's trusted_origins)"}})
                 return False
             return True
@@ -3223,7 +3223,7 @@ def make_handler(svc: Service):
             self._json(200, runconfig.view(cfg, svc.config_path))
 
         def _config_post(self):
-            """Change a few documented keys of the run config - JSON from basalt's own page only, as
+            """Change a few documented keys of the run config - JSON from the server's own page only, as
             /settings (the key is checked before); every other key of the file stays as it is."""
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             if not self._own_page("the run config can be changed"):
@@ -3245,7 +3245,7 @@ def make_handler(svc: Service):
                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be written: {e}"}})
                 return
             if changed:
-                print(f"[basalt] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
+                print(f"[server] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
 
@@ -3260,8 +3260,8 @@ def make_handler(svc: Service):
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            print("[basalt] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
-                  if shared else "[basalt] other apps use their own settings again", flush=True)
+            print("[server] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
+                  if shared else "[server] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
@@ -3316,11 +3316,11 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
             messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("basalt_mcp")):
+            if validator is not None and (tools or req.get("mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
-            use_mcp = req.get("basalt_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            use_mcp = req.get("mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # a second line of defence
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
@@ -3465,7 +3465,7 @@ def make_handler(svc: Service):
                                      "unsupported_parameter")
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
-                print(f"[basalt] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
+                print(f"[server] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
                       f"(this server cannot run them)", flush=True)
                 noted.update(skipped)
             if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
@@ -3557,7 +3557,7 @@ def warn_tight_ram(arena_mib) -> None:
         return
     left = total / 2**30 - arena_mib / 1024
     if left < 6:
-        print(f"[basalt] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
+        print(f"[server] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
               f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
               + "Linux may stop the engine in the middle of an answer. Close other programs.", flush=True)
 
@@ -3632,7 +3632,7 @@ def allowed_hosts_of(value) -> list[str]:
         dot = x.startswith(".")
         name = host_name(x[1:] if dot else x)
         if not name:
-            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like basalt.example.com")
+            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like host.example.com")
         out.append("." + name if dot else name)
     return list(dict.fromkeys(out))
 
@@ -3705,7 +3705,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
         return []
     items = [value] if isinstance(value, str) else value
     if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
-        raise SystemExit(f"[basalt] {key}: expected an origin or a list of origins")
+        raise SystemExit(f"[server] {key}: expected an origin or a list of origins")
     out = []
     for x in items:
         x = x.strip().rstrip("/")
@@ -3714,7 +3714,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
             continue
         scheme, sep, rest = x.partition("://")
         if scheme not in ("http", "https") or not sep or not rest or "/" in rest or "*" in rest:
-            raise SystemExit(f"[basalt] {key}: {x!r} is not an origin like https://chat.example.com"
+            raise SystemExit(f"[server] {key}: {x!r} is not an origin like https://chat.example.com"
                              + ("" if wildcard else " (no wildcards here)"))
         out.append(x)
     return out
@@ -3774,54 +3774,54 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "temperature":
             if not number or value < 0:
-                raise SystemExit(f"[basalt] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+                raise SystemExit(f"[server] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
             out[key] = float(value)
         elif key == "top_p":
             if not number or not 0 < value <= 1:
-                raise SystemExit(f"[basalt] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
+                raise SystemExit(f"[server] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
             out[key] = float(value)
         elif key == "min_p":
             if not number or not 0 <= value <= 1:
-                raise SystemExit(f"[basalt] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
+                raise SystemExit(f"[server] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
             if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[basalt] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+                raise SystemExit(f"[server] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[basalt] config sampling.presence_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[server] config sampling.presence_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "frequency_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[basalt] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[server] config sampling.frequency_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "repetition_penalty":
             if not number or value <= 0:
-                raise SystemExit(f"[basalt] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+                raise SystemExit(f"[server] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
             if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[basalt] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+                raise SystemExit(f"[server] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
             out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
-                raise SystemExit(f"[basalt] config sampling.seed={value!r}: expected a positive integer")
+                raise SystemExit(f"[server] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
-                raise SystemExit(f"[basalt] config sampling.experimental_speed_projection={value!r}: expected true or "
+                raise SystemExit(f"[server] config sampling.experimental_speed_projection={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
             out[key] = value
         else:
-            print(f"[basalt] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+            print(f"[server] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "basalt"], default="mock")
-    ap.add_argument("--config", help="basalt engine config (JSON: exe, args, cwd, tokenizer, model_name)")
+    ap.add_argument("--engine", choices=["mock", "engine"], default="mock")
+    ap.add_argument("--config", help="engine config (JSON: exe, args, cwd, tokenizer, model_name)")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -3870,16 +3870,16 @@ def main() -> int:
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
-        ap.error(f"port {a.port} is already in use - is basalt (or another server) already running? "
+        ap.error(f"port {a.port} is already in use - is the server (or another) already running? "
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "basalt" and not (tpath / "vocab.json").exists():
+    if a.engine == "engine" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'})")
     if (tpath / "vocab.json").exists():
-        import basalt_tokenizer as ST
+        import tokenizer as ST
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
@@ -3888,15 +3888,15 @@ def main() -> int:
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
-    if a.engine == "basalt":
+    if a.engine == "engine":
         if not cfg:
-            ap.error("--engine basalt needs --config")
+            ap.error("--engine engine needs --config")
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[basalt] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[server] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if lazy and cfg.get("vision"):
             ap.error("lazy loading is text-only; disable vision in the config")
@@ -3914,19 +3914,19 @@ def main() -> int:
             try:
                 split = layer_split_value(cfg)          # before the (minutes-long) start
             except ValueError as e:
-                raise SystemExit(f"[basalt] config {e}")
-            print(f"[basalt] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+                raise SystemExit(f"[server] config {e}")
+            print(f"[server] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
         # a relative "exe" is the config's cwd's
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
             silence = engine_silence_s(cfg)             # checked before the (minutes-long) start
         except ValueError as e:
-            raise SystemExit(f"[basalt] config {e}")
+            raise SystemExit(f"[server] config {e}")
         try:
             effort_end = effort_end_args(cfg, exe, tok)  # 8
         except ValueError as e:
-            raise SystemExit(f"[basalt] config {e}")
-        engine = BasaltEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+            raise SystemExit(f"[server] config {e}")
+        engine = ProcessEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
@@ -3943,13 +3943,13 @@ def main() -> int:
     try:
         svc.set_aliases(cfg.get("aliases"))             # other names the model answers to
     except ValueError as e:
-        raise SystemExit(f"[basalt] config {e}")
+        raise SystemExit(f"[server] config {e}")
     if svc.aliases:
-        print(f"[basalt] model aliases: {', '.join(svc.aliases)}", flush=True)
+        print(f"[server] model aliases: {', '.join(svc.aliases)}", flush=True)
     if any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(sys.argv)):
         # an empty key would switch authentication off without a word
-        print("[basalt] an API key was given but it is empty: set a key, or leave --api-key out", file=sys.stderr)
+        print("[server] an API key was given but it is empty: set a key, or leave --api-key out", file=sys.stderr)
         return 2
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
@@ -3957,17 +3957,17 @@ def main() -> int:
     try:
         svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"))
     except ValueError as e:
-        raise SystemExit(f"[basalt] config {e}")
+        raise SystemExit(f"[server] config {e}")
     if svc.allowed_hosts:
-        print("[basalt] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
-              else f"[basalt] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
+        print("[server] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
+              else f"[server] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
     if svc.api_monitor:
-        print("[basalt] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
+        print("[server] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
-        print(f"[basalt] CORS on /v1/* for {', '.join(svc.cors_origins)}"
+        print(f"[server] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
@@ -3976,11 +3976,11 @@ def main() -> int:
     svc.before_load = a.before_load or cfg.get("before_load") or None
     mode = str(cfg.get("anthropic_thinking") or "model")   # "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
-        raise SystemExit(f"[basalt] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
+        raise SystemExit(f"[server] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
-        raise SystemExit(f"[basalt] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
+        raise SystemExit(f"[server] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
     svc.effort_end = bool(effort_end)                   # "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # a default thinking budget for every request
@@ -3988,9 +3988,9 @@ def main() -> int:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
             budget = svc.reasoning_budget({})
         except ValueError as e:
-            raise SystemExit(f"[basalt] config {e}")
+            raise SystemExit(f"[server] config {e}")
         if budget:
-            print(f"[basalt] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
+            print(f"[server] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split
@@ -4001,17 +4001,17 @@ def main() -> int:
         try:
             svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
             if svc.shared:
-                print("[basalt] other apps use the Chat settings: " +
+                print("[server] other apps use the Chat settings: " +
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
     if hub is not None:
         import atexit
         svc.mcp = hub
-        print(f"[basalt] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
+        print(f"[server] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
-        atexit.register(hub.close)                      # the servers basalt started end with it
+        atexit.register(hub.close)                      # the servers it started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
@@ -4045,7 +4045,7 @@ def main() -> int:
         while True:
             time.sleep(1)                               # a timed wait keeps Ctrl+C deliverable
     except KeyboardInterrupt:
-        print("\n[basalt] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        print("\n[server] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
@@ -4054,7 +4054,7 @@ def main() -> int:
             except KeyboardInterrupt:                   # a second Ctrl+C: don't wait for the engine to free its memory
                 if getattr(engine, "proc", None):
                     engine.proc.kill()
-        print("[basalt] stopped", flush=True)
+        print("[server] stopped", flush=True)
     return 0
 
 

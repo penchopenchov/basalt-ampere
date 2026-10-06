@@ -1,4 +1,4 @@
-/* basalt web app - layout on top of tokens.css + components.css (the basalt UI kit). Colours, type, radii and
+/* web app - layout on top of tokens.css + components.css (the UI kit). Colours, type, radii and
    shadows come only from the kit's tokens. */
 [hidden] { display: none !important; }
 html, body { height: 100%; }

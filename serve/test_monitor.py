@@ -206,7 +206,7 @@ class ConversationCacheCard(unittest.TestCase):
         from serve.server import ConvCacheLog
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            log = Path(d) / "basalt.log"
+            log = Path(d) / "engine.log"
             log.write_text("an earlier run\n" + self.PARK, encoding="utf-8")
             start = log.stat().st_size                 # this run starts here: the earlier run's park is not counted
             c = ConvCacheLog()

@@ -1,6 +1,6 @@
 """serve/test_runconfig.py - the web page's Settings view of the run config (GET / POST /config), against the
 mock engine: only the listed keys change, every other key of the file stays, a bad value changes nothing, and only
-basalt's own page may write it (JSON, no foreign Origin, the API key when one is set).
+the server's own page may write it (JSON, no foreign Origin, the API key when one is set).
 
     python -m unittest serve.test_runconfig
 """
@@ -66,8 +66,8 @@ class Apply(unittest.TestCase):
             runconfig.apply({**CFG, "vision": {"gpu": True}}, {"lazy_load": True})
 
     def test_view(self):
-        v = runconfig.view({**CFG, "args": CFG["args"] + ["--vram-reserve-mib", "1500"]}, "x/basalt-q2_0.json")
-        self.assertEqual(v["file"], "basalt-q2_0.json")
+        v = runconfig.view({**CFG, "args": CFG["args"] + ["--vram-reserve-mib", "1500"]}, "x/q2_0.json")
+        self.assertEqual(v["file"], "q2_0.json")
         got = {k["key"]: k for k in v["keys"]}
         self.assertEqual(got["sampling.temperature"]["value"], 0.7)
         self.assertEqual(got["vram_reserve_mib"]["value"], 1500)
@@ -80,7 +80,7 @@ class Apply(unittest.TestCase):
 class Http(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
-        self.path = Path(self.dir.name) / "basalt-q2_0.json"
+        self.path = Path(self.dir.name) / "q2_0.json"
         self.path.write_text(json.dumps(CFG, indent=1), encoding="utf-8")
         tok = ByteTokenizer()
         self.svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -122,11 +122,11 @@ class Http(unittest.TestCase):
         self.assertIs(cfg["open_browser"], False)
         for k in ("mcp_servers", "cors_origins", "host", "args", "exe"):
             self.assertEqual(cfg[k], CFG[k], k)
-        self.assertEqual(json.loads((self.path.parent / "basalt-q2_0.json.bak").read_text(encoding="utf-8")), CFG)
+        self.assertEqual(json.loads((self.path.parent / "q2_0.json.bak").read_text(encoding="utf-8")), CFG)
         status, v = self.call("POST", {"set": {"open_browser": False}})   # no Origin (a script on this PC): allowed
         self.assertEqual((status, v["changed"]), (200, []))
 
-    def test_only_from_basalt_s_own_page(self):
+    def test_only_from_server_s_own_page(self):
         before = self.path.read_bytes()
         status, _ = self.call("POST", {"set": {"fit_max_tokens": True}}, {"Origin": "https://evil.example"})
         self.assertEqual(status, 403)
@@ -137,7 +137,7 @@ class Http(unittest.TestCase):
             status, b = self.call("POST", body, {"Origin": f"http://{self.host}"})
             self.assertEqual(status, 400, (body, b))
         self.assertEqual(self.path.read_bytes(), before)                 # nothing was written
-        self.assertFalse((self.path.parent / "basalt-q2_0.json.bak").exists())
+        self.assertFalse((self.path.parent / "q2_0.json.bak").exists())
 
     def test_the_api_key(self):
         self.svc.api_key = "secret"

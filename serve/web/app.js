@@ -1,4 +1,4 @@
-// serve/web/app.js - the basalt web app: Chat, Monitor, About. No framework, no network beyond this server.
+// serve/web/app.js - the web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab: a dashboard on the server's own /metrics.
 "use strict";
 
@@ -13,8 +13,8 @@ const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB
 
 const store = {
-  get(k, d) { try { const v = localStorage.getItem("basalt." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem("basalt." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+  get(k, d) { try { const v = localStorage.getItem("app." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem("app." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
 };
 
 // ------------------------------------------------------------------ toasts
@@ -57,7 +57,7 @@ async function copyText(text, btn) {
 // the system's theme until the user picks one (only a click is saved)
 function setTheme(t, save) {
   document.documentElement.dataset.theme = t;
-  if (save) try { localStorage.setItem("basalt.theme", t); } catch (e) { /* ignore */ }
+  if (save) try { localStorage.setItem("app.theme", t); } catch (e) { /* ignore */ }
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
   $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
 }
@@ -67,7 +67,7 @@ $("dark-toggle").onclick = flipTheme;
 setTheme(document.documentElement.dataset.theme || "light", false);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   let saved = null;
-  try { saved = localStorage.getItem("basalt.theme"); } catch (err) { /* ignore */ }
+  try { saved = localStorage.getItem("app.theme"); } catch (err) { /* ignore */ }
   if (!saved) setTheme(e.matches ? "dark" : "light", false);
 });
 
@@ -96,7 +96,7 @@ function headers(json = false) {
 $("api-key").value = store.get("apikey", "");
 $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
 
-let health = {model: "basalt", images: false, max_context: 0};
+let health = {model: "model", images: false, max_context: 0};
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
@@ -398,7 +398,7 @@ $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (las
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
-// "basalt_mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
+// "mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
 let mcpInfo = {servers: [], tools: 0}, mcpRetry = null;
 async function loadMcp() {
   try {
@@ -432,7 +432,7 @@ function renderMcp() {
 }
 
 // ------------------------------------------------------------------ Model settings (GET / POST /config)
-// A few documented keys of the run config (basalt-<model>.json), for every client, from the next start on.  The
+// A few documented keys of the run config (<model>.json), for every client, from the next start on.  The
 // server lists them, checks every value and keeps every other key of the file as it is.
 let cfgKeys = [];
 async function loadConfig() {
@@ -644,7 +644,7 @@ function answerHtml(m) {
   });
   return html + markdown(m.text.slice(pos));
 }
-// a tool event from the stream (the `basalt_mcp` field of a chunk)
+// a tool event from the stream (the `mcp` field of a chunk)
 function onTool(m, x) {
   if (x.event === "limit") { m.limit = x.max_rounds; return; }
   m.tools = m.tools || [];
@@ -785,7 +785,7 @@ async function send() {
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-  if (settings.mcp !== false && mcpInfo.tools > 0) body.basalt_mcp = true;   // this server may run MCP tools for it
+  if (settings.mcp !== false && mcpInfo.tools > 0) body.mcp = true;   // this server may run MCP tools for it
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -815,7 +815,7 @@ async function send() {
         try { j = JSON.parse(data); } catch (e) { continue; }
         if (j.error) throw new Error(j.error.message || "the engine reported an error");
         if (j.usage) usage = j.usage;
-        if (j.basalt_mcp) onTool(m, j.basalt_mcp);
+        if (j.mcp) onTool(m, j.mcp);
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
         if (d.reasoning_content) {
@@ -884,7 +884,7 @@ $("export-btn").onclick = () => {
     `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
-  a.download = `basalt-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
+  a.download = `chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 };
