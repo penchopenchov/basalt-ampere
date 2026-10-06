@@ -24,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from gguf_reader import GGUFFile  # noqa: E402
-from model_file import MAX_SECTIONS, ModelWriter  # noqa: E402
+from model_file import TENSOR_ALIGN, ModelWriter  # noqa: E402
 
 EXPERT_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.weight$")
 FINGERPRINT_BYTES = 64 << 20
@@ -221,16 +221,6 @@ def convert(a) -> None:
         else:
             vision_extra = list(fn(str(a.mmproj), [str(p) for p in natives]))
 
-    fixed = 1 + len(tok_files) + 2 + 2 + 4 + 1 + 1 + (0 if a.no_vision else 1) + len(vision_extra)
-    room = MAX_SECTIONS - fixed
-    if len(tensors) > room:
-        keep = [t for t in tensors if not t[0].startswith("blk.")]
-        print(f"note: the container holds {MAX_SECTIONS} sections; {len(tensors)} non-expert GGUF tensors do not "
-              f"fit beside the other {fixed}, so only the {len(keep)} tensors outside blk.* are stored as gguf/...")
-        tensors = keep
-        if len(tensors) > room:
-            die(f"{len(tensors)} gguf/... sections still do not fit in the {room} free table slots")
-
     if out.parent and not out.parent.exists():
         die(f"{out.parent} does not exist")
     if partial.exists():
@@ -250,8 +240,10 @@ def convert(a) -> None:
         lay = rewrite_layout_header((pack / "native_experts.txt").read_bytes())
         check_unbranded("experts.layout header", lay.split(b"\n", 1)[0])
         job.bytes("experts.layout", lay)
-        for name, src, off, size, _ in tensors:
-            job.file(f"gguf/{name}", src, off, size)
+        t = time.time()
+        offs = w.add_parts("gguf", [(src, off, size) for _, src, off, size, _ in tensors], TENSOR_ALIGN)
+        job._report("gguf", w.entries[-1][2], time.time() - t)
+        tensor_offsets = dict(zip((x[0] for x in tensors), offs))
         job.file("mtp/dense", mtp / "dense.bin")
         job.bytes("mtp/dense.index", rewrite_mtp_index((mtp / "dense.txt").read_bytes()))
         job.file("mtp/experts", mtp / "experts.bin")
@@ -277,7 +269,8 @@ def convert(a) -> None:
             "converter": {"tool": "tools/convert.py", "git": git_rev()},
             "sources": sources,
             "gguf_kv": kv,
-            "tensors": {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape], "bytes": nb}
+            "tensors": {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape], "bytes": nb,
+                            "offset": tensor_offsets[n]}
                         for n, _, _, nb, t in tensors},
             "engine_args": ENGINE_ARGS, "sampling": SAMPLING, "license": LICENSE,
             "profile": prof,

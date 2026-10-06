@@ -72,6 +72,41 @@ class ModelWriter:
                 n += len(b)
         self.entries.append((name, off, n, h.digest()))
 
+    def add_parts(self, name: str, parts, align: int = TENSOR_ALIGN) -> list[int]:
+        """One section of several parts, each starting at a multiple of `align` within it (zero padding between).
+        A part is bytes or (src_path, offset, size).  Returns each part's offset in the section; the hash covers
+        the whole section."""
+        off = self._start(name)
+        h = hashlib.sha256()
+        pos, offsets = 0, []
+
+        def put(b: bytes) -> None:
+            nonlocal pos
+            h.update(b)
+            self.f.write(b)
+            pos += len(b)
+
+        for part in parts:
+            pad = (-pos) % align
+            if pad:
+                put(b"\0" * pad)
+            offsets.append(pos)
+            if isinstance(part, (bytes, bytearray)):
+                put(bytes(part))
+                continue
+            src, o, size = part
+            left = size
+            with open(src, "rb") as s:
+                s.seek(o)
+                while left > 0:
+                    b = s.read(min(COPY_CHUNK, left))
+                    if not b:
+                        raise IOError(f"{src}: short read")
+                    put(b)
+                    left -= len(b)
+        self.entries.append((name, off, pos, h.digest()))
+        return offsets
+
     def close(self) -> None:
         end = self.f.tell()
         self.f.seek(0)

@@ -90,14 +90,14 @@ class ConvertTest(unittest.TestCase):
         convert.convert(self.args())
         m = ModelFile(str(self.t / "out.basalt"))
         self.assertFalse((self.t / "out.basalt.partial").exists())
+        a, b_ = self.a.astype("<f4").tobytes(), self.b.astype("<f4").tobytes()
         want = {"dense": self.dense, "experts": self.experts, "hc8": self.hc8, "vision/mmproj": self.mmproj,
                 "profile": self.profile[4:], "mtp/dense": self.mtp["dense.bin"],
                 "mtp/experts": self.mtp["experts.bin"], "mtp/draft_vocab": self.mtp["draft_vocab.bin"],
                 "mtp/dense.index": MTP_INDEX,
                 "dense.index": b"# dense index v3\nblk.0.attn_q 0 16\nblk.0.attn_k 16 16\n",
                 "experts.layout": LAYOUT.replace(b"# strata native experts v3", b"# experts v3"),
-                "gguf/token_embd.weight": self.a.astype("<f4").tobytes(),
-                "gguf/output_norm.weight": self.b.astype("<f4").tobytes()}
+                "gguf": a + b"\0" * (4096 - len(a)) + b_}
         for k, v in self.tok.items():
             want["tokenizer/" + k] = v
         self.assertEqual(set(m.names()), set(want) | {"meta"})
@@ -105,7 +105,7 @@ class ConvertTest(unittest.TestCase):
             self.assertEqual(m.read(k), v, k)
         for k in m.names():
             self.assertTrue(m.verify(k), k)
-        self.assertNotIn("gguf/blk.0.ffn_gate_exps.weight", m.names())
+        self.assertNotIn(b"ffn_gate_exps", m.read("meta").split(b'"tensors"')[1].split(b'"engine_args"')[0])
         for k in ("dense.index", "experts.layout", "mtp/dense.index", "profile"):
             self.assertNotIn(b"strata", m.read(k).lower(), k)
         meta = json.loads(m.read("meta"))
@@ -122,7 +122,8 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(meta["gguf_kv"]["qwen.rope.freqs"], [0.5, 1.5])
         self.assertEqual(meta["gguf_kv"]["qwen.nan"], "inf")
         self.assertEqual(meta["tensors"]["token_embd.weight"],
-                         {"type": "F32", "type_id": 0, "shape": [3, 8], "bytes": 96})
+                         {"type": "F32", "type_id": 0, "shape": [3, 8], "bytes": 96, "offset": 0})
+        self.assertEqual(meta["tensors"]["output_norm.weight"]["offset"], 4096)
         self.assertEqual(set(meta["tensors"]), {"token_embd.weight", "output_norm.weight"})
         self.assertEqual(meta["profile"]["n_pairs"], 6)
         self.assertEqual(meta["hc8"], {"bytes": 123})
