@@ -1364,15 +1364,11 @@ __global__ void __launch_bounds__(256, 2) native_iq4_xs_mma_kernel(const IQ4XSBl
 #endif
 }
 
-// STRATA_MMVQ_MMA=1: ncols > 1 IQ4_XS in exact mode on native_iq4_xs_mma_kernel where the device runs it (the same
-// bits).  native_mmvq_set_mma overrides it (tests).
-bool g_mmvq_mma = [] {
-    const char* v = std::getenv("STRATA_MMVQ_MMA");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
-}();
-// STRATA_MMVQ_MMA_MIN_T: the fewest columns that take it (one more where the projection narrows its input); below,
-// the dp4a kernel is faster
-int g_mmvq_mma_min_t = [] { const char* v = std::getenv("STRATA_MMVQ_MMA_MIN_T"); return v ? std::atoi(v) : 4; }();
+// ncols > 1 IQ4_XS in exact mode on native_iq4_xs_mma_kernel where the device runs it (the same bits);
+// native_mmvq_set_mma turns it on for tests.
+bool g_mmvq_mma = false;
+// the fewest columns that take it (one more where the projection narrows its input)
+int g_mmvq_mma_min_t = 4;
 std::atomic<long> g_mmvq_mma_launches{0};
 // The current device's SM count if it runs native_iq4_xs_mma_kernel (sm_80+, the card's or STRATA_EMULATE_CC's, with
 // sm_80+ device code in this build), else 0; per device

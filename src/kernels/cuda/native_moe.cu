@@ -166,10 +166,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     if (shared) { sx += h.x; sy += h.y; sz += h.z; sw += h.w; }
     *reinterpret_cast<float4*>(output + tk * n_embd + col) = make_float4(sx, sy, sz, sw);
 }
-bool dm_combine4_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_DEC_GLUE"); return e && (std::atoi(e) & 4); }();
-    return on;
-}
+constexpr bool dm_combine4_on() { return true; }
 }  // namespace
 
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,

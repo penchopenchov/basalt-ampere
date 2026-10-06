@@ -491,25 +491,12 @@ std::atomic<int> g_last_path{-1};
 bool old_kernels() {
     const int s = g_select_old.load(std::memory_order_relaxed);
     if (s >= 0) return s != 0;
-    static const bool env = [] {
-        const char* e = std::getenv("STRATA_OLD_GROUPED");
-        return e != nullptr && e[0] == '1';
-    }();
-    return env;
+    return false;
 }
 
-// `STRATA_GROUPED_PAIR_MIN_HITS=N`: the per-hit path keeps the previous one-warp-per-row kernels below N hits of
-// capacity.  The new per-hit kernels launch half the warps (two rows each), so one hit's gate/up is 80 blocks - fewer
-// than an RTX 5090's SMs - and whether that costs time at one to three hits is what `--bench` measures.  Bitwise
-// the same either way; default 0 (always the new kernels).  Ignored while `moe_grouped_select_old` forces a choice.
-long long pair_min_hits() {
-    if (g_select_old.load(std::memory_order_relaxed) >= 0) return 0;
-    static const long long n = [] {
-        const char* e = std::getenv("STRATA_GROUPED_PAIR_MIN_HITS");
-        return e != nullptr ? std::atoll(e) : 0LL;
-    }();
-    return n;
-}
+// The per-hit path always takes the new kernels (two rows a warp); the previous one-warp-per-row kernels stay for
+// `moe_grouped_select_old` (tests).
+long long pair_min_hits() { return 0; }
 
 // The new kernels read the activations as aligned words (`load_x_chunk`), so they need 4-byte aligned activation
 // rows - the input's and the intermediate's in `scratch`; the per-hit ones also read a blob's codes as uint2, which

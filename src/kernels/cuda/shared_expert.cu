@@ -176,13 +176,7 @@ __global__ void sigmoid_scale_rows_kernel(float* __restrict__ out, const float* 
     }
 }
 
-bool fused_swiglu_q81_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_FUSED_SWIGLU_Q81");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
-    return on;
-}
+constexpr bool fused_swiglu_q81_enabled() { return true; }
 }  // namespace
 
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
@@ -206,8 +200,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
-    static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), fused sigmoid+scale
+    if (native_bf16 && n_tok > 1) {   // one gemv for all rows (outputs identical), fused sigmoid+scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
         sigmoid_scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok), THREADS, 0, cs>>>(
             out, g, (int) n_embd);

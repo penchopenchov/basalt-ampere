@@ -2187,30 +2187,22 @@ int d_qk(int t) {
     }
 }
 
-bool env_on(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
-}
-// STRATA_OLD_IQ_MMVQ=1 keeps the per-column kernels (bitwise equal to the new ones; kept for A/B timing)
-bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
-// STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
-bool g_stage_grid = [] {
-    const char* v = std::getenv("STRATA_IQ_STAGE_GRID");
-    return v == nullptr || v[0] == '\0' || v[0] != '0';
-}();
-// STRATA_IQ_NC6=1: five or six columns in one pass of six rather than of eight (the same bits)
-bool g_nc6 = env_on("STRATA_IQ_NC6");
-// STRATA_GU_STAGE=1: the grouped gate/up kernel reads the group's activations from shared memory (the same bits)
-bool g_gu_stage = env_on("STRATA_GU_STAGE");
-// STRATA_DEC_GU2=1: the grid formats' gate/up rows two a warp (native_gu2_kernel); 2: also the SwiGLU pass inside
-// the down kernel (native_down2_kernel).  The same bits.
-int g_gu2 = [] { const char* v = std::getenv("STRATA_DEC_GU2"); return v ? std::atoi(v) : 0; }();
-// STRATA_DEC_GY (with STRATA_DEC_GU2=2; default 24): the most block rows a grouped call launches when its caller
-// leaves grid_groups to it (more groups take the stride; the same bits)
-int g_dec_gy = [] { const char* v = std::getenv("STRATA_DEC_GY"); return v ? std::atoi(v) : 24; }();
-// STRATA_GU_MMA=1: IQ3_XXS gate/up on int8 tensor cores, sm_80+ (the same bits; not with STRATA_GROUPED_V1); =2:
-// only for the calls whose caller asks (native_grouped_set_mma_hint), e.g. windows of several entries per expert
-int g_gu_mma = [] { const char* v = std::getenv("STRATA_GU_MMA"); return v ? std::atoi(v) : 0; }();
+// The per-column kernels instead of the ones that decode a weight part once for every column (the same bits; tests)
+bool g_old_kernels = false;
+// 64-bit i-quant codebook tables staged into shared memory
+constexpr bool g_stage_grid = true;
+// five or six columns in one pass of six rather than of eight (the same bits)
+constexpr bool g_nc6 = true;
+// the grouped gate/up kernel reads the group's activations from global memory (the same bits as staging them)
+constexpr bool g_gu_stage = false;
+// the grid formats' gate/up rows two a warp (native_gu2_kernel), and the SwiGLU pass inside the down kernel
+// (native_down2_kernel); native_grouped_set_gu2 sets it for tests.  The same bits.
+int g_gu2 = 2;
+// the most block rows a grouped call launches when its caller leaves grid_groups to it (more groups take the stride;
+// the same bits)
+constexpr int g_dec_gy = 24;
+// IQ3_XXS gate/up on int8 tensor cores (1), or only for the calls whose caller asks (2): off (0)
+constexpr int g_gu_mma = 0;
 thread_local int t_gu_mma_hint = 0;
 // Whether native_gu_mma_kernel runs on the current device at L's shapes: sm_80+ (the card's, or STRATA_EMULATE_CC's)
 // with sm_80+ device code in this build, n_embd in whole chunks (rows 4-byte aligned), the shared memory without opt-in
@@ -2230,11 +2222,11 @@ bool gu_mma_usable(const NativeExpertLayout& L) {
     }
     return ok[dev] == 1;
 }
-// STRATA_MMVQ_MMA=1: iq_mmvq's IQ3_S calls of 2..8 columns with n_in % 512 == 0 on mmvq_iq3s_mma_kernel where the
-// device runs it (the same bits; not with STRATA_OLD_IQ_MMVQ).  iq_set_mmvq_mma overrides it (tests).
-bool g_mmvq_mma = env_on("STRATA_MMVQ_MMA");
-// STRATA_MMVQ_MMA_MIN_T: as native_mmvq's (the fewest columns that take it)
-int g_mmvq_mma_min_t = [] { const char* v = std::getenv("STRATA_MMVQ_MMA_MIN_T"); return v ? std::atoi(v) : 4; }();
+// iq_mmvq's IQ3_S calls of 2..8 columns with n_in % 512 == 0 on mmvq_iq3s_mma_kernel where the device runs it (the
+// same bits); iq_set_mmvq_mma turns it on for tests.
+bool g_mmvq_mma = false;
+// the fewest columns that take it
+int g_mmvq_mma_min_t = 4;
 std::atomic<long> g_mmvq_mma_launches{0};
 // The current device's SM count if it runs mmvq_iq3s_mma_kernel (sm_80+, the card's or STRATA_EMULATE_CC's, with
 // sm_80+ device code in this build), else 0; per device
@@ -2255,13 +2247,9 @@ int mmvq_mma_sms() {
     }
     return known[dev] > 0 ? known[dev] : 0;
 }
-// The single-matrix mmvq (128-thread blocks, one per 4 rows) pays the 2-8 KB staging per block: on the RTX 5070 its
-// IQ2_XS / IQ2_S / IQ1_M calls were 10-20% slower staged at 3-8 columns (iq_multi_parity --bench), while the grouped
-// expert kernels gain.  So mmvq stages only with STRATA_IQ_STAGE_GRID_MMVQ=1 (bitwise the same either way).
-bool g_stage_grid_mmvq = g_stage_grid && [] {
-    const char* v = std::getenv("STRATA_IQ_STAGE_GRID_MMVQ");
-    return v != nullptr && v[0] == '1';
-}();
+// The single-matrix mmvq (128-thread blocks, one per 4 rows) does not stage the tables: the 2-8 KB per block cost
+// more than it saved there, while the grouped expert kernels gain (bitwise the same either way).
+constexpr bool g_stage_grid_mmvq = false;
 
 template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
@@ -2491,7 +2479,7 @@ void native_expert_set_mode(int mode, int phase) {
 }
 
 namespace {
-bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
+bool g_grouped_v1 = false;
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }

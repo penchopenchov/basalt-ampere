@@ -1210,8 +1210,6 @@ int dm_vram_tma_blocks() {
             cudaGetLastError();
             per = 0;
         }
-        const char* v = std::getenv("STRATA_DEC_MOE_TMA_PER_SM");
-        if (v != nullptr && std::atoi(v) > 0) per = std::min(per, std::atoi(v));
         known[dev] = per > 0 ? sms * per : -1;
     }
     return known[dev];
@@ -1229,8 +1227,6 @@ int dm_vram_blocks() {
             cudaGetLastError();
             per = 0;
         }
-        const char* v = std::getenv("STRATA_DEC_MOE_VRAM_PER_SM");
-        if (v != nullptr && std::atoi(v) > 0) per = std::min(per, std::atoi(v));
         known[dev] = per > 0 ? sms * per : -1;
     }
     return known[dev];
@@ -1554,9 +1550,8 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratc
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const int gy = g_dec_gy > 0 ? std::min(cap, g_dec_gy) : cap;
     const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * gy;
-    static const int blocks_env = [] { const char* v = std::getenv("STRATA_DEC_GLUE_BLOCKS"); return v ? std::atoi(v) : 0; }();
     auto go = [&](auto kernel, int resident) {
-        const int nb = std::max(1, std::min(items, blocks_env > 0 ? blocks_env : resident)) + (a.ring_on ? 1 : 0);
+        const int nb = std::max(1, std::min(items, resident)) + (a.ring_on ? 1 : 0);
         launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, gy);
     };
     switch (L.gu_type) {
@@ -1709,8 +1704,7 @@ int dec_moe_peer_blocks(bool q2) {
 
 bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2) {
     DmPeerArgs args = a;
-    static const int gu2_env = [] { const char* v = std::getenv("STRATA_DEC_GU2"); return v ? std::atoi(v) : 0; }();
-    if (gu2_env > 0) args.gu2 = 1;
+    args.gu2 = 1;
     void* params[] = {&args};
     const cudaError_t e = cudaLaunchCooperativeKernel((const void*) (q2 ? dm_peer_kernel<true> : dm_peer_kernel<false>),
                                                       dim3((unsigned) blocks),
