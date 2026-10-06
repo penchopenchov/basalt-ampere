@@ -166,11 +166,11 @@ struct Options {
     int64_t logits_stride = 1;        // storage selection; all prompt tokens remain conditioned
     /// **THE RESIDUAL, SO THE HEAD CAN BE CHECKED WITHOUT THE LAYERS.**
     ///
-    /// C1 fails (LEDGER L116) and the pipeline is `embed -> 48 layers -> head`.  Dumping `R` splits it in half:
-    /// the head is one norm, two bf16 projections and one 794 MB GEMV, all of which can be recomputed in Python
-    /// from the manifest.  If Python agrees with the engine on the same `R`, the head is right and the layers
-    /// are wrong; if it disagrees, the head is wrong.  Nothing else in the engine can be split that cheaply.
-    bool stream_token = false;        // R2.6 experiment: ordered work on the session stream
+    /// The pipeline is `embed -> 48 layers -> head`.  Dumping `R` splits it in half: the head is one norm, two
+    /// bf16 projections and one large GEMV, all of which can be recomputed in Python from the manifest.  If Python
+    /// agrees with the engine on the same `R`, the head is right and the layers are wrong; if it disagrees, the
+    /// head is wrong.  Nothing else in the engine can be split that cheaply.
+    bool stream_token = false;        // experiment: ordered work on the session stream
     bool check_logits = false;        // optional full-vocabulary finite scan
     bool gr_fp32_activations = false;  // pinned CUDA single-token BF16 activation contract
     bool gr_native_mmvf = false;       // pinned projection reduction tree as well as FP32 inputs
@@ -212,10 +212,10 @@ struct Options {
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
-    /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
+    /// bf16 projections and the stream mean) recompute cheaply in Python, and only the large GEMV does not.
     std::string dump_mixed;
     /// One residual snapshot per layer per position: `n_layers * hc * n_embd` floats per position, appended in
-    /// position order.  This is the C1 BISECTION LADDER - it is what `llama-debug --tensor-filter l_last` prints
+    /// position order.  This is the BISECTION LADDER - it is what `llama-debug --tensor-filter l_last` prints
     /// for the reference, so the first layer whose `sum` diverges is the layer that holds the bug.  It needs the
     /// captured path (the expert pool only exists there), so it is refused with `--no-capture`.
     std::string dump_layers;
@@ -237,19 +237,18 @@ struct Options {
     /// time per token.  This is the only measurement that separates host-bound from GPU-bound, because the
     /// stage events include every gap where the GPU waited for the host.
     bool graph_only = false;
-    bool gpu_only_full = false;   ///< R0.3: pre + post + head, the true per-token GPU floor
-    int pool_workers = 0;         ///< R2.2: 0 = "all physical cores minus the host's"; >0 overrides
+    bool gpu_only_full = false;   ///< pre + post + head, the true per-token GPU floor
+    int pool_workers = 0;         ///< 0 = "all physical cores minus the host's"; >0 overrides
     /// The pool's core layout; `all` (the default) uses every core, auto / p-cores are opt-in
     basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::All;
-    /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
-    /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
-    /// is reserved for a host thread that has nothing to do while the drain runs.
+    /// The A/B arm of the host thread joining the pool's drain.  **ON by default**, because the sixth core is
+    /// otherwise reserved for a host thread that has nothing to do while the drain runs.
     bool no_host_worker = false;
     bool coupled_draft = basalt::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
-    bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
-    std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
+    bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping
+    std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
-    /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
+    /// `--resident-experts` (the low-RAM resident mode): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), 4 GiB of RAM headroom, and plain mmap
     /// (with a warning) when even the experts no slot holds do not fit.
     bool resident_pin = false;
@@ -269,11 +268,9 @@ struct Options {
     bool remote_expert_opt = false; ///< optional optimization of the existing remote-expert decode path
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
     bool expert_cache_cpu_order = false;
-    /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
-    /// The default policy hands out slots in arrival order from one counter shared by all 48 layers, so the
-    /// first `n_slots` distinct pairs - about 26 LAYERS OF POSITION 0 - take every slot and hits are confined
-    /// to them.  Measured at 256 slots: **1781 of 60000 = 2.97%**, against **21.4%** for 8 slots per layer and
-    /// **70.4%** for 64, from `Memory/cache_allocation.py` on the same run's routing.  Off by default.
+    /// **GIVE EACH LAYER ITS OWN SLOTS.**  The default policy hands out slots in arrival order from one counter
+    /// shared by all 48 layers, so the first `n_slots` distinct pairs - about 26 LAYERS OF POSITION 0 - take every
+    /// slot and hits are confined to them.  Off by default.
     bool expert_cache_per_layer = false;
     /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
@@ -296,11 +293,10 @@ struct Options {
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
     std::string expert_profile_save;
     double expert_profile_save_min = 10.0;
-    /// R4.2d: **ON by default**, because the measurement is unambiguous and the alternative is known-broken.
-    /// Without it, 17 of 10,562 layers had the hit work done when the pool returned; with it, 9,190.  The
-    /// A/B arm is `--no-hit-poke`.
+    /// **ON by default**: without it the hit work is rarely done by the time the pool returns.  The A/B arm is
+    /// `--no-hit-poke`.
     bool no_hit_poke = false;
-    /// R0.9: capture each layer as THREE graphs and time them from outside the capture, which is the only
+    /// Capture each layer as THREE graphs and time them from outside the capture, which is the only
     /// valid way to get a per-stage table on the real graph.  Prints and exits; it is a measurement, not a run.
     bool gpu_stages = false;
     bool stats = false;
@@ -517,17 +513,17 @@ void usage() {
                  "                       basalt/core/model_file.hpp; the converter stores it as the `hc8` section), exit\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
-                 "  --ple-io direct|mmap|ram  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD\n"
+                 "  --ple-io direct|mmap|ram  n-gram table reads. direct (default): unbuffered SSD\n"
                  "                       reads, the table never enters RAM or the file cache; mmap: A/B arm;\n"
                  "                       ram: mmap with the whole table locked in RAM at start (Linux/macOS)\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
-                 "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
-                 "                       VRAM; default fp16 until gate G-C accepts int8\n"
+                 "  --kv fp16|int8       KV storage: int8 codes + fp16 scale per 64 values, half the\n"
+                 "                       VRAM; default fp16\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation: half of int8's memory,\n"
-                 "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
+                 "                       slightly lower precision\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); not with --kv-resident\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
@@ -569,7 +565,7 @@ void usage() {
                  "  --dump-logits PATH   write one line of raw logits per position\n"
                  "  --logits-stride N    store every Nth row plus final input (default 1); N>1 requires --max-new 1\n"
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
-                 "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
+                 "  --dump-layers PATH   write R after EVERY layer, per position: the bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
@@ -612,7 +608,7 @@ void usage() {
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
                  "                       event interval includes host gaps, so run with --gpu-only-full first\n"
                  "  --graph-only         MEASURE: replay the 48 `pre` graphs only.  OMITS the 48 `post` graphs\n"
-                 "                       and the LM head, so it is NOT the GPU floor (R0.3, Memory/ERRORS.md A4)\n"
+                 "                       and the LM head, so it is NOT the GPU floor\n"
                  "  --gpu-only-full      MEASURE: replay pre+post for all 48 layers plus the LM head, no pool.\n"
                  "                       THE TRUE PER-TOKEN GPU FLOOR.  Quote this one, not --graph-only.\n"
                  "  --stats              print the per-stage breakdown\n"
@@ -622,22 +618,20 @@ void usage() {
                  "  --draft-log FILE     one line per decode window for draft-policy study\n"
                  "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
                  "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
-                 "  --gpu-stages         R0.9: capture the layer as three graphs (mixer / ffn+router / post)\n"
+                 "  --gpu-stages         capture the layer as three graphs (mixer / ffn+router / post)\n"
                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
                  "  --expert-profile-save P  --serve: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
                  "                       0 = on QUIT only) between requests; tools/convert.py --profile reads it\n"
-                 "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
+                 "  --no-hit-poke        A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
                  "  --no-ple-prefetch     A/B arm: read the PLE table's sixteen rows one at a time, instead of\n"
-                 "                       issuing them in one PrefetchVirtualMemory call.\n"
-                 "  --expert-cache N     R4: keep N expert blobs resident in VRAM and compute their rows on the\n"
-                 "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
-                 "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
-                 "                       ms/token, -2.7 ms/token end to end.\n"
+                 "                       issuing them in one prefetch.\n"
+                 "  --expert-cache N     keep N expert blobs resident in VRAM and compute their rows on the\n"
+                 "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.\n"
                  "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
@@ -652,33 +646,31 @@ void usage() {
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
-                 "  --expert-cache-per-layer  R4.2g: give each layer its OWN slots instead of letting the first\n"
+                 "  --expert-cache-per-layer  give each layer its OWN slots instead of letting the first\n"
                  "                       position take all of them.  The default policy fills in arrival order\n"
-                 "                       from one shared counter, so 256 slots went to ~26 layers of position 0\n"
-                 "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
-                 "                       slots/layer and 70.4%% at 64.\n"
-                 "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
+                 "                       from one shared counter, so a small cache goes to a few layers of\n"
+                 "                       position 0.\n"
+                 "  --no-host-worker     the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
-                 "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
+                 "  --pool-workers N     CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on (with --pool-affinity auto or\n"
-                 "                       p-cores on a hybrid CPU: P-cores minus 1).  A sweep is how the pool's\n"
-                 "                       deviation from `cpu_s2` is attributed.\n"
+                 "                       p-cores on a hybrid CPU: P-cores minus 1).  \n"
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
                  "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
                  "  --coupled-draft      enable coupled draft sampling for MTP drafter under sampling\n"
                  "  --no-coupled-draft   disable coupled draft sampling (propose argmax drafts)\n"
-                 "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
+                 "  --mmap-experts       opt OUT of the resident expert arena, back to a file mapping.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
-                 "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n"
-                 "  --shared-expert-arena FILE  Linux: back the resident arena with one MAP_SHARED file.\n"
+                 "                       the experts, so cold and warm runs differ.\n"
+                 "  --shared-expert-arena FILE  back the resident arena with one MAP_SHARED file.\n"
                  "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
-                 "                       A small header binds an existing backing file to the same pack.\n"
+                 "                       A small header binds an existing backing file to the same model.\n"
                  "  --resident-cpu-experts  with mmap and a static profile, keep the experts the GPU cache does not\n"
                  "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
-                 "  --resident-experts   the low-RAM PC's resident mode (setup): --mmap-experts --resident-cpu-experts\n"
+                 "  --resident-experts   the low-RAM resident mode: --mmap-experts --resident-cpu-experts\n"
                  "                       with the copy page-locked when possible, 4 GiB headroom, plain mmap if it\n"
                  "                       does not fit.  Same answers as --mmap-experts for the same placement.\n");
 }
@@ -726,12 +718,10 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
     // advanced by the adapter as it consumes the blob, and reading it after the call is the same value the
     // dispatch used.  Record = int32 layer, int32 k, k int32 ids, k float weights.
     if (t->routing != nullptr) {
-        // **`d.layers` HAS ALREADY BEEN ADVANCED BY THE TIME THIS RUNS, AND THE FIRST TRACE WAS OFF BY ONE
-        // BECAUSE OF IT.**  The adapter walks the blob by incrementing `d.layers` as it consumes each layer's
-        // experts, so after the dispatch it holds the NEXT layer's index.  `tools/make_profile.py` caught it
-        // with a bounds check when the trace turned out to span 1..48 instead of 0..47.  The hit-rate CURVE was
-        // unaffected - it is a per-layer split, and shifting every layer by one preserves both metrics - but
-        // anything keyed on the layer index, which is exactly what a cache profile is, would have been wrong.
+        // **`d.layers` HAS ALREADY BEEN ADVANCED BY THE TIME THIS RUNS.**  The adapter walks the blob by incrementing `d.layers` as it consumes each layer's
+        // experts, so after the dispatch it holds the NEXT layer's index.  The index is therefore
+        // one past the layer (a trace spanning 1..48 instead of 0..47 is the symptom), and anything keyed on
+        // the layer index, which is exactly what a cache profile is, would be wrong.
         const int32_t layer_idx = (int32_t) (t->d.layers - 1);
         if (layer_idx < 0 || layer_idx >= 48) {
             std::fprintf(stderr, "basalt generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
@@ -1516,7 +1506,7 @@ int main(int argc, char** argv) {
                                o.expert_cache_remote[2] > 0;
     if (o.resident_cpu_experts && !o.layer_split.empty() && !remote_caches && o.resident_soft &&
         !o.resident_cpu_explicit && o.resident_budget == 0) {
-        // setup's --resident-experts with a layer split (--gpus at start, or a config edited by hand) runs as the plain
+        // --resident-experts with a layer split runs as the plain
         // mmap mode instead of refusing.  Exactly --mmap-experts: nothing else reads these flags (the headroom only
         // sizes the copy).
         std::fprintf(stderr, "basalt generate: WARNING: the resident RAM mode (--resident-experts) does not support a "
@@ -2177,8 +2167,7 @@ int main(int argc, char** argv) {
 
     // ================================ THE PLE ================================
     //
-    // **ITS ABSENCE IS WHY GATE C1 FAILED** (LEDGER L123): layer 1 carries six `blk.1.ple_*` tensors, the whole
-    // module was built and parity-tested, and nothing called it.  Everything below is construction - the table
+    // Layer 1 carries six `blk.1.ple_*` tensors and the model is wrong without the module.  Everything below is construction - the table
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
     basalt::kernels::PleTable ple_table;
@@ -2504,8 +2493,8 @@ int main(int argc, char** argv) {
     // and only the stage that carries the drafter and the head books room for those.  All of these allocations are
     // already made before a stage's cache is sized, so what has to be held back here is the windows and - only on that
     // stage - the drafter and the head.
-    const int64_t kWindowMib = 96;       // the verify windows; 75 MiB measured, rounded up
-    const int64_t kDrafterMib = 1000;    // the MTP drafter (839 MiB) + the head, on the last stage only
+    const int64_t kWindowMib = 96;       // the verify windows, with margin
+    const int64_t kDrafterMib = 1000;    // the MTP drafter + the head, on the last stage only
     auto stage_room = [&](int dev, bool later, bool drafter) -> int64_t {
         const basalt::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
@@ -2971,7 +2960,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt generate: no VRAM is left for the expert cache: it needs at least %lld slots "
                                  "(%lld MiB), about %lld MiB more than this card has free. To make room: a smaller "
                                  "--max-context (the session, mostly its KV cache, takes %lld MiB at %lld tokens), "
-                                 "--kv q4_0, the English draft subset (setup --draft-vocab en; the draft head takes "
+                                 "--kv q4_0, a smaller draft vocabulary (the draft head takes "
                                  "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU\n",
                          (long long) min_slots, (long long) ((min_slots * blob) >> 20), (long long) short_mib,
                          (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
@@ -3114,12 +3103,11 @@ int main(int argc, char** argv) {
         // expert_parity and the grouped kernels' tests check the kernels themselves.)
         std::fprintf(stderr,
                      "basalt generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
-                     "                 so a reply can differ slightly from a run without the cache (same quality:\n"
-                     "                 bench/results/2026-09-27-cache-parity).\n");
+                     "                 so a reply can differ slightly from a run without the cache (same quality).\n");
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
-            std::fprintf(stderr, "                 R4.2g PER-LAYER: each layer owns %lld slots (%lld..%lld).\n",
+            std::fprintf(stderr, "                 PER-LAYER: each layer owns %lld slots (%lld..%lld).\n",
                          (long long) (hi - lo), (long long) lo, (long long) (hi - 1));
         } else if (profile.empty()) {
             std::fprintf(stderr, "                 compulsory-miss (fills with whatever the run routes first).\n");
@@ -3127,7 +3115,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
     }
-    // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
+    // ---- fill the tier from the profile.  This is the only place the plan is applied, and it runs
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
@@ -3174,7 +3162,7 @@ int main(int argc, char** argv) {
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
-        // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
+        // cache's own `verify_slot` is the check and it costs one blob-sized D2H at startup.
         if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob(profile[0].first, profile[0].second), err,
                                 (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
@@ -3366,14 +3354,14 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
-    // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
+    // ---- THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.
     void* hit_scratch = nullptr;
     int32_t* d_hit_slot = nullptr;
     int32_t* d_hit_dst = nullptr;
     uint8_t* d_hit_q8 = nullptr;
-    float* d_hit_q8_scale = nullptr;   ///< R4.2h: the fp32 activation scales the CPU path also uses
+    float* d_hit_q8_scale = nullptr;   ///< the fp32 activation scales the CPU path also uses
     float* d_hit_out = nullptr;
     if (o.expert_cache > 0 && !o.no_pool) {
         const uint64_t sb = basalt::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, basalt::kernels::cpu::FF);
@@ -3381,12 +3369,12 @@ int main(int argc, char** argv) {
             cudaMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_dst, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_q8, (size_t) (g.n_embd / 32) * 34) != cudaSuccess ||
-            // R4.2h: the fp32 activation scales.  Without this the GPU's hits use the block's fp16 `d`
-            // while the CPU's misses use `ActQ::scale`, which is fp32 - a 4.761e-04 relative disagreement on
-            // every chunk, and the reason enabling the cache changed the tokens.
+            // the fp32 activation scales.  Without this the GPU's hits use the block's fp16 `d`
+            // while the CPU's misses use `ActQ::scale`, which is fp32 - a relative disagreement of up to 2^-11 on
+            // every chunk that would change the tokens when the cache is enabled.
             cudaMalloc((void**) &d_hit_q8_scale, (size_t) (g.n_embd / 32) * sizeof(float)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_out, (size_t) K * g.n_embd * 4) != cudaSuccess) {
-            std::fprintf(stderr, "basalt generate: the R4 hit path could not allocate its device buffers\n");
+            std::fprintf(stderr, "basalt generate: the hit path could not allocate its device buffers\n");
             return 1;
         }
         drive.d.cache = &xcache;
@@ -3611,7 +3599,7 @@ int main(int argc, char** argv) {
         hdr[0] = n_vocab; hdr[1] = n_rows;
     }
 
-    // ---- THE C1 ORACLE: ONE RESIDUAL SNAPSHOT PER LAYER PER POSITION, so the engine can be bisected against
+    // ---- THE LAYER ORACLE: ONE RESIDUAL SNAPSHOT PER LAYER PER POSITION, so the engine can be bisected against
     // `llama-debug`'s `l_last-<il>` node instead of against a single end-to-end perplexity.  The buffer is
     // PINNED because `session_loop` enqueues a device-to-host copy into it after every layer and the transfer
     // would otherwise be staged through a pageable bounce buffer on the critical path.
@@ -3658,7 +3646,7 @@ int main(int argc, char** argv) {
     // are the host's launch latency and they are proportional to the KERNEL COUNT rather than to any work, so
     // the no-capture stage shares are shares of kernel count - which is why the attention block, with the most
     // kernels, looks like 55% of the token there.
-    // ---- R0.9: THE PER-STAGE TABLE ON THE CAPTURED GRAPH.
+    // ---- THE PER-STAGE TABLE ON THE CAPTURED GRAPH.
     if (o.gpu_stages) {
         basalt::core::doorbell_reset(db);
         double mix = 0, ffn = 0, post = 0;
@@ -3723,12 +3711,12 @@ int main(int argc, char** argv) {
             std::printf("  %-22s %9.3f ms/token (must equal the mixer above)\n", "GDN + QSA", gdn + qsa);
         }
 
-        // ================================ R0.11: THE FIVE STAGES SEPARATELY ================================
+        // ================================ THE FIVE STAGES SEPARATELY ================================
         //
         // Prefixes 1..5 are replayed per layer with the residual restored between them, and consecutive
         // differences are the per-stage times.  **THE CHECK IS THAT THE FIVE SUM TO THE THREE-GRAPH TOTAL** -
-        // the same independent-restatement test that caught round 320's divide-by-reps bug, and it is the only
-        // reason to believe a table built out of differences.
+        // an independent restatement, and the only reason to believe a table built out of
+        // differences.
         {
             std::vector<double> acc5(5, 0.0), per, s5;
             for (int r = 0; r < reps; ++r) {
@@ -3756,12 +3744,12 @@ int main(int argc, char** argv) {
                 (void) v;
             }
             std::printf("  %-24s %-8s %10.3f\n", "sum of the five", "", tot5);
-            std::printf("  %-24s %-8s %10.3f   <- R3.3's target is <= 3 ms for all four passes\n",
+            std::printf("  %-24s %-8s %10.3f\n",
                         "GR passes (0,2,3)", "GR", gr_ms);
             std::printf("\n  the three-graph total above was %.3f ms/token; the five must account for it.\n",
                         tot / reps);
 
-            // ================================ R3.5c: THE SAME TABLE, A DIFFERENT WAY ================================
+            // ================================ THE SAME TABLE, A DIFFERENT WAY ================================
             //
             // The differencing table above mixes five graphs per layer, so stage 4's interval carries the launch
             // of the FULL five-stage graph while stage 3's carries a four-stage one.  This sweep launches ONE
@@ -3891,7 +3879,7 @@ int main(int argc, char** argv) {
     } scratch_free{&loop_scratch};
     // Initialised unconditionally, including under --no-pool: the loop validates the scratch it is handed, so
     // passing a default-constructed one is an error rather than a fallback.  (It was, and the guard caught it -
-    // which is the point of the guard.)  One allocation at setup either way.
+    // which is the point of the guard.)  One allocation at startup either way.
     if (!loop_scratch.init((size_t) K * g.n_embd * 4, err)) {
         std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
         return 1;
@@ -4435,7 +4423,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // say what frees VRAM
                 std::fprintf(stderr, "basalt serve: the GPU has too little free VRAM for the prompt path: turn images "
-                                     "off (setup: --vision no), close other programs using the GPU, use a shorter "
+                                     "off (--no-vision), close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
@@ -5776,7 +5764,7 @@ int main(int argc, char** argv) {
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
-            // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
+            // tuning keys (calibration can measure settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
@@ -7206,7 +7194,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         // **A CHECKPOINT AFTER THE HEAD, BECAUSE AN ASYNC FAULT IS STICKY AND LIES ABOUT WHERE IT HAPPENED.**
-        // Measured, and it cost an hour: without this, `embed_row`'s D2H on the NEXT token reported "an illegal
+        // Without this, `embed_row`'s D2H on the NEXT token reported "an illegal
         // memory access" at a plane offset that has nothing to do with the fault, and the layer that actually
         // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
         // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.
