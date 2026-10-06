@@ -726,9 +726,15 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
                                                                               const float* __restrict__ dead,
                                                                               const float* __restrict__ q_idx,
                                                                               const int32_t* __restrict__ steps, int nq,
-                                                                              int64_t max_blocks, float* __restrict__ out) {
+                                                                              int64_t max_blocks, float* __restrict__ out,
+                                                                              int skip_identity) {
     __shared__ __align__(16) float qs[MQ * IDX_HEADS * IDX_DIM];
     __shared__ int64_t s_nkv[MQ], s_nbid[MQ];
+    if (skip_identity) {   // every selection the identity: the top-k reads no score
+        bool all = true;
+        for (int q = 0; q < nq; ++q) all = all && steps[q * kStepCount + kStepNKv] <= steps[q * kStepCount + kStepWidth];
+        if (all) return;
+    }
     for (int i = threadIdx.x; i < nq * IDX_HEADS * IDX_DIM; i += blockDim.x) qs[i] = q_idx[i];
     if (threadIdx.x < nq) {
         s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
@@ -989,7 +995,8 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
 }  // namespace
 
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
-                      int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
+                      int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks,
+                      bool skip_identity) {
     if (nq <= 0) return;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535) {
         std::fprintf(stderr, "qsa_block_scores: unsupported indexer geometry\n");
@@ -999,7 +1006,8 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     static const bool multi = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
     if (multi && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
         block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
-                                                                                     max_blocks, scores);
+                                                                                     max_blocks, scores,
+                                                                                     skip_identity ? 1 : 0);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
