@@ -129,6 +129,7 @@ struct HcLaunch {
                      // tensor copies (tm[4..5], w_inject's by tm[2..3])
     int up_tma;      // 1: the 8-bit mma up slices by two tensor copies (tm[6..7], hc_up_tma); 2: the first one before
                      // the previous kernel is waited on
+    int no_fence;    // the up, router and top-10 items' waits without a full fence after the acquire poll
     int late_w;      // cn, up_tma: the slice's copy waited on after lo is formed
     int lo_stage;    // cn: an up item's copy of the down items' sums by bulk copies into shared memory (cn_lo's lbar)
     int no_dry;      // cn: the up items skip the top-10 dry run (a down item's CTA claims the top-10 and warms itself)
@@ -213,10 +214,11 @@ __device__ __forceinline__ void cta_signal(unsigned* ctr, int tid) {
         atomicAdd(ctr, 1u);
     }
 }
-__device__ __forceinline__ void cta_wait(const unsigned* ctr, unsigned target, int tid) {
+// fence false: the acquire load and the barrier order the CTA's later accesses (no full fence)
+__device__ __forceinline__ void cta_wait(const unsigned* ctr, unsigned target, int tid, bool fence = true) {
     if (tid == 0) {
         while (ld_acquire(ctr) < target) {}
-        __threadfence();
+        if (fence) __threadfence();
     }
     __syncthreads();
 }
@@ -1119,7 +1121,7 @@ __device__ void hc_up_issue8(const HcFusedArgs& a, UpSlice sl, char* smem, uint6
 __device__ void hc_up_stream(const HcFusedArgs& a, UpSlice sl, char* smem, uint64_t* bars, const unsigned* nload,
                              unsigned n_in, const unsigned* down, unsigned ph, bool rows = false, bool wait_down = true,
                              uint16_t* sc = nullptr, int issued = 0, unsigned nd = ND, unsigned long long* dbg = nullptr,
-                             int b = 0) {
+                             int b = 0, bool fence = true) {
     auto piece = [&](int p) { hc_up_piece_any(a, sl, smem, bars, p, rows, sc); };
     int landed = 0;
     if (issued < 0) {   // the slice is loaded otherwise: only the down projection is waited on
@@ -1142,7 +1144,7 @@ __device__ void hc_up_stream(const HcFusedArgs& a, UpSlice sl, char* smem, uint6
             if (down_ok) stamp(dbg, b, 11, 0);
         }
     }
-    __threadfence();
+    if (fence) __threadfence();
 }
 
 // Shared memory of an up CTA: [w_up rows 4 nc x 640 B][lo T x LR][rp T x 4 x nc: R'][px T x 4 x nc: R' * w_norm]
@@ -2015,7 +2017,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             float* const lsm = reinterpret_cast<float*>(smem + lst_off);
             if (tid == 0) {
                 hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph, mma, !(Q8 && !mma),
-                             sc8, cp || ut ? -1 : Q8 ? UP_PIECES : 0, (unsigned) it.nd, dbg, b);
+                             sc8, cp || ut ? -1 : Q8 ? UP_PIECES : 0, (unsigned) it.nd, dbg, b, !L.no_fence);
                 if (lst) {
                     asm volatile("fence.proxy.async;" ::: "memory");
                     mbar_expect_tx(&lbar, lst_p + lst_s);
@@ -2100,8 +2102,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                                   reinterpret_cast<uint32_t*>(smem) + (warp - 1) * CAND_WORDS, nullptr, b);
                 __syncthreads();
             }
-            if (L.hcx == 2) cta_wait(&sy->up.v, (unsigned) it.nu, tid);
-            else cta_wait(&sy->router.v, (unsigned) ND, tid);
+            if (L.hcx == 2) cta_wait(&sy->up.v, (unsigned) it.nu, tid, !L.no_fence);
+            else cta_wait(&sy->router.v, (unsigned) ND, tid, !L.no_fence);
             stamp(dbg, b, 8, tid);
             const int k = tid >> 5;
             uint32_t* cand = reinterpret_cast<uint32_t*>(smem) + k * CAND_WORDS;
@@ -2121,7 +2123,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                 mbar_expect_tx(&bars[UP_PIECES], bytes);
                 bulk_g2s(smem, a.w_router + (size_t) e0 * N, bytes, &bars[UP_PIECES]);
             }
-            cta_wait(&sy->up.v, (unsigned) it.nu, tid);
+            cta_wait(&sy->up.v, (unsigned) it.nu, tid, !L.no_fence);
             mbar_wait(&bars[UP_PIECES], rt_ph);
             rt_ph ^= 1u;
             stamp(dbg, b, 4, tid);
@@ -2371,7 +2373,8 @@ constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel
 // requested before the previous kernel is waited on; 16 = the up items skip the top-10 dry run (its global loads queue
 // behind the weight copies and hold the up pass's start); with 16: 32 = an up item's copy of the down items' sums by
 // two bulk copies into shared memory (where it fits) instead of every thread's loads; with 4: 128 = the slice's copy
-// waited on after lo is formed (the lo phase overlaps the weights' landing).
+// waited on after lo is formed (the lo phase overlaps the weights' landing); 256 = the up, router and top-10 items'
+// waits without a full fence after the acquire poll (the barrier after it orders the CTA).
 struct SkConf {
     bool on = false;
     int pf = 0, nu = 0, ups = 0, hcx = 0, upmma = 0, xh = 0, hc2 = 0, upw = 0, copies = 1, hc3 = 0;
@@ -2857,6 +2860,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.cn_copies = sk.copies;
     L.no_dry = L.cn && (sk.hc3 & 16) ? 1 : 0;
     L.lo_stage = L.no_dry && (sk.hc3 & 32) ? 1 : 0;
+    L.no_fence = sk.hc3 & 256 ? 1 : 0;
     if (L.cn && (sk.hc3 & 7)) {
         bool up = false;
         const bool down = cn_maps(L.a, L.tm, up);
