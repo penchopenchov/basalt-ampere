@@ -1061,10 +1061,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       ple_native_postops_enabled();
             // STRATA_DEC_QSAF & 16: the rows' write, post-ops, history advance and snapshots in two launches, the
             // value projection on the side stream beside the key's
-            const bool ple_win = (dec_qsaf_mask() & 16) && ple_batch_kv && !batch_rec_ && gr_native_mmvf_enabled();
+            // (one row too: there the multi-row GEMVs are ple_block's own)
+            const bool ple_win = (dec_qsaf_mask() & 16) && !batch_rec_ && gr_native_mmvf_enabled() &&
+                                 (ple_batch_kv || (n == 1 && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr &&
+                                                   ple_native_bf16_enabled() && ple_native_postops_enabled()));
             cudaStream_t pside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
             const bool ple_fork = ple_win && pside != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
-            if (ple_batch_kv) {
+            if (ple_batch_kv || ple_win) {
                 try {
                     if (ple_fork) {
                         cudaEventRecord(ev_fork_, cs);
