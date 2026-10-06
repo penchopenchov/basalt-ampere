@@ -139,11 +139,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         return (uint8_t*) map + kSharedArenaHeaderBytes;
     }
 
-    // STRATA_NO_LARGEPAGES=1 is the same-run A/B switch the Windows branch documents; honor it
-    // here too, so the large-page path can be compared without changing the pool or rebooting.
-    if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
-        note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
-    } else {
+    {
         void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
         if (p != MAP_FAILED) {
@@ -178,7 +174,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
     const uintptr_t end = aligned + bytes, raw_end = start + padded;
     if (raw_end > end) munmap((void*) end, raw_end - end);
     void* p = (void*) aligned;
-    if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && madvise(p, bytes, MADV_HUGEPAGE) == 0) {
+    if (madvise(p, bytes, MADV_HUGEPAGE) == 0) {
         const std::string four_k = "; using 4 KB pages";
         if (note.size() >= four_k.size() && note.compare(note.size() - four_k.size(), four_k.size(), four_k) == 0)
             note.resize(note.size() - four_k.size());
@@ -207,13 +203,7 @@ namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
 }  // namespace
 
-int arena_pin_cap_gib() {
-    const char* e = std::getenv("STRATA_ARENA_PIN_GIB");
-    if (e == nullptr || *e == '\0') return -1;
-    if (std::string(e) == "auto") return -2;   // #243: the Windows shared-memory budget sets the sliced pin's cap
-    const int v = std::atoi(e);
-    return v < 0 ? -1 : v;
-}
+int arena_pin_cap_gib() { return -1; }   // no cap: the whole arena is pinned
 
 namespace {
 }  // namespace
@@ -245,14 +235,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
     if (base) {
-        // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
-        const int env_gib = arena_pin_cap_gib();
         uint64_t cap = max_pinned_bytes;
-        std::string cap_why = "by the engine (multi-GPU under WDDM, or remote experts)";
-        if (cap == 0 && env_gib > 0) {
-            cap = (uint64_t) env_gib << 30;
-            cap_why = "by STRATA_ARENA_PIN_GIB";
-        }
+        const std::string cap_why = "by the engine (remote experts)";
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
         const cudaError_t e = capped ? cudaSuccess :
             cudaHostRegister(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
@@ -282,17 +266,14 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             note = (capped ? "cudaHostRegister limited to " + std::to_string(cap >> 30) + " GiB " + cap_why + "; " :
                              "cudaHostRegister of the whole arena FAILED (" + std::string(cudaGetErrorString(e)) + "); " +
                              (limited ? "slices capped at " + std::string(gib) + " GiB (" + limit_why +
-                                        "; STRATA_ARENA_PIN_GIB=auto; N sets a cap; #243); " : std::string())) +
+                                        "); " : std::string())) +
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
                    " GiB); " + note;
             if (registered_bytes < bytes) {
-                const char* env = std::getenv("STRATA_ARENA_LOCK");
-                if (env == nullptr || std::string(env) != "0") {
-                    const strata::platform::LockResult lr =
-                        strata::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
-                    locked_bytes = lr.locked_bytes;
-                    note = lr.note + "; " + note;
-                }
+                const strata::platform::LockResult lr =
+                    strata::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
+                locked_bytes = lr.locked_bytes;
+                note = lr.note + "; " + note;
             }
         } else {
             note = std::string("cudaHostRegister FAILED (") + cudaGetErrorString(e) +
@@ -309,17 +290,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // It is the same trap `gr.cu` warns about for ASYNC faults, in the other direction: a synchronous
             // failure is sticky too, and it lies about where it happened just as convincingly.
             (void) cudaGetLastError();
-            // Plan v0.3 P0.1: keep it RESIDENT instead. Unpinned, Windows trims the arena under memory pressure
-            // and the CPU pool's rate then depends on the OS; locking it through the working set needs no
-            // special privilege. STRATA_ARENA_LOCK=0 is the A/B arm.
-            const char* env = std::getenv("STRATA_ARENA_LOCK");
-            if (env == nullptr || std::string(env) != "0") {
-                const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
-                locked_bytes = lr.locked_bytes;
-                note = lr.note + "; " + note;
-            } else {
-                note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
-            }
+            // Keep it resident instead of pinned, so the OS does not page the arena out.
+            const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
+            locked_bytes = lr.locked_bytes;
+            note = lr.note + "; " + note;
         }
     }
 }
@@ -356,11 +330,6 @@ LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::
 
 bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
                         bool cache_counts, uint64_t read_bytes) {
-    const char* env = std::getenv("STRATA_UNBUFFERED_LOAD");
-    if (env != nullptr && env[0] != '\0') {
-        why = std::string("STRATA_UNBUFFERED_LOAD=") + env;
-        return env[0] != '0';
-    }
     (void) files; (void) arena_bytes; (void) cache_counts; (void) read_bytes;
     why = "buffered (not Windows)";
     return false;
