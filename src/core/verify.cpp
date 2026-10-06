@@ -1885,7 +1885,7 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiateWithFlags(&exec_[T], graph, dec_pk() ? cudaGraphInstantiateFlagUseNodePriority : 0);
+    const cudaError_t ie = cudaGraphInstantiateWithFlags(&exec_[T], graph, cudaGraphInstantiateFlagUseNodePriority);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
         if (pdl_try) return retry_plain(cudaGetErrorString(ie));
