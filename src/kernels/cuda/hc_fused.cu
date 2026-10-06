@@ -90,12 +90,35 @@ __device__ __forceinline__ void hc_q8_1_store(float xi, HcQ81* __restrict__ y, i
     if (lane == 0) y[ib].ds = q8_1_ds(d, sum);
 }
 
+// native_quantize_q8_1's arithmetic (its file is built with --use_fast_math: approximate flush-to-zero divisions)
+__device__ __forceinline__ float div_approx_ftz(float a, float b) {
+    float r;
+    asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+__device__ __forceinline__ void hc_q8_1_store_native(float xi, HcQ81* __restrict__ y, int ib, int lane) {
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    }
+    const float d = q8_1_finite(div_approx_ftz(amax, 127.0f));
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        const float v = roundf(div_approx_ftz(xi, d));
+        q = (int8_t) (v > 127.0f ? 127.0f : v < -127.0f ? -127.0f : v);
+    }
+    y[ib].qs[lane] = q;
+    if (lane == 0) y[ib].ds = q8_1_ds(d, sum);
+}
+
 // A read without a router that writes xq: per q8_1 block of a token row, the columns of the up slices done so far
 // (the slice that completes a block quantizes it for every token and zeroes its count)
 __device__ unsigned g_hc_q8cnt[4][N / 32];
 
 // The up slice's mixed columns are written: count them per q8_1 block, and the slice that completes a block writes its
-// q8_1 rows (hc_q8_1_store on the stored values: the same bits as native_quantize_q8_1).
+// q8_1 rows (on the stored values: the same bits as native_quantize_q8_1).
 template <int T>
 __device__ void hc_up_q8(const HcFusedArgs& a, int c0, int nc, int tid, unsigned* __restrict__ cnt) {
     __shared__ int s_done[4];
@@ -117,7 +140,7 @@ __device__ void hc_up_q8(const HcFusedArgs& a, int c0, int nc, int tid, unsigned
         const int jj = w / T, k = w - jj * T;
         if (!s_done[jj]) continue;
         const int q = k * (N / 32) + j0 + jj;
-        hc_q8_1_store(__ldcg(a.mixed + (size_t) q * 32 + (tid & 31)), static_cast<HcQ81*>(a.xq), q, tid & 31);
+        hc_q8_1_store_native(__ldcg(a.mixed + (size_t) q * 32 + (tid & 31)), static_cast<HcQ81*>(a.xq), q, tid & 31);
     }
 }
 
