@@ -95,6 +95,11 @@
 #include <vector>
 
 namespace {
+// A start-ending failure: one `basalt error:` line, which the server shows as the reason.  Returns the exit code.
+int fatal_start_error(const std::string& text) {
+    std::fprintf(stderr, "basalt error: %s\n", text.c_str());
+    return 1;
+}
 // " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message (clears the error first)
 std::string vram_free_note() {
     (void) cudaGetLastError();
@@ -1410,14 +1415,11 @@ int main(int argc, char** argv) {
     {
         std::string merr;
         if (!model_file.open(o.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr)) {
-            std::fprintf(stderr, "basalt generate: --model: %s\n", merr.c_str());
-            return 1;
+            return fatal_start_error("--model: " + merr);
         }
         basalt::core::model_sources(model_file, srcs);
         if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty() || srcs.experts_layout.empty()) {
-            std::fprintf(stderr, "basalt generate: %s lacks the dense, dense.index, experts or experts.layout section\n",
-                         o.model.c_str());
-            return 1;
+            return fatal_start_error(o.model + " lacks the dense, dense.index, experts or experts.layout section");
         }
         // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
         o.native_shards = {o.model};
@@ -1427,8 +1429,7 @@ int main(int argc, char** argv) {
         if (!srcs.hc8.empty() && o.dump_hc8.empty()) {
             std::map<std::string, basalt::core::Hc8Copy> table;
             if (!basalt::core::hc8_read(srcs.hc8, table, merr)) {
-                std::fprintf(stderr, "basalt generate: %s: %s\n", o.model.c_str(), merr.c_str());
-                return 1;
+                return fatal_start_error(o.model + ": " + merr);
             }
             basalt::core::hc8_set_table(std::move(table));
         }
@@ -1764,8 +1765,7 @@ int main(int argc, char** argv) {
                          basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), g0.n_layers,
                                                                        g0.n_expert, err);
         if (!layout_ok) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported type would otherwise fail from inside the first verify window or leave
@@ -1774,11 +1774,12 @@ int main(int argc, char** argv) {
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
             if (!basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
-                std::fprintf(stderr, "basalt generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
-                                     "engine has no GPU kernels for\n", (long long) l,
-                             basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
-                             f.gu_type, f.d_type);
-                return 1;
+                char msg[192];
+                std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s (ggml types %d/%d), which this "
+                                               "engine has no GPU kernels for", (long long) l,
+                              basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
+                              f.gu_type, f.d_type);
+                return fatal_start_error(msg);
             }
         }
     }
@@ -1788,8 +1789,7 @@ int main(int argc, char** argv) {
         // allocating GPU0 weights or mapping the large host expert arena.
         double free_gib = 0;
         if (!basalt::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         std::fprintf(stderr, "basalt generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
                      remote_dev[r], free_gib);
@@ -1926,8 +1926,7 @@ int main(int argc, char** argv) {
         const basalt::core::ModelGeometry g0;
         const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.native_shards, g0.n_embd, 248320, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         basalt::core::set_native_embed(&native_embed);
         std::fprintf(stderr, "basalt generate: %s experts (largest blob %.2f MB), token embedding "
@@ -1940,14 +1939,12 @@ int main(int argc, char** argv) {
     std::set<std::string> skip;
     {
         if (!basalt::core::NativeDense::served_names(o.native_shards, o.native_ple_key, skip, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         skip.insert("output.weight");
         // a PLE key the dense index holds in BF16 stays in the arena
         if (!basalt::core::NativeDense::keep_unquantized_ple_key(pack_files, skip, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         skip.insert("token_embd.weight");
     }
@@ -1986,8 +1983,7 @@ int main(int argc, char** argv) {
     }
     uint64_t pool_bytes = 0;
     if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
-        std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-        return 1;
+        return fatal_start_error(err);
     }
     // ---- the bytes this start places, once, from the model file's tables: the dense weights, the 8-bit copies, the
     // draft layer, the head and every expert (the GPU cache plus its complement in RAM).  Each term is the total its own
@@ -2071,8 +2067,7 @@ int main(int argc, char** argv) {
     };
     basalt::core::WeightTable wt;
     if (!wt.load(pack_files, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
-        std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-        return 1;
+        return fatal_start_error(err);
     }
     std::fprintf(stderr, "basalt generate: %llu MiB of weights loaded from %s in %.1f s (%zu tensors "
                          "skipped: served from the source tensors)\n",
@@ -2262,8 +2257,7 @@ int main(int argc, char** argv) {
             if (pio.mode != basalt::kernels::PleIo::Direct || !pio.io_thread) pio.keepalive_ms = 0;
         }
         if (!ple_table.open(o.model, err, pio)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         if (pio.mode == basalt::kernels::PleIo::Direct) {
             // --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational disk can take
@@ -2412,8 +2406,7 @@ int main(int argc, char** argv) {
         st.dev = split_devs[i];
         double free_gib = 0;
         if (!basalt::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         const basalt::core::OnDevice on(st.dev);
         std::set<std::string> skip_s = skip_base;
@@ -2423,8 +2416,7 @@ int main(int argc, char** argv) {
             add_foreign(lb, le, skip_s);
             basalt::core::NativeDense::set_layer_range((int) lb, (int) le);
             if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_s, err, &skip_s)) {
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
+                return fatal_start_error(err);
             }
             std::fprintf(stderr, "basalt generate: layer split: CUDA%d loads the dense weights of layers %lld-%lld only\n",
                          st.dev, (long long) lb, (long long) le - 1);
@@ -2495,8 +2487,7 @@ int main(int argc, char** argv) {
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
         if (!basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, profile, pslots, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
         // `--expert-cache 0` means auto: the profile ranks every pair.
@@ -2876,8 +2867,7 @@ int main(int argc, char** argv) {
     for (int r = 1; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
         double free_gib = 0;
         if (!basalt::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         std::fprintf(stderr, "basalt generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
                      remote_dev[r], free_gib);
@@ -2929,8 +2919,7 @@ int main(int argc, char** argv) {
         // The low-RAM mode: the experts come from the model file through the OS cache instead of a pinned copy in
         // RAM, for a machine whose GPU holds most of them but whose RAM cannot hold them all.
         if (!src.open(expert_files.experts, g.n_layers, g.n_expert, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         std::fprintf(stderr, "basalt generate: experts via mmap (--mmap-experts)\n");
         srcp = &src;
@@ -2938,9 +2927,7 @@ int main(int argc, char** argv) {
         const uint64_t pin_limit = 0;   // the whole arena is pinned
         if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
-            std::fprintf(stderr, "%s%s\n", err.rfind("the experts need", 0) == 0 ? "basalt error: " : "basalt generate: ",
-                         err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         if (!arena_src.ram_warning().empty())   // said before the load's numbers, which it explains
             std::fprintf(stderr, "basalt generate: WARNING: %s\n", arena_src.ram_warning().c_str());
@@ -3142,8 +3129,7 @@ int main(int argc, char** argv) {
                                  commit, o.expert_cache);
                     continue;
                 }
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
+                return fatal_start_error(err);
             }
             if (!auto_cache || attempt - failed >= 6) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
@@ -3250,8 +3236,7 @@ int main(int argc, char** argv) {
         if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob(profile[0].first, profile[0].second), err,
                                 (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         std::fprintf(stderr, "basalt generate: pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
                              "slot 0 verified\n",
@@ -3399,8 +3384,7 @@ int main(int argc, char** argv) {
             if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
                      g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err,
                      o.expert_cache_remote_auto[(size_t) r])) {
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
+                return fatal_start_error(err);
             }
             std::fprintf(stderr, "basalt generate: CUDA%d: %lld additional experts, %.2f GiB; "
                                  "results return through pinned host rows\n", remote_dev[r],
@@ -3722,8 +3706,7 @@ int main(int argc, char** argv) {
         double t_mix = 0, t_ffn = 0, t_post = 0;
         for (int r = 0; r < reps; ++r) {
             if (!basalt::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
+                return fatal_start_error(err);
             }
             t_mix += mix;
             t_ffn += ffn;
@@ -3749,8 +3732,7 @@ int main(int argc, char** argv) {
             double f2 = 0, p2 = 0;
             for (int r = 0; r < reps; ++r) {
                 if (!basalt::core::session_replay_stages_per_layer(g, 0, 0, ss, gr, main_cs, per, f2, p2, err)) {
-                    std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                    return 1;
+                    return fatal_start_error(err);
                 }
                 for (int64_t l = 0; l < g.n_layers; ++l) acc[(size_t) l] += per[(size_t) l];
             }
@@ -3781,8 +3763,7 @@ int main(int argc, char** argv) {
             std::vector<double> acc5(5, 0.0), per, s5;
             for (int r = 0; r < reps; ++r) {
                 if (!basalt::core::session_replay_stage_prefixes(g, 0, 0, ss, gr, main_cs, s5, per, err)) {
-                    std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                    return 1;
+                    return fatal_start_error(err);
                 }
                 for (int k = 0; k < 5; ++k) acc5[(size_t) k] += s5[(size_t) k];
             }
@@ -3822,8 +3803,7 @@ int main(int argc, char** argv) {
                     double acc = 0, one = 0;
                     for (int r = 0; r < reps; ++r) {
                         if (!basalt::core::session_replay_stage_sweep(g, 0, 0, ss, gr, main_cs, k, one, err)) {
-                            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                            return 1;
+                            return fatal_start_error(err);
                         }
                         acc += one;
                     }
@@ -3941,8 +3921,7 @@ int main(int argc, char** argv) {
     // passing a default-constructed one is an error rather than a fallback.  (It was, and the guard caught it -
     // which is the point of the guard.)  One allocation at startup either way.
     if (!loop_scratch.init((size_t) K * g.n_embd * 4, err)) {
-        std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-        return 1;
+        return fatal_start_error(err);
     }
     // The whole token as ONE graph whenever nothing needs a host step between the ring and post[l] (the VRAM expert
     // tier and the per-layer dumps do).  `--no-token-graph` keeps two graphs per layer.
@@ -7117,13 +7096,11 @@ int main(int argc, char** argv) {
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
+                return fatal_start_error(err);
             }
             prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
                 // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
@@ -7135,8 +7112,7 @@ int main(int argc, char** argv) {
         }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
@@ -7208,13 +7184,11 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
         vh.n_slots = xcache.slots();
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         const bool use_mtp = !o.mtp.empty();
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         ver.set_sampling(sp);   // the CLI's own sampling; no penalties here
         if (use_mtp) mtp.set_draft_sampling(sp);   // sampled drafts (a no-op without --coupled-draft)
@@ -7379,8 +7353,7 @@ int main(int argc, char** argv) {
             // on the GPU or the CPU (they round differently) would depend on the copy's timing
             apply_pending(true);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
+                return fatal_start_error(err);
             }
             if (drive.d.failed) {
                 std::fprintf(stderr, "basalt generate: the expert pool failed at layer %lld expert %lld: %s\n",
@@ -7402,8 +7375,7 @@ int main(int argc, char** argv) {
                 adapt_thr = std::thread([&] { adapt_ok = adapt(); });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
+                return fatal_start_error(err);
             }
             ++rounds;
             drafts_total += T - 1;
@@ -7426,8 +7398,7 @@ int main(int argc, char** argv) {
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
+                return fatal_start_error(err);
             }
             x = outv[(size_t) a];
             p += a + 1;
@@ -7440,8 +7411,7 @@ int main(int argc, char** argv) {
         }
         // the last commit (set_commit_async) before anything reads the session again
         if (!ver.wait_commit(err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
+            return fatal_start_error(err);
         }
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
