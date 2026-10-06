@@ -15,6 +15,7 @@
 // holds in the verify window's grouped kernels and the prompt path (the hit/miss split), and the CPU pool the rest.
 #pragma once
 
+#include "basalt/core/model_file.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -40,6 +41,10 @@ inline constexpr int32_t kNotResident = -1;
 /// The frequency table is not returned: it is the profile's own working, and the engine measures the hit rate by
 /// running rather than by re-deriving what the file claims.
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
+/// The same from a byte range: a profile file (`with_magic`) or a .basalt's `profile` section (the file without its
+/// 4-byte magic).
+bool read_expert_profile(const FileRange& range, bool with_magic, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
 
 /// --expert-profile-save: what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair - the

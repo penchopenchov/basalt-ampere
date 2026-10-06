@@ -14,26 +14,39 @@ namespace basalt::core {
 
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
+    return read_expert_profile(FileRange(path), true, n_layers, n_expert, ranked, slots, err);
+}
+
+bool read_expert_profile(const FileRange& range, bool with_magic, int64_t n_layers, int64_t n_expert,
+                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
+    const std::string& path = range.path;
+    std::vector<uint8_t> raw_file;
+    std::string rerr;
+    if (!read_range(range, raw_file, rerr)) {
         err = "read_expert_profile: cannot open " + path;
         return false;
     }
-    char magic[4] = {0, 0, 0, 0};
+    size_t at = 0;
+    if (with_magic) {
+        if (raw_file.size() < 4) {
+            err = "read_expert_profile: " + path + " is too short to hold a header";
+            return false;
+        }
+        if (std::memcmp(raw_file.data(), "STRP", 4) != 0) {
+            err = "read_expert_profile: " + path + " does not start with STRP";
+            return false;
+        }
+        at = 4;
+    }
     uint32_t hdr[5] = {0, 0, 0, 0, 0};
-    if (std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 5, f) != 5) {
-        std::fclose(f);
+    if (raw_file.size() - at < sizeof hdr) {
         err = "read_expert_profile: " + path + " is too short to hold a header";
         return false;
     }
-    if (std::memcmp(magic, "STRP", 4) != 0) {
-        std::fclose(f);
-        err = "read_expert_profile: " + path + " does not start with STRP";
-        return false;
-    }
+    std::memcpy(hdr, raw_file.data() + at, sizeof hdr);
+    at += sizeof hdr;
     const uint32_t version = hdr[0], nl = hdr[1], ne = hdr[2], want = hdr[3], n_ranked = hdr[4];
     if ((int64_t) nl != n_layers || (int64_t) ne != n_expert) {
-        std::fclose(f);
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "read_expert_profile: %s is %ux%u but this model is %lldx%lld - it is a profile for a "
@@ -42,18 +55,18 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         return false;
     }
     if (n_ranked > want) {
-        std::fclose(f);
         err = "read_expert_profile: the header claims more ranked pairs than slots";
         return false;
     }
     ranked.assign(n_ranked, {0, 0});
     std::vector<uint16_t> raw((size_t) n_ranked * 2);
-    if (n_ranked > 0 && std::fread(raw.data(), 2, (size_t) n_ranked * 2, f) != (size_t) n_ranked * 2) {
-        std::fclose(f);
-        err = "read_expert_profile: the ranked list is truncated";
-        return false;
+    if (n_ranked > 0) {
+        if (raw_file.size() - at < raw.size() * 2) {
+            err = "read_expert_profile: the ranked list is truncated";
+            return false;
+        }
+        std::memcpy(raw.data(), raw_file.data() + at, raw.size() * 2);
     }
-    std::fclose(f);
     for (uint32_t i = 0; i < n_ranked; ++i) {
         const int32_t l = (int32_t) raw[(size_t) i * 2], e = (int32_t) raw[(size_t) i * 2 + 1];
         if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
