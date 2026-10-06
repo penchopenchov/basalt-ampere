@@ -819,6 +819,7 @@ const int g_probe = env_int("STRATA_DEC_DTC_PROBE", 0);
 const int g_ks = env_int("STRATA_DEC_DTC_KS", 0);
 const int g_tile = env_int("STRATA_DEC_DTC_TILE", 1);   // 1: never split a tile's chunks over two warp groups
 const int g_v2 = env_int("STRATA_DEC_DTC2", 0);
+const int g_pair = env_int("STRATA_DEC_PAIR", 0);
 
 template<int TYPE, int S, int MT, int KS>
 void launch_s(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
@@ -997,6 +998,8 @@ void dense_tc_l2_prefetch(const void* w, size_t bytes, void* stream) {
     if (((uintptr_t) w & 15) != 0 || bytes < 16) return;
     launch_pdl(dense_tc_l2_kernel, dim3(16), dim3(32), 0, (cudaStream_t) stream, (const uint8_t*) w, bytes);
 }
+
+int dense_tc_pair_mask() { return g_pair; }
 
 int dense_tc_mask() {
     static const int m = [] {

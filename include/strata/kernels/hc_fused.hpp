@@ -49,6 +49,8 @@ struct HcFusedArgs {
     void* xq = nullptr;
     const void* pf[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t pf_bytes[4] = {0, 0, 0, 0};
+    /// let the next kernel in at the start (its blocks take the SMs this read's blocks leave)
+    bool next_early = false;
     /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null = the
     /// bf16 matrices.  hc_fused_read fills them from hc8_prepare's copies when STRATA_DEC_HC8=1.
     const int8_t* q_down = nullptr;

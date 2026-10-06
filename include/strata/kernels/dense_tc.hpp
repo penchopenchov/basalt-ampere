@@ -32,6 +32,10 @@ bool dense_tc_pair_supported(int type0, int type1, int n_in) noexcept;
 void dense_tc_pair(int type0, const void* w0, float* y0, int n_out0, int type1, const void* w1, float* y1, int n_out1,
                    const void* x_q8_1, int n_in, int ncols, void* stream);
 
+/// STRATA_DEC_PAIR (bits, default 0): 16 the hc read before the GDN qkv+z pair lets the pair in at its start, so the
+/// pair's blocks stage their first tiles on the SMs the read leaves.
+int dense_tc_pair_mask();
+
 /// The 16-byte aligned `bytes` at w into L2 (bulk prefetches), as a kernel on the stream that lets the next kernel in
 /// at once and ends after the kernel before it.
 void dense_tc_l2_prefetch(const void* w, std::size_t bytes, void* stream);

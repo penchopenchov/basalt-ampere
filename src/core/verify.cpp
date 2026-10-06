@@ -1162,6 +1162,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (dec_hc) {
                 HcFusedArgs h = hc_args(0, pending, inj2_, inj_);
                 if (read_q8) h.xq = xq_;
+                // STRATA_DEC_PAIR & 16: the GDN qkv+z pair kernel follows; its blocks start on the SMs the read leaves
+                h.next_early = read_q8 && (kernels::dense_tc_pair_mask() & 16) && (dec_dtc2_mask() & 16) &&
+                               !is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT &&
+                               dec_gdnf_mode() != 0;
                 h.pf[0] = wn[1]->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float);
                 if (dec_hc_pf) {   // the FFN read's weights and router, read after the mixer
                     const size_t mat = (size_t) g.hc_lr * HC * N * 2;

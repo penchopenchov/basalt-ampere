@@ -2891,6 +2891,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.t10_scratch = reinterpret_cast<float*>(d.t10 + NE) + NE;
     L.racc = d.racc + (size_t) L.slot * MAXT * NE;
     L.early = pdl2_mask() & (a.T <= 4 ? 3 : 2);   // from 5 tokens the next kernel's early blocks slow the read
+    if (a.next_early) L.early |= 1;
     if (L.dbg == nullptr) L.dbg = dbg_slot(a.T, a.w_router != nullptr);
     const SkConf& sk = sk_conf();
     // the 8-bit copies when every matrix of the read has one (the split-K read stays bf16); the prefetches then take
