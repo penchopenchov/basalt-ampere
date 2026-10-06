@@ -1,30 +1,29 @@
-// include/strata/kernels/cpu/pool.hpp - P2.S3: the CPU expert pool.
+// include/strata/kernels/cpu/pool.hpp - the CPU expert pool.
 //
-// A layer runs TEN experts against ONE activation, and the expert kernel is DRAM-bound (Memory/LEDGER.md L9:
-// 42.55 GB/s on 6 cores, tracking core count almost exactly).  So the pool's job is not to be clever - it is
-// to keep every physical core reading expert bytes for the whole layer, and to be cheap enough that ten
-// dispatches per layer cost less than one expert.
+// A layer runs TEN experts against ONE activation, and the expert kernel is DRAM-bound, tracking core count almost
+// exactly.  So the pool's job is not to be clever - it is to keep every physical core reading expert bytes for the
+// whole layer, and to be cheap enough that ten dispatches per layer cost less than one expert.
 //
-// WHY A FLAT BATCH AND NOT A RING.  P2.S3 describes a "lock-free SPMC ring", which is what you need when
-// jobs arrive while others are still being computed.  Here they cannot: the host must SUM all ten outputs
-// before the next layer starts, so a layer is a barrier by construction and the queue never holds more than
-// one batch.  A ring would add a wrap-around to get wrong and buy nothing.  What is kept from the phase is
-// the part that matters: `head`/`done` are single fetch_add counters, one claim per worker, no lock.
+// WHY A FLAT BATCH AND NOT A RING.  A lock-free SPMC ring is what you need when jobs arrive while others are still
+// being computed.  Here they cannot: the host must SUM all ten outputs before the next layer starts, so a layer is a
+// barrier by construction and the queue never holds more than one batch.  A ring would add a wrap-around to get
+// wrong and buy nothing.  What is kept is the part that matters: `head`/`done` are single fetch_add counters, one
+// claim per worker, no lock.
 //
-// THE COMPLETION PROTOCOL, because this is where a pool usually goes wrong.  `run()` waits for `done == n`
-// AND for every worker to PARK.  Waiting only for `done` is not enough: a worker can still be inside the
-// drain loop after its last `done` increment, and the host resetting `head` underneath it would let that
-// worker claim a job from the NEXT batch before the next batch has been published.
+// THE COMPLETION PROTOCOL, because this is where a pool usually goes wrong.  `run()` waits for `done == n` AND for
+// every worker to PARK.  Waiting only for `done` is not enough: a worker can still be inside the drain loop after its
+// last `done` increment, and the host resetting `head` underneath it would let that worker claim a job from the NEXT
+// batch before the next batch has been published.
 //
-// **AND `parked` IS NOT ENOUGH EITHER (issue #29).**  A worker that went to sleep (after `kSpinBeforeSleep`) is
-// still counted as parked when it wakes, so for a moment after it has seen a new epoch the host believes it is
-// idle.  On a card with most experts in VRAM the workers sleep in the middle of a request, tiny batches finish
-// before a sleeper is awake, and that moment comes round constantly: a late worker could claim from the NEXT
-// batch while the host was still writing it, run a job twice, or add to `done` after the host had reset it -
-// and `done != n` then never ended, with the GPU waiting on the pool forever.  So every claim carries its
-// batch: `head` is one 64-bit word `epoch | njobs | index`, a claim is a CAS that only succeeds for the epoch
-// the worker woke for, and a late worker's claim simply fails.  A claim that succeeds belongs to the current
-// batch, whose description the host cannot change until that job's `done` has landed.
+// **AND `parked` IS NOT ENOUGH EITHER.**  A worker that went to sleep (after `kSpinBeforeSleep`) is still counted as
+// parked when it wakes, so for a moment after it has seen a new epoch the host believes it is idle.  When most experts
+// are in VRAM the workers sleep in the middle of a request, tiny batches finish before a sleeper is awake, and that
+// moment comes round constantly: a late worker could claim from the NEXT batch while the host was still writing it,
+// run a job twice, or add to `done` after the host had reset it - and `done != n` then never ended, with the GPU
+// waiting on the pool forever.  So every claim carries its batch: `head` is one 64-bit word `epoch | njobs | index`, a
+// claim is a CAS that only succeeds for the epoch the worker woke for, and a late worker's claim simply fails.  A
+// claim that succeeds belongs to the current batch, whose description the host cannot change until that job's `done`
+// has landed.
 #pragma once
 
 #include "strata/kernels/cpu/expert.hpp"
@@ -52,19 +51,19 @@ struct ExpertJob {
     int slot = -1;                   ///< the job's index, for diagnostics
 };
 
-/// Plan v0.3 P6: one expert for the `nt` tokens of a verify window that were routed to it.  Every token's output
-/// is bitwise the single-token job's.
+/// One expert for the `nt` tokens of a verify window that were routed to it.  Every token's output is bitwise the
+/// single-token job's.
 struct ExpertJobMulti {
     const uint8_t* blob = nullptr;
     int nt = 0;
     const ActQ* act[MAXT] = {};
     float* out[MAXT] = {};
-    /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
+    /// a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
 };
 
-/// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
-/// always used and the default; the hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
+/// How worker threads are allocated across physical/logical CPU cores.  `All` uses every core and is the default; the
+/// hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
 enum class PoolAffinity {
     Auto,      ///< Hybrid: prioritize physical P-cores, then SMT, then E-cores (defaults to P-core count)
     PCores,    ///< Restrict workers strictly to Performance cores and their SMT siblings
@@ -76,63 +75,52 @@ struct CpuTopology {
     int p_cores = 0;                ///< Physical performance cores
     int p_threads = 0;              ///< Total logical threads on performance cores
     int e_cores = 0;                ///< Efficient cores
-    std::vector<int> worker_cores;  ///< Ordered CPU IDs; on Windows, group * 64 + processor within the group
+    std::vector<int> worker_cores;   // Ordered CPU IDs
     int host_core = -1;             ///< Logical core reserved for host thread
 };
 
 CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
 
-/// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
-/// worker.  On the 6-core/12-thread machine this project measures on, `hardware_concurrency()/2` workers on
-/// logical processors 0..5 would put every worker on a sibling pair and halve the useful bandwidth - which is
-/// exactly the kind of error that shows up as "the CPU path is slower than the model says" with no clue why.
+/// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another worker:
+/// `hardware_concurrency()/2` workers on logical processors 0..N/2 could put every worker on a sibling pair and halve
+/// the useful bandwidth - which shows up as "the CPU path is slower than the model says" with no clue why.
 ///
-/// `skip_first` drops the first core, which P2.S3 reserves for the host loop.
+/// `skip_first` drops the first core, which is reserved for the host loop.
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
 
 /// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
 ///
 /// `physical_cores(true)` keeps the workers off the first physical core so that the host loop can spin on
-/// `cudaEventQuery` without stealing a worker's cycles.  Nothing in the pool can enforce the other half of
-/// that, so this is it: the host loop calls this on entry and restores on exit.
+/// `cudaEventQuery` without stealing a worker's cycles.  Nothing in the pool can enforce the other half of that, so
+/// this is it: the host loop calls this on entry and restores on exit.  An unpinned spinning host is free to land on a
+/// worker's core or its SMT sibling, which costs the pool bandwidth.
 ///
-/// MEASURED, and this is why it exists: the pool runs at **36.32 GB/s on 5 workers with nothing else running**
-/// - exactly 5/6 of L9's 44.14 on 6 - and at **26.9 GB/s inside the host loop**, where the unpinned spinning
-/// host is free to land on a worker's core or its SMT sibling.  That 1.35x is not the kernel.
-///
-/// The previous host placement. `valid` is false when querying or setting placement failed.
-/// Windows uses a reversible CPU Set selection, leaving hard affinity (including Windows 11's implicit
-/// all-group eligibility) untouched. An empty selection restores inheritance from the process defaults.
-/// Linux stores the complete, dynamically sized native CPU mask, including CPU IDs above 63.
+/// The previous host placement. `valid` is false when querying or setting placement failed.  Linux stores the complete,
+/// dynamically sized native CPU mask, including CPU IDs above 63.
 struct ThreadAffinity {
     std::vector<unsigned long> mask;
     bool valid = false;
 };
 
-/// Selects one encoded processor for the caller; Windows CPU Sets respect existing hard-affinity limits.
+/// Selects one encoded processor for the caller.
 /// Restore on the same calling thread. Pool-owned workers use hard group affinity instead.
 ThreadAffinity pin_current_thread(int core);
 void restore_thread_affinity(const ThreadAffinity& previous);
 
 class ExpertPool {
 public:
-    /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores
-    /// (minus core 0 by default) and each owns one `ExpertScratch`, so nothing in the token path allocates.
+    /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores (minus core
+    /// 0 by default) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
-    /// **`host_works` PUTS THE HOST THREAD INTO THE DRAIN (R2.2's FIRST HALF).**
+    /// **`host_works` PUTS THE HOST THREAD INTO THE DRAIN.**
     ///
-    /// The pool reserves core 0 for the host loop so the doorbell spin cannot steal a worker's cycles - but
-    /// during `run()` the host does not spin, it waits, so core 0 is idle for the whole drain. Measured on the
-    /// 6-core machine this project targets: the engine's pool drains at **33.7 GB/s** (663.6 MB of expert
-    /// blobs in 19.71 ms/token) where the same kernel on 5 workers should reach 5/6 x 44.14 = 36.8 and the
-    /// machine measures 44.14 GB/s on all six. So the sixth core is being paid for and not used.
-    ///
-    /// With `host_works`, `run()` claims jobs itself instead of spinning on `done_`, and the pool is six
-    /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
-    /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
+    /// The pool reserves core 0 for the host loop so the doorbell spin cannot steal a worker's cycles - but during
+    /// `run()` the host does not spin, it waits, so core 0 is idle for the whole drain.  With `host_works`, `run()`
+    /// claims jobs itself instead of spinning on `done_`, and the pool uses every core.  `false` is the A/B arm - the
+    /// counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
     explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
                         PoolAffinity affinity = PoolAffinity::All);
-    /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
+    /// The watchdog's view of the pool: the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
     ExpertPool(const ExpertPool&) = delete;
@@ -153,16 +141,16 @@ public:
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
     void run(ExpertJob* jobs, int n);
 
-    /// Plan v0.3 P4: the same outputs as `run`, bitwise, with every expert split by rows across all threads
-    /// (gate/up rows, then the intermediate's quantization, then down rows).  With fewer experts than threads -
-    /// the case once the VRAM tier takes half of them - `run` leaves cores idle and each expert streams at one
-    /// core's bandwidth; this streams every expert at all of them.  At most `kMaxSplit` experts.
+    /// The same outputs as `run`, bitwise, with every expert split by rows across all threads (gate/up rows, then the
+    /// intermediate's quantization, then down rows).  With fewer experts than threads - the case once the VRAM tier
+    /// takes half of them - `run` leaves cores idle and each expert streams at one core's bandwidth; this streams every
+    /// expert at all of them.  At most `kMaxSplit` experts.
     void run_split(ExpertJob* jobs, int n);
     static constexpr int kMaxSplit = 16;
-    /// Plan v0.3 P6: `run_split` for multi-token jobs (at most `kMaxSplitMulti`); the rows of each expert are
-    /// read once for all of its tokens.
+    /// `run_split` for multi-token jobs (at most `kMaxSplitMulti`); the rows of each expert are read once for all of
+    /// its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
-    /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
+    /// the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
@@ -174,11 +162,10 @@ public:
     /// it.
     long long pauses() const { return 0; }
 
-    /// **WHERE `run()` SPENDS ITS TIME, in milliseconds accumulated over its lifetime.**  Three phases per
-    /// layer - wait for every worker to be parked, wait for the drain, wait for them to re-park - and until now
-    /// all three were reported as one number.  Without the split there is no way to tell a pool that is slow at
-    /// the WORK from one that is slow at the SYNCHRONISATION, and those need opposite fixes: the first is a
-    /// kernel problem and the second is a barrier problem.
+    /// **WHERE `run()` SPENDS ITS TIME, in milliseconds accumulated over its lifetime.**  Three phases per layer - wait
+    /// for every worker to be parked, wait for the drain, wait for them to re-park - reported apart, because a pool
+    /// that is slow at the WORK and one that is slow at the SYNCHRONISATION need opposite fixes: the first is a kernel
+    /// problem and the second is a barrier problem.
     ///
     /// Only the host thread touches these, in `run()`, so they need no atomics.
     void phase_ms(double& wait_park, double& drain, double& repark) const {
@@ -187,15 +174,14 @@ public:
         repark = ms_repark_;
     }
 
-    /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's
-    /// batches are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends
-    /// keeps every worker's core at 100% while the engine waits for a request - issue #4, "CPU 50% even when
-    /// doing nothing" (7 of the 5700X's 16 threads).  Between requests the workers block on `sleep_cv_`.  NOT only
-    /// between requests: with most experts in VRAM (a 24 GB card) many layers have no CPU work, so the workers
-    /// also sleep mid-request - which the claim protocol above must survive (issue #29).
+    /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's batches
+    /// are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends keeps every
+    /// worker's core at 100% while the engine waits for a request.  Between requests the workers block on `sleep_cv_`.
+    /// NOT only between requests: with most experts in VRAM many layers have no CPU work, so the workers also sleep
+    /// mid-request - which the claim protocol above must survive.
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
-    /// spinning forever, and the server starts it again (issue #29).
+    /// spinning forever, and the server starts it again.
     static constexpr std::chrono::seconds kStall{60};
 
 private:
@@ -223,26 +209,21 @@ private:
     double ms_wait_park_ = 0.0;
     double ms_drain_ = 0.0;
     double ms_repark_ = 0.0;
-    // ---- EACH ATOMIC GETS ITS OWN CACHE LINE, AND THE SPIN COUNTER IS GONE.  (Review finding C3.)
+    // ---- EACH ATOMIC GETS ITS OWN CACHE LINE.
     //
-    // These were six adjacent atomics, which put `head_`, `done_`, `parked_` and `epoch_` on ONE cache line -
-    // the four that workers and the host actually contend on, invalidating each other on every access.
-    //
-    // Worse, the parked spin did `pauses_.fetch_add(1)` on EVERY iteration: a LOCKED read-modify-write, five
-    // workers against one line, at roughly one iteration per `_mm_pause`.  So the line the host must WRITE to
-    // publish work (`epoch_`) and READ to confirm the workers are parked (`parked_`) was being hammered by the
-    // very threads waiting for it.  That is contention the pool imposes on itself.
-    //
-    // The counter was diagnostic only - `pauses()` was read in one place, to print a number nothing branched on
-    // - so it is deleted rather than amortised.  `alignas(64)` then stops the remaining four sharing.
-    // issue #31 diagnostics: each worker's state (kParked, kSleeping, kBetween, or the job it runs) and the host's
-    // (kIdle, kWaitParked, kWaitDone, or its job), printed by the serve watchdog through `diag`
+    // `head_`, `done_`, `parked_` and `epoch_` are the four that workers and the host actually contend on; sharing a
+    // cache line they would invalidate each other on every access.  The line the host must WRITE to publish work
+    // (`epoch_`) and READ to confirm the workers are parked (`parked_`) must not be hammered by the very threads
+    // waiting for it, so the parked spin carries no counter (a locked read-modify-write per iteration) and
+    // `alignas(64)` stops the four sharing.
+    // Diagnostics: each worker's state (kParked, kSleeping, kBetween, or the job it runs) and the host's (kIdle,
+    // kWaitParked, kWaitDone, or its job), printed by the serve watchdog through `diag`
     static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,
                              kWaitDone = -12;
     std::unique_ptr<std::atomic<int32_t>[]> wstate_;
     std::atomic<int32_t> hstate_{kIdle};
     std::atomic<int64_t> hstate_ms_{0};
-    alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index (issue #29)
+    alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index
     alignas(64) std::atomic<uint32_t> done_{0};
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
@@ -265,12 +246,12 @@ private:
     std::vector<SplitBuf> split_;
     // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
     ExpertJobMulti* mjobs_ = nullptr;
-    int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
-    int mtasks_ = 1;        // equal row ranges the phase is cut into
+    int64_t mrows_ = 0;   // rows of the current multi phase across all its experts (n * FF, then n * H)
+    int mtasks_ = 1;   // equal row ranges the phase is cut into
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][FF];
         ActQ a2[MAXT];
-        alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
+        alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;

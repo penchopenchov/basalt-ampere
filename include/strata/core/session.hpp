@@ -1,17 +1,17 @@
 // include/strata/core/session.hpp - ONE TOKEN through all 48 layers, and the doorbell protocol between them.
 //
-// P2.S5's host loop, and the first place the engine runs a whole forward pass rather than one block.  What it
-// owns is the ORDER across layers and the state that outlives a layer:
+// The host loop, and the place the engine runs a whole forward pass rather than one block.  What it owns is the ORDER
+// across layers and the state that outlives a layer:
 //
 //   * the gated residual stack `R` - (hc, n_embd), which every block reads and writes;
 //   * 12 QSA states (KV cache + indexer) and 36 GDN states (recurrence + conv history), because `is_qsa_layer`
 //     splits the 48 layers 12/36 and the two kinds of state have nothing in common;
 //   * the per-token expert handoff, which is where the CPU pool meets the GPU.
 //
-// WHY THE LAYER GRAPHS ARE CAPTURED AND THE LOOP IS NOT.  A graph bakes in its arguments, so the graph unit is
-// ONE LAYER: everything per-token (the position, the step counts) arrives through fixed-address device buffers
-// (rounds 211-214), and the HOST decides when each layer runs.  That decision is the whole point - it is what
-// lets the CPU expert pool start while the GPU is still working on the next layer.
+// WHY THE LAYER GRAPHS ARE CAPTURED AND THE LOOP IS NOT.  A graph bakes in its arguments, so the graph unit is ONE
+// LAYER: everything per-token (the position, the step counts) arrives through fixed-address device buffers, and the
+// HOST decides when each layer runs.  That decision is the whole point - it is what lets the CPU expert pool start
+// while the GPU is still working on the next layer.
 #pragma once
 
 #include "strata/core/hit_hook.hpp"
@@ -47,13 +47,11 @@ struct SessionState {
     float* R = nullptr;             ///< alias of `block.R`, named for what it means at this level
     int64_t k = 10;                 ///< experts per token
 
-    // **THE LAYER-RANGE CARVE (multi-GPU).**  A split stage's session used to carve state for ALL 48 layers
-    // (every QSA KV pool at max_cells, every GDN recurrence) while running only its slice - the same
-    // whole-model-sized-buffer disease the QSA chunked-prefill PR cured upstream.  A session now owns
-    // [layer_lo, layer_hi): `qsa_states`/`gdn_state` keep GLOBAL ordinal indexing, the arrays simply hold
-    // fewer rows, so per-layer consumers subtract `gdn_ord0`, and every old model-level `qsa_states[0]` use
-    // (the shared RoPE table, the prefill staging identity, the MTP rope borrow) reads `qsa_states[primary]`.
-    // A range with no QSA layer still carves ONE primary state so those model-level uses stay valid.
+    // **THE LAYER-RANGE CARVE (multi-GPU).**  A split stage's session owns [layer_lo, layer_hi) and carves state only
+    // for that range: `qsa_states`/`gdn_state` keep GLOBAL ordinal indexing, the arrays simply hold fewer rows, so
+    // per-layer consumers subtract `gdn_ord0`, and every model-level use of `qsa_states[0]` (the shared RoPE table,
+    // the prefill staging identity, the MTP rope borrow) reads `qsa_states[primary]`.  A range with no QSA layer
+    // still carves ONE primary state so those model-level uses stay valid.
     int64_t layer_lo = 0, layer_hi = 0;   ///< resolved by `session_init` (hi = n_layers for the full range)
     int64_t qsa_ord0 = 0;                 ///< global QSA ordinal of the first allocated state
     int64_t qsa_alloc = 0;                ///< allocated QSA states (>= 1 whenever the model has any)
@@ -88,20 +86,20 @@ struct SessionState {
     PleRun ple;
 };
 
-/// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because P2.T10
-/// requires ZERO token-path allocations - a `cudaMalloc` that happened on the first token of a longer sequence
-/// would satisfy every test here and fail that one.
+/// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because the token path
+/// allocates NOTHING - a `cudaMalloc` that happened on the first token of a longer sequence would satisfy every test
+/// here and fail that one.
 ///
-/// [layer_lo, layer_hi) carves only that range's per-layer state (a split stage runs a slice of the model);
-/// the default full range is byte-identical to the old whole-model carve.  Pure arithmetic - safe to call for
-/// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
+/// [layer_lo, layer_hi) carves only that range's per-layer state (a split stage runs a slice of the model); the
+/// default full range is the whole-model carve.  Pure arithmetic - safe to call for a candidate range before anything
+/// is allocated, which is how the layer-split search prices a placement.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo = 0, int64_t layer_hi = -1);
-/// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
-/// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
+/// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the rope
+/// kernels' registered angle table), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
@@ -109,31 +107,27 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 
 /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.
 ///
-/// `parts` is (k, n_embd) DEVICE memory, filled by the caller - by the CPU expert pool and the VRAM-resident
-/// experts.  In this phase `moe_layer` consumes it directly; the doorbell protocol's job is to let it be
-/// produced DURING the layer rather than before it, which is a change to *when* the host runs, not to what this
-/// function computes.
+/// `parts` is (k, n_embd) DEVICE memory, filled by the caller - by the CPU expert pool and the VRAM-resident experts.
+/// `moe_layer` consumes it directly; the doorbell protocol's job is to let it be produced DURING the layer rather
+/// than before it, which is a change to *when* the host runs, not to what this function computes.
 ///
 /// `sync_every_layer` inserts a device synchronisation and an error check after EVERY layer.  That is the
-/// `--sync-every-layer` debug mode, and it is deliberately a parameter rather than a compile-time choice: the
-/// errors it catches (a kernel reading a buffer that a later layer writes) are invisible otherwise, and the
-/// synchronisation it costs is exactly what P2.X3 forbids in the fast path.
+/// `--sync-every-layer` debug mode, and it is deliberately a parameter rather than a compile-time choice: the errors
+/// it catches (a kernel reading a buffer that a later layer writes) are invisible otherwise, and the synchronisation
+/// it costs is exactly what the fast path avoids.
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                    SessionState& s, const float* parts, void* stream, bool sync_every_layer,
                    std::string& err);
 
 // ================================ the captured form ================================
 
-/// ONE GRAPH PER LAYER, because a graph bakes in its POINTERS and every layer has different weights AND
-/// different state.  That is not a limitation to work around - it is what makes the per-layer graph the right
-/// unit: the host decides when each layer runs, which is what lets the CPU expert pool start while the GPU is
-/// still working on the next one.
+/// ONE GRAPH PER LAYER, because a graph bakes in its POINTERS and every layer has different weights AND different
+/// state.  That is what makes the per-layer graph the right unit: the host decides when each layer runs, which is what
+/// lets the CPU expert pool start while the GPU is still working on the next one.
 ///
-/// WHY THIS IS WORTH DOING, MEASURED: **the engine is launch-bound, not bandwidth-bound.**  Every kernel in
-/// `gdn_layer` measured ~0.028 ms - including `gdn_gate`, which processes FORTY-EIGHT elements, and a kernel
-/// cannot execute for 28 us.  That is what a null-stream launch costs on this driver, and `gdn_layer` makes ~19
-/// of them while a block makes ~45.  Replaying the 43-node block graph measured **1.585 ms against 2.393 ms**
-/// for the same work as direct launches - a 1.51x that is pure launch overhead.
+/// WHY THIS IS WORTH DOING: **the engine is launch-bound, not bandwidth-bound.**  Every small kernel costs the same
+/// fixed time whatever it processes, and a block makes dozens of launches; replaying one graph per block removes
+/// most of that overhead.
 struct SessionGraphs {
     cudaGraphExec_t* execs = nullptr;   ///< one per layer, in layer order
     int64_t n = 0;
@@ -206,20 +200,18 @@ struct SessionGraphs {
 
     /// **WHERE THE PER-LAYER ROUND TRIP GOES, AND `ms_to_ring` ALONE CANNOT SAY.**
     ///
-    /// `--no-pool` measures **38.73 ms/token against a 26.32 ms pure-GPU floor**, so ~12.4 ms/token - a quarter
-    /// of the token - is spent in the loop with no expert work at all: 0.258 ms per layer. `ms_to_ring` covers
-    /// only the first half of that; it stops when the ring is seen, and everything the host then does before
+    /// With `--no-pool` a sizeable part of the token is spent in the loop with no expert work at all.  `ms_to_ring`
+    /// covers only the first half of that; it stops when the ring is seen, and everything the host then does before
     /// the next `pre` is launched is invisible to it.
     ///
-    /// So the round trip is split at the ring, and **`ms_to_ring` above IS the first half** - do not add a
-    /// second counter for it:
+    /// So the round trip is split at the ring, and **`ms_to_ring` above IS the first half** - do not add a second
+    /// counter for it:
     ///
     ///   * `ms_to_ring` - launch -> ring observed. The GPU is working (or already finished) here.
-    ///   * `ms_host`    - ring observed -> `pre[l+1]` launched. **The GPU has nothing queued and is IDLE for
-    ///                    all of this unless `pre[l]`'s tail still covers it.** This is
-    ///                    `cudaMemcpyAsync(parts)` + `cudaGraphLaunch(post[l])` + `cudaGraphLaunch(pre[l+1])` +
-    ///                    `cudaEventRecord`, and if it is the large half then the fix is fewer driver calls
-    ///                    (R2.4), not a faster kernel.
+    ///   * `ms_host`    - ring observed -> `pre[l+1]` launched. **The GPU has nothing queued and is IDLE for all of
+    ///                    this unless `pre[l]`'s tail still covers it.** This is `cudaMemcpyAsync(parts)` +
+    ///                    `cudaGraphLaunch(post[l])` + `cudaGraphLaunch(pre[l+1])` + `cudaEventRecord`, and if it is
+    ///                    the large half then the fix is fewer driver calls, not a faster kernel.
     ///
     /// Cumulative, like `ms_to_ring`; divide by `calls_total * n_layers`.
     double ms_host = 0;
@@ -243,12 +235,11 @@ bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, Sessi
 ///
 /// **THIS IS THE TRUE PER-TOKEN GPU FLOOR, AND `session_replay` IS NOT.**  `session_replay` launches only
 /// `gr.execs[l]`, the `pre` graphs, so it omits the 48 `post` graphs (shared expert, combine, second `gr_write`)
-/// entirely - and everything published as "39.8 ms pure GPU" came from it while being described as the whole
-/// GPU.  See `Memory/ERRORS.md` A4.
+/// entirely.
 ///
 /// `parts` is left at whatever the buffer holds, because no pool writes it; that is deliberate and makes the
-/// measurement pure GPU work.  The LM head is NOT included here - the caller times it separately, since it runs
-/// on the host-side path rather than inside a captured graph.
+/// measurement pure GPU work.  The LM head is NOT included here - the caller times it separately, since it runs on
+/// the host-side path rather than inside a captured graph.
 bool session_replay_full(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
                          SessionGraphs& gr, void* stream, std::string& err);
 
@@ -291,14 +282,9 @@ bool session_replay_stages(const ModelGeometry& g, int64_t pos, int32_t pos_base
 
 /// **THE SAME REPLAY, KEEPING EVERY LAYER INSTEAD OF SUMMING THEM.**
 ///
-/// The 48 layers are not 48 of the same thing: 36 are GDN and 12 are QSA, and the mixer - 55.8% of the GPU
-/// floor - contains both. A total cannot separate them; a per-layer vector can, and it is already being
-/// measured. `out` is resized to `n_layers` and holds each layer's mixer time in milliseconds.
-///
-/// **THIS IS THE CHEAPEST HALF OF R0.10 AND IT NEEDS NO NEW SPLIT.** Round 309's uncaptured table put GDN at
-/// 10.88 ms for 36 layers and QSA at 4.56 for 12, which would make the recurrence the largest single R3
-/// target; that table also had `moe_finish` wrong by 4x, so the ratio is worth re-deriving from the captured
-/// graph rather than inherited.
+/// The 48 layers are not 48 of the same thing: 36 are GDN and 12 are QSA, and the mixer contains both.  A total
+/// cannot separate them; a per-layer vector can.  `out` is resized to `n_layers` and holds each layer's mixer time in
+/// milliseconds.
 bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
                                      SessionGraphs& gr, void* stream, std::vector<double>& mixer_per_layer,
                                      double& ms_ffn, double& ms_post, std::string& err);
@@ -326,46 +312,42 @@ using PoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, const 
 /// A null pointer means "no VRAM tier" - the default, and what every caller had before R4.
 // The hit hook's type lives in its own header - see `hit_hook.hpp` for why and for the ordering it wants.
 
-/// `phases/phase-2-correct-engine.md` P2.S5's host loop, which is the point of everything above it:
+/// The host loop, which is the point of everything above it:
 ///
 ///     launch G[l] -> poll the doorbell -> read the miss list -> dispatch the pool -> wait for it ->
 ///     write y_miss -> launch G[l+1]
 ///
-/// **NO `cudaStreamSynchronize` IN THE LOOP**, which is P2.X3.  Waiting is `cudaEventQuery` on an event recorded
-/// right after the launch - a QUERY, and it is not optional: round 195 measured a host spin that only read
-/// memory never running the kernel at all, 5,907,703 spins over 500 ms with the datum flipping only when
-/// `cudaStreamSynchronize` was called.
+/// **NO `cudaStreamSynchronize` IN THE LOOP.**  Waiting is `cudaEventQuery` on an event recorded right after the
+/// launch - a QUERY, and it is not optional: a host spin that only reads memory may never see the kernel run.
 ///
-/// **THE OVERLAP IS THE ONE-LAYER DELAY.**  A layer publishes `x_f` at ~71% of its own duration, so the pool has
-/// the remaining 29% of that layer to work in; its result is consumed by the NEXT layer, which is why the
-/// combine is not waiting on it.  `overlap = false` runs the same sequence with a synchronisation after every
-/// layer, which is the comparison that says whether the pipeline is worth its complexity - and it is a
-/// parameter rather than a second function so that the two cannot drift.
+/// **THE OVERLAP IS THE ONE-LAYER DELAY.**  A layer publishes `x_f` well before its own end, so the pool has the
+/// remaining part of that layer to work in; its result is consumed by the NEXT layer, which is why the combine is not
+/// waiting on it.  `overlap = false` runs the same sequence with a synchronisation after every layer, which is the
+/// comparison that says whether the pipeline is worth its complexity - and it is a parameter rather than a second
+/// function so that the two cannot drift.
 ///
-/// **`dump_layers`, WHEN NOT NULL, IS THE C1 ORACLE AND IT IS A HOST BUFFER OF `(n_layers + 1) * hc * n_embd`
-/// FLOATS.**  Slot 0 is the residual the function was ENTERED with - the token's embedding broadcast to every
-/// stream, which is the reference's `hc_init` node - and slot `l + 1` is `s.R` after layer `l`, which is the
-/// reference's `l_last-<l>`.  Each is enqueued as a device-to-host copy, and the final `cudaStreamSynchronize`
-/// at the end of the loop is what makes every one of them complete.  **NO EXTRA SYNCHRONISATION IS INSERTED**,
-/// which is the whole reason this is written as an enqueue rather than a read: `pre[l+1]` does not write `R` and
-/// `post[l+1]` is launched after the copy on the same stream, so FIFO order alone makes slot `l + 1` a true
-/// snapshot.  It costs 40 KB per layer per token, and it is the only way to bisect the engine against the
-/// reference layer by layer instead of against one end-to-end perplexity.
-/// Per-token scratch that MUST NOT be reallocated per token (P2.T10, review finding H3).
+/// **`dump_layers`, WHEN NOT NULL, IS THE ORACLE AND IT IS A HOST BUFFER OF `(n_layers + 1) * hc * n_embd` FLOATS.**
+/// Slot 0 is the residual the function was ENTERED with - the token's embedding broadcast to every stream, which is
+/// the reference's `hc_init` node - and slot `l + 1` is `s.R` after layer `l`, which is the reference's `l_last-<l>`.
+/// Each is enqueued as a device-to-host copy, and the final `cudaStreamSynchronize` at the end of the loop is what
+/// makes every one of them complete.  **NO EXTRA SYNCHRONISATION IS INSERTED**: `pre[l+1]` does not write `R` and
+/// `post[l+1]` is launched after the copy on the same stream, so FIFO order alone makes slot `l + 1` a true snapshot.
+/// It is the way to bisect the engine against the reference layer by layer instead of against one end-to-end
+/// perplexity.
 ///
-/// **`session_loop` IS CALLED ONCE PER TOKEN, SO ANYTHING IT ALLOCATES IS A PER-TOKEN ALLOCATION.**  It used to
-/// allocate three things on every token of every run:
+/// Per-token scratch that MUST NOT be reallocated per token.
+///
+/// **`session_loop` IS CALLED ONCE PER TOKEN, SO ANYTHING IT ALLOCATES IS A PER-TOKEN ALLOCATION**, and these three
+/// must not be:
 ///
 ///   * `cudaHostAlloc` for the pool's pinned staging, freed by an RAII destructor at the end of the call - and
-///     `cudaFreeHost` IMPLICITLY SYNCHRONISES THE DEVICE, so every token ended with a device sync;
+///     `cudaFreeHost` IMPLICITLY SYNCHRONISES THE DEVICE, so every token would end with a device sync;
 ///   * `cudaEventCreate` / `cudaEventDestroy` for the doorbell probe;
 ///   * a host-affinity change (`physical_cores` + pin + restore).
 ///
-/// A comment in the old code said "allocated once", but once per token is not once.
-///
-/// Own one of these at session setup and pass it in.  **Passing `nullptr` keeps the old behaviour** - the loop
-/// allocates and frees locally - so every existing caller and test is unaffected, but the allocation is then
-/// visible at the call site instead of hidden inside a hot function.
+/// Own one of these at session setup and pass it in.  **Passing `nullptr` makes the loop allocate and free locally**,
+/// so every existing caller and test is unaffected, but the allocation is then visible at the call site instead of
+/// hidden inside a hot function.
 struct SessionLoopScratch {
     float* y_miss = nullptr;        ///< pinned host staging for the pool's answer, `parts_bytes` long
     size_t parts_bytes = 0;
@@ -383,19 +365,18 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
                   PoolFn pool, HitFn hits, void* user, bool overlap, void* stream, std::string& err,
                   float* dump_layers = nullptr, SessionLoopScratch* scratch = nullptr);
 
-// ================================ plan v0.3 P3: THE WHOLE TOKEN AS ONE GRAPH ================================
+// ================================ THE WHOLE TOKEN AS ONE GRAPH ================================
 //
-// Under WDDM every graph launch costs ~0.3-0.4 ms of submission latency, and the per-layer loop above makes 96
-// of them per token: measured 48.6 ms/token for 12 ms of GPU kernels and 27 ms of pool.  The token graph holds
-// all 48 layers.  Between `pre[l]` (which rings the doorbell) and the parts copy, a one-thread kernel waits ON
-// THE DEVICE until the host writes the ring value into `db.h_flag`; the host only polls rings, runs the pool
-// and writes flags, with no driver call in the loop (bench/micro/device_wait.cu: 5.2 us per handoff).
+// Every graph launch costs submission latency, and the per-layer loop above makes 96 of them per token.  The token
+// graph holds all 48 layers.  Between `pre[l]` (which rings the doorbell) and the parts copy, a one-thread kernel
+// waits ON THE DEVICE until the host writes the ring value into `db.h_flag`; the host only polls rings, runs the pool
+// and writes flags, with no driver call in the loop.
 //
 //     for l:  pre[l] (.. router, doorbell ring, shared expert)  ->  doorbell_wait  ->  parts <- y_miss (H2D)
 //             ->  post[l] (combine, gr_write)
 //
-// Same kernels, same order per layer as `session_loop`, so the token is bitwise the same.  No VRAM expert tier
-// yet (the hit decision is a host step between ring and post); the caller falls back to `session_loop` then.
+// Same kernels, same order per layer as `session_loop`, so the token is bitwise the same.  Without a VRAM expert
+// tier (the hit decision is a host step between ring and post) the caller falls back to `session_loop`.
 struct TokenGraph {
     cudaGraphExec_t exec = nullptr;
     bool captured = false;
@@ -408,9 +389,9 @@ struct TokenGraph {
     int64_t flushes = 0;             ///< cudaStreamQuery calls made because a ring was slow to appear
 };
 
-/// Plan v0.3 P4: the VRAM expert tier inside the token graph.  Residency is STATIC during a token (a
-/// `n_layers x n_expert` table, slot or -1, on the device; the host pool reads its own copy), so the hit list
-/// is built on the device right after the ring and the hits run while the CPU computes the misses.
+/// The VRAM expert tier inside the token graph.  Residency is STATIC during a token (a `n_layers x n_expert` table,
+/// slot or -1, on the device; the host pool reads its own copy), so the hit list is built on the device right after
+/// the ring and the hits run while the CPU computes the misses.
 struct TokenHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert]
     int64_t n_expert = 0;

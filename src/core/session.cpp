@@ -62,7 +62,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
-    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
+    // One QSA state carries the RoPE table; the others borrow it.
     if (g.n_qsa_layers() > 0)
         n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
     n += qsa_buffers_bytes(g, max_cells);
@@ -591,16 +591,14 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     // the whole suite passed while a 20-token prompt rotated every token at position 0.
     stage_token(g, pos, pos_base, s);
 
-    // ---- **THE TOKEN PATH ALLOCATES NOTHING (P2.T10, review finding H3).**
+    // ---- **THE TOKEN PATH ALLOCATES NOTHING.**
     //
-    // Everything this loop needs on the host - the pinned staging for the pool's answer, the doorbell probe
-    // event, and the host pin - lives in a `SessionLoopScratch` owned by the SESSION and passed in.  It used to
-    // be created here, once per token, and `cudaFreeHost` at the end of the call IMPLICITLY SYNCHRONISES THE
-    // DEVICE, so every token finished with a device-wide sync that nothing had asked for.  A comment here said
-    // "allocated once"; once per token is not once.
+    // Everything this loop needs on the host - the pinned staging for the pool's answer, the doorbell probe event, and
+    // the host pin - lives in a `SessionLoopScratch` owned by the SESSION and passed in: created per token it would
+    // pay a `cudaFreeHost` at the end of every call, which IMPLICITLY SYNCHRONISES THE DEVICE.
     //
-    // Passing `nullptr` keeps the old behaviour so existing callers and tests are unaffected: the loop builds a
-    // local scratch and frees it on every exit path below, including the error returns.
+    // Passing `nullptr` makes the loop build a local scratch and free it on every exit path below, including the
+    // error returns.
     SessionLoopScratch local;
     if (scratch == nullptr) {
         if (!local.init(parts_bytes, err)) return false;
@@ -628,8 +626,8 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     float* y_miss = scratch->y_miss;
     cudaEvent_t probe = scratch->probe;
 
-    // the first layer has no previous layer's experts: `y_miss` starts at zero, which is what "hits are empty
-    // in this phase" means once every miss has been computed
+    // the first layer has no previous layer's experts: `y_miss` starts at zero, which is what "hits are empty in this
+    // phase" means once every miss has been computed
     cudaMemcpyAsync(gr.parts_dev, y_miss, parts_bytes, cudaMemcpyHostToDevice, cs);
     doorbell_reset(*s.db);
     uint32_t expected = 0;
@@ -808,10 +806,9 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
         if (is_qsa_layer(g, l)) ++qsa_index;
 
         if (sync_every_layer) {
-            // THE DEBUG MODE, and its cost is the point: it is a real synchronisation after every layer, which
-            // P2.X3 forbids in the fast path.  It exists to turn an ASYNCHRONOUS error - a kernel reading a
-            // buffer a later layer wrote, or an out-of-range launch - into a failure AT THE LAYER THAT CAUSED
-            // IT, instead of a wrong number 40 layers later or at the end of the token.
+            // THE DEBUG MODE, and its cost is the point: it is a real synchronisation after every layer.  It turns an
+            // ASYNCHRONOUS error - a kernel reading a buffer a later layer wrote, or an out-of-range launch - into a
+            // failure AT THE LAYER THAT CAUSED IT, instead of a wrong number 40 layers later or at the end of the token.
             const cudaError_t e = cudaStreamSynchronize(cs);
             if (e != cudaSuccess) {
                 err = "layer " + std::to_string(l) + ": " + cudaGetErrorString(e);
@@ -871,7 +868,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
                                                     hits->x_scale);
         }
         strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
-        // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
+        // A kernel, not a memcpy node: a copy-engine node splits the driver's submission into extra flushes.
         strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
         if (hits != nullptr)
             strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
@@ -910,7 +907,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     doorbell_reset(*s.db);
     const cudaError_t le = cudaGraphLaunch(tg.exec, cs);
     if (le != cudaSuccess) { err = std::string("session_run_token: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs);                     // one flush, so WDDM submits the graph now
+    (void) cudaStreamQuery(cs);   // one flush, so the driver submits the graph now
     constexpr int flush_us = 2000;   // only notices faults
     volatile uint32_t* const seq = s.db->h_seq;
     volatile uint32_t* const flag = s.db->h_flag;

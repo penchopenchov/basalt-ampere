@@ -1,4 +1,4 @@
-// src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
+// src/kernels/cpu/pool.cpp - the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -25,10 +25,10 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 
 CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo;
-    // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
-    // load/store bandwidth, so a worker on each would put two workers on one core, as the Windows branch above
-    // explains.  sysfs names each CPU's (package, core); the first allowed CPU of each pair is kept, so a taskset
-    // that leaves out the first sibling still gets its core.  Without sysfs every allowed CPU counts, as before.
+    // The logical CPUs this process may run on, ONE PER PHYSICAL CORE: SMT siblings share a core's load/store
+    // bandwidth, so a worker on each would put two workers on one core.  sysfs names each CPU's (package, core); the
+    // first allowed CPU of each pair is kept, so a taskset that leaves out the first sibling still gets its core.
+    // Without sysfs every allowed CPU counts.
     auto topo_read = [](int cpu, const char* what) -> long {
         char path[96];
         std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
@@ -104,7 +104,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     }
 
     if (affinity == PoolAffinity::All || !topo.is_hybrid) {
-        if (topo.is_hybrid)   // #642: the P-cores first (see the Windows branch)
+        if (topo.is_hybrid)
             std::stable_sort(all_cpus.begin(), all_cpus.end(),
                              [](const CoreLinux& x, const CoreLinux& y) { return x.cap > y.cap; });
         for (const auto& cl : all_cpus) {
@@ -272,17 +272,16 @@ void ExpertPool::worker(int id) {
     // first call, which is the good case; a version that deadlocked on the second would be far worse.
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
-        // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the
-        // sibling hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these
-        // iterations are spent here with nothing to do.
+        // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the sibling
+        // hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these iterations are spent
+        // here with nothing to do.
         //
-        // **AND NOTHING ELSE HAPPENS IN HERE.**  This loop used to do `pauses_.fetch_add(1)` on every iteration
-        // - a locked read-modify-write, five workers against one cache line - so the workers spent their wait
-        // invalidating each other's caches and the very line the host writes to publish work.  The counter was
-        // diagnostic and nothing branched on it.  See the note on the atomics in pool.hpp.
+        // **AND NOTHING ELSE HAPPENS IN HERE**: no counter is bumped per iteration (a locked read-modify-write, five
+        // workers against one cache line, would make the workers invalidate each other's caches and the very line the
+        // host writes to publish work).  See the note on the atomics in pool.hpp.
         //
-        // After `kSpinBeforeSleep` with no work the worker sleeps instead (issue #4).  The clock is read once
-        // every 1024 pauses, so the spin itself is unchanged.
+        // After `kSpinBeforeSleep` with no work the worker sleeps instead.  The clock is read once every 1024 pauses,
+        // so the spin itself is unchanged.
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
@@ -351,9 +350,9 @@ void ExpertPool::wait_parked(const char* what) {
         if (spins == 1024u) t0 = now;
         else if (now - t0 > kStall) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
-                                 "so the server can start it again (issue #29)\n",
+                                 "so the server can start it again\n",
                          what, parked_.load(), n_);
-            strata::core::release_gpu_waits(stderr);   // #267: the GPU may be spinning on this layer's flag
+            strata::core::release_gpu_waits(stderr);   // the GPU may be spinning on this layer's flag
             std::fflush(stderr);
             std::abort();
         }
@@ -374,9 +373,9 @@ void ExpertPool::wait_done(int n) {
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
         else if (now - t0 > kStall) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
-                                 "stopping the engine so the server can start it again (issue #29)\n",
+                                 "stopping the engine so the server can start it again\n",
                          d, n, parked_.load(), n_);
-            strata::core::release_gpu_waits(stderr);   // #267
+            strata::core::release_gpu_waits(stderr);
             std::fflush(stderr);
             std::abort();
         }
@@ -403,7 +402,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
         } else if (mode_ >= 5) {
-            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
+            // native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
             const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
@@ -440,7 +439,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 r += r1 - r0;
             }
         } else {
-            // plan v0.3 P6: an equal range of the phase's rows across ALL its experts (a range may span two)
+            // an equal range of the phase's rows across ALL its experts (a range may span two)
             const int per = mode_ == 3 ? FF : H;
             const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
@@ -580,20 +579,18 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     mode_ = 0;
     const uint32_t e = begin_batch(n);   // done, then head (release), then the epoch: the batch is described first
 
-    // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
+    // ---- **THE HOST DRAINS TOO, INSTEAD OF SPINNING ON `done_`.**
     //
-    // The loop below used to be `while (done_ != n) _mm_pause();`.  The host is pinned to core 0 - the core
-    // `physical_cores(true)` deliberately keeps the five workers off - so for the whole drain that core was
-    // idle while five cores did six cores' worth of work.  Measured before the change: 33.7 GB/s against
-    // 5/6 x 44.14 = 36.8 for five workers and 44.14 for six.
+    // The host is pinned to core 0 - the core `physical_cores(true)` deliberately keeps the workers off - so waiting
+    // on `done_` would leave that core idle for the whole drain.
     //
-    // The host claims through the SAME `head_` counter, so this is not a second scheduler and nothing about
-    // the ordering changes: `head_` is a single `fetch_add`, every job is the same size, and a thread that
-    // arrives late simply claims nothing.  `done_` is still the completion signal and the host still waits for
-    // it - what changed is only that the host arrives at that wait having done a share of the work.
+    // The host claims through the SAME `head_` counter, so this is not a second scheduler and nothing about the
+    // ordering changes: `head_` is a single `fetch_add`, every job is the same size, and a thread that arrives late
+    // simply claims nothing.  `done_` is still the completion signal and the host still waits for it - the host
+    // arrives at that wait having done a share of the work.
     //
-    // The host's `done_.fetch_add` is a release for the same reason a worker's is: `j.out` is read by the
-    // device after `run()` returns, so the write must be published, not merely performed.
+    // The host's `done_.fetch_add` is a release for the same reason a worker's is: `j.out` is read by the device
+    // after `run()` returns, so the write must be published, not merely performed.
     if (host_works_) {
         for (;;) {
             const int ci = claim(e);
