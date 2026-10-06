@@ -687,9 +687,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::exit(1);
     }
     const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
-    // STRATA_GDN_AB_UNROLL=1: rows of 2560 take the unrolled kernel (the same bits)
-    static const bool unroll = [] { const char* v = std::getenv("STRATA_GDN_AB_UNROLL"); return v && std::atoi(v) != 0; }();
-    if (unroll && n_embd == 32 * 8 * 10) {
+    if (n_embd == 32 * 8 * 10) {   // rows of 2560 take the unrolled kernel (the same bits)
         if (n_tok <= 4)
             launch_pdl(gdn_ab_multi_unrolled_kernel<4, 10>, dim3(blocks), dim3(64), 0, (cudaStream_t) stream,
                        x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
@@ -717,11 +715,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    static const bool commit_split = [] {
-        const char* e = std::getenv("STRATA_GDN_COMMIT_SPLIT");
-        return !e || e[0] != '0';
-    }();
-    if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
+    if (n_keep != nullptr && t_out_begin >= n_tok) {
         gdn_step_commit_kernel<<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, h_k, h_v, n_keep);
     } else {

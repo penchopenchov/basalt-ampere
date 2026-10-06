@@ -1,5 +1,4 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
-#include "strata/core/emulate.hpp"
 #include <cstdlib>
 #include <cstring>
 #include "strata/kernels/qsa_select.hpp"
@@ -823,8 +822,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         std::exit(1);
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
-    static const bool multi = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
-    if (multi && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
+    if (nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
         block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
                                                                                      max_blocks, scores,
                                                                                      skip_identity ? 1 : 0);
@@ -854,9 +852,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                 cudaGetLastError();
                 return false;
             }
-            // STRATA_QSA_WARP=1|select (an A/B arm): the pre-sm_80 kernels on any card, as RTX 20 runs them
-            const char* w = std::getenv("STRATA_QSA_WARP");
-            cc_major[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "select")) ? 7 : strata::cc_major_of(major);
+            cc_major[dev] = major;
         }
         if (cc_major[dev] < 8) return false;
     }
@@ -895,29 +891,13 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-// Only Turing has a retained model measurement for this CUDA dispatch. Other CUDA devices keep the capacity rule
-// (the RTX 5070 regression below). Cache the properties per calling thread; layer-split device switches are checked.
-static bool topk_active_turing_device() {
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return false;
-    static thread_local int cached_device = -1;
-    static thread_local bool turing = false;
-    if (dev != cached_device) {
-        cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-        turing = prop.major == 7 && prop.minor == 5;
-        cached_device = dev;
-    }
-    return turing;
-}
-
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                             const QsaShapes& s, int32_t* ids, void* stream) {
     if (nq <= 0) return true;
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || nq > 65535 || max_blocks <= 0) return false;
     const size_t smem = (size_t) ((max_blocks + CL_N - 1) / CL_N) * sizeof(uint32_t);
     // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not. It needs sm_90+ (the
-    // card's, or STRATA_EMULATE_CC's) AND code built for it: a build with only older code JIT-compiles their PTX, whose
+    // card's) AND code built for it: a build with only older code JIT-compiles their PTX, whose
     // copy of this kernel is a trap - the function's PTX version says which. `opt`: the dynamic shared memory opted in.
     static int ok[64] = {};
     static size_t opt[64] = {};
@@ -927,7 +907,7 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
         int major = 0;
         cudaFuncAttributes fa{};
         const bool code = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                          strata::cc_major_of(major) >= 9 &&
+                          major >= 9 &&
                           cudaFuncGetAttributes(&fa, block_topk_cluster_kernel) == cudaSuccess && fa.ptxVersion >= 90 &&
                           fa.binaryVersion >= 90;
         cudaGetLastError();
@@ -974,35 +954,15 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks) {
-    // keys in registers when every query's blocks fit (contexts up to ~135K cells), else (CUDA) the same threads
-    // reading them from memory; the same ids. STRATA_TOPK_OLD=1: the original kernel
-    static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
+    // keys in registers when every query's blocks fit (contexts up to ~135K cells), else the same threads reading
+    // them from memory; the same ids
     if (nq <= 0) return;
-    // sm_90+: a cluster of CL_N CTAs per query for the calls of a few queries (decode windows); the same ids.
-    // STRATA_QSA_CLUSTER=0: the one-CTA kernels below
-    static const bool cluster = [] {
-        const char* v = std::getenv("STRATA_QSA_CLUSTER");
-        return !v || std::atoi(v) != 0;
-    }();
-    if (cluster && !old && nq <= CL_MAXQ && qsa_block_topk_cluster(scores, steps, nq, max_blocks, cap, s, ids, stream))
-        return;
-    // the blocks a query can have: the call's active count when the caller knows it (the prompt path), else the capacity.
-    // Decode (no count) keeps the capacity rule and the original register width: nothing changes there.
-    // Turing: --max-context 262144 makes the stride 65538, even while a 131K prompt's active blocks fit in
-    // TK_T * TK_PER registers. Use the prefill bound on sm_75, keeping max_blocks as the score-row stride.
-    // Other CUDA devices keep 0.1.32's capacity rule: #337 was measured on RDNA4, and RTX 5070 64K prompts were
-    // 1-3% slower. Decode/captured graphs omit the bound and never query the device here.
-    static const bool capacity_guard = std::getenv("STRATA_TOPK_CAPACITY_GUARD") != nullptr;
-    // STRATA_TOPK_ACTIVE_ANY=1 (tests): the Turing dispatch on any CUDA card, so qsa_topk_active_parity checks it
-    // on whatever card runs the tests (the kernels are the same on every architecture)
-    static const bool any_card = [] { const char* v = std::getenv("STRATA_TOPK_ACTIVE_ANY"); return v && v[0] == '1'; }();
-    const bool counted = !capacity_guard && active_blocks > 0 && active_blocks <= max_blocks &&
-                         (any_card || topk_active_turing_device());
-    const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
-    const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);
-    constexpr int64_t kWideMinBlocks = 4608;   // RTX 3060: a prompt batch below ~18K cells is faster on the ref
-    const bool too_small = reach > fit && active_blocks > 0 && active_blocks < kWideMinBlocks;
-    if (old || too_small) {
+    // a cluster of CL_N CTAs per query for the calls of a few queries (decode windows); the same ids
+    if (nq <= CL_MAXQ && qsa_block_topk_cluster(scores, steps, nq, max_blocks, cap, s, ids, stream)) return;
+    const int64_t reach = max_blocks;
+    const int64_t fit = (int64_t) TK_T * TK_PER;
+    constexpr int64_t kWideMinBlocks = 4608;   // a prompt batch below ~18K cells is faster on the reference kernel
+    if (reach > fit && active_blocks > 0 && active_blocks < kWideMinBlocks) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
         return;
     }

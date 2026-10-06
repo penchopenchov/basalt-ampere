@@ -77,8 +77,6 @@ int main() {
         std::puts("SKIP: no CUDA device");
         return 77;
     }
-    // the active-bound dispatch is Turing's in the engine; forced here so every CUDA card checks it
-    setenv("STRATA_TOPK_ACTIVE_ANY", "1", 1);
     const Case cases[] = {
         {1111, 256, 0}, {8192, 256, 0}, {32768, 256, 0}, {131072, 256, 0},
         {131075, 255, 0}, {135164, 256, 0}, {135168, 256, 0}, {250022, 256, 0},
