@@ -1,6 +1,6 @@
 # AGENTS.md
 
-basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts model, built only for Linux and NVIDIA Blackwell (sm_120). It runs on one RTX 5090, with a second card as a peer expert tier and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
+Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts model, built only for Linux and NVIDIA Blackwell (sm_120). It runs on one RTX 5090, with a second card as a peer expert tier and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
 
 ## Working rules
 
@@ -17,7 +17,7 @@ basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts
 - **Fast iteration:** quick checks, go/no-go. If something isn't working, write down why and move on.
 - **No permission prompts while the maintainer is away** (ssh to other hosts, docker, system changes). A prompt blocks the whole session.
 - **No drafting/speculation work** in the performance effort; the focus is the per-pass decode cost.
-- **basalt's own kernels are the reference.** Parity tests compare a changed kernel against the current one and against a plain CPU reference; Strata's original kernels are not kept as oracles. Every new kernel gets a parity test (random inputs + real geometry) and a microbench line.
+- **Basalt's own kernels are the reference.** Parity tests compare a changed kernel against the current one and against a plain CPU reference; Strata's original kernels are not kept as oracles. Every new kernel gets a parity test (random inputs + real geometry) and a microbench line.
 
 ## The test machine (everything builds and runs there; the dev laptop has no CUDA)
 
