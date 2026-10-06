@@ -1102,44 +1102,126 @@ class StartFailureLog(unittest.TestCase):
             self.assertNotIn("an earlier start", text)
 
 
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
 class LoadProgress(unittest.TestCase):
-    """The engine's `basalt load:` lines: a bar while a target loads, one line when it is done."""
+    """The engine's `basalt load:` lines: one bar for the whole start, one line when it is done."""
 
     def test_parse(self):
-        from serve.server import load_progress
-        self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100))
+        from serve.server import engine_warning, load_progress, load_total
+        self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100, False))
+        self.assertEqual(load_progress("basalt load: copy cuda1 10 100"), ("cuda1", 10, 100, True))
+        self.assertIsNone(load_progress("basalt load: total 100"))
         self.assertIsNone(load_progress("basalt load: cuda0 ten 100"))
         self.assertIsNone(load_progress("basalt generate: loaded 3 GiB"))
+        from serve.server import load_plan
+        self.assertEqual(load_plan("basalt load: plan cuda0 100"), ("cuda0", 100, False))
+        self.assertEqual(load_plan("basalt load: plan copy cuda1 100"), ("cuda1", 100, True))
+        self.assertIsNone(load_plan("basalt load: plan cuda0 x"))
+        self.assertIsNone(load_plan("basalt load: cuda0 1 2"))
+        self.assertIsNone(load_progress("basalt load: plan cuda0 100"))
+        self.assertEqual(load_total("basalt load: total 4096"), 4096)
+        self.assertIsNone(load_total("basalt load: total many"))
+        self.assertIsNone(load_total("basalt load: cuda0 1 2"))
+        self.assertEqual(engine_warning("basalt warning: model 60.0 GiB, free 40.0 GiB"), "model 60.0 GiB, free 40.0 GiB")
+        self.assertIsNone(engine_warning("basalt warning: "))
+        self.assertIsNone(engine_warning("basalt generate: WARNING: x"))
 
     def test_log_output_prints_only_the_result(self):
-        import io
         from serve.server import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
+        bars.set_total(100 << 30)
+        bars.set_plan("ram", 100 << 30)
         for d in range(0, 101, 5):
             bars.update("ram", d << 30, 100 << 30)
-        bars.update("ram", 100 << 30, 100 << 30)
+        self.assertEqual(out.getvalue(), "")
+        bars.finish()
         lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].startswith("[server] loaded into system ram: 100.0 GiB in "))
+        self.assertTrue(lines[0].startswith("[server] loaded 100.0 GiB in "))
+        self.assertTrue(lines[0].endswith("(system ram 100.0 GiB)"))
 
-    def test_terminal_bar_becomes_a_result_line(self):
-        import io
+    def test_phases_add_up_to_one_result(self):
         from serve.server import LoadBars
+        out = io.StringIO()
+        bars = LoadBars(out, gpus=[2, 3])
+        bars.set_total(5 << 30)
+        for size in (1 << 30, 4 << 30):                                # two phases of one target
+            bars.update("cuda0", 0, size)
+            bars.update("cuda0", size, size)
+        bars.update("cuda1", 0, 2 << 30, copy=True)
+        bars.update("cuda1", 2 << 30, 2 << 30, copy=True)
+        bars.finish()
+        line, = out.getvalue().splitlines()
+        self.assertTrue(line.startswith("[server] loaded 5.0 GiB in "))
+        self.assertTrue(line.endswith("(cuda2 5.0 GiB; cuda3 copy 2.0 GiB)"))
 
-        class Tty(io.StringIO):
-            def isatty(self):
-                return True
+    def test_unfinished_start_is_not_reported(self):
+        from serve.server import LoadBars
+        out = io.StringIO()
+        bars = LoadBars(out)
+        bars.set_total(4 << 30)
+        bars.update("cuda0", 1 << 30, 4 << 30)
+        bars.finish()
+        self.assertEqual(out.getvalue(), "")
+
+    def test_one_bar_per_target_against_its_own_plan(self):
+        from serve.server import LoadBars
+        out = Tty()
+        bars = LoadBars(out, gpus=[2, 3])
+        bars.update("cuda0", 1 << 30, 1 << 30)                          # no plan yet: a count
+        self.assertEqual(out.getvalue().splitlines()[-1].split("\x1b[2K")[-1],
+                         "[server] loading weights into cuda2    1.0 GiB")
+        bars.set_plan("cuda0", 4 << 30)
+        bars.set_plan("ram", 2 << 30)
+        bars.set_plan("cuda1", 1 << 30, copy=True)
+        bars.update("cuda0", 0, 3 << 30)                                # the second phase of the target
+        bars.update("cuda0", 2 << 30, 3 << 30)
+        rows = [r.split("\x1b[2K")[-1] for r in out.getvalue().splitlines()[-3:]]
+        self.assertEqual(rows[0], "[server] loading weights into cuda2      [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB")
+        self.assertEqual(rows[1], "[server] loading weights into system ram [>" + " " * 23 + "]   0.0/2.0 GiB")
+        self.assertEqual(rows[2], "[server] copying experts to cuda3        [>" + " " * 23 + "]   0.0/1.0 GiB")
+        self.assertEqual(len({r.index("[", 8) for r in rows}), 1)       # the bars line up
+        bars.say("[server] warning: x")
+        self.assertIn("\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
+
+    def test_kv_is_a_line_after_the_result_and_not_a_load(self):
+        from serve.server import LoadBars, load_kv, load_progress
+        self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144))
+        self.assertIsNone(load_kv("basalt load: kv cuda0 x 1"))
+        self.assertIsNone(load_progress("basalt load: kv cuda0 100 5"))
+        out = io.StringIO()
+        bars = LoadBars(out, gpus=[2, 3])
+        bars.set_total(2 << 30)
+        bars.set_kv("cuda0", 4 << 30, 262144)
+        bars.update("cuda0", 2 << 30, 2 << 30)
+        bars.finish()
+        first, second = out.getvalue().splitlines()
+        self.assertTrue(first.startswith("[server] loaded 2.0 GiB in "))   # the allocation is not in the total
+        self.assertEqual(second, "[server] kv cache: 4.0 GiB on cuda2, 262144 tokens")
+
+    def test_a_target_planned_empty_shows_nothing(self):
+        from serve.server import LoadBars
         out = Tty()
         bars = LoadBars(out)
-        bars.update("cuda0", 1 << 30, 4 << 30)
-        bars.update("cuda1", 0, 2 << 30)
+        bars.set_plan("cuda0", 1 << 30)
+        bars.set_plan("ram", 0)
+        self.assertEqual(len(bars.lines()), 1)
+
+    def test_a_lowered_total_ends_at_full(self):
+        from serve.server import LoadBars
+        out = io.StringIO()
+        bars = LoadBars(out)
+        bars.set_total(6 << 30)
+        bars.update("cuda0", 0, 4 << 30)
         bars.update("cuda0", 4 << 30, 4 << 30)
-        text = out.getvalue()
-        self.assertIn("\x1b[2A", text)                            # the two bars erased
-        self.assertIn("[server] loaded into cuda0: 4.0 GiB in ", text)
-        self.assertTrue(text.rstrip("\n").endswith("0.0/2.0 GiB"))   # cuda1's bar still last
-        self.assertEqual(list(bars.bars), ["cuda1"])
+        bars.set_total(4 << 30)                                         # the engine left 2 GiB on the file
+        bars.finish()
+        self.assertTrue(out.getvalue().startswith("[server] loaded 4.0 GiB in "))
 
     def test_names_follow_the_picked_cards(self):
         from serve.server import LoadBars
@@ -1147,24 +1229,41 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(LoadBars().name("cuda1"), "cuda1")
         self.assertEqual(LoadBars().name("ram"), "system ram")
 
-    def test_narrator_shows_only_progress(self):
-        import contextlib
-        import io
+    def test_narrator_shows_warnings_and_the_result(self):
         from serve.server import narrate_start
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
-        log.write_text("basalt load: cuda0 0 100\nbasalt generate: expert arena: resident, 31.64 GiB\n"
-                       "basalt load: cuda0 100 100\nbasalt generate: session is up (engine 1)\n", encoding="utf-8")
+        log.write_text("basalt load: total 200\nbasalt load: plan cuda0 100\nbasalt load: plan ram 100\nbasalt load: plan copy cuda1 100\nbasalt warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow\n"
+                       "basalt load: cuda0 0 100\nbasalt generate: expert arena: resident, 31.64 GiB\n"
+                       "basalt load: cuda0 100 100\nbasalt load: ram 0 100\nbasalt load: ram 100 100\n"
+                       "basalt load: copy cuda1 100 100\nbasalt generate: session is up (engine 1)\n", encoding="utf-8")
         done, out = threading.Event(), io.StringIO()
         with contextlib.redirect_stdout(out):
-            t = threading.Thread(target=narrate_start, args=(str(log), 0, [], done))
+            t = threading.Thread(target=narrate_start, args=(str(log), 0, done))
             t.start()
             time.sleep(0.6)
             done.set()
             t.join(5)
         lines = out.getvalue().splitlines()
-        self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].startswith("[server] loaded into cuda0:"))
+        self.assertEqual(lines[0], "[server] warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow")
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[1].startswith("[server] loaded 0.0 GiB in "))
+        self.assertTrue(lines[1].endswith("(cuda0 0.0 GiB, system ram 0.0 GiB; cuda1 copy 0.0 GiB)"))
+
+    def test_an_older_engine_without_a_total_counts_bytes(self):
+        from serve.server import narrate_start
+        d = tempfile.mkdtemp()
+        log = Path(d) / "engine.log"
+        log.write_text("basalt load: cuda0 0 100\nbasalt load: cuda0 100 100\n", encoding="utf-8")
+        done, out = threading.Event(), Tty()
+        t = threading.Thread(target=narrate_start, args=(str(log), 0, done), kwargs={"out": out})
+        t.start()
+        time.sleep(0.6)
+        done.set()
+        t.join(5)
+        text = out.getvalue()
+        self.assertIn("[server] loading weights into cuda0    0.0 GiB", text)
+        self.assertNotIn("[=", text)
 
 
 class CancelledRead(unittest.TestCase):
