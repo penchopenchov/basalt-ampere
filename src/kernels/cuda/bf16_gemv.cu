@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -138,4 +138,4 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
     finish(stream, "bf16_gemv_split");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

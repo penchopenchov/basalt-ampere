@@ -2,7 +2,7 @@
 
 #include "basalt/kernels/rope_scaling.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 void native_rope_set_enabled(bool enabled);
 bool native_rope_enabled();
 

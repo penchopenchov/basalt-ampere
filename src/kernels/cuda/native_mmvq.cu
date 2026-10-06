@@ -40,7 +40,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int QK = 256;
@@ -1881,4 +1881,4 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 }
 
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

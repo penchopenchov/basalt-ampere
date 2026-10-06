@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 /// Where one expert's VRAM lives, or -1.  `int32_t` and not a bool because the slot index is what the kernel
 /// needs, and a table that has to be re-derived from a bitmask is a table that will be re-derived differently
@@ -209,4 +209,4 @@ private:
     int64_t admitted_ = 0;
 };
 
-}  // namespace strata::core
+}  // namespace basalt::core

@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <string>
 
-namespace strata::core {
+namespace basalt::core {
 
 /// The model's geometry, taken from the model definition and the artifact's own metadata.  Every field here
 /// is a number a kernel depends on, so a change is a change to a kernel contract and not a tuning knob.
@@ -94,4 +94,4 @@ bool check_layer(const WeightTable& table, const ModelGeometry& g, int64_t layer
 /// indices, every GDN layer having the GDN set and no QSA tensor, and vice versa.  Returns the first failure.
 bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& err);
 
-}  // namespace strata::core
+}  // namespace basalt::core

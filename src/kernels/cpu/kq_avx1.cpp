@@ -17,7 +17,7 @@
 #error "kq_avx1.cpp must be compiled with AVX enabled (see the per-source flags in CMakeLists.txt)"
 #endif
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 namespace {
 
 // 8 floats -> one float, the same reduction order the AVX2 kernel's hsum_float_8 uses.
@@ -68,4 +68,4 @@ void bf16_rows_dot_multi_avx1(const uint16_t* w, int rows, int cols, const float
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

@@ -1,6 +1,6 @@
 // src/kernels/s2_gemv_parity.cpp - P2.S2's parity test for the S2 GEMV.
 //
-// The reference is the same CHAIN as the decode test: `strata::dequantize_q2_0` is a scalar transcription that
+// The reference is the same CHAIN as the decode test: `basalt::dequantize_q2_0` is a scalar transcription that
 // `bench/micro/dequant_xcheck` checks against **ggml's own** dequantizer, so comparing the GPU GEMV against a
 // dot product built on that scalar decode compares against ggml through one proven hop.
 //
@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
     std::vector<float> scales((size_t) n_out * nb);
     for (size_t i = 0; i < codes.size(); ++i) codes[i] = (uint8_t) (rng() & 0xFF);
     for (size_t i = 0; i < scales.size(); ++i) {
-        scales[i] = strata::fp16_to_fp32(kScales[rng() % n_scales]);
+        scales[i] = basalt::fp16_to_fp32(kScales[rng() % n_scales]);
     }
 
     // CPU reference: rebuild each row's RAW Q2_0 blocks from the planes, decode with the scalar path that
@@ -97,16 +97,16 @@ int main(int argc, char** argv) {
             // re-narrowing is exact and the scalar decoder sees the same value the kernel does
             const uint16_t d_bits = (uint16_t) [&] {
                 for (uint16_t c : kScales) {
-                    if (strata::fp16_to_fp32(c) == d) return c;
+                    if (basalt::fp16_to_fp32(c) == d) return c;
                 }
                 return (uint16_t) 0x3C00;
             }();
             raw[0] = (uint8_t) (d_bits & 0xFF);
             raw[1] = (uint8_t) (d_bits >> 8);
             std::memcpy(&raw[2], &codes[(size_t) ((o * nb + b) * 16)], 16);
-            strata::dequantize_q2_0(raw.data(), dec.data());
+            basalt::dequantize_q2_0(raw.data(), dec.data());
             for (int j = 0; j < QK; ++j) {
-                acc += dec[(size_t) j] * strata::fp16_to_fp32(x[(size_t) (b * QK + j)]);
+                acc += dec[(size_t) j] * basalt::fp16_to_fp32(x[(size_t) (b * QK + j)]);
             }
         }
         ref[(size_t) o] = acc;
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
           "copy scales");
 
-    strata::kernels::s2_gemv(d_x, d_codes, d_scales, d_y, n_in, n_out);
+    basalt::kernels::s2_gemv(d_x, d_codes, d_scales, d_y, n_in, n_out);
 
     std::vector<float> got((size_t) n_out);
     check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");

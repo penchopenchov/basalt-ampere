@@ -38,7 +38,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 128;
@@ -374,4 +374,4 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

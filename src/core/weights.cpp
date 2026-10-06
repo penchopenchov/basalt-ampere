@@ -14,7 +14,7 @@
 
 #include <unistd.h>
 
-namespace strata::core {
+namespace basalt::core {
 namespace {
 
 constexpr uint64_t CHUNK = 8ull << 20;   // 8 MiB of SOURCE per staging round
@@ -275,7 +275,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             // ask for this file's remaining rows up front so their reads overlap
             for (size_t j = row_i; j < rows.size(); ++j)
                 if (rows[j].file == r.file && !skipped[j])
-                    strata::platform::advise_willneed(fileno(cur), rows[j].src_off, rows[j].src_bytes);
+                    basalt::platform::advise_willneed(fileno(cur), rows[j].src_off, rows[j].src_bytes);
         }
 
         // ---- the segment list: what this tensor's bytes are, plane by plane, in both forms
@@ -392,7 +392,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                         for (uint64_t i = 0; i < elems; ++i) {
                             float v;
                             std::memcpy(&v, src + i * 4, 4);
-                            const uint16_t h = strata::kernels::f16_from_f32(v);
+                            const uint16_t h = basalt::kernels::f16_from_f32(v);
                             std::memcpy(o + i * 2, &h, 2);
                         }
                         host_src = stage_out;
@@ -409,7 +409,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                         for (uint64_t i = 0; i < elems; ++i) {
                             uint16_t h;
                             std::memcpy(&h, src + i * 2, 2);
-                            o[i] = strata::kernels::f32_from_f16(h);
+                            o[i] = basalt::kernels::f32_from_f16(h);
                         }
                         host_src = stage_out;
                         out_at = s.dst_off + done * 2;
@@ -481,4 +481,4 @@ bool WeightTable::rebind(const std::string& name, const void* data) {
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

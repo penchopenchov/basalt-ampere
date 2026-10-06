@@ -20,7 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 namespace {
 
 inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
@@ -255,4 +255,4 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

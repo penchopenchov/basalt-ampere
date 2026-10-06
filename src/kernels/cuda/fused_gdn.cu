@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int S = 128;          // state size (rows = cols = 128)
@@ -163,4 +163,4 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

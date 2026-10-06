@@ -17,7 +17,7 @@
 
 #include <array>
 
-namespace strata::spec {
+namespace basalt::spec {
 
 class DraftPolicy {
 public:
@@ -49,4 +49,4 @@ private:
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
 };
 
-}  // namespace strata::spec
+}  // namespace basalt::spec

@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-namespace K = strata::kernels;
+namespace K = basalt::kernels;
 
 namespace {
 
@@ -211,7 +211,7 @@ int main(int argc, char** argv) {
     cudaStream_t st;
     cudaStreamCreate(&st);
     std::string err;
-    strata::prefill::Gemm big, small;
+    basalt::prefill::Gemm big, small;
     if (!big.init(st, 32ll << 20, err) || !small.init(st, 1ll << 20, err)) { std::printf("FAIL: gemm init: %s\n", err.c_str()); return 1; }
     struct Shape { int64_t T, N, K; const void* key; const uint16_t* w; const char* what; };
     const Shape shapes[] = {

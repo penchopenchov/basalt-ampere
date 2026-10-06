@@ -34,7 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 namespace {
 // The process's rope config (rope_scaling.hpp).  One writer - the engine's startup thread, before
@@ -133,4 +133,4 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     if (stream == nullptr) cudaDeviceSynchronize();
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

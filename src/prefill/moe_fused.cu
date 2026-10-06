@@ -27,7 +27,7 @@
 #include <cstdlib>
 #include <mutex>
 
-namespace strata::prefill::fused {
+namespace basalt::prefill::fused {
 namespace {
 
 void ck(cudaError_t e, const char* what) {
@@ -442,4 +442,4 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
     ck(cudaGetLastError(), "experts");
 }
 
-}  // namespace strata::prefill::fused
+}  // namespace basalt::prefill::fused

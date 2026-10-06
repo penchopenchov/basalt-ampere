@@ -15,15 +15,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: ple_q5_parity <gguf-containing-ple>\n");
         return 2;
     }
-    strata::GgufFile gguf(argv[1]);
+    basalt::GgufFile gguf(argv[1]);
     const auto* tensor = gguf.find("per_layer_token_embd.weight");
     if (!tensor || tensor->type != 6 || tensor->shape.size() != 2 || tensor->shape[0] != 160) {
         std::fprintf(stderr, "expected Q5_0 PLE [160, N]\n");
         return 2;
     }
-    strata::kernels::PleIoOptions options;
-    options.mode = strata::kernels::PleIo::Mmap;
-    strata::kernels::PleTable table;
+    basalt::kernels::PleIoOptions options;
+    options.mode = basalt::kernels::PleIo::Mmap;
+    basalt::kernels::PleTable table;
     std::string err;
     if (!table.open(argv[1], err, options)) {
         std::fprintf(stderr, "%s\n", err.c_str());

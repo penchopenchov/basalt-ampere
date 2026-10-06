@@ -7,7 +7,7 @@
 #include <string>
 
 
-namespace strata::core {
+namespace basalt::core {
 
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
     std::optional<uint64_t> result;
@@ -33,4 +33,4 @@ std::optional<uint64_t> conversation_available_memory() {
     return conversation_mem_available(meminfo);
 }
 
-} // namespace strata::core
+} // namespace basalt::core

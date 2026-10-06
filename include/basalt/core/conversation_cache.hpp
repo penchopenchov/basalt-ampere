@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 struct ConversationImageKey {
     int64_t start = 0;
@@ -280,4 +280,4 @@ private:
     ConversationKvReuse reuse_;
 };
 
-} // namespace strata::core
+} // namespace basalt::core

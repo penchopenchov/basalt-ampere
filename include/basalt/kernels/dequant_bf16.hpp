@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 bool dequant_bf16_supported(int ggml_type) noexcept;
 
@@ -24,4 +24,4 @@ void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
 /// The same into FP32 (tests and small tensors).
 void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

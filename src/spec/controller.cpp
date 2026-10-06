@@ -3,7 +3,7 @@
 
 #include <algorithm>
 
-namespace strata::spec {
+namespace basalt::spec {
 
 double CostModel::step_ms(int k, bool mtp) const {
     const int n = std::clamp(k + 1, 1, K_MAX + 1);
@@ -70,4 +70,4 @@ void Controller::observe(const Choice& c, int accepted, int lookup_match) {
         for (int i = c.k; i < K_MAX; ++i) mtp_p_[i] += ema_ * (mtp_p_[c.k - 1] - mtp_p_[i]);
 }
 
-}  // namespace strata::spec
+}  // namespace basalt::spec

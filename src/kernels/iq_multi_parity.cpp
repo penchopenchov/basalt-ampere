@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace k = strata::kernels;
+namespace k = basalt::kernels;
 
 namespace {
 

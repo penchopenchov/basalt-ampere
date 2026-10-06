@@ -40,7 +40,7 @@
 #include <string>
 #include <vector>
 
-namespace k = strata::kernels;
+namespace k = basalt::kernels;
 
 namespace {
 // The blob geometry, `cpu/expert.hpp`'s (restated as in the kernel).

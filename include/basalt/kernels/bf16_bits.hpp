@@ -25,7 +25,7 @@
 #define STRATA_BF16_HD
 #endif
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Round-to-nearest-even f32 -> bf16, returned as raw bits in the LOW half of the uint16.
 ///
@@ -50,4 +50,4 @@ STRATA_BF16_HD inline float f32_from_bf16(uint16_t h) {
     return f;
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

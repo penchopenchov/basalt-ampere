@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-namespace cpu = strata::kernels::cpu;
+namespace cpu = basalt::kernels::cpu;
 
 int main(int argc, char** argv) {
     const double seconds = argc > 1 ? std::atof(argv[1]) : 20.0;

@@ -14,7 +14,7 @@
 #include <cstdlib>
 #include <stdexcept>
 
-namespace strata::core {
+namespace basalt::core {
 
 static bool g_peer_portable = false;
 void set_peer_portable(bool on) { g_peer_portable = on; }
@@ -33,8 +33,8 @@ bool peers_access(int device) {
 
 namespace {
 
-constexpr int64_t H = strata::kernels::cpu::H;
-constexpr int64_t CAP = strata::kernels::cpu::MAXT * 10;   // entries per layer: MAXT tokens x top-10
+constexpr int64_t H = basalt::kernels::cpu::H;
+constexpr int64_t CAP = basalt::kernels::cpu::MAXT * 10;   // entries per layer: MAXT tokens x top-10
 
 struct Meta {                           // one block, uploaded with one copy per layer
     unsigned long long ptr[CAP];
@@ -100,7 +100,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
               " devices; set CUDA_VISIBLE_DEVICES)";
         return false;
     }
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     src_ = &src;
@@ -123,11 +123,11 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     On on(device);
     device_ = device;
     // scratch first, so the slots take what is really left
-    int64_t ff = strata::kernels::cpu::FF;
+    int64_t ff = basalt::kernels::cpu::FF;
     if (lay.native)
         for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
-    const size_t scratch = std::max<size_t>((size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, ff),
-                                            strata::kernels::native_expert_scratch_bytes(CAP, ff));
+    const size_t scratch = std::max<size_t>((size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(CAP, H, ff),
+                                            basalt::kernels::native_expert_scratch_bytes(CAP, ff));
     const bool alloc_ok =
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&
@@ -240,22 +240,22 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
         return false;
     Meta* dm = (Meta*) d_meta_;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     if (lay.native) {
-        strata::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
+        basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
         const auto& f = lay.fmt[(size_t) layer];
-        const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-        strata::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
-        strata::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
+        const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
+        basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                                d_scratch_, d_out_, s);
-        strata::kernels::native_grouped_set_mma_hint(false);
+        basalt::kernels::native_grouped_set_mma_hint(false);
     } else {
         err = "peer experts: only native packs are supported";
         return false;
     }
     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
         try {
-            strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
+            basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
         } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
         launched_direct_ = true;
         return true;
@@ -285,7 +285,7 @@ bool PeerExperts::finish(float* out, std::string& err) {
 
 bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err) {
     if (!pending_.empty() || max_swaps <= 0) return true;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     struct Swap { float gain; int32_t layer, in, out; };
     std::vector<Swap> swaps;
     std::vector<std::pair<float, int32_t>> cand, vict;
@@ -336,7 +336,7 @@ bool PeerExperts::reassign(int64_t layer, int32_t in, int32_t out, const uint8_t
     if (res_[i_out] >= 0 || blob == nullptr) return true;
     for (const auto& p : pending_)
         if (p.second == slot) return true;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     On on(device_);
     if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(layer), cudaMemcpyHostToDevice,
                             refill_), "reassign", err))
@@ -357,4 +357,4 @@ void PeerExperts::apply_pending(bool wait) {
     pending_.clear();
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

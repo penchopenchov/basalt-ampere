@@ -20,7 +20,7 @@
 #include <sched.h>
 #include <unistd.h>
 
-namespace cpu = strata::kernels::cpu;
+namespace cpu = basalt::kernels::cpu;
 
 class DynamicCpuSet {
 public:

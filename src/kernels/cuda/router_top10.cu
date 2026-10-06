@@ -59,7 +59,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int RT_MAX_THREADS = 512;
@@ -233,4 +233,4 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

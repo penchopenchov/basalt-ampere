@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 constexpr int kDecMaxT = 8;
 
@@ -51,4 +51,4 @@ void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream);
 /// z after qkv.
 inline constexpr int dec_gdnf_mode() { return 3; }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

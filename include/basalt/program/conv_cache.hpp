@@ -27,7 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::program::conv_cache {
+namespace basalt::program::conv_cache {
 
 /// The index in `stamps` of the chain item to drop once the chain holds more than `cap` items.  `stamps`
 /// are the items' last-use stamps; the caller owns the chain and erases the returned index.  Pure and
@@ -40,4 +40,4 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap) {
     return v;
 }
 
-}  // namespace strata::program::conv_cache
+}  // namespace basalt::program::conv_cache

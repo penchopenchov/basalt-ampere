@@ -3,7 +3,7 @@
 
 #include <cstdio>
 
-namespace strata::core {
+namespace basalt::core {
 namespace {
 
 /// A required 2-D shape.  `ne0` is the CONTIGUOUS axis, matching the manifest and `s_gemv`'s convention
@@ -170,4 +170,4 @@ bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& er
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

@@ -22,11 +22,11 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Same arguments and output as `qsa_decode_attn_batch` minus the scratch. Returns false (nothing launched) when the
 /// geometry is not 24 heads / 2 KV heads / 256: the caller then uses the old kernel.
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

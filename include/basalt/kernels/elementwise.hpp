@@ -21,7 +21,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Decode one canonical embedding row already selected by the caller. Codes are
 /// packed low bits first (2, 4 or 8 bits); scales/offsets are FP32 per group.
@@ -125,4 +125,4 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
 /// per-token step and positions), instead of a host-to-device memcpy node in the middle of a layer.
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

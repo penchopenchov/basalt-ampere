@@ -12,7 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int S = 128;          // GDN state size
@@ -603,8 +603,8 @@ __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __rest
     bool keep = p >= __int_as_float(*min_p_bits);
     if (cum_th > 0.0f) {   // the same products, in the same order, as draft_keep on the host
         float c = 1.0f;
-        for (int i = 0; i < j; ++i) c = c * strata::core::draft_cum_acc(((const volatile float*) hist)[i]);
-        c = c * strata::core::draft_cum_acc(p);
+        for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
+        c = c * basalt::core::draft_cum_acc(p);
         keep = c >= cum_th;
     }
     cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
@@ -906,4 +906,4 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

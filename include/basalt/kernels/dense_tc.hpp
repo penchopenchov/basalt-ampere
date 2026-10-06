@@ -18,7 +18,7 @@
 
 #include <cstddef>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 bool dense_tc_supported(int ggml_type, int n_in) noexcept;
 /// The same for this call's shape and weights: IQ3_S only where each 16-row tile takes a block
@@ -49,4 +49,4 @@ int dense_tc_mask();
 /// The weight types dense_tc takes: Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0.
 bool dense_tc_type_on(int ggml_type) noexcept;
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

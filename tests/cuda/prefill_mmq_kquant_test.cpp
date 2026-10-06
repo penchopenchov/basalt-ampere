@@ -20,7 +20,7 @@
 #include <vector>
 
 namespace {
-namespace mmq = strata::prefill::mmq;
+namespace mmq = basalt::prefill::mmq;
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));

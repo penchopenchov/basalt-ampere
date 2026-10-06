@@ -6,7 +6,7 @@
 
 #include <string>
 
-namespace strata::core {
+namespace basalt::core {
 
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
@@ -93,4 +93,4 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
 
-} // namespace strata::core
+} // namespace basalt::core

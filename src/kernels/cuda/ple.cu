@@ -30,7 +30,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -383,4 +383,4 @@ void ple_block_projected(const float* projected_key, const float* projected_valu
     native_ple_postops(projected_key, hidden, projected_value, hist_rows, w, buffers, stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

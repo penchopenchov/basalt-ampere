@@ -28,7 +28,7 @@
 #define STRATA_SPIN_PAUSE() ((void) 0)
 #endif
 
-namespace strata::core {
+namespace basalt::core {
 namespace {
 
 constexpr uint64_t SESSION_STATE_ALIGN = 256;
@@ -48,7 +48,7 @@ uint64_t gdn_state_floats(const ModelGeometry& g) {
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
 /// session arena.  The table and the weights are model-level and the caller owns them.
 static uint64_t ple_hist_bytes() {
-    return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
+    return (uint64_t) basalt::kernels::NG_HIST * basalt::kernels::NG_HC_DIM * sizeof(float);
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
@@ -131,7 +131,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 void session_release(SessionState& s) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (s.qsa_states[j].owns_rope) {
-            strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
+            basalt::kernels::rope_table_release(s.qsa_states[j].cos_tab);
             s.qsa_states[j].owns_rope = false;
         }
 }
@@ -175,7 +175,7 @@ void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
 /// captured the SOURCE POINTER, not the value, and that is exactly why the buffers are pinned and fixed.
 void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s) {
-    strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+    basalt::kernels::QsaShapes sh = basalt::kernels::qsa_real_shapes();
     sh.n_head = g.n_head;
     sh.n_head_kv = g.n_head_kv;
     sh.head_dim = g.head_dim;
@@ -544,9 +544,9 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     // core or its SMT sibling.  The symptom is not an error: it is a CPU path at 26.9 GB/s where the same pool
     // runs at 36.32.  It was being done and undone on EVERY token, which is a syscall pair on the critical path
     // for a property that wants to hold for the whole session.
-    const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
+    const std::vector<int> cores = basalt::kernels::cpu::physical_cores(false);
     if (!cores.empty()) {
-        pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
+        pinned_core = basalt::kernels::cpu::pin_current_thread(cores[0]);
         pinned = pinned_core.valid;
     }
     return true;
@@ -556,7 +556,7 @@ void SessionLoopScratch::free() {
     // Restores the caller's affinity on every path, including teardown: a library that silently leaves its
     // caller's thread nailed to one core is worse than one that never pinned at all.
     if (pinned) {
-        strata::kernels::cpu::restore_thread_affinity(pinned_core);
+        basalt::kernels::cpu::restore_thread_affinity(pinned_core);
         pinned = false;
         pinned_core = {};
     }
@@ -819,9 +819,9 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core
 
-namespace strata::core {
+namespace basalt::core {
 
 bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, SessionState& s, float* parts_dev,
                            const float* y_miss_host, size_t parts_bytes, TokenGraph& tg, std::string& err,
@@ -860,18 +860,18 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         if (!ok) { err = "session_capture_token: pre layer " + std::to_string(l) + ": " + err; break; }
         if (hits != nullptr) {
             // After the ring (and the shared expert): the GPU's experts run while the CPU computes the misses.
-            strata::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
+            basalt::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
                                             (int) hits->n_expert, hits->d_slot, hits->d_dst, hits->d_count, (void*) cs);
-            strata::kernels::quantize_q8_0_scaled(s.block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*) cs);
-            strata::kernels::moe_hit_grouped_s2_dev(hits->cache_base, hits->d_slot, hits->d_dst, hits->d_count, s.k,
+            basalt::kernels::quantize_q8_0_scaled(s.block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*) cs);
+            basalt::kernels::moe_hit_grouped_s2_dev(hits->cache_base, hits->d_slot, hits->d_dst, hits->d_count, s.k,
                                                     hits->blob, hits->x_q8, hits->scratch, hits->hit_out, (void*) cs,
                                                     hits->x_scale);
         }
-        strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
+        basalt::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
         // A kernel, not a memcpy node: a copy-engine node splits the driver's submission into extra flushes.
-        strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
+        basalt::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
         if (hits != nullptr)
-            strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
+            basalt::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
         ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err);
         if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
         if (qsa) ++qsa_index;
@@ -961,4 +961,4 @@ void token_graph_free(TokenGraph& tg) {
     tg = TokenGraph{};
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

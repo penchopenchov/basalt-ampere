@@ -15,7 +15,7 @@
 #include <random>
 #include <vector>
 
-namespace c = strata::kernels::cpu;
+namespace c = basalt::kernels::cpu;
 
 namespace {
 void make_blob(uint8_t* b, std::mt19937& rng) {

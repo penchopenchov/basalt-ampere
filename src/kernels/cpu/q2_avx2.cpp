@@ -11,7 +11,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 namespace {
 
 inline float h2f(const uint8_t* p) {
@@ -127,4 +127,4 @@ void act_quant_q8_1_avx2(const float* x, int n, ActQ& a) {
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

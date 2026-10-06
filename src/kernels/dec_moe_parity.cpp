@@ -31,7 +31,7 @@
 #include <string>
 #include <vector>
 
-namespace K = strata::kernels;
+namespace K = basalt::kernels;
 
 namespace {
 
@@ -120,7 +120,7 @@ double time_us(cudaStream_t s, int iters, const std::function<void()>& f) {
 // routes tokens with repeated expert ids and ids past n_expert (the route kernel must keep them off the peer).
 // DM_STRESS_TORN=1: the host-rung rings carry an expert id with different tiers in different tokens (what the route
 // kernel publishes when it reads a residency table while an upload lands): the peer must neither hang nor fault.
-void stress(const strata::GgufFile& gguf, int l, int gt, int dt, int windows) {
+void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows) {
     const auto L = K::native_expert_layout(gt, dt, H, FF);
     constexpr int NX0 = 32, NP = 48, NX1 = 64, RINGS = 48;
     const bool dup = std::getenv("DM_STRESS_DUP") != nullptr, torn = std::getenv("DM_STRESS_TORN") != nullptr;
@@ -419,7 +419,7 @@ int main(int argc, char** argv) {
         std::string t;
         while (std::getline(ss, t, ',')) layers.push_back(std::atoi(t.c_str()));
     }
-    strata::GgufFile gguf(argv[1]);
+    basalt::GgufFile gguf(argv[1]);
     int ndev = 0;
     ck(cudaGetDeviceCount(&ndev), "device count");
     const bool two = ndev >= 2;

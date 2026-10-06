@@ -55,7 +55,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 128;
@@ -816,4 +816,4 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
     if (stream == nullptr) check_sync("qsa_gate_apply");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

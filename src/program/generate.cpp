@@ -118,7 +118,7 @@ using Clock = std::chrono::steady_clock;
 // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
 // GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
 template <class Swap>
-bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
+bool resident_stage_swaps(basalt::core::FileExpertSource& src, basalt::core::ExpertCache& cache,
                           const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
                           cudaStream_t stream) {
     if (!src.complement_ready() || swaps.empty()) return true;
@@ -133,7 +133,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
         if (slot < 0) continue;
         if (cudaMemcpyAsync(src.exchange_buffer(q), cache.device_slot(slot),
-                            (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
+                            (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer), cudaMemcpyDeviceToHost,
                             stream) != cudaSuccess)
             return false;
         staged.push_back({s.layer, s.in, s.out, q});
@@ -200,7 +200,7 @@ struct Options {
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
-    /// Every shard of --native's model (strata::gguf_split_paths: the metadata shard first; a missing shard is an
+    /// Every shard of --native's model (basalt::gguf_split_paths: the metadata shard first; a missing shard is an
     /// error) and of --native-head-gguf's (the same list unless that names another model).
     std::vector<std::string> native_shards, native_head_shards;
     /// The whole native arithmetic set as ONE switch (model shard 1): the combination validated for attention and
@@ -246,12 +246,12 @@ struct Options {
     bool gpu_only_full = false;   ///< R0.3: pre + post + head, the true per-token GPU floor
     int pool_workers = 0;         ///< R2.2: 0 = "all physical cores minus the host's"; >0 overrides
     /// The pool's core layout; `all` (the default) uses every core, auto / p-cores are opt-in
-    strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;
+    basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::All;
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
     bool no_host_worker = false;
-    bool coupled_draft = strata::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
+    bool coupled_draft = basalt::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
@@ -648,7 +648,7 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
 struct Drive {
-    strata::core::ExpertDispatch d;
+    basalt::core::ExpertDispatch d;
     double cpu_ms = 0;
     int64_t calls = 0;
     /// THE ROUTING TRACE.  `drive_pool` is called once per layer from the main loop - the workers live inside
@@ -662,7 +662,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
                 float* out) {
     Drive* t = (Drive*) user;
     const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
+    basalt::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
     // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
@@ -693,7 +693,7 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
+    basalt::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
@@ -718,7 +718,7 @@ struct SplitDrive {
     Drive* base = nullptr;
     int n = 0;                                    ///< stages
     int64_t end[kMax] = {};                       ///< stage i runs the layers from end[i - 1] (0) below end[i]
-    strata::core::GpuPlanSink* plan[kMax] = {};
+    basalt::core::GpuPlanSink* plan[kMax] = {};
     const uint8_t* cache_base[kMax] = {};
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
@@ -743,16 +743,16 @@ struct GpuStage {
     int dev = 0;
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
-    strata::core::WeightTable wt;
-    strata::core::NativeDense dense;
-    strata::core::NativeHead head;
-    strata::core::SessionState ss;
+    basalt::core::WeightTable wt;
+    basalt::core::NativeDense dense;
+    basalt::core::NativeHead head;
+    basalt::core::SessionState ss;
     cudaStream_t stream = nullptr;
-    strata::core::ExpertCache cache;
+    basalt::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int32_t* d_res = nullptr;                            ///< the residency table on its device
-    strata::core::Verifier ver;
-    strata::prefill::Prefill sp;
+    basalt::core::Verifier ver;
+    basalt::prefill::Prefill sp;
     cudaStream_t adapt_stream = nullptr;
     cudaEvent_t adapt_ev = nullptr;
     bool adapt_live = false;                             ///< swaps of this request are in flight on it
@@ -793,7 +793,7 @@ MemSample mem_sample() {
 
 // the stage the watchdog names: "<where> <detail>", and the prompt chunk a batched read is in
 std::string stage_text() {
-    const strata::core::Progress& p = strata::core::progress();
+    const basalt::core::Progress& p = basalt::core::progress();
     std::string s = std::string(p.where.load()) + " " + std::to_string((long long) p.detail.load());
     if (const int64_t c = p.chunk.load(); c >= 0) s += " of the prompt chunk from token " + std::to_string((long long) c);
     return s;
@@ -847,18 +847,18 @@ void disk_wait_threads(std::FILE* f) {
 }
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
-    strata::core::Progress& p = strata::core::progress();
+    basalt::core::Progress& p = basalt::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
                     "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, stage_text().c_str(),
-                 (long long) ((strata::core::progress_now_ms() - p.since_ms.load()) / 1000),
+                 (long long) ((basalt::core::progress_now_ms() - p.since_ms.load()) / 1000),
                  (unsigned long long) layers_during);
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             std::fprintf(f, "  2 s later:\n");
         }
-        if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
-        if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
+        if (auto fn = basalt::core::diag_pool_fn().load()) fn(f);
+        if (auto fn = basalt::core::diag_verify_fn().load()) fn(f);
         disk_wait_threads(f);
         const MemSample m = mem_sample();
         std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
@@ -890,8 +890,8 @@ int argmax(const std::vector<float>& v) {
 //     back rejected drafts.
 // A checkpoint is only valid while the positional cells below it still hold ITS tokens, so the serve loop keeps
 // just the checkpoints that are prefixes of the tokens the session holds now.
-using ImgKey = strata::core::ConversationImageKey;
-using ConvCheckpoint = strata::core::ConversationCheckpoint;
+using ImgKey = basalt::core::ConversationImageKey;
+using ConvCheckpoint = basalt::core::ConversationCheckpoint;
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
     const uint8_t* p = (const uint8_t*) data;
@@ -899,29 +899,29 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) 
     return h;
 }
 
-using ConvStateSizes = strata::core::ConversationStateSizes;
+using ConvStateSizes = basalt::core::ConversationStateSizes;
 
-ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss) {
+ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basalt::core::SessionState& ss) {
     ConvStateSizes z;
     std::string error;
     // a split stage's session owns only its layer range's state (see SessionState's carve note); the geometry
     // and the carve have already passed engine validation
-    strata::core::conversation_session_sizes(g, ss, z, error);
+    basalt::core::conversation_session_sizes(g, ss, z, error);
     return z;
 }
 
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
-bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
-    if (strata::core::conversation_checkpoint_save(c, ss, g, error)) return true;
+    if (basalt::core::conversation_checkpoint_save(c, ss, g, error)) return true;
     std::fprintf(stderr, "strata serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
     return false;
 }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
-bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
-    if (strata::core::conversation_checkpoint_restore(c, ss, g, error)) return true;
+    if (basalt::core::conversation_checkpoint_restore(c, ss, g, error)) return true;
     std::fprintf(stderr, "strata serve: checkpoint restore: %s\n", error.c_str());
     return false;
 }
@@ -929,23 +929,23 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
-bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary, std::string& err) {
+bool load_control_vectors(const Options& o, const basalt::core::ModelGeometry& g, std::string& summary, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
     std::vector<bool> have((size_t) L, false);
     for (const auto& [path, scale] : o.cvec_files) {
         try {
-            strata::GgufFile f(path);
-            const strata::MetaValue* arch = f.get("general.architecture");
+            basalt::GgufFile f(path);
+            const basalt::MetaValue* arch = f.get("general.architecture");
             if (arch == nullptr || arch->s != "controlvector") {
                 err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
                 return false;
             }
-            const strata::MetaValue* hint = f.get("controlvector.model_hint");
+            const basalt::MetaValue* hint = f.get("controlvector.model_hint");
             if (hint != nullptr && hint->s != "qwen4exp")
                 std::fprintf(stderr, "strata generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
             int found = 0;
-            for (const strata::TensorInfo& t : f.tensors()) {
+            for (const basalt::TensorInfo& t : f.tensors()) {
                 if (t.name.rfind("direction.", 0) != 0) continue;
                 const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
                 if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
@@ -991,7 +991,7 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         ++steered;
     }
     if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
+    if (!basalt::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
     summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
               (single >= 0 ? ":single" + std::to_string(single) : "");
     // the line llama.cpp's patched build prints, so a log shows the same thing
@@ -1124,7 +1124,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
         else if (a == "--logits-stride") {
             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
-            if (!strata::program::logits_selection::parse_stride(next("--logits-stride"), o.logits_stride)) {
+            if (!basalt::program::logits_selection::parse_stride(next("--logits-stride"), o.logits_stride)) {
                 std::fprintf(stderr, "--logits-stride requires a positive decimal int64\n"); return 2;
             }
             have_logits_stride = true;
@@ -1172,9 +1172,9 @@ int main(int argc, char** argv) {
         else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
         else if (a == "--pool-affinity") {
             const std::string v = next("--pool-affinity");
-            if (v == "auto") o.pool_affinity = strata::kernels::cpu::PoolAffinity::Auto;
-            else if (v == "p-cores" || v == "pcores") o.pool_affinity = strata::kernels::cpu::PoolAffinity::PCores;
-            else if (v == "all") o.pool_affinity = strata::kernels::cpu::PoolAffinity::All;
+            if (v == "auto") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
+            else if (v == "p-cores" || v == "pcores") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::PCores;
+            else if (v == "all") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::All;
             else {
                 std::fprintf(stderr, "strata generate: unknown --pool-affinity value '%s' (expected auto, p-cores, or all)\n", v.c_str());
                 return 2;
@@ -1325,10 +1325,10 @@ int main(int argc, char** argv) {
             o.resident_headroom = 4ull << 30;
         }
         else if (a == "--stats") o.stats = true;
-        else if (a == "--profile") strata::core::diagnostics().profile = true;
-        else if (a == "--wait-stats") strata::core::diagnostics().wait_stats = true;
-        else if (a == "--decode-timing") strata::core::diagnostics().decode_timing = true;
-        else if (a == "--draft-log") strata::core::diagnostics().draft_log = next("--draft-log");
+        else if (a == "--profile") basalt::core::diagnostics().profile = true;
+        else if (a == "--wait-stats") basalt::core::diagnostics().wait_stats = true;
+        else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
+        else if (a == "--draft-log") basalt::core::diagnostics().draft_log = next("--draft-log");
         else if (a == "--ppl-base") ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") ppl_out = next("--ppl-out");
         else if (a == "--shared-late") o.shared_late = true;
@@ -1348,11 +1348,11 @@ int main(int argc, char** argv) {
         }
         }
     }
-    strata::core::set_coupled_draft(o.coupled_draft);
-    strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    basalt::core::set_coupled_draft(o.coupled_draft);
+    basalt::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // multi-GPU: without direct access the prompt path cannot take the peer, so it keeps the single-GPU kernels
-    strata::core::set_prompt_peer(o.peer_device >= 1 && o.peer_prefill_rows != 0 &&
-                                  strata::core::peers_access(o.peer_device));
+    basalt::core::set_prompt_peer(o.peer_device >= 1 && o.peer_prefill_rows != 0 &&
+                                  basalt::core::peers_access(o.peer_device));
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -1501,10 +1501,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
         return 2;
     }
-    strata::core::qsa_set_kv_int8(o.kv == "int8");
-    strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // 4-bit codes after a Hadamard rotation (kv_q4.hpp)
-    strata::core::qsa_set_kv_int8_rotate(false);
-    strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
+    basalt::core::qsa_set_kv_int8(o.kv == "int8");
+    basalt::core::qsa_set_kv_q4(o.kv == "q4_0");   // 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    basalt::core::qsa_set_kv_int8_rotate(false);
+    basalt::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
         return 2;
@@ -1513,7 +1513,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --kv k8v4 does not support --kv-resident streaming (yet)\n");
         return 2;
     }
-    strata::core::qsa_set_kv_resident(o.kv_resident);
+    basalt::core::qsa_set_kv_resident(o.kv_resident);
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (basalt/spec/draft_policy.hpp) takes one only where it pays.
     // --suffix-draft 0 turns it off.
@@ -1521,15 +1521,15 @@ int main(int argc, char** argv) {
         o.mtp_max_t = o.spec;
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
-    strata::core::layer_set_shared_early(!o.shared_late);
+    basalt::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error.
-            o.native_shards = strata::gguf_split_paths(o.native_preset);
+            o.native_shards = basalt::gguf_split_paths(o.native_preset);
             // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
             // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
             if (o.ple_gguf.empty() && !o.no_ple) {
-                const strata::GgufModel model(o.native_shards);
+                const basalt::GgufModel model(o.native_shards);
                 size_t at = 0;
                 if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
             }
@@ -1555,8 +1555,8 @@ int main(int argc, char** argv) {
             // a PLE-only table (tools/ple_fp8_pack.py: architecture strata-ple) holds no projections
             bool ple_only = false;
             try {
-                strata::GgufFile pg(o.ple_gguf);
-                if (const strata::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
+                basalt::GgufFile pg(o.ple_gguf);
+                if (const basalt::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
             } catch (const std::exception&) {}
             if (!ple_only &&
                 std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
@@ -1594,9 +1594,9 @@ int main(int argc, char** argv) {
     // THE ROPE KNOBS (rope_scaling.hpp).  Anything invalid dies here, at second zero, rather than becoming a
     // NaN angle inside one of the twelve QSA layers.  Only the RANGES are checked - the config itself is
     // resolved after the model file has had its say, right before session_init.
-    strata::kernels::RopeScaling rope_cfg;   // type filled here; the rest at the resolution below
+    basalt::kernels::RopeScaling rope_cfg;   // type filled here; the rest at the resolution below
     {
-        using RST = strata::kernels::RopeScalingType;
+        using RST = basalt::kernels::RopeScalingType;
         // an absent --rope-scaling (the empty default) leaves the type to the model file's rope keys,
         // resolved below; anything present must be one of the three names
         if (o.rope_scaling == "none") rope_cfg.type = RST::None;
@@ -1676,7 +1676,7 @@ int main(int argc, char** argv) {
     if (!o.native_head_gguf.empty()) {
         try {
             o.native_head_shards = o.native_head_gguf == o.native_preset ? o.native_shards
-                                                                         : strata::gguf_split_paths(o.native_head_gguf);
+                                                                         : basalt::gguf_split_paths(o.native_head_gguf);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata generate: --native-head-gguf %s: %s\n", o.native_head_gguf.c_str(), e.what());
             return 2;
@@ -1694,13 +1694,13 @@ int main(int argc, char** argv) {
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI), so on a CPU without those features it
     // does not fail - it executes an illegal instruction at some unpredictable token.  Refusing at second zero is the
     // whole point of this check.
-    strata::kernels::cpu::expert_set_oracle_q8_0(o.cpu_oracle_q8_0);
+    basalt::kernels::cpu::expert_set_oracle_q8_0(o.cpu_oracle_q8_0);
     // ... and nothing runs on a CPU without AVX2: every CPU expert kernel is AVX2 at least (the AVX-512 ones are
     // chosen above it), and so is ggml-cpu, which the native pack's layout load initializes next.  Refused here, by name, rather than an illegal instruction in the first expert.
-    if (!strata::kernels::cpu::cpu_avx2_ok()) {
+    if (!basalt::kernels::cpu::cpu_avx2_ok()) {
         std::fprintf(stderr, "strata generate: this CPU (%s) does not support AVX2 with FMA and F16C, which this engine's "
                              "CPU expert kernels need\n",
-                     strata::kernels::cpu::cpu_name().c_str());
+                     basalt::kernels::cpu::cpu_name().c_str());
         return 2;
     }
 
@@ -1713,33 +1713,33 @@ int main(int argc, char** argv) {
     // tensor in its GGUF form, so it needs --native (the dense projections, head and embedding come from the model
     // file) and runs its experts in verify windows only (--spec).
     {
-        const strata::core::ModelGeometry g0;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        const basalt::core::ModelGeometry g0;
+        if (!basalt::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported type would otherwise fail from inside the first verify window or leave
         // the prompt path's fp16 buffer unwritten.
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = basalt::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
-            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+            if (!basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
                                      "engine has no GPU kernels for\n", (long long) l,
-                             strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type),
+                             basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
                              f.gu_type, f.d_type);
                 return 1;
             }
         }
     }
-    const bool native_pack = strata::kernels::cpu::expert_layout().native;
+    const bool native_pack = basalt::kernels::cpu::expert_layout().native;
     // Only CUDA1's context is created here, before the large allocations: the later helpers' come after the arena.
     for (int r = 0; r < 1; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
         // Keep CUDA1's proven startup order: initialise its context before
         // allocating GPU0 weights or mapping the large host expert arena.
         double free_gib = 0;
-        if (!strata::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
+        if (!basalt::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -1767,12 +1767,12 @@ int main(int argc, char** argv) {
         }
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
-    if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
-    else if (!strata::kernels::cpu::cpu_avx512_ok())
+    if (!native_pack) basalt::kernels::cpu::cpu_require_expert_support();
+    else if (!basalt::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
-                     !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2)" : "AVX-2");
-    strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
+                     !basalt::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2)" : "AVX-2");
+    basalt::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
     // and `session_init` below builds the rope table from it and captures the kernels reading its constants
@@ -1789,13 +1789,13 @@ int main(int argc, char** argv) {
             // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
             // is the authority on its own MoE shape - everything else in the geometry is unchanged
             try {
-                strata::GgufFile model_gguf(o.native_shards.front());   // the metadata shard
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type = v->s;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor = v->num();
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.original_context_length"))
+                basalt::GgufFile model_gguf(o.native_shards.front());   // the metadata shard
+                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
+                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
+                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type = v->s;
+                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor = v->num();
+                if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.original_context_length"))
                     gguf_rope_orig_ctx = v->num();
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
@@ -1803,7 +1803,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        using RST = strata::kernels::RopeScalingType;
+        using RST = basalt::kernels::RopeScalingType;
         if (!o.rope_scaling.empty()) {
             // the early validation pinned the spelling; `none` here is the CLI opting OUT of the model file's keys
             if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
@@ -1837,7 +1837,7 @@ int main(int argc, char** argv) {
             const bool knobs = o.rope_scale > 1.0 || o.rope_freq_scale > 0 || o.yarn_ext_factor > 0 ||
                                o.yarn_attn_factor != 1.0;
             const double base = rope_cfg.freq_base;
-            rope_cfg = strata::kernels::RopeScaling{};
+            rope_cfg = basalt::kernels::RopeScaling{};
             rope_cfg.freq_base = base;
             if (knobs)
                 std::fprintf(stderr, "strata generate: note: no rope scaling is active (none), so --rope-scale, "
@@ -1846,14 +1846,14 @@ int main(int argc, char** argv) {
         // THE RESOLVED CONFIG IS VALIDATED AS A WHOLE, with the one rule every rotation site also applies
         // (rope_scaling.hpp): the CLI ranges above cannot see a model-file value, nor a combination such as a
         // --rope-freq-scale that turns the resolved factor non-finite.
-        if (const char* why = strata::kernels::rope_scaling_invalid(rope_cfg)) {
+        if (const char* why = basalt::kernels::rope_scaling_invalid(rope_cfg)) {
             std::fprintf(stderr, "strata generate: invalid rope scaling configuration: %s (type %s, factor %g, "
                                  "freq_scale %g, base %g, original context %g)\n",
                          why, rope_cfg.type == RST::YaRN ? "yarn" : rope_cfg.type == RST::Linear ? "linear" : "none",
                          rope_cfg.factor, rope_cfg.freq_scale(), rope_cfg.freq_base, rope_cfg.orig_ctx);
             return 2;
         }
-        strata::kernels::rope_scaling_set(rope_cfg);
+        basalt::kernels::rope_scaling_set(rope_cfg);
         if (rope_cfg.type != RST::None) {
             const char* tn = rope_cfg.type == RST::YaRN ? "yarn" : "linear";
             std::fprintf(stderr,
@@ -1875,7 +1875,7 @@ int main(int argc, char** argv) {
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
-    strata::core::NativeEmbed native_embed;
+    basalt::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
             (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
@@ -1883,18 +1883,18 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
+        const basalt::core::ModelGeometry g0;
         const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
                                248320, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        strata::core::set_native_embed(&native_embed);
+        basalt::core::set_native_embed(&native_embed);
         std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
                              "%s in mapped host memory (%.0f MiB, %.1f s)\n",
-                     o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
-                     strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
+                     o.pack.c_str(), (double) basalt::kernels::cpu::expert_layout().max_blob / 1e6,
+                     basalt::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
     }
     // Tensors served in native form are not also loaded in canonical form (VRAM back to the expert cache with
@@ -1902,7 +1902,7 @@ int main(int argc, char** argv) {
     std::set<std::string> skip;
     if (!o.keep_canonical) {
         if (!o.native_dense_gguf.empty() &&
-            !strata::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, skip, err)) {
+            !basalt::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, skip, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -1910,7 +1910,7 @@ int main(int argc, char** argv) {
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         // a --compat-bf16 pack (OrcaRouter IQ3_XXS) keeps its BF16 key in the arena
-        if (native_pack && !strata::core::NativeDense::keep_unquantized_ple_key(o.pack, skip, err)) {
+        if (native_pack && !basalt::core::NativeDense::keep_unquantized_ple_key(o.pack, skip, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -1943,14 +1943,14 @@ int main(int argc, char** argv) {
     };
     if (stage_trim) {
         add_foreign(0, split_at[0], skip, o.mmap_experts);
-        strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
+        basalt::core::NativeDense::set_layer_range(0, (int) split_at[0]);
         std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
                      (long long) split_at[0] - 1);
     }
     // One GPU: the hyper-connection down/up matrices are held only as 8-bit copies - the arena leaves their bf16 form
     // out and they are staged, copied and dropped right after the load
     std::set<std::string> hc8_names;
-    if (strata::kernels::hc8_only() && !multi_gpu) {
+    if (basalt::kernels::hc8_only() && !multi_gpu) {
         if (std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
             char line[1024], name[256];
             while (std::fgets(line, sizeof line, f)) {
@@ -1966,7 +1966,7 @@ int main(int argc, char** argv) {
         for (const std::string& n : hc8_names) skip.insert(n);
     }
     uint64_t pool_bytes = 0;
-    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!basalt::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
@@ -1992,7 +1992,7 @@ int main(int argc, char** argv) {
         load_t0 = t;
         return s;
     };
-    strata::core::WeightTable wt;
+    basalt::core::WeightTable wt;
     if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
@@ -2006,8 +2006,8 @@ int main(int argc, char** argv) {
             if (!hc8_names.count(kv.first)) others.insert(kv.first);
         uint64_t stage_bytes = 0;
         void* stage = nullptr;
-        strata::core::WeightTable staged;
-        if (!strata::core::WeightTable::pool_bytes(o.pack, stage_bytes, err, &others) ||
+        basalt::core::WeightTable staged;
+        if (!basalt::core::WeightTable::pool_bytes(o.pack, stage_bytes, err, &others) ||
             cudaMalloc(&stage, stage_bytes) != cudaSuccess || !staged.load(o.pack, stage, stage_bytes, err, &others)) {
             std::fprintf(stderr, "strata generate: hc8: staging the hyper-connection matrices failed%s%s\n",
                          err.empty() ? "" : ": ", err.c_str());
@@ -2015,9 +2015,9 @@ int main(int argc, char** argv) {
         }
         size_t n_done = 0;
         for (const std::string& n : hc8_names) {
-            const strata::core::WeightRef* r = staged.find(n);
-            const void* q = r && r->data && r->kind == strata::core::WeightKind::Bf16InF32
-                                ? strata::kernels::hc8_adopt((const uint16_t*) r->data, (int) r->ne1, (int) r->ne0)
+            const basalt::core::WeightRef* r = staged.find(n);
+            const void* q = r && r->data && r->kind == basalt::core::WeightKind::Bf16InF32
+                                ? basalt::kernels::hc8_adopt((const uint16_t*) r->data, (int) r->ne1, (int) r->ne0)
                                 : nullptr;
             if (q == nullptr || !wt.rebind(n, q)) {
                 std::fprintf(stderr, "strata generate: hc8: no 8-bit copy of %s\n", n.c_str());
@@ -2028,14 +2028,14 @@ int main(int argc, char** argv) {
         cudaFree(stage);
         for (const auto& kv : wt.all())   // the injections stay bf16 in the arena, with copies beside them
             if (kv.first.ends_with("_inject.weight") && kv.first.find(".hc_") != std::string::npos && kv.second.data)
-                strata::kernels::hc8_prepare((const uint16_t*) kv.second.data, (int) kv.second.ne1, (int) kv.second.ne0);
+                basalt::kernels::hc8_prepare((const uint16_t*) kv.second.data, (int) kv.second.ne1, (int) kv.second.ne0);
         std::fprintf(stderr, "strata hc8: %zu hyper-connection matrices held only as 8-bit copies (%.0f MiB of bf16 "
                              "left out of VRAM, %.0f MiB of copies) in %.1f s\n",
-                     n_done, (double) stage_bytes / 1048576.0, (double) strata::kernels::hc8_bytes() / 1048576.0,
+                     n_done, (double) stage_bytes / 1048576.0, (double) basalt::kernels::hc8_bytes() / 1048576.0,
                      load_s());
     }
 
-    strata::core::NativeDense native_dense;
+    basalt::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
@@ -2045,26 +2045,26 @@ int main(int argc, char** argv) {
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
     }
 
-    strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
-    strata::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
+    basalt::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
+    basalt::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
     // The fused hyper-connection read rides the native (FP32-activation) contract; the per-stage and dump
     // measurements need the unfused layout of R, so they keep the old kernels.
-    strata::core::layer_set_fast_attn(!o.no_fast_attn);
-    strata::core::layer_set_publish_kernel(!o.no_publish_kernel);
-    strata::core::layer_set_fused_gdn(!o.no_fused_gdn);
-    strata::core::layer_set_fast_select(!o.no_fast_select);
-    strata::core::layer_set_fused_gr(o.gr_native_mmvf && !o.no_fused_gr && !o.gpu_stages && o.dump_layers.empty() &&
+    basalt::core::layer_set_fast_attn(!o.no_fast_attn);
+    basalt::core::layer_set_publish_kernel(!o.no_publish_kernel);
+    basalt::core::layer_set_fused_gdn(!o.no_fused_gdn);
+    basalt::core::layer_set_fast_select(!o.no_fast_select);
+    basalt::core::layer_set_fused_gr(o.gr_native_mmvf && !o.no_fused_gr && !o.gpu_stages && o.dump_layers.empty() &&
                                      o.dump_halves.empty() && !o.stage_timing);
-    strata::core::layer_set_native_bf16(o.native_bf16);
-    strata::core::layer_set_native_flash_attn_short(o.native_flash_attn_short);
-    strata::kernels::ple_set_native_bf16(o.native_bf16_extra);
-    strata::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
-    strata::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
-    strata::kernels::native_gdn_set_enabled(o.native_gdn);
-    strata::kernels::native_router_set_enabled(o.native_router);
-    strata::kernels::native_qsa_set_enabled(o.native_qsa);
-    strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
-    strata::kernels::native_rope_set_enabled(o.native_rope);
+    basalt::core::layer_set_native_bf16(o.native_bf16);
+    basalt::core::layer_set_native_flash_attn_short(o.native_flash_attn_short);
+    basalt::kernels::ple_set_native_bf16(o.native_bf16_extra);
+    basalt::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
+    basalt::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
+    basalt::kernels::native_gdn_set_enabled(o.native_gdn);
+    basalt::kernels::native_router_set_enabled(o.native_router);
+    basalt::kernels::native_qsa_set_enabled(o.native_qsa);
+    basalt::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
+    basalt::kernels::native_rope_set_enabled(o.native_rope);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (basalt/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
@@ -2080,9 +2080,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: cannot allocate the image position table\n");
             return 1;
         }
-        strata::kernels::mrope_table_set(d_mrope);
+        basalt::kernels::mrope_table_set(d_mrope);
     }
-    strata::kernels::ple_set_native_postops(o.native_ple_postops);
+    basalt::kernels::ple_set_native_postops(o.native_ple_postops);
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
     if (!o.cvec_files.empty()) {
@@ -2098,7 +2098,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    strata::core::SessionState ss;
+    basalt::core::SessionState ss;
     void* sbuf = nullptr;   // allocated after the layer-split search, sized to CUDA0's own layer range (the carve)
     // The engine runs its captured graphs and kernels on its own stream, not the legacy default stream: every
     // session call - `session_capture`, `session_replay`, `session_token` and `session_loop` - is handed that stream,
@@ -2134,8 +2134,8 @@ int main(int argc, char** argv) {
         ss.block.dump = half_stage;
     }
 
-    strata::core::Doorbell db;
-    if (strata::core::doorbell_init(g, K, db) == 0) {
+    basalt::core::Doorbell db;
+    if (basalt::core::doorbell_init(g, K, db) == 0) {
         std::fprintf(stderr, "strata generate: doorbell_init failed\n");
         return 1;
     }
@@ -2147,13 +2147,13 @@ int main(int argc, char** argv) {
     // module was built and parity-tested, and nothing called it.  Everything below is construction - the table
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
-    strata::kernels::PleTable ple_table;
-    std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
+    basalt::kernels::PleTable ple_table;
+    std::vector<float> ple_emb_host((size_t) basalt::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
     if (!o.ple_gguf.empty()) {
-        strata::kernels::PleIoOptions pio;
-        pio.mode = o.ple_io == "mmap" || o.ple_io == "ram" ? strata::kernels::PleIo::Mmap : strata::kernels::PleIo::Direct;
+        basalt::kernels::PleIoOptions pio;
+        pio.mode = o.ple_io == "mmap" || o.ple_io == "ram" ? basalt::kernels::PleIo::Mmap : basalt::kernels::PleIo::Direct;
         pio.lock = o.ple_io == "ram";
         const auto tpl = Clock::now();
         pio.max_inflight = (uint32_t) o.ple_inflight;
@@ -2165,13 +2165,13 @@ int main(int argc, char** argv) {
         {
             pio.keepalive_ms = 100.0;
             pio.keepalive_window_s = 60.0;
-            if (pio.mode != strata::kernels::PleIo::Direct || !pio.io_thread) pio.keepalive_ms = 0;
+            if (pio.mode != basalt::kernels::PleIo::Direct || !pio.io_thread) pio.keepalive_ms = 0;
         }
         if (!ple_table.open(o.ple_gguf, err, pio)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        if (pio.mode == strata::kernels::PleIo::Direct) {
+        if (pio.mode == basalt::kernels::PleIo::Direct) {
             // --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational disk can take
             // longer than the stall watchdog's limit for one prompt chunk's rows.  Recommended, not forced.
             std::string dev;
@@ -2189,14 +2189,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: the SSD is kept awake while rows are read: one page of the table after "
                                  "%.0f ms without a read, until %.0f s after the last request "
                                  "\n", pio.keepalive_ms, pio.keepalive_window_s);
-        else if (pio.mode == strata::kernels::PleIo::Direct)
+        else if (pio.mode == basalt::kernels::PleIo::Direct)
             std::fprintf(stderr, "strata generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
-        const strata::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
-        const strata::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
-        const strata::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
-        const strata::core::WeightRef* wnq = wt.find("blk.1.ple_norm_query.weight");
-        const strata::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
-        const strata::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
+        const basalt::core::WeightRef* wk = wt.find("blk.1.ple_key.weight");
+        const basalt::core::WeightRef* wv = wt.find("blk.1.ple_value.weight");
+        const basalt::core::WeightRef* wnk = wt.find("blk.1.ple_norm_key.weight");
+        const basalt::core::WeightRef* wnq = wt.find("blk.1.ple_norm_query.weight");
+        const basalt::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
+        const basalt::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
         if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
             std::fprintf(stderr, "strata generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
                                  "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
@@ -2230,8 +2230,8 @@ int main(int argc, char** argv) {
         // plausible wrong layer-1 routing.  tools/iq_pack.py narrows it (index kind 3); a pack that did not is refused
         // here.  F16 is index kind 5 or 3 (F16InF32) in a native pack and kind 0 (verbatim 2-byte F16) in the canonical
         // Q2_0 pack; BF16 (kind 4) has the same size and is not F16.
-        const bool f16 = wc->kind == strata::core::WeightKind::F16InF32 ||
-                         (wc->kind == strata::core::WeightKind::Verbatim && wc->code_bits == 0);
+        const bool f16 = wc->kind == basalt::core::WeightKind::F16InF32 ||
+                         (wc->kind == basalt::core::WeightKind::Verbatim && wc->code_bits == 0);
         if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
             std::fprintf(stderr, "strata generate: blk.1.ple_conv1d.weight is not stored as F16 (pack index kind %d, "
                                  "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
@@ -2240,7 +2240,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
-        ss.ple.consts = strata::kernels::ple_artifact_consts();
+        ss.ple.consts = basalt::kernels::ple_artifact_consts();
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
         ss.ple.table = &ple_table;
         ss.ple.token = &ss.ple_token;
@@ -2248,8 +2248,8 @@ int main(int argc, char** argv) {
         // `ss.ple.hist` and the ready() check wait for `session_init`, which carves the history - the session is
         // allocated after the layer-split search (see the carve), and the wiring lands there
         ss.ple.emb_host = ple_emb_host.data();
-        if (cudaMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
-            cudaMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+        if (cudaMalloc((void**) &ple_emb_dev, (size_t) basalt::kernels::NG_N_EMBD * 4) != cudaSuccess ||
+            cudaMalloc((void**) &ple_scratch, basalt::core::ple_run_scratch_bytes()) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
             return 1;
         }
@@ -2278,17 +2278,17 @@ int main(int argc, char** argv) {
         std::string perr;
         const bool remote = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         if (remote || o.expert_profile.empty() ||
-            !strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, prof, pslots, perr)) {
+            !basalt::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, prof, pslots, perr)) {
             std::fprintf(stderr, "strata generate: --split-skip-if-fits: %s; the split stays\n",
                          remote ? "remote expert caches are in use" : perr.empty() ? "no expert profile" : perr.c_str());
         } else {
-            const auto& lay = strata::kernels::cpu::expert_layout();
+            const auto& lay = basalt::kernels::cpu::expert_layout();
             int64_t pairs_bytes = 0;
             for (const auto& pr : prof)
                 pairs_bytes += native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
+            const int64_t session = (int64_t) basalt::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
             const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20);   // + drafter/head, windows
             const int64_t room = (int64_t) fb - held_back;
             cudaDeviceProp dp{};
@@ -2314,7 +2314,7 @@ int main(int argc, char** argv) {
             }
         }
     }
-    strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
+    basalt::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped (as the drafter below, for the same reason)
     std::vector<std::unique_ptr<GpuStage>> stages;
@@ -2323,18 +2323,18 @@ int main(int argc, char** argv) {
         GpuStage& st = *stages.back();
         st.dev = split_devs[i];
         double free_gib = 0;
-        if (!strata::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
+        if (!basalt::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        const strata::core::OnDevice on(st.dev);
+        const basalt::core::OnDevice on(st.dev);
         std::set<std::string> skip_s = skip_base;
         uint64_t pool_s = pool_bytes;
         if (stage_trim) {
             const int64_t lb = split_at[i], le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
             add_foreign(lb, le, skip_s, false);
-            strata::core::NativeDense::set_layer_range((int) lb, (int) le);
-            if (!strata::core::WeightTable::pool_bytes(o.pack, pool_s, err, &skip_s)) {
+            basalt::core::NativeDense::set_layer_range((int) lb, (int) le);
+            if (!basalt::core::WeightTable::pool_bytes(o.pack, pool_s, err, &skip_s)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -2371,7 +2371,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         // a control vector (the speed projection): its tables on this device too - the stage's layers apply it here
-        if (!strata::kernels::cvec_replicate(err)) {
+        if (!basalt::kernels::cvec_replicate(err)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %s\n", st.dev, err.c_str());
             return 1;
         }
@@ -2384,7 +2384,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: layer split, CUDA%d: the image position table failed\n", st.dev);
                 return 1;
             }
-            strata::kernels::mrope_table_set(st.mrope);
+            basalt::kernels::mrope_table_set(st.mrope);
         }
         // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed).  A given
         // --pcie-frac is every stage's share and skips these probes (pcie_given); there is no per-stage setting yet.
@@ -2406,7 +2406,7 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
-        if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
+        if (!basalt::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -2467,8 +2467,8 @@ int main(int argc, char** argv) {
     // books here (without it the cards would fill and the draft head no longer fit).
     const int64_t split_ring_mib =
         (multi_gpu && !pf_borrow && o.prefill_chunk >= 1024)
-            ? (int64_t) (((uint64_t) strata::prefill::Prefill::ring_slots_for(o.prefill_chunk) *
-                              (uint64_t) strata::kernels::cpu::expert_layout().max_blob + (1ull << 20) - 1) >> 20)
+            ? (int64_t) (((uint64_t) basalt::prefill::Prefill::ring_slots_for(o.prefill_chunk) *
+                              (uint64_t) basalt::kernels::cpu::expert_layout().max_blob + (1ull << 20) - 1) >> 20)
             : 0;
     const int64_t split_pf_mib =
         (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 + split_ring_mib : 0;
@@ -2479,7 +2479,7 @@ int main(int argc, char** argv) {
     const int64_t kWindowMib = 96;       // the verify windows; 75 MiB measured, rounded up
     const int64_t kDrafterMib = 1000;    // the MTP drafter (839 MiB) + the head, on the last stage only
     auto stage_room = [&](int dev, bool later, bool drafter) -> int64_t {
-        const strata::core::OnDevice on(dev);
+        const basalt::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
@@ -2489,7 +2489,7 @@ int main(int argc, char** argv) {
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = basalt::kernels::cpu::expert_layout();
         const int ns = (int) stages.size() + 1;
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
         std::vector<double> layer_ms((size_t) ns);
@@ -2522,7 +2522,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                capr[(size_t) i] = cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le);
+                capr[(size_t) i] = cap[(size_t) i] - (int64_t) basalt::core::session_bytes(g, o.max_context, K, lb, le);
             }
             std::fill(used.begin(), used.end(), 0);
             held_mass = 0;
@@ -2609,13 +2609,13 @@ int main(int argc, char** argv) {
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
     {
-        const strata::core::OnDevice on0(0);
+        const basalt::core::OnDevice on0(0);
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        if (cudaMalloc(&sbuf, basalt::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (basalt::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -2623,12 +2623,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                                  "%.2f GiB of pinned RAM\n",
                          (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4),
-                         (long long) o.max_context, (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+                         (long long) o.max_context, (double) basalt::core::qsa_kv_host_bytes() / 1073741824.0);
         // the PLE block above built everything but the history, which session_init has just carved
         ss.ple.hist = ss.ple_hist;
         // generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt path or
         // the verifier reads it (--serve zeroes it per request when nothing is reused)
-        strata::core::session_zero(ss, g, nullptr, main_cs);
+        basalt::core::session_zero(ss, g, nullptr, main_cs);
         if (cudaDeviceSynchronize() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
             return 1;
@@ -2644,15 +2644,15 @@ int main(int argc, char** argv) {
     }
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
-        const strata::core::OnDevice on(st.dev);
+        const basalt::core::OnDevice on(st.dev);
         void* sbuf_s = nullptr;
-        if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
-            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
+        if (cudaMalloc(&sbuf_s, basalt::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
+            basalt::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
         const bool last = i + 1 == stages.size();
-        const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
+        const basalt::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
             (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s%s\n", st.dev,
@@ -2671,9 +2671,9 @@ int main(int argc, char** argv) {
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
     // engine still starts and serves one request at a time.
-    std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
+    std::vector<std::vector<std::unique_ptr<basalt::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
-        const int cap = strata::kernels::kVerifyMaxT;
+        const int cap = basalt::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
@@ -2698,13 +2698,13 @@ int main(int argc, char** argv) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
-            const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
+            const basalt::core::OnDevice on_k(dev);
+            const uint64_t bytes = basalt::core::session_bytes(g, o.max_context, K, lo, hi);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
-                auto u = std::make_unique<strata::core::SessionState>();
+                auto u = std::make_unique<basalt::core::SessionState>();
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                if (cudaMalloc(&buf, bytes) != cudaSuccess || basalt::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
@@ -2715,7 +2715,7 @@ int main(int argc, char** argv) {
                     fit = b;
                     break;
                 }
-                strata::core::session_zero(*u, g, nullptr, nullptr);
+                basalt::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
             }
             cudaDeviceSynchronize();
@@ -2742,7 +2742,7 @@ int main(int argc, char** argv) {
 
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts: the driver can
     // refuse the draft weights after mapping tens of GiB of host pages.
-    strata::core::MtpDrafter mtp;
+    basalt::core::MtpDrafter mtp;
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -2751,9 +2751,9 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
-        static const strata::core::ModelGeometry draft_geometry{};
+        static const basalt::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
-        const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
+        const basalt::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
@@ -2761,10 +2761,10 @@ int main(int argc, char** argv) {
     // everything allocated after it comes out of the reserve.  Loaded first, the cache is sized around the native
     // head, and the head is not refused after the expert arena has registered tens of GiB of host pages, like the
     // drafter above.
-    const strata::core::WeightRef* wo = wt.find("output.weight");
+    const basalt::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
-    strata::core::NativeHead native_head;
+    basalt::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
@@ -2786,7 +2786,7 @@ int main(int argc, char** argv) {
     // before the host arena maps its expert pages into their address spaces.
     for (int r = 1; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
         double free_gib = 0;
-        if (!strata::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
+        if (!basalt::core::RemoteExperts::preflight(remote_dev[r], free_gib, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -2807,7 +2807,7 @@ int main(int argc, char** argv) {
     // fills and the PCIe share of the misses.  When `cudaHostRegister` fails the arena falls back to 4 KB anonymous
     // pages, reported by `note()`.  A stale CUDA error left set by a failed `cudaHostRegister` would be read later by
     // `gr_read`'s launch check: see the note in `pinned.cu`.
-    strata::core::FileExpertSource src;
+    basalt::core::FileExpertSource src;
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         int dev = 0;
@@ -2827,15 +2827,15 @@ int main(int argc, char** argv) {
                                      "toolkit>, with its libcudart.so present)\n",
                              CUDART_VERSION / 1000, CUDART_VERSION % 1000 / 10, rt / 1000, rt % 1000 / 10);
         }
-        const std::string e = strata::core::device_code_error();
+        const std::string e = basalt::core::device_code_error();
         if (!e.empty()) {
             std::fprintf(stderr, "strata generate: this engine has no code for %s (sm_%d%d): %s - rebuild it for this "
                                  "card (setup does: START-HERE.bat --setup)\n", name, p.major, p.minor, e.c_str());
             return 1;
         }
     }
-    strata::core::ArenaExpertSource arena_src;
-    strata::core::ExpertSource* srcp = nullptr;
+    basalt::core::ArenaExpertSource arena_src;
+    basalt::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when built
         // with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout).  The low-RAM mode: the
@@ -2872,23 +2872,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: WARNING: %s\n", arena_src.ram_warning().c_str());
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
-                     (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
+                     (double) basalt::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker, o.pool_affinity);
-    if (pool.is_hybrid() && pool.affinity() != strata::kernels::cpu::PoolAffinity::All) {
-        const char* aff_str = pool.affinity() == strata::kernels::cpu::PoolAffinity::PCores ? "p-cores" :
-                              pool.affinity() == strata::kernels::cpu::PoolAffinity::All ? "all" : "auto";
+    basalt::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker, o.pool_affinity);
+    if (pool.is_hybrid() && pool.affinity() != basalt::kernels::cpu::PoolAffinity::All) {
+        const char* aff_str = pool.affinity() == basalt::kernels::cpu::PoolAffinity::PCores ? "p-cores" :
+                              pool.affinity() == basalt::kernels::cpu::PoolAffinity::All ? "all" : "auto";
         std::fprintf(stderr, "strata generate: hybrid CPU detected (%d P-cores / %d threads, %d E-cores), pool workers: %d, affinity: %s\n",
                      pool.p_cores(), pool.p_threads(), pool.e_cores(), pool.workers(), aff_str);
     }
-    if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
+    if (o.no_ple_prefetch) basalt::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
-    strata::core::Verifier::prepare_hc8(wt, g); // before the cache sizes itself
-    strata::core::ExpertCache xcache;
+    basalt::core::Verifier::prepare_hc8(wt, g); // before the cache sizes itself
+    basalt::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // the auto sizing lowered the reserve so a small card's cache fits
@@ -2903,7 +2903,7 @@ int main(int argc, char** argv) {
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
                                      ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
@@ -2920,7 +2920,7 @@ int main(int argc, char** argv) {
         // room.  A card the default reserve leaves that much is sized as before.
         constexpr int kSmallReserveMib = 300;
         const int64_t min_slots = (o.prefill_chunk > 0 && pf_borrow)
-            ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
+            ? ((int64_t) basalt::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
         if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
             const int64_t fit_mib = ((int64_t) free_b - mtp_bind - min_slots * blob) / (1 << 20) - prefill_mib;
@@ -2943,7 +2943,7 @@ int main(int argc, char** argv) {
             const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + min_slots * blob;
             const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) free_b + (1 << 20) - 1) >> 20);
             const int64_t session_mib =
-                (int64_t) (strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers) >> 20);
+                (int64_t) (basalt::core::session_bytes(g, o.max_context, K, 0, g.n_layers) >> 20);
             const std::string reserve_tip =
                 o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib
                     ? ", a smaller --vram-reserve-mib (" + std::to_string(o.vram_reserve_mib) + " now; " +
@@ -2966,7 +2966,7 @@ int main(int argc, char** argv) {
         cudaMemGetInfo(&free_b, &total_b);
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
-        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
+        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) basalt::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
             // a WARNING that names the knob: the user asked for this size, and gets fewer slots
             std::fprintf(stderr, "strata generate: WARNING: layer split: --expert-cache %d leaves no room for the "
@@ -2984,7 +2984,7 @@ int main(int argc, char** argv) {
     if (native_pack && o.expert_cache > 0 && !profile.empty() && !o.expert_cache_per_layer) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = basalt::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
@@ -3024,13 +3024,13 @@ int main(int argc, char** argv) {
                 sized_slots.resize(keep);
                 o.expert_cache = (int) keep;
             } else {
-                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
+                o.expert_cache = (int) (keep_bytes / (int64_t) basalt::kernels::cpu::expert_layout().max_blob);
             }
             if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
             return true;
         };
         auto cache_bytes = [&]() -> int64_t {
-            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
             int64_t b = 0;
             for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
             return b;
@@ -3046,7 +3046,7 @@ int main(int argc, char** argv) {
             bool ok = false;
             {
                 ok = sized_slots.empty()
-                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
+                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) basalt::kernels::cpu::expert_layout().max_blob, err)
                     : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
             }
             if (!ok) {
@@ -3140,18 +3140,18 @@ int main(int argc, char** argv) {
             }
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (slot == strata::core::kNotResident) {
+            if (slot == basalt::core::kNotResident) {
                 if (per_layer) continue;
                 break;
             }
             const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
             ++prefilled;
         }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
@@ -3160,7 +3160,7 @@ int main(int argc, char** argv) {
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
         if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+                                (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -3172,11 +3172,11 @@ int main(int argc, char** argv) {
 
     for (auto& stp : stages) {
         GpuStage& st = *stp;
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = basalt::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
         // to hold back is the windows - and `free_b` has already lost the drafter.
         const int64_t room = stage_room(st.dev, true, false);
-        const strata::core::OnDevice on(st.dev);
+        const basalt::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
@@ -3202,7 +3202,7 @@ int main(int argc, char** argv) {
         for (const auto& pr : st.profile) {
             if (filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
-            if (slot == strata::core::kNotResident) break;
+            if (slot == basalt::core::kNotResident) break;
             const uint8_t* b = srcp->blob(pr.first, pr.second);
             if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
                 std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
@@ -3226,9 +3226,9 @@ int main(int argc, char** argv) {
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
 
-    std::array<strata::core::RemoteExperts, 3> remote_experts;
-    std::unique_ptr<strata::core::RemoteExpertOpt> remote_opt;
-    if (o.remote_expert_opt && o.expert_cache_remote[0] > 0) remote_opt = std::make_unique<strata::core::RemoteExpertOpt>();
+    std::array<basalt::core::RemoteExperts, 3> remote_experts;
+    std::unique_ptr<basalt::core::RemoteExpertOpt> remote_opt;
+    if (o.remote_expert_opt && o.expert_cache_remote[0] > 0) remote_opt = std::make_unique<basalt::core::RemoteExpertOpt>();
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
@@ -3315,7 +3315,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
-    strata::core::PeerExperts peer;
+    basalt::core::PeerExperts peer;
     if (o.peer_device >= 1) {
         if (profile.empty() || srcp == nullptr || o.expert_cache <= 0) {
             std::fprintf(stderr, "strata generate: --peer-device needs --expert-profile and the expert cache\n");
@@ -3346,13 +3346,13 @@ int main(int argc, char** argv) {
     drive.d.jobs.resize((size_t) K);
     // Routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE input
     // predicts its experts and their pages are warmed meanwhile.  It only warms pages.
-    strata::core::RouterLookahead lookahead;
+    basalt::core::RouterLookahead lookahead;
     if (srcp == &src && src.warms()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
-            ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
+            const basalt::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+            ok = w != nullptr && w->kind == basalt::core::WeightKind::Bf16InF32 &&
                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
             if (!ok) break;
             routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
@@ -3378,7 +3378,7 @@ int main(int argc, char** argv) {
     float* d_hit_q8_scale = nullptr;   ///< R4.2h: the fp32 activation scales the CPU path also uses
     float* d_hit_out = nullptr;
     if (o.expert_cache > 0 && !o.no_pool) {
-        const uint64_t sb = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
+        const uint64_t sb = basalt::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, basalt::kernels::cpu::FF);
         if (cudaMalloc(&hit_scratch, (size_t) sb) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_slot, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_dst, (size_t) K * sizeof(int32_t)) != cudaSuccess ||
@@ -3394,7 +3394,7 @@ int main(int argc, char** argv) {
         drive.d.cache = &xcache;
         drive.d.cache_stream = main_cs;
         drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
-        drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        drive.d.cache_blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
         drive.d.cache_slot_off = xcache.slot_offsets();
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
@@ -3429,27 +3429,27 @@ int main(int argc, char** argv) {
                                  "--no-capture as well.\n");
             return 2;
         }
-        if (!strata::core::stage_timing_enable()) {
+        if (!basalt::core::stage_timing_enable()) {
             std::fprintf(stderr, "strata generate: stage_timing_enable failed\n");
             return 1;
         }
-        strata::core::stage_timing_name(0, "gr_read (attn)");
-        strata::core::stage_timing_name(1, "attention block");
-        strata::core::stage_timing_name(2, "gr_write (attn)");
-        strata::core::stage_timing_name(3, "gr_read (ffn)");
-        strata::core::stage_timing_name(4, "moe_route");
-        strata::core::stage_timing_name(5, "moe_finish");
-        strata::core::stage_timing_name(6, "gr_write (ffn)");
+        basalt::core::stage_timing_name(0, "gr_read (attn)");
+        basalt::core::stage_timing_name(1, "attention block");
+        basalt::core::stage_timing_name(2, "gr_write (attn)");
+        basalt::core::stage_timing_name(3, "gr_read (ffn)");
+        basalt::core::stage_timing_name(4, "moe_route");
+        basalt::core::stage_timing_name(5, "moe_finish");
+        basalt::core::stage_timing_name(6, "gr_write (ffn)");
         // The GDN block's internals: a single "attention block" number cannot say which of its many small
         // latency-bound launches costs anything.
-        strata::core::stage_timing_name(8, "  gdn: quantize x");
-        strata::core::stage_timing_name(9, "  gdn: qkv gemv");
-        strata::core::stage_timing_name(10, "  gdn: conv+silu");
-        strata::core::stage_timing_name(11, "  gdn: l2 norms");
-        strata::core::stage_timing_name(12, "  gdn: alpha/beta/gate");
-        strata::core::stage_timing_name(13, "  gdn: gdn_step");
-        strata::core::stage_timing_name(14, "  gdn: z + out_norm");
-        strata::core::stage_timing_name(15, "  gdn: out gemv");
+        basalt::core::stage_timing_name(8, "  gdn: quantize x");
+        basalt::core::stage_timing_name(9, "  gdn: qkv gemv");
+        basalt::core::stage_timing_name(10, "  gdn: conv+silu");
+        basalt::core::stage_timing_name(11, "  gdn: l2 norms");
+        basalt::core::stage_timing_name(12, "  gdn: alpha/beta/gate");
+        basalt::core::stage_timing_name(13, "  gdn: gdn_step");
+        basalt::core::stage_timing_name(14, "  gdn: z + out_norm");
+        basalt::core::stage_timing_name(15, "  gdn: out gemv");
     }
     std::FILE* routing = nullptr;
     if (!o.dump_routing.empty()) {
@@ -3465,11 +3465,11 @@ int main(int argc, char** argv) {
         }
         drive.routing = routing;
     }
-    strata::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
+    basalt::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
     // The hit hook rides the same switch as the pool: with no pool there is no `parts` staging to
     // write into, and a hit path with nowhere to write is a wrong token rather than an error.
-    strata::core::HitFn hit_fn =
-        (o.no_pool || o.expert_cache <= 0) ? nullptr : &strata::core::expert_hit_run;
+    basalt::core::HitFn hit_fn =
+        (o.no_pool || o.expert_cache <= 0) ? nullptr : &basalt::core::expert_hit_run;
     void* pool_user = o.no_pool ? nullptr : (void*) &drive;
     std::fprintf(stderr, "strata generate: %d expert-pool workers%s%s\n", pool.workers(),
                  pool.host_works() ? " + the host thread" : "",
@@ -3482,12 +3482,12 @@ int main(int argc, char** argv) {
     // and the CPU term is answered by the VRAM expert cache, not by this pipeline.
 
     // ---- the graphs
-    strata::core::SessionGraphs gr;
+    basalt::core::SessionGraphs gr;
     if (!o.no_capture && !native_pack) {   // a native pack runs verify windows only
         // a layer split's CUDA0 session owns only [0, split_at[0]), so its graphs cover that range; the
         // whole-model replay paths (`session_loop`, the plain generate loop) refuse rather than read another
         // stage's state - a split runs its layers on the stages' verifiers (serve) or prefill stage chain
-        if (!strata::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, 0,
+        if (!basalt::core::session_capture(wt, g, ss, d_parts, gr, err, /*split=*/o.gpu_stages, 0,
                                            multi_gpu ? split_at[0] : -1)) {
             std::fprintf(stderr, "strata generate: session_capture: %s\n", err.c_str());
             return 1;
@@ -3529,8 +3529,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
-            return strata::core::lm_head(wt, g, ss.block, d_logits, stream, err);
-        return strata::core::lm_head_mix(wt, g, ss.block, stream, err) &&
+            return basalt::core::lm_head(wt, g, ss.block, d_logits, stream, err);
+        return basalt::core::lm_head_mix(wt, g, ss.block, stream, err) &&
                native_head.run(ss.block.mixed, d_logits, stream, err);
     };
     float* d_emb = nullptr;
@@ -3554,12 +3554,12 @@ int main(int argc, char** argv) {
     // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
     void* token_stream = o.stream_token ? main_cs : nullptr;
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
-        if (!strata::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
+        if (!basalt::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return false;
         }
         if (pos == 0) {
-            strata::core::session_zero(ss, g, d_emb, token_stream);
+            basalt::core::session_zero(ss, g, d_emb, token_stream);
         } else {
             for (int64_t c = 0; c < g.hc; ++c)
                 if (cudaMemcpyAsync(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
@@ -3571,7 +3571,7 @@ int main(int argc, char** argv) {
         return o.stream_token || cudaDeviceSynchronize() == cudaSuccess;
     };
 
-    strata::kernels::SamplerParams sp;
+    basalt::kernels::SamplerParams sp;
     sp.greedy = o.greedy;
     sp.seed = o.seed;
     sp.top_k = o.top_k;
@@ -3609,7 +3609,7 @@ int main(int argc, char** argv) {
         // `n_prompt - 1`.  So a 5-token prompt with `--max-new 6` writes 10 rows.  The header must describe the file
         // that was written: anything reading the count instead of the size would otherwise get a wrong answer that
         // looks authoritative.
-        const int32_t n_rows = (int32_t) strata::program::logits_selection::row_count(dump_positions, o.logits_stride);
+        const int32_t n_rows = (int32_t) basalt::program::logits_selection::row_count(dump_positions, o.logits_stride);
         hdr[0] = n_vocab; hdr[1] = n_rows;
     }
 
@@ -3662,9 +3662,9 @@ int main(int argc, char** argv) {
     // kernels, looks like 55% of the token there.
     // ---- R0.9: THE PER-STAGE TABLE ON THE CAPTURED GRAPH.
     if (o.gpu_stages) {
-        strata::core::doorbell_reset(db);
+        basalt::core::doorbell_reset(db);
         double mix = 0, ffn = 0, post = 0;
-        if (!strata::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
+        if (!basalt::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
             // a native (IQ) pack captures no per-layer graphs; the serve path times its window's stages
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(),
                          native_pack ? " - a native (IQ) pack has no per-layer graphs to replay. Its decode window's GPU "
@@ -3675,7 +3675,7 @@ int main(int argc, char** argv) {
         const int reps = 20;
         double t_mix = 0, t_ffn = 0, t_post = 0;
         for (int r = 0; r < reps; ++r) {
-            if (!strata::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
+            if (!basalt::core::session_replay_stages(g, 0, 0, ss, gr, main_cs, mix, ffn, post, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -3702,7 +3702,7 @@ int main(int argc, char** argv) {
             std::vector<double> acc((size_t) g.n_layers, 0.0), per;
             double f2 = 0, p2 = 0;
             for (int r = 0; r < reps; ++r) {
-                if (!strata::core::session_replay_stages_per_layer(g, 0, 0, ss, gr, main_cs, per, f2, p2, err)) {
+                if (!basalt::core::session_replay_stages_per_layer(g, 0, 0, ss, gr, main_cs, per, f2, p2, err)) {
                     std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                     return 1;
                 }
@@ -3712,7 +3712,7 @@ int main(int argc, char** argv) {
             int64_t ng = 0, nq = 0, worst_l = 0;
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 const double v = acc[(size_t) l] / reps;
-                if (strata::core::is_qsa_layer(g, l)) { qsa += v; ++nq; }
+                if (basalt::core::is_qsa_layer(g, l)) { qsa += v; ++nq; }
                 else { gdn += v; ++ng; }
                 if (v > worst) { worst = v; worst_l = l; }
             }
@@ -3734,7 +3734,7 @@ int main(int argc, char** argv) {
         {
             std::vector<double> acc5(5, 0.0), per, s5;
             for (int r = 0; r < reps; ++r) {
-                if (!strata::core::session_replay_stage_prefixes(g, 0, 0, ss, gr, main_cs, s5, per, err)) {
+                if (!basalt::core::session_replay_stage_prefixes(g, 0, 0, ss, gr, main_cs, s5, per, err)) {
                     std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                     return 1;
                 }
@@ -3775,7 +3775,7 @@ int main(int argc, char** argv) {
                 for (int k = 1; k <= 5; ++k) {
                     double acc = 0, one = 0;
                     for (int r = 0; r < reps; ++r) {
-                        if (!strata::core::session_replay_stage_sweep(g, 0, 0, ss, gr, main_cs, k, one, err)) {
+                        if (!basalt::core::session_replay_stage_sweep(g, 0, 0, ss, gr, main_cs, k, one, err)) {
                             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                             return 1;
                         }
@@ -3798,16 +3798,16 @@ int main(int argc, char** argv) {
         }
         std::printf("\n  compare `--gpu-only-full`, which replays the same work as TWO graphs per layer.  The\n");
         std::printf("  three sum slightly above it because each launch carries the driver's gap.\n");
-        strata::core::session_graphs_free(gr);
-        strata::core::doorbell_free(db);
+        basalt::core::session_graphs_free(gr);
+        basalt::core::doorbell_free(db);
         cudaFree(d_next);
         return 0;
     }
 
     if (o.graph_only) {
-        strata::core::doorbell_reset(db);
+        basalt::core::doorbell_reset(db);
         // one warm pass so the first launch does not pay for page mapping
-        if (!strata::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
+        if (!basalt::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
             std::fprintf(stderr, "strata generate: session_replay warm: %s\n", err.c_str());
             return 1;
         }
@@ -3818,7 +3818,7 @@ int main(int argc, char** argv) {
         const int reps = 20;
         const Clock::time_point t0 = Clock::now();
         for (int r = 0; r < reps; ++r) {
-            if (!strata::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
+            if (!basalt::core::session_replay(g, 0, 0, ss, gr, main_cs, err)) {
                 std::fprintf(stderr, "strata generate: session_replay: %s\n", err.c_str());
                 return 1;
             }
@@ -3840,12 +3840,12 @@ int main(int argc, char** argv) {
     // expert, the combine and the second `gr_write` - and the LM head.  This flag measures the whole GPU work of a
     // token: no pool runs, so `parts` keeps whatever the buffer holds and the timing is GPU work alone.
     if (o.gpu_only_full) {
-        strata::core::doorbell_reset(db);
+        basalt::core::doorbell_reset(db);
         const int reps = 20;
         double ms_layers = 0, ms_head = 0;
         for (int r = -1; r < reps; ++r) {          // r == -1 is the warm pass, not counted
             const Clock::time_point t0 = Clock::now();
-            if (!strata::core::session_replay_full(g, 0, 0, ss, gr, main_cs, err)) {
+            if (!basalt::core::session_replay_full(g, 0, 0, ss, gr, main_cs, err)) {
                 std::fprintf(stderr, "strata generate: session_replay_full: %s\n", err.c_str());
                 return 1;
             }
@@ -3886,9 +3886,9 @@ int main(int argc, char** argv) {
     // `session_loop` must not allocate its pinned staging buffer, its probe event and its host pin on every token:
     // `cudaFreeHost` implicitly synchronises the device, so every token would finish with a device-wide sync.  The
     // scratch is created once here and reused; it also owns the host pin for the whole session.
-    strata::core::SessionLoopScratch loop_scratch;
+    basalt::core::SessionLoopScratch loop_scratch;
     struct ScratchFree {
-        strata::core::SessionLoopScratch* p;
+        basalt::core::SessionLoopScratch* p;
         ~ScratchFree() { if (p != nullptr) p->free(); }
     } scratch_free{&loop_scratch};
     // Initialised unconditionally, including under --no-pool: the loop validates the scratch it is handed, so
@@ -3900,27 +3900,27 @@ int main(int argc, char** argv) {
     }
     // The whole token as ONE graph whenever nothing needs a host step between the ring and post[l] (the VRAM expert
     // tier and the per-layer dumps do).  `--no-token-graph` keeps two graphs per layer.
-    strata::core::TokenGraph tgraph;
+    basalt::core::TokenGraph tgraph;
     struct TokenGraphFree {
-        strata::core::TokenGraph* p;
-        ~TokenGraphFree() { strata::core::token_graph_free(*p); }
+        basalt::core::TokenGraph* p;
+        ~TokenGraphFree() { basalt::core::token_graph_free(*p); }
     } tgraph_free{&tgraph};
     // With a PROFILE-filled cache the residency is static, so the hit decision moves onto the device and the token
     // graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
     std::vector<int32_t> host_res;
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
-    strata::core::TokenHits thits;
+    basalt::core::TokenHits thits;
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
-        host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+        host_res.assign((size_t) (g.n_layers * g.n_expert), basalt::core::kNotResident);
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const int st = multi_gpu ? stage_of(l) : 0;
                 const int32_t slot = st > 0 ? stages[(size_t) st - 1]->cache.slot_of(l, e) : xcache.slot_of(l, e);
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
-                if (slot != strata::core::kNotResident) ++resident;
+                if (slot != basalt::core::kNotResident) ++resident;
             }
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
@@ -3937,21 +3937,21 @@ int main(int argc, char** argv) {
         {
             uint64_t released = 0;
             for (size_t i = 0; i < host_res.size(); ++i)
-                if (host_res[i] != strata::core::kNotResident)
+                if (host_res[i] != basalt::core::kNotResident)
                     released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
             if (released > 0)
                 std::fprintf(stderr, "strata generate: expert arena: %.2f GiB of VRAM-held experts handed back to the OS\n",
                              (double) released / (1024.0 * 1024.0 * 1024.0));
             int64_t pf = 0;
             for (size_t i = 0; i < host_res.size(); ++i)
-                if (host_res[i] == strata::core::kNotResident) {
+                if (host_res[i] == basalt::core::kNotResident) {
                     srcp->prefetch((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
                     ++pf;
                 }
             (void) pf;
         }
         for (auto& st : stages) {   // layer split across GPUs: the same table on every device
-            const strata::core::OnDevice on(st->dev);
+            const basalt::core::OnDevice on(st->dev);
             if (cudaMalloc((void**) &st->d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
                 cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
@@ -3974,7 +3974,7 @@ int main(int argc, char** argv) {
     }
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&
         (hit_fn == nullptr || thits.on()) && !native_pack && !multi_gpu) {   // a split's token graph cannot span stages
-        if (!strata::core::session_capture_token(wt, g, ss, d_parts, loop_scratch.y_miss, loop_scratch.parts_bytes,
+        if (!basalt::core::session_capture_token(wt, g, ss, d_parts, loop_scratch.y_miss, loop_scratch.parts_bytes,
                                                  tgraph, err, thits.on() ? &thits : nullptr)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -4015,19 +4015,19 @@ int main(int argc, char** argv) {
     // the share of expert bytes the arena could pin (sizes the prompt path's lend cap)
     if (srcp != nullptr && o.prefill_chunk > 0) {
         uint64_t pinned = 0, total = 0;
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = basalt::kernels::cpu::expert_layout();
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const uint64_t b = lay.blob_bytes(l);
                 total += b;
                 if (srcp->pinned(l, e)) pinned += b;
             }
-        strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
+        basalt::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
     // bytes -> slots for CUDA0's cache: exact when it knows its per-slot offsets (a native pack's blobs differ
     // per layer), otherwise max_blob each.
     auto slots_from_bytes = [&](uint64_t need) -> int64_t {
-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
             k = 0;
@@ -4037,7 +4037,7 @@ int main(int argc, char** argv) {
         return k;
     };
     auto lend_slots = [&](int64_t c) -> int64_t {
-        return slots_from_bytes(strata::prefill::Prefill::bytes_needed(g, ss, c));
+        return slots_from_bytes(basalt::prefill::Prefill::bytes_needed(g, ss, c));
     };
     // `lend_bytes` went with the single-cache serve loan: a participant's loan is priced by `part_bytes` from its
     // OWN cache, and the only other user of the old helper was the serve path's own relayout.
@@ -4055,7 +4055,7 @@ int main(int argc, char** argv) {
     // At large chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the copies are DMA
     // from pinned RAM, 85% when host copies are the limit (lending more only streams more through them).
     // Hoisted out of plan_lend: the serve path's per-stage loans obey the same cap, one participant at a time.
-    const int64_t kAutoLendPct = strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85;
+    const int64_t kAutoLendPct = basalt::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85;
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
     // but a bare `auto` always reaches 8192.  32768 and 16384 stay opt-in.
     const int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
@@ -4115,7 +4115,7 @@ int main(int argc, char** argv) {
             // fallback reads, so the answers are unchanged.  Nothing pinned: the fallback below.
             whole_err = err;
             resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, -1, o.resident_headroom,
-                                                   strata::core::FileExpertSource::kResidentWhatFits, &profile);
+                                                   basalt::core::FileExpertSource::kResidentWhatFits, &profile);
             if (resident_ok)
                 std::fprintf(stderr, "strata generate: WARNING: the whole resident RAM mode does not fit (%s); %.2f "
                                      "GiB of the experts the GPU does not hold, the hottest by the expert profile, are "
@@ -4160,7 +4160,7 @@ int main(int argc, char** argv) {
                                  "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
             return 2;
         }
-        strata::prefill::Prefill sp;
+        basalt::prefill::Prefill sp;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -4172,9 +4172,9 @@ int main(int argc, char** argv) {
         // are indices into whichever cache owns the layer, so a loan that marked rows by slot number alone would hand
         // CUDA0 a slot belonging to another stage's cache.
         struct PfPart {
-            strata::core::ExpertCache* cache = nullptr;
-            const strata::core::SessionState* ses = nullptr;
-            strata::prefill::Prefill* sp = nullptr;
+            basalt::core::ExpertCache* cache = nullptr;
+            const basalt::core::SessionState* ses = nullptr;
+            basalt::prefill::Prefill* sp = nullptr;
             int dev = -1;                  // -1: leave the device alone (CUDA0)
             int64_t lb = 0, le = 0;        // the layers whose rows this cache holds - the only rows it may lend
             int32_t first = -1;            // the first slot it may lend, for the chunk that was chosen
@@ -4184,24 +4184,24 @@ int main(int argc, char** argv) {
         };
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
         // per layer), otherwise max_blob each.
-        auto cache_slots_for = [&](const strata::core::ExpertCache& xc, uint64_t need) -> int64_t {
+        auto cache_slots_for = [&](const basalt::core::ExpertCache& xc, uint64_t need) -> int64_t {
             if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
                 int64_t k = 0;
                 while (k < xc.slots() &&
                        (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
                 return k;
             }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
             return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
-            return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c));
+            return cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, c));
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
-            strata::core::ExpertCache& xc = *p.cache;
+            basalt::core::ExpertCache& xc = *p.cache;
             return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
                                      : (uint64_t) (xc.slots() - first) *
-                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+                                           (uint64_t) basalt::kernels::cpu::expert_layout().max_blob;
         };
         std::vector<PfPart> pf_parts;
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
@@ -4271,7 +4271,7 @@ int main(int argc, char** argv) {
                     // and what the INFO line reports to the Monitor tab.
                     std::fprintf(stderr, "strata serve: prompt chunk auto: %lld tokens, a %lld-slot ring\n",
                                  (long long) chunk,
-                                 (long long) strata::prefill::Prefill::ring_slots_for(chunk));
+                                 (long long) basalt::prefill::Prefill::ring_slots_for(chunk));
                 else if (chunk != o.prefill_chunk)
                     std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in "
                                          "every expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
@@ -4287,10 +4287,10 @@ int main(int argc, char** argv) {
                 // splits only - one GPU keeps its loan.
                 if (pf_parts.size() > 1) {
                     for (PfPart& p : pf_parts) {
-                        const strata::core::OnDevice on(p.dev);
+                        const basalt::core::OnDevice on(p.dev);
                         size_t fb = 0, tb = 0;
                         if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); continue; }
-                        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
+                        const uint64_t need = basalt::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
                         if ((uint64_t) fb >= need + (3ull << 29)) {
                             std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
                                                  "%.2f GiB free): no loan\n", p.dev < 0 ? 0 : p.dev,
@@ -4344,7 +4344,7 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
-                const strata::core::OnDevice on(st.dev);
+                const basalt::core::OnDevice on(st.dev);
                 void* sb = nullptr;              // this stage's own loan, out of its own cache
                 uint64_t sbb = 0;
                 // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
@@ -4374,10 +4374,10 @@ int main(int argc, char** argv) {
                     const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
                     if (loan) continue;
                     const int dev = i == 0 ? -1 : stages[i - 1]->dev;
-                    const strata::core::OnDevice on(dev);
+                    const basalt::core::OnDevice on(dev);
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
-                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c);
+                    const int64_t need = (int64_t) basalt::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c);
                     if (need + kHeadroom > (int64_t) fb) {
                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                         return false;
@@ -4413,7 +4413,7 @@ int main(int argc, char** argv) {
                 // start the prompt paths over (a failed init may hold buffers), and consume the failed allocation's
                 // error: it is sticky, and the next launch check would report "out of memory" for a kernel
                 for (auto& stp : stages) {
-                    const strata::core::OnDevice on(stp->dev);
+                    const basalt::core::OnDevice on(stp->dev);
                     stp->sp.reset();
                     (void) cudaGetLastError();
                 }
@@ -4440,7 +4440,7 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
-        if (peer.valid() && strata::core::prompt_peer()) {
+        if (peer.valid() && basalt::core::prompt_peer()) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
@@ -4452,16 +4452,16 @@ int main(int argc, char** argv) {
         // request without penalties gets a null buffer and takes the byte-for-byte neutral path (no upload, no buffer
         // handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
-        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
+        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) basalt::kernels::kVerifyMaxT;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
-        if (const strata::core::OnDevice on_h(hist_dev); cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
+        if (const basalt::core::OnDevice on_h(hist_dev); cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
-        strata::core::Verifier ver;
-        strata::core::VerifyHits vh;
+        basalt::core::Verifier ver;
+        basalt::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
@@ -4471,16 +4471,16 @@ int main(int argc, char** argv) {
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
-        strata::core::Verifier ver_same;
+        basalt::core::Verifier ver_same;
         SplitDrive split_drive;
-        auto stage_ver = [&](int st) -> strata::core::Verifier& {
+        auto stage_ver = [&](int st) -> basalt::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
         if (n_stages > 1) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
-                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            const size_t hb = (size_t) basalt::kernels::kVerifyMaxT *
+                              (size_t) basalt::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
             for (float*& h : hand) {
                 float* hh = nullptr;
@@ -4507,8 +4507,8 @@ int main(int argc, char** argv) {
                     ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
-                    const strata::core::OnDevice on(gs.dev);
-                    strata::core::VerifyHits vs;
+                    const basalt::core::OnDevice on(gs.dev);
+                    basalt::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
                     vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
@@ -4543,10 +4543,10 @@ int main(int argc, char** argv) {
         // each stage's verifier gets its stage's slot sessions
         if (o.batch > 0) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                std::vector<strata::core::SessionState*> ptrs;
+                std::vector<basalt::core::SessionState*> ptrs;
                 for (auto& u : bslot_ss[k]) ptrs.push_back(u.get());
-                strata::core::Verifier& vk = k == 0 ? ver : stages[k - 1]->ver;
-                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                basalt::core::Verifier& vk = k == 0 ? ver : stages[k - 1]->ver;
+                const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (!vk.init_slots(ptrs, err)) {
                     std::fprintf(stderr, "strata serve: --batch, stage %zu: %s\n", k + 1, err.c_str());
                     return 1;
@@ -4561,7 +4561,7 @@ int main(int argc, char** argv) {
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
-        const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
+        const basalt::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA has the host call cudaMemcpyAsync + cudaLaunchHostFunc inside a
@@ -4582,7 +4582,7 @@ int main(int argc, char** argv) {
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
-        strata::core::ConversationCache conversations(
+        basalt::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
         // Save only on a switch/rewind, not on each continuing request. No graph
@@ -4600,27 +4600,27 @@ int main(int argc, char** argv) {
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const strata::core::QsaState* draft0 = n_st > 0 ? nullptr : &mtp.kv_state();
-            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? &mtp.kv_state() : nullptr; };
-            strata::core::ConversationCheckpointSplit cs;
-            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);
+            const basalt::core::QsaState* draft0 = n_st > 0 ? nullptr : &mtp.kv_state();
+            auto draft_of = [&](size_t k) -> const basalt::core::QsaState* { return k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            basalt::core::ConversationCheckpointSplit cs;
+            if (n_st > 0) cs = basalt::core::conversation_checkpoints_split(std::move(checks), n_st);
             struct MergeBack {
-                strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
-                ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
+                basalt::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
+                ~MergeBack() { if (on && !basalt::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
-            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
+            const basalt::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
             auto reuse = conversations.take_reuse();
-            std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
+            std::vector<basalt::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
             // the later stages' estimates, each with its own retained K/V when it still fits
             size_t stage_estimate = 0, stage_retained = 0;
             for (size_t k = 0; k < n_st; ++k) {
                 auto& st = stages[k];
-                const strata::core::OnDevice on(st->dev);
-                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                const basalt::core::OnDevice on(st->dev);
+                const basalt::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                 size_t b = 0;
-                if (!strata::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, err)) {
+                if (!basalt::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
                                  st->dev, err.c_str());
                     err.clear();
@@ -4628,7 +4628,7 @@ int main(int argc, char** argv) {
                 }
                 if (!stage_reuse[k].kv.empty()) {
                     size_t r = 0;
-                    if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, st->ss, g, draft_of(k),
+                    if (basalt::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, st->ss, g, draft_of(k),
                                                                           r, err)) {
                         b = r;
                         stage_retained += stage_reuse[k].bytes();
@@ -4640,13 +4640,13 @@ int main(int argc, char** argv) {
                 stage_estimate += b;
             }
             size_t estimate = 0;
-            if (!strata::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, err)) {
+            if (!basalt::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
                 err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
                 return true;
             }
             const size_t fresh_estimate = estimate;
-            if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
+            if (!reuse.kv.empty() && !basalt::core::conversation_snapshot_capture_bytes(
                     reuse, view, ss, g, draft0, estimate, err)) {
                 reuse = {};
                 estimate = fresh_estimate;
@@ -4669,28 +4669,28 @@ int main(int argc, char** argv) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t retained = reuse.bytes() + stage_retained;
                 const size_t additional = estimate > retained ? estimate - retained : 0;
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(),
                         additional, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
                     return true;
                 }
-                strata::core::SavedConversation image;
+                basalt::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                if (!basalt::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
                         std::move(reuse), &reused_bytes)) return false;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
+                    const basalt::core::OnDevice on(st->dev);
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
-                    strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                    const basalt::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                    basalt::core::SavedConversation part;
+                    if (!basalt::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
                             std::move(stage_reuse[k]), &reused_bytes))
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
+                if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
                     return true;
                 }
@@ -4755,7 +4755,7 @@ int main(int argc, char** argv) {
             } else {
                 if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
-                    const strata::core::OnDevice on(st->dev);
+                    const basalt::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
                     part.ids = c.ids;
                     if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
@@ -4768,7 +4768,7 @@ int main(int argc, char** argv) {
                 std::vector<uint64_t> stamps;
                 stamps.reserve(checks.size());
                 for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
-                const size_t victim = strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
+                const size_t victim = basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
                                                                                    o.prompt_cache);
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
@@ -4786,8 +4786,8 @@ int main(int argc, char** argv) {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
-            strata::core::progress_at("reading the prompt (batched), done up to token", done);
-            strata::core::progress_beat();
+            basalt::core::progress_at("reading the prompt (batched), done up to token", done);
+            basalt::core::progress_beat();
             std::fflush(stdout);
             if (o.prompt_cache_every > 0 && done >= pp_next_check) {
                 bool saved = false;
@@ -4814,8 +4814,8 @@ int main(int argc, char** argv) {
             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
             sp.on_chunk = nullptr;
             for (size_t i = 0; i <= stages.size(); ++i) {
-                strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
-                strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
+                basalt::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
+                basalt::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
                     part_next[i] = done + o.prompt_cache_every;
@@ -4862,7 +4862,7 @@ int main(int argc, char** argv) {
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             for (auto& st : stages) {
-                const strata::core::OnDevice on(st->dev);
+                const basalt::core::OnDevice on(st->dev);
                 cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
         };
@@ -4960,10 +4960,10 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
                 GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
-                const strata::core::OnDevice on(gs ? gs->dev : -1);
+                const basalt::core::OnDevice on(gs ? gs->dev : -1);
                 if (slot < 0 || b == nullptr ||
                     cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                    (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer),
                                     cudaMemcpyHostToDevice, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d): %s\n",
                                  (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
@@ -4971,7 +4971,7 @@ int main(int argc, char** argv) {
                 }
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
-                host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                host_res[out] = basalt::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
                 if (peer_promote && peer.valid() && peer.has(s.layer, s.in)) promoted.push_back({s.layer, s.in, s.out});
@@ -4980,7 +4980,7 @@ int main(int argc, char** argv) {
             (void) main_live;
             for (auto& st : stages)
                 if (st->adapt_live) {
-                    const strata::core::OnDevice on(st->dev);
+                    const basalt::core::OnDevice on(st->dev);
                     cudaEventRecord(st->adapt_ev, st->adapt_stream);
                 }
             // the routing counted since the start (each count adds up to 1 / (1 - --adapt-decay) over its decays: the
@@ -5023,7 +5023,7 @@ int main(int argc, char** argv) {
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             xq.clear();
             size_t n_noplace = 0;
-            const auto& lay = strata::kernels::cpu::expert_layout();
+            const auto& lay = basalt::kernels::cpu::expert_layout();
             for (const Swap& s : swaps) {
                 const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
                 if (slot < 0) continue;
@@ -5063,7 +5063,7 @@ int main(int argc, char** argv) {
         };
         auto xq_advance = [&]() -> bool {
             if (xq_stage == 0) return true;
-            const auto& lay = strata::kernels::cpu::expert_layout();
+            const auto& lay = basalt::kernels::cpu::expert_layout();
             cudaEventSynchronize(adapt_ev);
             if (xq_stage == 1) {
                 for (const XSwap& x : xq) {
@@ -5072,7 +5072,7 @@ int main(int argc, char** argv) {
                                      (int) x.layer, (int) x.out);
                         return false;
                     }
-                    host_res[(size_t) x.layer * g.n_expert + x.out] = strata::core::kNotResident;
+                    host_res[(size_t) x.layer * g.n_expert + x.out] = basalt::core::kNotResident;
                 }
                 for (const XSwap& x : xq) {   // stream order keeps each behind its slot's eviction copy
                     const uint8_t* b = srcp->blob(x.layer, x.in);
@@ -5117,9 +5117,9 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
             for (const auto& p : pending) resident[(size_t) p.first] = 1;
             std::string e;
-            const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
+            const auto ranked = basalt::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
                                                                    profile_loaded);
-            if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
+            if (basalt::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
                 std::fprintf(stderr, "strata serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(),
                              why);
             else
@@ -5230,7 +5230,7 @@ int main(int argc, char** argv) {
                         (long long) slots_primary, (long long) mib_primary,
                         o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                        (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                        (long long) ((o.mmap_experts ? src.resident_bytes() : basalt::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
@@ -5245,7 +5245,7 @@ int main(int argc, char** argv) {
             const int limit = 60;   // one step (a prompt layer, a verify window) takes seconds
             if (limit > 0)
                 std::thread([limit] {
-                    strata::core::Progress& p = strata::core::progress();
+                    basalt::core::Progress& p = basalt::core::progress();
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
                     for (;;) {
@@ -5258,7 +5258,7 @@ int main(int argc, char** argv) {
                                              "the engine so the server starts it again\n",
                                      limit, stage_text().c_str());
                         stall_report(stderr, p.ticks.load() - ticks_at);
-                        strata::core::release_gpu_waits(stderr);   // no spin kernel outlives the process
+                        basalt::core::release_gpu_waits(stderr);   // no spin kernel outlives the process
                         std::fflush(stderr);
                         std::abort();
                     }
@@ -5271,8 +5271,8 @@ int main(int argc, char** argv) {
         const int S = o.spec;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
-        strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        basalt::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -5350,7 +5350,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= live) {
                         vram_evicted.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
+                        host_res[i] = basalt::core::kNotResident;
                     }
                 res_upload();
             } else if (mapped < xcache.full_bytes()) {
@@ -5376,7 +5376,7 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     const uint8_t* b = srcp->blob(layer, pick % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                            (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
@@ -5444,21 +5444,21 @@ int main(int argc, char** argv) {
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
-                strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
-                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                basalt::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
+                basalt::core::SessionState& to = *bslot_ss[k][(size_t) b];
+                const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
-                strata::core::ConversationCheckpoint ck;
+                basalt::core::ConversationCheckpoint ck;
                 ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                if (!basalt::core::conversation_checkpoint_save(ck, from, g, e) ||
+                    !basalt::core::conversation_checkpoint_restore(ck, to, g, e))
                     return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
+                    basalt::core::ConversationKv img;
+                    if (!basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    if (!basalt::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
@@ -5472,26 +5472,26 @@ int main(int argc, char** argv) {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
-                strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
-                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                basalt::core::SessionState& from = *bslot_ss[k][(size_t) b];
+                basalt::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
+                const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                 if (at != nullptr) {
-                    if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
+                    if (!basalt::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
                         return false;
                 } else {
-                    strata::core::ConversationCheckpoint ck;
+                    basalt::core::ConversationCheckpoint ck;
                     ck.ids = bs[(size_t) b].ids;
-                    if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                        !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                    if (!basalt::core::conversation_checkpoint_save(ck, from, g, e) ||
+                        !basalt::core::conversation_checkpoint_restore(ck, to, g, e))
                         return false;
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
+                    basalt::core::ConversationKv img;
+                    if (!basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    if (!basalt::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
@@ -5502,10 +5502,10 @@ int main(int argc, char** argv) {
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
             int S = 0;
-            int rows[strata::kernels::kVerifyMaxT] = {};
-            int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
-            for (int b = 0; b < (int) bs.size() && S < strata::kernels::kVerifyMaxT; ++b)
+            int rows[basalt::kernels::kVerifyMaxT] = {};
+            int32_t tok[basalt::kernels::kVerifyMaxT] = {}, outb[basalt::kernels::kVerifyMaxT] = {};
+            int64_t pos[basalt::kernels::kVerifyMaxT] = {};
+            for (int b = 0; b < (int) bs.size() && S < basalt::kernels::kVerifyMaxT; ++b)
                 if (bs[(size_t) b].active) {
                     rows[S] = b;
                     tok[S] = bs[(size_t) b].x;
@@ -5513,8 +5513,8 @@ int main(int argc, char** argv) {
                     ++S;
                 }
             if (S == 0) return true;
-            const bool was_busy = strata::core::progress().busy.load();
-            strata::core::progress().busy.store(true);
+            const bool was_busy = basalt::core::progress().busy.load();
+            basalt::core::progress().busy.store(true);
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
@@ -5562,7 +5562,7 @@ int main(int argc, char** argv) {
             }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
-            strata::core::progress().busy.store(was_busy);
+            basalt::core::progress().busy.store(was_busy);
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
                 const double L = (double) g.n_layers;
@@ -5590,14 +5590,14 @@ int main(int argc, char** argv) {
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
-            int32_t tok[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
+            int32_t tok[basalt::kernels::kVerifyMaxT] = {};
+            int64_t pos[basalt::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
-        auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+        auto stage_verifier = [&](int k) -> basalt::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
@@ -5614,7 +5614,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
-                strata::core::Verifier& vk = stage_verifier(k);
+                basalt::core::Verifier& vk = stage_verifier(k);
                 const int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
@@ -5679,7 +5679,7 @@ int main(int argc, char** argv) {
                     apply_pending(false);
                 }
                 PGroup& G = pg[(size_t) pick];
-                strata::core::progress().busy.store(true);
+                basalt::core::progress().busy.store(true);
                 if (!stage_verifier(k).batch_launch(pick * GS, GS, G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
@@ -5697,7 +5697,7 @@ int main(int argc, char** argv) {
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
                 }
                 bt_windows = bt_rows = 0;
-                strata::core::progress().busy.store(false);
+                basalt::core::progress().busy.store(false);
             }
             return true;
         };
@@ -5756,8 +5756,8 @@ int main(int argc, char** argv) {
             if (line == "QUIT") break;
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
-                BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
-                ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+                BusyScope() { basalt::core::progress().busy.store(true); basalt::core::progress_at("request"); }
+                ~BusyScope() { basalt::core::progress().busy.store(false); basalt::core::progress_at("idle"); }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
@@ -5827,11 +5827,11 @@ int main(int argc, char** argv) {
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
-            strata::program::PplGate* ppl = nullptr;
+            basalt::program::PplGate* ppl = nullptr;
             if (req_ppl >= 0) {
                 std::string pe2;
-                strata::program::PplGate::configure(ppl_base, ppl_out);
-                ppl = &strata::program::PplGate::get();
+                basalt::program::PplGate::configure(ppl_base, ppl_out);
+                ppl = &basalt::program::PplGate::get();
                 if (geni || !ppl->begin(req_ppl, ids.data(), n, n_vocab, pe2)) {
                     std::printf("ERR %s\n", geni ? "ppl: text only" : pe2.c_str());
                     continue;
@@ -5907,7 +5907,7 @@ int main(int argc, char** argv) {
                     bool ok = cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                          cudaMemcpyHostToDevice) == cudaSuccess;
                     for (auto& st : stages) {
-                        const strata::core::OnDevice on(st->dev);
+                        const basalt::core::OnDevice on(st->dev);
                         cudaDeviceSynchronize();
                         ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                               cudaMemcpyHostToDevice) == cudaSuccess;
@@ -5961,7 +5961,7 @@ int main(int argc, char** argv) {
                     if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
-            const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            const bool want_cvec = basalt::kernels::cvec().loaded() ? req_cvec != 0 : true;
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
@@ -6002,7 +6002,7 @@ int main(int argc, char** argv) {
                         }
                 }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
-            std::optional<strata::core::SavedConversation> incoming;
+            std::optional<basalt::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
@@ -6012,8 +6012,8 @@ int main(int argc, char** argv) {
                 incoming.reset();
             }
             if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
-                const strata::core::OnDevice on(stages[i]->dev);
-                if (!strata::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
+                const basalt::core::OnDevice on(stages[i]->dev);
+                if (!basalt::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
                         i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
                     std::fprintf(stderr, "strata serve: conversation cache: discard invalid stage snapshot (%s)\n",
                                  err.c_str());
@@ -6022,7 +6022,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
-            if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
+            if (incoming && !basalt::core::conversation_snapshot_validate(*incoming, ss, g,
                     stages.empty() ? &mtp.kv_state() : nullptr, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
@@ -6073,19 +6073,19 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                if (basalt::core::conversation_snapshot_restore(*incoming, ss, g,
                         stages.empty() ? &mtp.kv_state() : nullptr, err) !=
-                    strata::core::ConversationRestore::restored) {
+                    basalt::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
                     std::printf("ERR restoring parked conversation: %s\n", err.c_str());
                     return 1;
                 }
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
-                    const strata::core::OnDevice on(stages[i]->dev);
-                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+                    const basalt::core::OnDevice on(stages[i]->dev);
+                    if (basalt::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
                             i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
-                        strata::core::ConversationRestore::restored) {
+                        basalt::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());
                         return 1;
@@ -6097,15 +6097,15 @@ int main(int argc, char** argv) {
                 if (stages.empty()) {
                     checks = std::move(incoming->checkpoints);
                 } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
-                    strata::core::ConversationCheckpointSplit cs;
+                    basalt::core::ConversationCheckpointSplit cs;
                     cs.stage0 = std::move(incoming->checkpoints);
                     for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
-                    if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                    if (!basalt::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
-                std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
+                std::vector<std::vector<basalt::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                 for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                 conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
@@ -6119,7 +6119,7 @@ int main(int argc, char** argv) {
                 checks.clear();
                 cvec_cached = want_cvec;
             }
-            if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
+            if (basalt::kernels::cvec().loaded()) basalt::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
@@ -6127,11 +6127,11 @@ int main(int argc, char** argv) {
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
             if (resume == 0) {
-                strata::core::session_zero(ss, g, nullptr, main_cs);
+                basalt::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
                 for (auto& st : stages) {
-                    const strata::core::OnDevice on(st->dev);
-                    strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                    const basalt::core::OnDevice on(st->dev);
+                    basalt::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
                     cudaStreamSynchronize(st->stream);
                 }
                 checks.clear();
@@ -6142,7 +6142,7 @@ int main(int argc, char** argv) {
                 if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {
-                                   const strata::core::OnDevice on(stages[i]->dev);
+                                   const basalt::core::OnDevice on(stages[i]->dev);
                                    if (!checkpoint_restore(c->stage_parts[i], stages[i]->ss, g)) return true;
                                }
                                return false;
@@ -6168,7 +6168,7 @@ int main(int argc, char** argv) {
                 std::fill(part_next.begin(), part_next.end(), pp_next_check);
             }
             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
-            strata::core::progress_at("reading the prompt, from token", read_from);
+            basalt::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
             // A SHORT PART OF THE PROMPT - the new message of a chat that continues from a checkpoint, the assistant
             // header - goes through the verify windows, S tokens at a time, as decode reads them.  The batched path has
@@ -6185,11 +6185,11 @@ int main(int argc, char** argv) {
             };
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
-                strata::core::progress_at("reading the prompt (verify windows), from token", a);   // not "batched"
+                basalt::core::progress_at("reading the prompt (verify windows), from token", a);   // not "batched"
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
-                    strata::core::Verifier& v;
-                    explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+                    basalt::core::Verifier& v;
+                    explicit NoHeadSampling(basalt::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
@@ -6216,7 +6216,7 @@ int main(int argc, char** argv) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
-                strata::core::progress_beat();
+                basalt::core::progress_beat();
                 std::fflush(stdout);
                 return true;
             };
@@ -6228,10 +6228,10 @@ int main(int argc, char** argv) {
             // holding an expert it does not own, which is silent and produces plausible tokens.
             // (split in two halves so a layer split can queue every stage's copies before it waits for any)
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
-                const strata::core::OnDevice on(p.dev);
+                const basalt::core::OnDevice on(p.dev);
                 for (const auto& [i, slot] : p.lent) {   // queued, one wait
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     host_res[(size_t) i] = slot;
@@ -6239,7 +6239,7 @@ int main(int argc, char** argv) {
                 return true;
             };
             auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
-                const strata::core::OnDevice on(p.dev);
+                const basalt::core::OnDevice on(p.dev);
                 if (!p.cache->sync_queued(e)) return false;
                 p.lent.clear();
                 p.lent_chunk = 0;
@@ -6292,7 +6292,7 @@ int main(int argc, char** argv) {
                         // resident again would hand the next window a prompt buffer in place of an expert
                         if (!refill_one(p, e)) return false;
                     }
-                    const strata::core::OnDevice on(p.dev);
+                    const basalt::core::OnDevice on(p.dev);
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
                     if (want != p.sp->chunk() || first != p.first_now) {
                         if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
@@ -6303,7 +6303,7 @@ int main(int argc, char** argv) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
                             if (host_res[i] >= first) {
                                 p.lent.emplace_back((int32_t) i, host_res[i]);
-                                host_res[i] = strata::core::kNotResident;
+                                host_res[i] = basalt::core::kNotResident;
                                 any = true;
                             }
                         }
@@ -6403,7 +6403,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             // per-request sampling for the verify window's head (greedy when temperature is absent)
-            strata::kernels::SamplerParams req_sp;
+            basalt::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
             req_sp.temperature = req_temperature;
             req_sp.top_p = req_top_p;
@@ -6522,7 +6522,7 @@ int main(int argc, char** argv) {
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // --decode-timing: where a request's decode time goes (one line per request)
-            const bool dec_timing = strata::core::diagnostics().decode_timing;
+            const bool dec_timing = basalt::core::diagnostics().decode_timing;
             struct DecSnap {
                 double wait, pool, host, plan, actq, jobs, run, peer_wait;
                 int64_t misses, entries, hits, pcie, peer;
@@ -6542,7 +6542,7 @@ int main(int argc, char** argv) {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;
-            static const bool chain = strata::core::Verifier::chain_on();
+            static const bool chain = basalt::core::Verifier::chain_on();
             int adapt_age = 2;   // loop tops since the last adaptive round
             bool applied_early = false;
             struct Joined {
@@ -6553,8 +6553,8 @@ int main(int argc, char** argv) {
             bool copy_live = false, copy_done = false;   // exchanges applied early whose RAM copies are under way
             if (cancelled) finish = "cancel";
             // --draft-log FILE: one line per window (T, accepted, draft probabilities, ms) for draft-policy study
-            static FILE* const draft_log = strata::core::diagnostics().draft_log.empty() ? nullptr
-                : std::fopen(strata::core::diagnostics().draft_log.c_str(), "a");
+            static FILE* const draft_log = basalt::core::diagnostics().draft_log.empty() ? nullptr
+                : std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a");
             if (draft_log != nullptr) {
                 std::fprintf(draft_log, "R temp=%g min_p=%g S=%d\n", (double) req_temperature, req_spec_min_p, S_mtp);
                 std::fflush(draft_log);
@@ -6563,7 +6563,7 @@ int main(int argc, char** argv) {
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && strata::core::draft_keep(dprob.data(), T - 1, (float) req_spec_min_p, strata::core::draft_cum_env())) ++T;
+                    while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, (float) req_spec_min_p, basalt::core::draft_cum_env())) ++T;
                 }
                 if (first_window) T = 1;
                 if (ppl != nullptr) {
@@ -6578,7 +6578,7 @@ int main(int argc, char** argv) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                        const basalt::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
@@ -6594,7 +6594,7 @@ int main(int argc, char** argv) {
                 drive.d.failed = false;
                 // the previous adapt round's copies land first: with a non-blocking query, whether a swapped-in expert
                 // ran on the GPU or the CPU (they round differently) would depend on the copy's timing
-                strata::core::decode_gaps().mark(17);
+                basalt::core::decode_gaps().mark(17);
                 // an adaptive round's swaps land before the second window after it (a fixed window, so reproducible),
                 // applied beside the draft before it (apply_thr) when their copies are done; what that moved to the
                 // peer lands one window later
@@ -6605,18 +6605,18 @@ int main(int argc, char** argv) {
                 }
                 ++adapt_age;
                 if (!chain || (adapt_age >= 2 && !(applied_early && adapt_age == 2))) apply_pending(true);
-                strata::core::decode_gaps().mark(18);
+                basalt::core::decode_gaps().mark(18);
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the fed-back
                     // head `x` (it joins `consumed` only after this window commits), then the drafts before that row -
                     // what plain decode would have counted there
-                    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
+                    basalt::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
                                                   hist_n, hist_stage.data());
-                    const strata::core::OnDevice on_h(hist_dev);
+                    const basalt::core::OnDevice on_h(hist_dev);
                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                                cudaMemcpyHostToDevice);
                 }
-                strata::core::decode_gaps().mark(19);
+                basalt::core::decode_gaps().mark(19);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -6651,7 +6651,7 @@ int main(int argc, char** argv) {
                             adapt_ok = xq_stage != 0 ? xq_advance() : xq_round();
                             std::string perr;
                             if (adapt_ok && !ver.dm_presync(perr)) std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
-                            strata::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                            basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                         });
                         return;
                     }
@@ -6664,7 +6664,7 @@ int main(int argc, char** argv) {
                             std::string perr;
                             if (!ver.dm_presync(perr)) std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
                         }
-                        strata::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                        basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                     });
                 };
                 if (chain) {
@@ -6712,7 +6712,7 @@ int main(int argc, char** argv) {
                         }
                         for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                             std::printf("T %d\n", (int) outv[(size_t) i]);
-                            strata::core::progress_beat();
+                            basalt::core::progress_beat();
                             ++produced_n;
                             if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                             eos = ppl == nullptr &&
@@ -6724,7 +6724,7 @@ int main(int argc, char** argv) {
                     const Clock::time_point tw2 = Clock::now();
                     if (hist_n > 0 && mtp.coupled() && will_draft)
                         mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                    strata::core::decode_gaps().mark(5);
+                    basalt::core::decode_gaps().mark(5);
                     bool drafted = true;
                     if (will_draft) {
                         mtp.set_launch_hook(after_launch);
@@ -6745,7 +6745,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (adapt_thr.joinable()) adapt_thr.join();
-                    strata::core::decode_gaps().mark(16);
+                    basalt::core::decode_gaps().mark(16);
                     if (!commit_ok) {
                         std::printf("ERR %s\n", cerr.c_str());
                         return 1;
@@ -6761,7 +6761,7 @@ int main(int argc, char** argv) {
                     if (timed_round && !eos)
                         policy.observe(from_sfx, T, a, sfx_match,
                                        std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
-                    strata::core::decode_gaps().mark(17);
+                    basalt::core::decode_gaps().mark(17);
                     if (eos) { finish = "stop"; break; }
                     if (stop_req.load()) { finish = "cancel"; break; }
                     x = outv[(size_t) a];
@@ -6782,7 +6782,7 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
-                    strata::core::progress_beat();
+                    basalt::core::progress_beat();
                     ++produced_n;
                     if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                     eos = ppl == nullptr &&
@@ -6795,7 +6795,7 @@ int main(int argc, char** argv) {
                 // outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                strata::core::decode_gaps().mark(5);
+                basalt::core::decode_gaps().mark(5);
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
@@ -6805,7 +6805,7 @@ int main(int argc, char** argv) {
                     ++dec_windows; dec_T += T;
                 }
                 if (adapt_thr.joinable()) adapt_thr.join();
-                strata::core::decode_gaps().mark(16);
+                basalt::core::decode_gaps().mark(16);
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -6817,7 +6817,7 @@ int main(int argc, char** argv) {
                 if (timed_round && !eos)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
-                strata::core::decode_gaps().mark(17);
+                basalt::core::decode_gaps().mark(17);
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
@@ -6968,8 +6968,8 @@ int main(int argc, char** argv) {
                 uint64_t miss = 0, look = 0;
                 bool over = false;
                 for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
-                    const strata::kernels::KvStreamCounters c =
-                        strata::kernels::kv_stream_counters(ss.qsa_states[ss.qsa_ord0 + j].map);
+                    const basalt::kernels::KvStreamCounters c =
+                        basalt::kernels::kv_stream_counters(ss.qsa_states[ss.qsa_ord0 + j].map);
                     miss += c.misses; look += c.lookups; over = over || c.overflow;
                 }
                 std::fprintf(stderr, "strata serve: KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
@@ -6999,7 +6999,7 @@ int main(int argc, char** argv) {
     // last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // where the speculative loop starts (0 = not used)
-    strata::prefill::Prefill prefill;
+    basalt::prefill::Prefill prefill;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
@@ -7024,13 +7024,13 @@ int main(int argc, char** argv) {
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
             }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
+                        host_res[i] = basalt::core::kNotResident;
                     }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 borrow = xcache.device_slot(first);
@@ -7071,7 +7071,7 @@ int main(int argc, char** argv) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // queued, one wait
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !(xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -7093,7 +7093,7 @@ int main(int argc, char** argv) {
         // the PLE window of the token path: the two tokens before `pos_start`
         ss.ple_prev[0] = pos_start >= 2 ? (int32_t) o.tokens[(size_t) (pos_start - 2)] : -1;
         ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
-        const strata::prefill::PrefillStats& ps = prefill.stats();
+        const basalt::prefill::PrefillStats& ps = prefill.stats();
         std::fprintf(stderr, "strata generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
                              "streamed %lld (%lld by DMA, host %.1f ms), resident %lld; PLE %.1f ms\n",
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
@@ -7121,7 +7121,7 @@ int main(int argc, char** argv) {
         Clock::time_point tp = Clock::now();
         // The SSD reads start here and complete while the embedding is staged; `ms_ple` is the issue plus the time
         // still spent WAITING afterwards, i.e. the part the embedding did not hide.
-        if (ss.ple.ready() && !strata::core::ple_issue_token(ss.ple, err)) {
+        if (ss.ple.ready() && !basalt::core::ple_issue_token(ss.ple, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -7136,7 +7136,7 @@ int main(int argc, char** argv) {
             ms_embed += std::chrono::duration<double, std::milli>(n - tp).count();
             tp = n;
         }
-        if (ss.ple.ready() && !strata::core::ple_finish_token(ss.ple, token_stream, err)) {
+        if (ss.ple.ready() && !basalt::core::ple_finish_token(ss.ple, token_stream, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -7159,20 +7159,20 @@ int main(int argc, char** argv) {
         drive.d.failed = false;
         err.clear();
         if (o.no_capture) {
-            if (!strata::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
+            if (!basalt::core::session_token(wt, g, pos, /*pos_base=*/0, ss, d_parts, main_cs,
                                              o.sync_every_layer, err)) {
                 std::fprintf(stderr, "strata generate: session_token: %s\n", err.c_str());
                 return 1;
             }
         } else {
-            strata::core::doorbell_reset(db);
+            basalt::core::doorbell_reset(db);
             if (tgraph.captured) {
-                if (!strata::core::session_run_token(g, pos, /*pos_base=*/0, ss, tgraph, pool_fn, pool_user,
+                if (!basalt::core::session_run_token(g, pos, /*pos_base=*/0, ss, tgraph, pool_fn, pool_user,
                                                      loop_scratch.y_miss, main_cs, err)) {
                     std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                     return 1;
                 }
-            } else if (!strata::core::session_loop(g, pos, /*pos_base=*/0, ss, gr, pool_fn, hit_fn, pool_user, /*overlap=*/true, main_cs,
+            } else if (!basalt::core::session_loop(g, pos, /*pos_base=*/0, ss, gr, pool_fn, hit_fn, pool_user, /*overlap=*/true, main_cs,
                                         err, layer_stage, &loop_scratch)) {
                 std::fprintf(stderr, "strata generate: session_loop: %s\n", err.c_str());
                 return 1;
@@ -7221,7 +7221,7 @@ int main(int argc, char** argv) {
             tp = n;
         }
         const bool emit_logits = dump != nullptr &&
-            strata::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
+            basalt::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
         const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
         if (read_logits && (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4,
                                            cudaMemcpyDeviceToHost, (cudaStream_t) token_stream) != cudaSuccess ||
@@ -7261,7 +7261,7 @@ int main(int argc, char** argv) {
         // The draw is Philox(seed, position), as in a verify window (row t at pos0 draws pos0 + t): a seed gives
         // the same text whether a token comes from this path or from the speculative loop below.
         sp.counter = (uint64_t) pos;
-        strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
+        basalt::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
         if (cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost,
                             (cudaStream_t) token_stream) != cudaSuccess ||
             cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess) {
@@ -7274,7 +7274,7 @@ int main(int argc, char** argv) {
         // hide an earlier failure; no extra synchronization or token allocation.
         if (o.native_flash_attn_short) for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
             const int64_t i = ss.qsa_ord0 + j;   // the global ordinal, as the session's carve names it
-            const int32_t status = ss.qsa_states[i].host_step[strata::kernels::kStepCount];
+            const int32_t status = ss.qsa_states[i].host_step[basalt::kernels::kStepCount];
             if (status != 0) {
                 std::fprintf(stderr, "strata generate: native attention status %d at QSA layer %lld, position %lld\n",
                              status, (long long) i, (long long) pos);
@@ -7341,8 +7341,8 @@ int main(int argc, char** argv) {
                                  "--expert-cache and the token graph)\n");
             return 2;
         }
-        strata::core::Verifier ver;
-        strata::core::VerifyHits vh;
+        basalt::core::Verifier ver;
+        basalt::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
@@ -7445,12 +7445,12 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer),
                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                     return false;
                 }
-                host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                host_res[out] = basalt::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
@@ -7478,8 +7478,8 @@ int main(int argc, char** argv) {
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
-        strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        basalt::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         if (o.suffix_draft > 0) {
@@ -7493,7 +7493,7 @@ int main(int argc, char** argv) {
             int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
-                while (T < S_mtp && strata::core::draft_keep(dprob.data(), T - 1, (float) o.spec_min_p, strata::core::draft_cum_env())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, (float) o.spec_min_p, basalt::core::draft_cum_env())) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;
@@ -7502,7 +7502,7 @@ int main(int argc, char** argv) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
                 if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
-                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                    const basalt::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
@@ -7679,7 +7679,7 @@ int main(int argc, char** argv) {
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
                     o.dump_routing.c_str(), (long long) drive.calls);
     }
-    if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
+    if (o.stage_timing) basalt::core::stage_timing_report(g.n_layers);
 
     const int64_t decoded = (int64_t) produced.size();
     std::printf("prompt  :");
@@ -7827,8 +7827,8 @@ int main(int argc, char** argv) {
 
     if (dump != nullptr) std::printf("%-24s %s\n", "logits dumped", o.dump_logits.c_str());
 
-    strata::core::session_graphs_free(gr);
-    strata::core::doorbell_free(db);
+    basalt::core::session_graphs_free(gr);
+    basalt::core::doorbell_free(db);
     cudaFree(d_next);
     cudaFree(d_logits);
     cudaFree(d_emb);

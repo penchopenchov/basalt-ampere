@@ -29,7 +29,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int D = 128, R = 4, ROT = 64, THREADS = 256;
@@ -332,4 +332,4 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-} // namespace strata::kernels
+} // namespace basalt::kernels

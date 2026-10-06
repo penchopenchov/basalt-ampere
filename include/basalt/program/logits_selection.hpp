@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace strata::program::logits_selection {
+namespace basalt::program::logits_selection {
 
 // Storage selection only: callers must still condition on every input token.
 // Positive decimal int64, with no sign, whitespace, suffix or overflow.
@@ -27,4 +27,4 @@ inline constexpr int64_t row_count(int64_t total, int64_t stride) {
     return total > 0 && stride > 0 ? (total - 1) / stride + 1 + ((total - 1) % stride != 0) : 0;
 }
 
-} // namespace strata::program::logits_selection
+} // namespace basalt::program::logits_selection

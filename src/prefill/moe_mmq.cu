@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::prefill::mmq {
+namespace basalt::prefill::mmq {
 namespace {
 
 void ck(cudaError_t e, const char* what) {
@@ -265,4 +265,4 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     ck(cudaGetLastError(), "iota");
 }
 
-}  // namespace strata::prefill::mmq
+}  // namespace basalt::prefill::mmq

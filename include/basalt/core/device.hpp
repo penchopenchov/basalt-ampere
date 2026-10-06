@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 struct DeviceInfo {
     int ordinal = -1;
@@ -82,4 +82,4 @@ private:
     bool poison_ = false;
 };
 
-}  // namespace strata::core
+}  // namespace basalt::core

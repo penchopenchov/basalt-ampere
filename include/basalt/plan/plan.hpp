@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::plan {
+namespace basalt::plan {
 
 // ---- model geometry (the real Qwen3.8-Flash-Next artifact) ------------------
 struct Geometry {
@@ -165,4 +165,4 @@ inline std::string to_string(const Plan& p) {
     return s;
 }
 
-} // namespace strata::plan
+} // namespace basalt::plan

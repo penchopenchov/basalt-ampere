@@ -16,7 +16,7 @@
 #include <stdexcept>
 
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 namespace {
 /// The A/B arm.  Host-token-path only, so it needs no atomics; see the note on `ple_prefetch_enable`.
@@ -136,15 +136,15 @@ struct PleTable::Impl {
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
-    strata::ngram::PleReader reader;
-    strata::ngram::PleReader::Ticket ticket;
+    basalt::ngram::PleReader reader;
+    basalt::ngram::PleReader::Ticket ticket;
     bool pending = false;
     bool locked = false;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     static constexpr size_t kMaxPrefetch = 16;
     size_t n_prefetch = 0;
-    strata::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
+    basalt::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     bool fp8 = false;                 // F8_E4M3 rows (tools/ple_fp8_pack.py); else IQ4_NL
@@ -153,7 +153,7 @@ struct PleTable::Impl {
     void decode(const uint8_t* row, float* out160) const {
         if (fp8) fp8_e4m3_dequant_row(row, scale, out160);
         else if (q5_0)
-            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) strata::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
+            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
         else iq4nl_dequant_row(row, out160);
     }
 };
@@ -408,7 +408,7 @@ void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_del
 
 std::string PleTable::io_report() const {
     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};
-    const strata::ngram::ReaderStats s = impl_->reader.snapshot();
+    const basalt::ngram::ReaderStats s = impl_->reader.snapshot();
     char buf[400];
     int n = std::snprintf(buf, sizeof buf,
                   "ple io: %llu rows, %.1f%% row-cache hits, %llu SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
@@ -453,4 +453,4 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
     for (int h = 0; h < PLE_N_HEADS; ++h) read_row(rows16[h], out2560 + (size_t) h * PLE_HEAD_DIM);
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

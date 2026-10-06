@@ -39,7 +39,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace strata {
+namespace basalt {
 
 // ---- ggml type ids we care about. 42 = Q2_0, the PrismML ternary 2-bit encoding this engine targets.
 inline const char* ggml_type_name(uint32_t t) {
@@ -446,7 +446,7 @@ inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
     return blocks * (uint64_t) bb;
 }
 
-// The shards of one model (strata::gguf_split_paths), opened together; tensors are looked up across all of them.
+// The shards of one model (basalt::gguf_split_paths), opened together; tensors are looked up across all of them.
 // From eddoursul/Strata 8029fa9, with the split-key validation of #255 (gopinath87607) made a property of the
 // model rather than of one loader: a split GGUF carries the model's metadata (general.architecture and the
 // qwen4exp keys) in its FIRST shard only, and the later shards just declare split.count / split.no /
@@ -562,4 +562,4 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
     return {}; // empty == ok
 }
 
-} // namespace strata
+} // namespace basalt

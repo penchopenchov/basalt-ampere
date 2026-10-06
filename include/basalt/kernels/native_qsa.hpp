@@ -1,6 +1,6 @@
 #pragma once
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Set before session construction/capture; existing CUDA graphs retain their
 // selected kernels. Disabled by default. Integration chooses the call sites.
@@ -27,4 +27,4 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
                            int n_head, int head_dim, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

@@ -3,7 +3,7 @@
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int kDmThreads = 256;
@@ -1572,4 +1572,4 @@ void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long lon
     check("dec_moe_peer_math_test");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

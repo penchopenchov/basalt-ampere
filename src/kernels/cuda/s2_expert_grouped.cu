@@ -28,7 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 // THE BLOB'S OWN GEOMETRY, from `include/basalt/kernels/cpu/expert.hpp`.  Restated as literals because that
@@ -1174,4 +1174,4 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
     check("cpu_order/down", stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int IDX_DIM = 128, IDX_HEADS = 4, R = 4;
@@ -981,4 +981,4 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

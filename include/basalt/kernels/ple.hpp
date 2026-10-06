@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Opt in to pinned CUDA BF16/F32 MMVF for the PLE value projection only (default false).
 /// Configure before session capture; captured graphs retain their selected projection kernels.
@@ -120,4 +120,4 @@ void ple_history_advance(float* hist, const float* normalized, void* stream);
 /// Whether the CUDA path is available.  The host hash and the table read work without it; the block does not.
 bool ple_block_available();
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

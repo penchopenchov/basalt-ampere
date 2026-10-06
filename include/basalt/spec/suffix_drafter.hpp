@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace strata::spec {
+namespace basalt::spec {
 
 class SuffixDrafter {
 public:
@@ -50,4 +50,4 @@ private:
     int last_match_ = 0;
 };
 
-}  // namespace strata::spec
+}  // namespace basalt::spec

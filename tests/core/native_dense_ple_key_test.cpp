@@ -24,8 +24,8 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using strata::core::NativeDense;
-using strata::core::WeightTable;
+using basalt::core::NativeDense;
+using basalt::core::WeightTable;
 
 namespace {
 int g_fail = 0;

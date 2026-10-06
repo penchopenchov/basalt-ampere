@@ -32,7 +32,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Geometry of one GDN layer.  The real artifact: S = 128, h_k = 16, h_v = 48.
 struct GdnShapes {
@@ -94,4 +94,4 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream);
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
                   float eps, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

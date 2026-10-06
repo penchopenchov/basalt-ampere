@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // y[o] = sum_i fp16(x[i]) * W[i][o], with W in S2 canonical planes.
 // `codes` is n_out * (n_in/64) * 16 bytes, `scales` n_out * (n_in/64) floats, `x` n_in uint16 fp16 patterns,
@@ -22,4 +22,4 @@ namespace strata::kernels {
 void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float* y, int64_t n_in,
              int64_t n_out);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

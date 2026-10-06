@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace strata::prefill {
+namespace basalt::prefill {
 
 // ---- hyper-connection (n_embd 2560, hc 4, hc_lr 320)
 /// xn[t, c*2560 + d] = R[t,c,d] * rsqrt(mean_d R[t,c,:]^2 + eps) * w_norm[c*2560 + d]; also its BF16 image.
@@ -75,7 +75,7 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
 /// NEOX rotary on the first 64 dims of each head: x [T, heads, dim] at positions pos0 + t.  The rope
 /// scaling (rope_scaling.hpp) rides in as the process config - none is today's arithmetic exactly.
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
-          const strata::kernels::RopeScaling& scaling, void* stream);
+          const basalt::kernels::RopeScaling& scaling, void* stream);
 /// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
@@ -86,8 +86,8 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
 /// K, V: [T, 2, 256].
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream, const strata::kernels::KvHostPools* host = nullptr,
-               const strata::kernels::KvHostPools* stage = nullptr);
+               void* stream, const basalt::kernels::KvHostPools* host = nullptr,
+               const basalt::kernels::KvHostPools* stage = nullptr);
 
 /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
@@ -97,4 +97,4 @@ void round_f16(const float* x, float* y, int64_t n, void* stream);
 /// Expert blob -> FP16 (Q2_0 values are exact in FP16).
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 
-}  // namespace strata::prefill
+}  // namespace basalt::prefill

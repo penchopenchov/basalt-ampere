@@ -30,7 +30,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
 __device__ float warp_sum(float x) {
@@ -378,4 +378,4 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     history_batch_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T);
     launch_check();
 }
-} // namespace strata::kernels
+} // namespace basalt::kernels

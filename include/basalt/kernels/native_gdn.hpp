@@ -1,7 +1,7 @@
 #pragma once
 #include "basalt/kernels/gdn.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Configure before creating/capturing a session. Existing captures retain their
 // selected kernel, so changing the flag does not change an existing graph.
@@ -19,4 +19,4 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
                      const float* gate, const float* beta, float* output,
                      const GdnShapes& shapes, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

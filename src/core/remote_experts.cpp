@@ -11,11 +11,11 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::core {
+namespace basalt::core {
 namespace {
-constexpr int64_t H = strata::kernels::cpu::H;
-constexpr int64_t FF = strata::kernels::cpu::FF;
-constexpr int64_t CAP = strata::kernels::cpu::MAXT * 10;
+constexpr int64_t H = basalt::kernels::cpu::H;
+constexpr int64_t FF = basalt::kernels::cpu::FF;
+constexpr int64_t CAP = basalt::kernels::cpu::MAXT * 10;
 
 // Small enough to copy as one pinned buffer per layer. The kernels read the
 // individual arrays through pointers into the same device allocation.
@@ -131,7 +131,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     if (!scope.ok) { err = scope.error(device); return false; }
     device_ = device;
     n_expert_ = experts;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     size_t free_bytes = 0, total_bytes = 0;
     if (!check(cudaMemGetInfo(&free_bytes, &total_bytes), "free memory", err, device)) { close(); return false; }
     uint64_t needed = 0;
@@ -186,8 +186,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     }
 
     const size_t scratch = std::max<size_t>(
-        (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
-        strata::kernels::native_expert_scratch_bytes(CAP, FF));
+        (size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
+        basalt::kernels::native_expert_scratch_bytes(CAP, FF));
     const size_t meta_bytes = sizeof(RemoteMeta) + (remote_opt_ ? remote_opt_->metadata_bytes() : 0);
     const bool allocated =
         check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err, device) &&
@@ -238,7 +238,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
     const int64_t n = n_tok * k;
-    if (n <= 0 || n > CAP || n_tok > strata::kernels::cpu::MAXT || k != 10 || layer < 0 ||
+    if (n <= 0 || n > CAP || n_tok > basalt::kernels::cpu::MAXT || k != 10 || layer < 0 ||
         (size_t) layer >= layers_present_.size() || device_ < 0) {
         err = "CUDA" + std::to_string(device_) + " experts: invalid layer, routing width or window size";
         return false;
@@ -297,16 +297,16 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         check(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(RemoteMeta) + (reduce ? remote_opt_->metadata_bytes() : 0),
                               cudaMemcpyHostToDevice, s), "copy group metadata", err, device_);
     if (!staged) return false;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     if (lay.native) {
-        strata::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
+        basalt::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
         const auto& fmt = lay.fmt[(size_t) layer];
-        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
-        strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
+        auto L = basalt::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+        basalt::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                                groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ && !reduce ? z_out_ : d_out_, s);
     } else {
-        strata::kernels::quantize_q8_0_scaled(zero_copy_ ? z_x_ : d_x_, d_q8_, d_scales_, n_tok * H, s);
-        strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
+        basalt::kernels::quantize_q8_0_scaled(zero_copy_ ? z_x_ : d_x_, d_q8_, d_scales_, n_tok * H, s);
+        basalt::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                         groups_, (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, zero_copy_ && !reduce ? z_out_ : d_out_, s);
     }
     const uint64_t compact_bytes = (uint64_t) (reduce ? n_tok : dst_.size()) * H * sizeof(float);
@@ -333,4 +333,4 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     return true;
 }
 
-} // namespace strata::core
+} // namespace basalt::core

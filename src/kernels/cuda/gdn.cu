@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int JTHREADS = 32;   ///< threads along j, the state's fast axis
@@ -245,4 +245,4 @@ void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* 
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

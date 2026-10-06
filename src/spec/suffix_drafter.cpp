@@ -3,7 +3,7 @@
 
 #include <algorithm>
 
-namespace strata::spec {
+namespace basalt::spec {
 
 namespace {
 uint64_t mix(uint64_t x) {
@@ -85,4 +85,4 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     return k;
 }
 
-}  // namespace strata::spec
+}  // namespace basalt::spec

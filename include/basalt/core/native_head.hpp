@@ -5,12 +5,12 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
 /// activation scratch. The normal canonical head remains available for numerical A/B comparisons.
 /// Plan v0.3 P6: any type the native MMVQ takes (Q5_K in the Q2_0 / IQ3_XXS files, IQ4_XS in IQ2_XS).
-/// `load` takes the model's shards (strata::gguf_split_paths): the architecture is checked on the first, the
+/// `load` takes the model's shards (basalt::gguf_split_paths): the architecture is checked on the first, the
 /// tensor is read from the shard that holds it.
 class NativeHead {
 public:
@@ -65,4 +65,4 @@ private:
 void set_native_embed(const NativeEmbed* e);
 const NativeEmbed* native_embed();
 
-}  // namespace strata::core
+}  // namespace basalt::core

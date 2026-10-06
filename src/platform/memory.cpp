@@ -7,7 +7,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-namespace strata::platform {
+namespace basalt::platform {
 
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -54,4 +54,4 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
 }
 
-}  // namespace strata::platform
+}  // namespace basalt::platform

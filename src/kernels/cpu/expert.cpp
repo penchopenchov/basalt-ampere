@@ -14,7 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 namespace {
 
 std::atomic<bool> oracle_q8_0{false};
@@ -634,4 +634,4 @@ void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool q
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

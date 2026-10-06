@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// The 4-tap causal conv + SiLU over all `channels` (history is `[channel][3]`, updated), then the L2 norm of
 /// each of the first `qk_heads` 128-channel heads (q then k), eps as the native `l2_norm` (x / sqrt(sum + eps)).
@@ -32,4 +32,4 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
                          void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

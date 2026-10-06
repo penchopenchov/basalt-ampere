@@ -10,7 +10,7 @@
 #include <utility>
 #include <cstring>
 
-namespace strata::core {
+namespace basalt::core {
 
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
@@ -622,4 +622,4 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
     return true;
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

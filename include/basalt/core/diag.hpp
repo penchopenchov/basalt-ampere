@@ -3,7 +3,7 @@
 
 #include <string>
 
-namespace strata::core {
+namespace basalt::core {
 
 struct Diag {
     bool profile = false;      ///< --profile: per-stage GPU stamps of the verify window (turns PDL off; not for A/B)
@@ -17,4 +17,4 @@ inline Diag& diagnostics() {
     return d;
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

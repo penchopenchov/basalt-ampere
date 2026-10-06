@@ -31,7 +31,7 @@
 #include <string>
 #include <vector>
 
-using namespace strata::kernels;
+using namespace basalt::kernels;
 
 namespace {
 

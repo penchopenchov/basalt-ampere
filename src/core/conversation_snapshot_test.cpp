@@ -8,8 +8,8 @@
 #include <limits>
 #include <vector>
 
-using namespace strata::core;
-using namespace strata::kernels;
+using namespace basalt::core;
+using namespace basalt::kernels;
 
 namespace {
 int checks = 0;

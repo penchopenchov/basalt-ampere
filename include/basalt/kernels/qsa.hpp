@@ -89,7 +89,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Geometry of one QSA layer.  The real artifact: n_head 24, n_head_kv 2, head_dim 256, n_rot 64,
 /// idx_n_head 4, idx_dim 128, idx_block 4, idx_top_k 2048, freq_base 1e7, rms_eps 1e-6.
@@ -366,4 +366,4 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
                     const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                     const KvHostPools* host = nullptr);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

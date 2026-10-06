@@ -18,7 +18,7 @@
 
 #include "basalt/kernels/rope_scaling.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// The table of the CURRENT device (a layer split sets one per device; null = the identity).
 void mrope_table_set(const int32_t* device_table);
@@ -58,4 +58,4 @@ __device__ __forceinline__ bool rope_tab_cs(const RopeTab& t, int p, int pair, f
 }
 #endif
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

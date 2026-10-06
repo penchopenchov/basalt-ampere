@@ -39,7 +39,7 @@
 #include <thread>
 #include <vector>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 
 /// One expert evaluation.  `act` is SHARED and read-only across the whole batch - that sharing is the point
 /// of `s2_expert_vnni_q` and it is what saves 480 redundant activation conversions per token.
@@ -259,4 +259,4 @@ private:
     CpuTopology topo_;
 };
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

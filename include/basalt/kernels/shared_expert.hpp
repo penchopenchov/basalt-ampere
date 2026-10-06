@@ -18,7 +18,7 @@
 
 #include "basalt/kernels/s_gemv.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Opt in to pinned CUDA BF16/F32 MMVF and FP32 sigmoid for the shared scalar gate (default false).
 /// Configure before session capture; captured graphs retain their selected kernels.
@@ -100,4 +100,4 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
 void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
                  int64_t k, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

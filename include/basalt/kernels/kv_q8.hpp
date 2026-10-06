@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 inline constexpr int KV_Q8_GROUP = 64;
 
@@ -38,4 +38,4 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
                        const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
                        const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

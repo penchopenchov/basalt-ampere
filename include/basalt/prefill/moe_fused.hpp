@@ -18,7 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::prefill::fused {
+namespace basalt::prefill::fused {
 
 /// Routed rows (token, k pairs of one expert) per tile.
 constexpr int kTileRows = 64;
@@ -61,4 +61,4 @@ struct Batch {
 void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const void* xa, const int32_t* src, void* ha,
              float* dm, void* stream);
 
-}  // namespace strata::prefill::fused
+}  // namespace basalt::prefill::fused

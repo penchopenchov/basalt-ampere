@@ -15,7 +15,7 @@
 #define STRATA_DRAFT_CUM_HD
 #endif
 
-namespace strata::core {
+namespace basalt::core {
 
 /// The acceptance rate of a sampled draft by its probability bin.
 STRATA_DRAFT_CUM_HD inline float draft_cum_acc(float p) {
@@ -34,4 +34,4 @@ STRATA_DRAFT_CUM_HD inline bool draft_keep(const float* probs, int j, float min_
 /// The rule's threshold (0 would switch it off, the min_p rule).
 inline constexpr float draft_cum_env() { return 0.35f; }
 
-}  // namespace strata::core
+}  // namespace basalt::core

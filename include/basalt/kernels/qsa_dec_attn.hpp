@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// The pools this kernel reads: FP16 or INT8 (not Q4_0, not hybrid); false sends the caller to qsa_decode_attn_batch.
 bool qsa_dec_attn_supported(const QsaAttnPools& pools, const QsaShapes& s);
@@ -24,4 +24,4 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
                   const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream,
                   const float* q_full = nullptr, float* attn_gated = nullptr, void* xq = nullptr);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

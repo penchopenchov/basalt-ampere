@@ -6,7 +6,7 @@
 #include <sstream>
 
 
-using namespace strata::core;
+using namespace basalt::core;
 namespace {
 int checks = 0;
 void check(bool ok, const char* label) {

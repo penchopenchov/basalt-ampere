@@ -15,7 +15,7 @@
 #include <sched.h>
 #include "pool_affinity_linux.hpp"
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 
 namespace {
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
@@ -229,7 +229,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
-    strata::core::diag_pool_fn().store(&diag_active_pool);
+    basalt::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
@@ -352,7 +352,7 @@ void ExpertPool::wait_parked(const char* what) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again\n",
                          what, parked_.load(), n_);
-            strata::core::release_gpu_waits(stderr);   // the GPU may be spinning on this layer's flag
+            basalt::core::release_gpu_waits(stderr);   // the GPU may be spinning on this layer's flag
             std::fflush(stderr);
             std::abort();
         }
@@ -375,7 +375,7 @@ void ExpertPool::wait_done(int n) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again\n",
                          d, n, parked_.load(), n_);
-            strata::core::release_gpu_waits(stderr);
+            basalt::core::release_gpu_waits(stderr);
             std::fflush(stderr);
             std::abort();
         }
@@ -617,4 +617,4 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     ms_repark_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

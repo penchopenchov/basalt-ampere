@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 class RemoteExpertOpt;
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
@@ -86,4 +86,4 @@ private:
     std::vector<unsigned long long> ptr_;
 };
 
-} // namespace strata::core
+} // namespace basalt::core

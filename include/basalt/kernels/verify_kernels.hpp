@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 inline constexpr int kVerifyMaxT = 8;
 
@@ -118,4 +118,4 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// last `window` cells: ids[q * ids_stride + j] = max(0, n_kv - window) + j and the record's width = the count.
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

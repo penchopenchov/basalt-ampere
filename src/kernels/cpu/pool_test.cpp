@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace cpu = strata::kernels::cpu;
+namespace cpu = basalt::kernels::cpu;
 
 namespace {
 

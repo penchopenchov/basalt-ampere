@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 /// multi-GPU: set once at startup when a peer device is configured (--peer-device N).  The mapped host buffers
 /// the peer card writes into are then allocated with cudaHostAllocPortable; without a peer the flag stays off.
@@ -114,4 +114,4 @@ private:
     bool launched_direct_ = false;
 };
 
-}  // namespace strata::core
+}  // namespace basalt::core

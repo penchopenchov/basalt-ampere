@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 
 struct ExpertLayout {
     bool native = false;
@@ -77,4 +77,4 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 inline constexpr int kExpertLayoutVersion = 4;
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

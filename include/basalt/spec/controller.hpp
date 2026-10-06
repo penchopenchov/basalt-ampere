@@ -18,7 +18,7 @@
 #include <array>
 #include <cstdint>
 
-namespace strata::spec {
+namespace basalt::spec {
 
 inline constexpr int K_MAX = 8;
 
@@ -70,4 +70,4 @@ private:
     std::array<double, 4> lookup_q_{};
 };
 
-}  // namespace strata::spec
+}  // namespace basalt::spec

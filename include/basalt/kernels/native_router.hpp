@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 // Configure before session capture. Existing graphs retain their selected kernels.
 // This experiment is off by default and does not modify the legacy router.
 void native_router_set_enabled(bool enabled);

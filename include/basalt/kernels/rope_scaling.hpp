@@ -43,7 +43,7 @@
 #define STRATA_ROPE_SCALING_HD
 #endif
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 enum class RopeScalingType { None, Linear, YaRN };
 
@@ -190,4 +190,4 @@ inline const char* rope_scaling_invalid(const RopeScaling& s) {
 void rope_scaling_set(const RopeScaling& scaling);
 const RopeScaling& rope_scaling();
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

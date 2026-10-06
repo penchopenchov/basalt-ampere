@@ -159,16 +159,16 @@ const char* activation_mode_name(int mode) {
     return mode == 2 ? "native pinned GR" : (mode == 1 ? "FP32" : "BF16");
 }
 void select_activation_mode(int mode) {
-    strata::kernels::gr_set_native_mmvf(mode == 2);
+    basalt::kernels::gr_set_native_mmvf(mode == 2);
     // In mode 2 the precision-only switch is deliberately false: native MMVF must imply FP32 by itself.
-    strata::kernels::gr_set_fp32_activations(mode == 1);
+    basalt::kernels::gr_set_fp32_activations(mode == 1);
 }
 
 // A diagonal GR fixture makes activation precision observable without summation-order ambiguity.
 // Two-wide matrices satisfy native MMVF's pair ABI, while each nonzero dot has only one nonzero product.
 // At R=1 and eps=0, xn=gamma exactly; any rounding in xn or lo comes from the selected activation contract.
 int scalar_activation_contract() {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const GrShapes sh{2, 1, 2};
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t* d_weights = nullptr;
@@ -272,7 +272,7 @@ int scalar_activation_contract() {
 
 int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up,
                            const uint16_t* d_inject, float eps) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = kFusedGrMaxT;
     std::mt19937 rng(0x6f8a);
     std::normal_distribution<float> normal(0.0f, 0.3f);
@@ -486,13 +486,13 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(d_up, q_up.data(), q_up.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c up");
     check(cudaMemcpy(d_inj, q_inject.data(), q_inject.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c inj");
 
-    const strata::kernels::GrShapes sh{n_embd, hc, hc_lr};
+    const basalt::kernels::GrShapes sh{n_embd, hc, hc_lr};
     // DEVICE memory: the workspace is written by the kernel.
     void* d_ws_raw = nullptr;
-    check(cudaMalloc(&d_ws_raw, strata::kernels::gr_workspace_bytes(sh)), "m ws");
-    strata::kernels::GrWorkspace ws;
-    strata::kernels::gr_workspace_init(sh, d_ws_raw, ws);
-    strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
+    check(cudaMalloc(&d_ws_raw, basalt::kernels::gr_workspace_bytes(sh)), "m ws");
+    basalt::kernels::GrWorkspace ws;
+    basalt::kernels::gr_workspace_init(sh, d_ws_raw, ws);
+    basalt::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
     std::vector<float> got_mixed((size_t) n_embd), got_inject((size_t) hc);
     check(cudaMemcpy(got_mixed.data(), d_mixed, got_mixed.size() * sizeof(float), cudaMemcpyDeviceToHost), "c mixed");
     check(cudaMemcpy(got_inject.data(), d_inject, got_inject.size() * sizeof(float), cudaMemcpyDeviceToHost), "c inject");
@@ -558,17 +558,17 @@ int main(int argc, char** argv) {
         fp32.round_activation = false;
         std::vector<float> wm, wi, gm((size_t) n_embd), gi((size_t) hc);
         reference(R, w_norm, w_down, w_up, w_inject, eps, n_embd, hc, hc_lr, fp32, wm, wi);
-        strata::kernels::gr_set_fp32_activations(true);
-        strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
+        basalt::kernels::gr_set_fp32_activations(true);
+        basalt::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
         check(cudaMemcpy(gm.data(), d_mixed, gm.size() * sizeof(float), cudaMemcpyDeviceToHost), "FP32 mixed");
         check(cudaMemcpy(gi.data(), d_inject, gi.size() * sizeof(float), cudaMemcpyDeviceToHost), "FP32 inject");
-        strata::kernels::gr_set_fp32_activations(false);
+        basalt::kernels::gr_set_fp32_activations(false);
         const double rm = rel_diff(wm, gm), ri = rel_diff(wi, gi);
         const bool ok = rm <= 1e-4 && ri <= 1e-4;
         std::printf("  FP32 activations vs reference: %s (mixed %.3e, inject %.3e)\n",
                     ok ? "pass" : "FAIL", rm, ri);
         if (!ok) ++bad;
-        strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
+        basalt::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
         check(cudaMemcpy(gm.data(), d_mixed, gm.size() * sizeof(float), cudaMemcpyDeviceToHost), "restored mixed");
         check(cudaMemcpy(gi.data(), d_inject, gi.size() * sizeof(float), cudaMemcpyDeviceToHost), "restored inject");
         const bool restored = std::memcmp(gm.data(), got_mixed.data(), gm.size() * sizeof(float)) == 0 &&
@@ -597,7 +597,7 @@ int main(int argc, char** argv) {
         std::vector<float> bad_mixed((size_t) n_embd);
         float* d_bad = nullptr;
         check(cudaMalloc(&d_bad, bad_mixed.size() * sizeof(float)), "m bad");
-        strata::kernels::gr_read(d_R, d_norm, d_down_bad, d_up_bad, d_inj, eps, sh, ws, d_bad, d_inject,
+        basalt::kernels::gr_read(d_R, d_norm, d_down_bad, d_up_bad, d_inj, eps, sh, ws, d_bad, d_inject,
                                  nullptr);
         check(cudaMemcpy(bad_mixed.data(), d_bad, bad_mixed.size() * sizeof(float), cudaMemcpyDeviceToHost), "cb b");
         const double rel = rel_diff(want_mixed, bad_mixed);
@@ -611,7 +611,7 @@ int main(int argc, char** argv) {
     // ---- the FINAL mixer passes w_inject = nullptr, and then nothing may be written
     float sentinel = -12345.0f;
     check(cudaMemcpy(d_inject, &sentinel, sizeof(float), cudaMemcpyHostToDevice), "c sentinel");
-    strata::kernels::gr_read(d_R, d_norm, d_down, d_up, nullptr, eps, sh, ws, d_mixed, d_inject, nullptr);
+    basalt::kernels::gr_read(d_R, d_norm, d_down, d_up, nullptr, eps, sh, ws, d_mixed, d_inject, nullptr);
     float after = 0.0f;
     check(cudaMemcpy(&after, d_inject, sizeof(float), cudaMemcpyDeviceToHost), "c after");
     const bool untouched = (after == sentinel);
@@ -631,7 +631,7 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(d_bo, block_out.data(), block_out.size() * sizeof(float), cudaMemcpyHostToDevice), "c bo");
     check(cudaMemcpy(d_zi, zero_inj.data(), zero_inj.size() * sizeof(float), cudaMemcpyHostToDevice), "c zi");
 
-    strata::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, nullptr);
+    basalt::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, nullptr);
     std::vector<float> got_write((size_t) hc_dim);
     check(cudaMemcpy(got_write.data(), d_outw, got_write.size() * sizeof(float), cudaMemcpyDeviceToHost), "c outw");
 
@@ -675,7 +675,7 @@ int main(int argc, char** argv) {
     std::vector<float> inj((size_t) hc);
     for (auto& x : inj) x = gauss(rng) * 3.0f;
     check(cudaMemcpy(d_zi, inj.data(), inj.size() * sizeof(float), cudaMemcpyHostToDevice), "c inj2");
-    strata::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, nullptr);
+    basalt::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, nullptr);
     check(cudaMemcpy(got_write.data(), d_outw, got_write.size() * sizeof(float), cudaMemcpyDeviceToHost), "c outw2");
     double worst_stream = 0;
     for (long long c = 0; c < hc; ++c) {
@@ -733,14 +733,14 @@ int main(int argc, char** argv) {
         check(cudaMemcpy(dU, qu.data(), qu.size() * 2, cudaMemcpyHostToDevice), "crU");
         check(cudaMemcpy(dJ, qi.data(), qi.size() * 2, cudaMemcpyHostToDevice), "crJ");
 
-        const strata::kernels::GrShapes rsh{rn, rhc, rlr};
+        const basalt::kernels::GrShapes rsh{rn, rhc, rlr};
         void* rws_raw = nullptr;
-        check(cudaMalloc(&rws_raw, strata::kernels::gr_workspace_bytes(rsh)), "m rws");
-        strata::kernels::GrWorkspace rws;
-        strata::kernels::gr_workspace_init(rsh, rws_raw, rws);
+        check(cudaMalloc(&rws_raw, basalt::kernels::gr_workspace_bytes(rsh)), "m rws");
+        basalt::kernels::GrWorkspace rws;
+        basalt::kernels::gr_workspace_init(rsh, rws_raw, rws);
         for (int mode = 0; mode < 3; ++mode) {
             select_activation_mode(mode);
-            strata::kernels::gr_read(dR, dN, dD, dU, dJ, eps, rsh, rws, dM, dI, nullptr);
+            basalt::kernels::gr_read(dR, dN, dD, dU, dJ, eps, rsh, rws, dM, dI, nullptr);
             std::vector<float> gm((size_t) rn), gi((size_t) rhc);
             check(cudaMemcpy(gm.data(), dM, gm.size() * 4, cudaMemcpyDeviceToHost), "cgm");
             check(cudaMemcpy(gi.data(), dI, gi.size() * 4, cudaMemcpyDeviceToHost), "cgi");

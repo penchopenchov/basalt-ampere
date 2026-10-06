@@ -35,11 +35,11 @@
 #include <string>
 #include <vector>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 struct ExpertLayout;
 }
 
-namespace strata::core {
+namespace basalt::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
@@ -237,12 +237,12 @@ struct GpuPlanSink {
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing.
 struct ExpertDispatch {
-    strata::kernels::cpu::ExpertPool* pool = nullptr;
+    basalt::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
-    int64_t n_expert = strata::kernels::cpu::NE;
+    int64_t n_expert = basalt::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.
     int64_t layers = 0;
@@ -338,14 +338,14 @@ struct ExpertDispatch {
                hit_scratch != nullptr && x_q8_0_hit != nullptr && x_q8_0_hit_scale != nullptr && d_slot != nullptr && d_dst != nullptr;
     }
 
-    std::vector<strata::kernels::cpu::ExpertJob> jobs;
-    strata::kernels::cpu::ActQ act;
+    std::vector<basalt::kernels::cpu::ExpertJob> jobs;
+    basalt::kernels::cpu::ActQ act;
     /// Verify window: one quantized activation per token, the multi-token jobs, and the expert -> job map (reset after
     /// every layer).
-    std::vector<strata::kernels::cpu::ActQ> act_multi;
+    std::vector<basalt::kernels::cpu::ActQ> act_multi;
     /// a native pack's per-token activations (MAXT x kNativeActBytes).
     std::vector<uint8_t> nact_multi;
-    std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
+    std::vector<basalt::kernels::cpu::ExpertJobMulti> jobs_multi;
     std::vector<int16_t> job_of;
     /// The verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of each layer's distinct
     /// missed experts (the last ones in routing order) are read by the GPU over PCIe.
@@ -378,7 +378,7 @@ struct ExpertDispatch {
     int64_t fail_expert = -1;
 };
 
-/// `strata::core::PoolFn`, exactly.  Silent on failure BY SIGNATURE - see `ExpertDispatch::fail`.
+/// `basalt::core::PoolFn`, exactly.  Silent on failure BY SIGNATURE - see `ExpertDispatch::fail`.
 void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                           int64_t k, float* out);
 
@@ -717,10 +717,10 @@ private:
 /// checks native_experts.txt's GGUF spans against the files, before anything is read: each layer's gate/up/down at its
 /// recorded (file, offset) must be that tensor (`blk.L.ffn_<role>_exps.weight`), of the layout's type and dimensions,
 /// and inside the file.  `native` is the --native shard (see set_gguf).
-bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
+bool check_experts_gguf(const std::string& native, const basalt::kernels::cpu::ExpertLayout& lay, std::string& err);
 /// Fills `dst` (lay.total bytes, the experts.bin layout) from the GGUF files, one role at a time.
 /// `unbuffered`: each chunk read past the file cache.
-LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
+LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const basalt::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered = false);
 
-}  // namespace strata::core
+}  // namespace basalt::core

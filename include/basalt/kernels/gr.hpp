@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Select the activation precision for subsequent gr_read launches (default: false/BF16).
 /// Configure before creating/capturing a session, and do not mutate concurrently with gr_read.
@@ -120,4 +120,4 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
 void gr_write(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
               void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

@@ -22,7 +22,7 @@
 #include <cstdlib>
 #include <type_traits>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 void check(const char* what) {
@@ -2537,6 +2537,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/down");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels
 
 #include "dec_moe.cuh"   // STRATA_DEC_MOE: the decode MoE tail's kernels, on this file's row dots

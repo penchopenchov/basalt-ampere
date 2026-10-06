@@ -16,14 +16,14 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// `y[o] = sum_i f32(x[i]) * f32(w[o*n_in + i])`, with both sides bf16-valued so every product is exact in
 /// f32 and only the summation order differs.
 ///
 /// THE WEIGHT LAYOUT IS THE MANIFEST'S: shape [n_in, n_out] with ne0 = n_in CONTIGUOUS, so row `o` is a
 /// contiguous run of `n_in` bf16 values.  That is the same convention `s_gemv` uses, and it is what
-/// `strata::core::WeightRef::ne0/ne1` already report.
+/// `basalt::core::WeightRef::ne0/ne1` already report.
 void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream);
 
 /// The row-split variant, for the same reason `s_gemv_split` exists: with one thread per output row the
@@ -53,4 +53,4 @@ void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

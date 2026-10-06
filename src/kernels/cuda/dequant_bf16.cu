@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 __device__ __forceinline__ float h2f(const uint8_t* p) {
@@ -258,4 +258,4 @@ void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
     launch<float>(ggml_type, blocks, row0, rows, cols, out, stream);
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

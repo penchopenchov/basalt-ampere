@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::ngram {
+namespace basalt::ngram {
 
 inline constexpr uint32_t ROW_BYTES = 90;          ///< an IQ4_NL row; `open` takes the table's own size
 inline constexpr uint32_t PAGE = 4096;
@@ -97,4 +97,4 @@ private:
     Impl* impl_ = nullptr;
 };
 
-}  // namespace strata::ngram
+}  // namespace basalt::ngram

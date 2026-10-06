@@ -1,6 +1,6 @@
 #pragma once
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Pinned llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d CUDA weighted F32
 // RMSNorm for contiguous [n_cols, n_rows] data and equally shaped F32 gamma.
@@ -15,4 +15,4 @@ namespace strata::kernels {
 void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                  int n_cols, int n_rows, float epsilon, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

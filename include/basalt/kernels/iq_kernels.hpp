@@ -10,7 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// ggml type ids handled here.
 bool iq_supported(int ggml_type) noexcept;
@@ -92,4 +92,4 @@ bool iq_mmvq_mma_available();
 /// Tensor-core launches so far in this process (tests: proof that the path ran).
 long iq_mmvq_mma_launches();
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

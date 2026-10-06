@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 
 bool iq256_supported(int ggml_type) noexcept;
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
@@ -23,4 +23,4 @@ void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                         float* const* out, int r0, int r1);
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

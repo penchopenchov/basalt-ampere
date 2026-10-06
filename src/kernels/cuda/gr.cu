@@ -34,7 +34,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -405,4 +405,4 @@ void gr_write(const float* R, const float* block_out, const float* inject, const
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

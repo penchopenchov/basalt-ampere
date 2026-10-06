@@ -9,10 +9,10 @@
 
 #include <cstdint>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 
 /// Mirrors bf16_rows_dot_multi's arithmetic (same accumulation shape, mul+add instead of FMA).
 /// Requires cols % 8 == 0 and nt <= 8, exactly like the AVX2 kernel it stands in for.
 void bf16_rows_dot_multi_avx1(const uint16_t* w, int rows, int cols, const float* x, int nt, float* out);
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

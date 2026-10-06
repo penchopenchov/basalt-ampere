@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 /// Everything a sequence needs that is NOT a weight: the per-layer state, the block scratch, and the pinned
 /// handoff between the GPU and the CPU expert pool.
@@ -352,7 +352,7 @@ struct SessionLoopScratch {
     float* y_miss = nullptr;        ///< pinned host staging for the pool's answer, `parts_bytes` long
     size_t parts_bytes = 0;
     cudaEvent_t probe = nullptr;
-    strata::kernels::cpu::ThreadAffinity pinned_core{};  ///< affinity to restore, or invalid if the host was not pinned
+    basalt::kernels::cpu::ThreadAffinity pinned_core{};  ///< affinity to restore, or invalid if the host was not pinned
     bool pinned = false;
 
     /// Allocates the buffers and pins the host thread.  Call ONCE, at session setup.
@@ -414,4 +414,4 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                        PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err);
 void token_graph_free(TokenGraph& tg);
 
-}  // namespace strata::core
+}  // namespace basalt::core

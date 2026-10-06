@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 bool q5k_head_supported(int n_in, int ncols);
 /// y[j * n_out + r] = row r of `weights` (Q5_K, n_in / 256 blocks per row) . column j of `x_q8_1`
@@ -20,4 +20,4 @@ size_t q5k_head_top1_scratch_bytes();
 bool q5k_head_top1(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, const int32_t* map,
                    int* out_id, float* out_prob, void* scratch, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

@@ -14,7 +14,7 @@
 #include <random>
 #include <vector>
 
-using namespace strata::core;
+using namespace basalt::core;
 
 namespace {
 int g_fail = 0;
@@ -59,7 +59,7 @@ void check_history(std::mt19937& rng, int cap, int h, int n_consumed, int n_draf
     window.insert(window.end(), drafts.begin(), drafts.end());
     const int T = (int) window.size();
     std::vector<int32_t> rows((size_t) T * (size_t) h);
-    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T, h, rows.data());
+    basalt::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T, h, rows.data());
     for (int j = 0; j < n_drafts; ++j) {
         const int s = coupled_hist_start(cap, j, h);
         check(s >= 0 && s + h <= cap + n_drafts, "the window lies inside the ring", s, cap + n_drafts);

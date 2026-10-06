@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 struct Cvec {
     const float* dir = nullptr;   ///< device, n_layers * n_embd: project = the unit v_l, add = d_l; zero rows elsewhere
@@ -58,4 +58,4 @@ bool cvec_enabled();
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
                 int64_t inj_ld, bool write, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

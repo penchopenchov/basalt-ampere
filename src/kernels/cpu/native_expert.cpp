@@ -15,7 +15,7 @@
 #include <cstdlib>
 #include <mutex>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
@@ -143,4 +143,4 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

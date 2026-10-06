@@ -16,7 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int MT = kFusedGrMaxT;
@@ -291,4 +291,4 @@ bool hc8_gr_read_multi(const FusedGrArgs* a, int n_tok, int64_t n_embd, int64_t 
     return true;
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

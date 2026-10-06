@@ -8,11 +8,11 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Decode `n_blocks` S2 blocks.  `codes` is n_blocks*16 bytes, `scales` n_blocks floats, `out` n_blocks*64
 // floats.  All device pointers.  Synchronises before returning, so a caller can read `out` immediately -
 // correctness first; overlap is a Phase 3 concern.
 void dequant_s2(const uint8_t* codes, const float* scales, float* out, int64_t n_blocks);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

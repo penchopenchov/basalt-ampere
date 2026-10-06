@@ -2,7 +2,7 @@
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/rope_scaling.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Configure before session construction/capture. Disabled independently of the
 // native QSA norm/gate switch; existing captures retain their selected kernels.
@@ -63,4 +63,4 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, const RopeScaling& scaling, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

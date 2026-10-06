@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 
-namespace strata::core {
+namespace basalt::core {
 
 struct Progress {
     std::atomic<uint64_t> beats{0};
@@ -56,4 +56,4 @@ inline void progress_at(const char* where, int64_t detail = -1, int64_t chunk = 
 inline void progress_beat() { progress().beats.fetch_add(1, std::memory_order_relaxed); }
 inline void progress_tick() { progress().ticks.fetch_add(1, std::memory_order_relaxed); }
 
-}  // namespace strata::core
+}  // namespace basalt::core

@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <string>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // ---- geometry, every value confirmed against the artifact ----
 inline constexpr int NG_N_EMBD = 2560;          // n_embd
@@ -213,4 +213,4 @@ bool ple_prefetch_enabled();
 // belongs in `GgufFile::open`, which this module does not own.
 // ------------------------------------------------------------------------------------------------------
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

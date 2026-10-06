@@ -25,7 +25,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// Bytes of caller-owned scratch `moe_hit_grouped_s2` needs for `n_hits` experts.
 ///
@@ -128,4 +128,4 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
                                  const uint8_t* x_q8_0, void* scratch, float* out, void* stream,
                                  const float* x_scales, float* gate_up_trace = nullptr);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

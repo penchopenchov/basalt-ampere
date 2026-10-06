@@ -1,7 +1,7 @@
 #pragma once
 #include "basalt/kernels/qsa.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Configure before capture; independent of native key pooling and norm/gate.
 void native_qsa_score_set_enabled(bool enabled);
@@ -28,4 +28,4 @@ void native_qsa_score(const float* pooled, const float* query, const float* bloc
                       int64_t max_blocks, int64_t max_cells,
                       float* cell_scores, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <string>
 
-namespace strata::platform {
+namespace basalt::platform {
 
 struct LockResult {
     bool ok = false;
@@ -51,4 +51,4 @@ void advise_willneed(const void* p, uint64_t bytes);
 /// The same for [offset, offset + bytes) of an open file.
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes);
 
-}  // namespace strata::platform
+}  // namespace basalt::platform

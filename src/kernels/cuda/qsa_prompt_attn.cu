@@ -14,7 +14,7 @@
 #include <cstring>
 #include <type_traits>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int HD = 256;           // head_dim
@@ -730,4 +730,4 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

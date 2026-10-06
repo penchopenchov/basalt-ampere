@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // `act`   (n_in/32) ggml Q8_0 blocks, 34 bytes each, as `quantize_q8_0` produces
 // `codes` n_out * (n_in/4) bytes, one 2-bit code byte per quad
@@ -19,4 +19,4 @@ namespace strata::kernels {
 void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, float* y, int64_t n_in,
                 int64_t n_out, int threads_per_row, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

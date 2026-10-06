@@ -1,7 +1,7 @@
 #pragma once
 #include "basalt/kernels/ple.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Fixed qwen4exp single-token geometry: embd=2560, streams=4, history=9,
 // convolution kernel=4/dilation=3. All buffers are caller-owned and capture-safe.
@@ -50,4 +50,4 @@ struct PleWindowArgs {
 };
 void native_ple_window(const PleWindowArgs& a, const PleWeights& w, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

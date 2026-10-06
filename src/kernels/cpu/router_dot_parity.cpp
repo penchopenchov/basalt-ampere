@@ -16,7 +16,7 @@
 #include <random>
 #include <vector>
 
-namespace cpu = strata::kernels::cpu;
+namespace cpu = basalt::kernels::cpu;
 
 int main() {
     constexpr int R = 512, C = 2560, MAXT = 8;

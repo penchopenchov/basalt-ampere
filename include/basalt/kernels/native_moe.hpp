@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 // Configure before constructing/capturing sessions. Existing captures keep their
 // selected kernels; changing this flag does not rewrite an existing graph.
 void native_moe_combine_set_enabled(bool enabled);

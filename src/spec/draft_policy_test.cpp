@@ -10,7 +10,7 @@
 
 #include <cstdio>
 
-using strata::spec::DraftPolicy;
+using basalt::spec::DraftPolicy;
 
 namespace {
 int g_fail = 0;

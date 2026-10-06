@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 struct FusedGrArgs {
     const float* R = nullptr;          ///< (hc, n_embd), read by `down`; `up` updates it in place when apply
@@ -65,4 +65,4 @@ bool hc8_gr_read_multi(const FusedGrArgs* a, int n_tok, int64_t n_embd, int64_t 
 void fused_gr_check();
 int fused_gr_variant();
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

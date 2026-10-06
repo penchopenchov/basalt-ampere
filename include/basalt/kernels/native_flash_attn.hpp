@@ -1,7 +1,7 @@
 #pragma once
 #include "basalt/kernels/qsa.hpp"
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 enum NativeFlashAttnStatus : int32_t {
     kNativeFlashAttnSuccess = 0,
@@ -33,4 +33,4 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
                                   const QsaShapes& shapes, float* output, int32_t* status,
                                   const uint16_t* mask, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

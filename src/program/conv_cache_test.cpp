@@ -19,7 +19,7 @@
 #include <cstdio>
 #include <vector>
 
-using strata::program::conv_cache::eviction_victim;
+using basalt::program::conv_cache::eviction_victim;
 
 namespace {
 int g_fail = 0;

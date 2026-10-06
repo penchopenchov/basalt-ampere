@@ -43,7 +43,7 @@
 #include <cstdint>
 #include <string>
 
-namespace strata::core {
+namespace basalt::core {
 
 /// Select pinned CUDA BF16/F32 projections for SSM gates, routing and the sparse indexer.
 /// Configure before session capture; captured graphs retain the selected implementation.
@@ -231,8 +231,8 @@ struct QsaState {
     /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
     int kv_mode = 0;
     int64_t n_slots = 0;
-    strata::kernels::KvHostPools host;
-    strata::kernels::KvStreamMap map;
+    basalt::kernels::KvHostPools host;
+    basalt::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
@@ -300,12 +300,12 @@ inline int qsa_kv_format(const QsaState& st) {
         std::fprintf(stderr, "strata: qsa_kv_format: a hybrid K8V4 state must never reach the block movers\n");
         std::exit(1);   // the kernels' own "unsupported geometry" convention (kv_q8.cu, qsa_decode_attn.cu)
     }
-    return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
+    return st.kv_q4 ? basalt::kernels::kKvQ4 : st.kv_int8 ? basalt::kernels::kKvInt8 : basalt::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
-strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
+basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
                     int64_t cap, void* stream);
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
@@ -434,7 +434,7 @@ struct BlockBuffers {
     float* inject2 = nullptr;                 ///< hc
     float* gr_rs = nullptr;                   ///< hc: the fused read's per-stream 1/rms
     uint8_t* head_q8k = nullptr;              ///< `q8k_bytes(n_embd)`: the head's Q8_K activation image
-    strata::kernels::GrWorkspace gr;          ///< `gr_read`'s scratch
+    basalt::kernels::GrWorkspace gr;          ///< `gr_read`'s scratch
 
     /// THE HALF-LEVEL C1 ORACLE, and it is a HOST buffer of `(2 * n_embd + 2 * hc + n_head * head_dim)` floats
     /// PER LAYER: `[0, n_embd)` the attention half's `block_out`, `[n_embd, 2*n_embd)` the MoE half's, the two
@@ -528,8 +528,8 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
 struct PleRun {
     /// Null when the PLE is not wired (no table, or a pack without `blk.1.ple_*`).  Then `block_layer_pre`
     /// SKIPS the module entirely, which is what every measurement before this change did.
-    strata::kernels::PleTable* table = nullptr;
-    strata::kernels::PleWeights w;
+    basalt::kernels::PleTable* table = nullptr;
+    basalt::kernels::PleWeights w;
     /// The session's PLE state, by pointer so `block_layer_pre` needs no `SessionState`.
     const int32_t* token = nullptr;    ///< the token being decoded
     const int32_t* prev = nullptr;     ///< (2,) predecessors, OLDEST FIRST, `-1` where there is none
@@ -541,7 +541,7 @@ struct PleRun {
     /// Internal workspace plus a disjoint normalized export for the next history row.
     /// Allocate ple_run_scratch_bytes(), not merely the lower-level ple_block_scratch_bytes().
     float* scratch = nullptr;
-    strata::kernels::PleConsts consts;
+    basalt::kernels::PleConsts consts;
     bool ready() const {
         return table != nullptr && table->is_open() && hist != nullptr && emb_dev != nullptr &&
                emb_host != nullptr && scratch != nullptr && token != nullptr && prev != nullptr &&
@@ -615,4 +615,4 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
                       const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,
                       std::string& err);
 
-}  // namespace strata::core
+}  // namespace basalt::core

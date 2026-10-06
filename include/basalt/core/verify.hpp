@@ -37,7 +37,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 class NativeHead;
 class RemoteExpertOpt;
@@ -113,13 +113,13 @@ public:
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
-    void set_sampling(const strata::kernels::SamplerParams& sp) {
+    void set_sampling(const basalt::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
         if (next_) next_->set_sampling(sp);
     }
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
-    /// slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused front slots
+    /// slots at that stride (`basalt::kernels::penalty_rows` builds them), most recent token LAST, unused front slots
     /// -1 (the kernel reads only the tail window).  Row t follows the window's drafts 1..t.  Null disables the
     /// penalties entirely - the neutral run's sampling call is byte-for-byte the plain one.  The engine re-uploads the
     /// rows before every window; the buffer must hold kVerifyMaxT rows and stay alive across the request.
@@ -197,7 +197,7 @@ public:
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
     /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
     /// default.  Set on the first stage, it reaches the last.
-    void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
+    void set_slot_sampling(int slot, const basalt::kernels::SamplerParams& sp) {
         if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
         if (next_) next_->set_slot_sampling(slot, sp);
     }
@@ -264,7 +264,7 @@ private:
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
     int32_t b_out_[8] = {};
-    std::vector<strata::kernels::SamplerParams> slot_sp_;
+    std::vector<basalt::kernels::SamplerParams> slot_sp_;
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
@@ -275,8 +275,8 @@ private:
     void collect_profile();   // --profile: add the last window's stamps to prof_sum_
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
-    strata::kernels::SamplerParams sampling_ = [] {
-        strata::kernels::SamplerParams s;
+    basalt::kernels::SamplerParams sampling_ = [] {
+        basalt::kernels::SamplerParams s;
         s.greedy = true;
         s.temperature = 0.0f;
         return s;
@@ -393,4 +393,4 @@ private:
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
-}  // namespace strata::core
+}  // namespace basalt::core

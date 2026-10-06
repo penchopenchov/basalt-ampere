@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 // The FP32-activation MMVF implementation below is adapted from llama.cpp
@@ -202,4 +202,4 @@ void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

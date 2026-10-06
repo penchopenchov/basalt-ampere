@@ -38,7 +38,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-namespace strata::core {
+namespace basalt::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
 namespace {constexpr int Q8K_BYTES_PER_BLOCK = 292;
 constexpr int Q8K_ELEMS_PER_BLOCK = 256;
@@ -50,7 +50,7 @@ uint64_t q8k_bytes(int64_t n) { return (uint64_t) (n / Q8K_ELEMS_PER_BLOCK) * Q8
 /// `s_gemv_q8k` takes the canonical-form attributes; a `WeightRef` carries them, and a tensor that is NOT
 /// quantized has none.  Returns false and names the tensor rather than building a form out of zeroes - which
 /// would decode every code as `0 + bias` and produce a perfectly finite wrong answer.
-bool sform_of(const WeightRef& r, strata::kernels::SForm& f, const std::string& name, std::string& err) {    if (!r.quantized()) {        err = name + " is not a quantized tensor, so it has no S-form";        return false;    }    f.code_bits = r.code_bits;    f.code_bias = r.code_bias;    f.group_elems = r.group_elems;    f.codebook = r.codebook_iq4nl ? strata::kernels::Codebook::Iq4Nl : strata::kernels::Codebook::Affine;    f.has_offset = r.has_offset;    f.act_kind = r.act_kind;
+bool sform_of(const WeightRef& r, basalt::kernels::SForm& f, const std::string& name, std::string& err) {    if (!r.quantized()) {        err = name + " is not a quantized tensor, so it has no S-form";        return false;    }    f.code_bits = r.code_bits;    f.code_bias = r.code_bias;    f.group_elems = r.group_elems;    f.codebook = r.codebook_iq4nl ? basalt::kernels::Codebook::Iq4Nl : basalt::kernels::Codebook::Affine;    f.has_offset = r.has_offset;    f.act_kind = r.act_kind;
 // carried, not derived - see the note on `SForm::act_kind`
 return true;}
 /// The three canonical planes of a quantized tensor, located INSIDE the loaded region.
@@ -91,7 +91,7 @@ bool native_flash_attn_short = false;
 
 void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weights, float* out,
                   int64_t n_in, int64_t n_out, bool split, void* stream) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     if (native_bf16_projections) bf16_gemv_fp32_mmvf(x, weights, out, n_in, n_out, stream);
     else if (split) bf16_gemv_split(x_bf16, weights, out, n_in, n_out, TPR, stream);
     else bf16_gemv(x_bf16, weights, out, n_in, n_out, stream);
@@ -110,8 +110,8 @@ void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weight
 //
 // `x80` and `xq8k` are the two quantized images of the SAME activation; a caller produces both once and this
 // picks.  Producing only the one it thinks it needs is how the assumption gets baked in.
-bool gemv_quantized(const WeightRef& w, const Planes& p, const strata::kernels::SForm& f, const uint8_t* x80, const uint8_t* xq8k,                    float* y, int64_t n_in, int64_t n_out, const std::string& name, void* stream,                    std::string& err, const float* x_f32 = nullptr, bool x_q8_1_ready = false) {
-    using namespace strata::kernels;
+bool gemv_quantized(const WeightRef& w, const Planes& p, const basalt::kernels::SForm& f, const uint8_t* x80, const uint8_t* xq8k,                    float* y, int64_t n_in, int64_t n_out, const std::string& name, void* stream,                    std::string& err, const float* x_f32 = nullptr, bool x_q8_1_ready = false) {
+    using namespace basalt::kernels;
     if (w.native_data) {
         if (!x_f32 || !w.native_q8_1 || !stream || n_in != w.ne0 || n_out != w.ne1) {
             err = name + ": native projection requires matching FP32 input and session scratch";
@@ -198,7 +198,7 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 const WeightRef* w_qkv = v.get("attn_qkv.weight");    const WeightRef* w_gate = v.get("attn_gate.weight");    const WeightRef* w_out = v.get("ssm_out.weight");    const WeightRef* w_alpha = v.get("ssm_alpha.weight");    const WeightRef* w_beta = v.get("ssm_beta.weight");    const WeightRef* w_conv = v.get("ssm_conv1d.weight");    const WeightRef* w_norm = v.get("ssm_norm.weight");    const WeightRef* w_dt = v.get("ssm_dt.bias");    const WeightRef* w_a = v.get("ssm_a");    const char* missing = !w_qkv ? "attn_qkv.weight" : !w_gate ? "attn_gate.weight"                          : !w_out ? "ssm_out.weight" : !w_alpha ? "ssm_alpha.weight"                          : !w_beta ? "ssm_beta.weight" : !w_conv ? "ssm_conv1d.weight"                          : !w_norm ? "ssm_norm.weight" : !w_dt ? "ssm_dt.bias"                          : !w_a ? "ssm_a" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
 // The conv kernel and the two norms are F32 source types, and the loader copied them verbatim - so their
 // device bytes ARE f32 and can be handed straight to the kernels that want `const float*`.
-const float* conv_kernel = (const float*) w_conv->data;    const float* ssm_norm = (const float*) w_norm->data;    const float* dt = (const float*) w_dt->data;    const float* ssm_a = (const float*) w_a->data;    strata::kernels::SForm f_qkv, f_gate, f_out;    if (!sform_of(*w_qkv, f_qkv, v.name("attn_qkv.weight"), err)) return false;    if (!sform_of(*w_gate, f_gate, v.name("attn_gate.weight"), err)) return false;    if (!sform_of(*w_out, f_out, v.name("ssm_out.weight"), err)) return false;    Planes p_qkv, p_gate, p_out;    if (!plane_ptrs(*w_qkv, v.name("attn_qkv.weight"), p_qkv, err)) return false;    if (!plane_ptrs(*w_gate, v.name("attn_gate.weight"), p_gate, err)) return false;    if (!plane_ptrs(*w_out, v.name("ssm_out.weight"), p_out, err)) return false;    using namespace strata::kernels;    cudaStream_t st = (cudaStream_t) stream;
+const float* conv_kernel = (const float*) w_conv->data;    const float* ssm_norm = (const float*) w_norm->data;    const float* dt = (const float*) w_dt->data;    const float* ssm_a = (const float*) w_a->data;    basalt::kernels::SForm f_qkv, f_gate, f_out;    if (!sform_of(*w_qkv, f_qkv, v.name("attn_qkv.weight"), err)) return false;    if (!sform_of(*w_gate, f_gate, v.name("attn_gate.weight"), err)) return false;    if (!sform_of(*w_out, f_out, v.name("ssm_out.weight"), err)) return false;    Planes p_qkv, p_gate, p_out;    if (!plane_ptrs(*w_qkv, v.name("attn_qkv.weight"), p_qkv, err)) return false;    if (!plane_ptrs(*w_gate, v.name("attn_gate.weight"), p_gate, err)) return false;    if (!plane_ptrs(*w_out, v.name("ssm_out.weight"), p_out, err)) return false;    using namespace basalt::kernels;    cudaStream_t st = (cudaStream_t) stream;
 // ---- 1. the activation, in EVERY format a weight on this layer might ask for.  BOTH quantized images are
 //         produced, because which one is wanted is a property of the TENSOR and the pack mixes them by
 //         layer - producing only the "right" one is how the per-role assumption gets baked back in.
@@ -315,15 +315,15 @@ uint64_t moe_buffers_bytes(const ModelGeometry& g, int64_t k) {    const uint64_
 // weights
 (uint64_t) g.n_embd * 4,
 // shared
-strata::kernels::shared_expert_scratch_bytes(g.n_ff),
+basalt::kernels::shared_expert_scratch_bytes(g.n_ff),
 // the shared expert's own scratch
 (uint64_t) (g.n_embd / 32) * 34,
 // x_q8_0
 q8k_bytes(g.n_embd),
 // x_q8k
 };    uint64_t total = 0;    for (uint64_t v : parts) total += (v + 15) & ~(uint64_t) 15;    return total;}
-uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        strata::kernels::shared_expert_scratch_bytes(g.n_ff),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
-bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, void* stream, std::string& err, const Doorbell* db) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_router = v.get("ffn_gate_inp.weight");    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
+uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        basalt::kernels::shared_expert_scratch_bytes(g.n_ff),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
+bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, void* stream, std::string& err, const Doorbell* db) {    using namespace basalt::kernels;    const LayerView v(tables, layer);    const WeightRef* w_router = v.get("ffn_gate_inp.weight");    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
 // ---- the router's activation.  The router's weight is BF16 and that is the one `ref/moe.py` singles out.
 if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 // ---- logits = ffn_gate_inp @ bf16(x).  The weight is BF16, so this is `bf16_gemv` and not `s_gemv` - and using the
@@ -344,7 +344,7 @@ if (native_router_enabled() && g.n_expert == 512 && k == 10) {
 // on them while the GPU keeps working.  Both the copy and the ring are captured into `G[l]` like anything else - a
 // kernel writing mapped pinned memory, which the host sees early in the graph.
 if (db != nullptr && g_publish_kernel) {
-    strata::kernels::doorbell_publish(x, b.ids, b.weights, g.n_embd, k, db->d_x_f, db->d_ids, db->d_weights, db->d_seq,
+    basalt::kernels::doorbell_publish(x, b.ids, b.weights, g.n_embd, k, db->d_x_f, db->d_ids, db->d_weights, db->d_seq,
                                       stream);
 } else if (db != nullptr) {        if (cudaMemcpyAsync(db->d_x_f, x, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(db->d_ids, b.ids, (size_t) k * 4, cudaMemcpyDeviceToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(db->d_weights, b.weights, (size_t) k * 4, cudaMemcpyDeviceToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "moe_route: the doorbell handoff copy failed";            return false;        }
 // THE RING IS LAST, so a host that sees it knows every byte above is in place.  Ordering within a
@@ -353,13 +353,13 @@ if (db != nullptr && g_publish_kernel) {
 // not exist.  The sequence value is read from the HOST copy and incremented, which is what makes the
 // write idempotent across replays of the same graph - a captured literal would ring the same number
 // forever and the host would never see a change.
-strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
+basalt::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
 // The verify window's routing: n tokens' logits in one BF16 projection and their top-k in one launch, each token
 // bitwise what `moe_route` gives it (the projection is the same kernel per column, the top-k kernel is per token).
 // Anything else (a native router, the canonical BF16 GEMVs, a doorbell) takes the per-token `moe_route`.
 bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                       const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const bool batched = native_bf16_projections && !(native_router_enabled() && g.n_expert == 512 && k == 10);
     if (!batched || n == 1) {
         for (int t = 0; t < n; ++t) {
@@ -376,7 +376,7 @@ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t
     router_top10(logits, n, (int) g.n_expert, (int) k, ids, weights, stream);
     return true;
 }
-bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,                const float* x, void* stream, std::string& err) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");    const char* missing = !w_ginp ? "ffn_gate_inp_shexp.weight" : !w_sgate ? "ffn_gate_shexp.weight"                          : !w_sup ? "ffn_up_shexp.weight" : !w_sdown ? "ffn_down_shexp.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
+bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,                const float* x, void* stream, std::string& err) {    using namespace basalt::kernels;    const LayerView v(tables, layer);    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");    const char* missing = !w_ginp ? "ffn_gate_inp_shexp.weight" : !w_sgate ? "ffn_gate_shexp.weight"                          : !w_sup ? "ffn_up_shexp.weight" : !w_sdown ? "ffn_down_shexp.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
 // ---- the shared expert.  Its three weights are quantized, so they need their planes.
 SForm f_gate, f_up, f_down;    if (!sform_of(*w_sgate, f_gate, v.name("ffn_gate_shexp.weight"), err)) return false;    if (!sform_of(*w_sup, f_up, v.name("ffn_up_shexp.weight"), err)) return false;    if (!sform_of(*w_sdown, f_down, v.name("ffn_down_shexp.weight"), err)) return false;    Planes p_gate, p_up, p_down;    if (!plane_ptrs(*w_sgate, v.name("ffn_gate_shexp.weight"), p_gate, err)) return false;    if (!plane_ptrs(*w_sup, v.name("ffn_up_shexp.weight"), p_up, err)) return false;    if (!plane_ptrs(*w_sdown, v.name("ffn_down_shexp.weight"), p_down, err)) return false;
 // `ffn_gate_inp_shexp` is a 1-D BF16 vector, so THE ARENA HOLDS 2 BYTES PER ELEMENT, not 4 - the loader
@@ -413,7 +413,7 @@ f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 }
 bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
                        float* out, void* stream, std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     if (k < 1 || k > 64) { err = "moe_finish: k must be 1..64"; return false; }
     // ---- the combination: sum of w[i] * parts[i], plus the shared output ADDED PLAIN.
 //
@@ -438,10 +438,10 @@ bool layer_verify_compatible(std::string& why) {
     // the verify window reproduces exactly this configuration's per-token arithmetic.
     if (!native_bf16_projections) why = "the native BF16 projections are off";
     else if (!g_fused_gr) why = "the fused hyper-connection read is off";
-    else if (!g_fused_gdn || !strata::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
+    else if (!g_fused_gdn || !basalt::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
     else if (!g_fast_attn || native_flash_attn_short) why = "the split-K decode attention is off";
     else if (!g_fast_select) why = "the block top-k selection is off";
-    else if (!strata::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
+    else if (!basalt::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
     else return true;
     return false;
 }
@@ -460,10 +460,10 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 // loop uses the halves separately.
 if (!moe_route(tables, g, layer, k, b, x, stream, err, db)) return false;    return moe_finish(tables, g, layer, k, b, x, parts, out, stream, err);}
 // ================================ the QSA mixer ================================
-namespace {using strata::kernels::QsaIndexerBuffers;using strata::kernels::QsaShapes;
+namespace {using basalt::kernels::QsaIndexerBuffers;using basalt::kernels::QsaShapes;
 /// The geometry the QSA kernels want, from the one place that defines it.  `ModelGeometry` carries the widths
 /// the LAYOUT needs; `QsaShapes` adds `n_rot`, `idx_block` and `idx_top_k`, which are kernel contracts.
-QsaShapes qsa_shapes(const ModelGeometry& g) {    QsaShapes s = strata::kernels::qsa_real_shapes();    s.n_head = g.n_head;    s.n_head_kv = g.n_head_kv;    s.head_dim = g.head_dim;    s.idx_n_head = g.idx_q_heads;    s.idx_dim = g.idx_key_dim;    return s;}
+QsaShapes qsa_shapes(const ModelGeometry& g) {    QsaShapes s = basalt::kernels::qsa_real_shapes();    s.n_head = g.n_head;    s.n_head_kv = g.n_head_kv;    s.head_dim = g.head_dim;    s.idx_n_head = g.idx_q_heads;    s.idx_dim = g.idx_key_dim;    return s;}
 uint64_t align_up16(uint64_t n) { return (n + 15) & ~15ull; }
 /// One cursor over an arena, so every region is 16-byte aligned without a list of hand-added offsets.
 struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>    T* take(uint64_t count) {        T* r = (T*) (p + used);        used = align_up16(used + count * sizeof(T));        return r;    }    uint8_t* take_bytes(uint64_t n) {        uint8_t* r = p + used;        used = align_up16(used + n);        return r;    }};
@@ -499,11 +499,11 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
 uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
-        return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2 +
-               rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
+        return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2 +
+               rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
     }
-    if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
-    return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
+    if (g_kv_q4) return (uint64_t) pages * s.page_size * basalt::kernels::kv_q4_bytes_per_cell(s) + 64;
+    return int8 ? (uint64_t) pages * s.page_size * basalt::kernels::kv_q8_bytes_per_cell(s) + 64
                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
 }
 }  // namespace
@@ -520,13 +520,13 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                        g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
-    if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
+    if (p.mode == 1) n += basalt::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
     n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
     n += 16;                                                                   // block_pos
     if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
-    n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
+    n += basalt::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
 }
@@ -554,10 +554,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
-    const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    const uint64_t q4_row = basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     if (st.kv_hybrid) {
         st.k_q = c.take<int8_t>(rows * s.head_dim);
-        st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        st.k_scale = c.take<uint16_t>(rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
     } else if (st.kv_q4) {
         st.k_q4 = c.take<uint8_t>(rows * q4_row);
@@ -565,8 +565,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     } else if (st.kv_int8) {   // st, not the global: the drafter's ring is INT8 under --kv k8v4 too
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.v_q = c.take<int8_t>(rows * s.head_dim);
-        st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-        st.v_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        st.k_scale = c.take<uint16_t>(rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
+        st.v_scale = c.take<uint16_t>(rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
     } else {
         st.k_pool = c.take<uint16_t>(rows * s.head_dim);
         st.v_pool = c.take<uint16_t>(rows * s.head_dim);
@@ -574,7 +574,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.page_table = c.take<int32_t>((uint64_t) pages);
     st.n_pages = pages;
     st.max_cells = max_cells;
-    st.map = strata::kernels::KvStreamMap{};
+    st.map = basalt::kernels::KvStreamMap{};
     st.map.page_table = st.page_table;
     st.map.n_blocks = pages;
     st.map.n_slots = p.slots;
@@ -584,7 +584,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.map.slot_ref = c.take<int32_t>((uint64_t) p.slots);
         st.map.miss_block = c.take<int32_t>((uint64_t) p.slots);
         st.map.miss_slot = c.take<int32_t>((uint64_t) p.slots);
-        st.map.ctl = c.take<int32_t>((uint64_t) strata::kernels::kKvCtlInts);
+        st.map.ctl = c.take<int32_t>((uint64_t) basalt::kernels::kKvCtlInts);
     }
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
@@ -598,22 +598,22 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
     }
-    st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount);
+    st.step = c.take<int32_t>((uint64_t) basalt::kernels::kStepCount);
     st.attention_status = c.take<int32_t>(1);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
-    if (cudaHostAlloc((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
+    if (cudaHostAlloc((void**) &st.host_step, basalt::kernels::qsa_step_bytes() + sizeof(int32_t),
                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
             cudaSuccess) {
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
-    st.host_step[strata::kernels::kStepCount] = 0;
+    st.host_step[basalt::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
-    st.host = strata::kernels::KvHostPools{};
+    st.host = basalt::kernels::KvHostPools{};
     if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
-        const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+        const uint64_t bytes = (uint64_t) pages * basalt::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
         if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
@@ -634,8 +634,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         } else if (st.kv_int8) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
             st.host.v_q = hc.take<int8_t>(hrows * s.head_dim);
-            st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-            st.host.v_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
+            st.host.v_scale = hc.take<uint16_t>(hrows * (s.head_dim / basalt::kernels::KV_Q8_GROUP));
         } else {
             st.host.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
             st.host.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
@@ -647,13 +647,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
     if (share_rope == nullptr) {
         std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
-        strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
+        basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
                                           hc.data(), hs.data());
         cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp)
-            strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
+            basalt::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, basalt::kernels::rope_scaling());
     }
     // the page table starts as the IDENTITY, which is the simplest legal mapping and what a caller that does
     // not page at all wants; a streamed state starts with nothing resident, a ring at `block % n_slots`.
@@ -662,9 +662,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
         cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
     } else if (p.mode == 1) {
-        strata::kernels::kv_stream_reset(st.map, nullptr);
+        basalt::kernels::kv_stream_reset(st.map, nullptr);
     } else {
-        strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
+        basalt::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
     }
     cudaDeviceSynchronize();
     return c.used;
@@ -676,16 +676,16 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const size_t rows = (size_t) st.n_slots * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
-        cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+        cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2, cs);
+        cudaMemsetAsync(st.v_q4, 0, rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
     } else if (st.kv_q4) {
-        cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
-        cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+        cudaMemsetAsync(st.k_q4, 0, rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+        cudaMemsetAsync(st.v_q4, 0, rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
     } else if (st.kv_int8) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
-        cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+        cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2, cs);
+        cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2, cs);
     } else {
         cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
         cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);
@@ -693,14 +693,14 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
     // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
     // carries the unwritten cells past the end, which nothing reads.
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    if (st.kv_mode == 1) basalt::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
 }
 
-strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
-    strata::kernels::QsaAttnPools pools;
+basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
+    basalt::kernels::QsaAttnPools pools;
     pools.page_table = st.page_table;
     if (st.kv_hybrid) { pools.k_q = st.k_q; pools.k_scale = st.k_scale; pools.v_q4 = st.v_q4; }
     else if (st.kv_q4) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
@@ -712,11 +712,11 @@ strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
                     int64_t cap, void* stream) {
     if (st.kv_mode != 1) return;
-    strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q, cap,
+    basalt::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q, cap,
                                        qsa_shapes(g), stream);
 }
 
-uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
+uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
 // block_q8_0
 n += (uint64_t) g.n_embd * 2;    n += (uint64_t) g.n_head * 2 * g.head_dim * 4;    n += (uint64_t) g.n_head * g.head_dim * 4;    n += (uint64_t) g.n_head_kv * g.head_dim * 4 * 2;    n += (uint64_t) g.idx_key_dim * 4;    n += (uint64_t) g.idx_q_heads * g.idx_key_dim * 4;    n += (uint64_t) max_cells * 4;    n += (uint64_t) cap * 4;    n += (uint64_t) cap * g.n_head_kv * g.head_dim * 2 * 2;    n += (uint64_t) g.n_head * g.head_dim * 4;
 // attn
@@ -726,10 +726,10 @@ n += (uint64_t) g.n_head * g.head_dim * 4;
 // attn32
 n += (uint64_t) q8k_bytes(g.n_head * g.head_dim);
 // attn_q8k
-n += strata::kernels::qsa_decode_attn_scratch_floats(cap, s) * 4 + 16;
+n += basalt::kernels::qsa_decode_attn_scratch_floats(cap, s) * 4 + 16;
 // attn_scratch
 return align_up16(n) + 256;}
-uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) g.n_head * 2 * g.head_dim);    b.qcur = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.kcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.vcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);    b.k_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.attn = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) g.n_head * g.head_dim);    b.attn32 = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));    b.attn_scratch = c.take<float>(strata::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
+uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) g.n_head * 2 * g.head_dim);    b.qcur = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.kcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.vcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);    b.k_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.attn = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) g.n_head * g.head_dim);    b.attn32 = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));    b.attn_scratch = c.take<float>(basalt::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
 // Event pairs are recorded per (layer, stage) and read once at the end, so **NOTHING IS SYNCHRONISED DURING THE
@@ -823,7 +823,7 @@ void stage_timing_report(int64_t n_layers) {
 // needs nothing from the layer it is called for beyond its index.
 static void dump_slot(float* dump, const ModelGeometry& g, int64_t layer, const float* src, uint64_t off,
                       uint64_t n, void* stream);
-bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace strata::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t n_bid = n_kv / s.idx_block;    const int64_t width = qsa_selection_width(n_kv, s);    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace basalt::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t n_bid = n_kv / s.idx_block;    const int64_t width = qsa_selection_width(n_kv, s);    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
 const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, int cols) {
     try {
         if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
@@ -860,8 +860,8 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
         int32_t* m_pos = nullptr;
         if (g_publish_kernel && cudaHostGetDevicePointer((void**) &m_step, st.host_step, 0) == cudaSuccess &&
             cudaHostGetDevicePointer((void**) &m_pos, st.host_pos, 0) == cudaSuccess) {
-            strata::kernels::copy_i32_from_mapped(st.step, m_step, strata::kernels::kStepCount, stream);
-            strata::kernels::copy_i32_from_mapped(st.pos_dev, m_pos, g.n_head, stream);
+            basalt::kernels::copy_i32_from_mapped(st.step, m_step, basalt::kernels::kStepCount, stream);
+            basalt::kernels::copy_i32_from_mapped(st.pos_dev, m_pos, g.n_head, stream);
         } else
         if (cudaMemcpyAsync(st.step, st.host_step, qsa_step_bytes(), cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(st.pos_dev, st.host_pos, (size_t) g.n_head * 4, cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
 // ---- 3. the indexer's RAW key: appended before any norm, pooled later once per block
@@ -880,16 +880,16 @@ if (st.kv_hybrid) {
     // K8V4: only V is rotated (kv_q4.hpp's H); the scores pair unrotated q with unrotated INT8 K, and the
     // output - a mix of rotated values - is rotated back after attention. Each append/gather call folds the
     // unused half's lanes onto the used pool (a bit-identical duplicate write), so no kernel variants exist.
-    strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
+    basalt::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
     kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, st.step, b.kcur, b.kcur, s, stream, nullptr);   // mode 0: no host mirror
-    strata::kernels::kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, st.step, b.vcur, b.vcur, s, stream, nullptr);
+    basalt::kernels::kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, st.step, b.vcur, b.vcur, s, stream, nullptr);
 } else {
 if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0
-    strata::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
-    strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
+    basalt::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
+    basalt::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
 }
 if (st.kv_q4) {
-    strata::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
+    basalt::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
 } else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
     try {
         native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
@@ -923,18 +923,18 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     }
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
-    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
+    if (st.kv_rot) basalt::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
     if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
-        const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
-        strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
+        const basalt::kernels::QsaAttnPools pools = qsa_attn_pools(st);
+        basalt::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
     } else {
     if (st.kv_hybrid) {
         kv_gather_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, b.ids, st.step, cap, s,
                           b.k_scratch, b.k_scratch, stream);
-        strata::kernels::kv_gather_q4_step(st.v_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s,
+        basalt::kernels::kv_gather_q4_step(st.v_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s,
                                            b.v_scratch, b.v_scratch, stream);
     }
-    else if (st.kv_q4) strata::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+    else if (st.kv_q4) basalt::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
     else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);    if (native_flash_attn_short) {
     if (st.max_cells < 1 || st.max_cells > 256 || !st.attention_status || !st.host_step) {
         err = v.name("native_flash_attn") + ": short adapter requires context <=256 and persistent status storage";
@@ -950,7 +950,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     }
 } else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
-    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
+    if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
 // ---- 9. Gate the attention output before its projection. Native CUDA keeps F32
 // sigmoid/multiply arithmetic and uses Q8_1 for the native quantized projection.
@@ -1029,7 +1029,7 @@ bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token,
     const auto* offsets = w->has_offset ? reinterpret_cast<const float*>(codes + w->codes_bytes + w->scales_bytes)
                                        : nullptr;
     const uint64_t group_offset = (uint64_t) token * row_groups;
-    strata::kernels::embedding_gather(codes + (uint64_t) token * row_codes, scales + group_offset,
+    basalt::kernels::embedding_gather(codes + (uint64_t) token * row_codes, scales + group_offset,
                                        offsets ? offsets + group_offset : nullptr, w->ne0,
                                        w->code_bits, w->code_bias, w->group_elems, out_dev, stream);
     return true;
@@ -1048,8 +1048,8 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
         err = "lm_head: the output_hc_* weights have the wrong engine forms";
         return false;
     }
-    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    strata::kernels::gr_read(bb.R, (const float*) wn->data, (const uint16_t*) wd->data,
+    const basalt::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    basalt::kernels::gr_read(bb.R, (const float*) wn->data, (const uint16_t*) wd->data,
                             (const uint16_t*) wu->data, nullptr, RMS_EPS, gs, bb.gr,
                             bb.mixed, bb.inject, stream);
     return true;
@@ -1059,7 +1059,7 @@ bool lm_head(const WeightTable& tables, const ModelGeometry& g, const BlockBuffe
              float* logits, void* stream, std::string& err) {
     const WeightRef* wo = tables.find("output.weight");
     if (!wo) { err = "output.weight is missing"; return false; }
-    strata::kernels::SForm form;
+    basalt::kernels::SForm form;
     Planes planes;
     if (!sform_of(*wo, form, "output.weight", err) ||
         !plane_ptrs(*wo, "output.weight", planes, err)) return false;
@@ -1068,12 +1068,12 @@ bool lm_head(const WeightTable& tables, const ModelGeometry& g, const BlockBuffe
         return false;
     }
     if (!lm_head_mix(tables, g, bb, stream, err)) return false;
-    strata::kernels::quantize_q8_K(bb.mixed, bb.head_q8k, g.n_embd, stream);
+    basalt::kernels::quantize_q8_K(bb.mixed, bb.head_q8k, g.n_embd, stream);
     return gemv_quantized(*wo, planes, form, bb.head_q8k, bb.head_q8k, logits,
                           g.n_embd, wo->ne1, "output.weight", stream, err);
 }
 // ================================ ONE WHOLE BLOCK ================================
-uint64_t block_buffers_bytes(const ModelGeometry& g) {    const strata::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    uint64_t n = 0;    n += (uint64_t) g.hc * g.n_embd * 4;
+uint64_t block_buffers_bytes(const ModelGeometry& g) {    const basalt::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    uint64_t n = 0;    n += (uint64_t) g.hc * g.n_embd * 4;
 // R
 n += (uint64_t) g.n_embd * 4;
 // mixed
@@ -1085,8 +1085,8 @@ n += (uint64_t) g.hc * 4 * 2 + 32;
 // inject2, gr_rs
 n += q8k_bytes(g.n_embd);
 // head_q8k
-n += strata::kernels::gr_workspace_bytes(s);    return align_up16(n) + 256;}
-uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b) {    const strata::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    Cursor c{(uint8_t*) base};    b.R = c.take<float>((uint64_t) g.hc * g.n_embd);    b.mixed = c.take<float>((uint64_t) g.n_embd);    b.block_out = c.take<float>((uint64_t) g.n_embd);    b.inject = c.take<float>((uint64_t) g.hc);    b.inject2 = c.take<float>((uint64_t) g.hc);    b.gr_rs = c.take<float>((uint64_t) g.hc);    b.head_q8k = c.take_bytes(q8k_bytes(g.n_embd));    uint8_t* grw = c.take_bytes(strata::kernels::gr_workspace_bytes(s));    strata::kernels::gr_workspace_init(s, grw, b.gr);    return c.used;}
+n += basalt::kernels::gr_workspace_bytes(s);    return align_up16(n) + 256;}
+uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b) {    const basalt::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    Cursor c{(uint8_t*) base};    b.R = c.take<float>((uint64_t) g.hc * g.n_embd);    b.mixed = c.take<float>((uint64_t) g.n_embd);    b.block_out = c.take<float>((uint64_t) g.n_embd);    b.inject = c.take<float>((uint64_t) g.hc);    b.inject2 = c.take<float>((uint64_t) g.hc);    b.gr_rs = c.take<float>((uint64_t) g.hc);    b.head_q8k = c.take_bytes(q8k_bytes(g.n_embd));    uint8_t* grw = c.take_bytes(basalt::kernels::gr_workspace_bytes(s));    basalt::kernels::gr_workspace_init(s, grw, b.gr);    return c.used;}
 // ---- THE HALF-LEVEL C1 ORACLE.  `dump` is a HOST buffer of `2 * n_embd + 2 * hc + n_head * head_dim` floats
 // per layer; this enqueues one slice of it as a device-to-host copy.  **IT RUNS INSIDE THE CAPTURE**, which is
 // the point: the copy becomes a node of that layer's graph and replays with it, so the layer functions stay one
@@ -1133,25 +1133,25 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
     // So the driver calls `ple_stage_token` once per token, BEFORE the graphs, and what is captured here is only the
     // device half: `ple_block` reading `emb_dev`, and the history shift.
     const bool fused = g_fused_gr && stage_prefix == 0 && half == 0 &&
-                       strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
+                       basalt::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
     // layer-1's FFN write has not been applied to R yet - unless a control vector follows it, which needs R
-    bool pending_ffn = fused && layer > 0 && !strata::kernels::cvec().covers(layer - 1);
+    bool pending_ffn = fused && layer > 0 && !basalt::kernels::cvec().covers(layer - 1);
     if (ple != nullptr && ple->ready() && layer == 1 && (half == 0 || half == 1)) {
         if (pending_ffn) {
-            const strata::kernels::GrShapes gs0{g.n_embd, g.hc, g.hc_lr};
+            const basalt::kernels::GrShapes gs0{g.n_embd, g.hc, g.hc_lr};
             gr_write(bb.R, bb.block_out, bb.inject2, gs0, bb.R, stream);
             pending_ffn = false;
         }
-        const int64_t hcd = strata::kernels::NG_HC_DIM;
-        strata::kernels::PleOut po;
+        const int64_t hcd = basalt::kernels::NG_HC_DIM;
+        basalt::kernels::PleOut po;
         // Exports must not alias the block's internal workspace: exporting gated values would overwrite normalized
         // values before the latter were copied to history.  Allocate only the one export the recurrence needs.
-        po.normalized = (float*) ((uint8_t*) ple->scratch + strata::kernels::ple_block_scratch_bytes());
+        po.normalized = (float*) ((uint8_t*) ple->scratch + basalt::kernels::ple_block_scratch_bytes());
         // `result` IS THE RESIDUAL, in place: the block computes `hidden[i] + gated[i] + conv[i]` elementwise,
         // so reading and writing `R` at the same index is well-defined.
         po.result = bb.R;
         try {
-            strata::kernels::ple_block(ple->emb_dev, bb.R, ple->hist, ple->w, po, ple->scratch, stream);
+            basalt::kernels::ple_block(ple->emb_dev, bb.R, ple->hist, ple->w, po, ple->scratch, stream);
         } catch (const std::exception& error) {
             err = std::string("block_layer_pre PLE: ") + error.what();
             return false;
@@ -1164,13 +1164,13 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
         // testable - so the shift is here.  The layout is ROW-FASTEST (`hist[row + NG_HIST*channel]`), so a row shift
         // is a STRIDED copy of NG_HIST-1 elements per channel and an append is a strided copy of one - not a flat
         // memmove, which would be the natural reading and would scramble the channels.
-        strata::kernels::ple_history_advance(ple->hist, po.normalized, stream);
+        basalt::kernels::ple_history_advance(ple->hist, po.normalized, stream);
         if (cudaPeekAtLastError() != cudaSuccess) {
             err = "block_layer_pre: the PLE history shift failed";
             return false;
         }
     }
-    const bool qsa = is_qsa_layer(g, layer);    const LayerView v(tables, layer);    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    const bool qsa = is_qsa_layer(g, layer);    const LayerView v(tables, layer);    const basalt::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // ---- the two halves' GR tensors.  Both halves have the same four names with a different prefix, and the
 // prefix is the ONLY thing that distinguishes them - so it is built rather than written twice.
 const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
@@ -1190,12 +1190,12 @@ float* R = bb.R;
     if (run0) {
 st_begin(layer, 0, stream);
     if (fused) {
-        strata::kernels::FusedGrArgs fa;
+        basalt::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
         fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = (const uint16_t*) w_down[0]->data;
         fa.w_up = (const uint16_t*) w_up[0]->data; fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
-        strata::kernels::fused_gr_read(fa, stream);
+        basalt::kernels::fused_gr_read(fa, stream);
     } else {
     gr_read(R, (const float*) w_norm[0]->data, (const uint16_t*) w_down[0]->data,            (const uint16_t*) w_up[0]->data, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
@@ -1213,12 +1213,12 @@ st_begin(layer, 0, stream);
     if (run3) {
 st_begin(layer, 3, stream);
     if (fused) {
-        strata::kernels::FusedGrArgs fa;
+        basalt::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
         fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = (const uint16_t*) w_down[1]->data;
         fa.w_up = (const uint16_t*) w_up[1]->data; fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
-        strata::kernels::fused_gr_read(fa, stream);
+        basalt::kernels::fused_gr_read(fa, stream);
     } else {
     gr_read(R, (const float*) w_norm[1]->data, (const uint16_t*) w_down[1]->data,            (const uint16_t*) w_up[1]->data, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
@@ -1234,8 +1234,8 @@ st_begin(layer, 3, stream);
 }
 bool ple_issue_token(const PleRun& p, std::string& err) {
     if (!p.ready()) { err = "ple_issue_token: the PLE run is not ready"; return false; }
-    uint32_t rows[strata::kernels::PLE_N_HEADS];
-    strata::kernels::ngram_rows(p.token, p.prev, 1, p.consts, rows);
+    uint32_t rows[basalt::kernels::PLE_N_HEADS];
+    basalt::kernels::ngram_rows(p.token, p.prev, 1, p.consts, rows);
     if (!p.table->issue(rows)) { err = "ple_issue_token: the previous token's rows were never collected"; return false; }
     return true;
 }
@@ -1243,7 +1243,7 @@ bool ple_issue_token(const PleRun& p, std::string& err) {
 bool ple_finish_token(const PleRun& p, void* stream, std::string& err) {
     if (!p.ready()) { err = "ple_finish_token: the PLE run is not ready"; return false; }
     if (!p.table->collect(p.emb_host, err)) { err = "ple_finish_token: " + err; return false; }
-    if (cudaMemcpyAsync(p.emb_dev, p.emb_host, (size_t) strata::kernels::NG_N_EMBD * sizeof(float),
+    if (cudaMemcpyAsync(p.emb_dev, p.emb_host, (size_t) basalt::kernels::NG_N_EMBD * sizeof(float),
                         cudaMemcpyHostToDevice, (cudaStream_t) stream) != cudaSuccess) {
         err = "ple_finish_token: the row upload failed";
         return false;
@@ -1258,27 +1258,27 @@ bool ple_stage_token(const PleRun& p, void* stream, std::string& err) {
 
 uint64_t ple_run_scratch_bytes() {
     // Internal workspace followed by a disjoint normalized export used for the next history row.
-    return strata::kernels::ple_block_scratch_bytes() + strata::kernels::NG_HC_DIM * sizeof(float);
+    return basalt::kernels::ple_block_scratch_bytes() + basalt::kernels::NG_HC_DIM * sizeof(float);
 }
 
-bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err) {    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err) {    const basalt::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // `bb.mixed` and `bb.inject` are what `block_layer_pre` left, and NOTHING between the two calls may touch
 // them - that is what makes `post[l]` safe to launch after the host has run the pool.
 st_begin(layer, 5, stream);
     if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
                        : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
     st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
-    const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write
+    const bool steer = basalt::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write
     try {
-        if (!(g_fused_gr && strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr))) {
+        if (!(g_fused_gr && basalt::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr))) {
             gr_write(bb.R, bb.block_out, bb.inject, gs, bb.R, stream);
-            if (steer) strata::kernels::cvec_apply(bb.R, layer, 1, g.hc * g.n_embd, nullptr, 0, nullptr, 0, false, stream);
+            if (steer) basalt::kernels::cvec_apply(bb.R, layer, 1, g.hc * g.n_embd, nullptr, 0, nullptr, 0, false, stream);
         } else if (layer == g.n_layers - 1) {
             gr_write(bb.R, bb.block_out, bb.inject2, gs, bb.R, stream);   // materialise R for the head
-            if (steer) strata::kernels::cvec_apply(bb.R, layer, 1, g.hc * g.n_embd, nullptr, 0, nullptr, 0, false, stream);
+            if (steer) basalt::kernels::cvec_apply(bb.R, layer, 1, g.hc * g.n_embd, nullptr, 0, nullptr, 0, false, stream);
         } else if (steer) {
             // the write the next layer's fused read would have folded, then the vector
-            strata::kernels::cvec_apply(bb.R, layer, 1, g.hc * g.n_embd, bb.block_out, g.n_embd, bb.inject2, g.hc,
+            basalt::kernels::cvec_apply(bb.R, layer, 1, g.hc * g.n_embd, bb.block_out, g.n_embd, bb.inject2, g.hc,
                                         true, stream);
         }
     } catch (const std::exception& e) {
@@ -1291,4 +1291,4 @@ bool block_layer(const WeightTable& tables, const ModelGeometry& g, int64_t laye
 // which holds for `session_token`, where the caller supplies them, and does NOT hold for a host loop that
 // has only just seen the router.  That is why the captured path calls the halves separately.
 if (!block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err, db, ple))        return false;    return block_layer_post(tables, g, layer, k, mb, bb, parts, stream, err);}}
-// namespace strata::core
+// namespace basalt::core

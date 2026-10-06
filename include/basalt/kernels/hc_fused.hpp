@@ -21,7 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 struct HcFusedArgs {
     int T = 0;                          ///< tokens, 1..8; token t's rows at the fixed strides below
@@ -110,4 +110,4 @@ void hc_fused_set_debug(unsigned long long* dbg);
 /// *started once running.
 void hc_test_hold_sms(int k, int* go, int* started, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

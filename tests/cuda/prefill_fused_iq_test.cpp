@@ -37,8 +37,8 @@
 #include <vector>
 
 namespace {
-namespace mmq = strata::prefill::mmq;
-namespace fused = strata::prefill::fused;
+namespace mmq = basalt::prefill::mmq;
+namespace fused = basalt::prefill::fused;
 
 constexpr int N = 2560, FF = 640, K = 10, GROUP = 16;
 

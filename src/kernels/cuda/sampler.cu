@@ -27,7 +27,7 @@
 #include <mutex>
 #include <vector>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 // Philox 4x32-10, a counter-based generator.  Counter-based matters because it makes the stream a function of
@@ -681,7 +681,7 @@ __global__ void coupled_stage_kernel(const SamplerParams* __restrict__ mp, const
     const volatile int* s = (const volatile int*) mp;
     int* d = (int*) dp;
     for (int i = threadIdx.x; i < (int) (sizeof(SamplerParams) / sizeof(int)); i += blockDim.x) d[i] = s[i];
-    const int h = strata::core::coupled_hist_len(((const volatile SamplerParams*) mp)->penalty_last_n, cap);
+    const int h = basalt::core::coupled_hist_len(((const volatile SamplerParams*) mp)->penalty_last_n, cap);
     const volatile int* vh = (const volatile int*) mh;
     for (int i = cap - h + (int) threadIdx.x; i < cap; i += blockDim.x) ring[i] = vh[i];
 }
@@ -694,9 +694,9 @@ __global__ void coupled_penalize_kernel(float* __restrict__ logits, int nv, cons
                                         int id_vocab, const SamplerParams* __restrict__ dp, const int* __restrict__ ring,
                                         int cap, int j) {
     const SamplerParams p = *dp;
-    const int h = strata::core::coupled_hist_len(p.penalty_last_n, cap);
+    const int h = basalt::core::coupled_hist_len(p.penalty_last_n, cap);
     if (h <= 0) return;
-    const int* hrow = ring + strata::core::coupled_hist_start(cap, j, h);
+    const int* hrow = ring + basalt::core::coupled_hist_start(cap, j, h);
     extern __shared__ unsigned int seen[];
     const int words = (nv + 31) / 32;
     for (int w = threadIdx.x; w < words; w += blockDim.x) seen[w] = 0u;
@@ -722,7 +722,7 @@ coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kp
                      float* __restrict__ out_prob) {
     const int lane = (int) threadIdx.x;
     SamplerParams p = *dp;
-    p.counter = strata::core::coupled_draft_counter((int64_t) step_rec[0]);
+    p.counter = basalt::core::coupled_draft_counter((int64_t) step_rec[0]);
     const int k = sampled_k(p.top_k, nv);    // <= kpart: the first k of a union lie in the first k of each list
     __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
     __shared__ int sel_ids[kSelMax];
@@ -1000,4 +1000,4 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
     coupled_check("coupled_draft merge");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

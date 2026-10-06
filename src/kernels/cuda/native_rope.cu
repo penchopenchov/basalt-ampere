@@ -32,7 +32,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 bool overlaps(const void* a, size_t an, const void* b, size_t bn) {

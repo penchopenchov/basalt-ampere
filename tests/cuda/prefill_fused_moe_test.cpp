@@ -29,8 +29,8 @@
 #include <vector>
 
 namespace {
-namespace mmq = strata::prefill::mmq;
-namespace fused = strata::prefill::fused;
+namespace mmq = basalt::prefill::mmq;
+namespace fused = basalt::prefill::fused;
 
 constexpr int N = 2560, FF = 640, K = 10, GROUP = 16, Q2 = 42;   // GGML_TYPE_Q2_0
 constexpr size_t BLOB = 1382400, O_D_CODES = (size_t) 1280 * 640, O_GU_SC = O_D_CODES + (size_t) 2560 * 160,

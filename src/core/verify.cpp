@@ -61,7 +61,7 @@
 #include <exception>
 #include <immintrin.h>
 
-namespace strata::core {
+namespace basalt::core {
 
 // the MoE tail (dec_moe.hpp): planned on CUDA0 from device residency tables, the peer card served from mapped rings
 // by one persistent kernel per window, the CPU pool by the host loop (only its own entries).
@@ -70,7 +70,7 @@ struct DecMoe {
     int32_t* res0 = nullptr;                 ///< CUDA0: [n_layers * n_expert] CUDA0 slot or -1 (host_res mirrored)
     int32_t* res1 = nullptr;                 ///< CUDA0: the same for the peer's slots
     std::vector<int32_t> shadow0, shadow1;   ///< what res0 / res1 hold
-    strata::kernels::DmPlan* plan = nullptr;
+    basalt::kernels::DmPlan* plan = nullptr;
     unsigned int* ctr = nullptr;
     unsigned long long* slot_off = nullptr;  ///< CUDA0's per-slot offsets (null: slot * blob)
     int vram = -1;   // the VRAM share's kernels (dec_moe_vram's kind; -1 grouped)
@@ -82,7 +82,7 @@ struct DecMoe {
     int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
-    strata::kernels::DmRing* h_ring = nullptr; strata::kernels::DmRing* m_ring = nullptr;
+    basalt::kernels::DmRing* h_ring = nullptr; basalt::kernels::DmRing* m_ring = nullptr;
     float* h_x = nullptr; float* m_x = nullptr;
     uint8_t* h_xq = nullptr; uint8_t* m_xq = nullptr;
     uint32_t* h_w = nullptr; uint32_t* m_w = nullptr;
@@ -92,7 +92,7 @@ struct DecMoe {
     int pdev = -1;
     cudaStream_t ps = nullptr;
     unsigned long long* ptab = nullptr;      ///< [n_layers * n_expert] blob address or 0
-    strata::kernels::NativeExpertLayout* lay = nullptr;
+    basalt::kernels::NativeExpertLayout* lay = nullptr;
     void* pscr = nullptr;
     unsigned int* parr = nullptr;
     int pblocks = 0;
@@ -154,8 +154,8 @@ bool mapped(size_t bytes, void** h, void** d) {
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
 
-strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+basalt::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
+    basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
     s.n_head = g.n_head;
     s.n_head_kv = g.n_head_kv;
     s.head_dim = g.head_dim;
@@ -260,7 +260,7 @@ std::string Verifier::dm_note() const {
     const uint32_t seq = rd(h_seq_);
     std::string s = "; device plan: ring " + std::to_string(seq) + " published";
     if (seq >= 1 && (int64_t) seq <= d->rings) {
-        const strata::kernels::DmRing& r = d->h_ring[seq - 1];
+        const basalt::kernels::DmRing& r = d->h_ring[seq - 1];
         s += " (entries: VRAM " + std::to_string(r.n_vram) + ", peer " + std::to_string(r.n_peer) + ", CPU " +
              std::to_string(r.n_cpu) + ")";
     }
@@ -275,7 +275,7 @@ std::string Verifier::dm_note() const {
         }
         s += "; peer card: rung for ring " + std::to_string(w & 0xffffu) + ((w >> 28) & 1u ? " (with entries)" : "") +
              ", finished ring " + std::to_string(done) + ", its kernel " + st;
-        const std::string ab = strata::kernels::dec_moe_peer_diag(d->h_w + 32);
+        const std::string ab = basalt::kernels::dec_moe_peer_diag(d->h_w + 32);
         if (!ab.empty()) s += "; the peer window " + ab;
     }
     return s;
@@ -308,9 +308,9 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 bool Verifier::dm_init(std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     const char* why = nullptr;
     if (!lay.native) why = "the experts are not a native pack";
     else if (lb_ != 0 || le_ != g.n_layers || hand_in_ != nullptr) why = "a layer split";
@@ -502,12 +502,12 @@ Verifier::~Verifier() {
 }
 
 void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
-    if (!strata::kernels::hc8_enabled()) return;
+    if (!basalt::kernels::hc8_enabled()) return;
     const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
     auto add = [&](const WeightRef* d, const WeightRef* u, const WeightRef* i) {
-        if (d) strata::kernels::hc8_prepare((const uint16_t*) d->data, LR, D);
-        if (u) strata::kernels::hc8_prepare((const uint16_t*) u->data, D, LR);
-        if (i) strata::kernels::hc8_prepare((const uint16_t*) i->data, HCn, D);
+        if (d) basalt::kernels::hc8_prepare((const uint16_t*) d->data, LR, D);
+        if (u) basalt::kernels::hc8_prepare((const uint16_t*) u->data, D, LR);
+        if (i) basalt::kernels::hc8_prepare((const uint16_t*) i->data, HCn, D);
     };
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const LayerView v(wt, l);
@@ -518,7 +518,7 @@ void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
     }
     add(wt.find("output_hc_down.weight"), wt.find("output_hc_up.weight"), nullptr);
     std::fprintf(stderr, "strata hc8: 8-bit hyper-connection copies, %.0f MiB of VRAM\n",
-                 (double) strata::kernels::hc8_bytes() / 1048576.0);
+                 (double) basalt::kernels::hc8_bytes() / 1048576.0);
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -531,8 +531,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
-    strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
-    strata::kernels::hc_fused_init();
+    basalt::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
+    basalt::kernels::hc_fused_init();
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -541,8 +541,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
-    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
-        err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
+    if (max_t < 2 || max_t > basalt::kernels::kVerifyMaxT || max_t > basalt::kernels::cpu::MAXT) {
+        err = "verify: the window must hold 2.." + std::to_string(basalt::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
@@ -557,7 +557,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: " + why + " (the verify window reproduces the default native decode path)";
         return false;
     }
-    if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
+    if (!basalt::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
         g.ssm_d_conv != 4) {
         err = "verify: geometry differs from the artifact's";
         return false;
@@ -572,23 +572,23 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
 
-    const strata::kernels::QsaShapes s = shapes_of(g);
-    cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    const basalt::kernels::QsaShapes s = shapes_of(g);
+    cap_ = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    attn_scratch_floats_ = (int64_t) basalt::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
     const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
-    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    const uint64_t HS = (uint64_t) basalt::kernels::NG_HIST * basalt::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
-              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
+              mapped(T * basalt::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
@@ -627,14 +627,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
     // ---- the device arena: the same sequence counted, then carved
     auto carve = [&](Bump& b) {
-        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
+        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * basalt::kernels::kStepCount);
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
+        xq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes(max_in, (int) T));
+        sh_xq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes(max_in, (int) T));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -649,12 +649,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * basalt::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
+            basalt::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -767,7 +767,7 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN state), never
 // A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
 bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
     SessionState& ss = *ss_;
@@ -1457,7 +1457,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // dec_glue_mask & 1: the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
         glue_on[grp] = false;
         if ((dec_glue_mask() & 1) && pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
-            const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+            const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
             glue_on[grp] = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
             if (!glue_on[grp]) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
         }
@@ -1594,7 +1594,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         if (dm) {}   // the route kernel wrote nat_xq_
-        else if (strata::kernels::cpu::expert_layout().native)
+        else if (basalt::kernels::cpu::expert_layout().native)
             quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
         else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
@@ -1620,7 +1620,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const int32_t* p_start2 = pl + ptr_off + 4 * capx;
         float* hit_out = hit_out_ + (size_t) tb * K * N;
         float* parts_out = parts_ + (size_t) tb * K * N;
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = basalt::kernels::cpu::expert_layout();
         // the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf) {
@@ -1877,7 +1877,7 @@ std::string Verifier::profile_report() {
 
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr) return true;
-    const bool pdl_try = strata::kernels::pdl_requested() && !pdl_off_;
+    const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
     auto retry_plain = [&](const std::string& why) {
         std::fprintf(stderr, "strata verify: the %d-token window failed with programmatic dependent launch (%s): capturing it without\n", T,
@@ -1893,10 +1893,10 @@ bool Verifier::capture(int T, std::string& err) {
     }
     std::string rerr;
     pdl_rec_ = pdl_try;
-    strata::kernels::pdl_count() = 0;
+    basalt::kernels::pdl_count() = 0;
     const bool ok = record_window(T, cs_, rerr);
     pdl_rec_ = false;
-    const long pdl_n = strata::kernels::pdl_count();
+    const long pdl_n = basalt::kernels::pdl_count();
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -1930,7 +1930,7 @@ bool Verifier::capture(int T, std::string& err) {
 
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const QsaShapes s = shapes_of(g);
@@ -2025,7 +2025,7 @@ bool Verifier::capture_commit(std::string& err) {
 }
 
 void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
     int32_t* const pk = h_pos_ + (size_t) max_t_ * g.n_head;
@@ -2102,7 +2102,7 @@ void Verifier::collect_profile() {
 
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const OnDevice on_device(device_);
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
@@ -2142,7 +2142,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pa.rings_m = dm_->h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
             pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
             pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
-            pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) strata::kernels::cpu::expert_layout().fmt[0].n_ff;
+            pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
             pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
             if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
                 !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
@@ -2222,7 +2222,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
-            const strata::kernels::DmRing& R = dm_->h_ring[k];
+            const basalt::kernels::DmRing& R = dm_->h_ring[k];
             sink_.ext_kind = R.kind;
             if (pool != nullptr)
                 pool(user, dm_->h_x + (size_t) k * dm_->x_stride, R.ids, n, ss.k, h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -2272,7 +2272,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         dm_->peer_live = false;
         const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
         if (pe != cudaSuccess) { err = std::string("verify: the peer window: ") + cudaGetErrorString(pe); return false; }
-        const std::string ab = strata::kernels::dec_moe_peer_diag(dm_->h_w + 32);
+        const std::string ab = basalt::kernels::dec_moe_peer_diag(dm_->h_w + 32);
         if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
@@ -2284,7 +2284,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cudaMemset(dm_->wstat, 0, w.size() * 8);
         const double nw = (double) dm_->wstat_windows;
         std::fprintf(stderr, "strata verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
-                     dm_->wstat_t / nw, strata::kernels::dec_moe_stats_text(w.data(), nw).c_str());
+                     dm_->wstat_t / nw, basalt::kernels::dec_moe_stats_text(w.data(), nw).c_str());
         dm_->wstat_windows = 0;
         dm_->wstat_t = 0;
     }
@@ -2337,7 +2337,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.start2 = base + ptr_off + 4 * cap;
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
+    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * basalt::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
 }
 
@@ -2436,7 +2436,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
             return false;
         }
     }
-    const strata::kernels::QsaShapes s = shapes_of(*g_);
+    const basalt::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
     const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
     void* d = nullptr;
@@ -2494,7 +2494,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
 bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
     cudaGraphExec_t& cex = commit_bm_[batch_key(rows, S, hbase)];
     if (cex != nullptr) return true;
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
@@ -2569,7 +2569,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
 
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     if (S < 1 || S > max_t_ || hbase < 0 || hbase + S > (int) slots_.size()) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
@@ -2639,7 +2639,7 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
 
 bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
                              void* user, int32_t* out, std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
@@ -2732,11 +2732,11 @@ bool Verifier::commit_slots(std::string& err) {
 bool Verifier::sample_rows(int S, std::string& err) {
     bool any = false;
     for (int t = 0; t < S; ++t) {
-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
+        basalt::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
         if (sp.greedy || sp.temperature <= 0.0f) continue;
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
         sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+        basalt::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
                                        m_out_ + t, cs_);
         any = true;
     }
@@ -2837,4 +2837,4 @@ bool Verifier::copy_logits(int t, float* host) const {
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

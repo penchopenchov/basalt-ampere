@@ -37,7 +37,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace strata::core {
+namespace basalt::core {
 
 namespace detail {
 
@@ -304,7 +304,7 @@ FileExpertSource::~FileExpertSource() { close(); }
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
-    const auto& layout = strata::kernels::cpu::expert_layout();
+    const auto& layout = basalt::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
         err = "FileExpertSource: the requested geometry does not match the loaded expert layout";
         return false;
@@ -327,16 +327,16 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         return false;
     }
     if (!layout.native) {
-        if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) strata::kernels::cpu::BLOB) {
+        if (blob_count > std::numeric_limits<uint64_t>::max() / (uint64_t) basalt::kernels::cpu::BLOB) {
             err = "FileExpertSource: the canonical expert size overflows";
             return false;
         }
-        const uint64_t canonical_size = blob_count * (uint64_t) strata::kernels::cpu::BLOB;
+        const uint64_t canonical_size = blob_count * (uint64_t) basalt::kernels::cpu::BLOB;
         if (want != canonical_size) {
             err = "FileExpertSource: the canonical expert layout has an inconsistent size";
             return false;
         }
-        const uint64_t bytes = (uint64_t) strata::kernels::cpu::BLOB;
+        const uint64_t bytes = (uint64_t) basalt::kernels::cpu::BLOB;
         const uint64_t layer_bytes = (uint64_t) n_expert * bytes;
         for (int64_t layer = 0; layer < n_layers; ++layer) {
             layer_offsets[(size_t) layer] = (uint64_t) layer * layer_bytes;
@@ -418,7 +418,7 @@ void FileExpertSource::close() {
         else {
             if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
             if (complement_locked_ > 0)
-                strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+                basalt::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             std::free(complement_arena_);
         }
     }
@@ -498,7 +498,7 @@ void FileExpertSource::close() {
 bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const uint8_t* b = blob(layer, expert);
     if (b == nullptr || dst == nullptr) return false;
-    std::memcpy(dst, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
+    std::memcpy(dst, b, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer));
     return true;
 }
 
@@ -510,7 +510,7 @@ bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 // blob is assembled when it is asked for (`blob`, into a small pool of buffers) or copied where it is needed
 // (`copy_blob`: the RAM copy, the prompt path's pinned stager buffers).
 bool FileExpertSource::open_gguf(std::string& err) {
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     if (!check_experts_gguf(gguf_, lay, err)) { err = "FileExpertSource: " + err; return false; }
     const size_t cut = gguf_.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : gguf_.substr(0, cut + 1);
@@ -721,17 +721,17 @@ void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, 
 }
 
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
-    if (base_ == nullptr || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
+    if (base_ == nullptr || !direct_.empty() || !basalt::platform::read_ahead_enabled()) return false;
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
-            if (const uint8_t* b = mapped_blob(l, e)) strata::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
+            if (const uint8_t* b = mapped_blob(l, e)) basalt::platform::advise_willneed(b, layer_blob_bytes_[(size_t) l]);
             continue;
         }
         for (int r = 0; r < 3; ++r) {
             const size_t k = (size_t) (3 * l + r);
-            strata::platform::advise_willneed(role_ptr_[k] + (size_t) ((uint64_t) e * role_bytes_[k]), role_bytes_[k]);
+            basalt::platform::advise_willneed(role_ptr_[k] + (size_t) ((uint64_t) e * role_bytes_[k]), role_bytes_[k]);
         }
     }
     return true;
@@ -890,11 +890,11 @@ void RouterLookahead::run() {
         // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the Strata_Dirigo fork (rwkeyes): an
         // AVX-only Xeon E5-2687W died here (vpmovzxwd) on its first request.  An estimate only (which experts to
         // prefetch); the order of the additions differs between the three, the output does not depend on it.
-        if (strata::kernels::cpu::cpu_avx2_ok()) {
-            strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
+        if (basalt::kernels::cpu::cpu_avx2_ok()) {
+            basalt::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
                                                       x_.data(), (int) nt, logits.data());
-        } else if (strata::kernels::cpu::cpu_avx1_ok()) {
-            strata::kernels::cpu::bf16_rows_dot_multi_avx1(routers_[(size_t) layer].data(), (int) n_expert_,
+        } else if (basalt::kernels::cpu::cpu_avx1_ok()) {
+            basalt::kernels::cpu::bf16_rows_dot_multi_avx1(routers_[(size_t) layer].data(), (int) n_expert_,
                                                            (int) n_embd_, x_.data(), (int) nt, logits.data());
         } else {
             // a mul and an add, not std::fma: without an FMA instruction that is a libm call per element
@@ -1157,7 +1157,7 @@ bool FileExpertSource::pin_cache_complement(
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (partial_pin > 0) (void) cudaHostUnregister(arena);
-            if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
+            if (locked > 0) basalt::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             std::free(arena);
         }
         arena = nullptr;
@@ -1203,8 +1203,8 @@ bool FileExpertSource::pin_cache_complement(
                 // set (the registered prefix is page-locked by the driver already - locking it twice made the next
                 // device allocation fail).
                 lock_off = partial_pin;
-                const strata::platform::LockResult lr =
-                    strata::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
+                const basalt::platform::LockResult lr =
+                    basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
                 locked = lr.locked_bytes;
                 note += (note.empty() ? "" : "; ") + lr.note;
             }
@@ -1552,7 +1552,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;   // a previous layer already failed; do not make it worse
 
-    using namespace strata::kernels::cpu;
+    using namespace basalt::kernels::cpu;
     // Clause 3: the blob's internal offsets are compile-time constants, so a mismatched geometry does not
     // produce a wrong answer - it produces a walk off the end of the blob into the next expert's bytes, which
     // is finite and plausible.  Refuse, name the number, and let the driver report it.
@@ -1673,12 +1673,12 @@ namespace {
 // are fixed arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = 128;
-static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+static_assert(basalt::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
-    using namespace strata::kernels::cpu;
+    using namespace basalt::kernels::cpu;
     if (d.failed) return;
     if (n_tok < 1 || n_tok > MAXT) {
         d.failed = true;
@@ -1831,7 +1831,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
-            if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
+            if (native && basalt::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
             else if (native)
                 native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
@@ -1967,7 +1967,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                 // count of distinct experts moved rather than of looks.
                 const uint8_t* b = d.src->blob(d.layers, e);
                 std::string ferr;
-                if (b == nullptr || !d.cache->fill_slot(cand, b, cs, ferr, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(d.layers))) {
+                if (b == nullptr || !d.cache->fill_slot(cand, b, cs, ferr, (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(d.layers))) {
                     d.failed = true;
                     d.fail = "the expert cache could not fill a slot";
                     d.fail_layer = d.layers;
@@ -2013,13 +2013,13 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             d.fail = "the hit path has no fp32 activation scales (R4.2h)";
             return;
         }
-        strata::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, strata::kernels::cpu::H,
+        basalt::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, basalt::kernels::cpu::H,
                                               cs);
         if (d.hit_cpu_order)
-            strata::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
+            basalt::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
                 d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         else
-            strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
+            basalt::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
                 d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
         if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
@@ -2039,7 +2039,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         if (cudaEventQuery((cudaEvent_t) d.hit_done) == cudaSuccess) ++d.hit_ready;
         else ++d.hit_late;
     }
-    strata::kernels::add_inplace(d.parts_out, d.hit_out, d.parts_elems, cs);
+    basalt::kernels::add_inplace(d.parts_out, d.hit_out, d.parts_elems, cs);
 }
 
 // ================================ THE RESIDENT ARENA (R2.1) ================================
@@ -2110,7 +2110,7 @@ bool hash_sampled_file(const std::filesystem::path& path, uint64_t& h, std::stri
 }
 
 bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& experts_path,
-                            const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay,
+                            const std::string& gguf, const basalt::kernels::cpu::ExpertLayout& lay,
                             uint64_t& out, std::string& err) {
     uint64_t h = 1469598103934665603ull;
     hash_text(h, "strata-shared-expert-arena-pack-v1");
@@ -2152,7 +2152,7 @@ bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& expe
 namespace {
 /// The GGUF file that holds role `r` (0 gate, 1 up, 2 down) of layer `l`: a name beside the --native shard
 /// (native_experts.txt v3 per layer, v4 per role), or the --native shard itself.
-std::string expert_gguf_file(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, int64_t l, int r) {
+std::string expert_gguf_file(const std::string& gguf, const basalt::kernels::cpu::ExpertLayout& lay, int64_t l, int r) {
     const size_t i = (size_t) (3 * l + r);
     if (lay.gguf_file.size() <= i || lay.gguf_file[i].empty()) return gguf;
     const size_t cut = gguf.find_last_of("/\\");
@@ -2160,14 +2160,14 @@ std::string expert_gguf_file(const std::string& gguf, const strata::kernels::cpu
 }
 }  // namespace
 
-bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {
+bool check_experts_gguf(const std::string& gguf, const basalt::kernels::cpu::ExpertLayout& lay, std::string& err) {
     static const char* roles[3] = {"gate", "up", "down"};
     if (lay.gguf_off.size() != (size_t) (3 * lay.n_layers)) {
         err = "native_experts.txt has no GGUF offsets (a pack older than v2): repack it with tools/iq_pack.py";
         return false;
     }
     try {
-        std::map<std::string, std::unique_ptr<strata::GgufFile>> files;
+        std::map<std::string, std::unique_ptr<basalt::GgufFile>> files;
         for (int64_t l = 0; l < lay.n_layers; ++l) {
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
@@ -2175,9 +2175,9 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
             for (int r = 0; r < 3; ++r) {
                 const std::string path = expert_gguf_file(gguf, lay, l, r);
                 auto& f = files[path];
-                if (!f) f = std::make_unique<strata::GgufFile>(path);
+                if (!f) f = std::make_unique<basalt::GgufFile>(path);
                 const std::string name = "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight";
-                const strata::TensorInfo* t = f->find(name);
+                const basalt::TensorInfo* t = f->find(name);
                 const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
                 // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts
                 const uint64_t cols = (uint64_t) (r < 2 ? fm.n_embd : fm.n_ff);
@@ -2192,7 +2192,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
                          t->shape[2] != (uint64_t) lay.n_expert)
                     why = "is not [" + std::to_string(cols) + ", " + std::to_string(rows) + ", " +
                           std::to_string(lay.n_expert) + "]";
-                else if (strata::tensor_payload_bytes(*t) != bytes)
+                else if (basalt::tensor_payload_bytes(*t) != bytes)
                     why = "is not " + std::to_string(per[r]) + " B per expert";
                 else if (f->data_start() + t->offset != lay.gguf_off[(size_t) (3 * l + r)])
                     why = "starts at byte " + std::to_string(f->data_start() + t->offset) + ", the pack says " +
@@ -2220,7 +2220,7 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 // (check_experts_gguf).
 // `unbuffered` (experts_unbuffered): each chunk's 4 KiB-aligned window is read past the file cache into an aligned
 // buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
-LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
+LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const basalt::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered) {
     LoadStats st;
     st.layers = (uint64_t) lay.n_layers;
@@ -2294,7 +2294,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     close();
     const std::string path = pack_dir + "/experts.bin";
     // the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
-    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     if (lay.n_layers != n_layers || lay.n_expert != n_expert) {
         err = "ArenaExpertSource: the expert layout was loaded for a different geometry";
         return false;
@@ -2460,7 +2460,7 @@ void ArenaExpertSource::close() {
 
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
     const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
     madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
@@ -2472,7 +2472,7 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
 // Dropping them from the cache too (POSIX_FADV_DONTNEED) would make every eviction a re-read from the disk.
 uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
     const uint64_t end = (lay.blob_offset(layer, expert) + lay.blob_bytes(layer)) & ~(uint64_t) 4095;
     if (end <= off) return 0;
@@ -2482,13 +2482,13 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = basalt::kernels::cpu::expert_layout();
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
     // one registration slice per layer
     if ((size_t) layer >= dev_slice_.size()) return nullptr;
@@ -2503,7 +2503,7 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
-    return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+    return base_ + basalt::kernels::cpu::expert_layout().blob_offset(layer, expert);
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

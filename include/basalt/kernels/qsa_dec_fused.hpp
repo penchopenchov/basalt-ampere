@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 struct QsaDecKvPost {
     float* kcur = nullptr;              ///< [n][n_head_kv][head_dim], normed and rotated in place
@@ -52,4 +52,4 @@ bool qsa_dec_fused_supported(const QsaShapes& s);
 void qsa_dec_kv_post(const QsaDecKvPost& a, int n, const QsaShapes& s, const RopeScaling& scaling, void* stream);
 void qsa_dec_q_post(const QsaDecQPost& a, int n, const QsaShapes& s, const RopeScaling& scaling, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

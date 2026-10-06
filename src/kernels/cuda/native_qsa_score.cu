@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
@@ -148,4 +148,4 @@ void native_qsa_score(const float* pooled,const float* query,const float* bias,
     const auto error=cudaGetLastError();
     if(error!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(error));
 }
-} // namespace strata::kernels
+} // namespace basalt::kernels

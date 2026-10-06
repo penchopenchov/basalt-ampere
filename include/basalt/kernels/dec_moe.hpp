@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <string>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 constexpr int kDmCap = 128;          ///< entries per window: kVerifyMaxT tokens x top-10 fit
 
@@ -169,4 +169,4 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
                      void* stream, bool dep = false);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int HD = 256;          // head_dim
@@ -302,4 +302,4 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

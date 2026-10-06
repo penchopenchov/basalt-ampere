@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Which table turns a code into a number.  `Affine` is `code + bias`; `Iq4Nl` is the non-linear
 // `kvalues_iq4nl`, which no bias can express - the reason the canonical form carries a codebook at all.
@@ -130,4 +130,4 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
 void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float* scales, const float* offset,
                        float* y, int64_t n_in, int64_t n_out, const SForm& form, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

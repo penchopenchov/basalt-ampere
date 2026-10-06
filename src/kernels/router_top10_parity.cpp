@@ -76,7 +76,7 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     check(cudaMalloc(&d_ids, h_ids.size() * sizeof(int)), "malloc ids");
     check(cudaMalloc(&d_w, h_w.size() * sizeof(float)), "malloc w");
     check(cudaMemcpy(d_l, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "copy");
-    strata::kernels::router_top10(d_l, n_tokens, n_expert, k, d_ids, d_w, nullptr);
+    basalt::kernels::router_top10(d_l, n_tokens, n_expert, k, d_ids, d_w, nullptr);
     check(cudaMemcpy(h_ids.data(), d_ids, h_ids.size() * sizeof(int), cudaMemcpyDeviceToHost), "back ids");
     check(cudaMemcpy(h_w.data(), d_w, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost), "back w");
 

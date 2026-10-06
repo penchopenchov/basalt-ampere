@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int QK = 256, Q8K = 32, WARP = 32;
@@ -399,4 +399,4 @@ void q5k_head_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, 
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

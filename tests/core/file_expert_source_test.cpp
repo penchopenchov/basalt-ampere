@@ -65,7 +65,7 @@ void create_pack(const fs::path& dir, uint64_t bytes, const std::vector<std::pai
     }
 }
 
-void check_file_size_rejection(strata::core::FileExpertSource& source, const fs::path& dir, int64_t layers,
+void check_file_size_rejection(basalt::core::FileExpertSource& source, const fs::path& dir, int64_t layers,
                                int64_t experts, uint64_t expected_bytes) {
     std::string err;
     source.close();
@@ -80,8 +80,8 @@ void check_file_size_rejection(strata::core::FileExpertSource& source, const fs:
 }
 
 void test_canonical_layout() {
-    using namespace strata::core;
-    using namespace strata::kernels::cpu;
+    using namespace basalt::core;
+    using namespace basalt::kernels::cpu;
     constexpr int64_t layers = 2;
     constexpr int64_t experts = 3;
     const uint64_t layer_bytes = (uint64_t) experts * BLOB;
@@ -123,8 +123,8 @@ void test_canonical_layout() {
 
 #if defined(STRATA_NATIVE_EXPERTS)
 void test_native_variable_layout() {
-    using namespace strata::core;
-    using namespace strata::kernels::cpu;
+    using namespace basalt::core;
+    using namespace basalt::kernels::cpu;
     constexpr int64_t layers = 2;
     constexpr int64_t experts = 3;
     constexpr int64_t embedding = 2560;
@@ -186,7 +186,7 @@ void test_native_variable_layout() {
 #endif
 
 void test_complement_plan() {
-    using namespace strata::core::detail;
+    using namespace basalt::core::detail;
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     std::string error;
@@ -208,7 +208,7 @@ void test_complement_plan() {
 }
 
 void test_resident_lend_region() {
-    using namespace strata::core::detail;
+    using namespace basalt::core::detail;
     // four slots (sizes 5, 3, 3, 5); the experts no slot holds take 10 bytes
     const std::vector<uint64_t> slots{5, 3, 3, 5};
     require(choose_resident_keep_from(slots, 10, 9, 1) == -1, "a base larger than the budget was accepted");
@@ -223,8 +223,8 @@ void test_resident_lend_region() {
 }
 
 void test_resident_exchange() {
-    using namespace strata::core;
-    using namespace strata::core::detail;
+    using namespace basalt::core;
+    using namespace basalt::core::detail;
     // 2 layers x 3 experts; the GPU holds (0,1) and (1,2): the compact copy holds the other four
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
@@ -254,7 +254,7 @@ void test_resident_exchange() {
 }
 
 void test_cgroup_memory_budget() {
-    using namespace strata::core::detail;
+    using namespace basalt::core::detail;
     constexpr uint64_t GiB = 1ull << 30;
     uint64_t bytes = 0;
 
@@ -291,7 +291,7 @@ void test_cgroup_memory_budget() {
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
 void test_host_memory() {
-    using namespace strata::core::detail;
+    using namespace basalt::core::detail;
     constexpr uint64_t GiB = 1ull << 30;
     HostMemory m;
 #if defined(__linux__)

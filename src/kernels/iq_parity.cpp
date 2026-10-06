@@ -58,8 +58,8 @@ int main(int argc, char** argv) {
         cudaMalloc(&dq, ref.size() * 4);
         cudaMemcpy(dw, raw.data(), raw.size(), cudaMemcpyHostToDevice);
         double dq_err = 0.0;
-        if (strata::kernels::iq_supported(type) && ((size_t) rows * cols) % 256 == 0) {
-            strata::kernels::iq_dequant_f32(type, dw, (int64_t) rows * cols, dq, s);
+        if (basalt::kernels::iq_supported(type) && ((size_t) rows * cols) % 256 == 0) {
+            basalt::kernels::iq_dequant_f32(type, dw, (int64_t) rows * cols, dq, s);
             std::vector<float> got(ref.size());
             cudaMemcpy(got.data(), dq, got.size() * 4, cudaMemcpyDeviceToHost);
             double num = 0, den = 0;
@@ -80,20 +80,20 @@ int main(int argc, char** argv) {
         cudaMalloc(&xq, (size_t) MC * cols / 32 * 36);
         cudaMalloc(&dy, (size_t) MC * rows * 4);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
-        strata::kernels::quantize_q8_1_rows(dx, MC, cols, xq, s);
+        basalt::kernels::quantize_q8_1_rows(dx, MC, cols, xq, s);
         std::vector<float> y((size_t) MC * rows), yn(y.size());
         int multi_bad = 0;
         try {
             for (int c = 0; c < MC; ++c)
-                strata::kernels::native_mmvq(type, dw, (const uint8_t*) xq + (size_t) c * cols / 32 * 36,
+                basalt::kernels::native_mmvq(type, dw, (const uint8_t*) xq + (size_t) c * cols / 32 * 36,
                                              dy + (size_t) c * rows, cols, rows, 1, s);
             cudaStreamSynchronize(s);
             cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);
             for (int nc = 2; nc <= MC; ++nc) {
-                strata::kernels::native_mmvq(type, dw, xq, dy, cols, rows, nc, s);
+                basalt::kernels::native_mmvq(type, dw, xq, dy, cols, rows, nc, s);
                 cudaStreamSynchronize(s);
                 cudaMemcpy(yn.data(), dy, yn.size() * 4, cudaMemcpyDeviceToHost);
-                if (strata::kernels::native_mmvq_multi_exact() &&
+                if (basalt::kernels::native_mmvq_multi_exact() &&
                     std::memcmp(yn.data(), y.data(), (size_t) nc * rows * 4) != 0) {
                     std::printf("%-8s mmvq ncols %d: not bitwise equal to the one-column calls\n", nm, nc);
                     ++multi_bad;

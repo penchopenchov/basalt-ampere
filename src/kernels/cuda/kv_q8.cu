@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 void check(const char* what) {
@@ -124,4 +124,4 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
     check("kv_gather_q8 launch");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

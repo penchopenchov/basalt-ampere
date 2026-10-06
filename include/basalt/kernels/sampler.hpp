@@ -10,7 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 struct SamplerParams {
     int top_k = 20;              // sampled path: 1..64 as given; 0 (off) or more than 64 keep the widest list, 64
@@ -89,4 +89,4 @@ inline void penalty_rows(const int32_t* tail, int64_t n_tail, const int32_t* win
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

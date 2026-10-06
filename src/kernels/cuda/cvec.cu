@@ -5,7 +5,7 @@
 
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -163,4 +163,4 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
     if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply: launch failed");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

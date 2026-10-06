@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // x (n floats) -> ggml's block_q8_0 layout: 34 bytes per 32 elements, { fp16 d ; int8 qs[32] }.
 // n must be a multiple of 32.  `stream` may be null, in which case the call synchronises.
@@ -55,4 +55,4 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream);
 // The inverse: each element becomes `d * qs[j]`, with `d = 1/iscale` stored as f32.
 void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

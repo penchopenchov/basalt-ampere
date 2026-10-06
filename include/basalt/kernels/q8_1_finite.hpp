@@ -11,7 +11,7 @@
 
 #include <cuda_fp16.h>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 constexpr float kHalfMax = 65504.0f;
 
@@ -30,4 +30,4 @@ __device__ __forceinline__ half2 q8_1_ds(const float d, const float sum) {
     return make_half2(__float2half(q8_1_finite(d)), __float2half(q8_1_finite(sum)));
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

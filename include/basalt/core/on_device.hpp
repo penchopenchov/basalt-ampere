@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 
-namespace strata::core {
+namespace basalt::core {
 
 struct OnDevice {
     int previous = -1;
@@ -19,4 +19,4 @@ struct OnDevice {
     OnDevice& operator=(const OnDevice&) = delete;
 };
 
-}  // namespace strata::core
+}  // namespace basalt::core

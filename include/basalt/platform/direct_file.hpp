@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <string>
 
-namespace strata::platform {
+namespace basalt::platform {
 
 struct Completion {
     uint64_t tag = 0;      ///< the caller's tag from `submit`
@@ -57,4 +57,4 @@ private:
 /// Monotonic time in microseconds, for latency accounting.
 double now_us();
 
-}  // namespace strata::platform
+}  // namespace basalt::platform

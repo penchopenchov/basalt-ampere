@@ -22,7 +22,7 @@
 #define MAP_HUGE_2MB (21 << 26)
 #endif
 
-namespace strata::core {
+namespace basalt::core {
 
 namespace {
 
@@ -265,8 +265,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
                    " GiB); " + note;
             if (registered_bytes < bytes) {
-                const strata::platform::LockResult lr =
-                    strata::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
+                const basalt::platform::LockResult lr =
+                    basalt::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
                 locked_bytes = lr.locked_bytes;
                 note = lr.note + "; " + note;
             }
@@ -286,7 +286,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // failure is sticky too, and it lies about where it happened just as convincingly.
             (void) cudaGetLastError();
             // Keep it resident instead of pinned, so the OS does not page the arena out.
-            const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
+            const basalt::platform::LockResult lr = basalt::platform::lock_resident(base, bytes);
             locked_bytes = lr.locked_bytes;
             note = lr.note + "; " + note;
         }
@@ -295,7 +295,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
 
 PinnedArena::~PinnedArena() {
     if (base) {
-        if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
+        if (locked_bytes) basalt::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
             for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
         } else {
@@ -460,4 +460,4 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
     return st;
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::prefill::mmq {
+namespace basalt::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
@@ -87,4 +87,4 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
 
-}  // namespace strata::prefill::mmq
+}  // namespace basalt::prefill::mmq

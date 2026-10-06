@@ -34,7 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int QK_S2 = 64;
@@ -150,4 +150,4 @@ void s2_gemv_fast(const uint16_t* x, const uint8_t* codes, const float* scales, 
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

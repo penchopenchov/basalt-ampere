@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int N = 2560;              // n_embd
@@ -2550,4 +2550,4 @@ void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* s
     hc_l2_prefetch_kernel<<<8, 32, 0, (cudaStream_t) stream>>>(p[0], b[0], p[1], b[1], p[2], b[2], p[3], b[3]);
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

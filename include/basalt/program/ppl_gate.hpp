@@ -18,7 +18,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-namespace strata::program {
+namespace basalt::program {
 
 class PplGate {
 public:
@@ -166,4 +166,4 @@ private:
     std::future<bool> pending_;
 };
 
-}  // namespace strata::program
+}  // namespace basalt::program

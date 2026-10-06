@@ -21,7 +21,7 @@
 namespace {
 
 bool cpu_block(int type, const uint8_t* b, float* out) {
-    using namespace strata;
+    using namespace basalt;
     switch (type) {
     case 2: dequantize_q4_0(b, out); return true;
     case 6: dequantize_q5_0(b, out); return true;
@@ -54,12 +54,12 @@ int main(int argc, char** argv) {
     std::map<int, bool> done;
     int fails = 0, checked = 0;
     for (int a = 1; a < argc; ++a) {
-        strata::GgufFile gguf(argv[a]);
+        basalt::GgufFile gguf(argv[a]);
         for (const auto& t : gguf.tensors()) {
             const int type = (int) t.type;
-            if (done.count(type) || !strata::kernels::dequant_bf16_supported(type) || t.shape.size() != 2) continue;
+            if (done.count(type) || !basalt::kernels::dequant_bf16_supported(type) || t.shape.size() != 2) continue;
             int be = 0, bb = 0;
-            if (!strata::block_geometry(t.type, be, bb)) continue;
+            if (!basalt::block_geometry(t.type, be, bb)) continue;
             const int64_t cols = (int64_t) t.shape[0];
             const int64_t rows = (std::min<int64_t>)(4, (int64_t) t.shape[1]);
             const int64_t row_bytes = cols / be * bb;
@@ -71,8 +71,8 @@ int main(int argc, char** argv) {
             cudaMalloc(&d_f, (size_t) (rows * cols) * 4);
             cudaMalloc(&d_h, (size_t) (rows * cols) * 2);
             cudaMemcpy(d_blocks, host, (size_t) (rows * row_bytes), cudaMemcpyHostToDevice);
-            strata::kernels::dequant_f32(type, d_blocks, 0, rows, cols, d_f, nullptr);
-            strata::kernels::dequant_bf16(type, d_blocks, 0, rows, cols, d_h, nullptr);
+            basalt::kernels::dequant_f32(type, d_blocks, 0, rows, cols, d_f, nullptr);
+            basalt::kernels::dequant_bf16(type, d_blocks, 0, rows, cols, d_h, nullptr);
             std::vector<float> gf((size_t) (rows * cols));
             std::vector<uint16_t> gh((size_t) (rows * cols));
             cudaMemcpy(gf.data(), d_f, gf.size() * 4, cudaMemcpyDeviceToHost);

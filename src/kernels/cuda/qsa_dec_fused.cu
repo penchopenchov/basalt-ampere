@@ -14,7 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int HD = 256, ID = 128, R = 4, ROT = 64, THREADS = 256;
@@ -282,4 +282,4 @@ void qsa_dec_q_post(const QsaDecQPost& a, int n, const QsaShapes& s, const RopeS
     check("qsa_dec_q_post");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

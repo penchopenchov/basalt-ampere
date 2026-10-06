@@ -28,7 +28,7 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 
 // ---- geometry, all of it fixed by the artifact (tools/verify_q2_0_geometry.py: 202/202 tensors at QK=64) ----
 inline constexpr int H = 2560;      // n_embd
@@ -176,4 +176,4 @@ void act_quant_q8_1_avx2(const float* x, int n, ActQ& a);
 
 void s2_expert_scalar(const uint8_t* blob, const float* x, float* out, bool quant_acts);
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

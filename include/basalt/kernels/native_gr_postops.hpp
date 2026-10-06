@@ -1,6 +1,6 @@
 #pragma once
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Pinned llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d contiguous F32
 // single-token GR post-operations. Explicit stream, no allocation or wait; null
@@ -25,4 +25,4 @@ void native_gr_pre_gated(const float* xn, float* gate, float* mixed,
 void native_gr_post(const float* residual, const float* block_out, const float* inject,
                     float* output, int n_embd, int hc, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

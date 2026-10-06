@@ -11,7 +11,7 @@ uint64_t gib(double g) { return (uint64_t) (g * 1073741824.0); }
 
 // #577: the file tier's unbuffered choice (true = the file cache keeps its reads, so they stay buffered)
 int file_cache_keeps_cases() {
-    using strata::platform::file_cache_keeps;
+    using basalt::platform::file_cache_keeps;
     struct Case { const char* what; double avail, arena, read; bool keeps; };
     const double experts = 71.7;   // UD-Q4_K_XL's routed experts
     const Case cases[] = {
@@ -48,11 +48,11 @@ int main() {
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
     std::memset(p, 1, bytes);
-    const strata::platform::LockResult r = strata::platform::lock_resident(p, bytes);
+    const basalt::platform::LockResult r = basalt::platform::lock_resident(p, bytes);
     std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
                 r.note.c_str());
     int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
-    strata::platform::unlock_resident(p, bytes);
+    basalt::platform::unlock_resident(p, bytes);
     std::free(p);
     std::printf("platform_memory_test: %s\n", fail ? "FAILED" : "OK");
     return fail;

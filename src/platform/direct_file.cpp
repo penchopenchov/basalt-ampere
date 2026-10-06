@@ -15,7 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace strata::platform {
+namespace basalt::platform {
 
 double now_us() {
     using namespace std::chrono;
@@ -150,4 +150,4 @@ int DirectFile::wait(Completion* out, int max, int timeout_ms) {
     return n;
 }
 
-}  // namespace strata::platform
+}  // namespace basalt::platform

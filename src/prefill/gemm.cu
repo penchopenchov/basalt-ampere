@@ -18,7 +18,7 @@
 #include <memory>
 
 
-namespace strata::prefill {
+namespace basalt::prefill {
 namespace {
 
 void ck(cublasStatus_t s, const char* what) {
@@ -120,8 +120,8 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 }
 
 void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
-    strata::kernels::Hc8View v;
-    if (strata::kernels::hc8_view(W, v) && v.owned) {
+    basalt::kernels::Hc8View v;
+    if (basalt::kernels::hc8_view(W, v) && v.owned) {
         if (v.rows != N || v.cols != K) {
             std::fprintf(stderr, "prefill gemm: an 8-bit copy is %d x %d, the product wants %lld x %lld\n", v.rows,
                          v.cols, (long long) N, (long long) K);
@@ -135,7 +135,7 @@ void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int
         }
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min<int64_t>(rows, N - r0);
-            strata::kernels::hc8_dequant_bf16(v, r0, n, scratch_, stream_);
+            basalt::kernels::hc8_dequant_bf16(v, r0, n, scratch_, stream_);
             bf16(X, scratch_, Y + r0, T, n, K, ldy);
         }
         return;
@@ -164,13 +164,13 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
-            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            basalt::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
         return;
     }
-    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    basalt::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 
-}  // namespace strata::prefill
+}  // namespace basalt::prefill

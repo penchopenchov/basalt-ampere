@@ -28,7 +28,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 template<int Width> __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
@@ -209,4 +209,4 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
     if (result != cudaSuccess)
         throw std::runtime_error(std::string("native FlashAttention launch: ") + cudaGetErrorString(result));
 }
-} // namespace strata::kernels
+} // namespace basalt::kernels

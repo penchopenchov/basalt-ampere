@@ -65,7 +65,7 @@ int main() {
         size_t n = 0;
         bool both = false;
         try {
-            strata::GgufFile g(path.string());
+            basalt::GgufFile g(path.string());
             n = g.tensors().size();
             both = g.find("blk.0.attn_q.weight") && g.find("blk.0.attn_k.weight");
         } catch (const std::exception& e) {
@@ -78,7 +78,7 @@ int main() {
         const auto path = write_gguf({"blk.0.attn_q.weight", "blk.0.attn_q.weight"});
         std::string err;
         try {
-            strata::GgufFile g(path.string());
+            basalt::GgufFile g(path.string());
         } catch (const std::exception& e) {
             err = e.what();
         }

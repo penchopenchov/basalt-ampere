@@ -74,7 +74,7 @@ bool ck(cudaError_t e, const char* what) {
 }
 
 std::vector<uint8_t> make_weights(const Case& c, std::mt19937& rng) {
-    const std::size_t wbytes = strata::kernels::native_mmvq_weight_bytes(c.type, c.n_in, c.n_out);
+    const std::size_t wbytes = basalt::kernels::native_mmvq_weight_bytes(c.type, c.n_in, c.n_out);
     std::vector<uint8_t> w(wbytes);
     for (auto& b : w) b = (uint8_t) (rng() & 0xff);
     const std::size_t nb = wbytes / (std::size_t) c.block_bytes;
@@ -94,7 +94,7 @@ bool parity(const Case& c, cudaStream_t s) {
     std::vector<float> x((std::size_t) TM * c.n_in);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : x) v = nd(rng);
-    const std::size_t qcol = strata::kernels::native_q8_1_bytes(c.n_in, 1);
+    const std::size_t qcol = basalt::kernels::native_q8_1_bytes(c.n_in, 1);
     void *dw = nullptr, *xq = nullptr;
     float *dx = nullptr, *yref = nullptr, *yt = nullptr;
     const std::size_t ybytes = (std::size_t) TM * c.n_out * 4;
@@ -105,13 +105,13 @@ bool parity(const Case& c, cudaStream_t s) {
     cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();   // pageable copies may still be in flight for a non-blocking stream
-    strata::kernels::native_quantize_q8_1(dx, xq, c.n_in, TM, s);
+    basalt::kernels::native_quantize_q8_1(dx, xq, c.n_in, TM, s);
     for (int j = 0; j < TM; ++j)
-        strata::kernels::native_mmvq(c.type, dw, (const uint8_t*) xq + j * qcol, yref + (std::size_t) j * c.n_out,
+        basalt::kernels::native_mmvq(c.type, dw, (const uint8_t*) xq + j * qcol, yref + (std::size_t) j * c.n_out,
                                      c.n_in, c.n_out, 1, s);
     cudaMemsetAsync(yt, 0xff, ybytes * (TM + 1), s);
     for (int T = 1; T <= TM; ++T)
-        strata::kernels::dense_tc(c.type, dw, xq, yt + (std::size_t) T * TM * c.n_out, c.n_in, c.n_out, T, s);
+        basalt::kernels::dense_tc(c.type, dw, xq, yt + (std::size_t) T * TM * c.n_out, c.n_in, c.n_out, T, s);
     if (!ck(cudaStreamSynchronize(s), "run")) return false;
     std::vector<float> ref((std::size_t) TM * c.n_out), got((std::size_t) (TM + 1) * TM * c.n_out);
     cudaMemcpy(ref.data(), yref, ybytes, cudaMemcpyDeviceToHost);
@@ -152,7 +152,7 @@ bool pair_parity(const Case& a, const Case& b, cudaStream_t s) {
     std::vector<float> x((std::size_t) TM * a.n_in);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : x) v = nd(rng);
-    const std::size_t qcol = strata::kernels::native_q8_1_bytes(a.n_in, 1);
+    const std::size_t qcol = basalt::kernels::native_q8_1_bytes(a.n_in, 1);
     void *dwa = nullptr, *dwb = nullptr, *xq = nullptr;
     float *dx = nullptr, *ra = nullptr, *rb = nullptr, *ya = nullptr, *yb = nullptr;
     cudaMalloc(&dwa, wa.size()); cudaMalloc(&dwb, wb.size()); cudaMalloc(&xq, qcol * TM);
@@ -163,15 +163,15 @@ bool pair_parity(const Case& a, const Case& b, cudaStream_t s) {
     cudaMemcpy(dwb, wb.data(), wb.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
-    strata::kernels::native_quantize_q8_1(dx, xq, a.n_in, TM, s);
+    basalt::kernels::native_quantize_q8_1(dx, xq, a.n_in, TM, s);
     for (int j = 0; j < TM; ++j) {
-        strata::kernels::native_mmvq(a.type, dwa, (const uint8_t*) xq + j * qcol, ra + (std::size_t) j * a.n_out, a.n_in,
+        basalt::kernels::native_mmvq(a.type, dwa, (const uint8_t*) xq + j * qcol, ra + (std::size_t) j * a.n_out, a.n_in,
                                      a.n_out, 1, s);
-        strata::kernels::native_mmvq(b.type, dwb, (const uint8_t*) xq + j * qcol, rb + (std::size_t) j * b.n_out, b.n_in,
+        basalt::kernels::native_mmvq(b.type, dwb, (const uint8_t*) xq + j * qcol, rb + (std::size_t) j * b.n_out, b.n_in,
                                      b.n_out, 1, s);
     }
     for (int T = 1; T <= TM; ++T)
-        strata::kernels::dense_tc_pair(a.type, dwa, ya + (std::size_t) T * TM * a.n_out, a.n_out, b.type, dwb,
+        basalt::kernels::dense_tc_pair(a.type, dwa, ya + (std::size_t) T * TM * a.n_out, a.n_out, b.type, dwb,
                                        yb + (std::size_t) T * TM * b.n_out, b.n_out, xq, a.n_in, T, s);
     if (!ck(cudaStreamSynchronize(s), "pair run")) return false;
     bool ok = true;
@@ -219,7 +219,7 @@ double time_graph(F&& call, int NL, cudaStream_t s, int reps = 7) {
     cudaGraphExec_t ge;
     cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
     {
-        strata::kernels::PdlScope ps(true);   // with STRATA_PDL=1, as the verify graphs launch them
+        basalt::kernels::PdlScope ps(true);   // with STRATA_PDL=1, as the verify graphs launch them
         for (int l = 0; l < NL; ++l) call(l);
     }
     cudaStreamEndCapture(s, &g);
@@ -268,7 +268,7 @@ void bench(cudaStream_t s) {
     }
     std::printf("\nbench: us per call (median of 7 graph replays), GB/s of the weight bytes%s\n", warm ? ", L2-warm" : "");
     for (const Case* c : sel) {
-        const std::size_t wb = strata::kernels::native_mmvq_weight_bytes(c->type, c->n_in, c->n_out);
+        const std::size_t wb = basalt::kernels::native_mmvq_weight_bytes(c->type, c->n_in, c->n_out);
         const int NL = warm ? 16 : (int) std::max<std::size_t>(8, (400u << 20) / wb);
         std::mt19937 rng(99u);
         const std::vector<uint8_t> w = make_weights(*c, rng);
@@ -277,7 +277,7 @@ void bench(cudaStream_t s) {
         float *dx = nullptr, *y = nullptr;
         cudaMalloc(&dw, wb * NL);
         for (int l = 0; l < (warm ? 1 : NL); ++l) cudaMemcpy(dw + wb * l, w.data(), wb, cudaMemcpyHostToDevice);
-        cudaMalloc(&xq, strata::kernels::native_q8_1_bytes(c->n_in, 8));
+        cudaMalloc(&xq, basalt::kernels::native_q8_1_bytes(c->n_in, 8));
         cudaMalloc(&dx, (std::size_t) 8 * c->n_in * 4);
         cudaMalloc(&y, (std::size_t) 8 * c->n_out * 4);
         std::vector<float> x((std::size_t) 8 * c->n_in);
@@ -285,16 +285,16 @@ void bench(cudaStream_t s) {
         for (auto& v : x) v = nd(rng);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
         cudaDeviceSynchronize();
-        strata::kernels::native_quantize_q8_1(dx, xq, c->n_in, 8, s);
+        basalt::kernels::native_quantize_q8_1(dx, xq, c->n_in, 8, s);
         std::printf("%-12s %5d x %5d  %.1f MB  floor %.2f us at 1.79 TB/s\n", c->name, c->n_in, c->n_out, wb / 1e6,
                     wb / 1.79e6);
         std::printf("   T   native us   GB/s   dtc us   GB/s   speedup\n");
         for (int T = 1; T <= 8; ++T) {
             const double tn = time_graph([&](int l) {
-                strata::kernels::native_mmvq(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
+                basalt::kernels::native_mmvq(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
             }, NL, s);
             const double td = time_graph([&](int l) {
-                strata::kernels::dense_tc(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
+                basalt::kernels::dense_tc(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
             }, NL, s);
             std::printf("  %2d  %8.2f %7.0f %8.2f %7.0f   %.2fx\n", T, tn, wb / tn / 1e3, td, wb / td / 1e3, tn / td);
         }
@@ -308,8 +308,8 @@ void bench_pair(cudaStream_t s) {
     std::printf("\npair bench: us per call (median of 7 graph replays)\n");
     for (const auto& pr : pairs) {
         const Case &a = CASES[pr[0]], &b = CASES[pr[1]];
-        const std::size_t wba = strata::kernels::native_mmvq_weight_bytes(a.type, a.n_in, a.n_out);
-        const std::size_t wbb = strata::kernels::native_mmvq_weight_bytes(b.type, b.n_in, b.n_out);
+        const std::size_t wba = basalt::kernels::native_mmvq_weight_bytes(a.type, a.n_in, a.n_out);
+        const std::size_t wbb = basalt::kernels::native_mmvq_weight_bytes(b.type, b.n_in, b.n_out);
         const std::size_t wb = ((wba + 255) & ~(std::size_t) 255) + ((wbb + 255) & ~(std::size_t) 255);
         const int NL = (int) std::max<std::size_t>(8, (400u << 20) / wb);
         std::mt19937 rng(5u);
@@ -323,7 +323,7 @@ void bench_pair(cudaStream_t s) {
             cudaMemcpy(dw + wb * l, w0.data(), wba, cudaMemcpyHostToDevice);
             cudaMemcpy(dw + wb * l + off1, w1.data(), wbb, cudaMemcpyHostToDevice);
         }
-        cudaMalloc(&xq, strata::kernels::native_q8_1_bytes(a.n_in, 8));
+        cudaMalloc(&xq, basalt::kernels::native_q8_1_bytes(a.n_in, 8));
         cudaMalloc(&dx, (std::size_t) 8 * a.n_in * 4);
         cudaMalloc(&y0, (std::size_t) 8 * a.n_out * 4);
         cudaMalloc(&y1, (std::size_t) 8 * b.n_out * 4);
@@ -332,16 +332,16 @@ void bench_pair(cudaStream_t s) {
         for (auto& v : x) v = nd(rng);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
         cudaDeviceSynchronize();
-        strata::kernels::native_quantize_q8_1(dx, xq, a.n_in, 8, s);
+        basalt::kernels::native_quantize_q8_1(dx, xq, a.n_in, 8, s);
         std::printf("%-10s + %-10s %.1f MB  floor %.2f us at 1.79 TB/s\n   T   serial us   pair us   GB/s\n", a.name,
                     b.name, (wba + wbb) / 1e6, (wba + wbb) / 1.79e6);
         for (int T = 1; T <= 4; ++T) {
             const double ts = time_graph([&](int l) {
-                strata::kernels::dense_tc(a.type, dw + wb * l, xq, y0, a.n_in, a.n_out, T, s);
-                strata::kernels::native_mmvq(b.type, dw + wb * l + off1, xq, y1, b.n_in, b.n_out, T, s);
+                basalt::kernels::dense_tc(a.type, dw + wb * l, xq, y0, a.n_in, a.n_out, T, s);
+                basalt::kernels::native_mmvq(b.type, dw + wb * l + off1, xq, y1, b.n_in, b.n_out, T, s);
             }, NL, s);
             const double tp = time_graph([&](int l) {
-                strata::kernels::dense_tc_pair(a.type, dw + wb * l, y0, a.n_out, b.type, dw + wb * l + off1, y1, b.n_out,
+                basalt::kernels::dense_tc_pair(a.type, dw + wb * l, y0, a.n_out, b.type, dw + wb * l + off1, y1, b.n_out,
                                                xq, a.n_in, T, s);
             }, NL, s);
             std::printf("  %2d  %8.2f  %8.2f  %6.0f\n", T, ts, tp, (wba + wbb) / tp / 1e3);

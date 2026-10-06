@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // `stream` may be null, in which case the call synchronises before returning.  `ids` is (n_tokens, k) int32 and
 // `weights` is (n_tokens, k) f32, both device pointers.  k must be <= 64.
@@ -23,4 +23,4 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
 bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                           void* stream, int variant);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

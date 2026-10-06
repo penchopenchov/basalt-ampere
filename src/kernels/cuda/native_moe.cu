@@ -31,7 +31,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 __global__ void combine(const float* __restrict__ parts, const float* __restrict__ weights,

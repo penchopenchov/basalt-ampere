@@ -71,10 +71,10 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
     std::vector<uint64_t> bytes;
     uint64_t at = 0;
     for (const auto& t : ts) {
-        strata::TensorInfo info;
+        basalt::TensorInfo info;
         info.shape = t.shape;
         info.type = t.type;
-        const uint64_t n = strata::tensor_payload_bytes(info);
+        const uint64_t n = basalt::tensor_payload_bytes(info);
         if (n == 0) throw std::runtime_error("fixture: " + t.name + " has no whole-block byte count");
         puts(t.name);
         put32((uint32_t) t.shape.size());

@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int N = 2560;         // n_embd
@@ -893,4 +893,4 @@ void fused_gr_check() {
 }
 
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

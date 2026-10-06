@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strata::prefill::fused {
+namespace basalt::prefill::fused {
 
 /// One layer's native expert geometry (cpu::NativeFmt's fields the kernels read; n_embd 2560, n_ff 640).
 struct NativeGeom {
@@ -46,4 +46,4 @@ void native_v2_override(int mode);
 /// v2 is wanted (the variable or the override) and its kernels run on the current device.
 bool native_v2_ready();
 
-}  // namespace strata::prefill::fused
+}  // namespace basalt::prefill::fused

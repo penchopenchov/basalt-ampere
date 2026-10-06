@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace K = strata::kernels;
+namespace K = basalt::kernels;
 
 
 static uint16_t bf16(float x) {

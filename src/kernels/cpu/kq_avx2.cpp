@@ -22,7 +22,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 namespace {
 
 constexpr int MAXT = 8;   // the verify window's tokens per group (kVerifyMaxT)
@@ -262,4 +262,4 @@ void kq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

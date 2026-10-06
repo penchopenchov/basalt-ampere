@@ -42,7 +42,7 @@
 #define STRATA_COUPLED_HD
 #endif
 
-namespace strata::core {
+namespace basalt::core {
 
 /// The longest penalty window the coupled drafter mirrors (serve's kPenaltyWindowCap).
 inline constexpr int kCoupledHistCap = 4096;
@@ -79,7 +79,7 @@ STRATA_COUPLED_HD inline int coupled_hist_start(int cap, int j, int h) { return 
 /// out[0..h) - row 0 of `penalty_rows` for the one-token window [next].
 inline void coupled_hist_base(const int32_t* tail, int64_t n_tail, int32_t next, int h, int32_t* out) {
     if (h <= 0) return;
-    strata::kernels::penalty_rows(tail, n_tail, &next, 1, h, out);
+    basalt::kernels::penalty_rows(tail, n_tail, &next, 1, h, out);
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

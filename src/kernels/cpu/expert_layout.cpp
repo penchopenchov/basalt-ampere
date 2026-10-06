@@ -9,7 +9,7 @@
 #include <fstream>
 #include <sstream>
 
-namespace strata::kernels::cpu {
+namespace basalt::kernels::cpu {
 namespace {
 ExpertLayout g_layout;
 }
@@ -251,4 +251,4 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
 #endif
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace basalt::kernels::cpu

@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 class WeightTable;
 
 // Experimental GDN/QSA/shared-expert projection overrides. Upload unchanged native GGUF
@@ -42,4 +42,4 @@ private:
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
 };
-} // namespace strata::core
+} // namespace basalt::core

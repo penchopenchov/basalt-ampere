@@ -3,7 +3,7 @@
 
 #include <cstdio>
 
-using namespace strata::spec;
+using namespace basalt::spec;
 
 namespace {
 int g_fail = 0;

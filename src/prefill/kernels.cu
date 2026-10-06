@@ -12,7 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::prefill {
+namespace basalt::prefill {
 namespace {
 
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
@@ -740,17 +740,17 @@ template <bool TAB>
 __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
                             float theta_scale, float freq_scale, float corr_low, float corr_high,
                             float ext_factor, float mscale, const int32_t* __restrict__ mtab,
-                            strata::kernels::RopeTab rt) {
+                            basalt::kernels::RopeTab rt) {
     const int64_t row = blockIdx.x;             // t * heads + h
     const int pair = threadIdx.x;               // 0..31
     const int64_t t = row / heads, h = row % heads;
     float* p = x + t * ld + h * dim;
     float c, s;
-    if (!(TAB && strata::kernels::rope_tab_cs(rt, strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair), pair, c,
+    if (!(TAB && basalt::kernels::rope_tab_cs(rt, basalt::kernels::mrope_pos(mtab, (int) (pos0 + t), pair), pair, c,
                                               s))) {
         const float theta_extrap =
-            (float) strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair) * powf(theta_scale, (float) pair);
-        strata::kernels::rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale,
+            (float) basalt::kernels::mrope_pos(mtab, (int) (pos0 + t), pair) * powf(theta_scale, (float) pair);
+        basalt::kernels::rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale,
                                            pair, c, s);
     }
     const float a = p[pair], b = p[pair + 32];
@@ -776,7 +776,7 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
 __global__ void kv_append_kernel(const float* __restrict__ K, const float* __restrict__ V, int64_t pos0,
                                  const int32_t* __restrict__ table, int64_t page_size, uint16_t* k_pool,
                                  uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-                                 strata::kernels::KvHostPools host, strata::kernels::KvHostPools stage) {
+                                 basalt::kernels::KvHostPools host, basalt::kernels::KvHostPools stage) {
     const int64_t t = blockIdx.x;
     const int kvh = blockIdx.y, g = blockIdx.z >> 1;
     const bool is_v = (blockIdx.z & 1) != 0;
@@ -837,11 +837,11 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
+               void* stream, const basalt::kernels::KvHostPools* host, const basalt::kernels::KvHostPools* stage) {
     if (T <= 0) return;
     kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
         K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
-        host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
+        host ? *host : basalt::kernels::KvHostPools{}, stage ? *stage : basalt::kernels::KvHostPools{});
     check("kv_append");
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
@@ -933,7 +933,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
     else if (n_expert == 256)
         route_kernel<8><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
     else
-        strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
+        basalt::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
@@ -994,24 +994,24 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
     check("rms_rows");
 }
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
-          const strata::kernels::RopeScaling& scaling, void* stream) {
+          const basalt::kernels::RopeScaling& scaling, void* stream) {
     // The engine validates the resolved config at startup with the same rule (generate.cpp), so this only
     // fires for a caller that bypassed it; the prompt path has no error return here, so it stops the process.
-    if (const char* why = strata::kernels::rope_scaling_invalid(scaling)) {
+    if (const char* why = basalt::kernels::rope_scaling_invalid(scaling)) {
         std::fprintf(stderr, "prefill rope: invalid rope scaling: %s\n", why);
         std::exit(1);
     }
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
-    const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);   // none: the identity constants
-    const strata::kernels::RopeTab rt = strata::kernels::rope_table_for(scaling);
+    const basalt::kernels::RopeKernelArgs k = scaling.kernel_args(64);   // none: the identity constants
+    const basalt::kernels::RopeTab rt = basalt::kernels::rope_table_for(scaling);
     if (rt.cos != nullptr)
         rope_kernel<true><<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(
             x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
-            strata::kernels::mrope_table(), rt);
+            basalt::kernels::mrope_table(), rt);
     else
         rope_kernel<false><<<(unsigned) (T * heads), 32, 0, (cudaStream_t) stream>>>(
             x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
-            strata::kernels::mrope_table(), rt);
+            basalt::kernels::mrope_table(), rt);
     check("rope");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
@@ -1023,4 +1023,4 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
     check("gate_attn");
 }
 
-}  // namespace strata::prefill
+}  // namespace basalt::prefill

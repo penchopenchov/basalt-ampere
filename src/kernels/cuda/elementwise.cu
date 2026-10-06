@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
@@ -394,4 +394,4 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     sync_if_needed(stream, "rms_norm_weighted");
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

@@ -22,9 +22,9 @@
 #include <memory>
 #include <string>
 
-namespace strata::core { class PeerExperts; }
+namespace basalt::core { class PeerExperts; }
 
-namespace strata::prefill {
+namespace basalt::prefill {
 
 struct PrefillStats {
     int64_t tokens = 0;
@@ -37,9 +37,9 @@ struct PrefillStats {
     double ms_ple = 0;
 };
 
-}  // namespace strata::prefill
-namespace strata::core { class MtpDrafter; }
-namespace strata::prefill {
+}  // namespace basalt::prefill
+namespace basalt::core { class MtpDrafter; }
+namespace basalt::prefill {
 
 class Prefill {
 public:
@@ -144,4 +144,4 @@ private:
     PrefillStats stats_;
 };
 
-}  // namespace strata::prefill
+}  // namespace basalt::prefill

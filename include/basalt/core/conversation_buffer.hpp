@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 // Snapshot-owned host storage. Appending never relocates existing payloads;
 // only the small segment directory can move. No sharing or copy-on-write is
@@ -151,4 +151,4 @@ private:
     size_t size_ = 0;
 };
 
-} // namespace strata::core
+} // namespace basalt::core

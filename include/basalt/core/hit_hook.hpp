@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace strata::core {
+namespace basalt::core {
 
 /// **TWO PHASES, AND THE SPLIT IS THE WHOLE POINT.**  `Launch` runs BEFORE the CPU pool and `Combine` runs
 /// AFTER the misses have been copied into `parts`.  That ordering is what lets the GPU's resident experts run
@@ -38,4 +38,4 @@ enum class HitPhase { Launch, Combine };
 /// A null `HitFn` means "no VRAM tier" - the default, and what every caller had before R4.
 using HitFn = void (*)(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k);
 
-}  // namespace strata::core
+}  // namespace basalt::core

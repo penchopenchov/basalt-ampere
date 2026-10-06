@@ -50,7 +50,7 @@
 #include <immintrin.h>
 #endif
 
-namespace strata::core {
+namespace basalt::core {
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -65,13 +65,13 @@ constexpr bool dec_draft_par() { return true; }
 // Every hyper-connection read of those graphs (and the MLP read's router) as the one-kernel read, whose bits are
 // fused_gr_read_multi's.
 bool dec_draft_hcf() {
-    static const bool on = strata::kernels::hc_fused_supported();
+    static const bool on = basalt::kernels::hc_fused_supported();
     return on;
 }
 
 // The one-kernel hyper-connection read of the rows fa[0..T) (rows at the layer's fixed strides)
-strata::kernels::HcFusedArgs hcf_args(const strata::kernels::FusedGrArgs* fa, int T, float* xn) {
-    strata::kernels::HcFusedArgs h;
+basalt::kernels::HcFusedArgs hcf_args(const basalt::kernels::FusedGrArgs* fa, int T, float* xn) {
+    basalt::kernels::HcFusedArgs h;
     h.T = T; h.R = fa[0].R; h.R_out = fa[0].R_out; h.apply = fa[0].apply;
     h.bo_prev = fa[0].bo_prev; h.inj_prev = fa[0].inj_prev;
     h.w_norm = fa[0].w_norm; h.w_down = fa[0].w_down; h.w_up = fa[0].w_up; h.w_inject = fa[0].w_inject;
@@ -96,8 +96,8 @@ bool mapped(size_t bytes, void** h, void** d) {
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
 
-strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+basalt::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
+    basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
     s.n_head = g.n_head;
     s.n_head_kv = g.n_head_kv;
     s.head_dim = g.head_dim;
@@ -118,7 +118,7 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
     if (fseeko(f, 0, SEEK_END) != 0) return false;
     const long long n = (long long) ftello(f);
     if (n < 0 || fseeko(f, 0, SEEK_SET) != 0) return false;
-    strata::platform::advise_willneed(fileno(f), 0, (uint64_t) n);
+    basalt::platform::advise_willneed(fileno(f), 0, (uint64_t) n);
     out.resize((size_t) n);
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
@@ -184,7 +184,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (ple_ss_ == nullptr) ple_ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
-    if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
+    if (max_t < 1 || max_t > basalt::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
     // the two reads below are the whole "drafter files" cost; reported apart from the rest of the stage
     const auto t_files = std::chrono::steady_clock::now();
     // ---- the index and the dense weights
@@ -202,7 +202,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
-        if (strata::kernels::hc8_only()) {   // the hyper-connection matrices as 8-bit copies only: out of the blob
+        if (basalt::kernels::hc8_only()) {   // the hyper-connection matrices as 8-bit copies only: out of the blob
             std::vector<uint8_t> kept;
             size_t staged = 0;
             for (Tensor& t : tensors_) {
@@ -214,7 +214,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                     void* tmp = nullptr;
                     if (cudaMalloc(&tmp, t.bytes) != cudaSuccess) { err = "mtp: no VRAM to stage " + t.name; return false; }
                     cudaMemcpy(tmp, blob.data() + t.off, t.bytes, cudaMemcpyHostToDevice);
-                    t.dev = strata::kernels::hc8_adopt((const uint16_t*) tmp, (int) t.rows, (int) t.cols);
+                    t.dev = basalt::kernels::hc8_adopt((const uint16_t*) tmp, (int) t.rows, (int) t.cols);
                     cudaFree(tmp);
                     if (t.dev == nullptr) { err = "mtp: no VRAM for the 8-bit copy of " + t.name; return false; }
                     staged += t.bytes;
@@ -244,7 +244,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     // ---- the 512 routed experts, one blob each
     {
-        const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
+        const uint64_t bytes = (uint64_t) g.n_expert * basalt::kernels::cpu::BLOB;
         FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
         if (f == nullptr) { err = "mtp: cannot open experts.bin"; return false; }
         struct Closer {
@@ -252,7 +252,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
         if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-        strata::platform::advise_willneed(fileno(f), 0, bytes);
+        basalt::platform::advise_willneed(fileno(f), 0, bytes);
         std::vector<uint8_t> chunk(64u << 20);
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
@@ -268,7 +268,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (q8_0)"; return false; }
 
     // ---- the layer's own K/V (dense attention: no indexer state is read)
-    const strata::kernels::QsaShapes s = shapes_of(g);
+    const basalt::kernels::QsaShapes s = shapes_of(g);
     const int64_t max_cells = ss.qsa_states[ss.qsa_primary()].max_cells;
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
@@ -302,7 +302,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;
     cap_ = (((window_ > 0 ? window_ : max_cells) + 63) / 64) * 64;
-    attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
+    attn_scratch_floats_ = (int64_t) basalt::kernels::qsa_decode_attn_scratch_floats(cap_, s);
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t R2 = 2 * T;   // step/pos rows: T catch-up rows + up to T-2 chain steps
@@ -322,8 +322,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         mixed_ = b.take<float>(T * N); inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); bo_ = b.take<float>(T * N);
         xn_ = b.take<float>(T * HC * N);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes((int) (NH * HD), 8));
-        xq2_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes((int) (NH * HD), 8));
+        xq_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) (NH * HD), 8));
+        xq2_ = b.take<uint8_t>(basalt::kernels::native_q8_1_bytes((int) (NH * HD), 8));
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
@@ -335,8 +335,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        hit_scratch_ = b.take<uint8_t>(strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
-        sh_scratch_ = (float*) b.take<uint8_t>(strata::kernels::shared_expert_scratch_bytes(g.n_ff));
+        hit_scratch_ = b.take<uint8_t>(basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
+        sh_scratch_ = (float*) b.take<uint8_t>(basalt::kernels::shared_expert_scratch_bytes(g.n_ff));
         x_bf16_ = b.take<uint16_t>(N);
         out_ids_ = b.take<int32_t>(T + 4);
         probs_ = b.take<float>(T + 4);
@@ -364,25 +364,25 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         err = "mtp: second stream";
         return false;
     }
-    strata::kernels::hc_fused_init();
+    basalt::kernels::hc_fused_init();
     {
-        if (strata::kernels::hc8_enabled()) {   // the draft layer's reads on 8-bit copies too
+        if (basalt::kernels::hc8_enabled()) {   // the draft layer's reads on 8-bit copies too
             const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
             for (const char* p : {"attn_hyper_connection.", "mlp_hyper_connection.", "hyper_connection_mixer."}) {
                 const std::string s(p);
-                strata::kernels::hc8_prepare(bf16((s + "input_mix_weight_down.weight").c_str()), LR, D);
-                strata::kernels::hc8_prepare(bf16((s + "input_mix_weight_up.weight").c_str()), D, LR);
-                strata::kernels::hc8_prepare(bf16((s + "block_inject_weight.weight").c_str()), HCn, D);
+                basalt::kernels::hc8_prepare(bf16((s + "input_mix_weight_down.weight").c_str()), LR, D);
+                basalt::kernels::hc8_prepare(bf16((s + "input_mix_weight_up.weight").c_str()), D, LR);
+                basalt::kernels::hc8_prepare(bf16((s + "block_inject_weight.weight").c_str()), HCn, D);
             }
         }
     }
-    if (strata::core::diagnostics().profile && cudaMalloc((void**) &gstamp_, 16) == cudaSuccess)
+    if (basalt::core::diagnostics().profile && cudaMalloc((void**) &gstamp_, 16) == cudaSuccess)
         cudaMemset(gstamp_, 0, 16);
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
-                 (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
+                 (double) vram_ / 1048576.0, (double) g.n_expert * basalt::kernels::cpu::BLOB / 1048576.0,
                  (double) tensors_.back().off / 1048576.0, files_s,
-                 files_s > 0 ? ((double) g.n_expert * strata::kernels::cpu::BLOB + (double) tensors_.back().off) /
+                 files_s > 0 ? ((double) g.n_expert * basalt::kernels::cpu::BLOB + (double) tensors_.back().off) /
                                    1048576.0 / files_s : 0.0);
     return true;
 }
@@ -406,23 +406,23 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
 
 bool MtpDrafter::setup_coupled(std::string& err) {
     const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
-    const size_t scratch = strata::kernels::coupled_draft_scratch_bytes((int) nv);
+    const size_t scratch = basalt::kernels::coupled_draft_scratch_bytes((int) nv);
     if (scratch == 0) {
         std::fprintf(stderr, "strata mtp: coupled draft sampling: %lld draft logits are too wide for the coupled sampler; "
                              "argmax drafts\n", (long long) nv);
         return true;
     }
     const size_t ring = (size_t) (kCoupledHistCap + max_t_) * sizeof(int32_t);
-    if (cudaMalloc((void**) &cparams_, sizeof(strata::kernels::SamplerParams)) != cudaSuccess ||
+    if (cudaMalloc((void**) &cparams_, sizeof(basalt::kernels::SamplerParams)) != cudaSuccess ||
         cudaMalloc((void**) &cring_, ring) != cudaSuccess || cudaMalloc(&cscratch_, scratch) != cudaSuccess ||
-        !mapped(sizeof(strata::kernels::SamplerParams), (void**) &h_cparams_, (void**) &m_cparams_) ||
+        !mapped(sizeof(basalt::kernels::SamplerParams), (void**) &h_cparams_, (void**) &m_cparams_) ||
         !mapped((size_t) kCoupledHistCap * sizeof(int32_t), (void**) &h_chist_, (void**) &m_chist_)) {
         err = "mtp: the coupled draft sampler's buffers do not fit";
         return false;
     }
     cudaMemset(cring_, 0xff, ring);   // -1: no token
     std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
-    vram_ += sizeof(strata::kernels::SamplerParams) + ring + scratch;
+    vram_ += sizeof(basalt::kernels::SamplerParams) + ring + scratch;
     if (dhead_ != nullptr) {   // token id -> subset index (-1: not in the draft head), for the penalties
         std::vector<int32_t> sub((size_t) n_dvocab_), inv((size_t) n_vocab_, -1);
         cudaMemcpy(sub.data(), dvocab_, sub.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
@@ -445,7 +445,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
     return true;
 }
 
-void MtpDrafter::set_draft_sampling(const strata::kernels::SamplerParams& sp) {
+void MtpDrafter::set_draft_sampling(const basalt::kernels::SamplerParams& sp) {
     coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f;
     if (!coupled_active_) return;
     *h_cparams_ = sp;   // read by the next round graph (after the previous one has synced)
@@ -523,7 +523,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 return false;
             }
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
-            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+            basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
@@ -550,7 +550,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     if (top_scratch_ == nullptr) {
-        const size_t b = strata::kernels::q5k_head_top1_scratch_bytes();
+        const size_t b = basalt::kernels::q5k_head_top1_scratch_bytes();
         if (cudaMalloc(&top_scratch_, b) != cudaSuccess) { err = "mtp: the draft head's argmax scratch does not fit"; return false; }
         cudaMemset(top_scratch_, 0, b);
         cudaDeviceSynchronize();
@@ -561,7 +561,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
 
 // The hidden input branch: h2_ <- fc_hidden(rms(R) * w) per stream, T rows.
 void MtpDrafter::record_hidden(const float* R, int T, uint8_t* xq, cudaStream_t cs) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const int64_t N = g_->n_embd, HC = g_->hc;
     native_qsa_rms_norm_weighted(R, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
     for (int c0 = 0; c0 < T * HC; c0 += 8) {
@@ -573,7 +573,7 @@ void MtpDrafter::record_hidden(const float* R, int T, uint8_t* xq, cudaStream_t 
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
 bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool reuse_row) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
@@ -744,7 +744,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
-        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) basalt::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
@@ -868,7 +868,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
@@ -889,7 +889,7 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
 // 2*max_t - 1; draft 0 and its probability to the mapped outputs.  The draft chain is one graph per step
 // (`capture_step`) so the host can stop it when a draft is unlikely, or conditional nodes (`capture_cond`).
 bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
@@ -923,7 +923,7 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
 bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string& err) {
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
     const int row = max_t_ + j - 1;
     if (copy_records) {
@@ -974,7 +974,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         cudaGraphExecDestroy(exec);
         exec = nullptr;
     }
-    using namespace strata::kernels;
+    using namespace basalt::kernels;
     std::string err;
     cudaGraph_t top = nullptr;
     cudaGraphConditionalHandle h[kVerifyMaxT] = {};
@@ -1038,9 +1038,9 @@ void MtpDrafter::kv_restore(int64_t upto) {
     const OnDevice on_device(device_);
     if (st_.kv_mode != 2 || upto <= 0) return;
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
-    const strata::kernels::QsaShapes s = shapes_of(*g_);
+    const basalt::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
-    strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
+    basalt::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
     cudaStreamSynchronize(cs_);
 }
 
@@ -1155,8 +1155,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     int32_t ple_prev[2] = {do_ple ? pss->ple_prev[0] : 0, do_ple ? pss->ple_prev[1] : 0};
     auto prefetch_ple = [&](int32_t tok) {
         if (!do_ple || tok < 0) return;
-        uint32_t rows16[strata::kernels::PLE_N_HEADS];
-        strata::kernels::ngram_rows(&tok, ple_prev, 1, pss->ple.consts, rows16);
+        uint32_t rows16[basalt::kernels::PLE_N_HEADS];
+        basalt::kernels::ngram_rows(&tok, ple_prev, 1, pss->ple.consts, rows16);
         ple_prev[0] = ple_prev[1];
         ple_prev[1] = tok;
         pss->ple.table->prefetch_rows(rows16);
@@ -1220,7 +1220,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         };
         wait_step(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
-        float pr[strata::kernels::kVerifyMaxT];
+        float pr[basalt::kernels::kVerifyMaxT];
         const float cum_th = draft_cum_env();
         float pj = ((volatile float*) h_prob_)[0];
         pr[0] = pj;
@@ -1286,4 +1286,4 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
 }
 
-}  // namespace strata::core
+}  // namespace basalt::core

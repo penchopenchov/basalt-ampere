@@ -23,7 +23,7 @@
 
 namespace cg = cooperative_groups;
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int S = 128;   // state size
@@ -365,4 +365,4 @@ void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream) {
     if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec_norm: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

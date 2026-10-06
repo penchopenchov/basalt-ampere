@@ -29,7 +29,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {

@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
@@ -138,4 +138,4 @@ struct StreamStats {
 // transfers, `iters` times.  The destination is REUSED, so this measures the bus and not allocation.
 StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk, int iters);
 
-}  // namespace strata::core
+}  // namespace basalt::core

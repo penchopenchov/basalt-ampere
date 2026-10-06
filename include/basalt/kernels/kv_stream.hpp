@@ -25,7 +25,7 @@
 
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 /// The host copy of one layer's K/V: device-mapped pointers (UVA) into pinned memory, identity layout
 /// `[block][kv_head][page_size][head_dim]`. All null when the layer is fully resident.
@@ -101,4 +101,4 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m);
 /// Bytes of one block (page) of K and V together.
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt);
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

@@ -33,7 +33,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 /// What the loader had to DO for a tensor, decided by `tools/pack_index.py` and written into the index
 /// rather than inferred here.  The four cases are distinguishable in the manifest only by combining
@@ -141,4 +141,4 @@ private:
     LoadReport report_;
 };
 
-}  // namespace strata::core
+}  // namespace basalt::core

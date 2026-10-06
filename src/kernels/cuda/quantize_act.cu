@@ -30,7 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int QK8_0 = 32;
@@ -288,4 +288,4 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     if (stream == nullptr) cudaDeviceSynchronize();
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

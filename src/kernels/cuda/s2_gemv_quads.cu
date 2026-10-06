@@ -22,7 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 // QK = 64 elements per group; a quad of 4 elements is 1/16 of a group, so
@@ -90,4 +90,4 @@ void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales,
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

@@ -23,8 +23,8 @@
 #include <string>
 #include <vector>
 
-namespace cpu = strata::kernels::cpu;
-namespace K = strata::kernels;
+namespace cpu = basalt::kernels::cpu;
+namespace K = basalt::kernels;
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: native_expert_bench <shard1.gguf> <layer[,layer]> <groups> <tokens> <ref mode> <mode> [iters]\n");
         return 2;
     }
-    strata::GgufFile gguf(argv[1]);
+    basalt::GgufFile gguf(argv[1]);
     std::vector<int> layers;
     {
         std::stringstream ss(argv[2]);
@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
     for (int l : layers) {
-        const strata::TensorInfo* t[3] = {};
+        const basalt::TensorInfo* t[3] = {};
         const char* roles[3] = {"gate", "up", "down"};
         for (const auto& ti : gguf.tensors())
             for (int r = 0; r < 3; ++r)

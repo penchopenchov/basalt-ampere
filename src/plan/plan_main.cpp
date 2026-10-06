@@ -13,7 +13,7 @@
 int main(int argc, char** argv) {
     uint64_t ctx = 20480;
     uint64_t free_vram = 12ull * 1000 * 1000 * 1000; // RTX 5070 nominal; overridden by --vram
-    strata::plan::Costs costs;
+    basalt::plan::Costs costs;
     bool state_given = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -55,18 +55,18 @@ int main(int argc, char** argv) {
     }
     // DEFAULT THE STATE FROM THE GEOMETRY.  A `--state` that defaults to 0 and is never passed is not a
     // default, it is an omission - and this one was worth 85 cache slots of overcommit.
-    if (!state_given) costs.state_bytes = strata::plan::state_bytes(strata::plan::Geometry{});
+    if (!state_given) costs.state_bytes = basalt::plan::state_bytes(basalt::plan::Geometry{});
     // The pool is what the KV cache and the expert cache share.  Derived from the card's free VRAM less the
     // resident dense weights; `--pool` overrides it for reproducing the standard-tier numbers exactly.
     const uint64_t pool = free_vram > costs.dense_bytes + costs.embd_bytes
                               ? free_vram - costs.dense_bytes - costs.embd_bytes
                               : 0;
     try {
-        const strata::plan::Plan p = strata::plan::make_plan(ctx, strata::plan::Geometry{}, costs,
-                                                             pool ? pool : strata::plan::vram_pool_bytes());
-        std::printf("%s", strata::plan::to_string(p).c_str());
+        const basalt::plan::Plan p = basalt::plan::make_plan(ctx, basalt::plan::Geometry{}, costs,
+                                                             pool ? pool : basalt::plan::vram_pool_bytes());
+        std::printf("%s", basalt::plan::to_string(p).c_str());
         return 0;
-    } catch (const strata::plan::DoesNotClose& e) {
+    } catch (const basalt::plan::DoesNotClose& e) {
         std::fprintf(stderr, "strata-plan: %s\n", e.what());
         return 1;
     }

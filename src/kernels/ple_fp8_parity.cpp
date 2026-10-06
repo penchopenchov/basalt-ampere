@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace k = strata::kernels;
+namespace k = basalt::kernels;
 
 int main(int argc, char** argv) {
     if (argc < 3) {

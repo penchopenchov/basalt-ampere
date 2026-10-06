@@ -31,7 +31,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int S = 128;
@@ -119,4 +119,4 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-} // namespace strata::kernels
+} // namespace basalt::kernels

@@ -26,7 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int kMaxCols = 8;
@@ -1154,4 +1154,4 @@ int dense_tc_pair_mask() { return g_pair; }
 
 int dense_tc_mask() { return 29; }   // STRATA_DEC_DTC 1 | 4 | 8 | 16 (see verify.cpp)
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

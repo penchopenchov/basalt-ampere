@@ -27,8 +27,8 @@
 #include <stdexcept>
 #include <vector>
 
-namespace k = strata::kernels;
-namespace o = strata::kernels::ple_oracle;
+namespace k = basalt::kernels;
+namespace o = basalt::kernels::ple_oracle;
 
 namespace {
 

@@ -46,7 +46,7 @@
 
 #ifndef STRATA_PREFILL_MMQ
 // A build without the MMQ sources: no MMQ, the FP16 expert path everywhere.
-namespace strata::prefill::mmq {
+namespace basalt::prefill::mmq {
 bool built() { return false; }
 bool supported(int) { return false; }
 bool fits(int, int64_t) { return false; }
@@ -61,11 +61,11 @@ bool gather_native_group(const GatherGroup&, size_t, size_t, size_t, size_t, voi
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
-}  // namespace strata::prefill::mmq
+}  // namespace basalt::prefill::mmq
 #endif
 #ifndef STRATA_PREFILL_FUSED
 // The fused int8 experts need the MMQ build; without it the FP16 path runs.
-namespace strata::prefill::fused {
+namespace basalt::prefill::fused {
 bool built() { return false; }
 bool available() { return false; }
 bool enabled() { return false; }
@@ -79,10 +79,10 @@ bool native_supported(int, int) { return false; }
 void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
 void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
-}  // namespace strata::prefill::fused
+}  // namespace basalt::prefill::fused
 #endif
 
-namespace strata::prefill {
+namespace basalt::prefill {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -90,7 +90,7 @@ constexpr float EPS = 1e-6f;
 constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // staging holds the largest blob of the pack (a native pack's blobs differ per layer)
-inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
+inline int64_t MAXBLOB() { return (int64_t) basalt::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
 // From the chunk size stream_all_min() on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
@@ -104,7 +104,7 @@ constexpr int kPrefillRing = 256;
 inline bool fused_ring() {
     if (!fused::enabled()) return false;
     if (core::prompt_peer()) return false;   // multi-GPU: a prompt peer keeps the MMQ path and its buffer sizes
-    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     if (!lay.native) return true;
     // EVERY layer: fused_layout() shrinks the MoE buffers to the fused path's needs, so a layer the native kernels do
     // not cover would run MMQ in them at the full chunk and overflow them.  A pack with such a layer keeps MMQ's
@@ -417,7 +417,7 @@ struct Prefill::Impl {
     uint64_t region_bytes = 0;
     PrefillStats* stats = nullptr;
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
-    strata::kernels::KvHostPools stage;
+    basalt::kernels::KvHostPools stage;
     int32_t* ident_table = nullptr;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
@@ -430,14 +430,14 @@ struct Prefill::Impl {
 
 namespace {
 // the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
-void take_stage(Alloc& o, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
-                strata::kernels::KvHostPools& st, bool& ok) {
+void take_stage(Alloc& o, const core::SessionState& ss, const basalt::kernels::QsaShapes& s,
+                basalt::kernels::KvHostPools& st, bool& ok) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
     const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
     if (q0.kv_q4) {
-        st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
-        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+        st.k_q4 = o.take<uint8_t>(rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+        st.v_q4 = o.take<uint8_t>(rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
     } else if (q0.kv_int8) {
         st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
@@ -448,8 +448,8 @@ void take_stage(Alloc& o, const core::SessionState& ss, const strata::kernels::Q
         st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
     }
 }
-strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
-    strata::kernels::QsaAttnPools p;
+basalt::kernels::QsaAttnPools pools_of(const basalt::kernels::KvHostPools& h, const int32_t* table) {
+    basalt::kernels::QsaAttnPools p;
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
     p.page_table = table;
@@ -500,13 +500,13 @@ uint64_t gdn_set_bytes(size_t T) {
     return a.used;
 }
 uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
-                       const strata::kernels::QsaShapes& s) {
+                       const basalt::kernels::QsaShapes& s) {
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * 512, ok); a.take<float>(T * 512, ok); a.take<float>(T * 12288, ok); a.take<float>(T * ZV, ok);
     a.take<float>(T * 128, ok); a.take<float>(T * 512, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
     a.take<int32_t>(T * (size_t) cap, ok);
     a.take<float>((size_t) sel_batch * (size_t) max_blocks, ok);
-    a.take<float>((size_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
+    a.take<float>((size_t) attn_batch * basalt::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
     return a.used;
 }
 // Which layers' experts go through MMQ (both weight types covered; the Q2_0 pack always - its blob
@@ -525,7 +525,7 @@ struct MmqPlan {
 const MmqPlan& mmq_plan() {
     static const MmqPlan plan = [] {
         MmqPlan p;
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = basalt::kernels::cpu::expert_layout();
         const bool on = mmq::built();
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
@@ -632,7 +632,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (files) m.stager->kRing = 4 * threads;
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
     }
-    m.steps_host.resize(T * strata::kernels::kStepCount);
+    m.steps_host.resize(T * basalt::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
         const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
@@ -662,7 +662,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
-        m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
+        m.ple_rows[b].resize(T * basalt::kernels::PLE_N_HEADS);
     }
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
@@ -706,11 +706,11 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
-    m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    m.steps_dev = o.take<int32_t>(T * basalt::kernels::kStepCount, ok);
+    basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
-    m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    m.cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);
     m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
@@ -733,7 +733,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.attn = b.take<float>(T * ZV, ok); m.attn_h = b.take<uint16_t>(T * ZV, ok);
         m.sel_ids = b.take<int32_t>(T * (size_t) m.cap, ok);
         m.sel_scores = b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok);
-        m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
+        m.attn_scratch = b.take<float>((size_t) m.attn_batch * basalt::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
         Alloc c;
         c.base = base; c.cap = region; c.owned = &m.owned;
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
@@ -770,7 +770,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.used_of[i] = i;
     }
     m.ple_emb = o.take<float>(T * N, ok);
-    m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
+    m.ple_norm = o.take<float>((size_t) basalt::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
     return ok;
@@ -845,7 +845,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
     int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
     if (st.kv_mode == 2)   // a ring: one batch's cells must not share a slot (a batch can straddle one page more)
-        B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
+        B = std::min<int64_t>(B, ((st.n_slots - 1) * basalt::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
     if (B < 64) return false;
     uint8_t* q = m.region;
     auto carve = [&](size_t bytes) { void* p = q; q += (bytes + 255) & ~(size_t) 255; return p; };
@@ -871,7 +871,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return false;
     if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     std::vector<int32_t> tk((size_t) B);
@@ -910,7 +910,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             const auto* scales = (const float*) (codes + wemb->codes_bytes);
             const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
                                                    : nullptr;
-            strata::kernels::embedding_gather_dev(codes, scales, offsets, tok, (int) nb, wemb->ne0, wemb->code_bits,
+            basalt::kernels::embedding_gather_dev(codes, scales, offsets, tok, (int) nb, wemb->ne0, wemb->code_bits,
                                                   wemb->code_bias, wemb->group_elems,
                                                   (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
                                                   (uint64_t) (wemb->ne0 / wemb->group_elems), emb, m.cs);
@@ -922,7 +922,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
         if (!q8) to_f16(hn, hn16, nb * HCN, m.cs);
         proj(hn, hn16, w_fh, h2, nb * g.hc, Nn, Nn, 1);   // every stream through fc_hidden
-        strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
+        basalt::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
         // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
         gr_norm_rs(Rm, w_hn, EPS, grs, xn16, nb, m.cs);
         m.gemm.bf16_w(xn16, w_dn, lo, nb, LR, HCN);
@@ -933,13 +933,13 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0);
         proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0);
         rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, EPS, m.cs);
-        rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, strata::kernels::rope_scaling(), m.cs);
+        rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, basalt::kernels::rope_scaling(), m.cs);
         if (st.kv_rot) {   // rotated as the drafter's own decode stores them (mtp.cpp)
-            strata::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
-            strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
+            basalt::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
+            basalt::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
         }
         if (st.kv_q4) {
-            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+            basalt::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
         } else {
             kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
@@ -1054,11 +1054,11 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f(T * HC);
     o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
-    o.take<int32_t>(T * strata::kernels::kStepCount, ok);
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    o.take<int32_t>(T * basalt::kernels::kStepCount, ok);
+    basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
-    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, true))}), ok);
@@ -1072,8 +1072,8 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
-    f((size_t) strata::kernels::NG_HC_DIM);
-    strata::kernels::KvHostPools stage;
+    f((size_t) basalt::kernels::NG_HC_DIM);
+    basalt::kernels::KvHostPools stage;
     take_stage(o, ss, s, stage, ok);
     return o.used + (8u << 20);   // alignment slack
 }
@@ -1112,7 +1112,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t LB = stage_lb_, LE = stage_le_;
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
@@ -1128,9 +1128,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
     const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
     // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token)
-    const bool ple_batch = ple_on && strata::kernels::ple_native_postops_enabled() &&
+    const bool ple_batch = ple_on && basalt::kernels::ple_native_postops_enabled() &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
-                           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+                           m.region_bytes / ((uint64_t) (3 * basalt::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
     auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = std::min(m.T, n - c0);
@@ -1138,8 +1138,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
             const int32_t tok = (int32_t) tokens[c0 + t];
-            strata::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
-                                        m.ple_rows[buf].data() + t * strata::kernels::PLE_N_HEADS);
+            basalt::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
+                                        m.ple_rows[buf].data() + t * basalt::kernels::PLE_N_HEADS);
             pv[0] = pv[1];
             pv[1] = tok;
         }
@@ -1190,7 +1190,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const auto* scales = (const float*) (codes + wemb->codes_bytes);
                 const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
                                                        : nullptr;
-                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
+                basalt::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
                                                       wemb->code_bits, wemb->code_bias, wemb->group_elems,
                                                       (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
                                                       (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
@@ -1247,8 +1247,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         };
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
-        cudaMemcpyAsync(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4,
+        for (int64_t t = 0; t < T; ++t) basalt::kernels::qsa_step_fill(m.steps_host.data() + t * basalt::kernels::kStepCount, p0 + t, s);
+        cudaMemcpyAsync(m.steps_dev, m.steps_host.data(), (size_t) T * basalt::kernels::kStepCount * 4,
                         cudaMemcpyHostToDevice, m.cs);
 
         int64_t qsa_index = 0, gdn_index = 0;
@@ -1256,7 +1256,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
-        const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
+        const basalt::kernels::cpu::ExpertLayout& lay0 = basalt::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
         const bool ps_on = stream_all && m.pp && m.pp->ps_frac > 0.0;
         if (m.pp && !ps_on) m.pp->ps_flag.clear();
@@ -1268,7 +1268,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const PeerPrefill::PsEntry& en = P.pseq[P.p_issued];
                 const size_t sl = P.p_issued % (size_t) P.RP;
                 if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
-                cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l),
+                cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(en.l),
                                 cudaMemcpyHostToDevice, P.s_cp);
                 cudaEventRecord(P.pcopied[sl], P.s_cp);
                 P.plive[sl] = 1;
@@ -1404,8 +1404,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
                 // projections as GEMMs (a token at a time they re-read the whole BF16 key per token), the rest with the per-token kernels' arithmetic (native_ple_postops_batch)
                 const auto tp = Clock::now();
-                const strata::kernels::PleWeights& pw = ss.ple.w;
-                constexpr int64_t HD = strata::kernels::NG_HC_DIM;
+                const basalt::kernels::PleWeights& pw = ss.ple.w;
+                constexpr int64_t HD = basalt::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * 2 + 4096;
                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
                 for (int64_t s0 = 0; s0 < T; s0 += SB) {
@@ -1429,7 +1429,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
                     try {
-                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
+                        basalt::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
                                                                   gate, (int) nb, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                 }
@@ -1437,14 +1437,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             } else if (l == 1 && ple_on) {
                 const auto tp = Clock::now();
                 for (int64_t t = 0; t < T; ++t) {
-                    strata::kernels::PleOut po;
+                    basalt::kernels::PleOut po;
                     po.normalized = m.ple_norm;
                     po.result = m.R + t * D;
                     try {
-                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
+                        basalt::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
                                                    ss.ple.scratch, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
-                    strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                    basalt::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
                 }
                 stats_.ms_ple += ms_since(tp);
             }
@@ -1500,30 +1500,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
-                    rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    rope(m.Kc, T, 2, 256, 512, p0, basalt::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = st.kv_mode == 1;
                     if (staged) {
-                        strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                        basalt::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
                                                             core::qsa_kv_format(st),
                                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
                     }
-                    const strata::kernels::KvHostPools* host_w = &st.host;
+                    const basalt::kernels::KvHostPools* host_w = &st.host;
                     if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
-                        strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                        basalt::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
                         kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                                   st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, nullptr,   // mode 0: no host mirror
                                   staged ? &m.stage : nullptr);
-                        strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, m.Vc, m.Vc, s, m.cs,
+                        basalt::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, m.Vc, m.Vc, s, m.cs,
                                                       nullptr, staged ? &m.stage : nullptr);
                     } else {
                         if (st.kv_rot) {   // rotated K and V (kv_q4.hpp), the queries below too, the output back
-                            strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
-                            strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                            basalt::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
+                            basalt::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
                         }
                         if (st.kv_q4)
-                            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                            basalt::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
                                                           host_w, staged ? &m.stage : nullptr);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
@@ -1532,50 +1532,50 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
-                    rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
-                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+                    rope(m.q, T, 24, 256, 6144, p0, basalt::kernels::rope_scaling(), m.cs);
+                    if (st.kv_rot) basalt::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
-                    rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    rope(m.q_idx, T, 4, 128, 512, p0, basalt::kernels::rope_scaling(), m.cs);
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
-                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    const basalt::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     // the chunk's appends in three launches instead of one per token (the same end state:
                     // the queries below read it only after the whole chunk is appended).
                     try {
-                        strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                        basalt::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
                                                                          EPS, ib, s, st.max_cells,
-                                                                         strata::kernels::rope_scaling(), m.cs);
+                                                                         basalt::kernels::rope_scaling(), m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
-                        const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
+                        const int32_t* steps0 = m.steps_dev + t0 * basalt::kernels::kStepCount;
                         // the grid reaches the batch's last query's n_bid (they rise with the position)
-                        const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
-                                                                                strata::kernels::kStepNBid)] + 1;
+                        const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * basalt::kernels::kStepCount +
+                                                                                basalt::kernels::kStepNBid)] + 1;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise)
-                        if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                        if (!basalt::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
                                                                              steps0, nb, m.max_blocks, s, m.sel_scores,
                                                                              m.cs, active))
-                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                            basalt::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
-                        strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                        basalt::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs, active);
                     }
-                    const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                    const basalt::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                        : core::qsa_attn_pools(st);
                     // the whole chunk on tensor cores, one block per (query, KV head), FP32-level
                     // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV (or a shape it does not take): the
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
-                    if (!strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
+                    if (!basalt::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                             m.attn, T, m.cs))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
-                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                            basalt::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                                   m.steps_dev + t0 * basalt::kernels::kStepCount, m.cap,
                                                                    s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
                         }
-                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                    if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
@@ -1603,7 +1603,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // activations in Xq, the int8 H in H, the grouping tables in GU).  Chunks below stream_all_min()
                     // keep MMQ.  A native pack's layer takes the native kernels
                     // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
-                    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                    const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
@@ -2015,9 +2015,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (lay.native) {
                                 // a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
-                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                basalt::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs);
-                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                basalt::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
@@ -2095,7 +2095,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // control vector)
                 const int64_t nl = half == 0 ? l : l + 1;
                 const bool fuse = nl < LE && !(half == 1 && nl == 1 && ple_on) &&
-                                  !(half == 1 && strata::kernels::cvec().covers(l));
+                                  !(half == 1 && basalt::kernels::cvec().covers(l));
                 const core::WeightRef* wnn = nullptr;
                 if (fuse) {
                     const core::LayerView vn(*m.wt, nl);
@@ -2108,8 +2108,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
                 }
-                if (half == 1 && strata::kernels::cvec().covers(l))   // --control-vector-scaled
-                    strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+                if (half == 1 && basalt::kernels::cvec().covers(l))   // --control-vector-scaled
+                    basalt::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
@@ -2203,4 +2203,4 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     return true;
 }
 
-}  // namespace strata::prefill
+}  // namespace basalt::prefill

@@ -4,7 +4,7 @@
 #include <cstdlib>
 #include <vector>
 
-using namespace strata::core;
+using namespace basalt::core;
 
 namespace {
 int checks = 0;

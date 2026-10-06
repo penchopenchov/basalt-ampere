@@ -4,7 +4,7 @@
 #include <istream>
 #include <optional>
 
-namespace strata::core {
+namespace basalt::core {
 
 // Host physical memory, not swap/commit or a container/job memory reservation.
 // Unknown telemetry is deliberately distinct from a measured zero.
@@ -16,4 +16,4 @@ inline bool conversation_memory_admit(std::optional<uint64_t> available,
     return available && *available >= floor && allocation <= *available - floor;
 }
 
-} // namespace strata::core
+} // namespace basalt::core

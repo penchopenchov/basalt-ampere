@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 
 class NativeHead;
 
@@ -79,7 +79,7 @@ public:
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
     /// the target's Philox draw for the verifying row, and `probs` is the draft's probability under that chain; a
     /// greedy one keeps the argmax drafts and their graphs.  A no-op when the switch is off.
-    void set_draft_sampling(const strata::kernels::SamplerParams& sp);
+    void set_draft_sampling(const basalt::kernels::SamplerParams& sp);
     /// Coupled mode with penalties: the history the next draft() chain starts from - what the session holds after the
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
@@ -132,7 +132,7 @@ private:
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     int coupled_j_ = 0;
-    strata::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
+    basalt::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
     int32_t *h_chist_ = nullptr, *m_chist_ = nullptr, *cring_ = nullptr, *dinv_ = nullptr;
     void* cscratch_ = nullptr;
     const float* f32(const char* name) const;
@@ -226,4 +226,4 @@ private:
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
 };
 
-}  // namespace strata::core
+}  // namespace basalt::core

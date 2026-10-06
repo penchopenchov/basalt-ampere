@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 void check(const char* what) {
@@ -273,4 +273,4 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     return r;
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core {
+namespace basalt::core {
 class RemoteExperts;
 class ExpertSource;
 
@@ -50,4 +50,4 @@ private:
     const float* weights_ = nullptr;
     int token_begin_ = 0, tokens_ = 0;
 };
-} // namespace strata::core
+} // namespace basalt::core

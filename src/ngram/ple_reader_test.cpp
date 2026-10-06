@@ -22,9 +22,9 @@
 #include <thread>
 #include <vector>
 
-namespace ng = strata::ngram;
-namespace k = strata::kernels;
-using strata::platform::now_us;
+namespace ng = basalt::ngram;
+namespace k = basalt::kernels;
+using basalt::platform::now_us;
 
 namespace {
 

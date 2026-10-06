@@ -15,7 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 namespace {
 
 constexpr int QK = 64;             // S2 group = Q2_0 block = 64 elements
@@ -48,4 +48,4 @@ void dequant_s2(const uint8_t* codes, const float* scales, float* out, int64_t n
     }
 }
 
-}  // namespace strata::kernels
+}  // namespace basalt::kernels

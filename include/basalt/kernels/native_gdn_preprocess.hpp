@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-namespace strata::kernels {
+namespace basalt::kernels {
 
 // Optional pinned CUDA GDN preprocessing. The layer selects these functions with
 // native_gdn_enabled(); direct callers explicitly select them by calling them.
@@ -34,4 +34,4 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
                          float* destination, int64_t heads, int64_t cols,
                          float epsilon, void* stream);
 
-} // namespace strata::kernels
+} // namespace basalt::kernels

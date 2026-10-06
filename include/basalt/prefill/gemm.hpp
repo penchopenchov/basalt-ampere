@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <string>
 
-namespace strata::prefill {
+namespace basalt::prefill {
 
 class Gemm {
 public:
@@ -60,4 +60,4 @@ private:
 
 
 
-}  // namespace strata::prefill
+}  // namespace basalt::prefill
