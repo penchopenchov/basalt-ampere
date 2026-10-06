@@ -2113,7 +2113,7 @@ bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& expe
                             const std::string& gguf, const basalt::kernels::cpu::ExpertLayout& lay,
                             uint64_t& out, std::string& err) {
     uint64_t h = 1469598103934665603ull;
-    hash_text(h, "strata-shared-expert-arena-pack-v1");
+    hash_text(h, "basalt-shared-expert-arena-pack-v1");
     hash_u64(h, (uint64_t) lay.n_layers);
     hash_u64(h, (uint64_t) lay.n_expert);
     hash_u64(h, lay.total);
