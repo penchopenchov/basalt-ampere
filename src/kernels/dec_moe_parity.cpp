@@ -640,8 +640,8 @@ int main(int argc, char** argv) {
                 std::memset(h_x + (size_t) 5 * MT * H, 0, (size_t) T * H * 4);
                 std::memset(h_xq + 5 * xq_stride, 0, q1.size());
                 h_words[0] = h_words[16] = 0;
-                ck(cudaMemset(d_plan, 0xee, sizeof(K::DmPlan)), "memset");
-                ck(cudaMemset(d_xq2, 0xee, q1.size()), "memset");
+                ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
+                ck(cudaMemsetAsync(d_xq2, 0xee, q1.size(), s0), "memset");
                 void* d_pub = dmal<uint8_t>(xq_stride);
                 K::DmRouteArgs r1 = ra, r2 = ra;
                 r1.mode = 1; r2.mode = 2; r2.xq_pub = d_pub;
@@ -728,7 +728,7 @@ int main(int argc, char** argv) {
                 ck(cudaMemcpy(d_pt, pt.data(), NE * 8, cudaMemcpyHostToDevice), "ptab");
                 float* d_p4 = dmal<float>((size_t) K::kDmCap * H);
                 void* d_pub = dmal<uint8_t>(xq_stride);
-                ck(cudaMemset(d_plan, 0xee, sizeof(K::DmPlan)), "memset");
+                ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
                 K::DmRouteArgs r2 = ra;
                 r2.mode = 2; r2.xq_pub = d_pub; r2.kinds = true;
                 K::dec_moe_route(r2, s0);
@@ -760,7 +760,7 @@ int main(int argc, char** argv) {
                     std::memset(h_x + (size_t) 5 * MT * H, 0, (size_t) T * H * 4);
                     std::memset(h_xq + 5 * xq_stride, 0, nq);
                     h_words[0] = h_words[16] = 0;
-                    ck(cudaMemset(d_plan, 0xee, sizeof(K::DmPlan)), "memset");
+                    ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
                     ck(cudaMemsetAsync(d_p4, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
                     K::DmGlueArgs gr = ga;
                     gr.ring_on = true; gr.ring = r2;
