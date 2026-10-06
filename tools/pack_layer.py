@@ -1,4 +1,4 @@
-"""basalt P0.S9 - build the pack-layout expert arena from the real GGUF.
+"""Build the pack-layout expert arena from the real GGUF.
 
 The architecture (§3.2) defines one expert blob as 1,382,400 bytes:
 
@@ -84,7 +84,7 @@ def build(n_layers: int, out_path: pathlib.Path) -> dict:
                 per_expert = t.elements // NE
                 assert per_expert * BLOCK_BYTES // QK == ROLE_BYTES, per_expert
             layer_off = out.tell()
-            # vectorized over the layer's 512 experts (the same bytes the per-block loop wrote; tools/basalt_pack.py
+            # vectorized over the layer's 512 experts (the same bytes the per-block loop wrote; tools/pack.py
             # verify checks them): each role is (512 experts, rows, blocks per row, 18 bytes)
             def role_blocks(role, rows, per_row):
                 t = roles[role]
