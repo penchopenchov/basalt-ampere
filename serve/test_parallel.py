@@ -161,7 +161,6 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [False] * n
         e.slot_held = [[] for _ in range(n)]
         e.slot_used = [0.0] * n
-        e.slot_live = [None] * n
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -177,16 +176,6 @@ class PickSlot(unittest.TestCase):
         self.assertIsNone(e.pick_slot([7, 8]))
         e.slot_busy = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
-
-    def test_slots_view(self):
-        e = self.engine(2)
-        e.slot_held[1] = [1, 2]
-        e.slot_live[0] = {"slot": 0, "state": "decoding", "prompt_tokens": 9, "generated": 4,
-                          "started": time.time() - 2, "first_token": time.time() - 1}
-        v = e.slots_view()
-        self.assertEqual(v[0]["state"], "decoding")
-        self.assertEqual(v[0]["generated"], 4)
-        self.assertEqual(v[1], {"slot": 1, "state": "idle", "held_tokens": 2})
 
 
 class ParallelService(unittest.TestCase):
@@ -266,9 +255,9 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(errors, [])
         for t in texts:
             self.assertEqual(out[t]["choices"][0]["message"]["content"], reply[t])
-        # the slots were reported, and a request was admitted while another decoded in a slot (the fake logs how many
-        # slots were active at each admission)
-        self.assertTrue(any(m.get("parallel") == 2 and len(m.get("slots", [])) == 2 for m in seen))
+        # /metrics showed the running requests, and one was admitted while another decoded in a slot (the fake logs
+        # how many slots were active at each admission)
+        self.assertTrue(any(m["state"] == "generating" for m in seen))
         admitted = [int(x.split()[3]) for x in self.log.read_text().splitlines() if x.startswith("BGEN")]
         self.assertIn(1, admitted)
         # every request recorded its own row; nothing is left running

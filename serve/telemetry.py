@@ -1,8 +1,10 @@
-"""serve/telemetry.py - hardware readings for the web app's Monitor tab.
+"""serve/telemetry.py - hardware readings for the stats page (GET /metrics).
 
-A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
+A background thread samples once a second; the page gets the latest reading and the last 60 values of the server's
+two speed series:
 - GPU: NVIDIA's own NVML library (libnvidia-ml.so.1, installed with every driver) through ctypes, so no pip package
-  is needed: load, VRAM, temperature, power, PCIe link and throughput.
+  is needed: per card load, VRAM, temperature, power and its limit, PCIe link and throughput; the driver and CUDA
+  versions; each card's name.
 - CPU, RAM, disk: `psutil` when it is installed; without it the CPU and RAM readings come from /proc and the disk
   rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -72,6 +74,26 @@ class _Nvml:
             pass
         return None
 
+    def driver_version(self):
+        buf = ctypes.create_string_buffer(96)
+        try:
+            if self.lib.nvmlSystemGetDriverVersion(buf, ctypes.c_uint(96)) == 0:
+                return buf.value.decode(errors="replace")
+        except (AttributeError, OSError):
+            pass
+        return None
+
+    def cuda_version(self):
+        """The newest CUDA the driver supports, as "13.3" (NVML says 13030)."""
+        v = ctypes.c_int()
+        for fn in ("nvmlSystemGetCudaDriverVersion_v2", "nvmlSystemGetCudaDriverVersion"):
+            try:
+                if getattr(self.lib, fn)(ctypes.byref(v)) == 0:
+                    return f"{v.value // 1000}.{v.value % 1000 // 10}"
+            except (AttributeError, OSError):
+                continue
+        return None
+
     def read(self):
         out = {}
         u = self.Util()
@@ -104,17 +126,6 @@ class _Nvml:
 def gpu_reader(index=0):
     """The card's readings, from NVML."""
     return _Nvml(index)
-
-
-def free_vram_mib(index=0):
-    """Free VRAM of a card in MiB, or None when it cannot be read."""
-    g = gpu_reader(index)
-    if not g.ok():
-        return None
-    r = g.read()
-    if r.get("mem_total") is None or r.get("mem_used") is None:
-        return None
-    return int((r["mem_total"] - r["mem_used"]) >> 20)
 
 
 # ------------------------------------------------------------------------------------------------ CPU / RAM
@@ -158,70 +169,63 @@ class _CpuRamFallback:
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
+GPU_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
+            "pcie_rx_mb", "pcie_tx_mb")
+SERIES = ("tok_s", "prefill_tok_s_mean")      # the values kept as history
+
+
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None):
-        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
-        engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
-        the model is split across several - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own."""
+    def __init__(self, extra=None, gpu_indices=None, gpu_factory=gpu_reader):
+        """`extra()` -> dict with the server's own speeds, recorded each second.  `gpu_indices`: every card the engine
+        uses (its own and its peer), numbered as nvidia-smi and NVML number them (by PCI bus); "gpus" has one entry
+        per card that can be read, with that card's own figures.  `gpu_factory(index)` -> a reader with ok(), read(),
+        name() (and optionally driver_version(), cuda_version())."""
         self.extra = extra
         self.lock = threading.Lock()
-        self.now: dict = {}
-        self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
-        self.gpus = [(i, gpu_reader(i)) for i in idx]
-        self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
-        self.gpu = self.gpus[0][1]
+        self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None, "disk_read_mb": None}
+        self.hist = {k: collections.deque(maxlen=HISTORY) for k in SERIES}
+        self.gpus = [(i, g) for i, g in ((i, gpu_factory(i)) for i in dict.fromkeys(gpu_indices or [0])) if g.ok()]
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
         except ImportError:
             self.ps = None
         self.fallback = _CpuRamFallback()
+        first = self.gpus[0][1] if self.gpus else None
         self.static = {
-            "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
-            "gpu_count": len(self.gpus),
+            "gpus": [{"index": i, "name": g.name()} for i, g in self.gpus],
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
-            "psutil": self.ps is not None,
+            "driver": first.driver_version() if hasattr(first, "driver_version") else None,
+            "cuda": first.cuda_version() if hasattr(first, "cuda_version") else None,
         }
         self._disk_prev = None
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _disk(self):
+        """Disk read rate in MB/s since the last call; None without psutil or on the first call."""
         if not self.ps:
-            return None, None
+            return None
         try:
             c = self.ps.disk_io_counters()
         except (OSError, RuntimeError):
-            return None, None
+            return None
         t = time.time()
-        prev, self._disk_prev = self._disk_prev, (t, c.read_bytes, c.write_bytes)
+        prev, self._disk_prev = self._disk_prev, (t, c.read_bytes)
         if prev is None or t <= prev[0]:
-            return None, None
-        dt = t - prev[0]
-        return (c.read_bytes - prev[1]) / dt / 2**20, (c.write_bytes - prev[2]) / dt / 2**20
+            return None
+        return (c.read_bytes - prev[1]) / (t - prev[0]) / 2**20
 
     def sample(self):
-        s = {}
-        if self.gpu.ok():
-            reads = [(i, g.read()) for i, g in self.gpus]
-            g = dict(reads[0][1])
-            if len(reads) > 1:
-                def vals(k):
-                    return [r[k] for _, r in reads if r.get(k) is not None]
-                for k in ("mem_used", "mem_total", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb"):
-                    v = vals(k)
-                    g[k] = sum(v) if v else None
-                u = vals("util")
-                g["util"] = sum(u) / len(u) if u else None
-                t = vals("temp")
-                g["temp"] = max(t) if t else None
-                s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
-                             for i, r in reads]
-            s.update({f"gpu_{k}": v for k, v in g.items()})
+        s = {"gpus": []}
+        for i, g in self.gpus:
+            try:
+                r = g.read()
+            except Exception:  # noqa: BLE001 - telemetry must never take the server down
+                r = {}
+            s["gpus"].append({"index": i, **{k: r.get(k) for k in GPU_KEYS}})
+        s["cpu"] = s["ram_used"] = s["ram_total"] = None
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
@@ -232,11 +236,11 @@ class Telemetry:
         else:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
-        s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        s["disk_read_mb"] = self._disk()
         if self.extra:
             try:
                 s.update(self.extra())
-            except Exception:  # noqa: BLE001 - telemetry must never take the server down
+            except Exception:  # noqa: BLE001
                 pass
         return s
 
@@ -245,13 +249,12 @@ class Telemetry:
             s = self.sample()
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in SERIES:
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             time.sleep(1.0)
 
     def snapshot(self):
         with self.lock:
-            return {"now": dict(self.now), "history": {k: list(v) for k, v in self.hist.items()},
-                    "static": dict(self.static)}
+            now = {k: v for k, v in self.now.items() if k not in SERIES}
+            return {"now": now, "history": {k: list(v) for k, v in self.hist.items()}, "static": dict(self.static)}

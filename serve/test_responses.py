@@ -116,12 +116,11 @@ class Parsing(unittest.TestCase):
         self.assertIsNone(request_tools({"tools": TOOLS, "tool_choice": "none"})[0])
 
     def test_effort_and_text_format(self):
-        self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}, {}), {"enable_thinking": False})
-        self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}, {}), {"reasoning_effort": "xhigh"})
-        self.assertEqual(template_kwargs({"reasoning": {"summary": "auto"}}, {}), {})      # Codex: the default
-        self.assertEqual(template_kwargs({}, {"reasoning_effort": "low"}), {"reasoning_effort": "low"})
+        self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}), {"enable_thinking": False})
+        self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}), {"reasoning_effort": "xhigh"})
+        self.assertEqual(template_kwargs({"reasoning": {"summary": "auto"}}), {})      # Codex: the default
         with self.assertRaises(ResponsesError):
-            template_kwargs({"reasoning": {"effort": "huge"}}, {})
+            template_kwargs({"reasoning": {"effort": "huge"}})
         self.assertEqual(text_format({"text": {"format": {"type": "json_schema", "name": "n", "schema": {}}}}),
                          {"type": "json_schema", "json_schema": {"name": "n", "schema": {}}})
         self.assertIsNone(text_format({"text": {"format": {"type": "text"}}}))
@@ -283,15 +282,10 @@ class OverHttp(Server):
         self.assertEqual(events[-1]["type"], "response.failed")
         self.assertEqual(events[-1]["response"]["error"]["code"], "structured_output_failed")
 
-    def test_monitor_and_status(self):
-        self.svc.api_monitor = True
+    def test_status_lists_the_dialect(self):
         self.post({"model": "m", "input": "hi", "stream": True})
-        rec = self.svc.request_records()[0]
-        self.assertEqual(rec["path"], "/v1/responses")
-        full = self.svc.request_records(rec["id"])
-        self.assertEqual(full["output"], "The file says before.")
-        self.assertEqual(full["reasoning"], "Read it.\n")
         self.assertIn("/v1/responses", self.svc.v1_status()["dialects"])
+        self.assertEqual(self.svc.history[-1]["path"], "/v1/responses")
 
 
 class ToolRoundTrip(Server):

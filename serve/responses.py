@@ -326,10 +326,8 @@ def check_request(req: dict) -> None:
         raise ResponsesError("reasoning must be an object", "reasoning")
 
 
-def template_kwargs(req: dict, shared: dict) -> dict:
+def template_kwargs(req: dict) -> dict:
     effort = (req.get("reasoning") or {}).get("effort")
-    if effort is None:
-        effort = shared.get("reasoning_effort")      # the Chat settings shared with apps, as on the chat path
     try:
         return effort_kwargs(effort)
     except ValueError as e:

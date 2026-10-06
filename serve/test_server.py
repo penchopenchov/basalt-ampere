@@ -975,16 +975,15 @@ class DoneLineEngine(MockEngine):
 
 class DraftCounts(unittest.TestCase):
     """GET /metrics gives each request's speculative draft counts (offered / accepted, from the engine's DONE
-    line; None when the line has no such fields) and their running sums in the totals."""
+    line; None when the line has no such fields)."""
 
-    def test_drafts_in_history_and_totals(self):
+    def test_drafts_in_history(self):
         tok = ByteTokenizer()
         engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
             "DONE 4 20 40.0 30.0 stop 7 12 0",                  # 7 of 12 drafts accepted
             "DONE 4 20 40.0 30.0 stop",                          # an engine that reports no drafts
             "DONE 4 20 40.0 30.0 stop 3 5 0 9 10"])
         svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        self.assertEqual((svc.totals["drafts_offered"], svc.totals["drafts_accepted"]), (0, 0))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
@@ -1001,7 +1000,6 @@ class DraftCounts(unittest.TestCase):
             httpd.server_close()
         rows = m["requests"]                                      # newest first
         self.assertEqual([(r["drafts_offered"], r["drafts_accepted"]) for r in rows], [(5, 3), (None, None), (12, 7)])
-        self.assertEqual((m["totals"]["drafts_offered"], m["totals"]["drafts_accepted"]), (17, 10))
 
 
 class PcieShare(unittest.TestCase):
@@ -1264,7 +1262,7 @@ class CancelledRead(unittest.TestCase):
         self.assertEqual(prompt_tokens_seen(98179, {}), 98179)                          # no DONE at all
         self.assertEqual(prompt_tokens_seen(10, {**last, "prompt_read": 50}), 10)       # never past the prompt
 
-    def test_history_and_totals(self):
+    def test_history_counts_the_prompt_read(self):
         tok = ByteTokenizer()
         engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
             "DONE 0 20 400.0 0.0 cancel 0 0 0 0 0 0 0 0.0 8",      # stopped after 8 prompt tokens
@@ -1286,20 +1284,17 @@ class CancelledRead(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
         rows = m["requests"][::-1]                                # oldest first
-        total = rows[0]["prompt_total"]
+        total = rows[1]["prompt_tokens"]
         self.assertGreater(total, 8)
-        self.assertEqual([r["prompt_total"] for r in rows], [total] * 3)
-        self.assertEqual([(r["prompt_tokens"], r["prompt_read"]) for r in rows], [(8, 8), (total, 20), (total, None)])
-        self.assertEqual(m["totals"]["prompt_tokens"], 8 + 2 * total)
+        self.assertEqual([r["prompt_tokens"] for r in rows], [8, total, total])
 
 
 class LiveRate(unittest.TestCase):
-    """The Monitor's Speed readout: live.tok_s is a rate, and a request that never got a DONE keeps no counters.
+    """live.tok_s is a rate, and a request that never got a DONE keeps no counters.
 
-    It used to be `generated / (now - first_token)` - the mean since the first token, whose first sample is
-    1/elapsed.  Against a paced engine that reads five-digit numbers for the first instant of every answer and
-    undershoots for the first second after that.  It is now the rate over the last RATE_WINDOW_S, with the mean
-    still available as `live.tok_s_mean` for anyone who wants it."""
+    A mean since the first token has 1/elapsed as its first sample: against a paced engine it reads huge numbers for
+    the first instant of every answer and undershoots for the first second after that.  The readout is the rate over
+    the last RATE_WINDOW_S."""
 
     PACE_S = 0.02                    # 50 tokens/s: a 30-token answer takes about 0.6 s
     TOKENS = 30
@@ -1357,11 +1352,11 @@ class LiveRate(unittest.TestCase):
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
 
-        def poll():                                   # what the Monitor polls, at 10 ms
+        def poll():                                   # what the stats page polls, at 10 ms
             while not stop.is_set():
                 live = self.metrics()["live"]
                 if live["state"] == "generating" and live["tok_s"] is not None:
-                    live_samples.append((live["generated"], live["tok_s"], live["tok_s_mean"]))
+                    live_samples.append((live["generated"], live["tok_s"]))
                 time.sleep(0.01)
 
         body = json.dumps({"model": "m", "max_tokens": self.TOKENS, "temperature": 0,
@@ -1379,8 +1374,8 @@ class LiveRate(unittest.TestCase):
             watcher.join(2)
         true_rate = usage["completion_tokens"] / (time.time() - t0)
         self.assertGreaterEqual(len(live_samples), 3, "too few live readings to judge the readout")
-        self.assertLess(max(s for _g, s, _m in live_samples), 4 * true_rate,
-                        f"live.tok_s peaked at {max(s for _g, s, _m in live_samples):.1f} tok/s "
+        self.assertLess(max(s for _g, s in live_samples), 4 * true_rate,
+                        f"live.tok_s peaked at {max(s for _g, s in live_samples):.1f} tok/s "
                         f"for a {true_rate:.1f} tok/s engine")
         self.assertEqual(self.metrics()["live"]["state"], "idle")
         self.assertIsNone(self.metrics()["live"]["tok_s"])
@@ -1413,29 +1408,19 @@ class LiveRate(unittest.TestCase):
             self.assertEqual(row["finish"], "error")
             self.assertEqual(row["output_tokens"], 3)
             self.assertIsNone(row["decode_tok_s"], "the previous request's counters were recorded as this one's")
-            self.assertIsNone(row["engine_generated"])
         finally:
             httpd.shutdown()
             httpd.server_close()
 
 
-class SharedSettings(unittest.TestCase):
-    """The web app's "Use for other apps too": POST /settings makes its Chat settings every client's defaults."""
+class OwnPage(unittest.TestCase):
+    """POST /load changes the server's state, so only JSON from the server's own page (or a trusted origin) may send it."""
 
     @classmethod
     def setUpClass(cls):
-        import tempfile
-
-        class Sampled(RecordingEngine):
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-                self.last_sampling = dict(sampling or {})
-                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
-
         tok = ByteTokenizer()
-        cls.engine = Sampled(tok, "</think>\n\nhello", max_context=CTX)
-        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        cls.tmp = tempfile.TemporaryDirectory()
-        cls.svc.shared_path = os.path.join(cls.tmp.name, "x.shared-settings.json")
+        cls.svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -1443,7 +1428,6 @@ class SharedSettings(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
-        cls.tmp.cleanup()
 
     def req(self, path, body, headers=None, raw=None):
         h = {"Content-Type": "application/json", **(headers or {})}
@@ -1455,89 +1439,48 @@ class SharedSettings(unittest.TestCase):
             with e:
                 return e.code, json.loads(e.read())
 
-    def chat(self, **extra):
-        return self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra})
-
-    def tearDown(self):
-        self.svc.set_shared(None)
-
-    def test_other_apps_get_the_chat_settings(self):
-        d = {"temperature": 0.3, "top_p": 0.9, "top_k": 10, "seed": 7, "max_tokens": 77,
-             "reasoning_effort": "low", "experimental_speed_projection": False}
-        code, b = self.req("/settings", {"defaults": d})
-        self.assertEqual(code, 200, b)
-        self.assertTrue(b["shared"])
-        self.assertTrue(os.path.exists(self.svc.shared_path))
-        code, _ = self.chat()                                        # a client that sets nothing
-        self.assertEqual(code, 200)
-        got = self.engine.last_sampling
-        for k in ("temperature", "top_p", "top_k", "seed", "experimental_speed_projection"):
-            self.assertEqual(got[k], d[k], k)
-        self.assertEqual(self.engine.last_max_new, 77)
-        code, _ = self.chat(temperature=0.9, max_tokens=5)          # its own values win
-        self.assertEqual(self.engine.last_sampling["temperature"], 0.9)
-        self.assertEqual(self.engine.last_max_new, 5)
-        r = self.svc.with_shared({"messages": []}, "openai")
-        self.assertEqual(r["reasoning_effort"], "low")
-        self.assertEqual(self.svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
-        self.assertEqual(self.svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
-
-    def test_off_again(self):
-        self.req("/settings", {"defaults": {"temperature": 0.3}})
-        code, b = self.req("/settings", {"defaults": None})
-        self.assertEqual((code, b["shared"]), (200, False))
-        self.assertFalse(os.path.exists(self.svc.shared_path))
-        self.chat()
-        self.assertNotIn("temperature", self.engine.last_sampling)
-
-    def test_only_server_s_own_page_may_set_them(self):
-        code, _ = self.req("/settings", None, {"Content-Type": "text/plain"}, raw=b'{"defaults": {"temperature": 1}}')
+    def test_only_server_s_own_page_may_control_the_model(self):
+        code, _ = self.req("/load", None, {"Content-Type": "text/plain"}, raw=b"{}")
         self.assertEqual(code, 415)
-        code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://evil.example"})
+        code, _ = self.req("/load", {}, {"Origin": "http://evil.example"})
         self.assertEqual(code, 403)
-        code, b = self.req("/settings", {"defaults": {"temperature": 9}})
-        self.assertEqual(code, 400)
-        self.assertIn("temperature", b["error"]["message"])
-        self.assertEqual(self.svc.shared, {})
         host = self.base.split("://", 1)[1]
-        code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://" + host})
+        code, _ = self.req("/load", {}, {"Origin": "http://" + host})
         self.assertEqual(code, 200)
 
     def test_they_need_the_key_when_one_is_set(self):
         self.svc.api_key = "secret"
         try:
-            self.assertEqual(self.req("/settings", {"defaults": {"temperature": 1}})[0], 401)
-            self.assertEqual(self.req("/settings", {"defaults": {"temperature": 1}},
-                                      {"Authorization": "Bearer secret"})[0], 200)
+            self.assertEqual(self.req("/load", {})[0], 401)
+            self.assertEqual(self.req("/load", {}, {"Authorization": "Bearer secret"})[0], 200)
         finally:
             self.svc.api_key = ""
 
     def test_proxy_headers_do_not_make_a_page_server_s_own(self):
         # X-Forwarded-*, CF-Ray or CF-Connecting-IP say nothing about the page that sent the request - any web
-        # page behind any proxy would otherwise change the settings (or run MCP tools)
+        # page behind any proxy would otherwise control the model
         for extra in ({"X-Forwarded-Host": "proxy.example.com"}, {"CF-Ray": "1234567890"},
                       {"X-Forwarded-For": "203.0.113.9"}, {"CF-Connecting-IP": "203.0.113.9"}):
-            code, _ = self.req("/settings", {"defaults": {"temperature": 1}},
-                               {"Origin": "https://proxy.example.com", **extra})
+            code, _ = self.req("/load", {}, {"Origin": "https://proxy.example.com", **extra})
             self.assertEqual(code, 403, extra)
         # another port on the same host is another site (a local dev server's page)
-        code, _ = self.req("/settings", {"defaults": {"temperature": 1}}, {"Origin": "http://127.0.0.1:1"})
+        code, _ = self.req("/load", {}, {"Origin": "http://127.0.0.1:1"})
         self.assertEqual(code, 403)
 
     def test_a_trusted_origin_is_server_s_own_page(self):
-        # the web app behind a reverse proxy or tunnel: the config's trusted_origins
+        # the page behind a reverse proxy or tunnel: the config's trusted_origins
         self.svc.trusted_origins = ["https://host.example.com"]
         try:
-            code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://host.example.com"})
+            code, _ = self.req("/load", {}, {"Origin": "https://host.example.com"})
             self.assertEqual(code, 200)
-            code, _ = self.req("/settings", {"defaults": {}}, {"Origin": "https://evil.example.com"})
+            code, _ = self.req("/load", {}, {"Origin": "https://evil.example.com"})
             self.assertEqual(code, 403)
         finally:
             self.svc.trusted_origins = []
 
 
 class WebApp(unittest.TestCase):
-    """The web app: its page and files, and GET /metrics."""
+    """The stats page and its files, GET /metrics and the llama.cpp-style discovery endpoints."""
 
     @classmethod
     def setUpClass(cls):
@@ -1564,8 +1507,9 @@ class WebApp(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
         self.assertIn(b"\"web/app.js\"", body)   # relative (works behind a path-prefixed proxy)
-        for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
-                           ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
+        for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/mark.svg", "image/svg+xml"),
+                           ("/fonts/geist-latin-wght.woff2", "font/woff2"),
+                           ("/fonts/geist-mono-latin-wght.woff2", "font/woff2")):
             with self.subTest(path=path):
                 code, ctype, _ = self.get(path)
                 self.assertEqual(code, 200)
@@ -1592,11 +1536,10 @@ class WebApp(unittest.TestCase):
 
     def test_model_discovery_and_props(self):
         svc = self.svc
-        previous = svc.engine.max_context, svc.vision, svc.sampling_defaults, svc.shared
+        previous = svc.engine.max_context, svc.vision, svc.sampling_defaults
         try:
             svc.engine.max_context = 262144
             svc.sampling_defaults = {"temperature": 1.0, "repetition_penalty": 1.1}
-            svc.shared = {"temperature": 0.7, "max_tokens": 4096}
             for vision in (None, object()):
                 svc.vision = vision
                 for path in ("/models", "/v1/models"):
@@ -1615,17 +1558,14 @@ class WebApp(unittest.TestCase):
                 props = json.loads(body)
                 self.assertEqual(props["default_generation_settings"]["n_ctx"], 262144)
                 self.assertEqual(props["default_generation_settings"]["params"],
-                                 {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096})
+                                 {"temperature": 1.0, "repeat_penalty": 1.1, "n_predict": -1})
                 self.assertEqual(props["chat_template"], (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
                 self.assertEqual(props["modalities"]["vision"], vision is not None)
                 self.assertEqual(props["total_slots"], 1)
                 self.assertFalse(props["models_autoload"])
-            svc.shared = {}
-            props = json.loads(self.get("/props")[2])
-            self.assertEqual(props["default_generation_settings"]["params"]["n_predict"], -1)
             self.assertEqual(self.get("/props?model=not-loaded&autoload=true")[0], 404)
         finally:
-            svc.engine.max_context, svc.vision, svc.sampling_defaults, svc.shared = previous
+            svc.engine.max_context, svc.vision, svc.sampling_defaults = previous
 
     def test_discovery_needs_the_api_key(self):
         self.svc.api_key = "secret"
@@ -1752,8 +1692,8 @@ class UsageAndStatus(unittest.TestCase):
             self.assertIn("authorization", h.get("Access-Control-Allow-Headers", ""))
             self.assertIsNone(self.preflight("/v1/chat/completions", "https://evil.example.com")[1]
                               .get("Access-Control-Allow-Origin"))
-            # never on the app's own endpoints (/settings, /unload, ...)
-            self.assertIsNone(self.preflight("/settings")[1].get("Access-Control-Allow-Origin"))
+            # never on the server's own controls (/unload, ...)
+            self.assertIsNone(self.preflight("/unload")[1].get("Access-Control-Allow-Origin"))
             req = urllib.request.Request(self.base + "/v1/models", headers={"Origin": "https://chat.example.com"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), "https://chat.example.com")
@@ -2193,8 +2133,7 @@ class StatusHandover(unittest.TestCase):
         self.assertEqual([r["finish"] for r in rows], ["disconnect", "length"])
         self.assertTrue(0 < rows[0]["output_tokens"] < 30, rows)     # where the first one stopped, not the second's
         self.assertEqual(rows[1]["output_tokens"], 20)
-        self.assertEqual(svc.totals["requests"], 2)
-        self.assertEqual(svc.totals["output_tokens"], rows[0]["output_tokens"] + 20)
+        self.assertEqual(svc.requests_done, 2)
         self.assertFalse(svc.status["busy"])
         self.assertNotIn("tail", svc.status)
 

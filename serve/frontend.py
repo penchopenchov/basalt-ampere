@@ -347,8 +347,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
         # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
-        # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
-        # request that gives its own reasoning_budget_tokens asks for thinking, so it thinks as before.
+        # A request that gives its own reasoning_budget_tokens asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
     return _late_system_to_user(messages), tools, kwargs
 

@@ -138,7 +138,7 @@ class OverHttp(unittest.TestCase):
     def test_rebinding_name_is_refused_everywhere(self):
         self.start()
         for method, path in (("GET", "/status"), ("GET", "/metrics"), ("GET", "/"), ("GET", "/health"),
-                             ("POST", "/settings"), ("POST", "/v1/chat/completions"), ("OPTIONS", "/v1/models")):
+                             ("GET", "/api/logs"), ("POST", "/v1/chat/completions"), ("OPTIONS", "/v1/models")):
             code, body, log = self.req(method, path, {} if method == "POST" else None,
                                        {"Content-Type": "application/json"}, host=f"evil.example.com:{self.port}")
             self.assertEqual(code, 403, path)
