@@ -819,17 +819,6 @@ class GpuChoice(unittest.TestCase):
         plain = {"gpu": [0, 1], "vision": {"exe": "v"}}
         self.assertIs(vision_env(plain, env), env)          # no cuda_device: the engine's environment, unchanged
 
-    def test_hip_ordinal(self):
-        """#325: on Windows the HIP ordinal setup resolved wins over the config's "gpu" (an iGPU takes HIP's 0)."""
-        from serve.server import child_env
-        self.assertEqual(child_env({"backend": "hip", "gpu": 1})["HIP_VISIBLE_DEVICES"], "1")       # Linux: KFD order
-        self.assertEqual(child_env({"backend": "hip", "hip_ordinal": 1})["HIP_VISIBLE_DEVICES"], "1")
-        self.assertEqual(child_env({"backend": "hip", "gpu": 0, "hip_ordinal": 1})["HIP_VISIBLE_DEVICES"], "1")
-        self.assertEqual(child_env({"backend": "hip", "gpu": [1, 0], "hip_ordinal": 2})["HIP_VISIBLE_DEVICES"],
-                         "1,0")                                          # a layer split keeps its list
-        self.assertEqual(child_env({"backend": "hip", "gpu": 0, "hip_ordinal": "x"})["HIP_VISIBLE_DEVICES"], "0")
-        plain = child_env({"backend": "hip"})
-        self.assertEqual(plain.get("HIP_VISIBLE_DEVICES"), os.environ.get("HIP_VISIBLE_DEVICES"))
 
 
 class RecordingPrompt(MockEngine):
@@ -1175,31 +1164,6 @@ class DraftHeadHint(unittest.TestCase):
         self.assertEqual(start_failure_hint(p, off), "")
         self.assertEqual(start_failure_hint(None, 0), "")
         self.assertEqual(start_failure_hint(str(Path(tempfile.mkdtemp()) / "missing.log"), 0), "")
-
-
-class DesktopVramNote(unittest.TestCase):
-    """#560 #516: an AMD card on a Linux desktop with little VRAM left after the start gets a recommended reserve."""
-
-    def test_when_it_applies(self):
-        from serve.server import desktop_vram_note
-        note = desktop_vram_note("hip", 624, ["--kv", "int8"], True)
-        self.assertIn("624 MiB of VRAM free", note)
-        self.assertIn("--vram-reserve-mib 3072", note)
-        self.assertIn("2.3 GB less", note)
-
-    def test_when_it_does_not(self):
-        from serve.server import desktop_vram_note
-        self.assertEqual(desktop_vram_note(None, 624, [], True), "")               # NVIDIA
-        self.assertEqual(desktop_vram_note("hip", 624, [], False), "")             # no desktop session
-        self.assertEqual(desktop_vram_note("hip", 2994, [], True), "")             # room left
-        self.assertEqual(desktop_vram_note("hip", None, [], True), "")             # lazy start: no INFO yet
-        self.assertEqual(desktop_vram_note("hip", 900, ["--vram-reserve-mib", "4000"], True), "")   # already raised
-
-    def test_desktop_detection(self):
-        from serve import server
-        with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "linux"):
-            self.assertTrue(server.linux_desktop({"WAYLAND_DISPLAY": "wayland-0"}))
-            self.assertFalse(server.linux_desktop({}))
 
 
 class StartFailureLog(unittest.TestCase):
@@ -2457,70 +2421,6 @@ class ModelAliases(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
-
-
-class AmdTelemetry(unittest.TestCase):
-    """#301: the AMD backend's readings from a fake amdgpu sysfs tree: KFD node -> render node, as setup numbers the
-    cards (the CPU node skipped), and free_vram_mib on HIP."""
-
-    def tree(self, d):
-        nodes = Path(d) / "class/kfd/kfd/topology/nodes"
-        for n, props in ((0, "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\ndrm_render_minor 0\n"),
-                         (1, "simd_count 128\ngfx_target_version 120001\ndrm_render_minor 129\n"),
-                         (2, "simd_count 128\ngfx_target_version 120001\ndrm_render_minor 128\n")):
-            (nodes / str(n)).mkdir(parents=True)
-            (nodes / str(n) / "properties").write_text(props)
-        for minor, used, busy, temp, power in ((129, 2 << 30, 37, 51000, 85000000), (128, 6 << 30, 99, 64000, None)):
-            dev = Path(d) / f"class/drm/renderD{minor}/device"
-            hw = dev / "hwmon" / "hwmon4"
-            hw.mkdir(parents=True)
-            (dev / "gpu_busy_percent").write_text(f"{busy}\n")
-            (dev / "mem_info_vram_used").write_text(f"{used}\n")
-            (dev / "mem_info_vram_total").write_text(f"{32 << 30}\n")
-            (dev / "product_name").write_text("AMD Radeon AI PRO R9700\n")
-            (hw / "temp1_input").write_text(f"{temp}\n")
-            if power is not None:
-                (hw / "power1_average").write_text(f"{power}\n")
-            else:
-                (hw / "power1_input").write_text("120000000\n")
-            (hw / "power1_cap").write_text("300000000\n")
-
-    def test_readings(self):
-        from serve import telemetry
-        with tempfile.TemporaryDirectory() as d:
-            self.tree(d)
-            with mock.patch.object(telemetry, "SYSFS", d):
-                self.assertTrue(telemetry.amd_device_dir(0).endswith(os.path.join("renderD129", "device")))
-                self.assertTrue(telemetry.amd_device_dir(1).endswith(os.path.join("renderD128", "device")))
-                self.assertIsNone(telemetry.amd_device_dir(2))
-                g = telemetry.gpu_reader(0, amd=True)
-                self.assertTrue(g.ok())
-                self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
-                self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
-                                            "power": 85.0, "power_limit": 300.0})
-                r = telemetry.gpu_reader(1, amd=True).read()
-                self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
-                self.assertEqual(telemetry.free_vram_mib(0, amd=True), 30 << 10)
-                self.assertIsNone(telemetry.free_vram_mib(5, amd=True))
-                t = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True)
-                s = t.sample()
-                self.assertEqual(t.static["gpu_name"], "AMD Radeon AI PRO R9700 + AMD Radeon AI PRO R9700")
-                self.assertEqual((s["gpu_mem_used"], s["gpu_util"], s["gpu_temp"], s["gpu_power"]),
-                                 (8 << 30, 68.0, 64.0, 205.0))
-        with tempfile.TemporaryDirectory() as d:                    # no amdgpu: nothing, and nothing breaks
-            with mock.patch.object(telemetry, "SYSFS", d):
-                self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
-                self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
-
-    def test_free_vram_on_hip(self):
-        from serve import telemetry
-        tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        svc.backend, svc.gpu_index = "hip", 1
-        with tempfile.TemporaryDirectory() as d:
-            self.tree(d)
-            with mock.patch.object(telemetry, "SYSFS", d):
-                self.assertEqual(svc.free_vram_mib(), 26 << 10)
 
 
 class SilentEngine(unittest.TestCase):
