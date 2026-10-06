@@ -1356,8 +1356,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 cudaStream_t qside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
                 const bool qsaf_side = (dec_qsaf_mask() & 1) && fused_pre && qb && qside != nullptr && ev_fork_ != nullptr &&
                                        ev_join_ != nullptr;
-                const bool qsaf_wide = (dec_qsaf_mask() & 32) && fused_pre && qb && qs_[0] != nullptr;
-                if (qsaf_wide) {   // & 32: K, V and the indexer key/query each on a branch of their own, beside the query
+                // & 32: K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
+                // multi-row GEMV is the one-row one)
+                const bool qsaf_wide = (dec_qsaf_mask() & 32) && fused_pre && (qb || n == 1) && qs_[0] != nullptr;
+                if (qsaf_wide) {
                     {
                         PdlScope ps(pdl);   // after the hc read
                         native_quantize_q8_1(xm, xq_, (int) N, n, cs);
