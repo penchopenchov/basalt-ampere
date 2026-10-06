@@ -384,7 +384,7 @@ public:
                 return true;
             }
         }
-        err = "the engine exited before READY (see " + log_path + ")";
+        err = "the engine exited before READY" + engine_failure(log_path);
         reap();
         return false;
     }
@@ -500,7 +500,7 @@ private:
 // ---------------------------------------------------------------------------------------------- options
 
 struct Options {
-    std::string engine, config, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, lock, power_label;
+    std::string engine, config, model, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, lock, power_label;
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec, spec_min_p;        // --spec N, --spec-min-p P: engine arguments of the same names
@@ -516,7 +516,8 @@ void usage() {
     std::printf(
         "basalt-bench - the standard benchmark: decode fixtures, prefill depths, optional quality gate\n"
         "\n"
-        "usage: basalt-bench --config CFG.json [options] [-- ENGINE ARGS...]\n"
+        "usage: basalt-bench --model FILE.basalt [options] [-- ENGINE ARGS...]\n"
+        "       basalt-bench --config CFG.json [options] [-- ENGINE ARGS...]\n"
         "\n"
         "what to run (default: -p 16384 -t conv,struct,prose; giving one of -p / -t runs only what is given)\n"
         "  -t LIST            decode fixtures, any of conv,struct,prose; they always run in that order, because\n"
@@ -531,6 +532,9 @@ void usage() {
         "  --quality-t T      tokens per verify window in the quality gate (default 3)\n"
         "\n"
         "engine\n"
+        "  --model FILE       a .basalt model file: its own engine arguments (the ones `basalt serve` uses), plus\n"
+        "                     --peer-device 1 when a second GPU is visible; the file's --spec is dropped (see --spec).\n"
+        "                     A flag given after -- replaces the file's value, or is added\n"
         "  --config FILE      server run config (JSON): \"exe\", \"args\", \"cwd\", \"env\", \"lib_dirs\" are used;\n"
         "                     the vision sidecar is not started\n"
         "  --engine EXE       engine binary (default: the one built with this program, else the config's)\n"
@@ -539,7 +543,8 @@ void usage() {
         "                     config or after --, the run has no speculation (--spec 0): a clean baseline\n"
         "  --spec-min-p P     the draft cutoff (--spec-min-p P); with N >= 2 and no cutoff given, 0.5\n"
         "                     MTP: --spec 7 --spec-min-p 0.5 (or -- --spec 7 --spec-min-p 0.5)\n"
-        "  -- ARGS...         engine arguments appended last (instead of --config, or with it)\n"
+        "  -- ARGS...         engine arguments: appended last to --config's; with --model they replace or add flags;\n"
+        "                     alone they are the whole command (the engine's default expert mode needs the RAM)\n"
         "\n"
         "output\n"
         "  -o md|json         a markdown table (default), or the full detail as JSON on stdout: per-repetition\n"
@@ -622,6 +627,77 @@ std::string arg_value(const std::vector<std::string>& args, const std::string& f
     return "";
 }
 
+// The engine arguments a .basalt file carries (its meta section's "engine_args"), as `basalt serve` reads them.
+bool model_file_args(const std::string& path, std::vector<std::string>& out, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot read " + path; return false; }
+    std::string head(64 * 1024, '\0');
+    f.read(head.data(), (std::streamsize) head.size());
+    if (f.gcount() < 64 || head.compare(0, 8, "BASALTMF") != 0) { err = path + " is not a .basalt model file"; return false; }
+    uint32_t n = 0;
+    std::memcpy(&n, head.data() + 12, 4);
+    for (uint32_t i = 0; i < n && 64 + (size_t) (i + 1) * 128 <= (size_t) f.gcount(); ++i) {
+        const char* e = head.data() + 64 + (size_t) i * 128;
+        if (std::strncmp(e, "meta", 64) != 0) continue;
+        uint64_t off = 0, bytes = 0;
+        std::memcpy(&off, e + 64, 8);
+        std::memcpy(&bytes, e + 72, 8);
+        if (bytes == 0 || bytes > (64u << 20)) { err = path + ": the meta section is unreadable"; return false; }
+        std::string meta(bytes, '\0');
+        f.clear();
+        f.seekg((std::streamoff) off);
+        f.read(meta.data(), (std::streamsize) bytes);
+        if ((uint64_t) f.gcount() != bytes) { err = path + ": the meta section is cut short"; return false; }
+        JVal v;
+        JParser jp(meta);
+        if (!jp.parse(v, err) || v.kind != JVal::Obj) { err = path + ": the meta section is not JSON"; return false; }
+        if (const JVal* a = v.find("engine_args"); a && a->kind == JVal::Arr)
+            for (const JVal& x : a->a) out.push_back(x.kind == JVal::Num ? fmt("%.17g", x.n) : x.s);
+        return true;
+    }
+    err = path + " has no meta section";
+    return false;
+}
+
+// The GPUs this process can see: CUDA_VISIBLE_DEVICES when set, else what NVML lists.
+size_t visible_gpus() {
+    if (const char* v = std::getenv("CUDA_VISIBLE_DEVICES")) {
+        size_t n = 0;
+        for (const auto& d : split(v, ','))
+            if (d != "-1") ++n;
+        return n;
+    }
+    Nvml nvml;
+    return nvml.open() ? nvml.count() : 0;
+}
+
+// FLAG [VALUE] words added to `args`: a flag already there takes the new value, else both are appended.  A word
+// that does not begin with "--" after a flag is its value.
+void merge_args(std::vector<std::string>& args, const std::vector<std::string>& add) {
+    for (size_t i = 0; i < add.size(); ++i) {
+        const bool value = i + 1 < add.size() && add[i + 1].rfind("--", 0) != 0;
+        if (add[i].rfind("--", 0) != 0) { args.push_back(add[i]); continue; }
+        if (value) { set_arg(args, add[i], add[i + 1]); ++i; }
+        else if (!has_arg(args, add[i])) args.push_back(add[i]);
+    }
+}
+
+// The engine's own `basalt error:` lines from its log, else the last few lines.
+std::string engine_failure(const std::string& log_path) {
+    std::ifstream f(log_path);
+    std::vector<std::string> lines, errors;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        lines.push_back(line);
+        if (line.rfind("basalt error: ", 0) == 0) errors.push_back(line);
+    }
+    if (errors.empty() && lines.size() > 8) lines.erase(lines.begin(), lines.end() - 8);
+    std::string r;
+    for (const auto& l : errors.empty() ? lines : errors) r += "\n  " + l;
+    return r;
+}
+
 bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -635,6 +711,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             usage();
             std::exit(0);
         } else if (a == "--config") o.config = next("--config");
+        else if (a == "--model") o.model = next("--model");
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--spec-min-p") o.spec_min_p = next("--spec-min-p");
@@ -678,7 +755,11 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             err = "-t: unknown fixture " + s + " (conv, struct, prose)";
             return false;
         }
-    if (o.config.empty() && o.passthrough.empty()) { err = "give --config FILE or engine arguments after --"; return false; }
+    if (!o.model.empty() && !o.config.empty()) { err = "give --model or --config, not both"; return false; }
+    if (o.config.empty() && o.model.empty() && o.passthrough.empty()) {
+        err = "give --model FILE, --config FILE or engine arguments after --";
+        return false;
+    }
     return true;
 }
 
@@ -949,6 +1030,21 @@ int main(int argc, char** argv) {
             }
         }
     }
+    if (!o.model.empty()) {
+        std::vector<std::string> file_args;
+        if (!model_file_args(o.model, file_args, err)) {
+            std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
+            return 2;
+        }
+        // the bench runs without speculation unless asked (--spec, or after --), so the file's are dropped
+        args = {"--model", fs::absolute(o.model).string()};
+        for (size_t i = 0; i < file_args.size(); ++i) {
+            if (file_args[i] == "--serve") continue;   // the bench starts the engine as a server itself
+            if ((file_args[i] == "--spec" || file_args[i] == "--spec-min-p") && i + 1 < file_args.size()) { ++i; continue; }
+            args.push_back(file_args[i]);
+        }
+        if (!has_arg(args, "--peer-device") && visible_gpus() > 1) set_arg(args, "--peer-device", "1");
+    }
     if (exe.empty()) exe = BASALT_BENCH_ENGINE;
     if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) exe = BASALT_BENCH_ENGINE;
     if (exe.empty() || !fs::exists(exe)) {
@@ -958,7 +1054,8 @@ int main(int argc, char** argv) {
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
     if (!o.spec_min_p.empty()) set_arg(args, "--spec-min-p", o.spec_min_p);
-    for (const auto& a : o.passthrough) args.push_back(a);
+    if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
+    else merge_args(args, o.passthrough);
     if (!has_arg(args, "--spec")) set_arg(args, "--spec", "0");
     if (!has_arg(args, "--spec-min-p") && std::atoi(arg_value(args, "--spec").c_str()) >= 2)
         set_arg(args, "--spec-min-p", "0.5");
