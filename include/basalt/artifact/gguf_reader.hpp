@@ -329,6 +329,23 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
     return v;
 }
 
+// A GGUF-shaped view of a file that is not a GGUF: the metadata and the tensor directory come from elsewhere
+// (a .basalt model file's `meta` section) and every tensor offset is an absolute file offset.  Registered under the
+// file's path, so everything that opens `GgufFile(path)` reads the tensors in place from it.
+struct VirtualGguf {
+    std::map<std::string, MetaValue> meta;
+    std::vector<TensorInfo> tensors;   // offset: absolute, from the start of the file
+};
+
+inline std::map<std::string, std::shared_ptr<const VirtualGguf>>& gguf_virtual_registry() {
+    static std::map<std::string, std::shared_ptr<const VirtualGguf>> r;
+    return r;
+}
+
+inline void gguf_register_virtual(const std::string& path, std::shared_ptr<const VirtualGguf> v) {
+    gguf_virtual_registry()[path] = std::move(v);
+}
+
 class GgufFile {
 public:
     explicit GgufFile(const std::string& path) : path_(path) {
@@ -346,6 +363,8 @@ public:
     uint64_t file_size() const { return size_; }
     uint64_t alignment() const { return alignment_; }
     const std::string& path() const { return path_; }
+    /// A view over a registered non-GGUF file (see VirtualGguf): tensor offsets are absolute, data_start() is 0.
+    bool is_virtual() const { return virtual_; }
 
     const TensorInfo* find(const std::string& name) const {
         for (const auto& t : tensors_)
@@ -375,6 +394,17 @@ private:
         void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
         if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
         base_ = (const uint8_t*)p;
+        const auto& reg = gguf_virtual_registry();
+        const auto it = reg.find(path_);
+        if (it != reg.end()) {
+            virtual_ = true;
+            meta_ = it->second->meta;
+            tensors_ = it->second->tensors;
+            version_ = 3;
+            data_start_ = 0;
+            alignment_ = 1;
+            return;
+        }
         parse();
     }
     void close() {
@@ -427,6 +457,7 @@ private:
     uint64_t size_ = 0, data_start_ = 0, alignment_ = 32;
     uint32_t version_ = 0;
     int fd_ = -1;
+    bool virtual_ = false;
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;
 };
@@ -496,6 +527,7 @@ public:
 
 private:
     void validate_split() const {
+        if (shards_[0]->is_virtual()) return;   // one file holds the whole model
         const size_t n = shards_.size();
         const MetaValue* count0 = shards_[0]->get("split.count");
         if (n == 1) {
