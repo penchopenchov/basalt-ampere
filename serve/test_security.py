@@ -37,7 +37,7 @@ class HostNames(unittest.TestCase):
     def test_allowed_hosts_of(self):
         self.assertEqual(allowed_hosts_of(None), [])
         self.assertEqual(allowed_hosts_of("Strata.Example.com"), ["strata.example.com"])
-        self.assertEqual(allowed_hosts_of(["https://a.example.com:8443/x", ".example.org", "*"], "box, nas.lan "),
+        self.assertEqual(allowed_hosts_of(["https://a.example.com:8443/x", ".example.org", "*", "box", "nas.lan"]),
                          ["a.example.com", ".example.org", "*", "box", "nas.lan"])
         for bad in (["bad name"], 5, [3], "http://"):
             with self.assertRaises(ValueError):

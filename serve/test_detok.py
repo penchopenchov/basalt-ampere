@@ -3,7 +3,6 @@ by token, and its cost per token does not grow with the reply.
 
     python -m unittest serve.test_detok      (needs a pack's tokenizer; skipped without one)
 """
-import os
 import random
 import sys
 import time
@@ -18,9 +17,7 @@ from serve.server import Detokenizer  # noqa: E402
 
 
 def find_tokenizer():
-    cands = [os.environ.get("STRATA_TOKENIZER", "")]
-    cands += [str(p) for p in ROOT.glob("packs/*/tokenizer")] + [str(p) for p in ROOT.glob("pack/*/tokenizer")]
-    cands += [r"C:\Users\AI-Server\Desktop\Strata\Public\Engine\pack\full\tokenizer"]
+    cands = [str(p) for p in ROOT.glob("packs/*/tokenizer")] + [str(p) for p in ROOT.glob("pack/*/tokenizer")]
     for c in cands:
         if c and (Path(c) / "vocab.json").exists():
             return Path(c)
