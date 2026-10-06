@@ -498,7 +498,7 @@ add_test(NAME qsa_topk_parity COMMAND qsa_topk_parity --selftest)
 # `ngram.cpp` is host-only but lives in `kernels` because `ple.cu` shares its geometry constants, and
 # splitting them across two libraries would only add a layer.
 #
-# The pack, the original GGUF and the ggml capture are all REQUIRED inputs: this test's oracles are real
+# The dense section (extracted to a file), the original GGUF and the ggml capture are all REQUIRED inputs: this test's oracles are real
 # artifacts, so the working directory is pinned to the source tree and a missing input is a hard error
 # INSIDE the test.  A test that passes by finding nothing to compare is the failure mode this project keeps
 # re-learning.
