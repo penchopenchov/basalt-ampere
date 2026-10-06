@@ -5,7 +5,7 @@
 // log-prob) and n_vocab log-probs quantized to uint16 over [min, max], padded to an even count.
 // A serve request with `ppl=K` reads chunk K's first half as its prompt and then teacher-forces the rest through
 // the verify windows; every scored row is compared with the base row here and written as one line to
-// STRATA_PPL_OUT: chunk pos target nll nll_base kld same_top top top_base dlogp_top_base.
+// --ppl-out: chunk pos target nll nll_base kld same_top top top_base dlogp_top_base.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <string>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -21,6 +22,11 @@ namespace strata::program {
 
 class PplGate {
 public:
+    /// the base file and the output file, set from --ppl-base and --ppl-out before the first get()
+    static void configure(const std::string& base, const std::string& out) {
+        paths().first = base;
+        paths().second = out;
+    }
     static PplGate& get() {
         static PplGate g;
         return g;
@@ -32,7 +38,7 @@ public:
 
     // chunk K's tokens; the request's prompt must be the chunk's first n_ctx/2 + 1 tokens
     bool begin(int chunk, const int64_t* ids, int64_t n, int64_t n_vocab, std::string& err) {
-        if (!available()) { err = "ppl: STRATA_PPL_BASE / STRATA_PPL_OUT not set or not readable"; return false; }
+        if (!available()) { err = "ppl: --ppl-base / --ppl-out not set or not readable"; return false; }
         if (n_vocab != n_vocab_) { err = "ppl: the base has another vocabulary size"; return false; }
         if (chunk < 0 || chunk >= n_chunk_) { err = "ppl: chunk out of range"; return false; }
         if (n != first() + 1) { err = "ppl: the prompt must be the chunk's first n_ctx/2 + 1 tokens"; return false; }
@@ -67,10 +73,14 @@ public:
     }
 
 private:
+    static std::pair<std::string, std::string>& paths() {
+        static std::pair<std::string, std::string> p;
+        return p;
+    }
     PplGate() {
-        const char* base = std::getenv("STRATA_PPL_BASE");
-        const char* out = std::getenv("STRATA_PPL_OUT");
-        if (base == nullptr || out == nullptr) return;
+        const char* base = paths().first.c_str();
+        const char* out = paths().second.c_str();
+        if (paths().first.empty() || paths().second.empty()) return;
         fd_ = ::open(base, O_RDONLY);
         char magic[8];
         uint32_t n_ctx = 0;

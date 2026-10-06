@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/device.hpp"
+#include "strata/core/diag.hpp"
 #include "strata/core/draft_cum.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
@@ -572,6 +573,12 @@ void usage() {
                  "  --gpu-only-full      MEASURE: replay pre+post for all 48 layers plus the LM head, no pool.\n"
                  "                       THE TRUE PER-TOKEN GPU FLOOR.  Quote this one, not --graph-only.\n"
                  "  --stats              print the per-stage breakdown\n"
+                 "  --profile            GPU stage times of the decode windows (serve path)\n"
+                 "  --wait-stats         the host's wait times in the decode loop (serve path)\n"
+                 "  --decode-timing      one line per request: where its decode time went (serve path)\n"
+                 "  --draft-log FILE     one line per decode window for draft-policy study\n"
+                 "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
+                 "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
                  "  --gpu-stages         R0.9: capture the layer as three graphs (mixer / ffn+router / post)\n"
                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
@@ -1088,6 +1095,7 @@ int main(int argc, char** argv) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
     }
     Options o;
+    std::string ppl_base, ppl_out;
     bool have_tokens = false;
     bool have_logits_stride = false;
     for (int i = 1; i < argc; ++i) {
@@ -1338,6 +1346,12 @@ int main(int argc, char** argv) {
             o.resident_headroom = 4ull << 30;
         }
         else if (a == "--stats") o.stats = true;
+        else if (a == "--profile") strata::core::diagnostics().profile = true;
+        else if (a == "--wait-stats") strata::core::diagnostics().wait_stats = true;
+        else if (a == "--decode-timing") strata::core::diagnostics().decode_timing = true;
+        else if (a == "--draft-log") strata::core::diagnostics().draft_log = next("--draft-log");
+        else if (a == "--ppl-base") ppl_base = next("--ppl-base");
+        else if (a == "--ppl-out") ppl_out = next("--ppl-out");
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
         else if (a == "--no-token-graph") o.no_token_graph = true;
@@ -3785,8 +3799,8 @@ int main(int argc, char** argv) {
             // #610: a native (IQ) pack captures no per-layer graphs; the serve path times its window's stages
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(),
                          native_pack ? " - a native (IQ) pack has no per-layer graphs to replay. Its decode window's GPU "
-                                       "stages are printed per request by the serve path instead: STRATA_VERIFY_PROFILE=1 "
-                                       "STRATA_DECODE_TIMING=1 with --serve" : "");
+                                       "stages are printed per request by the serve path instead: --profile "
+                                       "--decode-timing with --serve" : "");
             return 1;
         }
         const int reps = 20;
@@ -6123,7 +6137,7 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
-            // ppl=K [ppl_t=T]: quality gate (strata/program/ppl_gate.hpp) - chunk K of STRATA_PPL_BASE, the rest of
+            // ppl=K [ppl_t=T]: quality gate (strata/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed
             int req_ppl = -1, req_ppl_t = 3;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
@@ -6173,6 +6187,7 @@ int main(int argc, char** argv) {
             strata::program::PplGate* ppl = nullptr;
             if (req_ppl >= 0) {
                 std::string pe2;
+                strata::program::PplGate::configure(ppl_base, ppl_out);
                 ppl = &strata::program::PplGate::get();
                 if (geni || !ppl->begin(req_ppl, ids.data(), n, n_vocab, pe2)) {
                     std::printf("ERR %s\n", geni ? "ppl: text only" : pe2.c_str());
