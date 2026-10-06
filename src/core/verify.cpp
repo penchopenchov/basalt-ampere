@@ -76,10 +76,10 @@ struct DecMoe {
     unsigned long long* slot_off = nullptr;  ///< CUDA0's per-slot offsets (null: slot * blob)
     int vram = -1;   // the VRAM share's kernels (dec_moe_vram's kind; -1 grouped)
     void* vscr = nullptr;                    ///< its gate/up rows
-    void* xq_pub = nullptr;   // dec_pk_mask & 4: the side stream's q8_1 rows for the ring
+    void* xq_pub = nullptr;   // the side stream's q8_1 rows for the ring
     unsigned int* vsync = nullptr;           ///< its counters
     unsigned long long* wstat = nullptr;   // the per-layer wait counters (device), with --wait-stats
-    unsigned long long* ptab0 = nullptr;   // dec_glue_mask: [n_layers * n_expert] CUDA0 blob address or 0
+    unsigned long long* ptab0 = nullptr;   // [n_layers * n_expert] CUDA0 blob address or 0
     int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
@@ -117,37 +117,19 @@ struct Bump {
     }
 };
 
-// dec_pk_mask (bit mask): 1 = in windows of 2+ tokens, the shared expert's side kernels at the greatest stream
-// priority (their blocks are scheduled ahead of the routed experts' queued blocks, so the branch ends beside them, not
-// after); 2 = in windows of 1-2 tokens, a GDN layer's z projection forked at that priority before the qkv projection
-// (both stream together), joined before the one-launch recurrence with the gated norm (dec_gdnf_mode 1's kernel), no
-// separate norm launch.  Wider windows run slower with either.  4 = with 1, the MoE route split: CUDA0's plan and q8_1
-// rows on the main stream (the routed experts follow it at once), the ring for the peer card and the CPU pool (mapped
-// rows, system fences, doorbells) on a stream of its own at that priority.
-constexpr int dec_pk_mask() { return 7; }
-constexpr bool dec_pk() { return true; }
-// dec_glue_mask (bit mask): 1 = in windows of 2+ tokens with dec_pk_mask & 4, no route launch on the main stream: the
-// hc read's router items write the FFN input's q8_1 rows, the gate/up launch builds CUDA0's plan itself (dec_moe_glue:
-// co-resident blocks, each plans once) and the ring's launch the tiers' kinds; 2 = with 1, the ring's work in one more
-// block of that launch (no ring launch beside); 4 = the combine four columns a thread, launched as the wait kernel's
-// programmatic dependent (its CUDA0 rows loaded while the wait spins)
-constexpr int dec_glue_mask() { return 7; }
-// dec_qsaf_mask (bit mask): 1 = a QSA layer's indexer key, K/V projections, K/V post and indexer query projection on
-// the side stream beside the query projection; 2 = with 1, the indexer query projection after the query projection on
-// the main stream instead; 4 = the block scores skip a window whose selections are all the identity; 8 = the head's
-// hyper-connection read for every column in one launch (not bitwise); 16 = layer 1's PLE in two launches after its
-// projections (native_ple_window); 32 = in place of 1, K, V and the indexer projections on three branches of their own;
-// 64 = the attention's merge also writes the output projection's q8_1 rows
-constexpr int dec_qsaf_mask() { return 124; }
-// dec_dtc2_mask (bit mask; 1, 2 and 4: dense_tc.cu's layouts and IQ3_S): 8 = the attention's hc read writes the
-// projections' q8_1 rows (its up slices), no quantize launch; 16 = a GDN layer's qkv and z projections in one
-// dense_tc_pair launch for every window width (z off the side stream); 128 = the out projection's weights prefetched
-// into L2 behind the in projections (GDN with 16) or the query post (QSA with dec_qsaf_mask & 32)
-constexpr int dec_dtc2_mask() { return 30; }
-// The commit graph in two launches, its GDN part from 32 persistent blocks so it trickles beside the draft instead of
-// filling the card (mode 2)
-constexpr int dec_commit_mode() { return 2; }
-constexpr int dec_commit_blocks() { return 32; }
+// The decode window's overlap structure (all always on): in windows of 2+ tokens the shared expert's side kernels run
+// at the greatest stream priority, so their blocks are scheduled ahead of the routed experts' queued blocks; in windows
+// of 1-2 tokens a GDN layer's z projection is forked at that priority beside the qkv projection; the MoE route is
+// split (CUDA0's plan and q8_1 rows on the main stream, the ring for the peer card and the CPU pool on a stream of its
+// own) with the hc read's router items writing the FFN input's q8_1 rows and the gate/up launch building CUDA0's plan
+// itself; the combine runs as the wait kernel's programmatic dependent.  A QSA layer's K, V and the indexer key/query
+// run on branches of their own beside the query projection; its block scores skip a window whose selections are all
+// the identity; the head's hyper-connection read does every column in one launch; layer 1's PLE takes two launches;
+// the attention's merge also writes the output projection's q8_1 rows.  The attention's hc read writes the
+// projections' q8_1 rows, and a GDN layer's qkv and z projections are one dense_tc_pair launch.
+// The commit graph is two launches, its GDN part from 32 persistent blocks so it trickles beside the draft instead of
+// filling the card
+constexpr int kCommitBlocks = 32;
 
 bool mapped(size_t bytes, void** h, void** d) {
     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
@@ -352,7 +334,7 @@ bool Verifier::dm_init(std::string& err) {
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
              cudaMemcpy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8, cudaMemcpyHostToDevice) == cudaSuccess;
-    if (ok && (dec_glue_mask() & 1))
+    if (ok)
         ok = cudaMalloc((void**) &d->ptab0, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab0, 0, (size_t) LE * 8) == cudaSuccess;
     if (ok && diagnostics().wait_stats)
@@ -758,18 +740,17 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
-    if (dec_pk()) {
+    {
         int least = 0, greatest = 0;
         if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess ||
             cudaStreamCreateWithPriority(&sh_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
-            ((dec_pk_mask() & 4) &&
-             (cudaStreamCreateWithPriority(&ring_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
-              cudaEventCreateWithFlags(&ev_ring_, cudaEventDisableTiming) != cudaSuccess ||
-              cudaEventCreateWithFlags(&ev_ring_join_, cudaEventDisableTiming) != cudaSuccess))) {
+            cudaStreamCreateWithPriority(&ring_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_ring_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_ring_join_, cudaEventDisableTiming) != cudaSuccess) {
             err = "verify: side stream create failed";
             return false;
         }
-        std::fprintf(stderr, "basalt verify: side-stream mask %d: side branches at stream priority %d\n", dec_pk_mask(), greatest);
+        std::fprintf(stderr, "basalt verify: side branches at stream priority %d\n", greatest);
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
@@ -777,7 +758,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: event create failed";
         return false;
     }
-    if (dec_qsaf_mask() & 32) {
+    {
         int least = 0, greatest = 0;
         bool qok = cudaDeviceGetStreamPriorityRange(&least, &greatest) == cudaSuccess;
         for (auto& q : qs_) qok = qok && cudaStreamCreateWithPriority(&q, cudaStreamNonBlocking, greatest) == cudaSuccess;
@@ -851,12 +832,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const bool dm = dm_ != nullptr && !batch_rec_;   // the device-planned tail (one group)
     const int G = (split_ && T >= 2 && !batch_rec_ && !dm) ? 2 : 1;   // a batch window is one group
-    constexpr bool dec_batch = true;
-    constexpr bool dec_qsa = true;
     // each hyper-connection read (and the FFN read's router) as one kernel; the next read's w_norm is prefetched into
     // L2 at its end
     const bool dec_hc = hc_fused_supported();
-    constexpr bool dec_hc_pf = false;
     // the dense chain's kernels (pdl.hpp) may start during the previous kernel's tail.  Only where that previous kernel
     // is one of them or another plain kernel; never with the profile's stamps.
     const bool pdl = pdl_rec_ && !prof_on_ && !batch_rec_;
@@ -919,9 +897,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
-    bool ring_fork[2] = {false, false};   // dec_pk_mask & 4: the group's ring stream is joined in post
-    bool glue_on[2] = {false, false};   // dec_glue_mask & 1: post's gate/up launch plans the group's VRAM share
-    DmRouteArgs glue_ring[2];   // dec_glue_mask & 2: the ring's work for post's gate/up launch
+    bool ring_fork[2] = {false, false};   // the group's ring stream is joined in post
+    bool glue_on[2] = {false, false};   // post's gate/up launch plans the group's VRAM share
+    DmRouteArgs glue_ring[2];   // the ring's work for post's gate/up launch
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
@@ -944,13 +922,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
-            const bool ple_batch_kv = dec_batch && n > 1 && ss.ple.w.key_bf16 != nullptr &&
+            const bool ple_batch_kv = n > 1 && ss.ple.w.key_bf16 != nullptr &&
                                       ss.ple.w.value_bf16 != nullptr && ple_native_bf16_enabled() &&
                                       ple_native_postops_enabled();
-            // dec_qsaf_mask & 16: the rows' write, post-ops, history advance and snapshots in two launches, the value
+            // the rows' write, post-ops, history advance and snapshots in two launches, the value
             // projection on the side stream beside the key's
             // (one row too: there the multi-row GEMVs are ple_block's own)
-            const bool ple_win = (dec_qsaf_mask() & 16) && !batch_rec_ && gr_native_mmvf_enabled() &&
+            const bool ple_win = !batch_rec_ && gr_native_mmvf_enabled() &&
                                  (ple_batch_kv || (n == 1 && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr &&
                                                    ple_native_bf16_enabled() && ple_native_postops_enabled()));
             cudaStream_t pside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
@@ -1032,7 +1010,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             h.mixed = mixed_ + tb * N; h.xn = xn_ + (size_t) tb * HC * N;
             return h;
         };
-        const bool read_q8 = dec_hc && (dec_dtc2_mask() & 8) && hc_fused_q8_rows_ok();
+        const bool read_q8 = dec_hc && hc_fused_q8_rows_ok();
         {
             // the read's first kernel follows a combine, copy or wait: a plain launch, except after the device-planned
             // tail's combine kernel (PDL2)
@@ -1042,17 +1020,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 HcFusedArgs h = hc_args(0, pending, inj2_, inj_);
                 if (read_q8) h.xq = xq_;
                 // the GDN qkv+z pair kernel follows (dense_tc_pair_mask & 16): its blocks start on the SMs the read leaves
-                h.next_early = read_q8 && (kernels::dense_tc_pair_mask() & 16) && (dec_dtc2_mask() & 16) &&
+                h.next_early = read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
                                !is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT &&
                                dec_gdnf_mode() != 0;
                 h.pf[0] = wn[1]->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float);
-                if (dec_hc_pf) {   // the FFN read's weights and router, read after the mixer
-                    const size_t mat = (size_t) g.hc_lr * HC * N * 2;
-                    h.pf[1] = wd[1]->data; h.pf_bytes[1] = mat;
-                    h.pf[2] = wu[1]->data; h.pf_bytes[2] = mat;
-                    const WeightRef* wr = v.get("ffn_gate_inp.weight");
-                    if (wr != nullptr) { h.pf[3] = wr->data; h.pf_bytes[3] = (size_t) NE * N * 2; }
-                }
                 hc_fused_read(h, cs);
             } else {
                 gr_read_group(0, pending, inj2_, inj_);
@@ -1093,21 +1064,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     cudaEventRecord(ev_join_, sh_cs_);
                 };
                 if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                // dec_dtc2_mask & 16: qkv and z in one dense_tc_pair launch for every window width, then the
+                // qkv and z in one dense_tc_pair launch for every window width, then the
                 // one-launch recurrence with the gated norm
                 const bool pair_ok = kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
                                      ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0;
-                if (gdnf && (dec_dtc2_mask() & 16) && !pair_ok)
+                if (gdnf && !pair_ok)
                     note_fallback("GDN qkv + z without dense_tc_pair", wqkv->native_type,
                                   wg->native_type);
-                if (gdnf && (dec_dtc2_mask() & 16) && pair_ok) {
+                if (gdnf && pair_ok) {
                     {
                         PdlScope pp(pdl);   // after the hc read or the q8_1 kernel
                         kernels::dense_tc_pair(wqkv->native_type, wqkv->native_data, qkv + (size_t) tb * C, (int) C,
                                                wg->native_type, wg->native_data, z_, (int) ZV, xq_, (int) N, n, cs);
-                        if (dec_dtc2_mask() & 128)   // the out projection's weights into L2 during the recurrence
-                            kernels::dense_tc_l2_prefetch(
-                                wout->native_data, native_mmvq_weight_bytes(wout->native_type, (int) ZV, (int) N), cs);
                     }
                     for (int i = 2; i <= 5; ++i) stamp(l, i, grp);
                     DecRecArgs ra;
@@ -1125,8 +1093,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     dense_proj(4, wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
                     goto gdn_done;
                 }
-                const bool pk_z = gdnf_fork && sh_hi_ != nullptr && (dec_pk_mask() & 2) && n <= 2;
-                if (pk_z) {   // dec_pk_mask & 2: z at the greatest priority beside qkv, then the one-launch recurrence
+                const bool pk_z = gdnf_fork && sh_hi_ != nullptr && n <= 2;
+                if (pk_z) {   // z at the greatest priority beside qkv, then the one-launch recurrence
                     cudaEventRecord(ev_fork_, cs);
                     cudaStreamWaitEvent(sh_hi_, ev_fork_, 0);
                     {
@@ -1238,10 +1206,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the window's rows each
                 // - row-wise identical arithmetic
-                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
+                const bool qb = n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
                 // the K norm + RoPE, the INT8 appends, the tail snapshot and the indexer appends of the group's rows in
                 // one launch, the same bits
-                const bool fused_pre = dec_qsa && !batch_rec_ && st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
+                const bool fused_pre = !batch_rec_ && st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
                                        native_qsa_enabled() && native_rope_enabled() && qsa_dec_fused_supported(s);
                 auto kv_post_args = [&] {
                     QsaDecKvPost kp;
@@ -1262,14 +1230,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     qp.idx_q_norm = (const float*) wiqn->data; qp.eps = EPS;
                     return qp;
                 };
-                // dec_qsaf_mask & 1: the indexer key, K/V and their post kernel (and the indexer query unless & 2) on
-                // the side stream while the main stream runs the query projection; joined before the query post
-                cudaStream_t qside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
-                const bool qsaf_side = (dec_qsaf_mask() & 1) && fused_pre && qb && qside != nullptr && ev_fork_ != nullptr &&
-                                       ev_join_ != nullptr;
-                // & 32: K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
+                // K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
                 // multi-row GEMV is the one-row one)
-                const bool qsaf_wide = (dec_qsaf_mask() & 32) && fused_pre && (qb || n == 1) && qs_[0] != nullptr;
+                const bool qsaf_wide = fused_pre && (qb || n == 1) && qs_[0] != nullptr;
                 if (qsaf_wide) {
                     {
                         PdlScope ps(pdl);   // after the hc read
@@ -1311,44 +1274,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     cudaStreamWaitEvent(cs, qev_[3], 0);
                     cudaStreamWaitEvent(cs, qev_[1], 0);
-                    for (int i = 7; i <= 9; ++i) stamp(l, i, grp);
-                    qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
-                    if (dec_dtc2_mask() & 128) {   // the out projection's weights into L2 during the attention
-                        PdlScope pf(pdl);
-                        kernels::dense_tc_l2_prefetch(
-                            wo->native_data, native_mmvq_weight_bytes(wo->native_type, (int) (NH * HD), (int) N), cs);
-                    }
-                } else if (qsaf_side) {
-                    const bool iq_main = (dec_qsaf_mask() & 2) != 0;
-                    {
-                        PdlScope ps(pdl);   // after the hc read
-                        if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                    }
-                    cudaEventRecord(ev_fork_, cs);
-                    cudaStreamWaitEvent(qside, ev_fork_, 0);
-                    {
-                        PdlScope pz(pdl, true);   // the side's first kernel follows the fork
-                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID,
-                                                  n, qside);
-                        dense_proj(32, wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD),
-                                   n, qside);
-                        dense_proj(32, wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD),
-                                   n, qside);
-                        qsa_dec_kv_post(kv_post_args(), n, s, rope_scaling(), qside);
-                        if (!iq_main)
-                            bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
-                                                      IQ * ID, N, IQ * ID, n, qside);
-                    }
-                    cudaEventRecord(ev_join_, qside);
-                    {
-                        PdlScope pq(pdl);   // after the q8_1 kernel
-                        dense_proj(8, wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
-                                   (int) (NH * 2 * HD), n, cs);
-                        if (iq_main)
-                            bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
-                                                      IQ * ID, N, IQ * ID, n, cs);
-                    }
-                    cudaStreamWaitEvent(cs, ev_join_, 0);
                     for (int i = 7; i <= 9; ++i) stamp(l, i, grp);
                     qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
                 } else {
@@ -1453,7 +1378,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 10, grp);
                 bool fused_gate = false;
-                bool attn_q8 = false;   // dec_qsaf_mask & 64: the merge wrote the q8_1 rows
+                bool attn_q8 = false;   // the merge wrote the q8_1 rows
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
@@ -1469,7 +1394,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 } else {
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs, -1, (dec_qsaf_mask() & 4) != 0);
+                                 s, scores_ + (size_t) tb * max_blocks_, cs, -1, true);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                sel_ + (size_t) tb * cap_, cs);
                 stamp(l, 11, grp);
@@ -1478,9 +1403,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 // staged chunks and the gate in the merge, the same bits
-                fused_gate = dec_qsa && native_qsa_enabled() && !st.kv_rot && !st.kv_hybrid &&
+                fused_gate = native_qsa_enabled() && !st.kv_rot && !st.kv_hybrid &&
                              qsa_dec_attn_supported(pools, s);
-                attn_q8 = fused_gate && (dec_qsaf_mask() & 64) && !st.kv_rot && !st.kv_hybrid;
+                attn_q8 = fused_gate && !st.kv_rot && !st.kv_hybrid;
                 if (fused_gate)
                     qsa_dec_attn(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_, s,
                                  attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs,
@@ -1513,17 +1438,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 16, grp);
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-        const bool router_multi = dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
+        const bool router_multi = n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
         bool routed = false;   // the fused read ran the router too
         const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
-        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && (dec_pk_mask() & 1) && n >= 2 ? sh_hi_ : sh_cs_) : cs;
-        // dec_pk_mask & 4: the ring on its own stream, forked after the router, joined where the side branch is
+        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && n >= 2 ? sh_hi_ : sh_cs_) : cs;
+        // the ring on its own stream, forked after the router, joined where the side branch is
         const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && ring_hi_ != nullptr;
         ring_fork[grp] = pk_ring;
-        // dec_glue_mask & 1: the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
+        // the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
         glue_on[grp] = false;
-        if ((dec_glue_mask() & 1) && pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
+        if (pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
             const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
             glue_on[grp] = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
             if (!glue_on[grp]) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
@@ -1538,23 +1463,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (glue_on[grp]) h.xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
                     routed = true;
                 }
-                const WeightRef *next_norm = nullptr, *next_down = nullptr, *next_up = nullptr;
-                if (l + 1 < g.n_layers) {
-                    const LayerView vn(wt, l + 1);
-                    next_norm = vn.get("hc_attn_norm.weight");
-                    next_down = vn.get("hc_attn_down.weight");
-                    next_up = vn.get("hc_attn_up.weight");
-                } else {
-                    next_norm = wt.find("output_hc_norm.weight");
-                    next_down = wt.find("output_hc_down.weight");
-                    next_up = wt.find("output_hc_up.weight");
-                }
+                const WeightRef* next_norm = nullptr;
+                if (l + 1 < g.n_layers) next_norm = LayerView(wt, l + 1).get("hc_attn_norm.weight");
+                else next_norm = wt.find("output_hc_norm.weight");
                 if (next_norm != nullptr) { h.pf[0] = next_norm->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float); }
-                if (dec_hc_pf && next_down != nullptr && next_up != nullptr) {   // the next read's weights, read after the experts
-                    const size_t mat = (size_t) g.hc_lr * HC * N * 2;
-                    h.pf[1] = next_down->data; h.pf_bytes[1] = mat;
-                    h.pf[2] = next_up->data; h.pf_bytes[2] = mat;
-                }
                 hc_fused_read(h, cs);
             } else {
                 gr_read_group(1, true, inj_, inj2_);
@@ -1596,7 +1508,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
             PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
-            if (glue_on[grp] && (dec_glue_mask() & 2)) {   // the ring's work inside post's gate/up launch
+            if (glue_on[grp]) {   // the ring's work inside post's gate/up launch
                 glue_ring[grp] = ra;
                 glue_ring[grp].mode = 2; glue_ring[grp].kinds = true;
                 ring_fork[grp] = false;
@@ -1647,8 +1559,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
             {
             if (!shared_expert_native_bf16_enabled()) {
-                if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
-                else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
+                f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
             }
             try {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
@@ -1712,7 +1623,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 ga.ids = ids_ + tb * K; ga.ptab = dm_->ptab0 + l * g.n_expert;
                 ga.n_tok = n; ga.k = (int) K; ga.n_expert = (int) g.n_expert;
                 ga.plan = P; ga.xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
-                if (dec_glue_mask() & 2) { ga.ring_on = true; ga.ring = glue_ring[grp]; }
+                { ga.ring_on = true; ga.ring = glue_ring[grp]; }
                 dec_moe_glue(L, ga, hit_scratch_, parts_out, (int) cap, cs);
             } else if (dm_->vram >= 0)
                 dec_moe_vram(L, P, nat_xq_ + (size_t) tb * (N / 32) * 36, dm_->vscr, parts_out, dm_->vsync, cs, dm_->vram,
@@ -1760,11 +1671,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 23, grp);
                 if (remote_opt_)   // the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
-                else if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+                else   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
                     copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                           p_dst, p_counts + 1, cs);
-                else
-                    copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
             moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
@@ -1773,14 +1682,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (ring_fork[grp]) cudaStreamWaitEvent(cs, ev_ring_join_, 0);   // the ring's launch
         }
         if (dm) {
-            const bool cdep = (dec_glue_mask() & 4) != 0;   // the combine as the wait's programmatic dependent
-            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, cdep);
+            dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, true);   // true: the combine is the wait's programmatic dependent
             stamp(l, 23, grp);
             try {
                 dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
-                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs, cdep);
+                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs, true);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
-        } else if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
+        } else if (n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
                 native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
@@ -1865,7 +1773,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                if (dec_qsa && head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits, one wave
+                if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits, one wave
                     q5k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
                 else
                     native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
@@ -2016,8 +1924,7 @@ bool Verifier::capture_commit(std::string& err) {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        static const bool dec_commit = dec_commit_mode() > 0;
-        if (dec_commit) {   // every GDN layer's replay in one launch, every QSA layer's indexer appends in another
+        {   // every GDN layer's replay in one launch, every QSA layer's indexer appends in another
             GdnCommitLayers ga;
             ga.state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
             ga.h = h_L_ + (size_t) gdn_index * MT * C; ga.qkv = qkv_L_ + (size_t) gdn_index * MT * C;
@@ -2040,34 +1947,8 @@ bool Verifier::capture_commit(std::string& err) {
                 q.max_cells = (int) st.max_cells;
             }
             if (ok) {
-                gdn_commit_layers(ga, cs_, dec_commit_blocks());
+                gdn_commit_layers(ga, cs_, kCommitBlocks);
                 native_qsa_indexer_commit_layers(qa, s, rope_scaling(), cs_);
-            }
-        }
-        for (int64_t l = lb_; l < le_ && ok && !dec_commit; ++l) {
-            const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
-                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
-                if (!wnm) { ok = false; break; }
-                float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
-                gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
-                gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
-                                    beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
-                                    (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_, (int) MT);
-                ++gdn_index;
-            } else {
-                const QsaState& st = ss.qsa_states[qsa_index];
-                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
-                if (!wikn) { ok = false; break; }
-                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
-                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                for (int64_t t = 0; t < MT; ++t)
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
-                                              (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                              rope_scaling(), cs_);
-                ++qsa_index;
             }
         }
         if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs_);

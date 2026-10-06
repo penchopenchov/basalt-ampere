@@ -324,9 +324,9 @@ private:
     cudaStream_t sh_cs_ = nullptr;
     cudaStream_t sh_hi_ = nullptr;   // the shared expert's side stream at the greatest priority
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
-    cudaStream_t qs_[3] = {nullptr, nullptr, nullptr};   // dec_qsaf_mask & 32: a QSA layer's three branches
+    cudaStream_t qs_[3] = {nullptr, nullptr, nullptr};   // a QSA layer's three branches
     cudaEvent_t qev_[4] = {nullptr, nullptr, nullptr, nullptr};
-    cudaStream_t ring_hi_ = nullptr;   // dec_pk_mask & 4: the MoE ring's stream at the greatest priority
+    cudaStream_t ring_hi_ = nullptr;   // the MoE ring's stream at the greatest priority
     cudaEvent_t ev_ring_ = nullptr, ev_ring_join_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
@@ -389,7 +389,7 @@ private:
     uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
-    float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM (dec_qsaf_mask & 16)
+    float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 

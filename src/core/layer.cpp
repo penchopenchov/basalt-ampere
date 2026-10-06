@@ -145,9 +145,8 @@ if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset,
 // namespace
 void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
 void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
-namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false; }
+namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false; }
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
-void qsa_set_kv_int8_rotate(bool enabled) { g_kv_int8_rot = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
 void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
 bool qsa_kv_q4() { return g_kv_q4; }
@@ -550,7 +549,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.kv_int8 = false;
         st.kv_q4 = false;
     }
-    st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
+    st.kv_rot = st.kv_q4;   // K8V4 rotates only V (below)
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots

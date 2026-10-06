@@ -1589,7 +1589,6 @@ int main(int argc, char** argv) {
     }
     basalt::core::qsa_set_kv_int8(o.kv == "int8");
     basalt::core::qsa_set_kv_q4(o.kv == "q4_0");   // 4-bit codes after a Hadamard rotation (kv_q4.hpp)
-    basalt::core::qsa_set_kv_int8_rotate(false);
     basalt::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "basalt generate: --kv-resident must be >= 0\n");

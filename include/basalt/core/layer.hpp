@@ -219,7 +219,7 @@ struct QsaState {
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
     bool kv_hybrid = false;
     /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
-    /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
+    /// back: for Q4_0
     bool kv_rot = false;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
     int64_t n_pages = 0;
@@ -283,8 +283,6 @@ uint64_t qsa_kv_host_bytes();
 /// Store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and initializing the
 /// session; default off.
 void qsa_set_kv_int8(bool enabled);
-/// INT8 K/V through the Hadamard rotation (off by default)
-void qsa_set_kv_int8_rotate(bool enabled);
 bool qsa_kv_int8();
 /// Store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
