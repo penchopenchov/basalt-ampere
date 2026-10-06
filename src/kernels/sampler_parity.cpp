@@ -1,13 +1,13 @@
-// src/kernels/sampler_parity.cpp - P2.S2's test for the sampler chain.
+// src/kernels/sampler_parity.cpp - the test for the sampler chain.
 //
-// THE CHECK THAT MATTERS IS THAT THE ORDER IS OBSERVABLE.  A sampler in the wrong order still returns a valid
-// token, so "it produced a token" proves nothing; and because temperature is MONOTONIC it does not change which
-// tokens `top_k` keeps, so a top-k-only fixture cannot see the order either.  What it changes is `top_p`'s CUT:
-// at T < 1 the distribution sharpens, the cumulative mass reaches p sooner, and fewer tokens survive.
+// THE CHECK THAT MATTERS IS THAT THE ORDER IS OBSERVABLE.  A sampler in the wrong order still returns a valid token, so
+// "it produced a token" proves nothing; and because temperature is MONOTONIC it does not change which tokens `top_k`
+// keeps, so a top-k-only fixture cannot see the order either.  What it changes is `top_p`'s CUT: at T < 1 the
+// distribution sharpens, the cumulative mass reaches p sooner, and fewer tokens survive.
 //
 // So this builds a fixture where that happens, computes the greedy pick under BOTH orders, and requires them to
-// DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would
-// pass against either order.
+// DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would pass
+// against either order.
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -157,10 +157,9 @@ float host_philox_uniform(uint64_t seed, uint64_t counter) {
     return (float) (c0 >> 8) * (1.0f / 16777216.0f);
 }
 
-// The full SAMPLED chain, host side - the kernel's `sampler_kernel` in serial form, in llama.cpp's order:
-// penalties on the raw logits during the top_k selection (ties to the lowest index), top_p's cut in double over
-// the top_k list, the min_p prefix cut on its survivors, the temperature, and one Philox draw at
-// (seed, counter + row).  One penalties stage (issue #53: this reference used to repeat the kernel's second one).
+// The full SAMPLED chain, host side, in llama.cpp's order: penalties on the raw logits during the top_k selection
+// (ties to the lowest index), top_p's cut in double over the top_k list, the min_p prefix cut on its survivors, the
+// temperature, and one Philox draw at (seed, counter + row).  One penalties stage.
 int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
                       const strata::kernels::SamplerParams& p, int row) {
     auto penal = [&](float logit, int count) {
@@ -186,7 +185,7 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
         taken[(size_t) best] = 1;
         sel_ids.push_back(best); sel_logit.push_back(bv);
     }
-    // llama.cpp's order (issue #53): top_p over the whole top_k list, then min_p on its survivors
+    // llama.cpp's order: top_p over the whole top_k list, then min_p on its survivors
     const int n_sel = (int) sel_ids.size();
     int n_keep = n_sel;
     if (p.top_p < 1.0f) {
@@ -207,7 +206,7 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
             if (sel_logit[(size_t) i] < thresh) { n_keep = i; break; }
     }
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    auto scaled = [&](int i) { return sel_logit[(size_t) i] * inv_t; };   // one penalties stage, before (#53)
+    auto scaled = [&](int i) { return sel_logit[(size_t) i] * inv_t; };   // one penalties stage, before
     float smx = scaled(0);
     for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, scaled(i));
     double sum = 0.0;
@@ -268,15 +267,15 @@ int sampled_cut(const std::vector<float>& l, const std::vector<int>& hist, const
 // ---- the kernel's own semantics, for the fixtures ----
 //
 // `sampled_reference` picks the first unpicked logit even when it is -inf or NaN; the kernels never pick either, and
-// a round that finds nothing stores id 0 with a -inf logit (and later rounds treat id 0 as taken, as `sampler_kernel`
-// does).  The mirror below follows the kernels, so rows with -inf, NaN, +inf and more requested than finite logits
+// a round that finds nothing stores id 0 with a -inf logit (and later rounds treat id 0 as taken, as the kernels do)
+// The mirror below follows the kernels, so rows with -inf, NaN, +inf and more requested than finite logits
 // can be pinned exactly.  On rows without those it is `sampled_reference`.
 struct SelList {
     std::vector<int> ids;
     std::vector<float> logit;
 };
 
-// The top_k list of `sampler_kernel` for one row: `window` is the counted history (the row's last penalty_last_n).
+// The top_k list for one row: `window` is the counted history (the row's last penalty_last_n).
 SelList mirror_select(const float* l, int nv, const std::vector<int>& window, const strata::kernels::SamplerParams& p,
                       int k) {
     std::vector<float> s((size_t) nv);
@@ -305,7 +304,7 @@ SelList mirror_select(const float* l, int nv, const std::vector<int>& window, co
     return out;
 }
 
-// The tail of `sampler_kernel` over a list (its first `k` entries): top_p, min_p, temperature, the Philox draw.
+// The tail over a list (its first `k` entries): top_p, min_p, temperature, the Philox draw.
 int mirror_pick(const SelList& sel, int k, const strata::kernels::SamplerParams& p, int row) {
     int n_keep = k;
     float mx = sel.logit[0];
@@ -605,16 +604,14 @@ int main(int argc, char** argv) {
         bad += run("penalties: presence is boolean", lb, NT2, q, want_b, hist_b, 4);
     }
 
-    // ---- fixture 5: TEMPERATURE 0 MUST STILL RETURN THE ARGMAX.  Regression test for a real bug.
+    // ---- fixture 5: TEMPERATURE 0 MUST STILL RETURN THE ARGMAX.
     //
-    // The greedy branch used to read `apply_penalties(l[v] * inv_t, ...)`.  `inv_t` is 0.0f whenever
-    // temperature <= 0, so at temperature 0 EVERY logit became 0.0f and the argmax returned index 0 - the
-    // sampler emitted token 0 forever, whatever the model predicted.  OpenAI clients send `temperature: 0`
-    // for greedy decoding, so this was reachable from any ordinary client.
+    // At temperature <= 0, `inv_t` is 0.0f, so a greedy branch that scaled the logits by it would turn EVERY logit into
+    // 0.0f and the argmax would return index 0 - the sampler would emit token 0 forever, whatever the model predicted.
+    // Clients send `temperature: 0` for greedy decoding, so this is reachable from any ordinary client.
     //
-    // It survived because EVERY other greedy fixture in this file sets temperature = 1.0f, where inv_t = 1.0
-    // and the extra multiply is harmless.  The bug needs temperature <= 0 to appear, and no fixture used it.
-    // The fixture below makes token 0 the WORST token in every row, so returning 0 is unambiguously wrong.
+    // Every other greedy fixture here sets temperature = 1.0f, where inv_t = 1.0 and the extra multiply is harmless;
+    // this one makes token 0 the WORST token in every row, so returning 0 is unambiguously wrong.
     {
         const int NV3 = 512, NT3 = 4;
         std::vector<float> l((size_t) NV3 * NT3, -5.0f);
@@ -745,12 +742,11 @@ int main(int argc, char** argv) {
         else bad += run("penalty window: tail only", {l.begin(), l.end()}, 1, p, {want}, hist, 8);
     }
 
-    // ---- fixture 9: ONE PENALTIES STAGE (issue #53), against an independently computed distribution, not the
-    // reference above (which had copied the kernel's mistake).  Two tokens with equal logits, token 0 in the
-    // history, presence penalty 1.5, temperature 0.7: llama.cpp's chain gives token 0 the logit (0 - 1.5) / 0.7,
-    // P = 1 / (1 + exp(1.5 / 0.7)) = 0.1050; a second penalty after the temperature made it 0.0255.  Over 8,000
-    // draws the kernel's share of token 0 must be near 0.105 (4 sigma = 0.014), and its picks must equal the
-    // reference's draw for draw.
+    // ---- fixture 9: ONE PENALTIES STAGE, against an independently computed distribution, not the reference above.
+    // Two tokens with equal logits, token 0 in the history, presence penalty 1.5, temperature 0.7: llama.cpp's chain
+    // gives token 0 the logit (0 - 1.5) / 0.7, P = 1 / (1 + exp(1.5 / 0.7)) = 0.1050; a second penalty after the
+    // temperature would make it 0.0255.  Over 8,000 draws the kernel's share of token 0 must be near 0.105 (4 sigma =
+    // 0.014), and its picks must equal the reference's draw for draw.
     {
         const int NT9 = 8000;
         strata::kernels::SamplerParams p;
@@ -796,9 +792,9 @@ int main(int argc, char** argv) {
         bad += run("sampled chain: top_p then min_p", l, NT10, p, want);
     }
 
-    // ---- fixture 11: A STALE HISTORY WITH last_n = 0 IS INERT (PR #59).  A caller can hand over a history buffer
-    // from a previous penalised request while this request disables the penalties - the run must equal the
-    // no-history run in both kernels, and the bitmap the launch did not size must stay untouched.
+    // ---- fixture 11: A STALE HISTORY WITH last_n = 0 IS INERT.  A caller can hand over a history buffer from a
+    // previous penalised request while this request disables the penalties - the run must equal the no-history run in
+    // both kernels, and the bitmap the launch did not size must stay untouched.
     {
         std::mt19937 rng(11); std::normal_distribution<float> g(0.0f, 1.0f);
         std::vector<float> l((size_t) NV * NT);
@@ -822,12 +818,11 @@ int main(int argc, char** argv) {
         bad += run("stale history, last_n=0 (greedy)", l, NT, gp, gwant, hist, 8);
     }
 
-    // ---- fixture 12: ONE HISTORY PER ROW (engine 0.1.19).  A verify window samples T rows, and row t's pick
-    // follows the drafts 1..t: its penalties must count them.  The engine used to stage row 0 alone, so rows
-    // 1..T-1 read slots nobody wrote.  Here every row gets `penalty_rows`' history and is pinned against a
-    // per-row scalar reference; the fixture first asserts it can SEE the difference - with row 0's history
-    // copied to every row (the nearest well-defined stand-in for the old staging) some row must pick differently.
-    // Row t's own newest token (window[t]) is its favourite by a margin the presence penalty overturns.
+    // ---- fixture 12: ONE HISTORY PER ROW.  A verify window samples T rows, and row t's pick follows the drafts 1..t: its
+    // penalties must count them.  Here every row gets `penalty_rows`' history and is pinned against a per-row scalar
+    // reference; the fixture first asserts it can SEE the difference - with row 0's history copied to every row some
+    // row must pick differently.  Row t's own newest token (window[t]) is its favourite by a margin the presence
+    // penalty overturns.
     {
         auto greedy_pen = [](const std::vector<float>& l, const std::vector<int>& hist,
                              const strata::kernels::SamplerParams& p) {
@@ -886,9 +881,9 @@ int main(int argc, char** argv) {
         if (observable == 0) ++bad;
     }
 
-    // ---- fixture 13: HISTORY IDS OUTSIDE THE VOCABULARY ARE IGNORED.  The bitmap is sized for n_vocab bits;
-    // an id >= n_vocab used to set a bit past its end (a shared-memory write out of bounds - compute-sanitizer
-    // memcheck reports it).  They can never be a candidate, so the result equals the reference without them.
+    // ---- fixture 13: HISTORY IDS OUTSIDE THE VOCABULARY ARE IGNORED.  The bitmap is sized for n_vocab bits; an id >=
+    // n_vocab would set a bit past its end (a shared-memory write out of bounds - compute-sanitizer memcheck reports
+    // it).  They can never be a candidate, so the result equals the reference without them.
     {
         std::mt19937 rng(13); std::normal_distribution<float> g(0.0f, 1.0f);
         const int H = 16;
@@ -930,9 +925,9 @@ int main(int argc, char** argv) {
         bad += run("out-of-vocab history ids (sampled)", l, NT, sp2, swant, hist, H);
     }
 
-    // ---- fixture 14: THE top_k CONTRACT.  1..64 as given; 0 ("off") and anything wider use the widest list the
-    // kernel keeps, 64 - and every row is written (the sampled kernel used to print an error for 0 and leave the
-    // row unwritten, which a verify window then read as a token; `run` pre-fills -1 so that fails here).
+    // ---- fixture 14: THE top_k CONTRACT.  1..64 as given; 0 ("off") and anything wider use the widest list the kernel
+    // keeps, 64 - and every row is written (an unwritten row would be read by a verify window as a token; `run`
+    // pre-fills -1 so that fails here).
     {
         std::mt19937 rng(14); std::normal_distribution<float> g(0.0f, 1.0f);
         std::vector<float> l((size_t) NV * NT);
@@ -952,9 +947,8 @@ int main(int argc, char** argv) {
         bad += run("sampled top_k=-3 means 64", l, NT, pneg, want);
     }
 
-    // ---- fixture 15: `penalty_rows`, host only, against the plain definition: row t = the last h tokens of
-    // tail + window[0..t], -1 padded in front.  Covers a tail shorter than, equal to and longer than h, and row 0
-    // equal to the single row the engine staged before 0.1.19.
+    // ---- fixture 15: `penalty_rows`, host only, against the plain definition: row t = the last h tokens of tail +
+    // window[0..t], -1 padded in front.  Covers a tail shorter than, equal to and longer than h.
     {
         int wrong = 0, cases = 0;
         for (int n_tail : {0, 1, 5, 63, 64, 65, 300}) {

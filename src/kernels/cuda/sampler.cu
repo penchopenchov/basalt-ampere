@@ -1,24 +1,20 @@
-// src/kernels/cuda/sampler.cu - P2.S2: the sampler chain, in llama.cpp's order.
+// src/kernels/cuda/sampler.cu - the sampler chain, in llama.cpp's order.
 //
 //     penalties -> top_k -> top_p -> min_p -> temperature -> pick
 //
-// THE ORDER IS THE WHOLE CONTENT OF THIS FILE.  llama.cpp builds its chain by walking `params.samplers`, whose
-// default is { PENALTIES, DRY, TOP_N_SIGMA, TOP_K, TYPICAL_P, TOP_P, MIN_P, XTC, TEMPERATURE } (`common/common.h`
-// at 3cf03257) - ONE penalties stage, first, and TEMPERATURE AFTER THE TRUNCATION FILTERS.  (Issue #53: this file
-// used to apply the penalties a second time after the temperature, and min_p before top_p - both taken from the
-// order of the `case` labels in `common/sampling.cpp`, which is not the order the chain runs.)  Every order
-// produces a valid token, so only a comparison at the distribution level can tell them apart; the parity test
-// does that against an independently computed distribution.
+// THE ORDER IS THE WHOLE CONTENT OF THIS FILE.  llama.cpp builds its chain by walking `params.samplers`, whose default
+// is { PENALTIES, DRY, TOP_N_SIGMA, TOP_K, TYPICAL_P, TOP_P, MIN_P, XTC, TEMPERATURE } - ONE penalties stage, first,
+// and TEMPERATURE AFTER THE TRUNCATION FILTERS.  Every order produces a valid token, so only a comparison at the
+// distribution level can tell them apart; the parity test does that against an independently computed distribution.
 //
 // `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary (on sm_90+ without penalties,
-// `sampler_greedy_cluster_kernel`: the same token from a cluster of 8 CTAs per row).  The sampled chain has
-// three implementations that pick the same token, bit for bit:
+// `sampler_greedy_cluster_kernel`: the same token from a cluster of 8 CTAs per row).  The sampled chain has two
+// implementations that pick the same token, bit for bit:
 //   - the SPLIT top_k (default): `sampler_split_part_kernel` cuts each row into 4,096-logit blocks over the whole
 //     GPU, each keeps its own top_k, and `sampler_split_merge_kernel` merges those lists and runs the tail;
-//   - `sampler_one_block_kernel` (the fallback when the split cannot run): one
-//     block per token, `top_k` block-argmax rounds, each over the logits after the previous pick;
-//   - `sampler_kernel`, the block-per-token reference the others are checked against.
-// The two new ones share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
+//   - `sampler_one_block_kernel` (the fallback when the split cannot run): one block per token, `top_k` block-argmax
+//     rounds, each over the logits after the previous pick.
+// Both share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
 
@@ -34,9 +30,9 @@
 namespace strata::kernels {
 namespace {
 
-// Philox 4x32-10, the counter-based generator the phase asks for.  Counter-based matters because it makes the
-// stream a function of (seed, position) rather than of how many draws came before - so a batch can be sampled
-// in any order and a run is reproducible.
+// Philox 4x32-10, a counter-based generator.  Counter-based matters because it makes the stream a function of
+// (seed, position) rather than of how many draws came before - so a batch can be sampled in any order and a run is
+// reproducible.
 __device__ __forceinline__ uint32_t philox4x32_round(uint32_t& c0, uint32_t& c1, uint32_t& c2, uint32_t& c3,
                                                      uint32_t k0, uint32_t k1) {
     const uint32_t hi0 = __umulhi(0x9E3779B9u, c0);
@@ -79,25 +75,18 @@ __device__ __forceinline__ float apply_penalties(float logit, int count, const S
     return logit;
 }
 
-/// **THE GREEDY ARGMAX, ONE BLOCK PER TOKEN, COVERING THE VOCABULARY.**
-///
-/// **WHY THIS IS A SEPARATE KERNEL AND NOT A BRANCH.**  `sampler_kernel` is launched as a grid over TOKENS
-/// with 64 threads and a `if (t >= n_tokens) return;` at the top.  The decode path has `n_tokens == 1`, so
-/// that launch was `<<<1, 64>>>`, 63 threads exited on the first line, and ONE THREAD walked all 248,320
-/// logits in a dependent loop on one SM of 48.  Measured in isolation (`bench/micro/sampler_cost.cu`):
-/// **3.11 ms per token**, 5.7% of an ~54 ms token, and the whole of round 309's `sample` phase - the two
-/// synchronisations around it are 0.03 ms each.
-///
-/// The obvious repair is to parallelise the scan inside `sampler_kernel`, and it is WRONG: with one thread
-/// per token, a block reduction over the vocabulary has nothing to reduce, and the threads that returned
-/// early are not there for `__syncthreads` or `__shfl_down_sync`.  The first attempt did exactly that and
-/// produced the token `5120` thirty-two times.  The grid has to be over tokens with the BLOCK over the
-/// vocabulary, which is a different launch configuration and therefore a different kernel.
-///
-/// **THE TIE RULE IS UNCHANGED AND THAT IS THE WHOLE CORRECTNESS ARGUMENT.**  The serial scan walked `v`
-/// ascending with `if (s > bv)`, so the LOWEST index wins a tie.  Each thread keeps that rule over its own
-/// strided subset and the reduction resolves two candidates by taking the larger value and, on equality, the
-/// SMALLER index - the same total order, so `sampler_parity` and C1 see no change.
+/// /// **THE GREEDY ARGMAX, ONE BLOCK PER TOKEN, COVERING THE VOCABULARY.**
+/// ///
+/// /// **WHY THIS IS A SEPARATE KERNEL AND NOT A BRANCH.**  The decode path has `n_tokens == 1`, so a grid over TOKENS
+/// /// with 64 threads would leave 63 threads exiting at once and ONE THREAD walking the whole vocabulary in a
+/// /// dependent loop on one SM.  Parallelising the scan inside such a kernel is WRONG: with one thread per token, a
+/// /// block reduction over the vocabulary has nothing to reduce, and the threads that returned early are not there for
+/// /// `__syncthreads` or `__shfl_down_sync`.  The grid has to be over tokens with the BLOCK over the vocabulary, which
+/// /// is a different launch configuration and therefore a different kernel.
+/// ///
+/// /// **THE TIE RULE IS THE WHOLE CORRECTNESS ARGUMENT.**  A serial scan walks `v` ascending with `if (s > bv)`, so
+/// /// the LOWEST index wins a tie.  Each thread keeps that rule over its own strided subset and the reduction resolves
+/// /// two candidates by taking the larger value and, on equality, the SMALLER index - the same total order.
 __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vocab,
                                       const int* __restrict__ history, int history_len, const SamplerParams p,
                                       int pmin, int plen, int* __restrict__ out) {
@@ -112,11 +101,10 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
         hrow += history_len - hlen;          // the window is the TAIL
     }
 
-    // PENALTY MEMBERSHIP AS A BITMAP.  The history touches at most `hlen` tokens of a quarter-million
-    // vocabulary, but the naive `history_count` per candidate per argmax round costs O(k x n_vocab x hlen)
-    // integer compares (~318 M per token at k=20, hlen=64 - measured 45 -> 31 tok/s on a real workload).
-    // A shared bitmap gives an O(1) membership test, and only the (at most hlen) hits pay the count scan;
-    // the counts - and therefore every sampled value - are exactly what the per-candidate scan produced.
+    // PENALTY MEMBERSHIP AS A BITMAP.  The history touches at most `hlen` tokens of a quarter-million vocabulary, but
+    // a `history_count` per candidate per argmax round costs O(k x n_vocab x hlen) integer compares.  A shared bitmap
+    // gives an O(1) membership test, and only the (at most hlen) hits pay the count scan; the counts - and therefore
+    // every sampled value - are exactly what the per-candidate scan produces.
     extern __shared__ unsigned int penal_bits[];
     const int bits_words = (int) ((n_vocab + 31) / 32);
     // The gate needs a NON-EMPTY WINDOW (`hlen > 0`): the launch sizes the shared bitmap only when penalties
@@ -167,20 +155,19 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     }
 }
 
-/// **THE SAME ARGMAX ON A THREAD-BLOCK CLUSTER (sm_90+, S19), FOR THE CALLS WITHOUT PENALTIES.**  One block per
-/// token reads its 1 MB row (248,320 logits) on one SM with one load in flight per thread: latency-bound, 40 us per
-/// call on an RTX 5070, for every verify window and every draft step.  Here a cluster of `kAmCtas` CTAs shares the
-/// row, each thread keeps four loads in flight, and the CTAs' results meet in CTA 0's shared memory (distributed
-/// shared memory): 6 us (decode_cluster_parity --bench).
-///
-/// The answer is a function of the row alone, so it is the one-block kernel's bit for bit: the LOWEST index whose value
-/// is the largest non-NaN value above -inf (each thread walks its elements in ascending order with a strict `>`, and
-/// every merge takes the larger value or, on equality, the smaller index - an order-free rule), and 0 when there is
-/// none (all -inf / NaN), as there.  NaN never wins a `>`.
-///
-/// Barriers: a relaxed cluster arrive at entry, waited before the remote store (CTA 0 must be running); each CTA's
-/// result goes to slot `rank` of CTA 0, released by the next arrive; CTAs 1.. then exit (a cluster wait counts the
-/// threads that have not exited) and CTA 0 waits, reads its own slots, and writes the token.
+/// /// **THE SAME ARGMAX ON A THREAD-BLOCK CLUSTER (sm_90+), FOR THE CALLS WITHOUT PENALTIES.**  One block per token
+/// /// reading a long row on one SM with one load in flight per thread is latency-bound, for every verify window and
+/// /// every draft step.  Here a cluster of `kAmCtas` CTAs shares the row, each thread keeps four loads in flight, and
+/// /// the CTAs' results meet in CTA 0's shared memory (distributed shared memory).
+/// ///
+/// /// The answer is a function of the row alone, so it is the one-block kernel's bit for bit: the LOWEST index whose value
+/// /// is the largest non-NaN value above -inf (each thread walks its elements in ascending order with a strict `>`, and
+/// /// every merge takes the larger value or, on equality, the smaller index - an order-free rule), and 0 when there is
+/// /// none (all -inf / NaN), as there.  NaN never wins a `>`.
+/// ///
+/// /// Barriers: a relaxed cluster arrive at entry, waited before the remote store (CTA 0 must be running); each CTA's
+/// /// result goes to slot `rank` of CTA 0, released by the next arrive; CTAs 1.. then exit (a cluster wait counts the
+/// /// threads that have not exited) and CTA 0 waits, reads its own slots, and writes the token.
 constexpr int kAmCtas = 8;      // CTAs per token (the portable cluster size)
 constexpr int kAmThreads = 1024;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -336,15 +323,15 @@ __global__ void __launch_bounds__(kAmThreads) sampler_greedy_top_prob_cluster_ke
 #endif
 }
 
-// ---- the same list, in the same order, without the `taken` sweep ----
+// ---- the sampled list, in selection order ----
 //
-// THE SELECTION ORDER.  `sampler_kernel`'s rounds rank a candidate (value, id) before (value', id') when value >
-// value', or value == value' and id < id' - each thread's ascending scan keeps the first maximum it meets (strict
-// `>`), and the reductions resolve a tie to the lower id.  That is a strict total order (-0 and +0 compare equal and
-// fall to the id, as there), so round i picks the i-th logit of the order.  NaN and -inf are never picked (`s > bv`
-// from -inf fails); a round that finds nothing yields the SENTINEL (-inf, n_vocab), stored as id 0.
+// THE SELECTION ORDER.  The rounds rank a candidate (value, id) before (value', id') when value > value', or value ==
+// value' and id < id' - each thread's ascending scan keeps the first maximum it meets (strict `>`), and the reductions
+// resolve a tie to the lower id.  That is a strict total order (-0 and +0 compare equal and fall to the id), so round
+// i picks the i-th logit of the order.  NaN and -inf are never picked (`s > bv` from -inf fails); a round that finds
+// nothing yields the SENTINEL (-inf, n_vocab), stored as id 0.
 
-constexpr int kSelMax = 64;               // the widest top_k list, `sampler_kernel`'s KMAX
+constexpr int kSelMax = 64;   // the widest top_k list
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 
 // top_k 1..64 as given; 0 ("off") and anything wider keep 64; never more than the vocabulary
@@ -370,16 +357,12 @@ __device__ __forceinline__ void warp_first(float& bv, int& bi) {
     }
 }
 
-/// **THE TAIL ON ONE WARP, WITH `sampler_kernel`'S ARITHMETIC.**  `sel_ids` / `sel_logit` (shared, `k` entries) are
-/// the top_k list in selection order; the 32 lanes of one warp call this and lane 0 writes `out[t]`.  The old tail
-/// ran on all 1,024 threads, each computing the same ~4k double `exp`s - FP64 issues at 1/64 of FP32 on GeForce.
-/// Here the lanes share the `exp`s (one per entry, into `ex`) and then the quotients, and lane 0 alone runs the two
-/// ORDERED sums and the two cumulative scans.  Every double is the one the old chain computed: the same `exp` of
-/// the same argument, the sums in the same order, `cum += e / sum` with the same correctly rounded quotient - so
-/// the cut, the survivors and the pick are the same.  (`n_keep == 0`, reachable only with min_p > 1, which the
-/// callers clamp, read `sel_ids[-1]` in the old tail; it reads `sel_ids[0]` here.)
-/// kProb (the coupled draft only): lane 0 also writes the pick's probability under the final distribution to
-/// `*prob_out`.  The sampler's own calls take kProb = false, whose code is the tail above, unchanged.
+/// /// **THE TAIL ON ONE WARP.**  `sel_ids` / `sel_logit` (shared, `k` entries) are the top_k list in selection order;
+/// /// the 32 lanes of one warp call this and lane 0 writes `out[t]`.  The tail's doubles run on one warp (FP64 issues
+/// /// at a small fraction of FP32): the lanes share the `exp`s (one per entry, into `ex`) and then the quotients, and
+/// /// lane 0 alone runs the two ORDERED sums and the two cumulative scans: the same `exp` of the same argument, the
+/// /// sums in the same order, `cum += e / sum` with the same correctly rounded quotient.  (`n_keep == 0`, reachable
+/// /// only with min_p > 1, which the callers clamp, reads `sel_ids[0]`.)
 template <bool kProb = false>
 __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& p, int t,
                                   int* __restrict__ out, double* ex, float* prob_out = nullptr) {
@@ -411,7 +394,7 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         n_keep = cut;
         __syncwarp();                            // `ex` is written again below
     }
-    // min_p on top_p's survivors, as in `sampler_kernel` (every lane, the same float arithmetic)
+   // min_p on top_p's survivors (every lane, the same float arithmetic)
     if (p.min_p > 0.0f) {
         const float thresh = sel_logit[0] + logf(p.min_p);
         for (int i = 0; i < n_keep; ++i)
@@ -443,20 +426,18 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
     }
 }
 
-/// **THE ONE-BLOCK SAMPLED PATH: `sampler_kernel` WITHOUT THE `taken` SWEEP.**  Round i's candidates are the logits
-/// strictly AFTER round i-1's pick in the selection order, `s < prev_v || (s == prev_v && v > prev_i)`, which is
-/// exactly the set `taken` left: the picks so far are the first i of the order, so what comes after the last one is
-/// what has not been picked.  The round is then the same block argmax with the same tie rule, so the list is the
-/// same list in the same order.  An empty round leaves (-inf, id 0) as before, and every round after it is empty
-/// in both versions (nothing after -inf beats -inf).  O(k x n_vocab) per row instead of O(k^2 x n_vocab), then warp
-/// 0 runs the tail.  The fallback when the split path cannot run.
+/// /// **THE ONE-BLOCK SAMPLED PATH.**  Round i's candidates are the logits strictly AFTER round i-1's pick in the
+/// /// selection order, `s < prev_v || (s == prev_v && v > prev_i)`: the picks so far are the first i of the order, so
+/// /// what comes after the last one is what has not been picked.  The round is a block argmax with the same tie rule.
+/// /// An empty round leaves (-inf, id 0), and every round after it is empty (nothing after -inf beats -inf).
+/// /// O(k x n_vocab) per row, then warp 0 runs the tail.  The fallback when the split path cannot run.
 __global__ void __launch_bounds__(1024)
 sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
                          int history_len, const SamplerParams p, int* __restrict__ out) {
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
 
-    // the penalty window and its membership bitmap, exactly as in `sampler_kernel`
+   // the penalty window and its membership bitmap
     const int* hrow = history ? history + (size_t) t * history_len : nullptr;
     int hlen = 0;
     if (hrow) {
@@ -523,11 +504,11 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
 }
 
-// ---- THE SPLIT top_k.  `sampler_kernel` and the one-block kernel keep a row on ONE SM of 170 (5090) and walk its
-// 248,320 logits k times.  Here a warp keeps the top_k of 1,024 logits held in registers, four warps make a block of
-// 4,096 logits that merges their lists, and a row is 61 such blocks over the whole GPU; one warp per row then
-// merges the 61 lists and runs the tail.  Exact, because the first k of a union are within the first k of each part
-// and a merge of ordered lists is ordered - the selection order being a strict total order (above).
+// ---- THE SPLIT top_k.  The one-block kernel keeps a row on ONE SM and walks its logits k times.  Here a warp keeps the
+// top_k of 1,024 logits held in registers, four warps make a block of 4,096 logits that merges their lists, and a row
+// is 61 such blocks over the whole GPU; one warp per row then merges the 61 lists and runs the tail.  Exact, because
+// the first k of a union are within the first k of each part and a merge of ordered lists is ordered - the selection
+// order being a strict total order (above).
 constexpr int kSplitPerLane = 32;                               // logits per lane, in registers
 constexpr int kSplitWarpSpan = 32 * kSplitPerLane;              // 1,024 logits per warp
 constexpr int kSplitWarps = 4;
@@ -840,9 +821,8 @@ int2* split_scratch(void* stream, size_t entries) {
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return true;
     if (n_tokens > 65535) return false;
-    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - sm_90+ (the card's),
-    // code built for it (an older build's PTX holds a trap: the PTX version says which), and
-    // room for one cluster of kAmCtas CTAs.
+    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - sm_90+, code built
+    // for it (an older build's PTX holds a trap: the PTX version says which), and room for one cluster of kAmCtas CTAs.
     static int ok[64] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }

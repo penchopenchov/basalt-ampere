@@ -296,10 +296,9 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
     return d * sumi;
 }
 
-// ---------------------------------------------------------------- Unsloth's UD-Q4_K_XL experts
+// ---------------------------------------------------------------- UD-Q4_K_XL experts
 // Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down: llama.cpp's vec_dot_*_q8_1 (vecdotq.cuh, VDR 2 each), transcribed; the
-// Q5_1 min term is the one departure (below).  Via eddoursul/Strata 8029fa9 (iq_dot.cuh) and #255 (Q8_0,
-// gopinath87607), which agree with llama.cpp and with each other.
+// Q5_1 min term is the one departure (below).
 constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q8_0 = 2;
 
 __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restrict__ v, const int* __restrict__ u,
@@ -408,8 +407,8 @@ __device__ __forceinline__ float vec_dot_q5_K_q8_1(const void* __restrict__ vbq,
 // Q5_1: llama.cpp's integer chain, but the min term multiplies the sum of the QUANTIZED activations (dp4a with
 // 0x01010101, times d8) instead of the q8_1 block's `ds.y`, which our quantizer (like llama.cpp's) fills with the sum
 // of the ORIGINAL activations.  That is ggml-cpu's convention (its q8_1 `s` is d * sum(q)) and the one the K-quant
-// mins above use; the scaled and the min term then see the same activation (eddoursul/Strata measured 1.1-1.2%
-// against 1.9% relative error per expert).  Result: sumi * (d5 * d8) + sumu * (m5 * d8).
+// mins above use; the scaled and the min term then see the same activation, which has the lower relative error per
+// expert.  Result: sumi * (d5 * d8) + sumu * (m5 * d8).
 // Q5_0: llama.cpp's integer chain verbatim (vecdotq.cuh vec_dot_q5_0_q8_1_impl) -- symmetric (one delta, no
 // learned min), so unlike Q5_1 there is no min-term rounding choice to make: the constant -16 per-weight offset
 // is accounted for via the q8_1 block's `ds.y` (sum of the ORIGINAL activations), exactly as upstream.
@@ -583,11 +582,11 @@ __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w
 // scale as a float) and `apply` (the activation loads, the dp4a chain in the same order, the same integer scale
 // step and the same float expression).  `apply(load(...))` does the dot's integer and float operations in the same
 // order on the same values, so a column of the kernels below is BITWISE equal to the same column of mmvq_kernel /
-// native_gu_kernel / native_down_kernel (iq_multi_parity checks it; STRATA_OLD_IQ_MMVQ=1 keeps the old kernels).
+// native_gu_kernel / native_down_kernel (iq_multi_parity checks it).
 template<int TY> struct Split;
 // Formats with a Split below take the decode-once kernels; the others (Q4_K, Q5_K, Q5_1, Q8_0: UD-Q4_K_XL) the
-// per-entry ones, which call Fmt<TY>::dot per column exactly as before #242 (the launchers test kSplit at compile
-// time, so the multi kernels are never instantiated for a type without a Split).
+// per-entry ones, which call Fmt<TY>::dot per column (the launchers test kSplit at compile time, so the multi kernels
+// are never instantiated for a type without a Split).
 template<int TY> inline constexpr bool kSplit = false;
 template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 22 || TY == 29);
 
@@ -1171,7 +1170,7 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
 
 // native_gu_multi_kernel with the group's activations in shared memory, kGuStageT entries at a time: a q8_1 block
 // is 9 words, so the lanes' block-strided reads fall in distinct banks instead of spanning ~9 cache lines per load.
-// The same loads in the same order from shared memory, so the same bits (STRATA_GU_STAGE=0: the kernel above).
+// The same loads in the same order from shared memory, so the same bits.
 constexpr int kGuStageT = 8;
 
 template<int TG, bool STAGE_GRID = kStageIqGrid<TG>>
@@ -1235,7 +1234,7 @@ __global__ void __launch_bounds__(256) native_gu_multi_sx_kernel(const unsigned 
     }
 }
 
-// ---------------------------------------------------------------- IQ3_XXS gate/up on int8 tensor cores (STRATA_GU_MMA)
+// ---------------------------------------------------------------- IQ3_XXS gate/up on int8 tensor cores
 // Per 32-value sub-block k the integer dot of a weight row and an entry's q8_1 block is exact in int32 whichever
 // instruction computes it, so mma.sync m16n8k32 s8 takes it for 16 rows x 8 entries at once (A: the signed grid
 // values, decoded once per row and sub-block straight into fragments; B: the entries' q8_1 codes; C starts at 0).
@@ -1444,11 +1443,11 @@ __global__ void __launch_bounds__(256, 2) native_gu_mma_kernel(const unsigned lo
         }
     }
 #elif defined(__CUDA_ARCH__)
-    __trap();   // the host launches it only where device code for sm_80+ was built
+    __trap();   // the host launches it only where device code for the tensor-core instructions was built
 #endif
 }
 
-// ---------------------------------------------------------------- IQ3_S mmvq columns on int8 tensor cores (STRATA_MMVQ_MMA)
+// ---------------------------------------------------------------- IQ3_S mmvq columns on int8 tensor cores
 // mmvq_multi_kernel<21> with the 32-value integer dots on mma.sync m16n8k32 s8, as native_gu_mma_kernel does for
 // IQ3_XXS: Split<21>::apply's arithmetic on each integer, the float terms summed in row_dot_multi's order (lane L adds
 // k = L, L + 32, ... in turn, then warp_sum).  Warp w takes sub-block w of every block, i.e. the lanes
@@ -1633,7 +1632,7 @@ __global__ void __launch_bounds__(256, 2) mmvq_iq3s_mma_kernel(const uint8_t* __
         }
     }
 #elif defined(__CUDA_ARCH__)
-    __trap();   // the host launches it only where device code for sm_80+ was built
+    __trap();   // the host launches it only where device code for the tensor-core instructions was built
 #endif
 }
 
@@ -1668,8 +1667,8 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     }
 }
 
-// native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent
-// (STRATA_DEC_GU2=2) - the block's first group's weight rows are prefetched into L2 before the wait.
+// native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent - the
+// block's first group's weight rows are prefetched into L2 before the wait.
 template<int TD, bool DEP = false>
 __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
@@ -1840,7 +1839,7 @@ __device__ __forceinline__ void q8_1_store(const float xi, block_q8_1* __restric
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
         sum += __shfl_xor_sync(0xffffffffu, sum, o);
     }
-    const float d = q8_1_finite(amax / 127.0f);   // #606: q8_1_finite.hpp - the same bits for every finite block
+    const float d = q8_1_finite(amax / 127.0f);   // q8_1_finite.hpp - the same bits for every finite block
     const int8_t q = q8_1_quant(xi, d, amax);
     const long long ib = i / 32, iqs = i % 32;
     y[ib].qs[iqs] = q;
@@ -1858,8 +1857,8 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
 // its VRAM call) instead of all cap_entries twice - nothing reads the others: the down kernel reads its groups'.
 // n_ff is a multiple of 32, so a warp is one q8_1 block and the bounds are warp-uniform.  The values are the two
 // kernels': the SwiGLU product is rounded on its own - it must not contract into the first add of q8_1_store's block
-// sum, as it could not when it went through memory (CUDA: __fmul_rn; HIP's __fmul_rn is a plain product, so there
-// the product is written here under contract(off)) - then q8_1_store unchanged: the same blocks, bit for bit.
+// sum, as it could not when it went through memory (__fmul_rn) - then q8_1_store unchanged: the same blocks, bit
+// for bit.
 __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* __restrict__ gate,
                                                                   const float* __restrict__ up,
                                                                   const int32_t* __restrict__ grp_start,
@@ -2203,8 +2202,8 @@ constexpr int g_dec_gy = 24;
 // IQ3_XXS gate/up on int8 tensor cores (1), or only for the calls whose caller asks (2): off (0)
 constexpr int g_gu_mma = 0;
 thread_local int t_gu_mma_hint = 0;
-// Whether native_gu_mma_kernel runs on the current device at L's shapes: sm_80+ (the card's, or STRATA_EMULATE_CC's)
-// with sm_80+ device code in this build, n_embd in whole chunks (rows 4-byte aligned), the shared memory without opt-in
+// Whether native_gu_mma_kernel runs on the current device at L's shapes: sm_80+ with sm_80+ device code in this
+// build, n_embd in whole chunks (rows 4-byte aligned), the shared memory without opt-in
 bool gu_mma_usable(const NativeExpertLayout& L) {
     if (L.n_embd <= 0 || L.n_embd % 512 != 0 || L.n_ff % kGmRows != 0 || gu_mma_smem(L.n_embd) > 48 * 1024)
         return false;
@@ -2227,8 +2226,8 @@ bool g_mmvq_mma = false;
 // the fewest columns that take it
 int g_mmvq_mma_min_t = 4;
 std::atomic<long> g_mmvq_mma_launches{0};
-// The current device's SM count if it runs mmvq_iq3s_mma_kernel (sm_80+, the card's or STRATA_EMULATE_CC's, with
-// sm_80+ device code in this build), else 0; per device
+// The current device's SM count if it runs mmvq_iq3s_mma_kernel (sm_80+ with sm_80+ device code in this build),
+// else 0; per device
 int mmvq_mma_sms() {
     static int known[64] = {};   // 0 unknown, -1 no, else the SM count
     int dev = 0;
@@ -2436,7 +2435,7 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
-    // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
+    // checked like the other entry points: an unknown type would leave `dst` unwritten, a wrong prompt and no error
     if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
@@ -2500,7 +2499,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const bool v1 = g_grouped_v1;
-    const bool chain = g_gu2 >= 2 && !v1 && !g_old_kernels;   // STRATA_DEC_GU2=2: SwiGLU and down as dependents
+    const bool chain = g_gu2 >= 2 && !v1 && !g_old_kernels;   // SwiGLU and down as dependents
     int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     if (chain && grid_groups <= 0 && g_dec_gy > 0 && gy > g_dec_gy) gy = g_dec_gy;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
