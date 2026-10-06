@@ -216,7 +216,7 @@ if(STRATA_ENABLE_CUDA)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
   endif()
-  # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
+  # #512: the top-k's active-block bound against
   # the capacity rule, selected ids bitwise
   if(STRATA_BUILD_TESTS)
     add_executable(qsa_topk_active_parity src/kernels/qsa_topk_active_parity.cpp)

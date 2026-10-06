@@ -69,7 +69,7 @@ public:
 
     /// Starts the peer's share of one layer: the entries i with kind[i] == 2 (x: n_tok rows of n_embd floats).
     /// multi-GPU: with `out` (pinned, portable host rows) the peer writes its rows straight into
-    /// out[entry] with a scatter kernel (no D2H copy + host memcpy in finish); STRATA_PEER_DIRECT=0: the old way.
+    /// out[entry] with a scatter kernel (no D2H copy + host memcpy in finish).
     bool launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
                 std::string& err, float* out = nullptr);
     /// Waits for the launched share and writes its rows into `out` (row i = entry i, n_embd floats).

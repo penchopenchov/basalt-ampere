@@ -716,7 +716,7 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
-    void* map_ = nullptr;            ///< STRATA_ARENA_MMAP: the arena file, mapped read-only (not the PinnedArena)
+    void* map_ = nullptr;            ///< the arena file, mapped read-only (not the PinnedArena)
     uint64_t map_bytes_ = 0;
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
     uint64_t slice_bytes_ = 0;

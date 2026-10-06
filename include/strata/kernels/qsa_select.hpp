@@ -47,12 +47,12 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                                                    ///< CUDA uses the bound only on sm_75; HIP keeps its existing policy.
                                                    ///< Omit it for captured graphs whose context can grow after capture.
 /// The same ids on a thread-block cluster of 8 CTAs per query (sm_90+, CUDA; S19). qsa_block_topk takes it for calls
-/// of up to 16 queries unless STRATA_QSA_CLUSTER=0. False (nothing launched) where it cannot run: HIP, a card or a
+/// of up to 16 queries. False (nothing launched) where it cannot run: HIP, a card or a
 /// build below sm_90, or a capacity whose keys do not fit one cluster's shared memory. Capturable.
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                             const QsaShapes& s, int32_t* ids, void* stream);
 /// The original kernel (256 threads, one shared histogram, keys read from memory on every radix pass), for tests and
-/// STRATA_TOPK_OLD=1: the same ids.
+/// The same ids.
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);
 

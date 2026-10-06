@@ -990,8 +990,8 @@ int2* split_scratch(void* stream, size_t entries) {
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return true;
     if (n_tokens > 65535) return false;
-    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - sm_90+ (the card's,
-    // or STRATA_EMULATE_CC's), code built for it (an older build's PTX holds a trap: the PTX version says which), and
+    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - sm_90+ (the card's),
+    // code built for it (an older build's PTX holds a trap: the PTX version says which), and
     // room for one cluster of kAmCtas CTAs.
     static int ok[64] = {};
     int dev = 0;

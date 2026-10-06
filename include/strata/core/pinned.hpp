@@ -22,9 +22,7 @@ namespace strata::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
-/// #243: STRATA_ARENA_PIN_GIB, the cap on the expert arena's CUDA registration in GiB.  -1 when unset (the engine
-/// decides, as in 0.1.30), 0 = no cap (the whole arena, or as many slices as the driver takes), N > 0 = at most N GiB,
-/// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
+/// The cap on the expert arena's CUDA registration in GiB: always -1 (the engine decides).
 int arena_pin_cap_gib();
 
 struct PinnedArena {
@@ -114,7 +112,7 @@ LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::
 /// reads says they are not in the OS file cache (a cached read takes ~10 us, the drive ~80), and the RAM left
 /// beside the arena (`arena_bytes`) could not keep them cached for the next start either - so a warm restart after
 /// an idle unload never gets slower, and only a start that reads the drive anyway skips the cache's copy.
-/// STRATA_UNBUFFERED_LOAD=1 / 0 forces it. `why` says what decided.
+/// `why` says what decided.
 /// `cache_counts` false (the file tier with a RAM budget): only whether the files could be kept decides - their mapped
 /// pages land in the process's working set, so a partly cached file would still take the RAM the budget was sized for.
 /// `read_bytes` (#577): the bytes the files are read for, when that is less than the files (the file tier reads only
