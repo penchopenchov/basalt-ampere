@@ -165,7 +165,8 @@ int dec_qsaf_mask() {
 }
 // STRATA_DEC_DTC2 (bit mask; 1, 2 and 4: dense_tc.cu's layouts and IQ3_S): 8 = the attention's hc read writes the
 // projections' q8_1 rows (its up slices), no quantize launch; 16 = a GDN layer's qkv and z projections in one
-// dense_tc_pair launch for every window width (z off the side stream)
+// dense_tc_pair launch for every window width (z off the side stream); 128 = the out projection's weights prefetched
+// into L2 behind the in projections (GDN with 16) or the query post (QSA with QSAF & 32)
 int dec_dtc2_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_DTC2"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -1236,6 +1237,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         PdlScope pp(pdl);   // after the hc read or the q8_1 kernel
                         kernels::dense_tc_pair(wqkv->native_type, wqkv->native_data, qkv + (size_t) tb * C, (int) C,
                                                wg->native_type, wg->native_data, z_, (int) ZV, xq_, (int) N, n, cs);
+                        if (dec_dtc2_mask() & 128)   // the out projection's weights into L2 during the recurrence
+                            kernels::dense_tc_l2_prefetch(
+                                wout->native_data, native_mmvq_weight_bytes(wout->native_type, (int) ZV, (int) N), cs);
                     }
                     for (int i = 2; i <= 5; ++i) stamp(l, i, grp);
                     DecRecArgs ra;
@@ -1441,6 +1445,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     cudaStreamWaitEvent(cs, qev_[1], 0);
                     for (int i = 7; i <= 9; ++i) stamp(l, i, grp);
                     qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
+                    if (dec_dtc2_mask() & 128) {   // the out projection's weights into L2 during the attention
+                        PdlScope pf(pdl);
+                        kernels::dense_tc_l2_prefetch(
+                            wo->native_data, native_mmvq_weight_bytes(wo->native_type, (int) (NH * HD), (int) N), cs);
+                    }
                 } else if (qsaf_side) {
                     const bool iq_main = (dec_qsaf_mask() & 2) != 0;
                     {

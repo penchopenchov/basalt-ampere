@@ -773,6 +773,23 @@ __global__ void __launch_bounds__(256) dense_tc_pair_kernel(PairMat m0, PairMat 
 #endif
 }
 
+// A matrix into L2 for a later kernel: bulk prefetches, then the next kernel let in; the grid ends only after the
+// kernel before it (pdl_wait), so a dependent's pdl_wait still covers that kernel.
+__global__ void __launch_bounds__(32) dense_tc_l2_kernel(const uint8_t* __restrict__ w, size_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (threadIdx.x == 0) {
+        const size_t n16 = bytes / 16, lo = (size_t) blockIdx.x * n16 / gridDim.x * 16,
+                     hi = (size_t) (blockIdx.x + 1) * n16 / gridDim.x * 16;
+        for (size_t o = lo; o < hi; o += 65536) {
+            const unsigned sz = (unsigned) (hi - o < 65536 ? hi - o : 65536);
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(w + o), "r"(sz) : "memory");
+        }
+    }
+    pdl_launch_dependents();
+    pdl_wait();
+#endif
+}
+
 template<int TYPE, int S, int MT, int KS>
 size_t smem_bytes() {
     return (size_t) S * 16 * MT * row_stride(KS * Fmt<TYPE>::SB) + (size_t) MT * KS * 4 * 16 * kMaxCols * 4;
@@ -974,6 +991,11 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
         std::fprintf(stderr, "dense_tc_pair: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+
+void dense_tc_l2_prefetch(const void* w, size_t bytes, void* stream) {
+    if (((uintptr_t) w & 15) != 0 || bytes < 16) return;
+    launch_pdl(dense_tc_l2_kernel, dim3(16), dim3(32), 0, (cudaStream_t) stream, (const uint8_t*) w, bytes);
 }
 
 int dense_tc_mask() {

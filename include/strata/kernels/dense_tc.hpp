@@ -14,6 +14,8 @@
 // multiple of 512, x_q8_1 16-byte aligned.  sm_90+ CUDA only.
 #pragma once
 
+#include <cstddef>
+
 namespace strata::kernels {
 
 bool dense_tc_supported(int ggml_type, int n_in) noexcept;
@@ -29,6 +31,10 @@ void dense_tc(int ggml_type, const void* weights, const void* x_q8_1, float* y, 
 bool dense_tc_pair_supported(int type0, int type1, int n_in) noexcept;
 void dense_tc_pair(int type0, const void* w0, float* y0, int n_out0, int type1, const void* w1, float* y1, int n_out1,
                    const void* x_q8_1, int n_in, int ncols, void* stream);
+
+/// The 16-byte aligned `bytes` at w into L2 (bulk prefetches), as a kernel on the stream that lets the next kernel in
+/// at once and ends after the kernel before it.
+void dense_tc_l2_prefetch(const void* w, std::size_t bytes, void* stream);
 
 /// STRATA_DEC_DTC: which verify projections take dense_tc for every window width (bits): 1 GDN qkv, 2 GDN z, 4 GDN
 /// out, 8 QSA q, 16 QSA out, 32 QSA k/v.  0 (default) none.
