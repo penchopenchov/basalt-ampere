@@ -190,9 +190,13 @@ bool pair_parity(const Case& a, const Case& b, cudaStream_t s) {
         }
         const double rms = std::sqrt(sd / std::max(sr, 1e-300));
         const bool k = bits == 0 && rms < 1e-3;
-        std::printf("pair %-10s + %-10s [%d] T-columns bitwise: %s (%lld)  vs native: max|d|/max|ref| %.3e  rms %.3e  %s\n",
+        uint64_t h = 1469598103934665603ull;   // FNV-1a of the 8-column output
+        const uint8_t* hb = reinterpret_cast<const uint8_t*>(g8);
+        for (std::size_t i = 0; i < (std::size_t) TM * c.n_out * 4; ++i) h = (h ^ hb[i]) * 1099511628211ull;
+        std::printf("pair %-10s + %-10s [%d] T-columns bitwise: %s (%lld)  vs native: max|d|/max|ref| %.3e  rms %.3e  "
+                    "hash %016llx  %s\n",
                     a.name, b.name, m, bits == 0 ? "yes" : "NO", bits, maxd / std::max(maxr, 1e-30), rms,
-                    k ? "PASS" : "FAIL");
+                    (unsigned long long) h, k ? "PASS" : "FAIL");
         ok = ok && k;
     }
     cudaFree(dwa); cudaFree(dwb); cudaFree(xq); cudaFree(dx); cudaFree(ra); cudaFree(rb); cudaFree(ya); cudaFree(yb);
@@ -291,7 +295,7 @@ void bench(cudaStream_t s) {
 
 // DTC_BENCH_PAIR=1: dense_tc_pair of qkv + z against dense_tc qkv then native z, L2-cold
 void bench_pair(cudaStream_t s) {
-    const int pairs[][2] = {{0, 6}, {1, 5}, {3, 5}, {0, 4}, {1, 6}};
+    const int pairs[][2] = {{0, 6}, {1, 5}, {3, 5}, {0, 4}, {1, 6}, {3, 6}};
     std::printf("\npair bench: us per call (median of 7 graph replays)\n");
     for (const auto& pr : pairs) {
         const Case &a = CASES[pr[0]], &b = CASES[pr[1]];
@@ -352,8 +356,9 @@ int main(int argc, char** argv) {
     const bool only_bench = argc > 1 && std::string(argv[1]) == "--bench-only";
     bool ok = true;
     if (!only_bench) {
-        for (const Case& c : CASES)
-            if (c.type != 21 || c.n_in % 2048 == 0) ok = parity(c, s) && ok;
+        if (std::getenv("DTC_PAIR_ONLY") == nullptr)   // DTC_PAIR_ONLY=1: only the dense_tc_pair checks
+            for (const Case& c : CASES)
+                if (c.type != 21 || c.n_in % 2048 == 0) ok = parity(c, s) && ok;
         const int pairs[][2] = {{0, 6}, {1, 5}, {2, 4}, {3, 6}, {0, 5}};
         for (const auto& pr : pairs) ok = pair_parity(CASES[pr[0]], CASES[pr[1]], s) && ok;
     }
