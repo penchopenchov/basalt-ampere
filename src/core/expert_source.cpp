@@ -302,6 +302,10 @@ bool available_memory_bytes(uint64_t& bytes) {
 FileExpertSource::~FileExpertSource() { close(); }
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+    return open(FileRange(pack_dir + "/experts.bin"), n_layers, n_expert, err);
+}
+
+bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
     const auto& layout = basalt::kernels::cpu::expert_layout();
@@ -372,7 +376,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
             return false;
         }
     }
-    const std::string path = pack_dir + "/experts.bin";
+    const std::string& path = experts.path;
     if (layout.native && !gguf_.empty() && !std::filesystem::exists(path)) {
         // CS-T: no experts.bin - the model's GGUF shards, read in place
         blobs_ = (int64_t) blob_count;
@@ -388,20 +392,24 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
     struct stat st{};
     if (fstat(fd, &st) != 0) { ::close(fd); err = "FileExpertSource: cannot stat " + path; return false; }
-    if (st.st_size < 0 || (uint64_t) st.st_size != want) {
+    // a whole file is exactly the experts; a section must be, and lie inside the file
+    const uint64_t have = experts.bytes != 0 ? experts.bytes : (st.st_size < 0 ? 0 : (uint64_t) st.st_size);
+    if (st.st_size < 0 || have != want || experts.offset > (uint64_t) st.st_size ||
+        have > (uint64_t) st.st_size - experts.offset) {
         char buf[400];
         std::snprintf(buf, sizeof buf,
                       "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
                       "the pack this geometry came from",
-                      path.c_str(), (unsigned long long) (st.st_size < 0 ? 0 : st.st_size),
+                      path.c_str(), (unsigned long long) have,
                       (unsigned long long) want);
         ::close(fd);
         err = buf;
         return false;
     }
-    void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, 0);
+    void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, (off_t) experts.offset);
     if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
     fd_ = fd;
+    file_off_ = experts.offset;
     base_ = (const uint8_t*) view;
     blobs_ = (int64_t) blob_count;
     n_layers_ = n_layers;
@@ -489,6 +497,7 @@ void FileExpertSource::close() {
     n_layers_ = 0;
     n_expert_ = 0;
     mapped_bytes_ = 0;
+    file_off_ = 0;
     layer_offsets_.clear();
     layer_blob_bytes_.clear();
     reads_ = 0;
@@ -1293,7 +1302,7 @@ bool FileExpertSource::pin_cache_complement(
                 fail("FileExpertSource: madvise could not release mapped expert layer " + std::to_string(layer));
                 return;
             }
-            if (posix_fadvise(fd_, (off_t) layer_offset, (off_t) layer_bytes, POSIX_FADV_DONTNEED) != 0) {
+            if (posix_fadvise(fd_, (off_t) (file_off_ + layer_offset), (off_t) layer_bytes, POSIX_FADV_DONTNEED) != 0) {
                 fail("FileExpertSource: posix_fadvise could not release expert layer " + std::to_string(layer));
                 return;
             }
@@ -2109,6 +2118,45 @@ bool hash_sampled_file(const std::filesystem::path& path, uint64_t& h, std::stri
     return true;
 }
 
+// The fingerprint of a .basalt's (or any ranged) pack: the index and the layout in full, the experts sampled.
+bool shared_arena_range_hash(const ExpertFiles& files, const basalt::kernels::cpu::ExpertLayout& lay, uint64_t& out,
+                             std::string& err) {
+    uint64_t h = 1469598103934665603ull;
+    hash_text(h, "basalt-shared-expert-arena-pack-v1");
+    hash_u64(h, (uint64_t) lay.n_layers);
+    hash_u64(h, (uint64_t) lay.n_expert);
+    hash_u64(h, lay.total);
+    hash_u64(h, lay.max_blob);
+    hash_u64(h, lay.native ? 1 : 0);
+    const std::pair<const char*, const FileRange*> small[] = {{"index", &files.index}, {"layout", &files.layout}};
+    for (const auto& [name, r] : small) {
+        hash_text(h, name);
+        std::vector<uint8_t> raw;
+        std::string e;
+        if (r->empty() || !read_range(*r, raw, e)) { hash_u64(h, 0); continue; }
+        hash_u64(h, 1);
+        h = fnv1a64(raw.data(), (uint64_t) raw.size(), h);
+    }
+    const uint64_t bytes = files.experts.size();
+    hash_text(h, "experts");
+    hash_u64(h, bytes);
+    constexpr uint64_t sample = 64u << 10;
+    const uint64_t starts[3] = {0, bytes / 2, bytes > sample ? bytes - sample : 0};
+    std::vector<uint8_t> buf((size_t) std::min<uint64_t>(sample, bytes));
+    for (uint64_t off : starts) {
+        if (buf.empty()) break;
+        const uint64_t at = std::min<uint64_t>(off, bytes - (uint64_t) buf.size());
+        if (!read_range_at(files.experts, at, buf.data(), buf.size(), err)) {
+            err = "ArenaExpertSource: cannot sample the experts: " + err;
+            return false;
+        }
+        hash_u64(h, at);
+        h = fnv1a64(buf.data(), (uint64_t) buf.size(), h);
+    }
+    out = h == 0 ? 1 : h;
+    return true;
+}
+
 bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& experts_path,
                             const std::string& gguf, const basalt::kernels::cpu::ExpertLayout& lay,
                             uint64_t& out, std::string& err) {
@@ -2291,8 +2339,14 @@ ArenaExpertSource::~ArenaExpertSource() { close(); }
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err, uint64_t max_pinned_bytes,
                              const std::string& shared_arena_file) {
+    return open(ExpertFiles::dir(pack_dir), n_layers, n_expert, threads, err, max_pinned_bytes, shared_arena_file);
+}
+
+bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int64_t n_expert, int threads,
+                             std::string& err, uint64_t max_pinned_bytes,
+                             const std::string& shared_arena_file) {
     close();
-    const std::string path = pack_dir + "/experts.bin";
+    const std::string& path = files_in.experts.path;
     // the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     if (lay.n_layers != n_layers || lay.n_expert != n_expert) {
@@ -2303,7 +2357,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     const uint64_t want = lay.total;
 
     // no experts.bin in a native pack -> the experts come straight from the GGUF
-    const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
+    const bool from_gguf = !files_in.experts.exists() && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
     // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend a
     // minute of loading first.
     if (from_gguf) {
@@ -2312,9 +2366,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         // shard is a message rather than an arena of plausible wrong experts
         if (!check_experts_gguf(gguf_, lay, err)) { err = "ArenaExpertSource: " + err; return false; }
     } else {
-        std::ifstream f(path, std::ios::binary | std::ios::ate);
-        if (!f) { err = "ArenaExpertSource: cannot open " + path; return false; }
-        const uint64_t got = (uint64_t) f.tellg();
+        if (!files_in.experts.exists()) { err = "ArenaExpertSource: cannot open " + path; return false; }
+        const uint64_t got = files_in.experts.size();
         if (got != want && got != want + (uint64_t) blob) {   // + one blob: a file padded for whole-slot copies
             char buf[400];
             std::snprintf(buf, sizeof buf,
@@ -2360,7 +2413,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 
     uint64_t pack_hash = 0;
     if (!shared_arena_file.empty() &&
-        !shared_arena_pack_hash(pack_dir, path, gguf_, lay, pack_hash, err)) return false;
+        !(files_in.pack_dir.empty() ? shared_arena_range_hash(files_in, lay, pack_hash, err)
+                                    : shared_arena_pack_hash(files_in.pack_dir, path, gguf_, lay, pack_hash, err)))
+        return false;
 
     // one layer per registration slice, so no expert straddles two registrations.  The arena is one blob
     // longer than the file: a copy of a whole VRAM slot (the largest blob) may then start at any expert.
@@ -2400,9 +2455,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     if (from_gguf) {
         st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered);
     } else {
-        if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20);
+        if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20,
+                                                 files_in.experts.offset);
         if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
+            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20,
+                                     files_in.experts.offset);
     }
     std::fprintf(stderr, "basalt generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
                  why.c_str());

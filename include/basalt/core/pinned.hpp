@@ -90,15 +90,16 @@ struct LoadStats {
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,
                        uint64_t layers, int threads, uint64_t chunk);
 /// The same with one byte range per layer (`layer_off[L]`, `layer_bytes[L]`).
+/// `base`: where the experts start in the file (a section of a larger file); `layer_off` stays relative to them.
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
-                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk);
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base = 0);
 
 /// The same ranges read UNBUFFERED straight into `dst`: no staging buffer and no file-cache copy - the drive's DMA
 /// lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok = false with an
 /// empty `error` when they are not (or where unbuffered reads are not available), and the caller falls back to
 /// load_experts_ranges.
 LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
-                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk);
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base = 0);
 
 /// Whether the expert files are better read unbuffered (false on this platform): a timed probe of random 64 KiB reads
 /// says they are not in the OS file cache, and the RAM left beside the arena (`arena_bytes`) could not keep them cached

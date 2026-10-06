@@ -21,6 +21,7 @@
 
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/hit_hook.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 
 #include <atomic>
@@ -107,6 +108,28 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 }  // namespace detail
 
 
+
+/// The files the experts come from: the blobs, and (for the shared arena's fingerprint) the index and layout they
+/// were packed with.  `pack_dir` is set for a pack directory, whose fingerprint also covers its manifest.
+struct ExpertFiles {
+    FileRange experts, index, layout;
+    std::string pack_dir;
+    static ExpertFiles dir(const std::string& pack_dir) {
+        ExpertFiles f;
+        f.experts = FileRange(pack_dir + "/experts.bin");
+        f.index = FileRange(pack_dir + "/index.txt");
+        f.layout = FileRange(pack_dir + "/native_experts.txt");
+        f.pack_dir = pack_dir;
+        return f;
+    }
+    static ExpertFiles from(const ModelSources& s) {
+        ExpertFiles f;
+        f.experts = s.experts;
+        f.index = s.dense_index;
+        f.layout = s.experts_layout;
+        return f;
+    }
+};
 
 /// Where one routed expert's bytes come from.
 ///
@@ -425,6 +448,8 @@ public:
     /// is asked for: the SSD tier, read in place through the OS file cache, with no second copy of the experts.  With
     /// experts.bin present nothing changes.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+    /// The same over a byte range: `experts` is a pack's experts.bin or a .basalt's `experts` section.
+    bool open(const FileRange& experts, int64_t n_layers, int64_t n_expert, std::string& err);
     /// CS-T: the --native shard (native_experts.txt names the other files beside it); see `open`.
     void set_gguf(const std::string& native) { gguf_ = native; }
     /// Whether the experts are read from the GGUF shards in place (no experts.bin).
@@ -613,6 +638,7 @@ private:
     std::atomic<int64_t> ram_reads_{0};
     std::atomic<uint64_t> file_read_bytes_{0};
     const uint8_t* base_ = nullptr;
+    uint64_t file_off_ = 0;                   ///< where the experts start in the mapped file
     int64_t blobs_ = 0;
     int64_t n_layers_ = 0;
     int64_t n_expert_ = 0;
@@ -666,6 +692,8 @@ public:
     /// Allocates and loads `<pack_dir>/experts.bin`.  Prints nothing; the caller reports `note()` and the load
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
+              uint64_t max_pinned_bytes = 0, const std::string& shared_arena_file = {});
+    bool open(const ExpertFiles& files, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
               uint64_t max_pinned_bytes = 0, const std::string& shared_arena_file = {});
     /// A native pack without experts.bin takes its experts from the model's GGUF: `native` is the --native shard, and
     /// native_experts.txt names the other shards beside it (per layer, or per role).

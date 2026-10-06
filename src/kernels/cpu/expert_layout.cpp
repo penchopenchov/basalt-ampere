@@ -135,15 +135,23 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 
 
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+    std::ifstream in(pack_dir + "/native_experts.txt", std::ios::binary);
+    if (!in) return expert_layout_load_text(std::string(), n_layers, n_expert, err);
+    std::stringstream buf;
+    buf << in.rdbuf();
+    return expert_layout_load_text(buf.str(), n_layers, n_expert, err);
+}
+
+bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
-    std::ifstream in(pack_dir + "/native_experts.txt");
-    if (!in) {
+    if (text.empty()) {   // no per-layer table: the canonical layout
         L.total = (uint64_t) n_layers * (uint64_t) n_expert * (uint64_t) BLOB;
         g_layout = L;
         return true;
     }
+    std::istringstream in(text);
     L.native = true;
     L.fmt.resize((size_t) n_layers);
     L.offset.assign((size_t) n_layers, ~0ull);
@@ -153,11 +161,16 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             if (!line.empty() && line[0] == '#') {
-                // "# strata native experts vN: ...".  A version this engine does not know may mean columns it
-                // would misread, so it is refused rather than parsed as far as the known columns go.
+                // "# experts vN: ..." (a .basalt) or "# strata native experts vN: ..." (a pack).  A version this
+                // engine does not know may mean columns it would misread, so it is refused rather than parsed as
+                // far as the known columns go.
+                static const char kHeader[] = "# experts v";
                 static const char kPackHeader[] = "# strata native experts v";
-                if (line.compare(0, sizeof kPackHeader - 1, kPackHeader) == 0) {
-                    L.version = std::atoi(line.c_str() + sizeof kPackHeader - 1);
+                const char* ver = nullptr;
+                if (line.compare(0, sizeof kHeader - 1, kHeader) == 0) ver = line.c_str() + sizeof kHeader - 1;
+                else if (line.compare(0, sizeof kPackHeader - 1, kPackHeader) == 0) ver = line.c_str() + sizeof kPackHeader - 1;
+                if (ver != nullptr) {
+                    L.version = std::atoi(ver);
                     if (L.version > kExpertLayoutVersion) {
                         err = "native_experts.txt is v" + std::to_string(L.version) + "; this engine reads up to v" +
                               std::to_string(kExpertLayoutVersion) + " (the pack was written by a newer tools/"

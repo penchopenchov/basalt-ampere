@@ -316,10 +316,10 @@ LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_byte
 }
 
 LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
-                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk) {
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base) {
     LoadStats st;
     st.ok = false;
-    (void) path; (void) dst; (void) layer_off; (void) layer_bytes; (void) threads; (void) chunk;
+    (void) path; (void) dst; (void) layer_off; (void) layer_bytes; (void) threads; (void) chunk; (void) base;
     return st;
 }
 
@@ -331,7 +331,7 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
 }
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
-                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk) {
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk, uint64_t base) {
     LoadStats st;
     const uint64_t layers = (uint64_t) layer_off.size();
     st.layers = layers;
@@ -374,7 +374,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
             uint64_t pos = 0;
             uint64_t h = 1469598103934665603ull;
             // 64-bit seek: the pack is 42.9 GB, so the 32-bit `fseek` would wrap past 4 GiB
-            if (fseeko(f, (off_t) off, SEEK_SET) != 0) {
+            if (fseeko(f, (off_t) (base + off), SEEK_SET) != 0) {
                 std::lock_guard<std::mutex> g(err_mu);
                 err = "seek to " + std::to_string(off) + " B failed in layer " + std::to_string(L);
                 return;
