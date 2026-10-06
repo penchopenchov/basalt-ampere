@@ -1,6 +1,5 @@
 // src/prefill/ggml_cuda_host.cu - prompt-speed plan step 2b: the host-side symbols of llama.cpp's ggml-cuda that its MMQ
 // and quantize code reference, for the MMQ kernels compiled into strata_mmq without the rest of ggml-cuda.cu.
-#include "strata/core/emulate.hpp"
 #include "common.cuh"
 
 #include <cstdio>
@@ -42,9 +41,9 @@ const ggml_cuda_device_info & ggml_cuda_info() {
                 CUDA_CHECK(cudaDeviceGetAttribute(&v, a, id));
                 return v;
             };
-            d.cc = 100 * strata::cc_major_of(attr(cudaDevAttrComputeCapabilityMajor)) +
-                   10 * strata::cc_minor_of(attr(cudaDevAttrComputeCapabilityMinor));   // STRATA_EMULATE_CC
-            d.smpbo = strata::smem_optin_of(attr(cudaDevAttrMaxSharedMemoryPerBlockOptin));
+            d.cc = 100 * attr(cudaDevAttrComputeCapabilityMajor) +
+                   10 * attr(cudaDevAttrComputeCapabilityMinor);
+            d.smpbo = attr(cudaDevAttrMaxSharedMemoryPerBlockOptin);
             d.integrated = attr(cudaDevAttrIntegrated) != 0;
             d.supports_cooperative_launch = attr(cudaDevAttrCooperativeLaunch) != 0;
             d.nsm = attr(cudaDevAttrMultiProcessorCount);
