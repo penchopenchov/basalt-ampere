@@ -269,9 +269,9 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
         }
     }
     if (!v2 && !v1_path.empty()) {
-        // #633: cgroup v1 (older Docker hosts, RHEL 7/8): the memory controller's group and its ancestors.  An
-        // unlimited group says a number near 2^63 (rounded to its page size); a group whose files are not
-        // visible (no mount in this namespace) is skipped - MemAvailable alone, as with no cgroup at all.
+        // cgroup v1: the memory controller's group and its ancestors.  An unlimited group says a number near 2^63
+        // (rounded to its page size); a group whose files are not visible (no mount in this namespace) is skipped -
+        // MemAvailable alone, as with no cgroup at all.
         const std::filesystem::path mroot = root / "memory";
         auto path = (mroot / v1_path.substr(v1_path.rfind('/', 0) == 0 ? 1 : 0)).lexically_normal();
         while (path.string().rfind(mroot.string(), 0) == 0) {
@@ -568,7 +568,7 @@ bool FileExpertSource::open_gguf(std::string& err) {
 
 bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
-    if (!direct_.empty()) {   // #286: from the drive; a failed read falls back to the mapping below
+    if (!direct_.empty()) {   // from the drive; a failed read falls back to the mapping below
         const Fill f{0, layer, expert, dst};
         if (read_direct(&f, 1)) return true;
     }
@@ -745,8 +745,8 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
 void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     if (todo.empty()) return;
     if (!direct_.empty()) {
-        // #286: overlapped batches - every role window of 16 blobs in flight at once; a big batch (the profile
-        // fill) on up to 4 threads, a decode layer's few misses on this one
+        // overlapped batches - every role window of 16 blobs in flight at once; a big batch (the profile fill) on up to
+        // 4 threads, a decode layer's few misses on this one
         std::atomic<size_t> next{0};
         auto work = [&] {
             for (size_t at; (at = next.fetch_add(16)) < todo.size();) {
@@ -902,8 +902,7 @@ void RouterLookahead::run() {
             strata::kernels::cpu::bf16_rows_dot_multi_avx1(routers_[(size_t) layer].data(), (int) n_expert_,
                                                            (int) n_embd_, x_.data(), (int) nt, logits.data());
         } else {
-            // a mul and an add, not std::fma: without an FMA instruction that is a libm call per element (74x
-            // slower on a Xeon E5-2665, measured by the fork)
+            // a mul and an add, not std::fma: without an FMA instruction that is a libm call per element
             const uint16_t* rw = routers_[(size_t) layer].data();
             for (int64_t r = 0; r < n_expert_; ++r) {
                 const uint16_t* wr = rw + (size_t) r * (size_t) n_embd_;
@@ -1038,8 +1037,8 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t bytes = 0;
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
                                             additional_gpu_pairs, offsets, bytes, err)) return false;
-    const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
-    uint64_t budget_physical = 0;   // #403: the RAM reading a budget was sized from (0: no budget)
+    const bool what_fits = budget_bytes == kResidentWhatFits;   // the soft mode's second try
+    uint64_t budget_physical = 0;   // the RAM reading a budget was sized from (0: no budget)
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
         // they fit, the rest left on the mapped files; clamped to what the RAM has room for.
@@ -1051,9 +1050,9 @@ bool FileExpertSource::pin_cache_complement(
         budget_physical = physical;
         const uint64_t room = physical > headroom_bytes ? physical - headroom_bytes : 0;
         if (budget_bytes > room) {
-            // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
-            // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
-            // lower).  An unclamped budget is unchanged.
+            // 256 MiB under the room, so the engine's own allocations after this reading still leave the headroom (a
+            // budget clamped to exactly the room could fail the safety check below on a slightly lower reading).  An
+            // unclamped budget is unchanged.
             const uint64_t margin = 256ull << 20;
             const uint64_t clamped = room > margin ? room - margin : 0;
             if (what_fits)
@@ -1082,7 +1081,7 @@ bool FileExpertSource::pin_cache_complement(
                 at += b;
                 ++held;
             }
-        if (what_fits && held == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
+        if (what_fits && held == 0) {   // nothing to keep - the caller's plain mmap fallback, not an empty copy
             err = "FileExpertSource: the RAM has no room for any expert of the complement";
             return false;
         }
@@ -1097,8 +1096,8 @@ bool FileExpertSource::pin_cache_complement(
     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
     uint64_t budget = std::numeric_limits<uint64_t>::max();
     if (bytes > 0 || lend) {
-        // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
-        // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
+        // with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own allocations,
+        // the file cache) could fail a budget the first one had clamped.  (A budget turns `lend` off.)
         uint64_t physical = budget_physical;
         if (physical == 0 && !available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
@@ -1133,9 +1132,8 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
 
-    // STRATA_ADAPT_FAST: the free places after the experts (see set_spares).  A swap takes a place of its layer's
-    // blob size and gives one of the same size back, so each size keeps its own share of the n places: its layers'
-    // share, at least 8.
+    // The free places after the experts (see set_spares).  A swap takes a place of its layer's blob size and gives one
+    // of the same size back, so each size keeps its own share of the n places: its layers' share, at least 8.
     const uint64_t spare_at = bytes;
     std::vector<std::pair<uint64_t, int64_t>> spare_sizes;   // (blob bytes, places)
     if (bytes > 0 && spares_want_ > 0 && n_layers_ > 0) {
@@ -1242,7 +1240,7 @@ bool FileExpertSource::pin_cache_complement(
             const int64_t layer = next_layer.fetch_add(1);
             if (layer >= n_layers_ || failed.load()) return;
             const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
-            std::vector<Fill> batch;   // #286, unbuffered: 32 blobs' reads in flight at once, merged where near
+            std::vector<Fill> batch;   // unbuffered: 32 blobs' reads in flight at once, merged where near
             auto flush = [&]() {
                 if (batch.empty()) return true;
                 bool ok = read_direct(batch.data(), batch.size());
@@ -1570,7 +1568,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         return;
     }
     if (expert_layout().native) {
-        // plan v0.3 P6: a native pack runs its experts in verify windows only (the driver guarantees it)
+        // a native pack runs its experts in verify windows only (the driver guarantees it)
         d.failed = true;
         d.fail = "the single-token expert path does not take a native (IQ) pack";
         d.fail_layer = d.layers;
@@ -1661,7 +1659,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         j.slot = (int) i;
     }
 
-    // Plan v0.3 P4: rows of every expert across all threads (bitwise the same as `run`).
+    // rows of every expert across all threads (bitwise the same as `run`).
     if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
     else d.pool->run(d.jobs.data(), (int) njobs);
     if (d.remote_count > 0) {
@@ -1711,11 +1709,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
-    // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
-    // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
+    // ---- the GPU's share, decided and published FIRST so the GPU starts while the CPU works.  Distinct experts in
+    // routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
-    // STRATA_DEC_MOE: the device planned the layer; only its CPU entries are the pool's
+    // the device planned the layer; only its CPU entries are the pool's
     const bool ext = d.plan != nullptr && d.plan->ext_kind != nullptr && n <= kMaxWindowEntries;
     if (ext) {
         for (int64_t i = 0; i < n; ++i) kind[i] = d.plan->ext_kind[i];
@@ -1834,7 +1832,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (kind[i] < 0) { any_cpu = true; break; }
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
-        // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
+        // --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
@@ -1871,7 +1869,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
-                else ++d.offload_entries;                       // #588: PCIe or another GPU
+                else ++d.offload_entries;   // PCIe or another GPU
                 if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
                 // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU;
@@ -2220,13 +2218,13 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
     }
 }
 
-// Plan v0.3 P6: the arena from the model's GGUF shards.  Each layer's gate, up and down tensors hold the 512
-// experts one after another; they are read in chunks and each expert's slice lands at its place in the blob
-// [gate rows | up rows | down rows] - the layout tools/iq_pack.py would have written to experts.bin.  Each role
-// is read from its own file (native_experts.txt v4: a shard boundary can fall inside a layer; per role as in
-// #255, gopinath87607).  The caller checks the spans first (check_experts_gguf).
-// `unbuffered` (Windows, experts_unbuffered): each chunk's 4 KiB-aligned window is read with FILE_FLAG_NO_BUFFERING into
-// an aligned buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
+// The arena from the model's GGUF shards.  Each layer's gate, up and down tensors hold the experts one after another;
+// they are read in chunks and each expert's slice lands at its place in the blob [gate rows | up rows | down rows] -
+// the layout tools/iq_pack.py would have written to experts.bin.  Each role is read from its own file
+// (native_experts.txt v4: a shard boundary can fall inside a layer).  The caller checks the spans first
+// (check_experts_gguf).
+// `unbuffered` (experts_unbuffered): each chunk's 4 KiB-aligned window is read past the file cache into an aligned
+// buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered) {
     LoadStats st;
@@ -2236,9 +2234,8 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     std::atomic<bool> bad{false};
     (void) unbuffered;
     auto worker = [&]() {
-        // #230: `fread` on a `FILE*`, as load_experts_ranges (#89): MSVC's `std::ifstream::read` splits a request
-        // into 4095-byte freads, which took this path to 0.02 GiB/s on a Windows install without experts.bin.
-        // The guard closes the handle on every return.
+        // `fread` on a `FILE*`, as load_experts_ranges: it passes a large request straight to the read call.  The guard
+        // closes the handle on every return.
         struct Closer {
             FILE* f = nullptr;
             ~Closer() { if (f != nullptr) std::fclose(f); }
@@ -2301,7 +2298,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                              const std::string& shared_arena_file) {
     close();
     const std::string path = pack_dir + "/experts.bin";
-    // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
+    // the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     if (lay.n_layers != n_layers || lay.n_expert != n_expert) {
         err = "ArenaExpertSource: the expert layout was loaded for a different geometry";
@@ -2310,10 +2307,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     const int64_t blob = (int64_t) lay.max_blob;
     const uint64_t want = lay.total;
 
-    // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
+    // no experts.bin in a native pack -> the experts come straight from the GGUF
     const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
-    // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend
-    // 34 GB and a minute of loading first.
+    // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend a
+    // minute of loading first.
     if (from_gguf) {
         // every (file, offset) of native_experts.txt must be the tensor it claims, of the pack's type and
         // dimensions and inside its file - before the allocation, so a pack of another model or a truncated
@@ -2335,11 +2332,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         }
     }
 
-    // #633: THE RAM BEFORE THE ALLOCATION.  On Linux the arena is an anonymous mapping that succeeds whatever the host
-    // has; its pages are committed as the load writes them, so a container whose memory limit is below the arena was
-    // killed by the OOM killer part-way through the load, without a message.  A hard cgroup limit below it is
-    // certain to end that way: refused, with the numbers.  Less RAM available than the arena (another program, an
-    // engine still exiting) is only a warning - the OS may make room - per the recommend-not-force rule.
+    // THE RAM BEFORE THE ALLOCATION.  On Linux the arena is an anonymous mapping that succeeds whatever the host has;
+    // its pages are committed as the load writes them, so a container whose memory limit is below the arena would be
+    // killed by the OOM killer part-way through the load, without a message.  A hard cgroup limit below it is certain
+    // to end that way: refused, with the numbers.  Less RAM available than the arena (another program, an engine
+    // still exiting) is only a warning - the OS may make room.
     ram_warning_.clear();
     // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
     if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
@@ -2389,8 +2386,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
-    // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
-    // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
+    // unbuffered when the drive is read anyway and the file cache could not keep the experts for the next start
+    // either; otherwise the buffered readers, which a warm restart serves from the cache
     std::vector<std::string> files;
     if (from_gguf) {
         for (int64_t l = 0; l < n_layers; ++l)
@@ -2427,7 +2424,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     arena_ = a;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
-    // plan v0.3 P6: device aliases of the mapped registration, for the PCIe share of the misses
+    // device aliases of the mapped registration, for the PCIe share of the misses
     dev_slice_.clear();
     slice_bytes_ = a->slice_bytes;
     if (a->registered_bytes > 0) {
@@ -2477,9 +2474,7 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
 // Only the pages wholly inside the blob: a page shared with a neighbour the CPU may still read stays.  MADV_DONTNEED
 // unmaps them from this process; they stay in the page cache as clean, unmapped pages - the first the kernel takes
 // back under pressure, and a minor fault away when the CPU needs the expert again (an adaptive swap evicts it).
-// Dropping them from the cache too (POSIX_FADV_DONTNEED) made every eviction a re-read from the disk: ~200 major
-// faults a second in decode, +8 ms a window.  The memory the arena used to hold was never the cache itself but
-// ROCclr's pin-in-place locks on it (see main) - locked pages are the ones the kernel cannot take back.
+// Dropping them from the cache too (POSIX_FADV_DONTNEED) would make every eviction a re-read from the disk.
 uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
     if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
     const auto& lay = strata::kernels::cpu::expert_layout();
