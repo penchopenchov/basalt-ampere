@@ -1974,6 +1974,50 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
         return 1;
     }
+    // ---- the bytes this start places, once, from the model file's tables: the dense weights, the 8-bit copies, the
+    // draft layer, the head and every expert (the GPU cache plus its complement in RAM).  Each term is the total its own
+    // load phase reports.  A layer split places bytes per stage: no total, the progress lines stand alone.
+    uint64_t model_bytes = 0, expert_total_bytes = 0, cuda0_fixed_bytes = 0;   // the latter: all but the cache fill
+    bool ssd_warned = false;   // the fit check already said the experts will be read from the SSD
+    if (!multi_gpu) {
+        uint64_t dense_bytes = 0, mtp_bytes = 0, head_bytes = 0;
+        std::set<std::string> index_names;
+        for_each_index_name(pack_files.index, [&](const std::string& n) { index_names.insert(n); });
+        const bool planned =
+            basalt::core::NativeDense::plan_bytes(o.native_shards, o.native_ple_key, 0, -1, dense_bytes, err) &&
+            basalt::core::NativeHead::plan_bytes(o.native_shards, head_bytes, err) &&
+            (o.mtp.empty() || o.spec < 2 ||
+             basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err));
+        if (planned) {
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                expert_total_bytes += (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l);
+            cuda0_fixed_bytes = pool_bytes + dense_bytes + head_bytes + mtp_bytes +
+                                basalt::core::Verifier::hc8_plan_bytes(
+                                    [&](const std::string& n) { return index_names.count(n) > 0; }, g);
+            model_bytes = cuda0_fixed_bytes + expert_total_bytes;
+            // the model's bytes against what the primary card and the RAM have free: the rest is read from the SSD
+            size_t free_vram = 0, total_vram = 0;
+            const auto free_ram = basalt::core::conversation_available_memory();
+            if (cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_ram) {
+                const uint64_t vram = (uint64_t) free_vram > ((uint64_t) o.vram_reserve_mib << 20)
+                                          ? (uint64_t) free_vram - ((uint64_t) o.vram_reserve_mib << 20) : 0;
+                const uint64_t ram = *free_ram > o.resident_headroom ? *free_ram - o.resident_headroom : 0;
+                ssd_warned = model_bytes > vram + ram;
+                if (ssd_warned)
+                    std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
+                                         "the SSD while generating (slow)\n",
+                                 (double) model_bytes / 1073741824.0, (double) (vram + ram) / 1073741824.0);
+            } else {
+                (void) cudaGetLastError();
+            }
+            basalt::core::LoadProgress::announce_total(model_bytes);
+            // the experts' places follow once the cache is sized; with the arena every expert goes to RAM first
+            basalt::core::LoadProgress::plan("cuda0", cuda0_fixed_bytes);
+            if (!o.mmap_experts) basalt::core::LoadProgress::plan("ram", expert_total_bytes);
+        } else {
+            std::fprintf(stderr, "basalt generate: load total not computed: %s\n", err.c_str());
+        }
+    }
     void* arena = nullptr;
     if (const cudaError_t ce = cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
         // the arena is the first large allocation and its size does not depend on the context, so what is
@@ -2027,7 +2071,7 @@ int main(int argc, char** argv) {
         void* stage = nullptr;
         basalt::core::WeightTable staged;
         if (!basalt::core::WeightTable::pool_bytes(pack_files, stage_bytes, err, &others) ||
-            cudaMalloc(&stage, stage_bytes) != cudaSuccess || !staged.load(pack_files, stage, stage_bytes, err, &others)) {
+            cudaMalloc(&stage, stage_bytes) != cudaSuccess || !staged.load(pack_files, stage, stage_bytes, err, &others, false)) {
             std::fprintf(stderr, "basalt generate: hc8: staging the hyper-connection matrices failed%s%s\n",
                          err.empty() ? "" : ": ", err.c_str());
             return 1;
@@ -2630,6 +2674,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt generate: session state allocation failed\n");
             return 1;
         }
+        basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(0),
+                                       basalt::core::session_bytes(g, o.max_context, K, 0, hi0), o.max_context);
         if (basalt::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
             std::fprintf(stderr, "basalt generate: session_init failed\n");
             return 1;
@@ -2664,6 +2710,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
+        basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(st.dev),
+                                       basalt::core::session_bytes(g, o.max_context, K, st.lb, st.le), o.max_context);
         const bool last = i + 1 == stages.size();
         const basalt::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
@@ -2897,7 +2945,6 @@ int main(int argc, char** argv) {
     basalt::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena
     const bool auto_cache = o.expert_cache < 0;
-    bool reserve_adapted = false;   // the auto sizing lowered the reserve so a small card's cache fits
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
@@ -2921,7 +2968,7 @@ int main(int argc, char** argv) {
         // top - more than the reserve.  When the default reserve leaves less than that (a small card), the reserve
         // shrinks to what leaves exactly that cache, down to kSmallReserveMib: what is allocated after the cache - the
         // prompt path's own part, the verify buffers, the draft head - comes out of the reserve, so the cache gets no
-        // more than it needs, and the serve check says so plainly when it ends LOW (`reserve_adapted`).  A reserve
+        // more than it needs, and the serve check says so when it ends low.  A reserve
         // given on the command line is kept.  No slot at all: the start stops, saying what is short and what makes
         // room.  A card the default reserve leaves that much is sized as before.
         constexpr int kSmallReserveMib = 300;
@@ -2939,7 +2986,6 @@ int main(int argc, char** argv) {
                              o.vram_reserve_mib, (long long) min_slots, r, (long long) s2);
                 o.vram_reserve_mib = r;
                 o.expert_cache = (int) s2;
-                reserve_adapted = true;
             }
         }
         if (o.expert_cache == 0) {
@@ -3118,6 +3164,7 @@ int main(int argc, char** argv) {
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
+    uint64_t cache_fill_bytes = 0;   // what the GPU cache took from the profile (counted by its load phase)
     if (!profile.empty() && srcp != nullptr) {
         // per layer, a full layer skips only its own pairs - each layer takes its hottest experts until its range is
         // full
@@ -3137,7 +3184,16 @@ int main(int argc, char** argv) {
         uint64_t fill_total = 0;
         for (int64_t i = 0; i < want; ++i)
             fill_total += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
-        basalt::core::LoadProgress fill_progress(basalt::core::LoadProgress::cuda(0), fill_total);
+        cache_fill_bytes = fill_total;
+        if (model_bytes > 0) {
+            if (srcp == &src) {
+                basalt::core::LoadProgress::plan("cuda0", cuda0_fixed_bytes + fill_total);
+                basalt::core::LoadProgress::plan("ram", expert_total_bytes - fill_total);
+            } else {
+                basalt::core::LoadProgress::plan("cuda0", fill_total, true);
+            }
+        }
+        basalt::core::LoadProgress fill_progress(basalt::core::LoadProgress::cuda(0), fill_total, srcp != &src);
         for (int64_t i = 0; i < want; ++i) {
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
@@ -3322,30 +3378,17 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
+    // ---- Multi-GPU: the second GPU's expert tier (filled after the RAM complement below, from it)
     basalt::core::PeerExperts peer;
-    if (o.peer_device >= 1) {
-        if (profile.empty() || srcp == nullptr || o.expert_cache <= 0) {
-            std::fprintf(stderr, "basalt generate: --peer-device needs an expert profile and the expert cache\n");
-            return 1;
-        }
-        const auto tp0 = Clock::now();
-        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
-                       err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
-        }
-        std::fprintf(stderr, "basalt generate: peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
-                             "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
-                     std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
-                     (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+    if (o.peer_device >= 1 && (profile.empty() || srcp == nullptr || o.expert_cache <= 0)) {
+        std::fprintf(stderr, "basalt generate: --peer-device needs an expert profile and the expert cache\n");
+        return 1;
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "basalt generate: %s\n", err.c_str()); return 1; }
     Drive drive;
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
-    drive.d.peer = peer.valid() ? &peer : nullptr;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
@@ -4080,12 +4123,14 @@ int main(int argc, char** argv) {
             whole_err = err;
             resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, -1, o.resident_headroom,
                                                    basalt::core::FileExpertSource::kResidentWhatFits, &profile);
-            if (resident_ok)
-                std::fprintf(stderr, "basalt generate: WARNING: the whole resident RAM mode does not fit (%s); %.2f "
-                                     "GiB of the experts the GPU does not hold, the hottest by the expert profile, are "
-                                     "kept in RAM and the rest are read from the model folder through the OS file "
-                                     "cache\n",
-                             whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
+            if (resident_ok) {
+                std::fprintf(stderr, "basalt generate: the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
+                                     "are kept in RAM\n", whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
+                if (!ssd_warned)
+                    std::fprintf(stderr, "basalt warning: RAM holds only %.1f GiB of the experts, the rest is read from "
+                                         "the SSD while generating (slow)\n",
+                                 (double) src.resident_bytes() / 1073741824.0);
+            }
             else
                 err = whole_err + "; " + err;
         }
@@ -4103,20 +4148,43 @@ int main(int argc, char** argv) {
                          o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
                                                                 : "off");
         } else if (o.resident_soft) {
-            std::fprintf(stderr, "basalt generate: WARNING: the resident RAM mode does not fit (%s); the experts the "
-                                 "GPU does not hold are read from the model folder through the OS file cache "
-                                 "(--mmap-experts), which is slower when the RAM cannot keep them\n", err.c_str());
+            std::fprintf(stderr, "basalt generate: the resident RAM mode does not fit (%s)\n", err.c_str());
+            if (!ssd_warned)
+                std::fprintf(stderr, "basalt warning: not enough RAM for the experts, they are read from the SSD while "
+                                     "generating (slow)\n");
         } else if (o.resident_budget > 0) {
             // a RAM budget that cannot be kept is not a reason to stop - the experts it would have held are read from
             // the files like the ones outside it (pin_cache_complement leaves nothing half-built)
-            std::fprintf(stderr, "basalt generate: WARNING: the RAM budget (--resident-budget-gib) cannot be kept (%s); "
-                                 "every expert the GPU does not hold is read from the model files through the OS file "
-                                 "cache (--mmap-experts), which is slower\n", err.c_str());
+            std::fprintf(stderr, "basalt generate: the RAM budget (--resident-budget-gib) cannot be kept (%s)\n",
+                         err.c_str());
+            if (!ssd_warned)
+                std::fprintf(stderr, "basalt warning: not enough RAM for the experts, they are read from the SSD while "
+                                     "generating (slow)\n");
         } else {
             std::fprintf(stderr, "basalt generate: CPU expert residency: %s\n", err.c_str());
             return 1;
         }
     }
+    // experts no RAM tier holds (none was asked for, or the RAM is short) are read from the file when needed
+    if (srcp == &src && !src.complement_ready() && expert_total_bytes > cache_fill_bytes) {
+        basalt::core::LoadProgress::skipped(expert_total_bytes - cache_fill_bytes);
+        basalt::core::LoadProgress::plan("ram", 0);
+    }
+    // ---- the peer's experts: the ranked pairs the primary does not hold.  They are copies of experts the RAM
+    // complement holds, so with the complement built they are read from it, not from the file.
+    if (o.peer_device >= 1) {
+        const auto tp0 = Clock::now();
+        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
+                       err)) {
+            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "basalt generate: peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
+                             "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
+                     std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
+                     (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+    }
+    drive.d.peer = peer.valid() ? &peer : nullptr;
     if (o.serve) {
         if ((!no_spec && (o.spec < 2 || o.mtp.empty())) || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -5152,16 +5220,9 @@ int main(int argc, char** argv) {
             const int64_t free_mib = (int64_t) (free_b >> 20);
             if (free_mib >= 256) {
                 std::fprintf(stderr, "basalt serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
-            } else if (reserve_adapted) {
-                // the reserve was already lowered to make the cache fit - a bigger one would leave it no room
-                std::fprintf(stderr, "basalt serve: WARNING: %lld MiB of VRAM free with everything loaded - this card "
-                                     "only just fits the model (the VRAM reserve was lowered to %d MiB so the expert "
-                                     "cache fits): requests may stall. Close other programs that use the GPU, or lower "
-                                     "--max-context\n", (long long) free_mib, o.vram_reserve_mib);
             } else {
-                std::fprintf(stderr, "basalt serve: %lld MiB of VRAM free with everything loaded - LOW: requests may stall;"
-                                     " add --vram-reserve-mib %lld to the config's args (or lower --max-context)\n",
-                             (long long) free_mib, (long long) (o.vram_reserve_mib + 512 - free_mib));
+                std::fprintf(stderr, "basalt warning: only %lld MiB of VRAM free, requests may stall; close other "
+                                     "programs that use the GPU\n", (long long) free_mib);
             }
         }
         // what the server's Monitor tab shows (the server skips unknown lines until READY)
