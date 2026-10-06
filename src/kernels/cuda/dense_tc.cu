@@ -673,7 +673,53 @@ __device__ __forceinline__ void pair_terms(float (&acc)[4], const uint8_t* rowA,
     }
 }
 
-// block blk of nblk (256 threads); smem: 128 + 4096 + 2048 (IQ3_S grid) + 2 slots of the larger tile
+// the x fragments of chunk c (as pair_terms loads them)
+__device__ __forceinline__ void pair_xfrag(XFrag& xf, int c, int hb, int g, int t, const uint8_t* __restrict__ x,
+                                           int nb32, int ncols) {
+#pragma unroll
+    for (int k4 = 0; k4 < 4; ++k4) {
+        const int k = 16 * c + 4 * hb + k4;
+        xf.b0[k4] = xf.b1[k4] = 0;
+        if (g < ncols) {
+            const uint8_t* xb = x + ((size_t) g * nb32 + k) * kQ81;
+            xf.b0[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 4) + t);
+            xf.b1[k4] = __ldg(reinterpret_cast<const unsigned int*>(xb + 20) + t);
+        }
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const int col = 2 * t + e;
+            xf.d8[k4][e] = col < ncols ? __low2float(__ldg(reinterpret_cast<const half2*>(
+                                             x + ((size_t) col * nb32 + k) * kQ81)))
+                                       : 0.0f;
+        }
+    }
+}
+
+// pair_terms with the warp's (at most 3) chunks' x fragments held in registers across tiles
+template<int TYPE>
+__device__ __forceinline__ void pair_terms_xr(float (&acc)[4], const uint8_t* rowA, const uint8_t* rowB, int wp,
+                                              int hb, int n, int t, int nchunk, const XFrag (&xs)[3],
+                                              const uint32_t* grid, int probe) {
+    constexpr int CB = 2 * Fmt<TYPE>::SB;
+    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    if constexpr (TYPE == 23) {
+        const uint32_t* tbl = reinterpret_cast<const uint32_t*>(dtc_iq4nl);
+        t0 = tbl[0]; t1 = tbl[1]; t2 = tbl[2]; t3 = tbl[3];
+    }
+    rowA += (hb >> 1) * Fmt<TYPE>::SB;
+    rowB += (hb >> 1) * Fmt<TYPE>::SB;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int c = (wp >> 2) + 2 * j;
+        if (c >= nchunk) break;
+        const uint8_t* const p[2] = {rowA + c * CB, rowB + c * CB};
+        if (!(probe & 1)) half_sb_terms<TYPE>(acc, p, n, t, xs[j], t0, t1, t2, t3, grid);
+    }
+}
+
+// block blk of nblk (256 threads); smem: 128 + 4096 + 2048 (IQ3_S grid) + 2 slots of the larger tile.  XR: the x
+// fragments in registers (n_in <= 3072)
+template<bool XR>
 __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* smem, PairMat m0, PairMat m1,
                                                     const uint8_t* __restrict__ x, int n_in, int ncols, int probe) {
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
@@ -712,6 +758,12 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
     }
     __syncthreads();
     pdl_wait();
+    XFrag xs[3];
+    if constexpr (XR) {
+#pragma unroll
+        for (int j = 0; j < 3; ++j)
+            if ((wp >> 2) + 2 * j < nchunk) pair_xfrag(xs[j], (wp >> 2) + 2 * j, hb, g, t, x, nb32, ncols);
+    }
     for (int i = 0; i < mine; ++i) {
         const int tile = blk + i * nblk;
         const bool second = tile >= nt0;
@@ -730,12 +782,22 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         const uint8_t* rowA = slot + g * row_bytes;
         const uint8_t* rowB = slot + (g + 8) * row_bytes;
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        switch (m.type) {
-            case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-            case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-            case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-            case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
-            default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+        if constexpr (XR) {
+            switch (m.type) {
+                case 12: pair_terms_xr<12>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 13: pair_terms_xr<13>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 14: pair_terms_xr<14>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 21: pair_terms_xr<21>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+            }
+        } else {
+            switch (m.type) {
+                case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+            }
         }
         float* rw = red + wp * 16 * kMaxCols;
         rw[g * kMaxCols + 2 * t] = acc[0];
@@ -763,11 +825,12 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
 }
 #endif
 
+template<bool XR>
 __global__ void __launch_bounds__(256) dense_tc_pair_kernel(PairMat m0, PairMat m1, const uint8_t* __restrict__ x,
                                                             int n_in, int ncols, int probe) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_pair_block((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
+    dense_tc_pair_block<XR>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -975,17 +1038,20 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
     const int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(dense_tc_pair_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
+        cudaFuncSetAttribute(dense_tc_pair_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
+        cudaFuncSetAttribute(dense_tc_pair_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
         attr = true;
     }
+    // STRATA_DEC_PAIR & 2: each warp's x fragments in registers across its tiles
+    const auto kern = (g_pair & 2) && n_in <= 3072 ? dense_tc_pair_kernel<true> : dense_tc_pair_kernel<false>;
     int occ = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_pair_kernel, 256, smem);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, 256, smem);
     if (g_bps > 0 && g_bps < occ) occ = g_bps;
     if (occ < 1) occ = 1;
     const int ntiles = (n_out0 + 15) / 16 + (n_out1 + 15) / 16;
     const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
     const PairMat m0{(const uint8_t*) w0, y0, t0, n_out0}, m1{(const uint8_t*) w1, y1, t1, n_out1};
-    launch_pdl(dense_tc_pair_kernel, dim3((unsigned) grid), dim3(256), (size_t) smem, (cudaStream_t) stream, m0, m1,
+    launch_pdl(kern, dim3((unsigned) grid), dim3(256), (size_t) smem, (cudaStream_t) stream, m0, m1,
                (const uint8_t*) x_q8_1, n_in, ncols, g_probe);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
