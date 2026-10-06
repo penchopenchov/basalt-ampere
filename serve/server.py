@@ -300,8 +300,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
-                    say("arena", f"[server] {loading}\n"
-                                 "         This takes a few minutes and the system may feel slow meanwhile.")
+                    say("arena", f"[server] {loading[:-1]}; this takes a few minutes and the system may feel slow")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[server] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
@@ -3104,9 +3103,7 @@ def warn_tight_ram(arena_mib) -> None:
         return
     left = total / 2**30 - arena_mib / 1024
     if left < 6:
-        print(f"[server] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
-              f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
-              + "Linux may stop the engine in the middle of an answer. Close other programs.", flush=True)
+        print(f"[server] warning: low RAM, {left:.1f} of {total / 2**30:.0f} GB left after the experts", flush=True)
 
 
 
@@ -3424,15 +3421,15 @@ def main() -> int:
         if lazy and cfg.get("vision"):
             ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
+            print("[server] loading the vision encoder ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env))
-        print("model unloaded; the first request loads it ..." if lazy else
-              "loading the model (the first start takes a minute or two) ...", flush=True)
+        print("[server] model unloaded; the first request loads it ..." if lazy else
+              "[server] loading the model ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             try:
                 split = layer_split_value(cfg)          # before the (minutes-long) start
@@ -3492,7 +3489,7 @@ def main() -> int:
     if svc.cors_origins:
         print(f"[server] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
-                 " - WARNING: any web page may use the model (no API key)"), flush=True)
+                 "; warning: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
@@ -3520,20 +3517,19 @@ def main() -> int:
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
-    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+    print(f"[server] ready: http://{here}:{a.port}/v1 (OpenAI /v1/chat/completions, Anthropic /v1/messages), "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
-          f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{a.port}/ in a browser for the stats; close this window to stop the model", flush=True)
+          f"{', API key required' if svc.api_key else ''}", flush=True)
+    print(f"[server] stats page: http://{here}:{a.port}/ (Ctrl+C stops the model)", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
-            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
+            print(f"[server] from other devices: http://{ip}:{a.port}/ (API http://{ip}:{a.port}/v1)", flush=True)
         if not ips:
-            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
+            print(f"[server] from other devices: http://<this machine's address>:{a.port}/", flush=True)
         if not svc.api_key:
-            print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
-                  "to the config (clients send it as their API key)", flush=True)
+            print("[server] warning: no API key, open to the network (--api-key KEY)", flush=True)
     if a.open and cfg.get("open_browser") is not False:   # the config's "open_browser": false wins
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
