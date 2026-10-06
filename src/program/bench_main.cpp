@@ -335,6 +335,8 @@ struct Done {
     std::string finish;
 };
 
+std::string engine_failure(const std::string& log_path);
+
 class Engine {
 public:
     ~Engine() { stop(); }
