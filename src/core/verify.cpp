@@ -19,6 +19,7 @@
 #include "strata/kernels/hc_fused.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/dec_gdn.hpp"
+#include "strata/kernels/dense_tc.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -241,6 +242,14 @@ const int64_t g_test_stall = [] {
     const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
     return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
 }();
+// a dense projection of the window: dense_tc where STRATA_DEC_DTC has the projection's bit and the type, else
+// native_mmvq (either one for every window width, so a column's value never depends on T)
+void dense_proj(int bit, int type, const void* w, const void* xq, float* y, int n_in, int n_out, int n, void* s) {
+    if ((kernels::dense_tc_mask() & bit) && kernels::dense_tc_supported(type, n_in))
+        kernels::dense_tc(type, w, xq, y, n_in, n_out, n, s);
+    else
+        kernels::native_mmvq(type, w, xq, y, n_in, n_out, n, s);
+}
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) {
@@ -1122,7 +1131,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     cudaEventRecord(ev_fork_, cs);
                     cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
                     PdlScope pz(pdl, true);
-                    native_mmvq(wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, sh_cs_);
+                    dense_proj(2, wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, sh_cs_);
                     cudaEventRecord(ev_join_, sh_cs_);
                 };
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
@@ -1132,10 +1141,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     cudaStreamWaitEvent(sh_hi_, ev_fork_, 0);
                     {
                         PdlScope pz(pdl, true);
-                        native_mmvq(wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, sh_hi_);
+                        dense_proj(2, wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, sh_hi_);
                     }
                     cudaEventRecord(ev_join_, sh_hi_);
-                    native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
+                    dense_proj(1, wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                     stamp(l, 2, grp);
                     DecRecArgs ra;
                     ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
@@ -1150,11 +1159,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         dec_gdn_rec(ra, n, cs);
                     }
                     stamp(l, 6, grp);
-                    native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                    dense_proj(4, wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
                     goto gdn_done;
                 }
                 if (gdnf_fork && gdnf == 3) gdnf_z_side();
-                native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
+                dense_proj(1, wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
                 if (gdnf) {
                     DecRecArgs ra;
@@ -1173,13 +1182,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         PdlScope pn(pdl, true);   // the norm follows the join
                         dec_gdn_rec_norm(ra, n, cs);
                         stamp(l, 6, grp);
-                        native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                        dense_proj(4, wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
                     } else {
-                        native_mmvq(wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, cs);
+                        dense_proj(2, wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, cs);
                         for (int i = 3; i <= 5; ++i) stamp(l, i, grp);
                         dec_gdn_rec(ra, n, cs);
                         stamp(l, 6, grp);
-                        native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                        dense_proj(4, wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
                     }
                     goto gdn_done;
                 }
@@ -1199,7 +1208,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                dense_proj(2, wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 if (batch_rec_) {   // each row's recurrence from its own slot's state, one token
@@ -1215,7 +1224,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                     (int) HV, te, nullptr, cs, tb);
                 stamp(l, 6, grp);
                 native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
-                native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                dense_proj(4, wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
             gdn_done:;
             } else {
                 // ======================= QSA =======================
@@ -1247,8 +1256,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else for (int t = tb; t < te; ++t)
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                     stamp(l, 7, grp);
-                    native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                    native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                    dense_proj(32, wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
+                    dense_proj(32, wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 }
                 // STRATA_DEC_QSA=1: the K norm + RoPE, the INT8 appends, the tail snapshot and the indexer appends of the
                 // group's rows in one launch, the same bits
@@ -1311,8 +1320,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 9, grp);
                 {
                     PdlScope pq(pdl2 && fused_pre && qb);   // PDL2: after the K/V post kernel
-                    native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
-                                (int) (NH * 2 * HD), n, cs);
+                    dense_proj(8, wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                               (int) (NH * 2 * HD), n, cs);
                     if (fused_pre && qb)
                         bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
                                                   IQ * ID, N, IQ * ID, n, cs);
@@ -1407,7 +1416,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 14, grp);
                 PdlScope ps(pdl);   // after the gate kernel
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
-                native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+                dense_proj(16, wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
