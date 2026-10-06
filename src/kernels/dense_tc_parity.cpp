@@ -51,6 +51,15 @@ const Case CASES[] = {
     {"kv Q6_K", 14, 2560, 512, 210, {208, -1}},
     {"tail Q4_K", 12, 1024, 1000, 144, {0, 2}},
     {"tail Q6_K", 14, 1536, 999, 210, {208, -1}},
+    {"qkv Q3_K", 11, 2560, 10240, 110, {108, -1}},
+    {"z Q3_K", 11, 2560, 6144, 110, {108, -1}},
+    {"out Q3_K", 11, 6144, 2560, 110, {108, -1}},
+    {"q Q3_K", 11, 2560, 12288, 110, {108, -1}},
+    {"qkv Q2_0", 42, 2560, 10240, 18, {0, -1}},
+    {"z Q2_0", 42, 2560, 6144, 18, {0, -1}},
+    {"q Q2_0", 42, 2560, 12288, 18, {0, -1}},
+    {"tail Q3_K", 11, 1536, 999, 110, {108, -1}},
+    {"tail Q2_0", 42, 1024, 1000, 18, {0, -1}},
 };
 
 uint16_t sane_half(std::mt19937& rng) {
@@ -359,7 +368,8 @@ int main(int argc, char** argv) {
         if (std::getenv("DTC_PAIR_ONLY") == nullptr)   // DTC_PAIR_ONLY=1: only the dense_tc_pair checks
             for (const Case& c : CASES)
                 if (c.type != 21 || c.n_in % 2048 == 0) ok = parity(c, s) && ok;
-        const int pairs[][2] = {{0, 6}, {1, 5}, {2, 4}, {3, 6}, {0, 5}};
+        const int pairs[][2] = {{0, 6}, {1, 5}, {2, 4}, {3, 6}, {0, 5}, {16, 17}, {3, 17}, {20, 21}, {16, 21}, {1, 17},
+                                {20, 17}};
         for (const auto& pr : pairs) ok = pair_parity(CASES[pr[0]], CASES[pr[1]], s) && ok;
     }
     if (argc > 1 && (std::string(argv[1]) == "--bench" || only_bench)) {

@@ -6,6 +6,8 @@
 //   Q6_K          d * d8 * (sc0 * dot0 + sc1 * dot1)        (the two 16-value halves)
 //   IQ4_XS        d * d8 * (ls - 32) * dot
 //   IQ3_S         d * d8 * (1 + 2 * sc) * dot
+//   Q3_K          d * d8 * ((sc0 - 32) * dot0 + (sc1 - 32) * dot1)   (the two 16-value halves)
+//   Q2_0          d * d8 * dot                              (d per 64 values)
 // The terms are the native kernels' math with fewer roundings, not their bits.  Every column is summed in one order
 // fixed by the shape (n_in, n_out) alone, so a column's value does not depend on how many columns ride along or where
 // it sits.
@@ -44,8 +46,8 @@ void dense_tc_l2_prefetch(const void* w, std::size_t bytes, void* stream);
 /// STRATA_DEC_DTC: which verify projections take dense_tc for every window width (bits): 1 GDN qkv, 2 GDN z, 4 GDN
 /// out, 8 QSA q, 16 QSA out, 32 QSA k/v.  0 (default) none.
 int dense_tc_mask();
-/// STRATA_DEC_DTC_TYPES: the weight types STRATA_DEC_DTC takes (bits): 1 Q4_K, 2 Q5_K, 4 Q6_K, 8 IQ4_XS; default all;
-/// 16 IQ3_S (also with STRATA_DEC_DTC2 & 4).
+/// STRATA_DEC_DTC_TYPES: the weight types STRATA_DEC_DTC takes (bits): 1 Q4_K, 2 Q5_K, 4 Q6_K, 8 IQ4_XS, 32 Q3_K,
+/// 64 Q2_0; default all; 16 IQ3_S (also with STRATA_DEC_DTC2 & 4).
 bool dense_tc_type_on(int ggml_type) noexcept;
 
 }  // namespace strata::kernels

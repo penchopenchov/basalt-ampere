@@ -38,6 +38,8 @@ template<> struct Fmt<13> { static constexpr int SB = 176; };
 template<> struct Fmt<14> { static constexpr int SB = 210; };
 template<> struct Fmt<23> { static constexpr int SB = 136; };
 template<> struct Fmt<21> { static constexpr int SB = 110; };
+template<> struct Fmt<11> { static constexpr int SB = 110; };
+template<> struct Fmt<42> { static constexpr int SB = 72; };   // four 64-value Q2_0 blocks
 
 // a staged row of a slot: two super-blocks from the 16-byte unit holding their first byte, padded to an odd number
 // of 16-byte units so the eight rows a load touches fall in different banks
@@ -191,6 +193,81 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
         }
 #pragma unroll
         for (int q = 0; q < 4; ++q) acc[q] += dd[q >> 1] * part[q];
+    } else if constexpr (TYPE == 11) {   // Q3_K: hmask[32], qs[64], scales[12], d; 2-byte aligned
+        uint32_t qw[2][2], hw[2][2], sc[2][2];
+        float dd[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            qw[h][0] = ld32_b2(p[h] + 32 + 32 * n + 4 * t);   // values 4t.. of every block of the half
+            qw[h][1] = ld32_b2(p[h] + 48 + 32 * n + 4 * t);   // values 16 + 4t..
+            hw[h][0] = ld32_b2(p[h] + 4 * t);
+            hw[h][1] = ld32_b2(p[h] + 16 + 4 * t);
+            const uint32_t a0 = ld32_b2(p[h] + 96), a1 = ld32_b2(p[h] + 100), a2 = ld32_b2(p[h] + 104);
+            // the half's eight 6-bit scales (ggml's aux[2n], aux[2n + 1])
+            sc[h][0] = ((n ? a0 >> 4 : a0) & 0x0f0f0f0fu) | (((a2 >> (4 * n)) & 0x03030303u) << 4);
+            sc[h][1] = ((n ? a1 >> 4 : a1) & 0x0f0f0f0fu) | (((a2 >> (4 * n + 2)) & 0x03030303u) << 4);
+            dd[h] = __half2float(*reinterpret_cast<const __half*>(p[h] + 108));
+        }
+        float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {   // block 4n + i: 2-bit plane i of the half's qs, hmask bit 4n + i
+            const int j = 4 * n + i;
+            uint32_t lo[2], hi[2];
+            int sc0[2], sc1[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                lo[h] = __vsub4(((qw[h][0] >> (2 * i)) & 0x03030303u) | (((hw[h][0] >> j) & 0x01010101u) << 2),
+                                0x04040404u);
+                hi[h] = __vsub4(((qw[h][1] >> (2 * i)) & 0x03030303u) | (((hw[h][1] >> j) & 0x01010101u) << 2),
+                                0x04040404u);
+                sc0[h] = byte_of(sc[h][i >> 1], 2 * (i & 1)) - 32;
+                sc1[h] = byte_of(sc[h][i >> 1], 2 * (i & 1) + 1) - 32;
+            }
+            int e0[4], e1[4];
+            mma_k16(e0, lo[0], lo[1], x.b0[i]);
+            mma_k16(e1, hi[0], hi[1], x.b1[i]);
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+                part[q] += x.d8[i][q & 1] * (float) (sc0[q >> 1] * e0[q] + sc1[q >> 1] * e1[q]);
+        }
+#pragma unroll
+        for (int q = 0; q < 4; ++q) acc[q] += dd[q >> 1] * part[q];
+    } else if constexpr (TYPE == 42) {   // Q2_0: four blocks of d, qs[16] (value v: 2 bits at 2 (v % 4) of byte v / 4,
+                                         // code - 1); 2-byte aligned
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {   // Q2_0 block 2n + b: the 32-value blocks 4n + 2b, 4n + 2b + 1
+            float dw[2];
+            uint32_t qb[2][2][2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint8_t* bp = p[h] + 18 * (2 * n + b);
+                dw[h] = __half2float(*reinterpret_cast<const __half*>(bp));
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    qb[h][k][0] = bp[2 + 8 * k + t];
+                    qb[h][k][1] = bp[6 + 8 * k + t];
+                }
+            }
+            float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int i = 2 * b + k;
+                uint32_t v[2][2];
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) {
+                        const uint32_t q = qb[h][k][e];
+                        v[h][e] = __vsub4((q | q << 6 | q << 12 | q << 18) & 0x03030303u, 0x01010101u);
+                    }
+                int d[4];
+                mma_k32(d, v[0][0], v[1][0], v[0][1], v[1][1], x.b0[i], x.b1[i]);
+#pragma unroll
+                for (int q = 0; q < 4; ++q) part[q] += x.d8[i][q & 1] * (float) d[q];
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[q] += dw[q >> 1] * part[q];
+        }
     } else if constexpr (TYPE == 21) {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]; 2-byte aligned
         float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         float dw[2];
@@ -634,7 +711,7 @@ struct PairMat {
     int type, n_out;
 };
 __host__ __device__ constexpr int sb_bytes(int type) {
-    return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : 136;
+    return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 || type == 11 ? 110 : type == 42 ? 72 : 136;
 }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 template<int TYPE>
@@ -789,6 +866,8 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                 case 13: pair_terms_xr<13>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
                 case 14: pair_terms_xr<14>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
                 case 21: pair_terms_xr<21>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 11: pair_terms_xr<11>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 42: pair_terms_xr<42>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
                 default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
             }
         } else {
@@ -797,6 +876,8 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                 case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
                 case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
                 case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 11: pair_terms<11>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 42: pair_terms<42>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
                 default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
             }
         }
@@ -989,7 +1070,7 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
 }  // namespace
 
 bool dense_tc_supported(int t, int n_in) noexcept {
-    return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23);
+    return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42);
 }
 
 bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
@@ -998,8 +1079,8 @@ bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
 }
 
 bool dense_tc_type_on(int t) noexcept {
-    static const int m = env_int("STRATA_DEC_DTC_TYPES", 15) | ((g_v2 & 4) ? 16 : 0);
-    return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : t == 21 ? 16 : 0)) != 0;
+    static const int m = env_int("STRATA_DEC_DTC_TYPES", 15 | 32 | 64) | ((g_v2 & 4) ? 16 : 0);
+    return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : t == 21 ? 16 : t == 11 ? 32 : t == 42 ? 64 : 0)) != 0;
 }
 
 void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -1014,6 +1095,8 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
         case 13: launch<13>(w, x, y, n_in, n_out, ncols, s); break;
         case 14: launch<14>(w, x, y, n_in, n_out, ncols, s); break;
         case 21: launch<21>(w, x, y, n_in, n_out, ncols, s); break;
+        case 11: launch<11>(w, x, y, n_in, n_out, ncols, s); break;
+        case 42: launch<42>(w, x, y, n_in, n_out, ncols, s); break;
         default: launch<23>(w, x, y, n_in, n_out, ncols, s); break;
     }
     const cudaError_t e = cudaGetLastError();
@@ -1024,7 +1107,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
 }
 
 bool dense_tc_pair_supported(int t0, int t1, int n_in) noexcept {
-    auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23; };
+    auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 11 || t == 42; };
     if (!ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
     const int tb = 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
     return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb <= 99 * 1024;
