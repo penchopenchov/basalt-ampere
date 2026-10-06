@@ -1038,16 +1038,16 @@ class DraftHeadHint(unittest.TestCase):
 
     def test_the_engines_hint_is_relayed(self):
         p, off = self.log("basalt mtp: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
-                          "basalt mtp: hint: a smaller draft vocabulary needs less VRAM: --draft-vocab en (...)\n"
+                          "basalt mtp: hint: free VRAM (...)\n"
                           "basalt serve: mtp: the draft head does not fit\n")
         h = start_failure_hint(p, off)
         self.assertIn("the draft head does not fit", h)
         self.assertIn("348 MiB", h)
-        self.assertIn("--draft-vocab en", h)
+        self.assertIn("free VRAM", h)
 
-    def test_an_older_engine_gets_the_advice_in_words(self):
+    def test_without_the_engines_hint_the_server_gives_one(self):
         p, off = self.log("basalt serve: mtp: the draft head does not fit\n")
-        self.assertIn("--draft-vocab en", start_failure_hint(p, off))
+        self.assertIn("--spec 0", start_failure_hint(p, off))
 
     def test_other_failures_and_earlier_starts_add_nothing(self):
         p, off = self.log("basalt serve: cannot open the pack\n")

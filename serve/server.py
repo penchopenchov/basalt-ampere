@@ -168,9 +168,7 @@ ENGINE_REQUEST = re.compile(
 _echoing: set[str] = set()      # the logs echo_requests already follows (restart() runs ProcessEngine.__init__ again)
 
 DRAFT_HEAD_FAIL = "the draft head does not fit"
-DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic "
-                   "script) or --draft-vocab en (English and code, ~215 MiB less than the default), in the engine "
-                   "arguments; or a smaller --context.")
+DRAFT_HEAD_HINT = "free VRAM, or run without the drafter (--spec 0)"
 
 
 def start_failure_hint(log: str | None, offset: int) -> str:
