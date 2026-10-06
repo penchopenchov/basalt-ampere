@@ -230,23 +230,20 @@ int main(int argc, char** argv) {
         hs.resize((size_t) v.rows * v.srow);
         cudaMemcpy(hq.data(), v.q, hq.size(), cudaMemcpyDeviceToHost);
         cudaMemcpy(hs.data(), v.s, hs.size() * 2, cudaMemcpyDeviceToHost);
-        std::vector<uint16_t> X((size_t) s.T * s.K), Xl((size_t) s.T * s.K);
+        std::vector<uint16_t> X((size_t) s.T * s.K);
         for (size_t i = 0; i < X.size(); ++i) {
-            const float x = nd(rng);
-            X[i] = bf16(x);
-            Xl[i] = bf16(x - f32(X[i]));
+            X[i] = bf16(nd(rng));
         }
-        uint16_t *dX, *dXl;
+        uint16_t* dX;
         float *Y0, *Y1, *Y2;
         const int64_t ldy = s.N + 8;
-        cudaMalloc((void**) &dX, X.size() * 2); cudaMalloc((void**) &dXl, X.size() * 2);
+        cudaMalloc((void**) &dX, X.size() * 2);
         cudaMalloc((void**) &Y0, (size_t) s.T * ldy * 4); cudaMalloc((void**) &Y1, (size_t) s.T * ldy * 4);
         cudaMalloc((void**) &Y2, (size_t) s.T * ldy * 4);
         cudaMemcpy(dX, X.data(), X.size() * 2, cudaMemcpyHostToDevice);
-        cudaMemcpy(dXl, Xl.data(), Xl.size() * 2, cudaMemcpyHostToDevice);
-        big.bf16_w(dX, s.w, Y0, s.T, s.N, s.K, ldy, dXl);                         // bf16 matrix
-        big.bf16_w(dX, (const uint16_t*) s.key, Y1, s.T, s.N, s.K, ldy, dXl);     // copy, one slice
-        small.bf16_w(dX, (const uint16_t*) s.key, Y2, s.T, s.N, s.K, ldy, dXl);   // copy, row slices
+        big.bf16_w(dX, s.w, Y0, s.T, s.N, s.K, ldy);                         // bf16 matrix
+        big.bf16_w(dX, (const uint16_t*) s.key, Y1, s.T, s.N, s.K, ldy);     // copy, one slice
+        small.bf16_w(dX, (const uint16_t*) s.key, Y2, s.T, s.N, s.K, ldy);   // copy, row slices
         cudaStreamSynchronize(st);
         const std::vector<float> y0 = get(Y0, (size_t) s.T * ldy), y1 = get(Y1, (size_t) s.T * ldy),
                                  y2 = get(Y2, (size_t) s.T * ldy);
@@ -258,7 +255,7 @@ int main(int argc, char** argv) {
             const int64_t t = pt(rng), n = pn(rng);
             double ref = 0;
             for (int64_t i = 0; i < s.K; ++i) {
-                const double x = (double) f32(X[t * s.K + i]) + (double) f32(Xl[t * s.K + i]);
+                const double x = (double) f32(X[t * s.K + i]);
                 ref += x * (double) hq[n * s.K + i] * (double) f16f(hs[n * v.srow + i / 32]);
             }
             ex.add(y1[t * ldy + n], (float) ref);
@@ -272,7 +269,7 @@ int main(int argc, char** argv) {
         expect(ex.rel() < 5e-3, "the product against the copy in double");
         expect(eb.rel() < 5e-2, "the product against bf16");
         expect(sliced, "row slices");
-        cudaFree(dX); cudaFree(dXl); cudaFree(Y0); cudaFree(Y1); cudaFree(Y2);
+        cudaFree(dX); cudaFree(Y0); cudaFree(Y1); cudaFree(Y2);
     }
 
     // ---------------------------------------------------------------- 3. times

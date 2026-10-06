@@ -137,16 +137,12 @@ inline float hsum_ps(__m256 v) {
     return _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(s, s), s));
 }
 
-// ================================ plan v0.3 P6: the row dot in 512-bit lanes ================================
+// ================================ the row dot in 512-bit lanes ================================
 //
-// The 256-bit row dot below spent ~12 cycles per 64-weight block: two unpacks, two VNNI dots, two converts, two
-// scalar scale products broadcast into two FMAs, an fp16 conversion and a scalar correction - compute-bound at
-// ~39 GB/s while the machine streams 52.  Here a block is ONE unpack (16 code bytes -> 64 codes), ONE VNNI dot
-// over 64 activations, ONE convert and ONE FMA whose per-chunk scales come from a permute of a vector of scale
-// products built for eight blocks at a time; the weight-independent correction is one FMA per eight blocks.
-// The sum order differs from the 256-bit kernel (last-bit differences); the verify window and plain decode both
-// use this kernel, so speculative decode still reproduces plain decode exactly.
-static constexpr bool kZmm = true;
+// A block is ONE unpack (16 code bytes -> 64 codes), ONE VNNI dot over 64 activations, ONE convert and ONE FMA whose
+// per-chunk scales come from a permute of a vector of scale products built for eight blocks at a time; the
+// weight-independent correction is one FMA per eight blocks.  The verify window and plain decode both use this
+// kernel, so speculative decode reproduces plain decode exactly.
 
 inline __m512i unpack64_q2_0(const uint8_t* codes) {
     const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes
@@ -226,20 +222,7 @@ inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const A
 /// 64-weight block (two 8-lane horizontal sums: a store plus 16 scalar adds) cost far more than the dot
 /// products themselves - it made the kernel compute-bound at 21 GB/s instead of DRAM-bound at 32.
 inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
-    if (kZmm) return row_dot_z(codes, scales, a, nblocks);
-    __m256 acc = _mm256_setzero_ps();
-    // The -sum(xhat) term is a SCALAR: broadcasting it into all 8 lanes and letting hsum_ps add them would
-    // apply it eight times per block.
-    float corr = 0.f;
-    for (int b = 0; b < nblocks; ++b) {
-        const float d = h2f(scales + 2 * b);
-        const __m256 slo = _mm256_cvtepi32_ps(block_dot(codes + b * 16, a.q + b * QK));
-        const __m256 shi = _mm256_cvtepi32_ps(block_dot(codes + b * 16 + 8, a.q + b * QK + QKA));
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d * a.scale[2 * b]), slo, acc);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d * a.scale[2 * b + 1]), shi, acc);
-        corr += d * (a.hx[2 * b] + a.hx[2 * b + 1]);
-    }
-    return hsum_ps(acc) - corr;
+    return row_dot_z(codes, scales, a, nblocks);
 }
 
 // VNNI's integer partial sums are exact. Remove the Q2_0 code offset BEFORE
@@ -273,26 +256,7 @@ inline float row_dot_oracle(const uint8_t* codes, const uint8_t* scales, const A
 template<int NT>
 inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const ActQ* const* a, int nblocks,
                           float* res) {
-    if (kZmm) { row_dot_multi_z<NT>(codes, scales, a, nblocks, res); return; }
-    __m256 acc[NT];
-    float corr[NT];
-    for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_ps(); corr[t] = 0.f; }
-    for (int b = 0; b < nblocks; ++b) {
-        const float d = h2f(scales + 2 * b);
-        const __m256i lo = unpack_q2_0(codes + b * 16);
-        const __m256i hi = unpack_q2_0(codes + b * 16 + 8);
-        for (int t = 0; t < NT; ++t) {
-            const __m256 slo = _mm256_cvtepi32_ps(
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), lo, _mm256_load_si256((const __m256i*) (a[t]->q + b * QK))));
-            const __m256 shi = _mm256_cvtepi32_ps(
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), hi,
-                                    _mm256_load_si256((const __m256i*) (a[t]->q + b * QK + QKA))));
-            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b]), slo, acc[t]);
-            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b + 1]), shi, acc[t]);
-            corr[t] += d * (a[t]->hx[2 * b] + a[t]->hx[2 * b + 1]);
-        }
-    }
-    for (int t = 0; t < NT; ++t) res[t] = hsum_ps(acc[t]) - corr[t];
+    row_dot_multi_z<NT>(codes, scales, a, nblocks, res);
 }
 
 template<int NT>

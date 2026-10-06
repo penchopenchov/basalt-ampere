@@ -45,8 +45,6 @@ void note(cublasStatus_t s, const char* what) {
 
 Gemm::~Gemm() {
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
-    if (tc_w_) cudaFree(tc_w_);
-    if (tc_x_) cudaFree(tc_x_);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
         if (workspace_) cudaFree(workspace_);
@@ -108,86 +106,11 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     return true;
 }
 
-// ---- below sm_80: BF16 GEMMs without BF16 tensor cores (PR #655, #540, #395) ----------------------------------------
-// Turing and Volta have no BF16 tensor cores: cublasGemmEx on CUDA_R_16BF inputs falls back to a SIMT fp32 kernel
-// (magma_sgemmEx), a fifth of a 4K prompt on an RTX 2080 Ti (#655) and ~10% of a V100's prompt (#540).  BF16 -> FP16
-// is exact for every value inside FP16's normal range (the 7-bit mantissa fits in 10 bits); weights and normalized
-// activations sit there.  With the FP16 path, the weight is converted once per call and the activations in row
-// slices, into the instance's own buffers, and the product runs as the FP16 GEMM (fp32 accumulate) on the tensor
-// cores.  Finite values beyond FP16's range are clamped to +-65504 (#540) instead of becoming Inf.  A beta = 1
-// product (STRATA_PREFILL_BF16X2's remainder, ~2^-9 of the original, deep in FP16's subnormal band) keeps cuBLAS.
-// Pascal (6.x) has no tensor cores and cuBLAS has no BF16 GEMM for it (#395, measured NOT_SUPPORTED on a P40): both
-// operands are widened to fp32 by an exact shift and the product is cublasSgemm with the same fp32 accumulator.
-namespace {
-__global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ in, __half* __restrict__ out, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float f = __uint_as_float((uint32_t) in[i] << 16);
-        if (f > 65504.0f && !isinf(f)) f = 65504.0f;
-        else if (f < -65504.0f && !isinf(f)) f = -65504.0f;
-        out[i] = __float2half_rn(f);
-    }
-}
-void bf16_to_f16(const uint16_t* in, uint16_t* out, int64_t n, cudaStream_t st) {
-    if (n <= 0) return;
-    bf16_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, reinterpret_cast<__half*>(out), n);
-}
-// The current device's compute capability as 10 * major + minor, per device (a layer split can mix cards); 0: not
-// known, read as "not an old card" so a failed query keeps the cuBLAS BF16 call.
-int current_cc() {
-    static std::atomic<int> cc[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
-    int v = cc[dev].load(std::memory_order_relaxed);
-    if (v == 0) {
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-            cudaGetLastError();
-            return 0;
-        }
-        v = 10 * major + minor;
-        cc[dev].store(v, std::memory_order_relaxed);
-    }
-    return v;
-}
-// 0: cuBLAS's BF16 GEMM, 1: through FP16 (tensor cores), 2: through FP32 (Pascal)
-int bf16_path() {
-    const int cc = current_cc();
-    if (cc <= 0 || cc >= 80) return 0;
-    if (cc < 70) return 2;
-    return cc < 75 ? 1 : 0;
-}
-bool grow(uint16_t*& p, int64_t& have, int64_t want) {   // `have`, `want`: 2-byte elements
-    if (have >= want) return true;
-    if (p) cudaFree(p);
-    p = nullptr;
-    have = 0;
-    if (cudaMalloc((void**) &p, (size_t) want * 2) != cudaSuccess) { cudaGetLastError(); p = nullptr; return false; }
-    have = want;
-    return true;
-}
-constexpr int64_t kXSliceElems = 16ll << 20;   // 32 MiB of FP16 activations per slice (64 MiB as fp32)
-}  // namespace
-
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     const float alpha = 1.0f;
-    if (const int path = K > 0 ? bf16_path() : 0; path == 1 && N > 1 && beta == 0.0f) {
-        // a single output row stays cuBLAS's GEMV, faster than the conversions; beta = 1: see above
-        const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
-        if (grow(tc_w_, tc_w_elems_, N * K) && grow(tc_x_, tc_x_elems_, x_rows * K)) {
-            bf16_to_f16(W, tc_w_, N * K, (cudaStream_t) stream_);
-            for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
-                const int64_t n = std::min<int64_t>(x_rows, T - t0);
-                bf16_to_f16(X + t0 * K, tc_x_, n * K, (cudaStream_t) stream_);
-                f16(tc_x_, tc_w_, Y + t0 * ldy, n, N, K, ldy, beta);
-            }
-            return;
-        }
-    }
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
@@ -196,8 +119,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
-void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-                  const uint16_t* X_lo) {
+void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
     strata::kernels::Hc8View v;
     if (strata::kernels::hc8_view(W, v) && v.owned) {
         if (v.rows != N || v.cols != K) {
@@ -215,12 +137,10 @@ void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int
             const int64_t n = std::min<int64_t>(rows, N - r0);
             strata::kernels::hc8_dequant_bf16(v, r0, n, scratch_, stream_);
             bf16(X, scratch_, Y + r0, T, n, K, ldy);
-            if (X_lo) bf16(X_lo, scratch_, Y + r0, T, n, K, ldy, 1.0f);
         }
         return;
     }
     bf16(X, W, Y, T, N, K, ldy);
-    if (X_lo) bf16(X_lo, W, Y, T, N, K, ldy, 1.0f);
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,

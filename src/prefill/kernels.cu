@@ -275,108 +275,12 @@ __global__ void gdn_l2_kernel(float* __restrict__ h, float eps) {
     x[threadIdx.x] = v * rsqrtf(ss + eps);
 }
 constexpr int RG = 4, RPG = S / RG;
-__global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                         const float* __restrict__ gate,
-                                                         const float* __restrict__ beta, const float* __restrict__ z,
-                                                         const float* __restrict__ gamma, float eps,
-                                                         float* __restrict__ y, uint16_t* __restrict__ y16, int64_t T) {
-    __shared__ float sk[S], sq[S], red[RG][S], wsum[16];
-    const int head = blockIdx.x, col = threadIdx.x, rg = threadIdx.y, tid = rg * S + col;
-    const int qh = head % HK;
-    float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-    const size_t rs = (size_t) HV * S;
-#pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-    const float g_col = gamma[col];
-    for (int64_t t = 0; t < T; ++t) {
-        const float* ht = h + t * C;
-        __syncthreads();
-        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
-        __syncthreads();
-        const float g = __expf(gate[t * HV + head]);
-        float kv = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-        red[rg][col] = kv;
-        __syncthreads();
-        const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
-        const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
-        float o = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) {
-            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
-            o = fmaf(s[r], sq[rg * RPG + r], o);
-        }
-        __syncthreads();
-        red[rg][col] = o;
-        __syncthreads();
-        float oc = 0.0f, sp = 0.0f;
-        if (rg == 0) {
-            oc = (red[0][col] + red[1][col] + red[2][col] + red[3][col]) * rsqrtf((float) S);
-            sp = oc * oc;
-        }
-        sp = warp_sum(sp);
-        if ((tid & 31) == 0) wsum[tid >> 5] = sp;
-        __syncthreads();
-        if (rg == 0) {
-            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-            const float v = oc * rsqrtf(ss / (float) S + eps) * g_col * sigm(z[t * HV * S + head * S + col]);
-            y[t * HV * S + head * S + col] = v;
-            y16[t * HV * S + head * S + col] = hf(v);
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
-}
-
-// D-2: the recurrence with the value columns split over 4 blocks per head (4x the blocks of the kernel above, a
-// quarter of its threads per __syncthreads), and the output norm - the only step that couples the head's columns -
-// in its own kernel. Per column the same arithmetic in the same order (the 4 row-group partial sums added as
-// red[0] + red[1] + red[2] + red[3]; the norm's warp sums over the same 32-column warps): the same bits.
+// the recurrence with the value columns split over NCB blocks per head (a quarter of the threads per
+// __syncthreads); the output norm - the only step that couples the head's columns - is its own kernel
 constexpr int CB = 32, NCB = S / CB;
-__global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                                const float* __restrict__ gate,
-                                                                const float* __restrict__ beta,
-                                                                float* __restrict__ oc_out, int64_t T) {
-    __shared__ float sk[S], sq[S], red[RG][CB];
-    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
-    const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
-    const int qh = head % HK;
-    float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-    const size_t rs = (size_t) HV * S;
-#pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-    for (int64_t t = 0; t < T; ++t) {
-        const float* ht = h + t * C;
-        __syncthreads();
-        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
-        __syncthreads();
-        const float g = __expf(gate[t * HV + head]);
-        float kv = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-        red[rg][c] = kv;
-        __syncthreads();
-        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
-        const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
-        float o = 0.0f;
-#pragma unroll
-        for (int r = 0; r < RPG; ++r) {
-            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
-            o = fmaf(s[r], sq[rg * RPG + r], o);
-        }
-        __syncthreads();
-        red[rg][c] = o;
-        __syncthreads();
-        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
-    }
-#pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
-}
-// gdn_rec_cols_kernel with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this token
-// computes (software pipelining).  The same arithmetic in the same order: the same bits, and the same CB-column split.
+// The column-split recurrence with the next token's inputs (q/k rows, v, gate, beta) loaded into registers while this
+// token computes (software pipelining): per column the same arithmetic in the same order (the 4 row-group partial
+// sums added as red[0] + red[1] + red[2] + red[3]).
 __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                       const float* __restrict__ gate,
                                                                       const float* __restrict__ beta,
@@ -1012,9 +916,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    if (T <= 0) {
-        gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
-    } else {
+    if (T > 0) {
         if (gdn_warp_ok())   // the row sums inside a warp (not the same bits)
             gdn_rec_wl_kernel<<<HK * GDN_WNCB, GDN_WC * 8, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else if (gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)

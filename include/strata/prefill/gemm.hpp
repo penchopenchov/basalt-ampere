@@ -26,14 +26,12 @@ public:
                        std::string& err);
 
     /// Y[T, N] (fp32, row stride ldy) = X[T, K] (bf16, row-major) . W[N, K]^T (bf16, row-major).  `beta` = 1 adds.
-    /// Below sm_80 (no BF16 tensor cores): Volta converts both to FP16 and runs the FP16 tensor-core GEMM, Pascal widens both to fp32 (cublasSgemm); see gemm.cu.
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
               float beta = 0.0f);
 
-    /// `bf16` (twice with X_lo: Y += X_lo . W^T), or, when W is an 8-bit copy standing for a BF16 matrix that is not
-    /// in VRAM (STRATA_DEC_HC8, hc_fused.hpp), the same product with W's row slices dequantized to BF16 in the scratch.
-    void bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
-                const uint16_t* X_lo = nullptr);
+    /// `bf16`, or, when W is an 8-bit copy standing for a BF16 matrix that is not
+    /// in VRAM (hc_fused.hpp), the same product with W's row slices dequantized to BF16 in the scratch.
+    void bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
 
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
@@ -58,11 +56,6 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
-    // below sm_80: FP16 (Pascal: fp32) copies of a BF16 product's weight and activation slice (Gemm::bf16)
-    uint16_t* tc_w_ = nullptr;
-    int64_t tc_w_elems_ = 0;
-    uint16_t* tc_x_ = nullptr;
-    int64_t tc_x_elems_ = 0;
 };
 
 
