@@ -61,6 +61,9 @@ constexpr int CN_SB = CN_W / 32 * 2;           // scale bytes per row and half-s
 constexpr int CN_WB = CN_RG * CN_W;            // weight bytes in shared memory
 constexpr int CN_XOFF = CN_WB + CN_RG * CN_SB; // x after the weights and scales
 constexpr int CN_MIN_NU = N / 32;              // up slices of 32 columns at most
+constexpr int CN_MAXCOPY = 8;                  // copies of the sums: the up items read different copies (L2 load spread)
+constexpr int CN_PART = MAXT * CN_HS * CN_ROWS;   // floats per copy of the dot products
+constexpr int CN_SSN = MAXT * CN_HS;              // floats per copy of the sums of squares
 static_assert(LR % CN_RG == 0 && CN_W % 256 == 0 && CN_XOFF % 16 == 0, "cn geometry");
 static_assert(CN_XOFF + MAXT * CN_W * 4 <= SMEM, "cn item fits");
 static_assert(32 * (4 * LR + 16) + 16 + 4 * 32 * 16 * 2 + (MAXT * (LR + 8) + 3 * MAXT * 4 * 32) * 4 + 10240 + 3 * (2 * 512 + 20) * 4 <= SMEM,
@@ -117,6 +120,7 @@ struct HcLaunch {
     float* cns;      // cn: [MAXT][CN_HS] the half-streams' sums of squares
     int bf;          // 1: the 8-bit mma up pass's B fragments formed once per item (hc_up_main_mma8's BF)
     int cn_upw;      // cn: w_down warps whose rows are in before the up items request w_up (of CN_G * CN_HS * WARPS)
+    int cn_copies;   // cn: copies of the sums (up item u reads copy u % cn_copies)
 };
 
 // ---------------------------------------------------------------- primitives
@@ -703,7 +707,7 @@ __device__ bool cn_issue(const HcFusedArgs& a, int d, int tid, char* smem, uint6
 // then 4-7 of each chunk of eight); with `ss`, the half-stream's sum of R'^2 per token (thread order, then the warps in
 // order) into cns.
 template <int T>
-__device__ void cn_x(const HcFusedArgs& a, int hs, int tid, char* smem, float* part, float* cns, bool ss) {
+__device__ void cn_x(const HcFusedArgs& a, int hs, int tid, char* smem, float* part, float* cns, bool ss, int ncopy) {
     constexpr int NV = CN_W / 4 / THREADS + 1;   // float4 per thread and token: tid, then THREADS + tid when in range
     const int c = hs >> 1, lane = tid & 31, warp = tid >> 5;
     float4 r[T][NV], bb[T][NV], g[NV];
@@ -745,7 +749,7 @@ __device__ void cn_x(const HcFusedArgs& a, int hs, int tid, char* smem, float* p
     if (ss && tid < T) {
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w) s += part[tid * WARPS + w];
-        cns[tid * CN_HS + hs] = s;
+        for (int j = 0; j < ncopy; ++j) cns[j * CN_SSN + tid * CN_HS + hs] = s;
     }
 }
 // Warp w: rows 4 w .. 4 w + 3 against every token, lane L taking chunks L + 32 q, q ascending (one scale per chunk's dot
@@ -753,7 +757,7 @@ __device__ void cn_x(const HcFusedArgs& a, int hs, int tid, char* smem, float* p
 // `landed`: one count per warp of a w_down item once its rows are in (the up items' w_up copies wait on it).
 template <int T>
 __device__ void cn_dot(const CnRows& w, int tid, const char* smem, uint64_t* bars, unsigned ph, float* cnp,
-                       unsigned* landed, bool cp) {
+                       unsigned* landed, bool cp, int ncopy) {
     const int warp = tid >> 5, lane = tid & 31;
     if (4 * warp >= w.nrows) return;
     if (cp) {
@@ -796,7 +800,7 @@ __device__ void cn_dot(const CnRows& w, int tid, const char* smem, uint64_t* bar
         const int m = rd * 16 + (lane >> 1);
         if ((lane & 1) == 0 && m < 4 * T) {
             const int r = m / T, k = m - r * T;
-            cnp[((size_t) k * CN_HS + w.hs) * CN_ROWS + w.row0 + 4 * warp + r] = s;
+            for (int j = 0; j < ncopy; ++j) cnp[(size_t) j * CN_PART + ((size_t) k * CN_HS + w.hs) * CN_ROWS + w.row0 + 4 * warp + r] = s;
         }
     }
 }
@@ -1389,6 +1393,7 @@ __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char*
             acc[2] = fmaf(s1, gh[2] + gl[2], acc[2]);
             acc[3] = fmaf(s1, gh[3] + gl[3], acc[3]);
         }
+        stamp(dbg, b, 13, tid);   // warp 0's k-steps done
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int k = 2 * t4 + (j & 1), r = up_tile_row(warp, g + 8 * (j >> 1));
@@ -1837,9 +1842,9 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
                 if (!staged) cn_bars = cn_issue(a, d, tid, smem, dbars, L.cn & 2);
                 const CnRows w = cn_rows(a, d);
                 if (w.q != nullptr) {
-                    cn_x<T>(a, w.hs, tid, smem, s_ssp, L.cns, d < CN_HS);
+                    cn_x<T>(a, w.hs, tid, smem, s_ssp, L.cns, d < CN_HS, L.cn_copies);
                     stamp(dbg, b, 2, tid);
-                    cn_dot<T>(w, tid, smem, dbars, dn_ph, L.cnp, &sy->nload.v, L.cn & 2);
+                    cn_dot<T>(w, tid, smem, dbars, dn_ph, L.cnp, &sy->nload.v, L.cn & 2, L.cn_copies);
                 }
                 if (cn_bars) dn_ph ^= 1u;
             }
@@ -1918,8 +1923,10 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             uint32_t rw[RQ];   // the router weights stream in while the up pass runs (after the w_up copies)
             if (rx) hcx_router_load(a, sl, tid, rw);
             uint16_t* const bfp = reinterpret_cast<uint16_t*>(smem + bf_off);
-            if (Q8 && mma && cn && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, L.cnp, L.cns, item == it.up, bfp);
-            else if (Q8 && mma && cn) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, L.cnp, L.cns, item == it.up);
+            const int cpy = cn ? (item - it.up) % L.cn_copies : 0;
+            const float *cnp = L.cnp + (size_t) cpy * CN_PART, *cns = L.cns + (size_t) cpy * CN_SSN;
+            if (Q8 && mma && cn && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp);
+            else if (Q8 && mma && cn) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up);
             else if (Q8 && mma && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, nullptr, nullptr, false, bfp);
             else if (Q8 && mma) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b);
             else if (mma) hc_up_main_mma<T>(a, sl, tid, smem, dbg, b);
@@ -2215,9 +2222,10 @@ constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel
 // norm tasks (cn_rows; not bitwise, T-independent); 4 = the 8-bit mma up pass's B fragments formed once per item
 // (bitwise); with 1: 8 = the down items' rows, 16 = the up items' slices by cp.async instead of bulk copies.
 // STRATA_DEC_HC2_UPW=<percent> (with 1): the up items request w_up once that share of the w_down rows is in.
+// STRATA_DEC_HC2_COPIES=<n> (with 1, default 1): copies of the down items' sums.
 struct SkConf {
     bool on = false;
-    int pf = 0, nu = 0, ups = 0, hcx = 0, upmma = 0, xh = 0, hc2 = 0, upw = 0;
+    int pf = 0, nu = 0, ups = 0, hcx = 0, upmma = 0, xh = 0, hc2 = 0, upw = 0, copies = 1;
 };
 const SkConf& sk_conf() {
     static const SkConf c = [] {
@@ -2240,6 +2248,8 @@ const SkConf& sk_conf() {
         k.hc2 = e ? (int) std::strtol(e, nullptr, 0) : 0;
         e = std::getenv("STRATA_DEC_HC2_UPW");
         k.upw = std::min(std::max(e ? std::atoi(e) : 0, 0), 100);
+        e = std::getenv("STRATA_DEC_HC2_COPIES");
+        k.copies = std::min(std::max(e ? std::atoi(e) : 1, 1), CN_MAXCOPY);
         return k;
     }();
     return c;
@@ -2262,7 +2272,7 @@ struct DevInfo {
     unsigned long long* racc = nullptr;   // [NSLOT][MAXT][NE]
     float* cn = nullptr;                  // [NSLOT][MAXT * CN_HS * CN_ROWS + MAXT * CN_HS]
 };
-constexpr size_t CN_SLOT = (size_t) MAXT * CN_HS * CN_ROWS + MAXT * CN_HS;
+constexpr size_t CN_SLOT = (size_t) CN_MAXCOPY * (CN_PART + CN_SSN);
 DevInfo g_dev[16];
 
 const DevInfo& dev_info() {
@@ -2626,7 +2636,8 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.bf = (sk.hc2 & 4) && q8 && !sk.on && L.upmma && L.hcx == 1;
     L.cn_upw = sk.upw * CN_G * CN_HS * WARPS / 100;
     L.cnp = d.cn + (size_t) L.slot * CN_SLOT;
-    L.cns = L.cnp + (size_t) MAXT * CN_HS * CN_ROWS;
+    L.cns = L.cnp + (size_t) CN_MAXCOPY * CN_PART;
+    L.cn_copies = sk.copies;
     static const int pre8 = [] { const char* e = std::getenv("STRATA_DEC_HC8_PRE"); return e ? std::atoi(e) : 3; }();
     L.pre8 = std::min(std::max(pre8, 0), NSTAGE);
     if (sk.on) {
