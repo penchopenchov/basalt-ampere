@@ -31,7 +31,7 @@ struct SForm {
     /// are both 8-bit with bias -16 (only `has_offset` differs); IQ4_NL and IQ4_XS are both 4-bit with the
     /// IQ4NL codebook and no offset, and differ in NOTHING this struct otherwise holds.  So it is CARRIED from
     /// the manifest's `source_type` rather than reconstructed - see the activation contract and the
-    /// `act_kind` column `tools/pack_index.py` writes.
+    /// `act_kind` column of the dense index.
     int act_kind = 0;
 };
 

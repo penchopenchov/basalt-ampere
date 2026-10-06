@@ -117,8 +117,8 @@ public:
     /// `kNotResident` rather than reading whatever is adjacent in the table.
     int32_t slot_of(int64_t layer, int64_t expert) const;
     /// Claims the next free slot for `(layer, expert)`.  Returns the slot, or `kNotResident` when the cache is
-    /// full - **it never evicts**, because eviction policy is a measured question (`R4.1`'s LFU-decay vs LRU
-    /// sweep) and a placeholder policy would set the hit rate that everything downstream is then sized against.
+    /// full - **it never evicts**, because an eviction policy has to be chosen from measurements, and a placeholder policy would set the hit
+    /// rate that everything downstream is then sized against.
     int32_t admit(int64_t layer, int64_t expert);
 
     /// Publish a same-layer replacement after its slot copy has completed.
@@ -195,8 +195,7 @@ private:
     int64_t blob_ = 0;
     int64_t next_free_ = 0;
     int64_t fills_ = 0;
-    /// R4.2g.  `per_layer_` off (the default) leaves `next_free_` as the only admission counter, so the
-    /// pre-existing path is untouched.
+    /// `per_layer_` off (the default) leaves `next_free_` as the only admission counter.
     bool per_layer_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;   // slot offsets (slots + 1 entries) when sized

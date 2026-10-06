@@ -72,7 +72,7 @@ struct HostMemory {
     uint64_t cgroup_limit = ~uint64_t{0};
 };
 
-/// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
+/// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
 /// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
 /// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
 /// MemAvailable alone.  False when the RAM cannot be determined.
@@ -207,20 +207,14 @@ struct ExpertDispatch {
     int64_t experts = 0;
     int64_t missing = 0;
 
-    // ================================ R4: THE VRAM TIER, MEASURED BEFORE IT IS USED ================================
+    // ================================ THE VRAM TIER ================================
     //
-    // **THE CACHE IS CONSULTED AND FILLED HERE, AND NOTHING IS COMPUTED FROM IT YET.**  That is deliberate and
-    // it is `R4-design-note.md` §7 step 2: the *dispatch* is measured on its own before any kernel is written,
-    // because a hit rate measured after the kernel exists cannot say whether a disappointing result was the
-    // policy, the split or the kernel.
-    //
-    // So every expert is still computed by the CPU, exactly as before, and the run is numerically identical
-    // with the cache on or off.  What changes is that the engine now reports **h on its own routing, on a real
-    // workload** - which is the number `R4.1` asks for and which until now existed only from offline traces.
+    // **THE CACHE IS CONSULTED AND FILLED HERE.**  The engine reports the hit rate `h` on its own routing,
+    // on a real workload.
     //
     // The policy is compulsory-miss: the first time `(layer, expert)` is routed, if a slot is free it is
-    // admitted and filled from the arena.  No eviction, because eviction policy is the measured question
-    // (`R4.1`'s LFU-decay vs LRU sweep) and a placeholder would set the hit rate everything is sized against.
+    // admitted and filled from the arena.  No eviction: an eviction policy has to be chosen from
+    // measurements, and a placeholder would set the hit rate everything is sized against.
     ExpertCache* cache = nullptr;
     int64_t cache_hits = 0;      ///< lookups already resident
     int64_t cache_admitted = 0;  ///< lookups that took a slot
