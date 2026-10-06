@@ -346,6 +346,22 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
+  # The standard benchmark: a host-only program that drives the engine over its stdin/stdout protocol.
+  execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short=10 HEAD
+                  OUTPUT_VARIABLE _bench_git OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(NOT _bench_git)
+    set(_bench_git unknown)
+  endif()
+  add_executable(basalt-bench src/program/bench_main.cpp)
+  add_dependencies(basalt-bench strata)
+  target_link_libraries(basalt-bench PRIVATE strata_warnings ${CMAKE_DL_LIBS})
+  target_compile_definitions(basalt-bench PRIVATE
+    BASALT_BENCH_ENGINE="$<TARGET_FILE:strata>"
+    BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
+    BASALT_BENCH_GIT="${_bench_git}"
+    BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+    BASALT_BENCH_CUDA="${CMAKE_CUDA_COMPILER_VERSION}")
+
   add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
   # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
   # and cudart explicitly: enabling the CUDA language gives those to .cu sources automatically, but a .cpp
