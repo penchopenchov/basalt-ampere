@@ -1,4 +1,4 @@
-// include/basalt/kernels/s_gemv.hpp - the S-family GEMV, host-callable (P2.S2).
+// include/basalt/kernels/s_gemv.hpp - the S-family GEMV, host-callable.
 //
 // ONE kernel for S2, S4 and S8, because the pack format gives them ONE decode:
 //
@@ -7,7 +7,7 @@
 // with a per-TYPE codebook, code bias, group size and offset presence.  That uniformity is the point of the
 // canonical form - 13 source types collapse to three code widths and a handful of attributes - so the kernel
 // takes those attributes as ARGUMENTS rather than being specialised per source type.  The manifest already
-// carries them per tensor (round 163 added the tests that keep it honest).
+// carries them per tensor.
 #pragma once
 
 #include <cstdint>
@@ -50,7 +50,7 @@ void s_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, const 
 //
 // WHY BOTH EXIST.  `s_gemv` gives one thread per output row, so its parallelism is the OUTPUT WIDTH - and the
 // expert gate/up shape is [2560 x 640], which is 640 threads over 48 SMs, 13 per SM.  Measured, that
-// orientation ran 4.6x slower than [640 x 2560] with identical weights (Memory/LEDGER.md L1).  This variant
+// orientation ran 4.6x slower than [640 x 2560] with identical weights.  This variant
 // makes the parallelism independent of the output width.
 //
 // It is NOT bit-identical to `s_gemv`: the partial sums are added in a different order, so the parity test
@@ -101,14 +101,8 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
 
 /// The row-split form, for output widths too small to fill the machine.
 ///
-/// **THERE IS NO `threads_per_row` HERE, AND THAT IS A FIX RATHER THAN AN OVERSIGHT.**  The parameter used to be
-/// in this signature and the implementation threw it away - `(void) threads_per_row;  // informational` - so a
-/// caller reading the declaration reasonably believed it was tunable, and round 224 spent a whole sweep
-/// measuring it and concluding from the flat result that the kernel was instruction-bound.  The sweep could not
-/// have shown anything else: **it was measuring a knob that is not connected.**
-///
-/// This form is WARP per output row, which is what the shape wants, and the parameter is gone from the
-/// interface so that no one can believe otherwise.  `s_gemv_split`/`s_gemv_split_async` DO take threads_per_row
+/// **THERE IS NO `threads_per_row` HERE ON PURPOSE.**  This form is WARP per output row, which is what the
+/// shape wants, so there is no such knob to tune.  `s_gemv_split`/`s_gemv_split_async` DO take threads_per_row
 /// and DO use it, if a caller wants to tune that shape.
 void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* scales, const float* offset,
                       float* y, int64_t n_in, int64_t n_out, const SForm& form, void* stream);

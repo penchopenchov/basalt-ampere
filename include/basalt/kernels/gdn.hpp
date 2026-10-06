@@ -1,6 +1,6 @@
-// include/basalt/kernels/gdn.hpp - the gated delta-net (GDN) layer's non-projection parts, P2.S2.
+// include/basalt/kernels/gdn.hpp - the gated delta-net (GDN) layer's non-projection parts.
 //
-// Transcribed from `ref/gdn.py`, which is itself transcribed from `build_layer_attn_linear` and
+// Transcribed from `build_layer_attn_linear` and
 // `build_delta_net_autoregressive`.  The projections (`wqkv`, `wqkv_gate`, `ssm_out`) are the existing
 // `s_gemv`/`s2_gemv` kernels; what lives here is everything BETWEEN them.
 //
@@ -11,7 +11,7 @@
 //     C   = 2*128*16 + 128*48 = 10240 channels               d_conv = 4
 //
 // STATE LAYOUT.  This is the one place the kernels deliberately differ from the reference, and the reason is
-// coalescing.  `ref/gdn.py` carries the state as (S, S, H_v) = (i, j, h); here it is **(S, H_v, S)** =
+// coalescing.  the reference carries the state as (S, S, H_v) = (i, j, h); here it is **(S, H_v, S)** =
 // (i, h, j), so that for a fixed i a warp walking consecutive j reads CONTIGUOUS memory.  The state is a
 // runtime buffer, not a weight, so this costs nothing to choose - but it must be said, because the two
 // layouts index the same three numbers and a mismatch is silent.
@@ -27,7 +27,7 @@
 //
 // Every line touches ONLY the (j, h) column.  Nothing couples one column to another, so one thread can own a
 // column for the whole step and no barrier is needed anywhere in the recurrence.  (The decay must still be
-// applied BEFORE the rank-1 update - `ref/gdn.py` PROPERTY 5 pins that, and the test re-pins it here.)
+// applied BEFORE the rank-1 update - the test pins that.)
 #pragma once
 
 #include <cstdint>
@@ -51,8 +51,7 @@ struct GdnShapes {
 ///   beta  (h_v,)
 ///   o     (h_v, S)
 ///
-/// The head pairing is `h % h_k` (MODULO), not `h / (h_v/h_k)` (INTERLEAVE).  `ref/gdn.py` PROPERTY 8 and 11
-/// pin this and the test re-pins it, because both conventions produce well-formed output.
+/// The head pairing is `h % h_k` (MODULO), not `h / (h_v/h_k)` (INTERLEAVE).  The test pins this, because both conventions produce well-formed output.
 void gdn_step(float* state, const float* q, const float* k, const float* v, const float* gate,
               const float* beta, float* o, const GdnShapes& s, void* stream);
 
@@ -81,15 +80,15 @@ void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream);
 
 /// `beta = sigmoid(beta)`, in place over `h_v` values.
 ///
-/// **`gdn_step` DOES NOT DO THIS AND THE LAYER MUST.**  `build_layer_attn_linear` L889 is
+/// **`gdn_step` DOES NOT DO THIS AND THE LAYER MUST.**  `build_layer_attn_linear` has
 /// `beta = ggml_sigmoid(beta)` and the step kernel's contract is `d = (v - sk) * beta`, so what it receives has
 /// to be a fraction.  Passing the raw `ssm_beta @ cur` leaves the delta-net write strength unbounded and signed.
-/// `ref/gdn.py` and `ref/model.py` both sigmoid it; this call is what makes the C++ agree with them.
+/// This call is what makes the C++ agree with the reference.
 void gdn_beta_gate(float* beta, int64_t h_v, void* stream);
 
 /// The layer's closing norm: `y = rms_norm(o, eps) * ssm_norm * sigmoid(z)`.
 ///
-/// Note SIGMOID, not SiLU - qwen3.5 used SiLU and this artifact does not, and `ref/gdn.py` says so outright.
+/// Note SIGMOID, not SiLU - qwen3.5 used SiLU and this artifact does not.
 /// The norm is over the LAST axis: one RMS per head, so it is per-ROW here and not over the whole (h_v, S).
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
                   float eps, void* stream);

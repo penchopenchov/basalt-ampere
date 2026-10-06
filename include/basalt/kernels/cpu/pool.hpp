@@ -95,8 +95,8 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 /// this is it: the host loop calls this on entry and restores on exit.  An unpinned spinning host is free to land on a
 /// worker's core or its SMT sibling, which costs the pool bandwidth.
 ///
-/// The previous host placement. `valid` is false when querying or setting placement failed.  Linux stores the complete,
-/// dynamically sized native CPU mask, including CPU IDs above 63.
+/// The previous host placement. `valid` is false when querying or setting placement failed.  The complete,
+/// dynamically sized native CPU mask is stored, including CPU IDs above 63.
 struct ThreadAffinity {
     std::vector<unsigned long> mask;
     bool valid = false;
@@ -157,9 +157,9 @@ public:
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
 
-    /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
-    /// atomics below.  It was a LOCKED read-modify-write in the park loop, so measuring the contention added to
-    /// it.
+    /// Total `_mm_pause` iterations spent waiting are not counted - see the note on the
+    /// atomics below.  Counting needs a LOCKED read-modify-write in the park loop, which would add to the
+    /// contention being measured.
     long long pauses() const { return 0; }
 
     /// **WHERE `run()` SPENDS ITS TIME, in milliseconds accumulated over its lifetime.**  Three phases per layer - wait

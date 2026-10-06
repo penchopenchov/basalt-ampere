@@ -128,17 +128,15 @@ public:
         old = kNotResident;
     }
 
-    /// **R4.2g: GIVE EACH LAYER ITS OWN SLOTS.  ROUND 328 MEASURED WHY THE GLOBAL FORM CANNOT WORK.**
+    /// **GIVE EACH LAYER ITS OWN SLOTS.**
     ///
-    /// `admit`'s original policy hands out slots in ARRIVAL ORDER from one counter shared by every layer
-    /// (`if (next_free_ >= slots_) return kNotResident;`).  A position looks at 10 experts in each of 48
-    /// layers, so the first `n_slots` distinct (layer, expert) pairs are **about 26 layers of POSITION 0** -
+    /// `admit` hands out slots in ARRIVAL ORDER from one counter shared by every layer
+    /// (`if (next_free_ >= slots_) return kNotResident;`).  A position looks at 10 experts in each layer, so
+    /// the first `n_slots` distinct (layer, expert) pairs cover only the first few layers of POSITION 0 -
     /// the cache fills entirely inside the first position it ever sees and never changes again, so hits are
     /// confined to those few layers for the rest of the run.
     ///
-    /// Measured, `--expert-cache 256`: **1781 of 60000 = 2.97%**.  `Memory/cache_allocation.py` scores the
-    /// same run's routing and says **8 slots per layer is worth 21.4%** and 64 is worth **70.4%**.  The cache
-    /// was never short of capacity - it was handing all of it to two layers.
+    /// Spreading the slots evenly over layers is worth far more than letting a few layers take them all.
     ///
     /// With this on, layer `l` may only use slots `[l*q, (l+1)*q)` where `q = slots()/n_layers`, the last
     /// layer taking the remainder.  **EVICTION IS STILL ABSENT** - the property the comment above calls

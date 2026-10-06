@@ -1,15 +1,15 @@
-// include/basalt/kernels/elementwise.hpp - the small ops a LAYER needs between its GEMVs, P2.S5.
+// include/basalt/kernels/elementwise.hpp - the small ops a LAYER needs between its GEMVs.
 //
 // These are not interesting kernels and that is why they are in one file with one parity test: they are the
 // glue in the per-layer graph, and glue that is written inline at each call site is glue with several
 // slightly different float conventions.  Three of them exist because a projection returns a DIFFERENT
 // quantity from the one the next kernel wants:
 //
-//   * `gdn_gate` turns (alpha, dt, ssm_a) into the recurrence's `gate`.  `ref/gdn.py` L265:
+//   * `gdn_gate` turns (alpha, dt, ssm_a) into the recurrence's `gate`.  the reference:
 //     `gate = softplus(w_alpha . x + dt) * ssm_a`, with `softplus(x) = log1p(exp(x))` and the large-x branch
 //     `ggml_compute_softplus_f32` uses.  `ssm_a` is NEGATIVE, which is what puts `exp(gate)` in (0,1).
 //   * `scale_inplace` applies the delta net's `1/sqrt(S)` to q.  It is a separate op because
-//     `ref/gdn.py` says the two llama.cpp paths apply it in DIFFERENT places, so the caller has to own the
+//     the two llama.cpp paths apply it in DIFFERENT places, so the caller has to own the
 //     choice rather than have it buried in a kernel.
 //   * `f32_to_f16_bulk` is what lets the f32 arithmetic of the mixer feed the fp16-activation GEMVs.
 //     the activation contract is explicit that this is NOT the contract for a quantized weight - it is
@@ -76,14 +76,14 @@ void silu_inplace(float* x, int64_t n, void* stream);
 /// gets swapped, and swapping them produces a well-scaled, plausible tensor - so they are separate entry
 /// points and the parity test asserts the two readings are OBSERVABLE apart rather than trusting the names.
 ///
-/// There is NO `(1 + w)` folding: `ref/qsa.py::rms_norm` is `y * w`, and `build_norm` in the source is
+/// There is NO `(1 + w)` folding: the reference `rms_norm` is `y * w`, and `build_norm` in the source is
 /// `ggml_rms_norm` followed by a plain multiply. Some norms in this artifact DO fold (the GDN path records
 /// which); this one does not, and the same `sqrt(cols)`-sized argument applies to getting it wrong.
 void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream);
 
-/// *seq = v in MAPPED PINNED memory - THE DOORBELL.  A KERNEL and not cudaEventRecord, because round 199
-/// found that an event record inside a capture is SILENTLY DROPPED while a kernel is captured normally, and
-/// round 209 measured the host seeing this one's result 0.050 ms into a 39.8 ms graph.
+/// *seq = v in MAPPED PINNED memory - THE DOORBELL.  A KERNEL and not cudaEventRecord, because an
+/// event record inside a capture is SILENTLY DROPPED while a kernel is captured normally, and the host sees
+/// this one's result early in the graph.
 ///
 /// It lives here because the caller that needs it - moe_layer - is a HOST translation unit, where
 /// __global__ and <<<>>> do not exist.
@@ -95,7 +95,7 @@ void doorbell_ring(uint32_t* d_seq, void* stream);
 /// Plan v0.3 P3 token graph: one thread spins until the host-written `*d_flag` equals the ring value `*d_seq`
 /// (both mapped pinned memory), then fences so everything the host wrote before the flag is visible to the
 /// nodes that follow.  Captured once per layer between `pre[l]` and the parts copy; it is what lets one graph
-/// hold the whole token (bench/micro/device_wait.cu: 5.2 us per handoff, no driver call).
+/// hold the whole token (a handoff needs no driver call).
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
 
 /// Plan v0.3 P3 token graph: copy `n` floats from MAPPED pinned host memory (`src` is its device pointer) into
@@ -114,7 +114,7 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
 /// device-to-host memcpy nodes (copy-engine operations in the middle of the layer chain) and the ring kernel.
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream);
-/// #649 (HIP, DOORBELL_STORE=1): the ring stored as `value` instead of incremented over PCIe.
+/// The same publish, with the ring stored as `value` instead of incremented over PCIe.
 void doorbell_publish_value(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
                             float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
                             void* stream);

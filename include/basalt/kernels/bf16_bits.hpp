@@ -5,8 +5,7 @@
 //
 // **THE `& 1` IS ON BIT 16**, the lowest KEPT bit, which is what makes an exact tie round to EVEN.  Using bit
 // 15 there is a plausible mistake: it differs only on exact ties, i.e. almost never on real data, which is
-// exactly why it would survive any amount of end-to-end testing.  `ref/quant.py` documents the same rule for
-// the same reason.
+// exactly why it would survive any amount of end-to-end testing.  The same rule applies to every BF16 rounding in the engine.
 //
 // WHY THIS IS SEPARATE FROM `f16_bits.hpp`: fp16 and bf16 are not two spellings of one idea.  fp16 has 5
 // exponent bits and 10 mantissa bits; bf16 has 8 and 7.  A conversion routine written for one and reused for

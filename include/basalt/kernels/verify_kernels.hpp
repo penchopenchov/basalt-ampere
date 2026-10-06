@@ -1,4 +1,4 @@
-// include/basalt/kernels/verify_kernels.hpp - plan v0.3 P6: kernels for the speculative VERIFY window, where T
+// include/basalt/kernels/verify_kernels.hpp - kernels for the speculative VERIFY window, where T
 // tokens (the last accepted token and T-1 drafts) go through a layer at once.
 //
 // The GDN recurrence is the one piece of state that cannot simply be overwritten by the next window, so its
@@ -53,7 +53,7 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
 
-// ---- perf-review E-6: a layer whose routed experts are all in VRAM needs nothing from the host
+// ---- a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's
 /// layout (counts | start | dst | tok | pad | ptr | ptr2 | start2, `capx` entries) and order (distinct experts in
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.

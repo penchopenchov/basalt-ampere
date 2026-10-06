@@ -1,12 +1,11 @@
 // include/basalt/kernels/kv_q4.hpp - Q4_0 KV storage with Walsh-Hadamard rotation for the QSA layers (`--kv q4_0`).
 //
-// From PR #21 (code-martin). K and V are rotated by the orthonormal 256-point Hadamard matrix H before they are
+// K and V are rotated by the orthonormal 256-point Hadamard matrix H before they are
 // quantized to ggml's q4_0 (32 values per block: an fp16 scale + 16 bytes of 4-bit codes, 144 B per head per cell,
 // 576 B per cell for K and V of both heads, vs 1,056 B in INT8). The rotation spreads a head's outlier channels
 // over all 256 dimensions, which is what makes 4 bits usable. The query is rotated the same way, so
 // <Hq, Hk> = <q, k> and the scores are unchanged, and the attention output (a mix of rotated values) is rotated
-// back with H (self-inverse). What is lossy is the 4-bit rounding itself: measured, not assumed, in
-// bench/results/2026-09-27-kv-q4.
+// back with H (self-inverse). What is lossy is the 4-bit rounding itself, so check quality before using it.
 //
 // With KV streaming (--kv-resident) the codes live in the host copy and the resident slots like INT8's (KvHostPools
 // k_q4/v_q4, the same block granule), so both options combine.

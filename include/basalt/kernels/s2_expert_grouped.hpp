@@ -1,14 +1,13 @@
-// include/basalt/kernels/s2_expert_grouped.hpp - R4's GPU expert tier.
+// include/basalt/kernels/s2_expert_grouped.hpp - the GPU expert tier.
 //
-// **WHAT THIS IS FOR.** The CPU expert pool is the engine's largest single cost - 663.6 MB of expert bytes per
-// token at ~40 GB/s = 16.2 ms on a ~53 ms token - and `test_expert_pool` measures the pipeline hiding
-// **1.055 ms of 19.035**. The CPU work is 96% exposed because the residual chain is strictly serial, so the
-// only way past it is to stop reading those bytes on the CPU: put experts in VRAM and compute them on the GPU.
+// **WHAT THIS IS FOR.** The CPU expert pool is the engine's largest single cost, and almost all of its work is
+// exposed because the residual chain is strictly serial, so the only way past it is to stop reading those bytes
+// on the CPU: put experts in VRAM and compute them on the GPU.
 //
 // **WHY GROUPED, AND WHY THAT WORD IS THE WHOLE DESIGN.** A layer routes ten experts. The obvious
 // implementation is a loop over hits calling the per-matrix kernel, and it is wrong by arithmetic: five
-// launches per expert at ~6.45 hits and 48 layers is **~1,550 launches per token**, which at a real-stream
-// launch cost of ~3.6 us is 5.6 ms - most of the 10.4 ms the tier is supposed to save. So the hits are grouped
+// launches per expert per layer is over a thousand launches per token, and their launch cost eats most of what
+// the tier is supposed to save. So the hits are grouped
 // into ONE launch per projection:
 //
 //     1. `gu_kernel`    n_hits x 2 x FF rows   - gate and up, together
@@ -31,7 +30,7 @@ namespace basalt::kernels {
 ///
 /// Two regions: the gate/up activations (`n_hits x 2 x FF` floats) and the quantized intermediate
 /// (`n_hits x (FF/32) x 34` bytes).  Carved from the caller's arena rather than allocated - a `cudaMalloc`
-/// on the token path is forbidden by P2.T10 and illegal during stream capture, and this is called from both.
+/// on the token path is forbidden and illegal during stream capture, and this is called from both.
 uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n_ff);
 
 /// **ONE GROUPED EXPERT EVALUATION.**  For each hit `h` in `[0, n_hits)`, evaluates the expert held in
@@ -53,17 +52,16 @@ uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n
 /// * `x_q8_0`       `(n_embd/32)` `block_q8_0`, 34 bytes each, from `quantize_q8_0`
 /// * `scratch`      `moe_hit_grouped_scratch_bytes(n_hits, n_embd, n_ff)`, caller-owned
 /// * `out`          `(k, n_embd)` floats - the SAME buffer the misses were written into
-/// * **`x_scales`    R4.2h, OPTIONAL, and null keeps the previous behaviour exactly.**  When non-null it is
+/// * **`x_scales`    OPTIONAL, and null uses the block's fp16 `d`.**  When non-null it is
 ///                  `n_embd/32` **fp32** activation scales from `quantize_q8_0_scaled`, and they REPLACE the
 ///                  block's fp16 `d` as the activation multiplier - for the gate/up projection and for the
 ///                  intermediate's own quantization in step 3.
 ///
 ///                  **THIS EXISTS BECAUSE A HIT AND A MISS MUST PRODUCE THE SAME NUMBER.**  The CPU pool
-///                  multiplies by the fp32 `ActQ::scale` (`cpu/expert.cpp:92`); this kernel read fp16 `d` out
-///                  of the `block_q8_0`.  `bench/micro/act_quant_parity.cu` measured the gap with both real
-///                  implementations linked: **80 of 80 chunks differ, max relative 4.761e-04** - 2^-11, pure
-///                  fp16 rounding - which is why enabling the cache changed the generated tokens.  Pass null
-///                  and this is bit-for-bit the kernel `moe_hit_parity` has always checked at 6.279e-08.
+///                  multiplies by the fp32 `ActQ::scale` ; reading fp16 `d` out of the
+///                  `block_q8_0` differs from it by up to 2^-11 relative per chunk (pure fp16 rounding), which
+///                  would make enabling the cache change the generated tokens.  Pass null for the kernel
+///                  `moe_hit_parity` checks.
 ///
 /// **THE BLOB LAYOUT IS `expert.hpp`'s AND IS NOT RESTATED HERE.**  Gate/up codes are interleaved by row
 /// (`2r` = gate, `2r+1` = up), the down codes follow, and each plane's scales are fp16 - which is the ONE

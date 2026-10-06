@@ -1,12 +1,12 @@
-// include/basalt/core/layout.hpp - the pack's LAYOUT, resolved by name and checked against the kernels.
+// include/basalt/core/layout.hpp - the model's tensor LAYOUT, resolved by name and checked against the kernels.
 //
 // `WeightTable` answers "where are the bytes".  This answers "is this the tensor I think it is", and it is
-// the layer where a pack and a kernel disagree - which is the failure this project keeps paying for.  Two
+// the layer where the model file and a kernel disagree - which is the failure this project keeps paying for.  Two
 // examples, both real:
 //
-//   * round 194 sized the indexer key store from `indexer.head_count = 4`, which counts QUERY heads.  The
-//     cached key is ONE shared head of 128 (`indexer.k_proj` is [2560, 128]), so the term was 4x too big and
-//     the error survived a round because it moved in the direction that TIGHTENS the budget.
+//   * sizing the indexer key store from `indexer.head_count = 4` counts QUERY heads.  The cached key is ONE
+//     shared head of 128 (`indexer.k_proj` is [2560, 128]), so that term is 4x too big, and the error is
+//     easy to miss because it moves in the direction that TIGHTENS the budget.
 //   * the model definition and the tensor manifest agree on every dimension here, but nothing CHECKED that a
 //     named tensor had the shape the kernel reading it assumes.
 //

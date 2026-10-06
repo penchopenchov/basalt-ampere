@@ -1,4 +1,4 @@
-// include/basalt/spec/controller.hpp - plan v0.3 P6: which drafter, and how many draft tokens, this step.
+// include/basalt/spec/controller.hpp - which drafter, and how many draft tokens, this step.
 //
 // Each step the controller maximizes  E[tokens committed] / T(step)  over the choices
 //     none (k = 0) | suffix lookup with k <= its proposal | MTP with k <= K_MAX
@@ -9,9 +9,8 @@
 // match-length bucket (a long match is far more reliable than a trigram), also an EMA. `observe` updates them
 // from how many drafted tokens the verify pass accepted.
 //
-// Cost: T(n tokens) = dense(n) + experts(n) + sync + draft. The defaults are the 23 Sep measurements:
-// dense ratio per token count from native MMVQ (bench/results/2026-09-23-mmvq-multi), distinct experts per window
-// from the routing trace (2026-09-23-spec-economics), extra-token CPU cost 0.2-0.35 (2026-09-23-cpu-expert-multi).
+// Cost: T(n tokens) = dense(n) + experts(n) + sync + draft. The defaults are priors: dense ratio per token count from native MMVQ, distinct
+// experts per window from the routing trace, and the extra-token CPU cost.
 // Replace them with in-engine measurements through `CostModel`.
 #pragma once
 

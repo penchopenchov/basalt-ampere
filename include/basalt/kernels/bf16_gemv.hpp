@@ -1,4 +1,4 @@
-// include/basalt/kernels/bf16_gemv.hpp - the GEMV for a BF16 weight, P2.S5.
+// include/basalt/kernels/bf16_gemv.hpp - the GEMV for a BF16 weight.
 //
 // WHY THIS EXISTS WHEN `s_gemv` ALREADY DOES.  `s_gemv` decodes the S-family canonical forms (S2/S4/S8) from
 // `codes` + `scales`, and a BF16 weight is not one of them - it has no codes and no scales, it is a plain

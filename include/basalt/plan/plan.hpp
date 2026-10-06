@@ -1,4 +1,4 @@
-// include/basalt/plan/plan.hpp - P1.S9 census + memory planner.
+// include/basalt/plan/plan.hpp - census + memory planner.
 //
 // This is the component that makes one binary adapt to the GPU it is running on.  The engine has 33.97 GB of
 // expert weights (has to live in DRAM and be streamed) and a fixed VRAM budget that has to hold the dense
@@ -36,11 +36,11 @@ struct Geometry {
     /// its own note that the fp32 store is "50 MiB at 32K" (12 layers x 8192 blocks x 128 x 4 B = 48 MiB).
     ///
     ///   original      indexer_heads(1) * head_dim(256) / 4  = 64 B/token/layer   2x too big
-    ///   round 194     indexer_heads(4) * key_dim(128) / 4   = 128 B/token/layer  4x too big
+    ///   wrong         indexer_heads(4) * key_dim(128) / 4   = 128 B/token/layer  4x too big
     ///   correct       key_heads(1)     * key_dim(128) / 4   =  32 B/token/layer
     ///
-    /// Round 194 "fixed" this by reading `indexer.head_count = 4` out of the metadata and multiplying by it -
-    /// right about the metadata, wrong about what was being counted.  **A head count in the metadata does not
+    /// Reading `indexer.head_count = 4` out of the metadata and multiplying by it is
+    /// right about the metadata, wrong about what is being counted.  **A head count in the metadata does not
     /// say WHICH tensor it counts.**
     int indexer_q_heads = 4;    // query heads: they multiply the SCORES, and cost no cache at all
     int indexer_key_heads = 1;  // k_proj is [n_embd, 128]: ONE shared key head
@@ -70,9 +70,8 @@ struct Costs {
 
 // GDN recurrence + conv history, bytes per sequence.  DERIVED, for the same reason everything else here is.
 //
-// This term was MISSING from the plan until round 198: `Costs::state_bytes` exists and `--state` exists, but
-// nothing passed it, so the planner was fed zero and quietly planned without it.  36 GDN layers of fp32 state
-// is **117.7 MB, or 85 expert cache slots** - not a rounding error.
+// This term must be passed (`Costs::state_bytes`, `--state`): a planner fed zero quietly plans without it.
+// 36 GDN layers of fp32 state is **117.7 MB, or 85 expert cache slots** - not a rounding error.
 //
 //   recurrence    (S, h_v, S) fp32  = 128 * 48 * 128 * 4 = 3,145,728 B per layer
 //   conv history  (d_conv-1, C) fp32 =     3 * 10240 * 4 =   122,880 B per layer

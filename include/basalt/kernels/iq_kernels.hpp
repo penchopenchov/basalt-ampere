@@ -83,11 +83,11 @@ void native_expert_set_mode(int mode, int phase);
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
 /// MMVQ_MMA=1 (read at startup; the setter overrides it, for tests): `iq_mmvq`'s IQ3_S calls of 2..8 columns
-/// with n_in % 512 == 0 run on int8 tensor cores where the device has them (sm_80+ CUDA), never with the old kernels;
+/// with n_in % 512 == 0 run on int8 tensor cores where the device has them (int8 MMA), never with the old kernels;
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_mmvq_mma(bool on);
 bool iq_mmvq_mma();
-/// Whether the current device runs the tensor-core kernel (never on HIP).
+/// Whether the current device runs the tensor-core kernel.
 bool iq_mmvq_mma_available();
 /// Tensor-core launches so far in this process (tests: proof that the path ran).
 long iq_mmvq_mma_launches();

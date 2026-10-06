@@ -1,4 +1,4 @@
-// include/basalt/kernels/ple.hpp - P2.S4: the PLE block's GPU half (`build_ple`, qwen4exp.cpp L1206-1293).
+// include/basalt/kernels/ple.hpp - the PLE block's GPU half (`build_ple`).
 //
 // One token, sixteen gathered rows of 160 -> a residual-stack update:
 //
@@ -12,16 +12,13 @@
 //     conv      = sum_k kW[k][c] * padded[hist + t - (kern-1-k)*dil][c]
 //     out       = hidden + gated + silu(conv)
 //
-// **`normalized` IS THE CONV INPUT, AND `ref/ngram.py` SAYS OTHERWISE.**  Its `ple_block` docstring calls
-// `terms` "the padded gated values", but the source pads `normalized` - the grouped_norm of the gated values,
-// not the gated values themselves - and `ple_layer_xcheck.cpp` L107-112 builds it that way from ggml.  The
-// reference computes `normalized` and then ignores it, passing `terms` in from the caller, so its own code
-// does not contradict its docstring and nothing catches it.  This header takes the HISTORY OF NORMALIZED
+// **`normalized` IS THE CONV INPUT.**  The source pads `normalized` - the grouped_norm of the gated values,
+// not the gated values themselves - and ggml builds it that way.  This header takes the HISTORY OF NORMALIZED
 // ROWS, which is what the state actually is.
 //
 // WHERE THE WEIGHTS LIVE, and the two different layouts in play.  `ple_conv1d.weight` has manifest shape
-// [4, 10240] with ne0 = 4 fast, so ggml's flat index is `k + 4*c`; `ref/ngram.py`'s `kernel` is a (4, 10240)
-// numpy array whose flat index is `k*10240 + c`.  They are transposes, and the source's own view
+// [4, 10240] with ne0 = 4 fast, so ggml's flat index is `k + 4*c`; a numpy `kernel` is a (4, 10240)
+// array whose flat index is `k*10240 + c`.  They are transposes, and the source's own view
 // (`ggml_view_2d(tWc, 1, hc_dim, nb[1], k*nb[0])`) confirms which is meant.  `ple_key` and `ple_value` are
 // [2560, n] with ne0 = 2560 fast, which IS the reference's row-major orientation.
 #pragma once
@@ -49,7 +46,7 @@ bool ple_native_postops_enabled();
 ///                            as it already must for the experts.  Recorded because "the manifest says fp16"
 ///                            and "the kernel wants float" is a silent 2x-read if nobody says which wins.
 ///   value_bf16               `ple_value.weight` BF16 as raw bits, [n_embd, n_embd]
-///   norm_key/query/conv      F32 [hc_dim], NO (1+w) folding - `ref/gdn.py` records the same for `ssm_norm`
+///   norm_key/query/conv      F32 [hc_dim], NO (1+w) folding - as for `ssm_norm`
 ///   conv1d_f16               `ple_conv1d.weight` F16, GGML-NATIVE `kW[k + kern*c]`
 struct PleWeights {
     const uint8_t* key_codes = nullptr;    // hc_dim * (n_embd/4) bytes
@@ -73,7 +70,7 @@ struct PleWeights {
     const uint16_t* key_bf16 = nullptr;
 };
 
-/// Everything the block produces, in the order `ple_layer_xcheck`'s oracle writes it.  Any pointer may be
+/// Everything the block produces, in the order the oracle writes it.  Any pointer may be
 /// null; the caller that only wants the result passes nothing else.  Having the intermediates is what makes
 /// the parity test able to say WHICH stage diverged instead of only that the sum did.
 /// Every nonnull output region, including result, must be disjoint from the block's entire scratch region.
@@ -93,16 +90,14 @@ struct PleOut {
 ///
 /// `hist_rows` IS ROW-FASTEST: `hist_rows[row + NG_HIST*channel]`.  That is not a choice - it is
 /// `ggml_reshape_3d(state, d_conv-1, conv_channels, n_seqs)`, so ne0 = the history row varies fastest, and
-/// `ple_layer_xcheck.cpp` L79-83 records the transposed reading failing ggml's own assert.
+/// the transposed reading fails ggml's own assert.
 ///
 /// The block does NOT write back to the history: the caller keeps ownership of its state and this stays a
 /// pure function of its inputs, which is what makes the chunked-versus-single-shot property testable.
 /// Bytes the caller must hand `ple_block` as its workspace: five `hc_dim` buffers (key, query, norm,
 /// gated, conv), one `n_embd` (value) and one `hc` (gate), plus the Q8 activation image and the BF16
-/// embedding copy.  **THE WORKSPACE IS THE CALLER'S BECAUSE THIS FUNCTION IS CAPTURED**: it used to
-/// `cudaMalloc` three times and `cudaStreamSynchronize` once per call, and inside a graph both are errors -
-/// `ple_block: scratch: operation not permitted when stream is capturing`.  Same defect, same fix as
-/// `shared_expert`.
+/// embedding copy.  **THE WORKSPACE IS THE CALLER'S BECAUSE THIS FUNCTION IS CAPTURED**: allocation
+/// and synchronization are errors inside a graph capture.
 uint64_t ple_block_scratch_bytes();
 
 void ple_block(const float* emb, const float* hidden, const float* hist_rows, const PleWeights& w,

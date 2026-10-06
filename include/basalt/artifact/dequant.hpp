@@ -1,7 +1,7 @@
 #pragma once
-// src/artifact/dequant.cpp - P1.S3: scalar reference dequantizers, transcribed from ggml.
+// src/artifact/dequant.cpp - scalar reference dequantizers, transcribed from ggml.
 //
-// P1.S3 asks for every encoding present in the Q2_0 file. This starts with the ones on the critical
+// Every encoding present in the model file is needed. This starts with the ones on the critical
 // path (the routed experts are all Q2_0) plus the trivial element types, and is structured so the
 // rest drop in. Source of truth per encoding is quoted in each function.
 //
@@ -15,7 +15,7 @@
 // Validation: `--check <file.gguf>` dequantizes real blocks and asserts the STRUCTURAL invariant that
 // every output value is one of {-d, 0, +d, +2d} for that block's own scale. That catches bit-order,
 // sign and stride bugs, which are the failure modes a dequantizer actually has. It is deliberately
-// not a correctness-vs-ggml test - that needs ggml linked, which is P1.S3's next step.
+// not a correctness-vs-ggml test - that needs ggml linked.
 
 #include <cstdint>
 #include <cstdio>

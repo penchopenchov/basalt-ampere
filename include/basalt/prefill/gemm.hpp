@@ -1,4 +1,4 @@
-// include/basalt/prefill/gemm.hpp - plan v0.3 P5: the batched projections of prompt processing.
+// include/basalt/prefill/gemm.hpp - the batched projections of prompt processing.
 //
 // Every projection of a chunk of T tokens is Y[T, N] = X[T, K] . W[N, K]^T with W row-major (the GGUF / pack layout)
 // and FP32 outputs.  Weights are BF16 on the device - either already (the pack's BF16 tensors) or dequantized from

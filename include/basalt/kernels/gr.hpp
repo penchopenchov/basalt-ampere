@@ -1,7 +1,6 @@
-// include/basalt/kernels/gr.hpp - the gated residual (hyper-connection), P2.S2.
+// include/basalt/kernels/gr.hpp - the gated residual (hyper-connection).
 //
-// `ref/gr.py::gr_read` / `gr_write`, which are transcribed from
-// `llama_model_qwen4exp::graph::build_hc_mix` / `build_hc_combine` (qwen4exp.cpp L267-350 at 3cf03257).
+// Transcribed from `llama_model_qwen4exp::graph::build_hc_mix` / `build_hc_combine`.
 //
 // The residual is a STACK of `hc` streams, each `n_embd` wide - not one vector with a gate.  `gr_read`
 // collapses the stack to the one vector the mixer consumes and produces a per-stream injection; `gr_write`
@@ -46,8 +45,8 @@ struct GrShapes {
     int64_t hc_lr = 0;    ///< rank of the down/up bottleneck
 };
 
-/// Scratch for `gr_read`.  EXPLICIT and caller-owned, because P2.T10 requires ZERO token-path allocations:
-/// a hidden `cudaMalloc` on first use would satisfy every test here and fail the memory test in P2.S10.
+/// Scratch for `gr_read`.  EXPLICIT and caller-owned, because the token path must make ZERO allocations:
+/// a hidden `cudaMalloc` on first use would satisfy every functional test and break graph capture.
 ///
 /// **IT MUST BE DEVICE MEMORY.**  `gr_workspace_init` takes a raw pointer and does no checking, so handing it
 /// a host buffer produces device kernels writing to a truncated host address - an illegal access whose
@@ -68,7 +67,7 @@ struct GrWorkspace {
     float* gated = nullptr;
     float* lo = nullptr;
     /// Set by `gr_workspace_init`.  `gr_read` CHECKS it, so an under-sized buffer is a loud failure at the
-    /// first call instead of silent corruption - which is what a mis-ordered region table used to produce.
+    /// first call instead of silent corruption.
     size_t bytes = 0;
 };
 
@@ -94,20 +93,11 @@ inline size_t gr_workspace_bytes(const GrShapes& s) { GrWorkspace w; return gr_w
 /// **NO PERMUTATION: both matrices are taken exactly as the manifest stores them**, so the loader does nothing
 /// to them.  Both are coalesced because each projection assigns ONE WARP PER OUTPUT ROW and strides the
 /// reduction axis across its 32 lanes: for a fixed output, consecutive lanes touch consecutive addresses in
-/// either orientation.  An earlier version assigned one THREAD per row, which is coalesced with itself and 32
-/// transactions away from its warp neighbours - see the history below.
+/// either orientation.  One THREAD per row would be coalesced with itself but 32 transactions away from its
+/// warp neighbours, and a single block would leave most SMs idle (the work is issue-bound).
 ///
-/// **HISTORY, because this kernel was the engine's worst and the reason is instructive.**  The first version
-/// was launched `<<<1, 256>>>` with `xn`/`xq` in shared memory, and at the real geometry it cost **2.67 ms per
-/// call, 96 calls per token = 262 ms/token, about 3.8 tok/s, 134x off the 643 GB/s memory floor.**  The cause
-/// was isolated by elimination: NOT memory latency (four independent accumulator chains made it 17% SLOWER),
-/// NOT the SM clock (`nvidia-smi` reported 2917 MHz and 99% utilisation throughout), and only partly
-/// coalescing (transposing one of the two matrices gave 31% and transposing the other gave nothing).  It was
-/// ISSUE THROUGHPUT - ~8.4M iterations of 6-8 instructions issued by ONE of 48 SMs.
-///
-/// This version splits the work the way the shapes want: `hc` blocks for the per-stream norm, one warp per
-/// row for each of the two projections, and one block-tile for the mean.  The transposes are gone because the
-/// warp-per-row mapping makes them unnecessary.
+/// The work is split the way the shapes want: `hc` blocks for the per-stream norm, one warp per row for each
+/// of the two projections, and one block-tile for the mean.  No transposes are needed.
 void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
              const uint16_t* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed,
              float* inject, void* stream);

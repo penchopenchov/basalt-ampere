@@ -3,10 +3,10 @@
 // code with no state to hide, and a header-only split cannot introduce a duplicate-symbol or
 // missing-declaration bug in code that is already validated.
 #pragma once
-// src/artifact/gguf_reader.cpp - P1.S2: GGUF v3 reader, mmap, no ggml dependency.
+// src/artifact/gguf_reader.cpp - GGUF v3 reader, mmap, no ggml dependency.
 //
-// The C++ counterpart of tools/gguf_reader.py, which has been the reference since P0.S6 (written
-// because gguf-py cannot represent type 42 / Q2_0). Per P1.S2 it must:
+// The C++ counterpart of tools/gguf_reader.py (written
+// because gguf-py cannot represent type 42 / Q2_0). It must:
 //   * mmap the file and parse header, metadata KV (ALL value types incl. arrays), tensor directory
 //   * be multi-shard aware (split.* keys)
 //   * carry an architecture guard: general.architecture == "qwen4exp" and the compiled-in constants
@@ -109,8 +109,7 @@ inline const char* ggml_type_name(uint32_t t) {
     }
 }
 
-// Block geometry: (elements per block, bytes per block). Q2_0 is 64/18 - proven from this artifact's
-// own offset brackets in P0.S6.
+// Block geometry: (elements per block, bytes per block). Q2_0 is 64/18, from the file's own offset brackets.
 inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     switch (t) {
     case 0:
@@ -478,7 +477,7 @@ inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
 }
 
 // The shards of one model (basalt::gguf_split_paths), opened together; tensors are looked up across all of them.
-// From the upstream engine 8029fa9, with the split-key validation of #255 (gopinath87607) made a property of the
+// Split-key validation is a property of the
 // model rather than of one loader: a split GGUF carries the model's metadata (general.architecture and the
 // qwen4exp keys) in its FIRST shard only, and the later shards just declare split.count / split.no /
 // split.tensors.count.  Unsloth's UD-Q4_K_XL is the extreme case: shard 1 holds the metadata and no tensor at
@@ -561,7 +560,7 @@ private:
     std::map<std::string, std::pair<size_t, const TensorInfo*>> index_;
 };
 
-// ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
+// ---- architecture guard. The engine is specialised to ONE model; anything else must be
 // refused with a precise error rather than silently mis-run.
 struct Qwen4ExpGuard {
     uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 0, head_count = 24,

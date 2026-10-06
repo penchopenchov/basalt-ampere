@@ -1,13 +1,12 @@
-// include/basalt/kernels/ngram.hpp - P2.S4: the PLE n-gram hash and the per-layer token table.
+// include/basalt/kernels/ngram.hpp - the PLE n-gram hash and the per-layer token table.
 //
 // Two halves that share nothing but the row indices they exchange:
 //
 //   * `ngram_rows` - the HOST hash.  Sixteen row indices per token from the last three token ids, computed
-//     with 64-bit multiply/xor and no tensor op at all.  `qwen4exp.cpp` L1092-1124, where the source says
-//     outright that it is host-side because "ggml has no int64 and no xor".
-//   * `PleTable`  - the row gather.  `per_layer_token_embd.weight` is IQ4_NL and is NOT IN THE PACK: it is
-//     51.2e9 elements (28.8 GB) in the ORIGINAL second GGUF shard, and it is the only tensor this engine
-//     reads from the GGUF rather than from the canonical pack.
+//     with 64-bit multiply/xor and no tensor op at all.  The source computes it on the host
+//     because "ggml has no int64 and no xor".
+//   * `PleTable`  - the row gather.  `per_layer_token_embd.weight` is IQ4_NL and is NOT IN THE DENSE POOL: it is
+//     51.2e9 elements (28.8 GB) and is read straight from the source GGUF section of the model file.
 //
 // THE HASH IS THE ONE PLACE IN THIS MODEL WHERE A WRONG BIT IS SILENTLY PLAUSIBLE.  Every one of its
 // properties has a rival reading that produces a valid index in range:
@@ -54,7 +53,7 @@ inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_Q5_0;
 ///     head_vocab_sizes  = [20000003, 20000023, ...]          16 entries, NOT an arithmetic sequence
 ///     head_offsets      = [0, 20000003, 40000026, ...]       the running sum of head_vocab_sizes
 ///
-/// `ref/ngram.py::selftest` calls its own copies "synthetic but STRUCTURALLY REAL"; they are in fact
+/// A selftest that uses synthetic copies of these would use
 /// `20000003 + 10*i` for the vocab sizes, which the artifact's are not (20000003, 20000023, 20000033 - the
 /// differences are 20, 10, ...).  A selftest is free to use whatever constants it likes, but a PARITY test
 /// against the artifact must use these, and the difference is recorded because it is exactly the kind of
@@ -71,7 +70,7 @@ PleConsts ple_artifact_consts();
 /// Exposed separately so a test can assert the XOR STRUCTURE directly rather than only its consequences.
 uint64_t ngram_mixed(const int64_t* ctx, const uint64_t* mult, int n);
 
-/// The sixteen row indices per token.  `qwen4exp.cpp` L1092-1124.
+/// The sixteen row indices per token.
 ///
 ///   tokens  (n_tokens,)      the ubatch's own tokens
 ///   prev    (n_tokens, 2)    predecessors OLDEST FIRST, `TOKEN_NULL` where there is none
@@ -98,12 +97,12 @@ int iq4nl_code(int code);
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 
-/// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
+/// How the table's rows are read. `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
 /// A/B arm; it returns the same bytes.
 ///
 /// NEVER KEEP THE SHARD MAPPED WHILE READING IT DIRECT: a live section on the same file serializes the unbuffered
-/// reads (311 -> 1,575 us per token, bench/results/2026-09-23-p2-ssd-direct). Direct mode drops its own mapping
+/// reads (several times slower per token). Direct mode drops its own mapping
 /// after the header parse; nothing else in the process may hold one.
 enum class PleIo { Direct, Mmap };
 
@@ -171,7 +170,7 @@ public:
     /// One row -> 160 floats, for diagnostics and for the parity test's oracle comparison.
     void read_row(uint32_t row, float* out160) const;
 
-    /// Bytes actually touched since `open`, for the "how often is it not ready" measurement P2.S4 asks for.
+    /// Bytes actually touched since `open`, for the "how often is it not ready" measurement.
     uint64_t bytes_read() const;
 
     /// One line of reader statistics (Direct mode), e.g. for --stats. Empty in Mmap mode.
@@ -196,16 +195,5 @@ private:
 void ple_prefetch_enable(bool on);
 bool ple_prefetch_enabled();
 
-// ---- NOTE ON `madvise(MADV_RANDOM)` ------------------------------------------------------------------
-// P2.S4 asks for `madvise(MADV_RANDOM)` on the mapping, and on Linux that is exactly right: a token gathers
-// 16 rows scattered over 28.8 GB, so read-ahead is pure waste and would evict useful pages.
-//
-// THERE IS NO LINUX, SO THERE IS NO MADV_RANDOM HERE.  Windows has no equivalent of the advice - the closest
-// is `FILE_FLAG_RANDOM_ACCESS` at CreateFile time, which suppresses the cache-manager's read-ahead for the
-// whole handle, and `PrefetchVirtualMemory` for the positive case.  `GgufFile` opens with neither, so this
-// build gets the DEFAULT sequential read-ahead on a random access pattern.  Saying so is the point: a
-// comment claiming MADV_RANDOM here would be a comment about code that does not run.  On Linux the advice
-// belongs in `GgufFile::open`, which this module does not own.
-// ------------------------------------------------------------------------------------------------------
 
 }  // namespace basalt::kernels

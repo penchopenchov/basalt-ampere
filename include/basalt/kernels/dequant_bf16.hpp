@@ -1,4 +1,4 @@
-// include/basalt/kernels/dequant_bf16.hpp - plan v0.3 P5: native GGUF blocks -> BF16 on the device, for the
+// include/basalt/kernels/dequant_bf16.hpp - native GGUF blocks -> BF16 on the device, for the
 // tensor-core GEMMs of batched prompt processing.
 //
 // One thread per 32-element group, transcribed from the reference `dequantize_row_*` functions of the pinned

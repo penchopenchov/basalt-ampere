@@ -13,7 +13,7 @@
 // it sits.
 //
 // Weights are the GGUF row-major blocks; x_q8_1 holds ncols (1..8) columns of n_in / 32 q8_1 blocks.  n_in must be a
-// multiple of 512, x_q8_1 16-byte aligned.  sm_90+ CUDA only.
+// multiple of 512, x_q8_1 16-byte aligned.  Needs thread-block clusters.
 #pragma once
 
 #include <cstddef>

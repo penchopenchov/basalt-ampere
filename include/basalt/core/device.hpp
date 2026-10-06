@@ -1,7 +1,7 @@
-// include/basalt/core/device.hpp - P2.S1: the device arena and the runtime's device facts.
+// include/basalt/core/device.hpp - the device arena and the runtime's device facts.
 //
 // `DeviceArena` is ONE cudaMalloc per planner region with bump sub-allocation below it and no frees.  That is
-// not a simplification for the first version: the memory plan from P1.S9 is fixed at startup, so the set of
+// not a simplification: the memory plan is fixed at startup, so the set of
 // regions and their sizes is known before anything is allocated, and an allocator that can free would be
 // solving a problem the engine does not have while adding fragmentation and failure modes it does.
 //
@@ -38,8 +38,8 @@ int device_count();
 // the runtime cannot describe it.
 bool device_summary(int ordinal, std::string& name, std::string& detail);
 
-// Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
-// run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and
+// Throws when there is no CUDA device.  The engine targets one architecture and must say so rather than
+// run slowly on something else: `CMakeLists.txt` refuses to COMPILE for another architecture, and
 // this is the matching check at run time (a binary can be carried to a different machine).
 DeviceInfo device_info(int ordinal = 0);
 

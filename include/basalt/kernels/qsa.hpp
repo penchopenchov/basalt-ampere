@@ -1,7 +1,6 @@
-// include/basalt/kernels/qsa.hpp - the QSA (full-attention) layer's cache, indexer and attention, P2.S2.
+// include/basalt/kernels/qsa.hpp - the QSA (full-attention) layer's cache, indexer and attention.
 //
-// Spec of record: `ref/qsa.py` (whose own selftest carries eleven PROPERTY checks) and `ref/model.py::_qsa` /
-// `_indexer` / `_attend`, transcribed from `build_layer_attn` / `build_attn_qsa` in the source.  The
+// Transcribed from `build_layer_attn` / `build_attn_qsa` in the source.  The
 // projections are NOT here: `attn_q`, `attn_k`, `attn_v`, `attn_output`, `indexer.q_proj` and
 // `indexer.k_proj` are the existing `s_gemv`/`s2_gemv` kernels, exactly as `gdn_step` leaves them.  What lives
 // here is everything BETWEEN the projections:
@@ -14,12 +13,11 @@
 //     qsa_attend           softmax GQA over the scratch
 //     qsa_gate_apply       `attn * sigmoid(gate)` and the round to the fp16 activation `attn_output` consumes
 //
-// DECODE ONLY, and that is a deliberate scope statement rather than an omission.  `ref/qsa.py::indexer_scores`
-// has no mask parameter and says why: "The causal part of the mask is already satisfied: every cached cell
-// precedes the query at decode."  The plan's `qsa_index` bullet asks for a "block-causal mask", and at decode
-// its entire content is the TAIL -> SPARE SLOT mapping (`cell_block`), which is implemented here and tested.
+// DECODE ONLY, and that is a deliberate scope statement rather than an omission.  The causal part of the
+// mask is already satisfied: every cached cell precedes the query at decode.  At decode the block-causal mask's
+// entire content is the TAIL -> SPARE SLOT mapping (`cell_block`), which is implemented here and tested.
 // The per-query form - a query at position i may only see blocks with `block_start + r - 1 <= i`, plus the tail
-// tokens - is a PREFILL property: `phases/phase-5-prefill-and-context-reuse.md` L73 builds it as a
+// tokens - is a PREFILL property: the prefill path builds it as a
 // [chunk x blocks] GEMM with per-row top-k.  Adding a mask flag here that decode cannot exercise would be a
 // parameter with no observable behaviour, and this project has already been bitten by checks that cannot see
 // the thing they claim to check.
@@ -29,7 +27,7 @@
 //
 // A CUDA graph bakes kernel ARGUMENTS in at capture time.  Any argument that CHANGES PER TOKEN is therefore
 // frozen at its first-token value on replay - silently, because the graph still runs, still produces finite
-// output, and still looks correct.  Auditing this header for that property (round 211-212) found FIVE entry
+// output, and still looks correct.  Auditing this header for that property finds FIVE entry
 // points, not one:
 //
 //     kv_append           int64_t pos        every token      the new cell's position
@@ -62,8 +60,7 @@
 //
 // K/V CACHE: FP16, paged, `[page][kv_head][page_size][head_dim]` with head_dim fastest.  The plan says "FP16
 // first" and fp16 is also what makes 32K of context fit: 12 layers x 2 heads x 256 dims x 2 (K and V) x 2 B x
-// 32768 = 805 MiB, against 1.6 GiB in f32.  The page granule is coarse (the shape's `page_size`) for the
-// reason `Memory/Qwen-5070-engine-campaign/src/plans/paged-kv-cache.md` L146-170 gives: this engine serves a
+// 32768 = 805 MiB, against 1.6 GiB in f32.  The page granule is coarse (the shape's `page_size`) because this engine serves a
 // handful of sequences and not hundreds, so fine granularity buys nothing and costs per-token indirection.  The
 // physical row for logical cell `t` and head `h` is
 //
@@ -127,8 +124,8 @@ inline double qsa_freq_base() { return 1e7; }
 /// The selection width: `min(n_kv, idx_top_k + idx_block - 1)`.
 ///
 /// The `r - 1 = 3` is not slack, it is the incomplete tail: the budget is whole blocks PLUS whatever cells do
-/// not fill one.  So the plan's "selection skipped when context <= 2,048" is conservative by two - the source's
-/// own bound is 2,051, and `ref/qsa.py` L292-294 records the disagreement.  Below the bound the selection is
+/// not fill one.  So "selection skipped when context <= 2,048" would be conservative by two - the source's
+/// own bound is 2,051.  Below the bound the selection is
 /// the IDENTITY, which `topk_512` is required to reproduce exactly rather than approximately.
 inline int64_t qsa_selection_width(int64_t n_kv, const QsaShapes& s) {
     const int64_t w = s.idx_top_k + s.idx_block - 1;
@@ -139,8 +136,8 @@ inline int64_t qsa_selection_width(int64_t n_kv, const QsaShapes& s) {
 ///
 /// This exists so the QSA layer can be a CUDA graph.  A graph bakes kernel ARGUMENTS in at capture time, so any
 /// per-token argument is frozen at its first-token value on replay - silently, because the graph still runs and
-/// still produces finite output.  Six entry points used to take one of these as a host scalar; every one of
-/// them now reads it from here instead, which makes every argument list constant across tokens.
+/// still produces finite output.  Every entry point reads it from here rather than taking a host scalar, which
+/// keeps every argument list constant across tokens.
 ///
 /// WHAT IT PREVENTS, concretely: with `pos` frozen, `kv_append` writes every token to cell 0, `qsa_index` and
 /// `topk_512` score one cell, `kv_gather` gathers one cell, and attention runs over a single cell for the whole
@@ -151,7 +148,7 @@ inline int64_t qsa_selection_width(int64_t n_kv, const QsaShapes& s) {
 /// caller cannot update one and forget another.
 ///
 /// It is written by a plain H2D copy of four int32, which IS capturable and re-reads its source at replay
-/// (`bench/micro/pinned_capture.cu` case B) - so the same buffer works in a captured graph and in a direct
+/// - so the same buffer works in a captured graph and in a direct
 /// launch.
 enum QsaStep : int {
     kStepPos = 0,     ///< the new cell's sequence position
@@ -190,7 +187,7 @@ void kv_append(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, in
 ///
 /// A cell that is not gathered does not exist for `qsa_attend`, which is how the top-k mask is realised: the
 /// source fills the kq mask with -inf and leaves the selected cells at zero, so an unselected cell has weight
-/// exactly zero even when it would score highest (`ref/qsa.py` PROPERTY 8 tests precisely that).
+/// exactly zero even when it would score highest (the test checks precisely that).
 void kv_gather(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table, const int32_t* ids,
                int64_t n_ids, const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream);
 
@@ -219,17 +216,16 @@ struct QsaIndexerBuffers {
     int32_t* block_pos = nullptr;
 };
 
-/// Append one raw indexer key (IDX_DIM wide, fp32, NEVER normed and NEVER rotated - `ref/qsa.py` L201-210) and
+/// Append one raw indexer key (IDX_DIM wide, fp32, NEVER normed and NEVER rotated) and
 /// run the pooling if this cell COMPLETES a block.
 ///
 /// `pooled[b] = rope_neox(rms_norm(mean(raw[b*r .. b*r+r-1]), w_k_norm), pos of cell b*r)` for b = pos/r on a
 /// completion, and the spare slot `pooled[n_bid] = rope_neox(rms_norm(raw[0], w_k_norm), 0)`.  The rotation
-/// position is the block's FIRST cell, which `ref/qsa.py` PROPERTY 4 pins and the test re-pins: rotating at the
+/// position is the block's FIRST cell, which the test pins: rotating at the
 /// block's LAST cell keeps every shape and every magnitude.
 ///
-/// **`pos_dev` IS A DEVICE POINTER AND THIS FUNCTION IS CAPTURABLE.**  It used to take `int64_t pos` as a host
-/// scalar, and a CUDA graph bakes kernel ARGUMENTS in at capture time - so a captured call would have replayed
-/// the FIRST token's position forever: `slot = pos % idx_block` would never advance, no block would ever
+/// **`pos_dev` IS A DEVICE POINTER AND THIS FUNCTION IS CAPTURABLE.**  A host `int64_t pos` would be baked in at capture time
+/// (a CUDA graph freezes kernel ARGUMENTS), so a captured call would replay the FIRST token's position forever: `slot = pos % idx_block` would never advance, no block would ever
 /// complete, the indexer would keep pooling cells 0-3, and the selection would stay pinned to the first block.
 /// Not a crash and not a small error - a plausible attention output over the wrong cells.  Worse than a stale
 /// POINTER, which this project's pitfalls list already warns about, because a stale pointer tends to fault while
@@ -268,7 +264,7 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
 
 /// The largest `qsa_selection_width(n_kv)` cells of `cell_scores`, ascending, into `ids`.
 ///
-/// Ties are broken by ASCENDING INDEX.  ggml does not specify that, and `ref/qsa.py` is explicit about it so a
+/// Ties are broken by ASCENDING INDEX.  ggml does not specify that, so it is fixed here and a
 /// mismatch is at least diagnosable; the host test compares against `np.lexsort((arange, -scores))`, which is
 /// the same rule, implemented independently of the kernel's threshold search.
 ///
@@ -306,7 +302,7 @@ void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scr
 ///   gate    = q_full[h][head_dim + d]  - the SECOND half of each head's 2*head_dim block
 ///   out     (n_head, head_dim) fp16
 ///
-/// The split is NOT element-interleaved (`ref/qsa.py` PROPERTY 10 pins that: `q = per_head[:, :head_dim]`,
+/// The split is NOT element-interleaved (the test pins that: `q = per_head[:, :head_dim]`,
 /// `gate = per_head[:, head_dim:]`), and the rounding happens AFTER the multiply so there is one rounding
 /// rather than two.  SIGMOID, not SiLU: this artifact's QSA gate is a sigmoid.
 void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, uint16_t* out, void* stream);

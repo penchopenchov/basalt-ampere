@@ -1,4 +1,4 @@
-// include/basalt/kernels/q8_1_finite.hpp - #606: the q8_1 activation block's scale and sum, kept finite.
+// include/basalt/kernels/q8_1_finite.hpp - the q8_1 activation block's scale and sum, kept finite.
 //
 // A q8_1 block stores its scale d = amax / 127 and the sum of its 32 raw activations as fp16. A sum past 65504 (one
 // massive-activation dimension among 32 values is enough) rounds to inf, and d does past amax = 8.3M; the dot

@@ -5,7 +5,7 @@
 //
 // Every value is the one the per-stage kernels produce (gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi,
 // native_quantize_q8_1): the same operations on the same values in the same order, so a token's outputs do not
-// depend on T or its column.  sm_90+ only.
+// depend on T or its column.  Needs thread-block clusters.
 #pragma once
 
 #include <cstdint>

@@ -35,7 +35,7 @@ struct ConversationStateSizes {
 };
 /// Whole-model sizes: `gdn` covers every GDN layer, the indexer sizes are per QSA layer.
 bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& sizes, std::string& error);
-/// The same for one session's layer carve (#216): `gdn` covers its `gdn_alloc` rows; the per-QSA-layer sizes
+/// The same for one session's layer carve: `gdn` covers its `gdn_alloc` rows; the per-QSA-layer sizes
 /// apply to each owned state [qsa_ord0, qsa_ord0 + qsa_alloc).  Rejects an inconsistent carve.  Checkpoints,
 /// snapshots and their validation all use this: a session saves and restores only the state it owns.
 bool conversation_session_sizes(const ModelGeometry& g, const SessionState& session, ConversationStateSizes& sizes,

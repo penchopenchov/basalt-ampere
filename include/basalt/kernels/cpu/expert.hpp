@@ -1,23 +1,14 @@
-// include/basalt/kernels/cpu/expert.hpp - P2.S3: the CPU expert path.
+// include/basalt/kernels/cpu/expert.hpp - the CPU expert path (Q2_0 experts).
 //
-// This is the Q2_0 expert kernel promoted out of `bench/micro/cpu_s2.cpp`, which is the instrument that
-// measured `c` (Memory/LEDGER.md L9/L10: 15.03 ms for one token's full routed set on 6 cores, DRAM-bound at
-// 44.14 GB/s) and whose P0.T2 parity passes at 1.461e-06.
+// WHAT MAKES IT FAST:
 //
-// IT IS THE SAME CODE, NOT A COPY.  Keeping a second implementation next to a validated one is how a project
-// ends up with two answers and no way to say which is right, so `cpu_s2.cpp` is expected to become a thin
-// benchmark over these functions.  (Until it is, the two exist side by side and this header says so.)
-//
-// WHAT MAKES IT FAST, and each of the three was paid for once:
-//
-//   * `vpdpbusd` (AVX512-VNNI) does four int8 MACs per instruction.  The scalar loop it replaces ran at
-//     9.89 GB/s on one core; VNNI is the reason the 6-core figure is 42.55 GB/s.
+//   * `vpdpbusd` (AVX512-VNNI) does four int8 MACs per instruction, which keeps the kernel memory-bound
+//     instead of compute-bound.
 //   * `vpmultishiftqb` (AVX512-VBMI) unpacks the 2-bit codes eight at a time.  Its ARGUMENT ORDER is
 //     (control, data) and was determined empirically - the Intel guide states the opposite, and following the
 //     guide produced 43 of 64 wrong codes.
 //   * The row accumulator stays a FLOAT VECTOR and is reduced ONCE at the end of the row.  Reducing per
-//     64-weight block cost more than the dot products themselves: it made the kernel compute-bound at
-//     21 GB/s instead of DRAM-bound at 32.
+//     64-weight block costs more than the dot products themselves and makes the kernel compute-bound.
 //
 // THE CONTRACT THAT MATTERS, because collapsing it is invisible and cannot match ggml's logits: one Q2_0
 // WEIGHT block is QK=64 weights with one fp16 scale, while one ACTIVATION chunk is QKA=32 elements with
@@ -70,7 +61,7 @@ struct ActQ {
 };
 
 /// Per-worker scratch.  Owned by the caller and passed in, so the token path performs NO allocations
-/// (P2.T10) - the kernel itself allocates nothing.
+/// - the kernel itself allocates nothing.
 struct ExpertScratch {
     ActQ a1;
     ActQ a2;
@@ -119,7 +110,7 @@ void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScrat
 ///
 /// This split exists for the pool.  A layer runs TEN experts against ONE activation, so quantizing inside
 /// `s2_expert_vnni` would do the same 2560-element conversion ten times per layer per token - 480 redundant
-/// conversions per token.  P2.S3's work item is `(blob, x-hat quantized, block sums, weight, out)`, and this
+/// conversions per token.  The pool's work item is `(blob, x-hat quantized, block sums, weight, out)`, and this
 /// is the entry point that matches it.
 void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws);
 
@@ -158,14 +149,12 @@ void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_toke
 /// `quant_acts` makes the oracle consume the SAME INT8 activation values the VNNI path uses, **at BOTH
 /// stages**.  With it OFF the oracle is exact-FP32-activation and the gap between them IS the activation
 /// contract; with it ON the two differ only by FP32 evaluation order, so a small gap there proves the kernel
-/// itself correct.  That separation is the whole point of P0.T2 and it is why this parameter exists rather
+/// itself correct.  That separation is why this parameter exists rather
 /// than two functions.
 ///
-/// CORRECTION TO THE ORIGINAL: `bench/micro/cpu_s2.cpp`'s comment says "at both stages" but its code
-/// quantizes only the intermediate, leaving the gate/up projections on raw f32 `x`.  That is invisible when
-/// the caller passes an already-quantized input - which the engine does - and shows up as a ~1.2% gap when it
-/// does not, which reads as a kernel bug and is not one.  This version quantizes both.
-/// Plan v0.3 P6: rows [r0, r1) of a Q2_0 matrix in the GGUF block layout (18 bytes per 64 weights, `row_bytes`
+/// Both stages quantize: leaving the gate/up projections on raw f32 `x` is invisible when the caller passes
+/// an already-quantized input, as the engine does, and shows up as a gap otherwise.
+/// Rows [r0, r1) of a Q2_0 matrix in the GGUF block layout (18 bytes per 64 weights, `row_bytes`
 /// per row, `nblocks` blocks each) against `nt` activations: out[t][r].
 void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                           float* const* out, int r0, int r1);

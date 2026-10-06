@@ -1,6 +1,6 @@
 // include/basalt/kernels/f16_bits.hpp - the fp16 conversions, written out, as bits.
 //
-// WHY THIS IS NOT `__float2half`.  Round 193 found `__float2half` producing 0x2600 for a value whose correct
+// WHY THIS IS NOT `__float2half`.  `__float2half` has been seen producing 0x2600 for a value whose correct
 // fp16 encoding is 0x26DB, and 0x3C01 for a value that is exactly 1.0 - i.e. wrong bits, not a rounding
 // difference.  The cause was never isolated (it is either `__float2half` itself or `__half_as_ushort`), so
 // `src/kernels/cuda/quantize_act.cu` replaced it with the version below, which then came out byte-exact over
@@ -18,7 +18,7 @@
 //   * subnormal    - the implicit 1 is restored and the result is shifted right, so the rounding point MOVES
 //   * overflow     - exp >= 31 saturates to inf (0x7C00) and keeps the sign; a NaN input stays a NaN
 //
-// `f32_from_f16` deliberately does NOT round: it is used to compare against a reference that holds the same
+// `f32_from_f16` deliberately does NOT round: it is for comparing against a reference that holds the same
 // bits, so it only has to be exact.
 #pragma once
 
@@ -45,7 +45,7 @@ F16_HD inline uint16_t f16_from_f32(float f) {
     // an inf/NaN, and a FINITE value too large for fp16 (1e30) SATURATES TO INF.  The version of this function
     // in quantize_act.cu and shared_expert.cu tests `if (exp >= 31) return sign | 0x7C00 | (man ? 0x200 : 0)`
     // and therefore returns a NaN for every overflowing finite value - which their own fixtures cannot see,
-    // because all of their values are O(1).  Round 198's numpy oracle caught it here on the first run (1e30,
+    // because all of their values are O(1).  A numpy oracle catches it (1e30,
     // 65536, 1e45: numpy says inf, the conflated test said NaN).
     if (rawexp == 0xFFu) return (uint16_t) (sign | 0x7C00u | (man ? 0x200u : 0u));   // inf, or a quiet/NaN
     if (exp >= 31) return (uint16_t) (sign | 0x7C00u);                             // finite overflow -> inf

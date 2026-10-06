@@ -24,7 +24,7 @@ namespace basalt::kernels {
 void mrope_table_set(const int32_t* device_table);
 const int32_t* mrope_table();
 
-/// #280: the rotation angles, 32 pairs of a 64-wide rotary slice, from the session's
+/// The rotation angles, 32 pairs of a 64-wide rotary slice, from the session's
 /// float64 table (build_rope_table, [max_pos][32] cos and sin in VRAM, the rope scaling inside) of the CURRENT
 /// device.  With it the rope kernels rotate by the table's exact angles; without it they compute pos * powf(...) with cosf/sinf, which under
 /// --use_fast_math is 0.0014 rad off at 32K and ~0.02 at 262K, and the prompt path (precise libm) and decode

@@ -230,7 +230,7 @@ public:
         return true;
     }
 
-    // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
+    // Drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
     // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's

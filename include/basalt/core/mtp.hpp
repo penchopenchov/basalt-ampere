@@ -1,4 +1,4 @@
-// include/basalt/core/mtp.hpp - plan v0.3 P6: the MTP draft layer on the GPU.
+// include/basalt/core/mtp.hpp - the MTP draft layer on the GPU.
 //
 // The model ships one multi-token-prediction layer (transcribed and validated in
 // `tools/mtp_probe.py`).  Cell i of its

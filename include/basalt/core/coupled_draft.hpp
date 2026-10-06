@@ -5,7 +5,7 @@
 // sampler.cu), and a draft is kept only when it EQUALS that row's pick.  The output is therefore a function of the
 // seed alone, whatever the drafts are: drafts only decide how many tokens a window yields.
 //
-// The MTP draft layer used to propose its ARGMAX.  In coupled mode it SAMPLES instead, with the target's own chain
+// In coupled mode the MTP draft layer SAMPLES its proposal rather than taking the argmax, with the target's own chain
 // (the request's top_k / top_p / min_p / temperature and penalties over the same history) and the SAME uniform the
 // target will draw for the row that verifies the draft.  When the draft's distribution is close to the target's,
 // the two inverse-CDF picks from one uniform agree far more often than an argmax agrees with a sample; the target's

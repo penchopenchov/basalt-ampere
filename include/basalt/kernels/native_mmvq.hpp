@@ -6,14 +6,14 @@ namespace basalt::kernels {
 
 // Native GGUF Q2_0, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL
 // and IQ4_XS / CUDA Q8_1 adapters, pinned to llama.cpp
-// 3cf03257f219afbe7334045ff7c6a06ac68c627d, sm_120 generic MMVQ.
+// 3cf03257f219afbe7334045ff7c6a06ac68c627d, generic MMVQ.
 // All pointers are device pointers, at least 4-byte aligned, with no overlap.
 // All calls enqueue on the explicit non-null CUDA stream; no allocation or wait.
 // The translation unit must use --use_fast_math, as the pinned CUDA oracle does.
 //
 // Shapes use GGUF order: n_in is the contiguous reduction dimension, n_out is
 // the weight row count, and ncols is the activation column/token count, 1..8
-// (plan v0.3 P3). Columns are contiguous: activation column j is x + j * n_in
+//. Columns are contiguous: activation column j is x + j * n_in
 // (its Q8_1 blocks at j * n_in / 32) and output column j is y + j * n_out. See
 // native_mmvq_set_multi_exact for how ncols > 1 relates to ncols == 1.
 // n_in must be a positive multiple of 32 for quantization/Q4_0/Q5_0/Q8_0/IQ4_NL,
@@ -33,11 +33,11 @@ void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
 
 // MMVQ_MMA=1 (read at startup; the setter overrides it, for tests): ncols > 1 IQ4_XS calls in exact mode
-// run on int8 tensor cores where the device has them (sm_80+ CUDA), every column still bitwise equal to a
+// run on int8 tensor cores where the device has them (int8 MMA), every column still bitwise equal to a
 // single-column call. Set before graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_mma(bool on);
 bool native_mmvq_mma();
-// Whether the current device runs the tensor-core kernel (never on HIP).
+// Whether the current device runs the tensor-core kernel.
 bool native_mmvq_mma_available();
 // Tensor-core launches so far in this process (tests: proof that the path ran).
 long native_mmvq_mma_launches();

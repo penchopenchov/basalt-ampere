@@ -1,4 +1,4 @@
-// include/basalt/spec/suffix_drafter.hpp - plan v0.3 P6: the suffix-lookup drafter (no weights, no GPU).
+// include/basalt/spec/suffix_drafter.hpp - the suffix-lookup drafter (no weights, no GPU).
 //
 // Proposes the tokens that followed the longest earlier occurrence of the sequence's current suffix: when the
 // output quotes its input (edits, refactors, repeated code) the continuation is usually exact, and a verify pass

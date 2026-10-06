@@ -1,8 +1,7 @@
-// include/basalt/kernels/kv_q8.hpp - plan v0.3 P7: 8-bit KV storage for the QSA layers.
+// include/basalt/kernels/kv_q8.hpp - 8-bit KV storage for the QSA layers.
 //
 // The FP16 KV pools cost 2 x 12,288 bytes per token over the 12 QSA layers; with the FP32 pooled indexer keys the
-// engine allocates 29 KB per token, 7.65 GB at 262K (bench/results/2026-09-23-p7-int-audit), which cannot fit
-// 12 GB. This stores K and V as int8 codes with one FP16 scale per 64 values (per cell, per KV head):
+// engine allocates 29 KB per token, 7.65 GB at 262K, which does not fit small cards. This stores K and V as int8 codes with one FP16 scale per 64 values (per cell, per KV head):
 //     scale = fp16(max|x| / 127),  code = clamp(rint(x / scale), -127, 127),  x' = fp16(code * scale)
 // Per layer and token: 2 KV heads x 256 values x (K, V) = 1,024 values -> 1,024 B of codes + 32 B of scales,
 // instead of 2,048 B in FP16. Over the 12 QSA layers: 12,672 B/token instead of 24,576 (3.3 GB at 262K, not 6.4).

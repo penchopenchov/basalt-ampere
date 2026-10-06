@@ -1,4 +1,4 @@
-// include/basalt/kernels/rope.hpp - NEOX partial RoPE, host-callable (P2.S2).
+// include/basalt/kernels/rope.hpp - NEOX partial RoPE, host-callable.
 //
 // Pairing is NEOX: (i, i + n_rot/2), NOT the adjacent pair (2i, 2i+1).  The rotation is PARTIAL - only the
 // first n_rot of head_dim are touched, 64 of 256 in this artifact - and the tail passes through.

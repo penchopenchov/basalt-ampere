@@ -64,11 +64,9 @@ struct SessionState {
 
     // ================================ THE PLE, AND IT IS SEQUENCE STATE ================================
     //
-    // **THE PLE IS A LAYER-1 MODULE AND THIS ENGINE DID NOT RUN IT, WHICH IS WHY C1 FAILED** (LEDGER L123).
-    // Every part of it was already built and parity-tested - the hash against `ref/ngram.py` with the
-    // artifact's own constants, the IQ4_NL row read against numpy over the original GGUF, and the block
-    // against ggml's own graph - and none of it was ever called from the model path.  These fields are what
-    // was missing on the state side.
+    // **THE PLE IS A LAYER-1 MODULE.**  Its pieces are parity-tested against references outside this code (the
+    // hash with the artifact's own constants, the IQ4_NL row read against numpy over the original GGUF, and the
+    // block against ggml's own graph); these fields are its state.
     //
     // `ple_prev` is the last two tokens OLDEST FIRST with `-1` where there is none, which is exactly
     // `ngram_rows`' `prev` argument; `ple_token` is the token being decoded.  **They are advanced by the
@@ -77,12 +75,12 @@ struct SessionState {
     int32_t ple_token = -1;
     /// `NG_HIST` rows of `hc_dim` NORMALIZED history, **ROW-FASTEST**: `ple_hist[row + NG_HIST*channel]`.
     /// That is `ggml_reshape_3d(state, d_conv-1, conv_channels, n_seqs)`, not a layout choice - the transposed
-    /// reading fails ggml's own assert (`ple_layer_xcheck.cpp` L79-83).
+    /// reading fails ggml's own assert (ggml's reshape of the conv state).
     float* ple_hist = nullptr;
     /// **THE WHOLE PLE RUN LIVES HERE, AND THAT IS NOT A CONVENIENCE.**  Its history and its token window are
     /// sequence state, so the session is where they belong - and putting the rest of it here too means
     /// `session_capture`/`session_loop`/`session_token` need no new parameter to reach it.  A `PleRun` whose
-    /// `ready()` is false is skipped, which is what every caller had before LEDGER L123.
+    /// `ready()` is false is skipped, which is the behaviour without the PLE.
     PleRun ple;
 };
 
@@ -169,25 +167,21 @@ struct SessionGraphs {
     /// the pool gets to use.
     double ms_to_ring = 0;
 
-    // ================================ R0.9: THE LAYER AS THREE GRAPHS ================================
+    // ================================ THE LAYER AS SEVERAL GRAPHS ================================
     //
-    // **THE CAPTURED PER-STAGE TABLE THE PROTOCOL HAS DEMANDED SINCE R0 AND NOBODY HAS HAD.**  Round 309's
-    // came from `--no-capture`, and round 312 showed its `moe_finish` figure was a host-gap artefact four
-    // times the captured cost of the same work - so the plan has been choosing between R3.3, R3.4 and R3.5
-    // without knowing what any of them is worth.
+    // **THE CAPTURED PER-STAGE TABLE.**  The `--no-capture` table over-counts host gaps, so per-stage times come
+    // from the captured graph.
     //
     // An event recorded BETWEEN two `cudaGraphLaunch` calls is not inside a capture and is therefore valid,
     // so the layer is captured at its own documented seam (`block_layer_pre`'s `half`) and timed from outside.
-    /// **R0.11: FIVE PREFIX GRAPHS, ADDED BESIDE `preA`/`preB` RATHER THAN REPLACING THEM.**
+    /// **FIVE PREFIX GRAPHS, BESIDE `preA`/`preB`.**
     /// `preP[k]` (k = 1..5) runs stages `0..k-1`. Consecutive differences are the per-stage times, which is
-    /// what prices the two `gr_read`s and the `gr_write` (R3.3) against GDN's interior (R3.4). A prefix and not
+    /// what prices the two `gr_read`s and the `gr_write` against GDN's interior. A prefix and not
     /// a range, because the stages are a chain: stage 1 reads what stage 0 wrote and stage 2 mutates the
     /// residual in place.
     ///
-    /// **THE FIFTH PREFIX USED TO BE `execs[l]`, AND THAT WAS THE BUG ROUND 324 COULD NOT FIND.**  Prefix 5
-    /// has ~7 more nodes than prefix 4, so the two differ in launch setup as well as in execution - and the
-    /// difference attributed ALL of it to stage 4, the router. Capturing prefix 5 the same way as the others
-    /// makes the two comparable and the difference purely stage 4's.
+    /// Prefix 5 is captured the same way as the others, so that the difference between prefixes 4 and 5 is
+    /// stage 4's execution only and carries no difference in launch setup.
     cudaGraphExec_t* preP[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     cudaGraphExec_t* preA = nullptr;   ///< `half == 1`: gr_read -> attention -> gr_write   (the MIXER)
     cudaGraphExec_t* preB = nullptr;   ///< `half == 2`: gr_read -> moe_route              (FFN front + ROUTER)
@@ -250,9 +244,9 @@ bool session_replay_full(const ModelGeometry& g, int64_t pos, int32_t pos_base, 
 /// The stages are ordered by the stream, so an event pair around each launch measures that launch's GPU work
 /// plus the gap the driver left before it.  That gap is real and is why the three totals sum slightly above
 /// `session_replay_full`; the comparison is printed by the caller rather than hidden here.
-/// **R0.11: THE FIVE STAGES SEPARATELY, BY DIFFERENCING PREFIXES.**  `stage_ms` is resized to 5 and holds
+/// **THE FIVE STAGES SEPARATELY, BY DIFFERENCING PREFIXES.**  `stage_ms` is resized to 5 and holds
 /// stages 0..4 in milliseconds for a whole token; `mixer_per_layer` holds prefix 3's time for each layer, which
-/// is what R0.10's GDN-versus-QSA split needs.  Requires `session_capture(..., split = true)`.
+/// is what the GDN-versus-QSA split needs.  Requires `session_capture(..., split = true)`.
 ///
 /// **THE RESIDUAL IS SAVED AND RESTORED BETWEEN PREFIXES.**  Stage 2 is `gr_write`, which mutates `R` in
 /// place, so without the restore every prefix after the first reads a residual the earlier ones already
@@ -261,7 +255,7 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
                                    SessionGraphs& gr, void* stream, std::vector<double>& stage_ms,
                                    std::vector<double>& mixer_per_layer, std::string& err);
 
-/// **R3.5c: ONE PREFIX, ALL 48 LAYERS, BACK TO BACK.**  `k` in 1..5 replays `preP[k-1][l]` (or `execs[l]` for
+/// **ONE PREFIX, ALL LAYERS, BACK TO BACK.**  `k` in 1..5 replays `preP[k-1][l]` (or `execs[l]` for
 /// k = 5) for every layer with no other graph in between, and reports the whole sweep in milliseconds.
 ///
 /// **WHY THIS EXISTS: TO RULE OUT THE PREFIX TABLE'S OWN BIAS.**  The five-stage table differences prefix
@@ -300,7 +294,7 @@ void session_graphs_free(SessionGraphs& gr);
 using PoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                         int64_t k, float* out);
 
-/// **R4.2c: THE VRAM-RESIDENT HALF OF THE LAYER'S EXPERTS.**  Called by the loop after the misses have been
+/// **THE VRAM-RESIDENT HALF OF THE LAYER'S EXPERTS.**  Called by the loop after the misses have been
 /// staged into `parts` and before `post[l]` is launched, so its kernels are stream-ordered between them: the
 /// misses are already in `parts`, the hits overwrite the rows the CPU zeroed, and `post[l]`'s `moe_combine`
 /// reads the sum and cannot tell which engine produced which row.

@@ -1,8 +1,7 @@
-// include/basalt/platform/direct_file.hpp - plan v0.3 P1/P2: unbuffered asynchronous file reads.
+// include/basalt/platform/direct_file.hpp - unbuffered asynchronous file reads.
 //
 // The n-gram table (26.8 GiB) stays on the SSD and must never occupy RAM, including the OS file cache. A memory
-// map cannot promise that; an unbuffered read can. On Windows this is FILE_FLAG_NO_BUFFERING | OVERLAPPED with
-// an I/O completion port; on Linux, O_DIRECT preads.  Both issue the reads from a small thread pool (submit only
+// map cannot promise that; an unbuffered read can. This is O_DIRECT preads, which issue the reads from a small thread pool (submit only
 // queues), so many reads are in flight: 16 threads.
 //
 // Contract of every read: offset, length and buffer address are multiples of `alignment()` (4096 here).
@@ -41,7 +40,7 @@ public:
     /// forever; 0 polls. A `wake()` shows up as one completion with tag `WAKE_TAG`.
     int wait(Completion* out, int max, int timeout_ms);
 
-    /// Make a thread blocked in `wait` return (thread-safe). Used to hand it newly queued work.
+    /// Make a thread blocked in `wait` return (thread-safe). Hands it newly queued work.
     static constexpr uint64_t WAKE_TAG = ~0ull;
     void wake();
 

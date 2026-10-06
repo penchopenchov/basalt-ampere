@@ -16,7 +16,7 @@
 // prefix again at prefill speed.  So:
 //
 //   * the root is PINNED: dropping it frees one slot's ~118 MB and costs every future conversation that
-//     shares the prefix a full re-read of it (a 30K system prompt is ~30 s at ~1,000 tok/s);
+//     shares the prefix a full re-read of it;
 //   * every other slot rotates by least recent use.  A checkpoint's stamp advances when it is created,
 //     when a new checkpoint lands on its length, and when a request mounts through it.
 //

@@ -1,5 +1,5 @@
-// include/basalt/prefill/moe_fused.hpp - #136 (prompt speed): the routed experts of a Q2_0 pack in the prompt path on
-// own int8 tensor-core kernels (NVIDIA sm_80 and newer; sm_75 and HIP: MMQ).
+// include/basalt/prefill/moe_fused.hpp - the routed experts of a Q2_0 model in the prompt path on
+// own int8 tensor-core kernels (devices with int8 MMA; others use MMQ).
 //
 // The MMQ path (moe_mmq.hpp) per MoE layer: a host sync to group the (token, k) pairs by expert, a gather of each
 // expert into a 16-expert group buffer, then per group the q8_1 activations of every routed slot, gate/up, SwiGLU,
@@ -25,13 +25,13 @@ constexpr int kTileRows = 64;
 /// Experts per launch: their blob pointers travel in the launch's parameters (1 KB).
 constexpr int kMaxBatch = 128;
 
-/// This build has the kernels (a CUDA build; HIP and builds without MMQ do not).
+/// This build has the kernels (a CUDA build).
 bool built();
-/// built(), and the current device is sm_80 or newer (mma.sync with s8 operands at m16n8k32).
+/// built(), and the current device has int8 tensor cores (mma.sync with s8 operands at m16n8k32).
 bool available();
-/// available(): the Q2_0 pack's fused experts.
+/// available(): the Q2_0 fused experts.
 bool enabled();
-/// available(): the native IQ packs' fused kernels.
+/// available(): the native i-quant fused kernels.
 bool requested();
 
 /// Bytes of `rows` activation rows of `cols` values (a multiple of 64) in the kernels' int8 form: per 64 values 64

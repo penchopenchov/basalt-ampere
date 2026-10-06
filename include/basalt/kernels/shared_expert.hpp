@@ -1,4 +1,4 @@
-// include/basalt/kernels/shared_expert.hpp - the shared expert, host-callable (P2.S2).
+// include/basalt/kernels/shared_expert.hpp - the shared expert, host-callable.
 //
 //     h = silu(x @ gate_shexp.T) * (x @ up_shexp.T)      <- SILU ON GATE
 //     h = h @ down_shexp.T
@@ -41,27 +41,21 @@ struct NativeSharedWeights {
     const void* x_q8_1 = nullptr;   // optional pre-quantized Q8_1 input for gate/up in shared_expert_multi
 };
 
-/// Bytes of caller-owned scratch `shared_expert` needs.  **THE KERNEL USED TO `cudaMalloc` FOUR BUFFERS ON
-/// EVERY CALL**, which is two separate violations in one line: `cudaMalloc` is ILLEGAL INSIDE A CAPTURE
-/// (`cudaErrorStreamCaptureUnsupported`), so the MoE - and therefore the whole per-layer graph - could not be
-/// captured at all; and P2.T10 requires ZERO token-path allocations, which this was.  Neither is visible in a
-/// test that only checks the output, and the capture test found it in one run.
+/// Bytes of caller-owned scratch `shared_expert` needs.  **THE KERNEL ALLOCATES NOTHING**:
+/// `cudaMalloc` is ILLEGAL INSIDE A CAPTURE, and the token path must make no allocations.
 uint64_t shared_expert_scratch_bytes(int64_t n_ff);
 
 /// `x_q8_0` and `x_q8k` are the TWO QUANTIZED IMAGES of the same activation, and which one a projection uses is
 /// decided per weight by its `SForm::act_kind`.  There is no fp16 activation here any more.
 ///
-/// **THE fp16 PATH WAS A REAL ERROR AND IT WAS DESCRIBED WRONG FOR SEVERAL ROUNDS.**  This header used to say
-/// the weights "are Q3_K / IQ4_XS / Q5_0 whose `vec_dot_type` is Q8_K, which is not implemented".  In fact
-/// `ffn_down_shexp` is IQ4_NL/Q4_0/Q5_0/Q8_0/Q2_0 in every layer - **no K-quant at all** - so its contract is
+/// **THE ACTIVATION IS NOT FP16.**  `ffn_down_shexp` is IQ4_NL/Q4_0/Q5_0/Q8_0/Q2_0 in every layer - **no K-quant at all** - so its contract is
 /// Q8_0; and its `n_in` is 640, which is not a multiple of 256, so **Q8_K is structurally impossible for it**.
 /// The gate/up weights are Q2_0 on 21 and 13 layers (Q8_0 again) and K-quants on the rest.
 ///
 /// x_f32 is required for the native BF16 gate or native gate/up projections.
 /// Native down reads the unrounded F32 SwiGLU intermediate directly. No allocation occurs.
 ///
-/// Measured cost of the wrong choice: 0.66-1.41% per GEMV.  `s_gemv_q8_0_split` was written for the Q8_0 half
-/// (LEDGER L55) and `s2_gemv_q8` already served the Q2_0 half.
+/// `s_gemv_q8_0_split` serves the Q8_0 half and `s2_gemv_q8` the Q2_0 half.
 void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* x_bf16, const SForm& gate_form,
                    const uint8_t* gate_codes, const float* gate_scales, const float* gate_off,
                    const SForm& up_form, const uint8_t* up_codes, const float* up_scales, const float* up_off,
@@ -78,7 +72,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream);
 
-/// The MoE block's final combination, `ref/moe.py::moe` L156:
+/// The MoE block's final combination:
 ///
 ///     y = sum over the k routed experts of  w[k] * parts[k]  +  shared
 ///
@@ -87,8 +81,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
 ///
 /// TWO THINGS A READER GETS WRONG HERE, and they are why this is not inlined at the call site:
 ///
-///   * The ROUTED outputs are router-WEIGHTED; the SHARED output is ADDED PLAIN.  `ref/moe.py` L116 says so
-///     outright - "router-weighted, not renormalised against it" - and weighting the shared term too is a
+///   * The ROUTED outputs are router-WEIGHTED; the SHARED output is ADDED PLAIN.  Not renormalised against it; weighting the shared term too is a
 ///     one-line change that produces a plausible number.
 ///   * The weights come from `router_top10` ALREADY renormalised (they sum to 1 over the selected experts).
 ///     Normalising again here would be a second, different normalisation, and it is invisible whenever the

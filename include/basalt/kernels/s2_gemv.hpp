@@ -1,4 +1,4 @@
-// include/basalt/kernels/s2_gemv.hpp - the S2 GEMV, host-callable (P2.S2).
+// include/basalt/kernels/s2_gemv.hpp - the S2 GEMV, host-callable.
 //
 // The expert matvec is the hottest thing in the engine: every token runs 48 layers x 10 experts x 3 roles of
 // it, against weights that live in DRAM at 31.64 GiB.  Layout is the pack format S2: codes packed 4

@@ -1,4 +1,4 @@
-// include/basalt/prefill/kernels.hpp - plan v0.3 P5: the element-wise and stateful kernels of a prompt chunk.
+// include/basalt/prefill/kernels.hpp - the element-wise and stateful kernels of a prompt chunk.
 //
 // T tokens at a time, all row-major with the token as the slow index.  The arithmetic mirrors the per-token native
 // kernels (the decode path), batched; where a step is a recurrence in time (the GDN conv and state, the PLE conv)

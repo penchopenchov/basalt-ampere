@@ -128,8 +128,8 @@ uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuff
 ///
 /// TWO ACTIVATION FORMATS AGAIN, and the router's is the one that matters most:
 ///
-///   * `ffn_gate_inp.weight` is BF16, so the router sees a BF16 activation.  `ref/moe.py` L88-92 calls this
-///     "the highest-consequence rounding in the model": the logits were measured **8.100e-03** off without it,
+///   * `ffn_gate_inp.weight` is BF16, so the router sees a BF16 activation.  this is
+///     "the highest-consequence rounding in the model": without it the logits are off by about 8e-3,
 ///     which is enough to FLIP a top-10 selection - and a flipped selection is not a small numeric error, it
 ///     is a different expert reading a different weight.
 ///   * the shared expert's weights are Q3_K/IQ4_XS/Q5_0 IQ-quants whose contract is Q8_K, which
@@ -173,7 +173,7 @@ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t
 /// The finishing half: the shared expert and the combination.
 ///
 /// **`parts` MUST BE THE EXPERTS THIS LAYER'S OWN ROUTER SELECTED.**  It is combined with `b.weights`, which
-/// `moe_route` wrote for THIS layer.  Passing the previous layer's vectors is the L100 bug: it produces a
+/// `moe_route` wrote for THIS layer.  Passing the previous layer's vectors it produces a
 /// finite, fluent, deterministic token that is not the model's.
 bool moe_finish(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                 const float* x, const float* parts, float* out, void* stream, std::string& err);
@@ -361,7 +361,7 @@ uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base,
 /// `pos_base` is the sequence's FIRST cell's position, which the indexer needs and cannot derive - equating a
 /// cell's position with its index is only right for a sequence starting at 0.
 ///
-/// THE OP ORDER IS `ref/model.py::_qsa`, and two things in it are easy to read past:
+/// THE OP ORDER matters, and two things in it are easy to read past:
 ///
 ///   * the indexer's raw key is appended BEFORE any norm or rotation, and it is the raw `indexer.k_proj`
 ///     output that is pooled and rotated LATER, once per block and at the block's FIRST cell;
@@ -485,7 +485,7 @@ uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b)
 bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token, float* out_dev, void* stream,
                std::string& err);
 
-/// `ref/model.py` L520: `fin = GR.gr_read(R, output_hc_*..., inject=None, rms_eps); logits = output @ fin`.
+/// `fin = GR.gr_read(R, output_hc_*..., inject=None, rms_eps); logits = output @ fin`.
 ///
 /// `R` is read from `bb.R` and the result goes to `logits`, which the caller sizes at `output.weight`'s `ne1`
 /// (the vocabulary).  `bb.head_q8k` and `bb.mixed` are scratch.
@@ -515,7 +515,7 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
 // **THIS MODULE EXISTED, WAS PARITY-TESTED, AND WAS NEVER CALLED - WHICH IS WHY GATE C1 FAILED.**  Layer 1 is
 // the only layer with `blk.1.ple_*` tensors (six of them) and `block_layer` ran GDN/QSA + GR + MoE without it,
 // so the engine computed a different model.  `ple_parity` verifies all three pieces against things that are
-// not this project's code - the hash against `ref/ngram.py` with the artifact's own constants, the IQ4_NL row
+// not this project's code - the hash against a numpy reference with the artifact's own constants, the IQ4_NL row
 // read against numpy over the original GGUF, and the block against ggml's own graph - and none of that helps
 // if nothing calls it.
 //
@@ -566,7 +566,7 @@ bool ple_finish_token(const PleRun& p, void* stream, std::string& err);
 /// Internal PLE workspace plus one separate hc_dim normalized row for advancing history.
 uint64_t ple_run_scratch_bytes();
 
-/// `ple` is the layer-1 PLE, or null to skip it (which is what every measurement before LEDGER L123 did).
+/// `ple` is the layer-1 PLE, or null to skip it (the model needs it, so null is for measurement only).
 /// It is applied INSIDE `pre[1]`, before layer 1's own `gr_read`, because the block's output is
 /// `hidden + gated + silu(conv)` on the residual itself - it is a residual UPDATE, and the architecture puts
 /// the gathered rows in place "before layer 2".
@@ -588,10 +588,8 @@ bool block_layer(const WeightTable& tables, const ModelGeometry& g, int64_t laye
 ///
 /// **`half` EXISTS SO THE CAPTURED GRAPH CAN BE SPLIT FOR MEASUREMENT, AND IT IS THE ONLY REASON.**
 ///
-/// The plan's R3 items - GR, GDN, the router - are each worth several milliseconds and there has never been a
-/// per-stage breakdown of the CAPTURED graph to choose between them.  The `--no-capture` table cannot supply
-/// one: round 312 showed its `moe_finish` figure was a host-gap artefact, four times the captured cost of the
-/// same work.  An event recorded BETWEEN two `cudaGraphLaunch` calls IS valid, so the answer is to capture the
+/// A per-stage breakdown of the CAPTURED graph is needed to see what GR, GDN and the router cost.  The
+/// `--no-capture` table cannot supply one: its `moe_finish` figure is a host-gap artefact.  An event recorded BETWEEN two `cudaGraphLaunch` calls IS valid, so the answer is to capture the
 /// layer as more than one graph and time them from outside.
 ///
 /// `half` selects a prefix of the stages, and the seam is the one this file already documents:

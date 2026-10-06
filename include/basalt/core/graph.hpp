@@ -1,19 +1,15 @@
-// include/basalt/core/graph.hpp - P2.S5: the GraphRegistry.
+// include/basalt/core/graph.hpp - the GraphRegistry.
 //
 // `GraphRegistry`: capture/replay wrappers keyed by `(layer_type, n_tokens)`, with static input/output
 // buffers at fixed addresses.
 //
-// THREE THINGS ARE BAKED INTO THIS INTERFACE, and each one is a measurement rather than a preference.  All
-// three come from `bench/micro/graph_capture.cu`, which was written to answer the phase's own instruction -
-// "verify on the installed CUDA version with a minimal test before building on it".
+// THREE THINGS ARE BAKED INTO THIS INTERFACE, and each one is a measurement rather than a preference.
 //
-// 1. **THE WAIT MUST POLL THE DRIVER, NOT MEMORY.**  The phase's host loop says "spin on
-//    doorbell_seq == expected ... no cudaStreamSynchronize anywhere".  A spin that only reads memory NEVER
-//    RUNS THE KERNEL: 5,907,703 spins over 500 ms, and the datum flips to 1 the instant anything calls into
-//    the driver and never before.  On Windows the display driver model BATCHES command submission, and a
-//    thread that only reads memory gives it no reason to flush.  Hence `wait_ms`, which polls an event -
-//    a QUERY and not a blocking sync, so P2.X3's "zero synchronization calls in the layer loop" still holds,
-//    and it costs 0.021 ms.
+// 1. **THE WAIT MUST POLL THE DRIVER, NOT MEMORY.**  A host loop that spins on
+//    doorbell_seq == expected with no driver call does not work: a spin that only reads memory can NEVER
+//    RUN THE KERNEL, because the datum only flips once something calls into the driver (the driver batches
+//    command submission).  Hence `wait_ms`, which polls an event - a QUERY and not a blocking sync, so there
+//    are still no synchronization calls in the layer loop, and it is cheap.
 //
 // 2. **A GRAPH RE-READS ITS INPUT BUFFERS AT REPLAY, BUT NOT ITS KERNEL ARGUMENTS.**  Verified: eight
 //    replays with a different pinned input each time all tracked correctly, so the data path is live; but a

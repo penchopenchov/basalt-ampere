@@ -1,4 +1,4 @@
-// include/basalt/core/hit_hook.hpp - R4.2c: the seam between the host loop and the VRAM expert tier.
+// include/basalt/core/hit_hook.hpp - the seam between the host loop and the VRAM expert tier.
 //
 // **IT IS ITS OWN HEADER BECAUSE BOTH SIDES NEED IT AND NEITHER SHOULD OWN IT.**  `session.hpp` declares the
 // loop that calls the hook; `expert_source.hpp` declares the implementation that answers it.  Putting the type

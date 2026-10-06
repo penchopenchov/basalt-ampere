@@ -1,4 +1,4 @@
-// include/basalt/kernels/hc_fused.hpp - the hyper-connection read of a verify window as ONE kernel (sm_120).
+// include/basalt/kernels/hc_fused.hpp - the hyper-connection read of a verify window as ONE kernel.
 //
 // The same outputs as fused_gr_read_multi (and, optionally, the router after it), bit for bit:
 //
@@ -99,7 +99,7 @@ void hc8_dequant_bf16(const Hc8View& v, int64_t row0, int64_t n, uint16_t* out, 
 
 /// Allocate the read's scratch on the current device (outside a stream capture, once).
 void hc_fused_init();
-/// The current device runs the fused read (sm_120 with enough SMs for the role split); hc_fused_init ran there.
+/// The current device runs the fused read (enough SMs for the role split); hc_fused_init ran there.
 bool hc_fused_supported();
 /// Enqueue the read on `stream` (a PdlScope applies).  Aborts on invalid arguments.
 void hc_fused_read(const HcFusedArgs& a, void* stream);

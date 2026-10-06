@@ -1,4 +1,4 @@
-// include/basalt/kernels/qsa_decode_attn.hpp - plan v0.3 P3/P7: split-K decode attention over the selected cells.
+// include/basalt/kernels/qsa_decode_attn.hpp - split-K decode attention over the selected cells.
 //
 // The first attention kernel runs one block per query head (24 blocks on a 48-SM part), reads each key row with one
 // thread (uncoalesced) and walks every selected cell serially for the values; at a 4K context (2,051 selected

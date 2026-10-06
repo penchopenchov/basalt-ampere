@@ -1,4 +1,4 @@
-// include/basalt/ngram/ple_reader.hpp - plan v0.3 P2: the n-gram table read straight from the SSD.
+// include/basalt/ngram/ple_reader.hpp - the n-gram table read straight from the SSD.
 //
 // The table is 320,001,536 rows of 90 bytes (IQ4_NL, 26.8 GiB) or 160 (FP8 E4M3, 51.2 GB) and is never held in RAM: every row comes from an
 // unbuffered 4 KiB read (platform::DirectFile). A token needs 16 rows on 16 different pages, and all 16 depend
@@ -12,8 +12,7 @@
 // kept at most `max_inflight` deep, so a chunk's reads can run while the previous chunk computes.
 //
 // THE ROW CACHE IS NOT THE TABLE. It keeps rows this process has already fetched (90 bytes each, bounded,
-// clock eviction). Measured on the frozen corpus (bench/results/2026-09-23-ngram-io): 1M rows (~95 MB)
-// would serve up to ~82% of reads; within one long prompt 20-34% of rows recur. Capacity 0 disables it.
+// clock eviction). Within one long prompt a fraction of rows recur. Capacity 0 disables it.
 #pragma once
 
 #include "basalt/platform/direct_file.hpp"
@@ -75,7 +74,7 @@ public:
     /// Keep the SSD awake while the table is in use (io_thread mode only; call after `open`): when no read has
     /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`.
     /// Some SSDs drop into a power state after ~250 ms without a command and stall the next reads 50-150 ms
-    /// (a WD_BLACK SN7100 on Windows 11; the NVMe idle timeouts of the power plan did not change it), which in
+    ///, which in
     /// decode happens after a few rounds whose rows all came from the row cache. 0 turns it off (the reader's
     /// default; generate turns it on, see SSD_KEEPALIVE). A keep-alive read that fails turns it off.
     void set_keepalive(double period_ms, double window_s);

@@ -247,11 +247,10 @@ struct ExpertDispatch {
     int64_t parts_elems = 0;               ///< `K * n_embd`, the length of both buffers
     const float* mixed = nullptr;          ///< the layer's normed activation, for the hit kernel's Q8_0
     uint8_t* x_q8_0_hit = nullptr;         ///< `(n_embd/32) * 34` bytes, its own buffer
-    /// **R4.2h: THE CPU's fp32 ACTIVATION SCALES, `(n_embd/32)` FLOATS.**  Without them the GPU's hits are
+    /// **THE CPU's fp32 ACTIVATION SCALES, `(n_embd/32)` FLOATS.**  Without them the GPU's hits are
     /// computed with the `block_q8_0`'s fp16 `d` while the CPU's misses use the fp32 `ActQ::scale`
-    /// (`cpu/expert.cpp:92`) - **4.761e-04 relative on 80 of 80 chunks**, measured with both real
-    /// implementations linked in `bench/micro/act_quant_parity.cu`.  That disagreement is why turning the
-    /// cache on changed the generated tokens.  Required whenever the hit path runs.
+    /// (a relative difference of about 2^-11 per chunk), so a hit and a miss would give different tokens.
+    /// Required whenever the hit path runs.
     float* x_q8_0_hit_scale = nullptr;
     int32_t* d_slot = nullptr;             ///< device, K entries
     int32_t* d_dst = nullptr;              ///< device, K entries

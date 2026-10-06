@@ -1,9 +1,9 @@
-// include/basalt/kernels/qsa_prompt_attn.hpp - perf-review D-1: the prompt path's QSA attention on tensor cores.
+// include/basalt/kernels/qsa_prompt_attn.hpp - the prompt path's QSA attention on tensor cores.
 //
 // `qsa_decode_attn_batch` serves a prompt one query at a time with the decode kernel: FP32 dot products with a warp
 // reduction per head and cell, 64-cell chunks whose partial sums go through global scratch to a second (merge)
-// kernel. At 32K that is 21% of the prompt (5.6 s of 26 s on a 5070, Q2_0, int8 KV), and it is limited by
-// instruction issue, not memory (~150 GB/s of logical reads, 3.4 TFLOP/s).
+// kernel. At long context that is a large share of the prompt, and it is limited by
+// instruction issue, not memory.
 //
 // This kernel keeps the same per-query selection (no masking, no union) and reads the same pools, but:
 //   * one block per (query, KV head) walks all its selected cells in chunks of 32 with an online softmax: no

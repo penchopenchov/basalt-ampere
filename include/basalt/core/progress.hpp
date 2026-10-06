@@ -1,4 +1,4 @@
-// include/basalt/core/progress.hpp - issue #29: whether a request is still moving, and where it is.
+// include/basalt/core/progress.hpp - whether a request is still moving, and where it is.
 //
 // The engine's host loop and the GPU wait on each other through flags; a protocol bug there does not crash, it
 // spins forever (the GPU "100%", one CPU core busy, no tokens).  `--serve` runs a watchdog thread over this: a
@@ -19,7 +19,7 @@ struct Progress {
     std::atomic<bool> busy{false};
     std::atomic<const char*> where{"idle"};
     std::atomic<int64_t> detail{-1};
-    std::atomic<int64_t> chunk{-1};      ///< #251: the prompt chunk (its first position) a batched-read stage is in
+    std::atomic<int64_t> chunk{-1};      ///< the prompt chunk (its first position) a batched-read stage is in
     std::atomic<int64_t> since_ms{0};    ///< when `where` was set (steady clock): how long a stage has lasted
     std::atomic<uint64_t> ticks{0};      ///< layers served: a window that still moves, slowly, against one that stopped
 };
@@ -33,8 +33,8 @@ inline int64_t progress_now_ms() {
 using DiagFn = void (*)(std::FILE*);
 inline std::atomic<DiagFn>& diag_pool_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
 inline std::atomic<DiagFn>& diag_verify_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
-/// #267: what a path that ends the engine runs first - it releases the GPU's spin waits on host flags (the verify
-/// window's), so no kernel stays resident while the process goes away (on Windows that left the GPU "lost").
+/// What a path that ends the engine runs first - it releases the GPU's spin waits on host flags (the verify
+/// window's), so no kernel stays resident while the process goes away (a resident kernel can leave the GPU unusable).
 inline std::atomic<DiagFn>& release_gpu_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
 inline void release_gpu_waits(std::FILE* f) {
     if (auto fn = release_gpu_fn().load()) fn(f);

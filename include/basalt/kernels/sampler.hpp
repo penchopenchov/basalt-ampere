@@ -1,8 +1,8 @@
-// include/basalt/kernels/sampler.hpp - the sampler chain, host-callable (P2.S2).
+// include/basalt/kernels/sampler.hpp - the sampler chain, host-callable.
 //
 //     penalties -> top_k -> top_p -> min_p -> temperature -> pick
 //
-// llama.cpp's default chain (issue #53): ONE penalties stage, first, and temperature AFTER the truncation filters;
+// llama.cpp's default chain: ONE penalties stage, first, and temperature AFTER the truncation filters;
 // top_p cuts before min_p.  `src/kernels/cuda/sampler.cu` has the details and `sampler_parity` pins them.
 #pragma once
 
@@ -42,9 +42,9 @@ struct SamplerParams {
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
-// The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
+// The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (needs thread-block clusters): the same token as
 // sample_tokens' one-block argmax.  False (nothing launched) where it
-// cannot run: HIP, a card or a build below sm_90.  Device pointers; capturable.
+// cannot run: a device without thread-block clusters.  Device pointers; capturable.
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream);
 
 // The draft head's tail in one launch (MTP_FUSE_TOP): sample_greedy_cluster's pick, its probability summed as
@@ -75,7 +75,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.
 // `tail` is what the state consumed before the window, `window[0]` the fed-back token and `window[1..]` the
 // drafts: row t is exactly the history plain decode counts when it picks the token after `window[t]`, so drafting
-// cannot change which tokens are penalised.  Row 0 alone is the single row the engine staged before 0.1.19.
+// cannot change which tokens are penalised. 
 inline void penalty_rows(const int32_t* tail, int64_t n_tail, const int32_t* window, int T, int h, int32_t* out) {
     for (int t = 0; t < T; ++t) {
         int32_t* row = out + (size_t) t * (size_t) h;
