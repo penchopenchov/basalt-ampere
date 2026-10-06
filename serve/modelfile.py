@@ -134,4 +134,6 @@ def model_config(path: str, exe: str, gpus: int | None = None, vision: bool = Tr
     v = vision_config(mf, exe) if vision else None
     if v:
         cfg["vision"] = v
+        if "--vision" not in args:   # the engine takes image embeddings only when told
+            args.append("--vision")
     return cfg

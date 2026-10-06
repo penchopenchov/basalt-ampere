@@ -91,6 +91,13 @@ class Peer(Tmp):
         self.assertEqual(gpus_in_play(cfg, cfg["args"]), [0, 1])
         self.assertNotIn("--peer-device", modelfile.model_config(path, str(self.exe), gpus=1)["args"])
 
+    def test_vision_tells_the_engine(self):
+        path = self.build(vision=True)
+        (self.exe.parent / "basalt-vision").write_text("")
+        cfg = modelfile.model_config(path, str(self.exe), gpus=1)
+        self.assertIn("vision", cfg)
+        self.assertIn("--vision", cfg["args"])
+
     def test_overrides_replace_or_add(self):
         path = self.build(meta={**META, "engine_args": ["--spec", "7", "--spec-min-p", "0.5"]})
         args = modelfile.model_config(path, str(self.exe), gpus=1,
