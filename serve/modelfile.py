@@ -104,13 +104,26 @@ def vision_config(mf: ModelFile, exe: str) -> dict | None:
     return {"exe": str(side), "mmproj": str(mmproj), "model": str(vocab)}
 
 
-def model_config(path: str, exe: str, gpus: int | None = None, vision: bool = True) -> dict:
-    """The engine settings the model file implies.  A second visible GPU becomes the engine's peer
-    expert tier unless the file's engine arguments already say."""
+def with_arg(args: list[str], flag: str, value) -> list[str]:
+    """`args` with `flag value` replaced, or appended when absent."""
+    out = list(args)
+    if flag in out:
+        out[out.index(flag) + 1] = str(value)
+    else:
+        out += [flag, str(value)]
+    return out
+
+
+def model_config(path: str, exe: str, gpus: int | None = None, vision: bool = True,
+                 overrides: dict | None = None) -> dict:
+    """The engine settings the model file implies, with `overrides` ({flag: value}) replacing the file's
+    engine arguments.  A second visible GPU becomes the engine's peer expert tier unless they already say."""
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
     args = ["--model", path] + [str(a) for a in meta.get("engine_args") or []]
+    for flag, value in (overrides or {}).items():
+        args = with_arg(args, flag, value)
     if "--peer-device" not in args and (gpu_count() if gpus is None else gpus) > 1:
         args += ["--peer-device", "1"]
     cdir = cache_dir(mf)

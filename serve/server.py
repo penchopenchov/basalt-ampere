@@ -3151,6 +3151,11 @@ def main() -> int:
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
     ap.add_argument("--exe", help="the basalt binary to run the model with (with --model)")
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
+    ap.add_argument("--spec", type=int, help="tokens per verify window, the drafter's cap (default: the model file's; "
+                                             "0 = no speculation, the drafter is not loaded)")
+    ap.add_argument("--spec-min-p", type=float, help="stop drafting below this draft probability (default: the "
+                                                     "model file's; 0 = always draft to the cap)")
+    ap.add_argument("--mtp-max-t", type=int, help="the drafter's own window cap (default 0 = --spec)")
     ap.add_argument("--host", default="127.0.0.1",
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
                          "devices on your network (give --api-key)")
@@ -3201,7 +3206,9 @@ def main() -> int:
         listed = gpu_list(cfg)
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
-                a.model, a.exe, gpus=len(listed) if listed else None, vision=a.engine == "engine").items()
+                a.model, a.exe, gpus=len(listed) if listed else None, vision=a.engine == "engine",
+                overrides={f: v for f, v in (("--spec", a.spec), ("--spec-min-p", a.spec_min_p),
+                                             ("--mtp-max-t", a.mtp_max_t)) if v is not None}).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")

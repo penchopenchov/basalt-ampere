@@ -91,6 +91,12 @@ class Peer(Tmp):
         self.assertEqual(gpus_in_play(cfg, cfg["args"]), [0, 1])
         self.assertNotIn("--peer-device", modelfile.model_config(path, str(self.exe), gpus=1)["args"])
 
+    def test_overrides_replace_or_add(self):
+        path = self.build(meta={**META, "engine_args": ["--spec", "7", "--spec-min-p", "0.5"]})
+        args = modelfile.model_config(path, str(self.exe), gpus=1,
+                                      overrides={"--spec": 0, "--mtp-max-t": 4})["args"]
+        self.assertEqual(args, ["--model", path, "--spec", "0", "--spec-min-p", "0.5", "--mtp-max-t", "4"])
+
     def test_file_args_win(self):
         path = self.build(meta={**META, "engine_args": ["--peer-device", "-1"]})
         args = modelfile.model_config(path, str(self.exe), gpus=2)["args"]
