@@ -23,7 +23,6 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -505,7 +504,7 @@ private:
 // ---------------------------------------------------------------------------------------------- options
 
 struct Options {
-    std::string engine, config, model, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, lock, power_label;
+    std::string engine, config, model, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, power_label;
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec, spec_min_p;        // --spec N, --spec-min-p P: engine arguments of the same names
@@ -513,7 +512,7 @@ struct Options {
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
     int reps = 1;
-    bool quality = false, no_lock = false, no_windows = false;
+    bool quality = false, no_windows = false;
     int quality_chunks = 20, quality_t = 3;
 };
 
@@ -560,17 +559,13 @@ void usage() {
         "  --no-windows       do not ask the engine for the per-window log (no window statistics)\n"
         "  progress goes to stderr\n"
         "\n"
-        "GPU lock\n"
-        "  --gpu-lock FILE    flock FILE for the whole run (default ~/scripts/gpu.lock when it exists)\n"
-        "  --no-gpu-lock      take no lock, e.g. when started under ~/scripts/gpu.sh, which holds it already\n"
-        "\n"
         "fixtures (--fixtures DIR, default %s)\n"
         "  conv.ids struct.ids prose.ids   one line each: the comma-separated token ids of the chat-templated\n"
         "                                  prompt (thinking off, generation prompt added)\n"
         "  prefill.ids                     three lines: the ids before the body, the body, the ids after the body;\n"
         "                                  the body is the 16384-token depth, cut or repeated to the asked depth,\n"
         "                                  and 4 random ids are inserted before it so the prompt cache cannot match\n"
-        "  Prompts, as bench.sh: conv  \"Explain how a B-tree differs from an LSM tree, with a worked example of\n"
+        "  Prompts: conv  \"Explain how a B-tree differs from an LSM tree, with a worked example of\n"
         "  each. About 600 words.\" (1200 tokens, temperature 0.6); struct  the JSON-array prompt (8192 tokens,\n"
         "  temperature 0, 7230 tokens expected); prose  \"Write an essay on the Odyssey.\" (1200 tokens,\n"
         "  temperature 0.6); prefill  40000 characters of filler as the body, then \"In one sentence, what is this\n"
@@ -725,8 +720,6 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--power-label") o.power_label = next("--power-label");
         else if (a == "--logs") o.logs = next("--logs");
         else if (a == "--kld-base") o.kld_base = next("--kld-base");
-        else if (a == "--gpu-lock") o.lock = next("--gpu-lock");
-        else if (a == "--no-gpu-lock") o.no_lock = true;
         else if (a == "--no-windows") o.no_windows = true;
         else if (a == "-r") o.reps = std::atoi(next("-r").c_str());
         else if (a == "--quality-t") o.quality_t = std::atoi(next("--quality-t").c_str());
@@ -893,7 +886,7 @@ double prefill_wall_ts(const Done& d) {
     const double w = d.first_token_s > 0 ? d.first_token_s : d.wall_s;
     return w > 0 ? (double) d.prompt / w : 0.0;
 }
-// windows the draft log did not show are estimated as tokens minus accepted drafts, as bench.sh's len does
+// windows the draft log did not show are estimated as tokens minus accepted drafts
 double window_count(const Result& r) {
     return r.win.present ? (double) r.win.windows : (double) std::max<long long>(r.d.generated - r.d.accepted, 1);
 }
@@ -967,11 +960,6 @@ bool read_kld_base(const std::string& path, uint32_t& n_ctx, int32_t& n_vocab, i
 }
 
 // ---------------------------------------------------------------------------------------------- main
-
-std::string home_path(const std::string& rel) {
-    const char* h = std::getenv("HOME");
-    return (h != nullptr ? std::string(h) : std::string()) + "/" + rel;
-}
 
 }  // namespace
 
@@ -1108,22 +1096,6 @@ int main(int argc, char** argv) {
             }
         }
     } cleanup{work, temp_work};
-
-    // the GPU lock, held until exit
-    int lock_fd = -1;
-    std::string lock_path = o.lock;
-    if (lock_path.empty() && !o.no_lock) {
-        const std::string def = home_path("tuning/gpu.lock");
-        if (fs::exists(def)) lock_path = def;
-    }
-    if (!lock_path.empty() && !o.no_lock) {
-        lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
-        if (lock_fd < 0) { std::fprintf(stderr, "basalt-bench: cannot open the lock %s\n", lock_path.c_str()); return 2; }
-        if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
-            std::fprintf(stderr, "basalt-bench: waiting for the GPU lock %s\n", lock_path.c_str());
-            flock(lock_fd, LOCK_EX);
-        }
-    }
 
     Nvml nvml;
     const bool have_nvml = nvml.open();
