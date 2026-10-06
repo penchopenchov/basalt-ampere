@@ -17,15 +17,12 @@ namespace {
 
 // `kvalues_iq4nl`: the non-linear codebook, verbatim from ggml-common.h / ggml-quants.c.
 //
-// **IT WAS IN `__constant__` FOR THE WRONG REASON, AND IT COST 2.12x.**  The old comment justified constant
-// memory with "every thread reads it and it is the same 16 values for the whole launch".  That reasoning is
-// exactly backwards: constant memory is fast when the access is UNIFORM - every lane reading the SAME address -
+// **`__constant__` IS THE WRONG PLACE FOR IT.**  "Every thread reads it and it is the same 16 values for the
+// whole launch" is exactly backwards: constant memory is fast when the access is UNIFORM - every lane reading the SAME address -
 // and a NON-LINEAR codebook means every lane reads a DIFFERENT index, which is the pattern it handles worst.
 //
-// Measured on `attn_qkv` (IQ4_XS, 10240 x 2560), forcing the Affine codebook so that the memory traffic and the
-// instruction count stay identical and only the table read is removed:
-//
-//     codebook probe: IQ4NL 0.2032 ms   Affine 0.0960 ms   ratio 2.12x
+// Forcing the Affine codebook, so that the memory traffic and the instruction count stay identical and only the
+// table read is removed, shows the constant-memory read at about twice the time of the whole kernel.
 //
 // `decode_tbl` below reads a SHARED copy instead: 16 bytes loaded once per block, then an index into shared
 // memory that costs at most a four-way bank conflict.  The `__constant__` array stays as the source of it.
@@ -149,7 +146,7 @@ __global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint
     const int lane = threadIdx.x & 31;
 
     // THE CODEBOOK, IN SHARED MEMORY.  16 bytes, loaded once per block by the first 16 threads, instead of a
-    // divergent constant read per element - measured at 2.12x of this whole kernel (see the note on `kIq4Nl`).
+    // divergent constant read per element - about twice this whole kernel (see the note on `kIq4Nl`).
     //
     // THE LOAD AND THE BARRIER COME BEFORE THE EARLY RETURN, as in `s_gemv_q8k_kernel`.  The return must not
     // sit above them: whenever `n_out % 8 != 0` the last block's surplus warps would leave before a barrier the
@@ -416,7 +413,7 @@ __global__ void s_gemv_split_kernel(const uint16_t* __restrict__ x, const uint8_
     const float* s = scales + o * n_groups;
     const float* off = has_offset ? offset + o * n_groups : nullptr;
 
-    // FOUR ACCUMULATORS, NOT ONE.  L2 measured this kernel at 0.4% of FP32 peak and 2.1% of bandwidth, so
+    // FOUR ACCUMULATORS, NOT ONE.  This kernel runs far below FP32 peak and below bandwidth, so
     // neither limit is the constraint - the constraint is the DEPENDENCY CHAIN: a single `acc += ...` serialises
     // every FMA behind the previous one's latency (4-6 cycles each, ~1 per 4 cycles achieved), so the SM sits
     // idle.  Four independent accumulators let the scheduler keep four FMAs in flight, and the loop is

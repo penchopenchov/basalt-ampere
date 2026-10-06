@@ -5,10 +5,10 @@
 //      the Python reference does and then dots it against the same weights.
 //   2. **The gap is REAL and MEASURABLE in this project's own kernels**: the same weights driven by an FP16
 //      activation and by a Q8_0 activation must DIFFER, by roughly the activation contract's ~1%.  Without this
-//      the first check would pass on a kernel that quietly used fp16 anyway, and the round-186 gap would look
-//      fixed without being fixed.
-//   3. The measured size of that difference is reported, so the number in the state file is one this test
-//      produces rather than one quoted from elsewhere.
+//      the first check would pass on a kernel that quietly used fp16 anyway, and the activation-contract gap would
+//      look fixed without being fixed.
+//   3. The measured size of that difference is reported, so the number is one this test produces
+//      rather than one quoted from elsewhere.
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/s_gemv.hpp"
 #include "basalt/kernels/s2_gemv_q8.hpp"
@@ -112,10 +112,9 @@ int main(int argc, char** argv) {
         // stated because the wrong denominator reads as a wrong kernel
         const double rel = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
         if (!(rel <= worst)) worst = rel;
-        // 1e-4, not 1e-5: the measured worst is 1.479e-05, which is FMA contraction over 2560 terms rather
-        // than a structural error, and a threshold that passes 62 of 64 by luck is not a threshold.  The phase
-        // allows 1e-3 for FP16 paths, so this is ten times tighter than the spec and ten times looser than the
-        // measurement.
+        // 1e-4, not 1e-5: the worst is about 1.5e-05, which is FMA contraction over 2560 terms rather
+        // than a structural error, and a threshold that passes by luck is not a threshold.  1e-3 is allowed for
+        // FP16 paths, so this is ten times tighter than that and ten times looser than the measurement.
         if (!(rel <= 1e-4)) ++bad;
     }
     std::printf("  %-38s %s (%d of %lld over 1e-4, worst rel %.3e, mean |ref| %.3f)\n",

@@ -346,7 +346,7 @@ void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
     ck(cudaEventCreate(&e1), "event");
     for (const auto& r : rows) {
         const int ng = S.plan_sizes(r.sizes, 0, rng);
-        const Layers Ls(S, ng);                                       // 48 x 28 experts: 3.7 GB for the VRAM call
+        const Layers Ls(S, ng);                                       // 48 layers of experts, as the engine has
         // --bench-ab gu2: the new launches without / with native_gu2_kernel instead of v1 / new
         cudaGraphExec_t ga = ab_gu2 ? make_graph(s, S, Ls, false, r.gy, 0) : make_graph(s, S, Ls, true, 0);
         cudaGraphExec_t gb = make_graph(s, S, Ls, false, r.gy, ab_gu2 ? 1 : -1);

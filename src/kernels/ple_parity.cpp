@@ -78,10 +78,9 @@ double rel_l1(const float* a, const float* b, size_t n, double* mag_out = nullpt
 
 /// The file's size, WITHOUT reading it.
 ///
-/// The first version of this test called `read_file(gguf)` - which reads the WHOLE file into a vector - three
-/// times, on a 28.8 GB GGUF.  That is 27 GB of RSS, three full passes over the file, and a 132-second ctest
-/// entry in a suite where every other test is under a second.  A test that slow stops being run, which is how
-/// a gate stops being a gate.  Everything below now reads only the bytes it actually compares.
+/// Reading the WHOLE file into a vector, on a 28.8 GB GGUF, would be a huge RSS and a ctest entry far slower
+/// than every other test, and a test that slow stops being run, which is how a gate stops being a gate.
+/// Everything below reads only the bytes it actually compares.
 long long file_size(const char* path) {
     std::FILE* f = std::fopen(path, "rb");
     if (!f) return -1;

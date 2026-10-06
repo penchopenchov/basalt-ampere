@@ -186,8 +186,8 @@ __global__ void gr_down_kernel(const Activation* __restrict__ xq, const uint16_t
     if (warp == 0) {
         float t = (lane < nw) ? part[lane] : 0.0f;
         t = warp_sumf(t);
-        // NOTE: the reduction order differs from the one-warp version, so this is a NUMERICS CHANGE.  C1 is the
-        // gate that judges it - not this comment, and not `gr_parity`, which compares against the reference on
+        // NOTE: the reduction order differs from the one-warp version, so this is a NUMERICS CHANGE.  The quality
+        // gate judges it - not this comment, and not `gr_parity`, which compares against the reference on
         // a fixture that a changed summation order can still pass.
         if (lane == 0) store_activation(lq, k, silu_f(t / (float) hc));
     }

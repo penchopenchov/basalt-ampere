@@ -74,15 +74,13 @@ __global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict
 
 // The per-token scalar gate: sigmoid(dot(x, w)) with w = `ffn_gate_inp_shexp` (n_embd,).
 //
-// **ONE THREAD WAS THE LARGEST SINGLE KERNEL IN THE MODEL, AND THE COMMENT DEFENDING IT SAID WHY IT SHOULD
-// NOT BE.**  It read: "n_embd is 2560, so this is a short serial loop and the parallelism is elsewhere."
-// 2560 iterations is not short when each one is a DOUBLE multiply-add.  This card's double rate is **1/64** of
-// its float rate, so the loop is a 2560-long dependency chain through a 1/64-rate unit - tens of microseconds
+// **ONE THREAD WOULD BE THE LARGEST SINGLE KERNEL IN THE MODEL.**  "n_embd is 2560, so this is a short serial
+// loop" is wrong: 2560 iterations is not short when each one is a DOUBLE multiply-add.  The double rate is
+// a small fraction of the float rate, so the loop is a 2560-long dependency chain through a 1/64-rate unit - tens of microseconds
 // from the chain alone, before counting 2560 sequential global loads issued by one thread with no coalescing.
 //
-// MEASURED, and this is what the number looks like from outside: `shared_expert` is **0.2374 ms of a
-// 0.8883 ms block - 26.7% of the whole block, 11.4 ms per token** - for three projections that read 5.5 MB and
-// whose memory floor is 0.009 ms.  It is seven kernels, and six of them are GEMVs or elementwise passes over
+// From outside, a single-thread `shared_expert` costs a large share of the whole block for three projections
+// that read little memory.  It is seven kernels, and six of them are GEMVs or elementwise passes over
 // 640-2560 elements.  This is the one that cannot be explained by bandwidth.
 //
 // THE DOUBLE ACCUMULATOR IS KEPT.  the Python reference reduces in float64 and `block_sum` in `gr.cu` exists for the

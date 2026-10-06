@@ -339,9 +339,9 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
         return;
     }
     a.nchunks = n / QKA;
-    // Plan v0.3 P6: AVX-512, the same operations per element as the scalar loop below (max of |x|, one multiply,
-    // +-0.5 away from zero, truncation, clamp), so the result is bitwise the scalar one.  The scalar loop took
-    // ~22 us per 2560 values - 3.2 ms of every speculative round.
+    // AVX-512, the same operations per element as the scalar loop below (max of |x|, one multiply,
+    // +-0.5 away from zero, truncation, clamp), so the result is bitwise the scalar one.  The scalar loop is a
+    // visible cost per speculative round.
     {
         const __m512 half = _mm512_set1_ps(0.5f), mhalf = _mm512_set1_ps(-0.5f), zero = _mm512_setzero_ps();
         const __m512i lo = _mm512_set1_epi32(-127), hi = _mm512_set1_epi32(127);
@@ -377,11 +377,8 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
         int32_t sum = 0;
         int8_t* q = a.q + k * QKA;
         for (int j = 0; j < QKA; ++j) {
-            // **`std::lround` IS A FUNCTION CALL AND IT COST 51 us PER LAYER.**  Measured: quantizing 2560
-            // floats took 51.3 us - 20 ns per element, about 60 cycles for a fabs, a multiply and a round.
-            // `lround` respects the current rounding mode, so MSVC cannot inline it to a single instruction
-            // and emits a call per element.  48 layers x 51.3 us = 2.46 ms/token, which is 8.6% of the whole
-            // CPU expert term and is pure overhead.
+            // **`std::lround` IS A FUNCTION CALL.**  It respects the current rounding mode, so a compiler may not inline it
+            // to a single instruction and emits a call per element, which is pure overhead on the CPU expert path.
             //
             // `t + copysign(0.5, t)` is EXACTLY `lround`'s rule - round half AWAY FROM ZERO - and it is
             // branchless and vectorizable.  It is NOT `_mm256_round_ps`, which rounds half to EVEN and would

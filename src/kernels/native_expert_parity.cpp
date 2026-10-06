@@ -127,7 +127,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                             ggml_type_name((ggml_type) f.gu_type), tag, rg);
                 if (rg > 1e-5) {   // ggml's own vec_dot is the reference: above 1e-5 it is a real mismatch,
                     std::printf("          %s %s gate rows MISMATCH (rel %.2e > 1e-5)\n",
-                                ggml_type_name((ggml_type) f.gu_type), tag, rg);   // not rounding (measured 3e-8)
+                                ggml_type_name((ggml_type) f.gu_type), tag, rg);   // not rounding
                     ++failures;
                 }
                 float* f1[1] = {ffp[0]};
@@ -253,7 +253,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                                  blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
             const double rdn = rel(alt, refd);
             std::printf("          iq4_nl AVX-2 multi-token down vs ggml down: rel %.2e\n", rdn);
-            if (rdn > 1e-5) {   // measured 1e-7; same reasoning as the gate/up rows above
+            if (rdn > 1e-5) {   // same reasoning as the gate/up rows above
                 std::printf("          iq4_nl down MISMATCH (rel %.2e > 1e-5)\n", rdn);
                 ++failures;
             }

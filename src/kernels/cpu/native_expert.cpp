@@ -78,8 +78,8 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
-    // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
-    // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
+    // the multi-token kernels decode the weights once for all tokens: faster than ggml-cpu at several tokens, no faster
+    // at one (all are bound by the codebook lookups), as native_expert_parity measures.  AVX-512
     // first, then the AVX-2 one.  ggml-cpu's single-token vec_dot is reached only on a CPU with neither.
     static const bool avx512 = cpu_avx512_ok();
     // cpu_avx2_ok() is required for the AVX-2 kernel: iq_avx2.cpp and kq_avx2.cpp

@@ -116,11 +116,10 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
 
     // ================================ THE SELECTION, IN k PASSES ================================
     //
-    // **THE RANK-BY-COUNTING LOOP COMPARED EVERY EXPERT AGAINST EVERY OTHER**: 512 x 512 = 262,144 shared
-    // loads and compares per token per layer, to choose ten things out of 512 - measured at 34.35 us, 63% of
-    // `moe_route`'s accounted cost and the largest single item in the R3 plan.  The comment above records that
-    // the FP64 ARITHMETIC inside that loop was hoisted out once already ("262,144 double multiplies per token
-    // per layer instead of 512"); **the O(n^2) STRUCTURE was left, and it is the structure that costs.**
+    // **A RANK-BY-COUNTING LOOP COMPARES EVERY EXPERT AGAINST EVERY OTHER**: 512 x 512 = 262,144 shared
+    // loads and compares per token per layer, to choose ten things out of 512 - the largest single cost in
+    // `moe_route`.  Hoisting the FP64 arithmetic out of that loop helps, but **the O(n^2) STRUCTURE is what
+    // costs.**
     //
     // `k` passes of a block-wide argmax is 10 x 512 = 5,120 compares - **51x less work** - and it produces the
     // SAME ORDER.  That is the whole correctness argument: scanning `e` ascending with a strict `>` keeps the

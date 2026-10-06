@@ -395,17 +395,14 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
         }
         return;
     }
-    // ================================ SIXTEEN SERIAL PAGE FAULTS, MEASURED ================================
+    // ================================ SIXTEEN SERIAL PAGE FAULTS ================================
     //
-    // **THIS COST 2.10-2.61 ms PER TOKEN AND HAD NEVER BEEN IN THE PLAN'S BUDGET AT ALL.**  The round-309
-    // `token host phases` line put it second behind the layer loop among avoidable terms, and the arithmetic
-    // says why: the table is 320,001,536 rows of `PLE_ROW_BYTES` = 90 B in a 26.8 GB mapping, so the sixteen
-    // rows a token needs are 1,440 B - **0.5 MB/s**.  That is not bandwidth, it is latency: sixteen reads into
-    // sixteen different 4 KB pages scattered across 26.8 GB, taken ONE AT A TIME, and on this machine the PLE
-    // shard is 26.8 GB against 63 GB of RAM that the 31.6 GB expert arena is also competing for, so they are
-    // not in the OS cache.  Sixteen serial NVMe reads at ~150 us is 2.4 ms, which is the measurement.
+    // **THIS COSTS MILLISECONDS PER TOKEN.**  The table is 320,001,536 rows of `PLE_ROW_BYTES` = 90 B in a 26.8 GB
+    // mapping, so the sixteen rows a token needs are 1,440 B.  That is not bandwidth, it is latency: sixteen reads
+    // into sixteen different 4 KB pages scattered across 26.8 GB, taken ONE AT A TIME, and the table is not in
+    // the OS cache when the expert arena competes for RAM.  Sixteen serial NVMe reads add up to milliseconds.
     //
-    // `PrefetchVirtualMemory` issues all sixteen in ONE call and lets them complete in parallel.  It is a hint
+    // A prefetch issues all sixteen in ONE call and lets them complete in parallel.  It is a hint
     // and cannot change the answer - a range it does not fetch is simply faulted in by the read that follows -
     // so the only risk is that it does nothing.
     // HEAD-SLOWEST, which is what `ggml_get_rows` does and what the source's own comment says: head h's 160

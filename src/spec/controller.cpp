@@ -9,7 +9,7 @@ double CostModel::step_ms(int k, bool mtp) const {
     const int n = std::clamp(k + 1, 1, K_MAX + 1);
     const double dense = dense_ms * dense_ratio[n - 1];
     // CPU misses: distinct experts grow as U(n); each extra token routed to a missed expert adds a fraction of a
-    // read. Tokens per distinct expert = n / U(n)-ratio (U measured in units of one token's 10 experts).
+    // read. Tokens per distinct expert = n / U(n)-ratio (U in units of one token's 10 experts).
     const double u = distinct_ratio[n - 1];
     const double uses_per_expert = (double) n / u;
     const double cpu = (1.0 - hit_rate) * cpu_all_miss_ms * u * (1.0 + extra_use_cost * (uses_per_expert - 1.0));

@@ -9,12 +9,11 @@
 // Q2_0 IS THE CASE THAT MATTERS: the routed experts are all Q2_0, `Q2_0 -> Q8_0`, and that is most of the
 // model.  Q8_K (for the K-quants and IQ4_XS) is the other half of the table and is not here yet.
 //
-// THE THREE SUBTLETIES, each of which was paid for once already and is transcribed rather than recalled:
+// THE THREE SUBTLETIES, each transcribed rather than recalled:
 //
 //   1. `d32 = amax / 127.0f` is computed in FP32, and the QUANTIZED INTEGERS divide by **d32**, not by the
-//      fp16-rounded value that gets stored.  Conflating the two shifts every quant near a rounding boundary -
-//      measured against ggml's own bytes, 18 of 80 blocks differed, and because Q2_0 experts convert to Q8_0
-//      the error landed in all 48 MoE blocks and made the end-to-end KL WORSE.
+//      fp16-rounded value that gets stored.  Conflating the two shifts every quant near a rounding boundary, so
+//      the bytes differ from ggml's own, in every MoE block, and the end-to-end KL gets WORSE.
 //   2. The reference divides in FLOAT64 (`blk.astype(np.float64) / float(np.float32(d32))`) and rounds with
 //      `rint` - half to even.  This kernel therefore divides in double too: an FP32 division followed by
 //      `rintf` differs from the reference wherever the f32 quotient rounds across a .5 boundary.

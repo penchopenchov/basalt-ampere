@@ -25,8 +25,8 @@ constexpr int JTHREADS = 32;   ///< threads along j, the state's fast axis
 ///
 /// Each thread walks `i` in 0..S-1 TWICE per head with a strided global load each step, so it is entirely
 /// latency-bound: a warp that issues one 128-byte transaction and then waits ~600 cycles needs other warps to
-/// run meanwhile, and at 24 blocks there were none.  Measured 0.2800 ms per GDN block - 10 ms of a 71.5 ms
-/// token, 14%, in a kernel touching 12.6 MB that a 643 GB/s card should do in 0.020 ms.
+/// run meanwhile, and at 24 blocks there are none.  That is a large share of a token in a kernel that touches
+/// little memory.
 ///
 /// The arithmetic does not change at all: the same columns are computed by the same code, in different blocks.
 constexpr int MAX_H = 1;       ///< heads staged in shared memory per block

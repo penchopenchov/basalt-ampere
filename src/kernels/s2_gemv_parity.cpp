@@ -7,7 +7,7 @@
 // WHY A TOLERANCE AND NOT BIT EQUALITY.  The decode test is bit-exact because S2's decode is exact
 // integer-to-float arithmetic.  A dot product is not: the compiler is free to contract `a*b + acc` into an
 // FMA, which changes the result in the last bits, and nvcc does.  So this asserts a RELATIVE error, measures
-// what it actually is, and prints the number - the phase spec allows 1e-3 for FP16 paths, and if the measured
+// what it actually is, and prints the number - 1e-3 is allowed for FP16 paths, and if the measured
 // error were near that the tolerance would be hiding something rather than bounding rounding.
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/s2_gemv.hpp"

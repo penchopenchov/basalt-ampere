@@ -660,9 +660,9 @@ int main(int argc, char** argv) {
                     pct(num / den));
         }
 
-        // (d) THE TRAP THIS FIXTURE CANNOT SEE, measured and reported rather than hidden.  `rms_norm` divides
+        // (d) THE TRAP THIS FIXTURE CANNOT SEE, reported rather than hidden.  `rms_norm` divides
         //     by sqrt(mean(x^2) + eps), so the 1/r in the mean cancels EXCEPT through eps: mean and sum differ
-        //     by ~eps/(2*mean(x^2)) relative.  the Python reference makes the same point about its own test.
+        //     by ~eps/(2*mean(x^2)) relative.  The Python reference makes the same point about its own test.
         {
             std::vector<double> psum = want_raw;
             for (auto& x : psum) x *= (double) R;

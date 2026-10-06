@@ -343,7 +343,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
                 bytes / (1024.0 * 1024 * 1024) / (ms.front() / 1000.0));
 
     // The projection the objective is stated against: 48 layers x 10 experts x 3 roles, all of one token's
-    // experts, at the measured per-role rate.  This is the VRAM-resident path only - the CPU expert path and
+    // experts, at the per-role rate.  This is the VRAM-resident path only - the CPU expert path and
     // the KV/attention work are separate and are NOT included.
     const double roles_per_token = 48.0 * 10.0 * 3.0;
     const double tok_ms = roles_per_token * ms.front();
@@ -408,9 +408,9 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
 int main(int argc, char** argv) {
     long long n_in = 2560;
     long long n_out = 128;
-    // 1e-4, not 1e-5: the measured worst is ~1e-5 (FMA contraction of a 2560-term f32 accumulation), so a
-    // 1e-5 threshold would pass by 4% and fail on a different n_in.  The phase spec allows 1e-3 for FP16
-    // paths; this is 10x tighter than the spec and 10x looser than the measurement.
+    // 1e-4, not 1e-5: the worst is ~1e-5 (FMA contraction of a 2560-term f32 accumulation), so a
+    // 1e-5 threshold would pass by 4% and fail on a different n_in.  1e-3 is allowed for FP16
+    // paths; this is 10x tighter than that and 10x looser than the measurement.
     double tol = 1e-4;
     bool selftest = false;
     bool bench = false;
