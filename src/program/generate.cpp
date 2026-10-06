@@ -64,7 +64,6 @@
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/draft_cum.hpp"
-#include "strata/core/emulate.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include <unistd.h>
 #include <cerrno>
@@ -2865,7 +2864,7 @@ int main(int argc, char** argv) {
         if (!named) cudaGetLastError();
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
         std::fprintf(stderr, "strata generate: GPU %d: %s, compute capability %d.%d\n", dev, name,
-                     strata::cc_major_of(p.major), strata::cc_minor_of(p.minor));
+                     p.major, p.minor);
         {   // #542: a build whose libcudart is older than its headers (a CUDA 13 kit with a dangling libcudart.so that
             // CMake resolved to the system's CUDA 12 one) reads cudaDeviceProp shifted - silently, and slowly
             int rt = 0;

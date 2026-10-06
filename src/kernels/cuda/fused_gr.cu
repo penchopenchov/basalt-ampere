@@ -1,5 +1,4 @@
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
-#include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/pdl.hpp"
@@ -587,26 +586,15 @@ int down_chunk(bool staged, int* tile_out) {
     if (!attr[dev]) {
         int optin = 0;
         cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-        optin = strata::smem_optin_of(optin);   // STRATA_EMULATE_CC (tests only)
-        // the down kernel stages n_tok*TILEV floats of dynamic shared memory - 80 KB at the full 8 tokens of the
-        // CUDA tile.  sm_75 gets the smaller tile: all eight tokens fit one 40 KiB launch there (no more slicing),
-        // the TQ-5 prefetch holds half the registers, and the smaller blocks raise how many of the 41-block grid
-        // share an SM.  Cards whose opt-in is still below that (or that report no opt-in at all) slice the tokens;
-        // the down kernel's outputs (lo, inject_out) are strictly per-token, so the chunk boundaries are safe, and
-        // the up kernel below still sees every token of the batch in one launch.
-        int cc_maj = 0, cc_min = 0;
-        cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&cc_min, cudaDevAttrComputeCapabilityMinor, dev);
-        const bool small_tile = strata::cc_major_of(cc_maj) * 10 + strata::cc_minor_of(cc_min) == 75;
-        const int tv = small_tile ? 1280 : 2560;
+        // the down kernel stages n_tok*TILEV floats of dynamic shared memory, 80 KB at the full 8 tokens.  A card
+        // whose opt-in is below that (or that reports none) slices the tokens; the down kernel's outputs (lo,
+        // inject_out) are strictly per-token, so the chunk boundaries are safe, and the up kernel below still sees
+        // every token of the batch in one launch.
+        const int tv = 2560;
         tile[dev] = tv;
         int want = (int) (kFusedGrMaxT * tv * sizeof(float));
         if (optin > 0 && want > optin) want = optin;
-        if (small_tile) {
-            cudaFuncSetAttribute(gr_down_multi_kernel<1280>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-        } else {
-            cudaFuncSetAttribute(gr_down_multi_kernel<2560>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-        }
+        cudaFuncSetAttribute(gr_down_multi_kernel<2560>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
         int want_staged = (int) (2 * kFusedGrMaxT * H_TILE * sizeof(float));
         if (optin > 0 && want_staged > optin) want_staged = optin;
         cudaFuncSetAttribute(gr_down_staged_kernel<>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
@@ -620,15 +608,9 @@ int down_chunk(bool staged, int* tile_out) {
         cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
         cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
         cudaGetLastError();      // drop any error the attempt left behind
-        // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
-        // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
-        // will launch is its per-block limit, so the capacity comes from that below sm_70 - the same tokens
-        // the "no opt-in" branch assumes, but taken from the attribute that is actually enforced.
-        int cc = 0, per_block = 0;
-        cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
+        int per_block = 0;
         cudaDeviceGetAttribute(&per_block, cudaDevAttrMaxSharedMemoryPerBlock, dev);
-        cc = strata::cc_major_of(cc);
-        const int usable = (cc >= 7 && optin > 0) ? optin : per_block;
+        const int usable = optin > 0 ? optin : per_block;
         const int capacity = usable / (int) (tv * sizeof(float));
         chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
         const int capacity_staged = usable / (int) (2 * H_TILE * sizeof(float));
@@ -664,8 +646,6 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         const dim3 dg(DOWN_BLOCKS + 1), db(THREADS);
         if (staged) {
             launch_staged<kFusedGrMaxT>(3, c, dg, smem, st);   // three weight tiles in flight per warp
-        } else if (tv == 1280) {
-            launch_pdl(gr_down_multi_kernel<1280>, dg, db, smem, st, c);
         } else {
             launch_pdl(gr_down_multi_kernel<2560>, dg, db, smem, st, c);
         }

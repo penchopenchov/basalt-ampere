@@ -29,7 +29,6 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/pdl.hpp"
-#include "strata/core/emulate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1386,7 +1385,7 @@ int mmvq_mma_sms() {
                        cudaFuncGetAttributes(&f1, native_iq4_xs_mma_kernel<1>) == cudaSuccess &&
                        cudaFuncGetAttributes(&f2, native_iq4_xs_mma_kernel<2>) == cudaSuccess;
         if (!q) (void) cudaGetLastError();
-        known[dev] = q && strata::cc_major_of(major) >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
+        known[dev] = q && major >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
                          ? sms : -1;
     }
     return known[dev] > 0 ? known[dev] : 0;

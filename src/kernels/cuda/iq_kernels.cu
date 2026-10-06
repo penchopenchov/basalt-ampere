@@ -8,7 +8,6 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/pdl.hpp"
-#include "strata/core/emulate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -2218,7 +2217,7 @@ bool gu_mma_usable(const NativeExpertLayout& L) {
         const bool q1 = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess;
         const bool q2 = q1 && cudaFuncGetAttributes(&fa, native_gu_mma_kernel) == cudaSuccess;
         if (!q1 || !q2) cudaGetLastError();
-        ok[dev] = q2 && strata::cc_major_of(major) >= 8 && fa.ptxVersion >= 80 ? 1 : 2;
+        ok[dev] = q2 && major >= 8 && fa.ptxVersion >= 80 ? 1 : 2;
     }
     return ok[dev] == 1;
 }
@@ -2242,7 +2241,7 @@ int mmvq_mma_sms() {
                        cudaFuncGetAttributes(&f1, mmvq_iq3s_mma_kernel<1>) == cudaSuccess &&
                        cudaFuncGetAttributes(&f2, mmvq_iq3s_mma_kernel<2>) == cudaSuccess;
         if (!q) cudaGetLastError();
-        known[dev] = q && strata::cc_major_of(major) >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
+        known[dev] = q && major >= 8 && f1.ptxVersion >= 80 && f2.ptxVersion >= 80 && sms > 0
                          ? sms : -1;
     }
     return known[dev] > 0 ? known[dev] : 0;
