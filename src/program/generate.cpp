@@ -4140,6 +4140,8 @@ int main(int argc, char** argv) {
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
+    bool ram_short_check = false;   // warn after the top-up if the RAM still holds only part of the experts
+    uint64_t topped_up = 0;
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
@@ -4152,7 +4154,12 @@ int main(int argc, char** argv) {
         // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps + std::max(o.peer_adapt_swaps, o.adapt_swaps) : o.adapt_swaps);
-        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, lend_from, o.resident_headroom,
+        // A server also leaves room for what it allocates after this copy, before it is ready (the top-up below takes
+        // back whatever that does not use).
+        const uint64_t resident_headroom =
+            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + basalt::platform::kLateHostBytes)
+                    : o.resident_headroom;
+        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, lend_from, resident_headroom,
                                                     o.resident_budget, &profile);
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
@@ -4160,12 +4167,14 @@ int main(int argc, char** argv) {
             // path (sized by the RAM alone) instead of none: the misses outside it read the same file bytes the mmap
             // fallback reads, so the answers are unchanged.  Nothing pinned: the fallback below.
             whole_err = err;
-            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, -1, o.resident_headroom,
+            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, -1, resident_headroom,
                                                    basalt::core::FileExpertSource::kResidentWhatFits, &profile);
             if (resident_ok) {
                 std::fprintf(stderr, "basalt generate: the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
                                      "are kept in RAM\n", whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
-                if (!ssd_warned)
+                // a server tops the copy up before it is ready: it warns then, with what the RAM ended up holding
+                if (o.serve) ram_short_check = !ssd_warned;
+                else if (!ssd_warned)
                     std::fprintf(stderr, "basalt warning: RAM holds only %.1f GiB of the experts, the rest is read from "
                                          "the SSD while generating (slow)\n",
                                  (double) src.resident_bytes() / 1073741824.0);
@@ -5352,9 +5361,12 @@ int main(int argc, char** argv) {
         // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
         if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
             int64_t n_top = 0;
+            // what the engine still takes once serving: the parked conversations
+            const uint64_t later = o.prompt_cache > 0 ? (uint64_t) o.conversation_cache_mib << 20 : 0;
             const uint64_t add = src.top_up(profile, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
-            }, o.resident_pin, n_top);
+            }, o.resident_pin, n_top, later);
+            topped_up = add;
             if (add > 0) {
                 basalt::platform::watch_resident_ram(true, src.resident_bytes() + add);
                 std::fprintf(stderr, "basalt generate: RAM top-up: +%.2f GiB, %lld experts (total %.2f GiB)\n",
@@ -5362,6 +5374,11 @@ int main(int argc, char** argv) {
                              (double) (src.resident_bytes() + add) / 1073741824.0);
             }
         }
+        if (ram_short_check && src.complement_ready() &&
+            src.resident_bytes() + topped_up + (64ull << 20) < expert_total_bytes - cache_fill_bytes - peer_only_bytes)
+            std::fprintf(stderr, "basalt warning: RAM holds only %.1f GiB of the experts, the rest is read from the SSD "
+                                 "while generating (slow)\n",
+                         (double) (src.resident_bytes() + topped_up) / 1073741824.0);
         basalt::platform::stop_memory_watchdog();
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);

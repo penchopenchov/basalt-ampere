@@ -917,13 +917,14 @@ const uint8_t* FileExpertSource::host_at(uint64_t off, uint64_t bytes) const {
 }
 
 uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,
-                                  const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count) {
+                                  const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count,
+                                  uint64_t later) {
     count = 0;
     if (!complement_ready_ || top_arena_ != nullptr || !override_.empty() || !staged_.empty()) return 0;
     bool known = false;
     const uint64_t budget = basalt::platform::ram_budget(&known);
     if (!known) return 0;
-    const uint64_t guard = 256ull << 20;   // the engine's own allocations after this reading
+    const uint64_t guard = (256ull << 20) + later;   // the engine's own allocations after this reading
     const uint64_t room = budget > guard ? budget - guard : 0;
     // the experts no tier holds, hottest first, as many as fit
     std::vector<std::pair<int32_t, int32_t>> pick;

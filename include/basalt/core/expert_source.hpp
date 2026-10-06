@@ -445,9 +445,10 @@ public:
     void spare_return(int64_t layer, uint64_t off);
     /// After loading, before any reader runs: keeps more experts in RAM, in a second region placed after the first
     /// in the offset space, hottest first (`rank`) as far as available RAM less the RAM margin allows.  `skip(l, e)`
-    /// names experts a GPU holds.  Returns the bytes added (0: nothing done); `count` gets the experts.
+    /// names experts a GPU holds.  `later` is RAM still to be taken after this, kept free too.  Returns the bytes added
+    /// (0: nothing done); `count` gets the experts.
     uint64_t top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,
-                    const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count);
+                    const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count, uint64_t later = 0);
     /// Debug: whether `bytes` equal the expert's bytes in the model files.
     bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
