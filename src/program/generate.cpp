@@ -151,8 +151,7 @@ bool resident_stage_swaps(basalt::core::FileExpertSource& src, basalt::core::Exp
 }
 
 struct Options {
-    std::string pack = "pack/full";
-    std::string model;                ///< --model: a .basalt file that replaces --pack, --native, --ple-gguf, --mtp, --expert-profile
+    std::string model;                ///< --model: the .basalt file every loader reads from
     std::string dump_hc8;             ///< --dump-hc8: write the 8-bit hyper-connection copies here, then exit
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
@@ -170,8 +169,6 @@ struct Options {
     /// the head is one norm, two bf16 projections and one 794 MB GEMV, all of which can be recomputed in Python
     /// from the manifest.  If Python agrees with the engine on the same `R`, the head is right and the layers
     /// are wrong; if it disagrees, the head is wrong.  Nothing else in the engine can be split that cheaply.
-    std::string ple_gguf;              // the ORIGINAL second GGUF shard: the PLE table is not in the pack
-    bool no_ple = false;              // explicit diagnostic ablation; never a normal inference default
     bool stream_token = false;        // R2.6 experiment: ordered work on the session stream
     bool check_logits = false;        // optional full-vocabulary finite scan
     bool gr_fp32_activations = false;  // pinned CUDA single-token BF16 activation contract
@@ -202,16 +199,8 @@ struct Options {
     bool native_ple_postops = false;  // pinned PLE postprojection arithmetic
     bool native_router = false;       // pinned fused 512-expert top-10 router
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
-    std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
-    std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
-    /// Every shard of --native's model (basalt::gguf_split_paths: the metadata shard first; a missing shard is an
-    /// error) and of --native-head-gguf's (the same list unless that names another model).
-    std::vector<std::string> native_shards, native_head_shards;
-    /// The whole native arithmetic set as ONE switch (model shard 1): the combination validated for attention and
-    /// PLE plus the native indexer, never the <=256-token attention adapter.
-    std::string native_preset;
-    /// The token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py: BF16 as shipped)
-    std::string embd_gguf;
+    /// The files the source tensors are read from: the model file, which serves them as a GGUF.
+    std::vector<std::string> native_shards;
     /// How the n-gram table is read.  Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
@@ -298,14 +287,12 @@ struct Options {
     /// The PLE gather's prefetch, as an A/B arm.  Its sixteen row reads are sixteen SEPARATE page faults into a large
     /// mapping; see `ple_prefetch_enable`.
     bool no_ple_prefetch = false;
-    /// R4.2e: a `profile.bin` from `tools/make_profile.py`.  **When given, it decides residency instead of the
-    /// compulsory-miss policy**, which is the whole point: a profile ranked by routing frequency over a whole
-    /// trace is what the plan's `h = 0.6447` refers to, and compulsory-miss measured 0.4864 because it fills
-    /// with whatever the prompt touched FIRST.  Empty means no profile.
+    /// Names the model's expert profile when it carries one (the file and `#profile`); empty means none.  A profile
+    /// decides residency by routing frequency instead of by first use.
     std::string expert_profile;
-    /// --serve (opt-in): where to save what the adaptive tier learned, as a profile `--expert-profile` reads (the
-    /// resident experts first, then the routing counted since the start); on QUIT and every `expert_profile_save_min`
-    /// minutes between requests.  Empty (the default): nothing is counted or written.
+    /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
+    /// then the routing counted since the start; tools/convert.py reads it as `--profile`); on QUIT and every
+    /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
     std::string expert_profile_save;
     double expert_profile_save_min = 10.0;
     /// R4.2d: **ON by default**, because the measurement is unambiguous and the alternative is known-broken.
@@ -317,7 +304,6 @@ struct Options {
     bool gpu_stages = false;
     bool stats = false;
     bool shared_late = false;   // A/B: shared expert inside post[l] (old order)
-    bool keep_canonical = false;   // A/B: load canonical copies of natively served tensors
     bool no_token_graph = false;   // A/B: two graphs per layer instead of one per token
     bool no_fused_gr = false;   // A/B: the six-kernel native gr_read + separate gr_write
     bool no_fast_attn = false;   // A/B: gather + one-block-per-head QSA attention
@@ -367,12 +353,12 @@ struct Options {
     int batch_groups = 1;
     std::string spec_oracle;
     int spec_corrupt = 0;
-    /// The MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
+    /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
     /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the pinned arena while the
     /// CPU computes the rest (verify windows).
-    double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
+    double pcie_frac = -1.0;   ///< < 0: the default (0.55), scaled down on a slow link
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into the VRAM tier in
     /// place of the least-routed resident ones (decayed counts).  0 = static residency.
@@ -521,21 +507,15 @@ void usage() {
                  "    --alias sets the model name the API reports (default: the name stored in the file);\n"
                  "    --python defaults to .venv/bin/python in the source tree, else python3; the other arguments\n"
                  "    go to the server.  It runs in the source tree, so give paths to it as absolute ones.\n"
-                 "basalt generate (--model FILE.basalt | --pack DIR) --tokens \"1,2,3\" [options]\n"
+                 "basalt generate --model FILE.basalt --tokens \"1,2,3\" [options]\n"
                  "\n"
-                 "  --model FILE         a .basalt model file: the dense weights, experts, source tensors (embedding,\n"
-                 "                       PLE table, native projections, head), draft layer, default expert profile\n"
-                 "                       and 8-bit hyper-connection copies all come from it.  Replaces --pack,\n"
-                 "                       --native, --ple-gguf, --mtp and --expert-profile (the last two may still be\n"
-                 "                       given to use another drafter or profile); the engine's other flags apply\n"
+                 "  --model FILE         the .basalt model file (required): the dense weights, experts, source tensors\n"
+                 "                       (embedding, PLE table, native projections, head), draft layer, expert profile\n"
+                 "                       and 8-bit hyper-connection copies all come from it\n"
                  "  --dump-hc8 FILE      load as usual, write the 8-bit hyper-connection copies to FILE (the layout in\n"
                  "                       basalt/core/model_file.hpp; the converter stores it as the `hc8` section), exit\n"
-                 "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
-                 "  --ple-gguf PATH      required PLE table (original second GGUF shard); with --native, the model's\n"
-                 "                       shard that holds per_layer_token_embd.weight when not given\n"
-                 "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
                  "  --ple-io direct|mmap|ram  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD\n"
                  "                       reads, the table never enters RAM or the file cache; mmap: A/B arm;\n"
                  "                       ram: mmap with the whole table locked in RAM at start (Linux/macOS)\n"
@@ -558,7 +538,7 @@ void usage() {
                  "  --gr-native-mmvf      experimental pinned GR norm/projections; implies FP32 activations\n"
                  "  --native-bf16         experimental CUDA-oracle SSM/router/indexer BF16 projections\n"
                  "  --native-bf16-extra   experimental CUDA-oracle PLE/shared gate BF16 projections\n"
-                 "  --native-ple-key      experimental native PLE key; requires --native-dense-gguf\n"
+                 "  --native-ple-key      experimental native PLE key\n"
                  "  --native-moe-combine  experimental pinned CUDA routed/shared combination\n"
                  "  --native-gdn          experimental pinned CUDA GDN norms/gates/recurrence\n"
                  "  --native-flash-attn-short  diagnostic pinned vector attention; --max-context <=256\n"
@@ -568,14 +548,6 @@ void usage() {
                  "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"
                  "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
                  "  --cpu-oracle-q8-0     experimental pinned CPU expert quantization and dot reduction\n"
-                 "  --native SHARD1      every full-context native path at once (plan v0.3 P1): stream-token,\n"
-                 "                       GR MMVF, BF16, head, dense + PLE key, MoE combine, GDN, router, QSA,\n"
-                 "                       indexer, RoPE, PLE postops, and the CPU q8_0 contract unless the\n"
-                 "                       expert cache is on. Individual --native-* flags stay for A/B.\n"
-                 "  --native-head-gguf PATH  native Q5_K head from model shard 1; requires --stream-token\n"
-                 "  --embd-gguf PATH     the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:\n"
-                 "                       BF16 as the checkpoint ships it; mapped host memory, no VRAM)\n"
-                 "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
@@ -601,7 +573,6 @@ void usage() {
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
-                 "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from basalt-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
@@ -631,13 +602,11 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
+                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens; auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
                  "                       auto:16384 / auto:32768 allow bigger ones\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
-                 "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
-                 "                       which changes every number downstream - pass it for any real run\n"
                  "  --dump-mixed PATH    write the post-attention residual (n_embd, f32)\n"
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
                  "                       event interval includes host gaps, so run with --gpu-only-full first\n"
@@ -655,12 +624,10 @@ void usage() {
                  "  --gpu-stages         R0.9: capture the layer as three graphs (mixer / ffn+router / post)\n"
                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
-                 "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
-                 "                       tools/make_profile.py) instead of admitting on first use.\n"
                  "  --expert-profile-save P  --serve: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
-                 "                       0 = on QUIT only) between requests; start from it with --expert-profile P\n"
+                 "                       0 = on QUIT only) between requests; tools/convert.py --profile reads it\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -1168,7 +1135,6 @@ int main(int argc, char** argv) {
     std::string ppl_base, ppl_out;
     bool have_tokens = false;
     bool have_logits_stride = false;
-    bool pack_given = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -1177,7 +1143,6 @@ int main(int argc, char** argv) {
         };
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
-        else if (a == "--pack") { o.pack = next("--pack"); pack_given = true; }
         else if (a == "--model") o.model = next("--model");
         else if (a == "--dump-hc8") o.dump_hc8 = next("--dump-hc8");
         else if (a == "--tokens") {
@@ -1227,8 +1192,6 @@ int main(int argc, char** argv) {
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
-        else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
-        else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") o.ple_io = next("--ple-io");
         else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
@@ -1252,10 +1215,6 @@ int main(int argc, char** argv) {
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
-        else if (a == "--native") o.native_preset = next("--native");
-        else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
-        else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
-        else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
         else if (a == "--no-capture") o.no_capture = true;
         else if (a == "--no-pool") o.no_pool = true;
         else if (a == "--sync-every-layer") o.sync_every_layer = true;
@@ -1315,7 +1274,6 @@ int main(int argc, char** argv) {
         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
-        else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
@@ -1398,7 +1356,6 @@ int main(int argc, char** argv) {
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
-        else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
@@ -1425,7 +1382,6 @@ int main(int argc, char** argv) {
         else if (a == "--ppl-base") ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") ppl_out = next("--ppl-out");
         else if (a == "--shared-late") o.shared_late = true;
-        else if (a == "--keep-canonical") o.keep_canonical = true;
         else if (a == "--no-token-graph") o.no_token_graph = true;
         else if (a == "--no-fused-gr") o.no_fused_gr = true;
         else if (a == "--no-fast-attn") o.no_fast_attn = true;
@@ -1441,42 +1397,30 @@ int main(int argc, char** argv) {
         }
         }
     }
-    // ---- where every loader reads from: a pack directory and the other files named by flags, or one .basalt file
+    // ---- where every loader reads from: the sections of the .basalt file
+    if (o.model.empty()) {
+        std::fprintf(stderr, "basalt generate: --model FILE.basalt is required\n");
+        usage();
+        return 2;
+    }
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
-    bool mtp_from_model = false;
-    if (!o.model.empty()) {
-        if (pack_given || !o.ple_gguf.empty() || !o.native_preset.empty() || !o.native_head_gguf.empty() ||
-            !o.native_dense_gguf.empty() || !o.embd_gguf.empty()) {
-            std::fprintf(stderr, "basalt generate: --model replaces --pack, --native, --ple-gguf, --native-head-gguf, "
-                                 "--native-dense-gguf and --embd-gguf: give one or the other\n");
-            return 2;
-        }
+    {
         std::string merr;
         if (!model_file.open(o.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr)) {
             std::fprintf(stderr, "basalt generate: --model: %s\n", merr.c_str());
             return 1;
         }
         basalt::core::model_sources(model_file, srcs);
-        if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty()) {
-            std::fprintf(stderr, "basalt generate: %s lacks the dense, dense.index or experts section\n", o.model.c_str());
+        if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty() || srcs.experts_layout.empty()) {
+            std::fprintf(stderr, "basalt generate: %s lacks the dense, dense.index, experts or experts.layout section\n",
+                         o.model.c_str());
             return 1;
         }
-        o.pack = o.model;            // a label for messages; the loaders read `srcs`
-        o.native_preset = o.model;   // the source tensors are served through the GGUF view of this file
-        // the drafter and the default expert profile come with the model unless a flag names others
-        if (o.mtp.empty() && !srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) {
-            o.mtp = o.model;
-            mtp_from_model = true;
-        } else if (!o.mtp.empty()) {
-            basalt::core::mtp_dir_sources(o.mtp, srcs);
-        }
-        if (o.expert_profile.empty()) {
-            if (!srcs.profile.empty()) o.expert_profile = o.model + "#profile";
-        } else {
-            srcs.profile = basalt::core::FileRange(o.expert_profile);
-            srcs.profile_magic = true;
-        }
+        // the source tensors (embedding, PLE table, native projections, head) are served through the GGUF view of the file
+        o.native_shards = {o.model};
+        if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) o.mtp = o.model;
+        if (!srcs.profile.empty()) o.expert_profile = o.model + "#profile";
         // the 8-bit hyper-connection copies, unless this run is making them
         if (!srcs.hc8.empty() && o.dump_hc8.empty()) {
             std::map<std::string, basalt::core::Hc8Copy> table;
@@ -1486,15 +1430,9 @@ int main(int argc, char** argv) {
             }
             basalt::core::hc8_set_table(std::move(table));
         }
-    } else {
-        basalt::core::pack_dir_sources(o.pack, srcs);
-        if (!o.mtp.empty()) basalt::core::mtp_dir_sources(o.mtp, srcs);
-        if (!o.expert_profile.empty()) srcs.profile = basalt::core::FileRange(o.expert_profile);
     }
-    const basalt::core::PackFiles pack_files =
-        o.model.empty() ? basalt::core::PackFiles::dir(o.pack) : basalt::core::PackFiles::from(srcs);
-    const basalt::core::ExpertFiles expert_files =
-        o.model.empty() ? basalt::core::ExpertFiles::dir(o.pack) : basalt::core::ExpertFiles::from(srcs);
+    const basalt::core::PackFiles pack_files = basalt::core::PackFiles::from(srcs);
+    const basalt::core::ExpertFiles expert_files = basalt::core::ExpertFiles::from(srcs);
     basalt::core::set_coupled_draft(o.coupled_draft);
     basalt::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // multi-GPU: without direct access the prompt path cannot take the peer, so it keeps the single-GPU kernels
@@ -1570,7 +1508,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
-        std::fprintf(stderr, "basalt generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
+        std::fprintf(stderr, "basalt generate: --resident-cpu-experts requires --mmap-experts and a model with an expert profile\n");
         return 2;
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
@@ -1595,7 +1533,7 @@ int main(int argc, char** argv) {
     int remote_dev[3] = {1, 2, 3};
     if (multi_gpu) {
         if (o.expert_profile.empty()) {
-            std::fprintf(stderr, "basalt generate: a layer split across GPUs needs --expert-profile\n");
+            std::fprintf(stderr, "basalt generate: a layer split across GPUs needs a model with an expert profile\n");
             return 2;
         }
         // A stage's prompt path borrows from that stage's own expert cache: the loan is the tail of the stage's own
@@ -1669,63 +1607,28 @@ int main(int argc, char** argv) {
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
     basalt::core::layer_set_shared_early(!o.shared_late);
-    if (!o.native_preset.empty()) {
+    {
+        // the source tensors hold the PLE table
         try {
-            // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error.
-            o.native_shards = basalt::gguf_split_paths(o.native_preset);
-            // --ple-gguf defaults to the shard that holds the PLE table, found by name: shard 2 of the ISTA files
-            // and of Unsloth's UD-Q4_K_XL, shard 1 of Swift's
-            if (o.ple_gguf.empty() && !o.no_ple) {
-                const basalt::GgufModel model(o.native_shards);
-                size_t at = 0;
-                if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
+            const basalt::GgufModel model(o.native_shards);
+            if (model.find("per_layer_token_embd.weight") == nullptr) {
+                std::fprintf(stderr, "basalt generate: %s has no per_layer_token_embd.weight\n", o.model.c_str());
+                return 2;
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "basalt generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
+            std::fprintf(stderr, "basalt generate: %s: %s\n", o.model.c_str(), e.what());
             return 2;
         }
-        if (o.no_ple || o.ple_gguf.empty()) {
-            std::fprintf(stderr, "basalt generate: --native requires --ple-gguf (the PLE key is native too), and no "
-                                 "shard of the model holds per_layer_token_embd.weight\n");
-            return 2;
-        }
-        o.stream_token = true;
-        o.gr_native_mmvf = true;
-        o.native_bf16 = o.native_bf16_extra = true;
-        o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
-        o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
-        if (o.native_dense_gguf.empty()) {
-            // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
-            // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
-            o.native_dense_gguf = o.native_shards;
-            // a PLE-only table (tools/ple_fp8_pack.py: architecture strata-ple) holds no projections
-            bool ple_only = false;
-            try {
-                basalt::GgufFile pg(o.ple_gguf);
-                if (const basalt::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
-            } catch (const std::exception&) {}
-            if (!ple_only &&
-                std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
-                o.native_dense_gguf.push_back(o.ple_gguf);
-        }
-        // The CPU experts stay on the VNNI kernel: the llama.cpp-CPU-exact q8_0 contract costs more pool time and is not
-        // needed; `--cpu-oracle-q8-0` still selects it.
     }
+    o.stream_token = true;
+    o.gr_native_mmvf = true;
+    o.native_bf16 = o.native_bf16_extra = true;
+    o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
+    o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
+    // The CPU experts stay on the VNNI kernel: the CPU-exact q8_0 contract costs more pool time and is not needed;
+    // `--cpu-oracle-q8-0` still selects it.
     if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
         std::fprintf(stderr, "basalt generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
-        return 2;
-    }
-    if (o.no_ple && !o.ple_gguf.empty()) {
-        std::fprintf(stderr, "basalt generate: --no-ple and --ple-gguf are mutually exclusive\n");
-        return 2;
-    }
-    if (o.native_ple_postops && o.no_ple) {
-        std::fprintf(stderr, "basalt generate: --native-ple-postops requires PLE enabled\n");
-        return 2;
-    }
-    if (!o.no_ple && o.ple_gguf.empty()) {
-        std::fprintf(stderr, "basalt generate: --ple-gguf is required; --no-ple explicitly enables a diagnostic ablation\n");
         return 2;
     }
     // positions, cells and pooled-block indices are cast to int32 on the device path.
@@ -1820,21 +1723,8 @@ int main(int argc, char** argv) {
                              "session, which a layer split does not have; run them without --layer-split\n");
         return 2;
     }
-    if (!o.native_head_gguf.empty()) {
-        try {
-            o.native_head_shards = o.native_head_gguf == o.native_preset ? o.native_shards
-                                                                         : basalt::gguf_split_paths(o.native_head_gguf);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "basalt generate: --native-head-gguf %s: %s\n", o.native_head_gguf.c_str(), e.what());
-            return 2;
-        }
-    }
-    if (o.native_ple_key && (o.native_dense_gguf.empty() || o.no_ple)) {
-        std::fprintf(stderr, "basalt generate: --native-ple-key requires PLE and --native-dense-gguf\n");
-        return 2;
-    }
     if (o.cpu_oracle_q8_0 && (o.expert_cache != 0 || !o.expert_profile.empty())) {
-        std::fprintf(stderr, "basalt generate: --cpu-oracle-q8-0 cannot be combined with --expert-cache or --expert-profile until the GPU expert contract matches\n");
+        std::fprintf(stderr, "basalt generate: --cpu-oracle-q8-0 cannot be combined with --expert-cache or an expert profile until the GPU expert contract matches\n");
         return 2;
     }
 
@@ -1852,28 +1742,14 @@ int main(int argc, char** argv) {
     }
 
     std::string err;
-    if (!o.native_head_gguf.empty() && !o.stream_token) {
-        std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
-        return 2;
-    }
-    // Where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps every quantized
-    // tensor in its GGUF form, so it needs --native (the dense projections, head and embedding come from the model
-    // file) and runs its experts in verify windows only (--spec).
+    // Where the experts live.  The model keeps every quantized tensor in its GGUF form, so its experts run in verify
+    // windows only (--spec) and its dense projections, head and embedding come from the source tensors.
     {
         const basalt::core::ModelGeometry g0;
-        bool layout_ok = false;
-        if (o.model.empty()) {
-            layout_ok = basalt::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err);
-        } else {
-            std::vector<uint8_t> text;
-            // no layout section: the canonical layout
-            if (!srcs.experts_layout.empty() && !basalt::core::read_range(srcs.experts_layout, text, err)) {
-                std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-                return 1;
-            }
-            layout_ok = basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), g0.n_layers,
-                                                                      g0.n_expert, err);
-        }
+        std::vector<uint8_t> text;
+        bool layout_ok = basalt::core::read_range(srcs.experts_layout, text, err) &&
+                         basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), g0.n_layers,
+                                                                       g0.n_expert, err);
         if (!layout_ok) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
@@ -1893,7 +1769,8 @@ int main(int argc, char** argv) {
             }
         }
     }
-    const bool native_pack = basalt::kernels::cpu::expert_layout().native;
+    // The model's experts are always in their source formats: verify windows only, no per-layer graphs to replay.
+    constexpr bool native_pack = true;
     // Only CUDA1's context is created here, before the large allocations: the later helpers' come after the arena.
     for (int r = 0; r < 1; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
         // Keep CUDA1's proven startup order: initialise its context before
@@ -1906,18 +1783,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
                      remote_dev[r], free_gib);
     }
-    // The PCIe share of the missed experts, measured per kind of pack.  A x8 link carries half of what the native
-    // default assumes - the GPU's SMs read that share over the link (the copy kernel), so on a slower link it must
-    // shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the
-    // default stays.  The canonical pack's 0.2 is not tied to the link, so it is left alone.  `--calibrate` measures
-    // it outright.
+    // The PCIe share of the missed experts.  The GPU's SMs read that share over the link (the copy kernel), so on a
+    // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
+    // the default stays.
     if (o.pcie_frac < 0.0) {
-        const double base = native_pack ? 0.55 : 0.2;
+        const double base = 0.55;
         std::string bursts;
-        const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
-        if (!native_pack) {
-            o.pcie_frac = base;
-        } else if (bw > 0.0) {
+        const double bw = probe_pcie_h2d_gbps(&bursts);
+        if (bw > 0.0) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             std::fprintf(stderr, "basalt generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
@@ -1926,9 +1799,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
-    // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
-    if (!native_pack) basalt::kernels::cpu::cpu_require_expert_support();
-    else if (!basalt::kernels::cpu::cpu_avx512_ok())
+    if (!basalt::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "basalt generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
                      !basalt::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2)" : "AVX-2");
@@ -1941,13 +1812,12 @@ int main(int argc, char** argv) {
     // the struct defaults.  The empty --rope-scaling and the 0 --rope-scale mean the flag is absent, so the
     // model file decides; an explicit value - `none` and `1` included, the opt-outs - wins over the model file.
     {
-        // The model file's rope keys (llama.cpp's names under the arch prefix), when it carries any - the
-        // artifact today ships none, so this is a no-op defaults channel for future fine-tunes.
+        // The model file's rope keys (llama.cpp's names under the arch prefix), when it carries any.
         std::string gguf_rope_type;
         double gguf_rope_base = 0, gguf_rope_factor = 0, gguf_rope_orig_ctx = 0;
-        if (!o.native_preset.empty()) {
-            // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
-            // is the authority on its own MoE shape - everything else in the geometry is unchanged
+        {
+            // the model file is the authority on its own MoE shape (a pruned variant has fewer experts);
+            // everything else in the geometry is unchanged
             try {
                 basalt::GgufFile model_gguf(o.native_shards.front());   // the metadata shard
                 if (const basalt::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
@@ -1959,7 +1829,7 @@ int main(int argc, char** argv) {
                     gguf_rope_orig_ctx = v->num();
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "basalt generate: reading the model's expert shape from %s: %s\n",
-                             o.native_preset.c_str(), e.what());
+                             o.model.c_str(), e.what());
                 return 1;
             }
         }
@@ -1974,7 +1844,7 @@ int main(int argc, char** argv) {
             else if (gguf_rope_type == "yarn") rope_cfg.type = RST::YaRN;
             else if (gguf_rope_type != "none") {
                 std::fprintf(stderr, "basalt generate: %s carries rope.scaling.type '%s' - none, linear or yarn only\n",
-                             o.native_preset.c_str(), gguf_rope_type.c_str());
+                             o.model.c_str(), gguf_rope_type.c_str());
                 return 2;
             }
         }
@@ -2036,45 +1906,39 @@ int main(int argc, char** argv) {
         }
     }
     basalt::core::NativeEmbed native_embed;
-    if (native_pack) {
-        if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
-            (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
-            std::fprintf(stderr, "basalt generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
-                                 "and --prefill CHUNK\n", o.pack.c_str());
+    {
+        if (o.spec < 2 || (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
+            std::fprintf(stderr, "basalt generate: %s runs its experts in verify windows: it needs --spec T (T >= 2) "
+                                 "and --prefill CHUNK\n", o.model.c_str());
             return 2;
         }
         const basalt::core::ModelGeometry g0;
         const auto embed_t0 = std::chrono::steady_clock::now();
-        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err)) {
+        if (!native_embed.load(o.native_shards, g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
         basalt::core::set_native_embed(&native_embed);
-        std::fprintf(stderr, "basalt generate: native pack: %s experts (largest blob %.2f MB), token embedding "
+        std::fprintf(stderr, "basalt generate: %s experts (largest blob %.2f MB), token embedding "
                              "%s in mapped host memory (%.0f MiB, %.1f s)\n",
-                     o.pack.c_str(), (double) basalt::kernels::cpu::expert_layout().max_blob / 1e6,
+                     o.model.c_str(), (double) basalt::kernels::cpu::expert_layout().max_blob / 1e6,
                      basalt::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
     }
-    // Tensors served in native form are not also loaded in canonical form (VRAM back to the expert cache with
-    // --native).  `--keep-canonical` loads both.
+    // Tensors served from the source tensors are not also loaded into the weight arena.
     std::set<std::string> skip;
-    if (!o.keep_canonical) {
-        if (!o.native_dense_gguf.empty() &&
-            !basalt::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, skip, err)) {
+    {
+        if (!basalt::core::NativeDense::served_names(o.native_shards, o.native_ple_key, skip, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
-        if (!o.native_head_gguf.empty()) skip.insert("output.weight");
-        // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
-        if (!native_pack) skip.erase("blk.1.ple_key.weight");
-        // a --compat-bf16 pack (OrcaRouter IQ3_XXS) keeps its BF16 key in the arena
-        if (native_pack && !basalt::core::NativeDense::keep_unquantized_ple_key(pack_files, skip, err)) {
+        skip.insert("output.weight");
+        // a PLE key the dense index holds in BF16 stays in the arena
+        if (!basalt::core::NativeDense::keep_unquantized_ple_key(pack_files, skip, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
-        if (native_pack) skip.insert("token_embd.weight");
+        skip.insert("token_embd.weight");
     }
     // Layer split with explicit split points: every GPU holds only the dense weights of ITS layers (the PLE tensors
     // stay everywhere).  Without this each card keeps a full copy that its stage never reads - VRAM the expert cache
@@ -2145,9 +2009,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
         return 1;
     }
-    std::fprintf(stderr, "basalt generate: %llu MiB of weights loaded from %s in %.1f s (%zu canonical tensors "
-                         "skipped: served natively)\n",
-                 (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
+    std::fprintf(stderr, "basalt generate: %llu MiB of weights loaded from %s in %.1f s (%zu tensors "
+                         "skipped: served from the source tensors)\n",
+                 (unsigned long long) (pool_bytes >> 20), o.model.c_str(), load_s(), skip.size());
     if (!hc8_names.empty()) {
         // the copies the model file holds are registered as they are; the rest are quantized from their bf16 matrices,
         // staged for the purpose and dropped
@@ -2202,8 +2066,8 @@ int main(int argc, char** argv) {
     }
 
     basalt::core::NativeDense native_dense;
-    if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+    {
+        if (!native_dense.load(o.native_shards, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "basalt generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
@@ -2317,7 +2181,7 @@ int main(int argc, char** argv) {
     std::vector<float> ple_emb_host((size_t) basalt::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
-    if (!o.ple_gguf.empty()) {
+    {
         basalt::kernels::PleIoOptions pio;
         pio.mode = o.ple_io == "mmap" || o.ple_io == "ram" ? basalt::kernels::PleIo::Mmap : basalt::kernels::PleIo::Direct;
         pio.lock = o.ple_io == "ram";
@@ -2333,7 +2197,7 @@ int main(int argc, char** argv) {
             pio.keepalive_window_s = 60.0;
             if (pio.mode != basalt::kernels::PleIo::Direct || !pio.io_thread) pio.keepalive_ms = 0;
         }
-        if (!ple_table.open(o.ple_gguf, err, pio)) {
+        if (!ple_table.open(o.model, err, pio)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
@@ -2341,11 +2205,11 @@ int main(int argc, char** argv) {
             // --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational disk can take
             // longer than the stall watchdog's limit for one prompt chunk's rows.  Recommended, not forced.
             std::string dev;
-            if (on_rotational_disk(o.ple_gguf, dev) == 1)
+            if (on_rotational_disk(o.model, dev) == 1)
                 std::fprintf(stderr, "basalt generate: WARNING: the n-gram table (%s) is on a rotational disk (%s): "
                                      "--ple-io direct reads it at random and can stall a prompt for minutes. "
                                      "--ple-io ram (it then needs RAM for the table) or the model on an SSD is "
-                                     "recommended\n", o.ple_gguf.c_str(), dev.c_str());
+                                     "recommended\n", o.model.c_str(), dev.c_str());
         }
         if (pio.lock)
             std::fprintf(stderr, "basalt generate: PLE table %s (--ple-io ram) in %.1f s\n",
@@ -2364,14 +2228,13 @@ int main(int argc, char** argv) {
         const basalt::core::WeightRef* wnc = wt.find("blk.1.ple_norm_conv.weight");
         const basalt::core::WeightRef* wc = wt.find("blk.1.ple_conv1d.weight");
         if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
-            std::fprintf(stderr, "basalt generate: the pack has no blk.1.ple_* tensors, so the PLE cannot be "
-                                 "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
+            std::fprintf(stderr, "basalt generate: the model has no blk.1.ple_* tensors, so the PLE cannot be wired\n");
             return 1;
         }
         // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
         // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
         if (!wk->quantized()) {
-            // the IQ model files' BF16 key (the pack's extra.bin, raw BF16)
+            // a BF16 key
             ss.ple.w.key_bf16 = (const uint16_t*) wk->data;
         } else if (wk->data != nullptr) {
             ss.ple.w.key_codes = (const uint8_t*) wk->data;
@@ -2391,17 +2254,16 @@ int main(int argc, char** argv) {
         ss.ple.w.norm_key = (const float*) wnk->data;
         ss.ple.w.norm_query = (const float*) wnq->data;
         ss.ple.w.norm_conv = (const float*) wnc->data;
-        // The conv1d kernel reads F16, so this cast is a claim about the pack's storage.  A checkpoint that keeps the
-        // tensor F32 (Q8_0, UD-Q4_K_XL) would hand the kernel the low halves of the f32 words - not an error, a
-        // plausible wrong layer-1 routing.  tools/iq_pack.py narrows it (index kind 3); a pack that did not is refused
-        // here.  F16 is index kind 5 or 3 (F16InF32) in a native pack and kind 0 (verbatim 2-byte F16) in the canonical
-        // Q2_0 pack; BF16 (kind 4) has the same size and is not F16.
+        // The conv1d kernel reads F16, so this cast is a claim about the stored form.  A tensor kept as F32 would hand
+        // the kernel the low halves of the f32 words: a plausible wrong layer-1 routing, not an error.  The converter
+        // narrows it (index kind 3); a file that was not converted that way is refused here.  BF16 (kind 4) has the
+        // same size and is not F16.
         const bool f16 = wc->kind == basalt::core::WeightKind::F16InF32 ||
                          (wc->kind == basalt::core::WeightKind::Verbatim && wc->code_bits == 0);
         if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
-            std::fprintf(stderr, "basalt generate: blk.1.ple_conv1d.weight is not stored as F16 (pack index kind %d, "
-                                 "%llu B for %lld values); the PLE conv1d kernel reads F16 - repack with "
-                                 "tools/iq_pack.py\n",
+            std::fprintf(stderr, "basalt generate: blk.1.ple_conv1d.weight is not stored as F16 (index kind %d, "
+                                 "%llu B for %lld values); the PLE conv1d kernel reads F16 - convert the model again "
+                                 "with tools/convert.py\n",
                          (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
             return 1;
         }
@@ -2421,10 +2283,6 @@ int main(int argc, char** argv) {
         }
         ss.ple.emb_dev = ple_emb_dev;
         ss.ple.scratch = ple_scratch;
-    } else {
-        std::fprintf(stderr,
-                     "basalt generate: PLE OFF by explicit --no-ple diagnostic request.\n"
-                     "  The tokens below are NOT this model's; this is only useful for A/B measurement.\n");
     }
 
     float* d_parts = nullptr;
@@ -2451,7 +2309,7 @@ int main(int argc, char** argv) {
             const auto& lay = basalt::kernels::cpu::expert_layout();
             int64_t pairs_bytes = 0;
             for (const auto& pr : prof)
-                pairs_bytes += native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+                pairs_bytes += ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256;
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             const int64_t session = (int64_t) basalt::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
@@ -2522,7 +2380,7 @@ int main(int argc, char** argv) {
                          (unsigned long long) (total_b >> 20));
             return 1;
         }
-        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
+        if (!st.dense.load(o.native_shards, st.wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "basalt generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
             return 1;
@@ -2555,7 +2413,7 @@ int main(int argc, char** argv) {
         // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed).  A given
         // --pcie-frac is every stage's share and skips these probes (pcie_given); there is no per-stage setting yet.
         st.pcie_frac = o.pcie_frac;
-        if (!pcie_given && native_pack) {
+        if (!pcie_given) {
             std::string bursts;
             const double bw = probe_pcie_h2d_gbps(&bursts);
             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
@@ -2677,7 +2535,7 @@ int main(int argc, char** argv) {
         double total_mass = 0;
         for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
         auto cost = [&](int64_t l) -> int64_t {
-            return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+            return ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256;
         };
         // the predicted window time (ms) of a placement, and the routed mass its caches hold
         auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
@@ -2799,14 +2657,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt generate: zeroing the session state failed\n");
             return 1;
         }
-        if (!o.ple_gguf.empty()) {
-            if (!ss.ple.ready()) {
-                std::fprintf(stderr, "basalt generate: the PLE run is not ready after construction\n");
-                return 1;
-            }
-            std::fprintf(stderr, "basalt generate: PLE on, table %llu rows of %s\n",
-                         (unsigned long long) ple_table.rows(), o.ple_gguf.c_str());
+        if (!ss.ple.ready()) {
+            std::fprintf(stderr, "basalt generate: the PLE run is not ready after construction\n");
+            return 1;
         }
+        std::fprintf(stderr, "basalt generate: PLE on, table %llu rows of %s\n",
+                     (unsigned long long) ple_table.rows(), o.model.c_str());
     }
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
@@ -2820,7 +2676,7 @@ int main(int argc, char** argv) {
         const bool last = i + 1 == stages.size();
         const basalt::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
-            (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {
+            (last && !st.head.load(o.native_shards, g.n_embd, wo_s->ne1, err))) {
             std::fprintf(stderr, "basalt generate: layer split, CUDA%d head: %s%s\n", st.dev,
                          wo_s == nullptr ? "output.weight is missing" : err.c_str(),
                          wo_s == nullptr ? "" : vram_free_note().c_str());
@@ -2910,10 +2766,7 @@ int main(int argc, char** argv) {
     // refuse the draft weights after mapping tens of GiB of host pages.
     basalt::core::MtpDrafter mtp;
     if (!o.mtp.empty()) {
-        if (o.spec < 2) {
-            if (!mtp_from_model) std::fprintf(stderr, "basalt generate: --mtp is ignored without --spec T (T >= 2)\n");
-            o.mtp.clear();
-        }
+        if (o.spec < 2) o.mtp.clear();
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
@@ -2931,9 +2784,9 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "basalt generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     basalt::core::NativeHead native_head;
-    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+    if (!multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
-        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+        if (!native_head.load(o.native_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(), vram_free_note().c_str());
             return 1;
         }
@@ -2996,26 +2849,20 @@ int main(int argc, char** argv) {
         const std::string e = basalt::core::device_code_error();
         if (!e.empty()) {
             std::fprintf(stderr, "basalt generate: this engine has no code for %s (sm_%d%d): %s - rebuild it for this "
-                                 "card (setup does: START-HERE.bat --setup)\n", name, p.major, p.minor, e.c_str());
+                                 "card (build it for this GPU's architecture)\n", name, p.major, p.minor, e.c_str());
             return 1;
         }
     }
     basalt::core::ArenaExpertSource arena_src;
     basalt::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
-        // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when built
-        // with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout).  The low-RAM mode: the
-        // experts come from the file through the OS cache instead of a pinned copy in RAM, for a PC whose GPU holds
-        // most of them but whose RAM cannot hold them all.
-        // A native pack without experts.bin maps the model's GGUF shards instead (native_experts.txt's spans, checked
-        // against the files first) - no second copy of the experts on the disk
-        src.set_gguf(o.native_preset);
+        // The low-RAM mode: the experts come from the model file through the OS cache instead of a pinned copy in
+        // RAM, for a machine whose GPU holds most of them but whose RAM cannot hold them all.
         if (!src.open(expert_files.experts, g.n_layers, g.n_expert, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "basalt generate: experts via mmap (--mmap-experts; %s)\n",
-                     src.gguf_mode() ? "the GGUF shards in place, no experts.bin" : "the A/B arm of R2.1");
+        std::fprintf(stderr, "basalt generate: experts via mmap (--mmap-experts)\n");
         // with a RAM budget the hottest experts live in it, and the rest are read from the drive unbuffered when the
         // file cache could not keep them beside the budget anyway - the mapped reads' page faults are small requests
         // on the critical path, and their pages take the RAM the budget was sized for
@@ -3027,7 +2874,6 @@ int main(int argc, char** argv) {
         }
         srcp = &src;
     } else {
-        arena_src.set_gguf(o.native_preset);   // a native pack may take its experts from shard 1
         const uint64_t pin_limit = 0;   // the whole arena is pinned
         if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
@@ -3157,7 +3003,7 @@ int main(int argc, char** argv) {
     // Not with --expert-cache-per-layer - its per-layer slot ranges ignore the profile rank a sized slot was cut for,
     // so a layer's larger blob could land in a smaller slot: that mode keeps slots of the largest blob
     std::vector<int64_t> sized_slots;
-    if (native_pack && o.expert_cache > 0 && !profile.empty() && !o.expert_cache_per_layer) {
+    if (o.expert_cache > 0 && !profile.empty() && !o.expert_cache_per_layer) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const auto& lay = basalt::kernels::cpu::expert_layout();
@@ -3362,14 +3208,13 @@ int main(int argc, char** argv) {
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {
-            const int64_t b = native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+            const int64_t b = ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > room) break;
             used += b;
             sized.push_back((int64_t) lay.blob_bytes(pr.first));
         }
         if (sized.empty() ||
-            !(native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
-                          : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err))) {
+            !st.cache.open_sized(sized, g.n_layers, g.n_expert, err)) {
             std::fprintf(stderr, "basalt generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          sized.empty() ? "no room" : err.c_str());
             return 1;
@@ -3408,7 +3253,7 @@ int main(int argc, char** argv) {
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
-            std::fprintf(stderr, "basalt generate: remote experts need --expert-profile, "
+            std::fprintf(stderr, "basalt generate: remote experts need an expert profile, "
                                  "a CUDA0 expert cache and the expert pool\n");
             return 2;
         }
@@ -3494,7 +3339,7 @@ int main(int argc, char** argv) {
     basalt::core::PeerExperts peer;
     if (o.peer_device >= 1) {
         if (profile.empty() || srcp == nullptr || o.expert_cache <= 0) {
-            std::fprintf(stderr, "basalt generate: --peer-device needs --expert-profile and the expert cache\n");
+            std::fprintf(stderr, "basalt generate: --peer-device needs an expert profile and the expert cache\n");
             return 1;
         }
         const auto tp0 = Clock::now();
@@ -4333,7 +4178,7 @@ int main(int argc, char** argv) {
         if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "basalt serve: needs --spec T, --mtp DIR and --prefill CHUNK (and a fillable "
-                                 "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
+                                 "--expert-cache; the graphed hit path additionally needs an expert profile)\n");
             return 2;
         }
         basalt::prefill::Prefill sp;
@@ -5018,7 +4863,7 @@ int main(int argc, char** argv) {
         if (!o.expert_profile_save.empty() && !all_experts_resident) {
             if (drive.d.usage.empty() || host_res.empty())
                 std::fprintf(stderr, "basalt serve: --expert-profile-save needs the adaptive tier (--adapt-every and "
-                                     "--adapt-swaps above 0) and --expert-profile: nothing will be saved\n");
+                                     "--adapt-swaps above 0) and an expert profile: nothing will be saved\n");
             else
                 heat.assign(drive.d.usage.size(), 0.0);
         }
@@ -7135,9 +6980,8 @@ int main(int argc, char** argv) {
             // CS-T: the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
             if (srcp == &src)
                 std::fprintf(stderr, "basalt serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
-                                     "%.1f MB read%s\n", (long long) req_hits, (long long) src.ram_reads(),
-                             (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6,
-                             src.gguf_mode() ? " (the GGUF in place)" : "");
+                                     "%.1f MB read\n", (long long) req_hits, (long long) src.ram_reads(),
+                             (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6);
             if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 // (this device's owned ordinals; a split's other stages hold theirs)
@@ -7513,7 +7357,7 @@ int main(int argc, char** argv) {
             }
         }
         if (thits.d_res == nullptr) {
-            std::fprintf(stderr, "basalt generate: --spec needs the device residency table (--expert-profile, "
+            std::fprintf(stderr, "basalt generate: --spec needs the device residency table (an expert profile, "
                                  "--expert-cache and the token graph)\n");
             return 2;
         }
@@ -7809,10 +7653,10 @@ int main(int argc, char** argv) {
         if (srcp == &src) {  // CS-T: the RAM and file tiers (the GPU cache's share is the hit rate above)
             const double fms = src.file_ms() - fms0, fmb = (double) (src.file_blob_bytes() - fbytes0) / 1e6;
             std::printf("%-24s decode: RAM %lld blobs, files %lld blobs, %.1f MB read from the files (%.2f MB/round, "
-                        "%.1f ms/round of reading, %.2f GB/s per reading thread)%s; prompt copies %.1f MB\n",
+                        "%.1f ms/round of reading, %.2f GB/s per reading thread); prompt copies %.1f MB\n",
                         "expert tiers", (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         fmb, rounds > 0 ? fmb / rounds : 0.0, rounds > 0 ? fms / rounds : 0.0,
-                        fms > 0 ? fmb / fms : 0.0, src.gguf_mode() ? " (the GGUF in place)" : "",
+                        fms > 0 ? fmb / fms : 0.0,
                         (double) (fall0 - fbytes0) / 1e6);
             if (drive.d.lookahead != nullptr)
                 std::printf("%-24s %lld experts warmed, %lld of the file tier's %lld blob reads had been warmed (%.1f%%); "
