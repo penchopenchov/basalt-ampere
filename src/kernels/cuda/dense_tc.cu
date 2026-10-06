@@ -721,8 +721,7 @@ __device__ __forceinline__ void pair_terms_xr(float (&acc)[4], const uint8_t* ro
 // the x fragments in registers (n_in <= 3072); DB: two warp-sum buffers, one barrier per tile less
 template<bool XR, bool DB>
 __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* smem, PairMat m0, PairMat m1,
-                                                    const uint8_t* __restrict__ x, int n_in, int ncols, int probe,
-                                                    int pf) {
+                                                    const uint8_t* __restrict__ x, int n_in, int ncols, int probe) {
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
     constexpr int RB = (DB ? 2 : 1) * 8 * 16 * kMaxCols * 4;
     float* red0 = reinterpret_cast<float*>(smem + 128);   // [buffer][warp][row][column]
@@ -751,19 +750,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                      ::"r"(sb), "l"(m.w + (size_t) lt * 16 * row_bytes), "r"(bytes), "r"(bb) : "memory");
     };
-    // pf: tile i into L2 one step before its copy is issued
-    auto l2pf = [&](int i) {
-        const int tile = blk + i * nblk;
-        const bool second = tile >= nt0;
-        const PairMat& m = second ? m1 : m0;
-        const int lt = second ? tile - nt0 : tile;
-        const int row_bytes = (n_in / 256) * sb_bytes(m.type);
-        const uint32_t bytes = (uint32_t) ((min(16, m.n_out - lt * 16) * row_bytes + 15) & ~15);
-        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(m.w + (size_t) lt * 16 * row_bytes),
-                     "r"(bytes) : "memory");
-    };
     if (tid == 0) {
-        if (pf && 2 < mine) l2pf(2);
         for (int q = 0; q < 2; ++q)
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"((uint32_t) __cvta_generic_to_shared(bar + q)));
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -792,7 +779,6 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                              " selp.u32 %0, 1, 0, p;\n}" : "=r"(done) : "r"(bb), "r"(par) : "memory");
             } while (!done);
         }
-        if (pf && tid == 0 && i + 3 < mine) l2pf(i + 3);
         const uint8_t* slot = slots + (size_t) (i & 1) * slot_bytes;
         const uint8_t* rowA = slot + g * row_bytes;
         const uint8_t* rowB = slot + (g + 8) * row_bytes;
@@ -843,10 +829,10 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
 
 template<bool XR, bool DB>
 __global__ void __launch_bounds__(256) dense_tc_pair_kernel(PairMat m0, PairMat m1, const uint8_t* __restrict__ x,
-                                                            int n_in, int ncols, int probe, int pf) {
+                                                            int n_in, int ncols, int probe) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_pair_block<XR, DB>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe, pf);
+    dense_tc_pair_block<XR, DB>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -1075,7 +1061,7 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
     const int grid = ntiles < occ * sm_count() ? ntiles : occ * sm_count();
     const PairMat m0{(const uint8_t*) w0, y0, t0, n_out0}, m1{(const uint8_t*) w1, y1, t1, n_out1};
     launch_pdl(kern, dim3((unsigned) grid), dim3(256), (size_t) smem, (cudaStream_t) stream, m0, m1,
-               (const uint8_t*) x_q8_1, n_in, ncols, g_probe, g_pair & 8);
+               (const uint8_t*) x_q8_1, n_in, ncols, g_probe);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dense_tc_pair: %s\n", cudaGetErrorString(e));
