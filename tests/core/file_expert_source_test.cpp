@@ -172,6 +172,12 @@ void test_resident_lend_region() {
     require(choose_resident_keep_from(slots, 10, 100, 1) == 1, "the walk must stop at the lend region's first slot");
     require(choose_resident_keep_from(slots, 10, 100, -1) == 4, "no lend region kept slots in RAM");
     require(choose_resident_keep_from(slots, 10, 100, 9) == 4, "an out-of-range lend region kept slots in RAM");
+    bool fit = false;
+    require(choose_resident_room(slots, 10, 19, 1, 4, fit) == 3 && fit,
+            "the swaps' free places must be placed before the lent slots");
+    require(choose_resident_room(slots, 10, 15, 1, 6, fit) == 3 && !fit,
+            "free places that do not fit must leave the whole budget to the lent slots");
+    require(choose_resident_room(slots, 10, 100, 1, 0, fit) == 1 && !fit, "no free places asked for");
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
 }
 

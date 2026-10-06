@@ -150,6 +150,12 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
     return keep;
 }
 
+int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
+                             int64_t lend_from, uint64_t spare_bytes, bool& spares_fit) {
+    spares_fit = spare_bytes > 0 && base_bytes <= budget && spare_bytes <= budget - base_bytes;
+    return choose_resident_keep_from(slot_bytes, base_bytes, spares_fit ? budget - spare_bytes : budget, lend_from);
+}
+
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out) {
     if (in == out || in >= offsets.size() || out >= offsets.size() || offsets[in] == kNoCacheComplement ||
         offsets[out] != kNoCacheComplement) return false;
@@ -660,12 +666,30 @@ bool FileExpertSource::pin_cache_complement(
             return false;
         }
     }
+    // The free places after the experts (see set_spares).  A swap takes a place of its layer's blob size and gives one
+    // of the same size back, so each size keeps its own share of the n places: its layers' share, at least 8.
+    std::vector<std::pair<uint64_t, int64_t>> spare_sizes;   // (blob bytes, places)
+    uint64_t spare_bytes = 0;
+    if (spares_want_ > 0 && n_layers_ > 0) {
+        for (const uint64_t b : layer_blob_bytes_) {
+            if (b == 0) continue;
+            auto it = std::find_if(spare_sizes.begin(), spare_sizes.end(), [&](const auto& x) { return x.first == b; });
+            if (it == spare_sizes.end()) spare_sizes.emplace_back(b, 1);
+            else ++it->second;
+        }
+        for (auto& [b, n] : spare_sizes) {
+            n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
+            spare_bytes += (uint64_t) n * b;
+        }
+    }
+
     // The prompt path's lend region: its slots' experts are streamed from here during a prompt and copied back into
-    // their slots after it, so the ones that fit are kept here too (from the last slot down: a short prompt lends
-    // only the last few).  The rest keep the mapped-file fallback.
+    // their slots after it, so the ones that fit next to the free places are kept here too (from the last slot down:
+    // a short prompt lends only the last few).  The rest keep the mapped-file fallback.
     int64_t keep_from = n_slots;
     if (lend) {
-        keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
+        bool spares_fit = false;
+        keep_from = detail::choose_resident_room(slot_bytes, bytes, budget, lend_from_slot, spare_bytes, spares_fit);
         if (keep_from < 0) keep_from = n_slots;
         if (keep_from < n_slots) {
             std::vector<std::pair<int32_t, int32_t>> core;
@@ -677,25 +701,9 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
 
-    // The free places after the experts (see set_spares).  A swap takes a place of its layer's blob size and gives one
-    // of the same size back, so each size keeps its own share of the n places: its layers' share, at least 8.
     const uint64_t spare_at = bytes;
-    std::vector<std::pair<uint64_t, int64_t>> spare_sizes;   // (blob bytes, places)
-    if (bytes > 0 && spares_want_ > 0 && n_layers_ > 0) {
-        for (const uint64_t b : layer_blob_bytes_) {
-            if (b == 0) continue;
-            auto it = std::find_if(spare_sizes.begin(), spare_sizes.end(), [&](const auto& x) { return x.first == b; });
-            if (it == spare_sizes.end()) spare_sizes.emplace_back(b, 1);
-            else ++it->second;
-        }
-        uint64_t extra = 0;
-        for (auto& [b, n] : spare_sizes) {
-            n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
-            extra += (uint64_t) n * b;
-        }
-        if (bytes + extra > budget) spare_sizes.clear();   // no room for free places: swaps use exchange buffers
-        else bytes += extra;
-    }
+    if (bytes == 0 || bytes + spare_bytes > budget) spare_sizes.clear();   // no room: swaps use exchange buffers
+    else bytes += spare_bytes;
 
     void* arena = nullptr;
     const uint8_t* host = nullptr;
