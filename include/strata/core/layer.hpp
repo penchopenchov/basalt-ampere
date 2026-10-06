@@ -1,11 +1,11 @@
-// include/strata/core/layer.hpp - one GDN LAYER, composed.  P2.S5's mixer.
+// include/strata/core/layer.hpp - one GDN LAYER, composed.
 //
-// This is the first place in the engine where the kernels are COMPOSED rather than tested individually, so
-// the thing it has to get right is the ORDER and the buffers, not the arithmetic.  Every kernel it calls is
-// parity-tested on its own; what can go wrong here is a buffer sized for the wrong shape, a step done in the
-// wrong order, or a value that should have been converted and was not.
+// This is the place in the engine where the kernels are COMPOSED rather than tested individually, so the thing it has
+// to get right is the ORDER and the buffers, not the arithmetic.  Every kernel it calls is parity-tested on its own;
+// what can go wrong here is a buffer sized for the wrong shape, a step done in the wrong order, or a value that should
+// have been converted and was not.
 //
-// `ref/gdn.py::gdn_decode` is the specification, and the order below is its docstring verbatim:
+// The order below is the reference's `gdn_decode` verbatim:
 //
 //     qkv  = wqkv @ x                     (10240 = q|k|v, each a contiguous run of 128-wide heads)
 //     conv -> SiLU                        (SiLU is applied to the WHOLE conv output before the split)
@@ -13,7 +13,7 @@
 //     beta = sigmoid(wbeta @ x)
 //     gate = softplus(walpha @ x + dt) * ssm_a
 //     recurrent step
-//     y    = rms_norm(o, ssm_norm) * sigmoid(z)      <- SIGMOID for qwen4exp; qwen3.5 used SiLU
+//     y    = rms_norm(o, ssm_norm) * sigmoid(z)
 //     out  = ssm_out @ y
 //
 // FOUR THINGS IN THAT ORDER ARE EASY TO READ PAST, and each produces a plausible number:
@@ -21,15 +21,13 @@
 //   * **SiLU is applied BEFORE the split**, to the whole 10240-wide conv output.  Applying it only to q and
 //     k, or after the reshape, is the same arithmetic on different data.
 //   * **v is NOT normalised.** `l2_norm` applies to q and k only - two rows of 16 heads, not the 48 of v.
-//   * **the `/hc`-style scale on q is `1/sqrt(S)`**, applied by the CALLER because `ref/gdn.py` says the two
-//     llama.cpp paths apply it in different places.  It goes on AFTER the norm.
+//   * **the scale on q is `1/sqrt(S)`**, applied by the CALLER, after the norm.
 //   * **the state is transposed** relative to the reference: (S, h_v, S) here, (S, S, h_v) there.  That is
 //     `gdn.hpp`'s choice and it is the reason `gdn_step`'s arguments are laid out as they are.
 //
-// THE ACTIVATIONS FOLLOW THE CONTRACT, which is why three different GEMVs appear below: `attn_qkv`,
-// `attn_gate` and `ssm_out` are K-quants (Q8_K), while `ssm_alpha` and `ssm_beta` are BF16 (bf16).  Using one
-// activation format for all five would be a 0.66-1.41% error on the three that matter - measured, in
-// `s_gemv_q8k_parity` and `bf16_gemv_parity`.
+// THE ACTIVATIONS FOLLOW THE CONTRACT, which is why three different GEMVs appear below: `attn_qkv`, `attn_gate` and
+// `ssm_out` are K-quants (Q8_K), while `ssm_alpha` and `ssm_beta` are BF16 (bf16).  Using one activation format for
+// all five would be a percent-level error on the three that matter (`s_gemv_q8k_parity`, `bf16_gemv_parity`).
 #pragma once
 
 #include "strata/core/layout.hpp"
@@ -180,18 +178,18 @@ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t
 bool moe_finish(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                 const float* x, const float* parts, float* out, void* stream, std::string& err);
 
-/// Plan v0.3 P3: the two parts of `moe_finish` separately.  `moe_shared` computes the shared expert into
-/// `b.shared` and needs only `x`; `moe_combine_parts` combines `parts` with `b.weights` and `b.shared`.
-/// `moe_finish` is exactly `moe_shared` followed by `moe_combine_parts`.
+/// The two parts of `moe_finish` separately.  `moe_shared` computes the shared expert into `b.shared` and needs only
+/// `x`; `moe_combine_parts` combines `parts` with `b.weights` and `b.shared`.  `moe_finish` is exactly `moe_shared`
+/// followed by `moe_combine_parts`.
 bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,
                 const float* x, void* stream, std::string& err);
 bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
                        float* out, void* stream, std::string& err);
 
-/// Plan v0.3 P3 (default ON): the shared expert runs at the END OF `pre[l]`, after the doorbell has rung, so
-/// the GPU computes it while the host runs the CPU pool; `post[l]` then only combines.  Same kernels on the
-/// same inputs in the same stream order relative to their consumers, so the result is bitwise unchanged.
-/// Must be set before capture.  `false` restores the shared expert inside `post[l]` (A/B arm).
+/// (default ON): the shared expert runs at the END OF `pre[l]`, after the doorbell has rung, so the GPU computes it
+/// while the host runs the CPU pool; `post[l]` then only combines.  Same kernels on the same inputs in the same stream
+/// order relative to their consumers, so the result is bitwise unchanged.  Must be set before capture.  `false`
+/// restores the shared expert inside `post[l]` (A/B arm).
 void layer_set_shared_early(bool enabled);
 bool layer_shared_early();
 
@@ -206,13 +204,13 @@ bool layer_shared_early();
 struct QsaState {
     uint16_t* k_pool = nullptr;      ///< [page][kv_head][page_size][head_dim] fp16 (null in INT8 mode)
     uint16_t* v_pool = nullptr;
-    /// Plan v0.3 P7: INT8 KV (qsa_set_kv_int8). Codes [page][kv_head][page_size][head_dim], one FP16 scale per 64.
+    /// INT8 KV (qsa_set_kv_int8). Codes [page][kv_head][page_size][head_dim], one FP16 scale per 64.
     bool kv_int8 = false;
     int8_t* k_q = nullptr;
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
-    /// PR #21: Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
+    /// Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
     bool kv_q4 = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
@@ -267,9 +265,9 @@ struct QsaState {
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
 };
 
-/// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
-/// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
-/// instead of building a copy (the session builds it once, in the first QSA layer).
+/// The RoPE cos/sin table (max_cells x n_rot/2 x 2 floats) is identical in every QSA layer.  `with_rope = false` sizes a
+/// state that borrows it; `share_rope` points `st` at another state's table instead of building a copy (the session
+/// builds it once, in the first QSA layer).
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
@@ -282,13 +280,13 @@ int64_t qsa_kv_resident();
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
-/// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
-/// initializing the session; default off until gate G-C accepts it.
+/// Store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and initializing the
+/// session; default off.
 void qsa_set_kv_int8(bool enabled);
-/// INT8 K/V through the Hadamard rotation (off by default: STRATA_KV_ROT=1)
+/// INT8 K/V through the Hadamard rotation (off by default)
 void qsa_set_kv_int8_rotate(bool enabled);
 bool qsa_kv_int8();
-/// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
+/// Store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell. Not with --kv-resident.
@@ -316,23 +314,20 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
-// Event pairs around the pieces of `block_layer_pre`/`_post`, recorded per (layer, stage) and read once at the
-// end so that **NOTHING IS SYNCHRONISED DURING THE RUN** - a per-stage sync would serialise the pipeline and
-// report the serialised time.  **CAPTURED GRAPHS CANNOT USE IT**: an event record inside a stream capture is
-// silently dropped, so this is for the `--no-capture` path only.
-//
-// It exists because the engine spends ~1.047 ms per layer with the experts off while every cost model in
-// `bench/` predicts less than half that, and the gap has to be attributed before it can be attacked.
+// Event pairs around the pieces of `block_layer_pre`/`_post`, recorded per (layer, stage) and read once at the end so
+// that **NOTHING IS SYNCHRONISED DURING THE RUN** - a per-stage sync would serialise the pipeline and report the
+// serialised time.  **CAPTURED GRAPHS CANNOT USE IT**: an event record inside a stream capture is silently dropped, so
+// this is for the `--no-capture` path only.
 //   slot 0 gr_read(attn)  1 the attention block  2 gr_write(attn)  3 gr_read(ffn)  4 router
 //   slot 5 moe_finish     6 gr_write(ffn)
 bool stage_timing_enable();
 void stage_timing_name(int slot, const char* name);
 void stage_timing_report(int64_t n_layers);
-/// The same event pairs, reachable from `session.cpp`, for marks that sit OUTSIDE the captured graphs - the
-/// two `cudaGraphLaunch` calls per layer.  Those are ordinary stream operations, so an event around them is
-/// legal and is not captured, which is what lets the captured path's 1.047 ms/layer be split into the two
-/// graphs' execution and the gap the host spends between them.  Slots 16 and 17 are reserved for it; slots
-/// 0-15 are the in-layer marks and are only meaningful with `--no-capture`.
+/// The same event pairs, reachable from `session.cpp`, for marks that sit OUTSIDE the captured graphs - the two
+/// `cudaGraphLaunch` calls per layer.  Those are ordinary stream operations, so an event around them is legal and is
+/// not captured, which is what lets the captured path's time be split into the two graphs' execution and the gap the
+/// host spends between them.  Slots 16 and 17 are reserved for it; slots 0-15 are the in-layer marks and are only
+/// meaningful with `--no-capture`.
 void stage_mark_begin(int64_t layer, int slot, void* stream);
 void stage_mark_end(int64_t layer, int slot, void* stream);
 
@@ -354,11 +349,10 @@ struct QsaBuffers {
     float* attn = nullptr;         ///< n_head * head_dim
     uint16_t* attn16 = nullptr;    ///< n_head * head_dim, for a fp16-activation consumer
     /// `attn * sigmoid(gate)` in f32 and then in Q8_K - what `attn_output` ACTUALLY wants.  Its weights are
-    /// Q4_K/Q5_K/Q6_K, whose `vec_dot_type` is Q8_K, and the fp16 path is worth 0.66-1.41% against the
-    /// reference.
+    /// Q4_K/Q5_K/Q6_K, whose `vec_dot_type` is Q8_K, and the fp16 path is off against the reference.
     float* attn32 = nullptr;
     uint8_t* attn_q8k = nullptr;
-    float* attn_scratch = nullptr;   ///< plan v0.3 P3: split-K decode attention partials
+    float* attn_scratch = nullptr;   // split-K decode attention partials
 };
 
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells);
@@ -387,21 +381,18 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 
 /// THE HANDOFF: `x_f` and the miss list reach the CPU WHILE THE LAYER IS STILL RUNNING.
 ///
-/// Everything about the shape of this struct comes from two measurements, and neither was a guess:
+/// The shape of this struct comes from two requirements:
 ///
-///   * **THE WAIT MUST POLL THE DRIVER.**  Round 195: a host spin that only reads a memory location never runs
-///     the kernel - 5,907,703 spins over 500 ms and the datum flips the instant `cudaStreamSynchronize` is
-///     called and never before, because on Windows the driver BATCHES command submission and a memory-only
-///     spin gives it no reason to flush.  So `h_seq` is read AND `cudaEventQuery` is called, which is a query
-///     and not a blocking sync - P2.X3's "zero synchronization calls in the layer loop" still holds.
-///   * **THE WRITE MUST BE CAPTURABLE, AND A KERNEL IS.**  Round 199: `cudaEventRecord` inside a capture is
-///     SILENTLY DROPPED - 2 nodes for two kernels plus an event record, and the event never completed across a
-///     41 ms graph.  A mid-graph doorbell KERNEL is captured normally, and round 209 measured the host seeing a
-///     pinned handoff **0.050 ms** into a 39.8 ms graph.
+///   * **THE WAIT MUST POLL THE DRIVER.**  A host spin that only reads a memory location may never see the kernel run:
+///     the driver can BATCH command submission, and a memory-only spin gives it no reason to flush.  So `h_seq` is
+///     read AND `cudaEventQuery` is called, which is a query and not a blocking sync - there are zero synchronization
+///     calls in the layer loop.
+///   * **THE WRITE MUST BE CAPTURABLE, AND A KERNEL IS.**  `cudaEventRecord` inside a capture is SILENTLY DROPPED.  A
+///     mid-graph doorbell KERNEL is captured normally, and the host sees a pinned handoff early in the graph.
 ///
-/// The memory is MAPPED PINNED, so it has one address for the device and another for the host and both refer
-/// to the same bytes.  Pinned as well as mapped, because a pageable destination would turn the device's write
-/// into a staged copy and give back the overlap this exists for.
+/// The memory is MAPPED PINNED, so it has one address for the device and another for the host and both refer to the
+/// same bytes.  Pinned as well as mapped, because a pageable destination would turn the device's write into a staged
+/// copy and give back the overlap this exists for.
 struct Doorbell {
     int64_t n_embd = 0;
     int64_t k = 0;
@@ -410,8 +401,8 @@ struct Doorbell {
     int32_t* h_ids = nullptr;      ///< k
     float* h_weights = nullptr;    ///< k
     uint32_t* h_seq = nullptr;     ///< 1
-    /// Plan v0.3 P3 token graph: the HOST's answer.  The host writes the ring value it has served (after the
-    /// pool's output is in place); the device's `doorbell_wait` spins until the flag equals the ring.
+    /// Token graph: the HOST's answer.  The host writes the ring value it has served (after the pool's output is in
+    /// place); the device's `doorbell_wait` spins until the flag equals the ring.
     uint32_t* h_flag = nullptr;    ///< 1
     // the DEVICE's view of the same bytes
     float* d_x_f = nullptr;
@@ -438,8 +429,8 @@ struct BlockBuffers {
     float* mixed = nullptr;                   ///< n_embd: what the mixer consumes
     float* block_out = nullptr;               ///< n_embd: what a half produces
     float* inject = nullptr;                  ///< hc: `gr_read`'s per-stream injection, reused per half
-    /// Plan v0.3 P3 fused GR: the FFN half's injection lives here (the attention half's stays in `inject`),
-    /// because the fused read of one half reads the other half's injection while writing its own.
+    /// Fused GR: the FFN half's injection lives here (the attention half's stays in `inject`), because the fused read
+    /// of one half reads the other half's injection while writing its own.
     float* inject2 = nullptr;                 ///< hc
     float* gr_rs = nullptr;                   ///< hc: the fused read's per-stream 1/rms
     uint8_t* head_q8k = nullptr;              ///< `q8k_bytes(n_embd)`: the head's Q8_K activation image
@@ -458,26 +449,26 @@ struct BlockBuffers {
 
 uint64_t block_buffers_bytes(const ModelGeometry& g);
 
-/// Plan v0.3 P3: the hyper-connection read as two fused kernels with the previous half's write folded in
-/// (`strata/kernels/fused_gr.hpp`).  Requires the native MMVF contract (FP32 activations).  The residual `R`
-/// then lags by one pending write between halves; it is materialised before the layer-1 PLE and after the last
-/// layer.  Set before capture; not for the per-stage or dump measurements.
+/// The hyper-connection read as two fused kernels with the previous half's write folded in
+/// (`strata/kernels/fused_gr.hpp`).  Requires the native MMVF contract (FP32 activations).  The residual `R` then lags
+/// by one pending write between halves; it is materialised before the layer-1 PLE and after the last layer.  Set
+/// before capture; not for the per-stage or dump measurements.
 void layer_set_fused_gr(bool enabled);
 bool layer_fused_gr();
 
-/// Plan v0.3 P3/P7: QSA attention by the split-K kernel reading the KV pools directly (default ON; `false` keeps
-/// the gather + one-block-per-head kernel).  Set before capture.
+/// QSA attention by the split-K kernel reading the KV pools directly (default ON; `false` keeps the gather +
+/// one-block-per-head kernel).  Set before capture.
 void layer_set_fast_attn(bool enabled);
-/// Plan v0.3 P3: doorbell payload + ring as one kernel, QSA step staging read by a kernel from mapped memory
-/// (default ON; `false` keeps the memcpy nodes).  Set before capture.
+/// Doorbell payload + ring as one kernel, QSA step staging read by a kernel from mapped memory (default ON; `false`
+/// keeps the memcpy nodes).  Set before capture.
 void layer_set_publish_kernel(bool enabled);
-/// Plan v0.3 P3: GDN step + output norm as one coalesced kernel under the native contract (default ON).
+/// GDN step + output norm as one coalesced kernel under the native contract (default ON).
 void layer_set_fused_gdn(bool enabled);
-/// Plan v0.3 P7: QSA block scores in FP32 and a radix top-k over blocks (default ON; `false` = the FP64 row scores
-/// and the bit-serial cell top-k).  Set before capture.
+/// QSA block scores in FP32 and a radix top-k over blocks (default ON; `false` = the FP64 row scores and the
+/// bit-serial cell top-k).  Set before capture.
 void layer_set_fast_select(bool enabled);
-/// Plan v0.3 P6: whether the current decode configuration is the one the speculative verify window reproduces
-/// bit for bit (native projections, fused GR and GDN, split-K attention, block selection, native indexer).
+/// Whether the current decode configuration is the one the speculative verify window reproduces bit for bit (native
+/// projections, fused GR and GDN, split-K attention, block selection, native indexer).
 bool layer_verify_compatible(std::string& why);
 uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b);
 
@@ -486,7 +477,7 @@ uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b)
 /// THE EMBEDDING LOOKUP, done as a COLUMN DEQUANT rather than a GEMV.
 ///
 /// `token_embd.weight` is `[n_embd, n_vocab]`, so `out[i] = W[i][token]` - one column, `n_embd` values.  Running
-/// `output`-style arithmetic on a one-hot activation would produce the same numbers with 248320x the work.
+/// `output`-style arithmetic on a one-hot activation would produce the same numbers with vocabulary-times the work.
 ///
 /// **THE DECODE IS TRANSCRIBED FROM `s_gemv_q8k_split` AND MUST STAY BIT-IDENTICAL TO IT**: the code is the
 /// `CODE_BITS`-wide field, least-significant first, at bit `(i % PER_BYTE) * CODE_BITS` of byte `i / PER_BYTE`;
@@ -508,7 +499,7 @@ bool lm_head(const WeightTable& tables, const ModelGeometry& g, const BlockBuffe
 bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockBuffers& bb,
                  void* stream, std::string& err);
 
-/// THE PER-LAYER OP ORDER of `phases/phase-2-correct-engine.md` P2.S5, architecture Ă„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇÄ‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â§6.1, for ONE layer:
+/// THE PER-LAYER OP ORDER, for ONE layer:
 ///
 ///     gr_read (attn)  ->  mixer  ->  gr_write (attn)
 ///     gr_read (ffn)   ->  MoE    ->  gr_write (ffn)
@@ -519,8 +510,8 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
 ///
 /// **`parts` IS THE CALLER'S**, and that is the architecture's split rather than an omission: the routed experts
 /// are the only part of the model that does not fit in VRAM, so the CPU pool and the VRAM-resident experts fill
-/// `parts` and this function owns the two ends.  In P2.S5 everything is a miss, so a caller passes whatever the
-/// pool produced; the doorbell protocol is what lets it be produced DURING this layer rather than before it.
+/// `parts` and this function owns the two ends.  A caller passes whatever the pool produced; the doorbell protocol
+/// is what lets it be produced DURING this layer rather than before it.
 // ================================ THE PLE (LAYER 1'S PER-LAYER EMBEDDING) ================================
 //
 // **THIS MODULE EXISTED, WAS PARITY-TESTED, AND WAS NEVER CALLED - WHICH IS WHY GATE C1 FAILED.**  Layer 1 is
@@ -542,7 +533,7 @@ struct PleRun {
     /// The session's PLE state, by pointer so `block_layer_pre` needs no `SessionState`.
     const int32_t* token = nullptr;    ///< the token being decoded
     const int32_t* prev = nullptr;     ///< (2,) predecessors, OLDEST FIRST, `-1` where there is none
-    float* hist = nullptr;             ///< NG_HIST x hc_dim NORMALIZED history, row-fastest
+    float* hist = nullptr;   // NG_HIST x hc_dim NORMALIZED history, row-fastest
     /// The gathered 2560-wide row vector on the DEVICE, and the host staging it is copied from: `gather`
     /// writes HOST memory (the table is a host mapping) and the block wants the device.
     float* emb_dev = nullptr;
@@ -568,7 +559,7 @@ struct PleRun {
 /// different coat: silent, finite, and stable.
 bool ple_stage_token(const PleRun& p, void* stream, std::string& err);
 
-/// Plan v0.3 P2: `ple_stage_token` in two halves, so the SSD reads overlap other host work.
+/// `ple_stage_token` in two halves, so the SSD reads overlap other host work.
 /// `ple_issue_token` hashes the token and starts its 16 row reads; `ple_finish_token` waits for them,
 /// dequantizes and queues the upload. Both are driver-side, outside any capture, like `ple_stage_token`.
 bool ple_issue_token(const PleRun& p, std::string& err);

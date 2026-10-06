@@ -80,12 +80,10 @@ struct Planes {    const uint8_t* codes = nullptr;    const float* scales = null
 ///< null when the form has none
 };
 bool plane_ptrs(const WeightRef& r, const std::string& name, Planes& out, std::string& err) {
-// S2, S4 AND S8 ALL SPLIT THE SAME WAY.  The plane LOCATION does not depend on the code width - the three
-// sizes come from the index and are checked against the tensor below - so the guard is here to catch a
-// tensor that is not quantized at all, not to pick a decoder.  WHICH KERNEL reads the planes is the
-// caller's choice and the two differ: an S2 tensor's activation contract is Q8_0 (`s2_gemv_q8`) while a
-// K-quant's is Q8_K (`s_gemv_q8k`).  This used to accept only 4 and 8, which refused `attn_q` - a Q2_0
-// tensor and the reason the QSA layer could not be composed at all.
+// S2, S4 AND S8 ALL SPLIT THE SAME WAY.  The plane LOCATION does not depend on the code width - the three sizes come
+// from the index and are checked against the tensor below - so the guard is here to catch a tensor that is not
+// quantized at all, not to pick a decoder.  WHICH KERNEL reads the planes is the caller's choice and the two differ: an
+// S2 tensor's activation contract is Q8_0 (`s2_gemv_q8`) while a K-quant's is Q8_K (`s_gemv_q8k`).
 if (r.code_bits != 2 && r.code_bits != 4 && r.code_bits != 8) {        err = name + ": code_bits " + std::to_string(r.code_bits) + " is not an S2/S4/S8 form";        return false;    }    const uint64_t end = r.codes_bytes + r.scales_bytes + r.offset_bytes;    if (r.codes_bytes == 0 || r.scales_bytes == 0 || end != r.bytes) {        char buf[320];        std::snprintf(buf, sizeof buf,                      "%s: the planes add up to %llu B but the tensor is %llu B (codes %llu, scales %llu, "                      "offsets %llu) - what the loader recorded is not the layout that was loaded",                      name.c_str(), (unsigned long long) end, (unsigned long long) r.bytes,                      (unsigned long long) r.codes_bytes, (unsigned long long) r.scales_bytes,                      (unsigned long long) r.offset_bytes);        err = buf;        return false;    }    if (r.has_offset != (r.offset_bytes != 0)) {        err = name + ": has_offset is " + std::to_string(r.has_offset ? 1 : 0) + " but the offset plane is " +              std::to_string(r.offset_bytes) + " B";        return false;    }    const uint8_t* base = (const uint8_t*) r.data;    out.codes = base;    out.scales = (const float*) (base + r.codes_bytes);    out.offset = r.offset_bytes ? (const float*) (base + r.codes_bytes + r.scales_bytes) : nullptr;    return true;}
 constexpr int TPR = 32;
 bool native_bf16_projections = false;
@@ -98,45 +96,20 @@ void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weight
     else if (split) bf16_gemv_split(x_bf16, weights, out, n_in, n_out, TPR, stream);
     else bf16_gemv(x_bf16, weights, out, n_in, n_out, stream);
 }
-///< threads per row for the row-split GEMVs.
-/// **MEASURED, NOT ASSUMED, AND 64 IS NOT BETTER.**  `dense_pass.exe` drives the same split kernels at
-/// threads_per_row 64 and reports 248.5 GB/s, so matching it looked like free performance.  It is not:
-/// TPR=64 gives 11.75 tok/s against 32's 11.99 with experts, and 20.19 against 20.26 without - identical
-/// inside noise and marginally worse on both.  That is also what the stage table predicts, because the GEMVs
-/// are only ~16% of a token, so a few percent there cannot move the total.  Kept at 32; the sweep that would
-/// actually settle it is per-tensor, not global, and belongs with the fusion work rather than before it.
-///< threads per row for the row-split GEMVs
-/// Writes the sequence number into MAPPED PINNED memory.  A KERNEL, not cudaEventRecord - round 199 found
-/// that an event record inside a capture is silently dropped, while this is captured normally and the host can
-/// read its result MID-GRAPH.  One thread: it is a store.
-// (the ring kernel lives in src/kernels/cuda/elementwise.cu; this file is HOST code)
-/// WHICH ACTIVATION A QUANTIZED WEIGHT WANTS, AND IT IS A PROPERTY OF THE **TENSOR**, NOT OF ITS ROLE.
+// The doorbell ring kernel lives in src/kernels/cuda/elementwise.cu; this file is HOST code.
 //
-//
-// Rounds 205-215 ran `gdn_layer` and `qsa_layer` on the assumption that a name implies a family: `attn_qkv` is
-/// a K-quant, `attn_q` is Q2_0, and so on.  **The pack does not work that way.**  The same name is quantized
-/// per LAYER, and the spread is wide:
-//
-//
-//     attn_qkv     IQ4_XS x13, Q3_K x18, Q2_0 x1,  Q4_K x4      (36 GDN layers)
-///     attn_gate    Q3_K x25,  IQ4_XS x4, Q4_K x3,  Q2_0 x4
-///     attn_q       Q3_K x6,   IQ4_XS x4, Q2_0 x2                (12 QSA layers)
-//
-//
-// the activation contract fixes the rule per TYPE, and it is short:
-//
+// WHICH ACTIVATION A QUANTIZED WEIGHT WANTS is a property of the **TENSOR**, not of its role: the same name is
+// quantized per LAYER (attn_qkv: IQ4_XS, Q3_K, Q2_0, Q4_K; attn_gate: Q3_K, IQ4_XS, Q4_K, Q2_0; attn_q: Q3_K,
+// IQ4_XS, Q2_0), and the activation contract fixes the rule per TYPE:
 //
 //     code_bits == 2           ->  Q8_0,  via `quantize_q8_0` + `s2_gemv_q8`
-///     anything else quantized  ->  Q8_K,  via `quantize_q8_K` + `s_gemv_q8k_split`
+//     anything else quantized  ->  Q8_K,  via `quantize_q8_K` + `s_gemv_q8k_split`
 //
-//
-// Getting it wrong is worth 0.6-1.4% on the GEMV - a plausible vector, not a broken one - which is exactly
-/// what Gate C1 exists to find and what nothing before C1 would have.  `s_gemv_q8k`'s own guard is what caught
-/// it here (`code_bits 2 has no Q8_K contract`).
-//
+// Getting it wrong is worth a percent on the GEMV - a plausible vector, not a broken one.  `s_gemv_q8k`'s own guard
+// catches it (`code_bits 2 has no Q8_K contract`).
 //
 // `x80` and `xq8k` are the two quantized images of the SAME activation; a caller produces both once and this
-/// picks.  Producing only the one it thinks it needs is how the assumption gets baked in again.
+// picks.  Producing only the one it thinks it needs is how the assumption gets baked in.
 bool gemv_quantized(const WeightRef& w, const Planes& p, const strata::kernels::SForm& f, const uint8_t* x80, const uint8_t* xq8k,                    float* y, int64_t n_in, int64_t n_out, const std::string& name, void* stream,                    std::string& err, const float* x_f32 = nullptr, bool x_q8_1_ready = false) {
     using namespace strata::kernels;
     if (w.native_data) {
@@ -145,8 +118,8 @@ bool gemv_quantized(const WeightRef& w, const Planes& p, const strata::kernels::
             return false;
         }
         try {
-            // Plan v0.3 P3: a caller whose previous native projection quantized the SAME x into the shared
-            // scratch, with no native projection in between, passes x_q8_1_ready and the quantize is skipped.
+            // a caller whose previous native projection quantized the SAME x into the shared scratch, with no native
+            // projection in between, passes x_q8_1_ready and the quantize is skipped.
             if (!x_q8_1_ready) native_quantize_q8_1(x_f32, w.native_q8_1, (int) n_in, 1, stream);
             native_mmvq(w.native_type, w.native_data, w.native_q8_1, y,
                         (int) n_in, (int) n_out, 1, stream);
@@ -164,11 +137,10 @@ bool gemv_quantized(const WeightRef& w, const Planes& p, const strata::kernels::
 // S2 carries no offset plane and no SForm: its attributes are fixed (2 bits, group 64, bias -1), which
 // is why `s2_gemv_q8` takes neither.
 if (w.has_offset || p.offset != nullptr) {            err = name + ": an S2 form must have no offset plane";            return false;        }        if (w.group_elems != 64 || w.code_bias != -1) {            err = name + ": an S2 form must be group 64 with bias -1, this one is group " +                  std::to_string(w.group_elems) + " with bias " + std::to_string(w.code_bias);            return false;        }        s2_gemv_q8(x80, p.codes, p.scales, y, n_in, n_out, TPR, stream);        return true;    }
-// **A LEGACY 4/8-BIT FORM WANTS Q8_0, NOT Q8_K, AND `code_bits` CANNOT TELL YOU WHICH.**  This used to be
-// `code_bits == 2 ? Q8_0 : Q8_K`, which is CORRECT ONLY BY LUCK: every legacy tensor in this pack apart
-// from `ffn_down_shexp` is Q2_0, whose attributes happen to be S2's.  Q5_0 and Q5_K are both 8-bit with
-// bias -16 and differ only in `has_offset`; IQ4_NL and IQ4_XS differ in NOTHING the S-form carries.  The
-// kind therefore comes from the manifest's `source_type`, through the index (LEDGER L54/L55).
+// **A LEGACY 4/8-BIT FORM WANTS Q8_0, NOT Q8_K, AND `code_bits` CANNOT TELL YOU WHICH.**  Every legacy tensor in
+// this pack apart from `ffn_down_shexp` is Q2_0, whose attributes happen to be S2's, but Q5_0 and Q5_K are both 8-bit
+// with bias -16 and differ only in `has_offset`, and IQ4_NL and IQ4_XS differ in NOTHING the S-form carries.  The
+// kind therefore comes from the manifest's `source_type`, through the index.
 if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);        return true;    }    s_gemv_q8k_split(xq8k, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);    return true;}}
 // namespace
 void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
@@ -231,7 +203,7 @@ const float* conv_kernel = (const float*) w_conv->data;    const float* ssm_norm
 //         produced, because which one is wanted is a property of the TENSOR and the pack mixes them by
 //         layer - producing only the "right" one is how the per-role assumption gets baked back in.
 st_begin(layer, 8, stream);
-    // Plan v0.3 P3: the canonical activation images only when a canonical projection reads them.
+    // the canonical activation images only when a canonical projection reads them.
     if (!w_qkv->native_data || !w_gate->native_data) {
         quantize_q8_K(mixed, b.x_q8k, g.n_embd, stream);
         quantize_q8_0(mixed, b.x_q8_0, g.n_embd, stream);
@@ -242,8 +214,8 @@ st_begin(layer, 9, stream);    if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_
 // ---- 3. conv, then SiLU on the WHOLE conv output - before the q|k|v split, which is what
 //         `ref/gdn.py` L262 says and what makes the split a reshape rather than a copy.
 st_begin(layer, 10, stream);
-// Plan v0.3 P3: under the native contract, conv + SiLU + both L2 norms are one kernel, and alpha/beta with their
-// epilogues another (`fused_gdn.hpp`).
+// Under the native contract, conv + SiLU + both L2 norms are one kernel, and alpha/beta with their epilogues another
+// (`fused_gdn.hpp`).
 const bool fused_pre = g_fused_gdn && native_gdn_enabled() && native_bf16_projections && g.ssm_d_conv == 4 &&
                        g.ssm_state_size == 128;
 if (fused_pre) {
@@ -275,13 +247,12 @@ if (!fused_pre) try {
 // Keep the scale at that backend-specific boundary to preserve rounding order.
 if (!native_gdn_enabled()) scale_inplace(b.h, qk, 1.0f / std::sqrt((float) g.ssm_state_size), stream);
 st_end(layer, 11, stream);
-// ---- 5. beta and the gate. The weights are BF16. Native single-token CUDA MMVF
-//         consumes F32 activations; the legacy path rounds them to BF16 first.
+// ---- 5. beta and the gate. The weights are BF16. Native single-token CUDA MMVF consumes F32 activations; the legacy
+// path rounds them to BF16 first.
 //
-//         THE ROW-SPLIT FORM, and here the case is stronger than the router's: `ssm_v_heads` is **48**, so
-//         the plain one-thread-per-row form puts 48 threads on a 48-SM GPU and each walks 2,560 elements
-//         alone.  Measured 0.1072 ms each, against 0.0277 for the split - and there are two of them, in all
-//         36 GDN layers.
+// THE ROW-SPLIT FORM: `ssm_v_heads` is **48**, so the plain one-thread-per-row form puts 48 threads on 48 SMs and
+// each walks 2,560 elements alone.  The split form is several times faster, and there are two of them, in all 36
+// GDN layers.
 st_begin(layer, 12, stream);
     if (fused_pre) {
         fused_gdn_ab(mixed, (const uint16_t*) w_alpha->data, (const uint16_t*) w_beta->data, dt, ssm_a, b.gate, b.beta,
@@ -302,7 +273,7 @@ st_begin(layer, 12, stream);
     } catch (const std::exception& error) { err = v.name("gdn_gate") + ": " + error.what(); return false; }
     st_end(layer, 12, stream); st_begin(layer, 13, stream);
     GdnShapes gs{g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads};
-    // Plan v0.3 P3: with the native contract the step and the output norm are one kernel (after the z GEMV).
+    // with the native contract the step and the output norm are one kernel (after the z GEMV).
     const bool fused_gdn = g_fused_gdn && native_gdn_enabled() && g.ssm_state_size == 128;
     if (!fused_gdn) try {
         if (native_gdn_enabled()) native_gdn_step(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.o, gs, stream);
@@ -355,15 +326,12 @@ uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuff
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, void* stream, std::string& err, const Doorbell* db) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_router = v.get("ffn_gate_inp.weight");    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
 // ---- the router's activation.  The router's weight is BF16 and that is the one `ref/moe.py` singles out.
 if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
-// ---- logits = ffn_gate_inp @ bf16(x).  The weight is BF16, so this is `bf16_gemv` and not `s_gemv` -
-//      and using the fp16 activation here instead is the 8.100e-03 error that flips a selection.
+// ---- logits = ffn_gate_inp @ bf16(x).  The weight is BF16, so this is `bf16_gemv` and not `s_gemv` - and using the
+// fp16 activation here instead is an error that flips a selection.
 //
-//      **THE ROW-SPLIT VARIANT, BECAUSE THE PLAIN ONE'S PARALLELISM IS THE OUTPUT WIDTH.**  `bf16_gemv` is
-//      one thread per output row: for the router that is 512 threads over 48 SMs, each walking 2,560
-//      elements sequentially, and it measured **0.2711 ms for a 2.6 MB weight** - about 65x its
-//      memory-bound floor and the largest single item left inside the MoE after the top-10 was fixed.
-//      `bf16_gemv_split` exists for precisely this case; its own header says so.  Measured here:
-//      LEDGER L41 -> L42.
+// **THE ROW-SPLIT VARIANT, BECAUSE THE PLAIN ONE'S PARALLELISM IS THE OUTPUT WIDTH.**  `bf16_gemv` is one thread per
+// output row: for the router that is 512 threads over the SMs, each walking 2,560 elements sequentially, far from
+// the memory-bound floor.  `bf16_gemv_split` exists for precisely this case; its own header says so.
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
@@ -371,11 +339,10 @@ if (native_router_enabled() && g.n_expert == 512 && k == 10) {
     try { native_router_top10(b.logits, b.ids, b.weights, stream); }
     catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
 } else router_top10(b.logits, 1, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
-// ---- THE DOORBELL, AND IT IS THE WHOLE POINT OF THE PROTOCOL.  The routed experts' INPUT (`x`) and the
-//      miss list (`ids`, `weights`) are published to the host HERE, before anything that depends on them,
-//      so a CPU pool can start on them while the GPU keeps working.  Both the copy and the ring are
-//      captured into `G[l]` like anything else - a kernel writing mapped pinned memory, which round 209
-//      measured the host seeing 0.050 ms into a 39.8 ms graph.
+// ---- THE DOORBELL, AND IT IS THE WHOLE POINT OF THE PROTOCOL.  The routed experts' INPUT (`x`) and the miss list
+// (`ids`, `weights`) are published to the host HERE, before anything that depends on them, so a CPU pool can start
+// on them while the GPU keeps working.  Both the copy and the ring are captured into `G[l]` like anything else - a
+// kernel writing mapped pinned memory, which the host sees early in the graph.
 if (db != nullptr && g_publish_kernel) {
     strata::kernels::doorbell_publish(x, b.ids, b.weights, g.n_embd, k, db->d_x_f, db->d_ids, db->d_weights, db->d_seq,
                                       stream);
@@ -468,7 +435,7 @@ bool moe_finish(const WeightTable& tables, const ModelGeometry& g, int64_t layer
     return moe_combine_parts(g, layer, k, b, parts, out, stream, err);
 }
 bool layer_verify_compatible(std::string& why) {
-    // Plan v0.3 P6: the verify window reproduces exactly this configuration's per-token arithmetic.
+    // the verify window reproduces exactly this configuration's per-token arithmetic.
     if (!native_bf16_projections) why = "the native BF16 projections are off";
     else if (!g_fused_gr) why = "the fused hyper-connection read is off";
     else if (!g_fused_gdn || !strata::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
@@ -651,7 +618,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         uint8_t* d = nullptr;
         if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
-            // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
+            // the driver may pin only a small amount of host memory in all, which is less than a long context of
+            // 8-bit KV needs
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
                                  "WSL the driver pins only about 1 GiB in all)\n", (double) bytes / 1073741824.0,
@@ -764,20 +732,12 @@ return align_up16(n) + 256;}
 uint64_t qsa_buffers_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaBuffers& b) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    Cursor c{(uint8_t*) base};    b.x_q8k = c.take_bytes(q8k_bytes(g.n_embd));    b.x_q8_0 = c.take_bytes((uint64_t) (g.n_embd / 32) * 34);    b.x_bf16 = c.take<uint16_t>((uint64_t) g.n_embd);    b.q_full = c.take<float>((uint64_t) g.n_head * 2 * g.head_dim);    b.qcur = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.kcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.vcur = c.take<float>((uint64_t) g.n_head_kv * g.head_dim);    b.idx_raw = c.take<float>((uint64_t) g.idx_key_dim);    b.q_idx = c.take<float>((uint64_t) g.idx_q_heads * g.idx_key_dim);    b.cell_scores = c.take<float>((uint64_t) max_cells);    b.ids = c.take<int32_t>((uint64_t) cap);    b.k_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.v_scratch = c.take<uint16_t>((uint64_t) cap * g.n_head_kv * g.head_dim);    b.attn = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn16 = c.take<uint16_t>((uint64_t) g.n_head * g.head_dim);    b.attn32 = c.take<float>((uint64_t) g.n_head * g.head_dim);    b.attn_q8k = c.take_bytes(q8k_bytes(g.n_head * g.head_dim));    b.attn_scratch = c.take<float>(strata::kernels::qsa_decode_attn_scratch_floats(cap, s));    return c.used;}
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
-// **THE ENGINE SPENDS 1.047 ms PER LAYER WITH THE EXPERTS OFF, AND EVERY COST MODEL IN `bench/` PREDICTS LESS
-// THAN HALF OF THAT.**  `dense_pass.exe` puts all 302 dense GEMVs at 11.64 ms/token and the 1.377 GiB of
-// BF16/F32 weights they exclude at another ~5.9, so ~17.5 ms of the 50.25 ms captured no-pool floor is
-// accounted for and ~33 ms is not.  Arithmetic has already discounted the obvious candidates - the GDN
-// recurrence moves 6.2 MB of state per token, the QSA attention at 1,024 tokens is 75M MACs over twelve
-// layers, and `gr_norm_kernel`'s 4-block launch moves 40 KB - so the attribution has to come from the engine.
+// Event pairs are recorded per (layer, stage) and read once at the end, so **NOTHING IS SYNCHRONISED DURING THE
+// RUN** and the measurement does not perturb what it measures: a per-stage `cudaEventSynchronize` would serialise
+// the pipeline and report the serialised time.
 //
-// Event pairs are recorded per (layer, stage) and read once at the end, so **NOTHING IS SYNCHRONISED DURING
-// THE RUN** and the measurement does not perturb what it measures.  That matters here more than usual: a
-// per-stage `cudaEventSynchronize` would serialise the pipeline and report the serialised time.
-//
-// **IT CANNOT BE USED WITH CAPTURED GRAPHS.**  An event record inside a stream capture is silently dropped
-// (round 199: 2 nodes for two kernels plus an event record, and the event never completed across a 41 ms
-// graph), so this is gated on the `--no-capture` path where the layers are ordinary launches.
+// **IT CANNOT BE USED WITH CAPTURED GRAPHS.**  An event record inside a stream capture is silently dropped, so this
+// is gated on the `--no-capture` path where the layers are ordinary launches.
 constexpr int STAGE_SLOTS = 20;
 
 struct StageTimer {
@@ -879,8 +839,8 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
 // ---- resolve every tensor by name, and REFUSE rather than reading a null.  `check_layer` has already
 // asserted the shapes at load time; a missing name here is a wiring mistake.
 struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");    const WeightRef* w_attnq = v.get("attn_q.weight");    const WeightRef* w_attnk = v.get("attn_k.weight");    const WeightRef* w_attnv = v.get("attn_v.weight");    const WeightRef* w_attno = v.get("attn_output.weight");    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");    const WeightRef* w_qn = v.get("attn_q_norm.weight");    const WeightRef* w_kn = v.get("attn_k_norm.weight");    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");    const char* missing = !w_idxk ? "indexer.k_proj.weight" : !w_attnq ? "attn_q.weight"                          : !w_attnk ? "attn_k.weight" : !w_attnv ? "attn_v.weight"                          : !w_attno ? "attn_output.weight" : !w_idxq ? "indexer.q_proj.weight"                          : !w_qn ? "attn_q_norm.weight" : !w_kn ? "attn_k_norm.weight"                          : !w_iqn ? "indexer.q_norm.weight" : !w_ikn ? "indexer.k_norm.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }    if (pos < 0 || pos >= st.max_cells) {        err = "qsa_layer: pos " + std::to_string(pos) + " is outside the state's 0.." +              std::to_string(st.max_cells - 1);        return false;    }
-// THE TWO BF16 PROJECTIONS: the arena holds them re-rounded to 2 B/elem, which is what `bf16_gemv` wants.
-// Reading one as f32 would walk 2x its length inside the arena without faulting.
+// THE TWO BF16 PROJECTIONS: the arena holds them re-rounded to 2 B/elem, which is what `bf16_gemv` wants.  Reading one
+// as f32 would walk 2x its length inside the arena without faulting.
 if (w_idxk->kind != WeightKind::Bf16InF32 || w_idxq->kind != WeightKind::Bf16InF32) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }
 // ---- 1. the three activation formats, once each
 if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
@@ -924,7 +884,7 @@ if (st.kv_hybrid) {
     kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, st.step, b.kcur, b.kcur, s, stream, nullptr);   // mode 0: no host mirror
     strata::kernels::kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, st.step, b.vcur, b.vcur, s, stream, nullptr);
 } else {
-if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV_ROT=1
+if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0
     strata::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
     strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
 }
@@ -939,10 +899,9 @@ if (st.kv_q4) {
                           st.cos_tab, st.sin_tab, stream);    }
 // ---- 6. the query projection, and the HALF-SPLIT into q and gate.
 //
-// **`attn_q` IS *NOT* ALWAYS Q2_0.**  It is Q2_0 on TWO of the twelve QSA layers, Q3_K on six and IQ4_XS on
-// four, and this line used to call `s2_gemv_q8` unconditionally - so TEN of the twelve layers decoded an
-// S4 code plane with a Q8_0 activation.  Both are "a quantized activation", both produce a plausible
-// vector, and the difference is 0.6-1.4%.
+// **`attn_q` IS *NOT* ALWAYS Q2_0.**  It is Q2_0 on two of the twelve QSA layers, Q3_K on six and IQ4_XS on four, so the
+// projection must be chosen by the tensor's own form: an S4 code plane read with a Q8_0 activation would still produce
+// a plausible vector, off by a percent.
 if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g.n_head * 2 * g.head_dim,                        v.name("attn_q.weight"), stream, err, x, w_attnv->native_data && w_attnq->native_data)) return false;
 // `per_head[:, :head_dim]` - the FIRST half of each head's 2*head_dim block, copied out contiguously so
 // the norm and the rotation see whole rows.  A 2-D copy is a memcpy node, which captures (`pinned_capture`
@@ -956,7 +915,7 @@ if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim))
 // graph, and the kernels guard for the surplus.    const
 int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     if (g_fast_select) {
-        // Plan v0.3 P7: block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
+        // block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
         qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
         qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
     } else {
@@ -1022,7 +981,7 @@ void doorbell_reset(const Doorbell& db) {
 // ================================ THE TWO ENDS OF A TOKEN ================================
 bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token, float* out_dev,
                void* stream, std::string& err) {
-    if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table (IQ model files)
+    if (const NativeEmbed* ne = native_embed()) {   // the GGUF-form table (IQ model files)
         if (token < 0 || out_dev == nullptr) { err = "embed_row: invalid token or output"; return false; }
         ne->gather_one(token, out_dev, stream);
         return true;
@@ -1160,21 +1119,19 @@ static void dump_half(const BlockBuffers& bb, const ModelGeometry& g, int64_t la
 bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos,                     int32_t pos_base, const GdnBuffers& gb, const QsaState& qst, const QsaBuffers& qb,                     const MoEBuffers& mb, int64_t k, const BlockBuffers& bb, void* stream, std::string& err,                     const Doorbell* db, const PleRun* ple, int half, int stage_prefix) {
     // ================================ THE PLE, AT LAYER 1 ONLY ================================
     //
-    // **THIS IS THE CALL WHOSE ABSENCE FAILED GATE C1.**  Layer 1 carries the six `blk.1.ple_*` tensors and no
-    // other layer does; every part of the module was built and parity-tested and none of it was reachable from
-    // here.  The block's output is `hidden + gated + silu(conv)` on the RESIDUAL STACK ITSELF, so it is a
-    // residual update applied BEFORE layer 1's own `gr_read` - which is what the architecture means by the
-    // gathered rows arriving "before layer 2".
+    // Layer 1 carries the six `blk.1.ple_*` tensors and no other layer does.  The block's output is
+    // `hidden + gated + silu(conv)` on the RESIDUAL STACK ITSELF, so it is a residual update applied BEFORE layer 1's
+    // own `gr_read` - which is what the architecture means by the gathered rows arriving "before layer 2".
     //
-    // **THE HASH AND THE GATHER ARE *NOT* HERE, AND THAT IS THE WHOLE REASON `ple_stage_token` EXISTS.**  Both
-    // are HOST operations - the hash is 64-bit multiply/xor that `qwen4exp.cpp` says is host-side because "ggml
-    // has no int64 and no xor", and the table is a host mapping.  This function is CAPTURED, so anything host
-    // side in it runs ONCE, at capture time, and the graph then replays that result for every token: the engine
-    // would gather the capture-time token's rows forever and produce a perfectly finite, perfectly stable,
-    // completely wrong answer.  It is the same bug as the doorbell's cloned literal, and it is silent.
+    // **THE HASH AND THE GATHER ARE *NOT* HERE, AND THAT IS THE WHOLE REASON `ple_stage_token` EXISTS.**  Both are
+    // HOST operations - the hash is a 64-bit multiply/xor that is host-side because "ggml has no int64 and no xor",
+    // and the table is a host mapping.  This function is CAPTURED, so anything host side in it runs ONCE, at capture
+    // time, and the graph then replays that result for every token: the engine would gather the capture-time token's
+    // rows forever and produce a perfectly finite, perfectly stable, completely wrong answer.  It is the same bug as
+    // the doorbell's cloned literal, and it is silent.
     //
-    // So the driver calls `ple_stage_token` once per token, BEFORE the graphs, and what is captured here is only
-    // the device half: `ple_block` reading `emb_dev`, and the history shift.
+    // So the driver calls `ple_stage_token` once per token, BEFORE the graphs, and what is captured here is only the
+    // device half: `ple_block` reading `emb_dev`, and the history shift.
     const bool fused = g_fused_gr && stage_prefix == 0 && half == 0 &&
                        strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
     // layer-1's FFN write has not been applied to R yet - unless a control vector follows it, which needs R
@@ -1187,9 +1144,8 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
         }
         const int64_t hcd = strata::kernels::NG_HC_DIM;
         strata::kernels::PleOut po;
-        // Exports must not alias the block's internal workspace. The previous diagnostic views used a
-        // different layout inside that workspace: exporting gated values overwrote normalized values
-        // before the latter were copied to history. Allocate only the one export the recurrence needs.
+        // Exports must not alias the block's internal workspace: exporting gated values would overwrite normalized
+        // values before the latter were copied to history.  Allocate only the one export the recurrence needs.
         po.normalized = (float*) ((uint8_t*) ple->scratch + strata::kernels::ple_block_scratch_bytes());
         // `result` IS THE RESIDUAL, in place: the block computes `hidden[i] + gated[i] + conv[i]` elementwise,
         // so reading and writing `R` at the same index is well-defined.
@@ -1203,12 +1159,11 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
 
         // ---- AND THE HISTORY ADVANCES, ONCE PER TOKEN, WHICH IS WHAT MAKES IT A CONV HISTORY.
         //
-        // `ple_block` deliberately does NOT write back to the history - "the caller keeps ownership of its
-        // state and this stays a pure function of its inputs, which is what makes the chunked-versus-single-shot
-        // property testable" - so the shift is here.  The layout is ROW-FASTEST (`hist[row + NG_HIST*channel]`,
-        // from `ggml_reshape_3d(state, d_conv-1, conv_channels, n_seqs)`), so a row shift is a STRIDED copy of
-        // NG_HIST-1 elements per channel and an append is a strided copy of one - not a flat memmove, which
-        // would be the natural reading and would scramble the channels.
+        // `ple_block` deliberately does NOT write back to the history - the caller keeps ownership of its state and
+        // this stays a pure function of its inputs, which is what makes the chunked-versus-single-shot property
+        // testable - so the shift is here.  The layout is ROW-FASTEST (`hist[row + NG_HIST*channel]`), so a row shift
+        // is a STRIDED copy of NG_HIST-1 elements per channel and an append is a strided copy of one - not a flat
+        // memmove, which would be the natural reading and would scramble the channels.
         strata::kernels::ple_history_advance(ple->hist, po.normalized, stream);
         if (cudaPeekAtLastError() != cudaSuccess) {
             err = "block_layer_pre: the PLE history shift failed";
@@ -1219,8 +1174,8 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
 // ---- the two halves' GR tensors.  Both halves have the same four names with a different prefix, and the
 // prefix is the ONLY thing that distinguishes them - so it is built rather than written twice.
 const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
-// The GR weights are BF16 and the arena holds them re-rounded to 2 B/elem.  `gr_read` wants exactly
-// that; handing it f32 bytes would walk 2x the tensor inside the arena without faulting.
+// The GR weights are BF16 and the arena holds them re-rounded to 2 B/elem.  `gr_read` wants exactly that; handing it
+// f32 bytes would walk 2x the tensor inside the arena without faulting.
 if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
 // ---- half 1: the mixer
 float* R = bb.R;
@@ -1270,7 +1225,7 @@ st_begin(layer, 3, stream);
     st_end(layer, 3, stream);        }
     if (run4) {
     st_begin(layer, 4, stream);    {        const bool ok = moe_route(tables, g, layer, k, mb, bb.mixed, stream, err, db);        st_end(layer, 4, stream);        if (!ok) return false;    }
-    // Plan v0.3 P3: after the ring, so the GPU computes the shared expert while the host runs the pool.
+    // after the ring, so the GPU computes the shared expert while the host runs the pool.
     if (g_shared_early && !moe_shared(tables, g, layer, mb, bb.mixed, stream, err)) return false;
     }
     // Every stage this call was asked to run has run.  There is no other way out: the old `return ok;`
