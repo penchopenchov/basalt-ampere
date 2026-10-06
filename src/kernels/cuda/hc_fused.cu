@@ -8,6 +8,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 
 #include <cooperative_groups.h>
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -59,14 +60,17 @@ constexpr int CN_ND = CN_G * CN_HS + CN_HS;    // items: w_down's, then w_inject
 constexpr int CN_ROWS = LR + HC;               // dot products per (token, half-stream): w_down's rows, then w_inject's
 constexpr int CN_SB = CN_W / 32 * 2;           // scale bytes per row and half-stream
 constexpr int CN_WB = CN_RG * CN_W;            // weight bytes in shared memory
-constexpr int CN_XOFF = CN_WB + CN_RG * CN_SB; // x after the weights and scales
+constexpr int CN_SWB = 4 * CN_SB;              // scale bytes per warp's four rows
+constexpr int CN_SWT = 384;                    // tensor copies: a warp's scales on their own 128-byte aligned run
+constexpr int CN_XOFF = CN_WB + WARPS * CN_SWT; // x after the weights and scales
 constexpr int CN_MIN_NU = N / 32;              // up slices of 32 columns at most
 constexpr int CN_MAXCOPY = 8;                  // copies of the sums: the up items read different copies (L2 load spread)
 constexpr int CN_PART = MAXT * CN_HS * CN_ROWS;   // floats per copy of the dot products
 constexpr int CN_SSN = MAXT * CN_HS;              // floats per copy of the sums of squares
-static_assert(LR % CN_RG == 0 && CN_W % 256 == 0 && CN_XOFF % 16 == 0, "cn geometry");
+static_assert(LR % CN_RG == 0 && CN_W % 256 == 0 && CN_XOFF % 16 == 0 && CN_SWT >= CN_SWB && CN_SWT % 128 == 0 &&
+              CN_WB % 128 == 0 && (4 * CN_W) % 128 == 0, "cn geometry");
 static_assert(CN_XOFF + MAXT * CN_W * 4 <= SMEM, "cn item fits");
-static_assert(32 * (4 * LR + 16) + 16 + 4 * 32 * 16 * 2 + (MAXT * (LR + 8) + 3 * MAXT * 4 * 32) * 4 + 10240 + 3 * (2 * 512 + 20) * 4 <= SMEM,
+static_assert(32 * (4 * LR + 16) + 128 + 4 * 32 * 16 * 2 + (MAXT * (LR + 8) + 3 * MAXT * 4 * 32) * 4 + 10240 + 3 * (2 * 512 + 20) * 4 <= SMEM,
               "an 8-bit mma up slice of 32 columns with its B fragments and the top-10's dry run");
 
 // One q8_1 block (iq_kernels.cu's block_q8_1) and its q8_1_store: lane i holds value i of block ib.
@@ -121,6 +125,10 @@ struct HcLaunch {
     int bf;          // 1: the 8-bit mma up pass's B fragments formed once per item (hc_up_main_mma8's BF); 2: and HI1
     int cn_upw;      // cn: w_down warps whose rows are in before the up items request w_up (of CN_G * CN_HS * WARPS)
     int cn_copies;   // cn: copies of the sums (up item u reads copy u % cn_copies)
+    int tma;         // cn: 1 = each warp's rows by two tensor copies (tm[0..3]); 2 = the item's rows by one thread's
+                     // tensor copies (tm[4..5], w_inject's by tm[2..3])
+    int up_tma;      // 1: the 8-bit mma up slices by two tensor copies (tm[6..7], hc_up_tma)
+    CUtensorMap tm[8];   // q_down, s_down, q_inject, s_inject by four rows; q_down, s_down by CN_RG rows; q_up, s_up
 };
 
 // ---------------------------------------------------------------- primitives
@@ -157,6 +165,22 @@ __device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
 __device__ __forceinline__ void bulk_g2s(void* dst, const void* src, unsigned bytes, uint64_t* bar) {
     asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                  ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
+}
+// A 2D tensor copy (box of the map) at element coordinates (x, y) into shared memory, completing on bar.
+__device__ __forceinline__ void tma_2d(void* dst, const CUtensorMap* map, int x, int y, uint64_t* bar) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                 ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(smem_u32(bar))
+                 : "memory");
+}
+__device__ __forceinline__ void tma_3d(void* dst, const CUtensorMap* map, int x, int y, int z, uint64_t* bar) {
+    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];"
+                 ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(z), "r"(smem_u32(bar))
+                 : "memory");
+}
+__device__ __forceinline__ void tma_4d(void* dst, const CUtensorMap* map, int x, int y, int z, int w, uint64_t* bar) {
+    asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4, %5}], [%6];"
+                 ::"r"(smem_u32(dst)), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_u32(bar))
+                 : "memory");
 }
 __device__ __forceinline__ void prefetch_l2(const void* p, size_t bytes) {   // 16-byte aligned, multiple of 16
     const char* c = (const char*) p;
@@ -669,11 +693,36 @@ __device__ __forceinline__ CnRows cn_rows(const HcFusedArgs& a, int d) {
 }
 // Warp w's rows [4 w, 4 w + 4) (weights and scales of the half-stream) into shared memory on bars[w]; warps past the
 // rows arrive alone.  False: no rows (no w_inject) or `cp`, the barriers untouched.  `cp`: by the warp's own cp.async
-// (cn_dot waits on them) instead of bulk copies.
-__device__ bool cn_issue(const HcFusedArgs& a, int d, int tid, char* smem, uint64_t* bars, bool cp) {
+// (cn_dot waits on them) instead of bulk copies.  `tm` (tma 1): two tensor copies per warp, its scales at CN_SWT per
+// warp; (tma 2): thread 0 copies every row of a w_down item on bars[0] (cn_dot then waits on bars[0] only).
+__device__ bool cn_issue(const HcFusedArgs& a, int d, int tid, char* smem, uint64_t* bars, bool cp, int tma = 0,
+                         const CUtensorMap* tm = nullptr) {
     const CnRows w = cn_rows(a, d);
     if (w.q == nullptr) return false;
     const int warp = tid >> 5, lane = tid & 31;
+    if (tma == 2 && w.row0 < LR) {
+        if (tid == 0) {
+            mbar_expect_tx(&bars[0], CN_RG * (CN_W + CN_SB));
+            tma_2d(smem, &tm[4], w.hs * (CN_W / 8), w.row0, &bars[0]);
+            tma_2d(smem + CN_WB, &tm[5], w.hs * (CN_W / G8), w.row0, &bars[0]);
+        }
+        return true;
+    }
+    if (tma) {
+        if (4 * warp >= w.nrows) {
+            if (lane == 0 && tma == 1) mbar_arrive(&bars[warp]);
+            return true;
+        }
+        if (lane == 0) {
+            const CUtensorMap* m = w.row0 < LR ? &tm[0] : &tm[2];
+            const int y = (w.row0 < LR ? w.row0 : 0) + 4 * warp;
+            uint64_t* bar = &bars[tma == 2 ? 0 : warp];
+            mbar_expect_tx(bar, 4 * (CN_W + CN_SB));
+            tma_2d(smem + 4 * warp * CN_W, m, w.hs * (CN_W / 8), y, bar);
+            tma_2d(smem + CN_WB + warp * (tma == 2 ? CN_SWB : CN_SWT), m + 1, w.hs * (CN_W / G8), y, bar);
+        }
+        return true;
+    }
     if (cp) {
         if (4 * warp >= w.nrows) return false;
         constexpr int RW = CN_W / 16, RS = CN_SB / 16;   // 16-byte pieces per row: weights, scales
@@ -755,17 +804,19 @@ __device__ void cn_x(const HcFusedArgs& a, int hs, int tid, char* smem, float* p
 // Warp w: rows 4 w .. 4 w + 3 against every token, lane L taking chunks L + 32 q, q ascending (one scale per chunk's dot
 // product, as hc_down8_main); the sums of all (row, token) pairs reduced 16 at a time.
 // `landed`: one count per warp of a w_down item once its rows are in (the up items' w_up copies wait on it).
+// `tma`: cn_issue's mode (the scales' layout and barrier).
 template <int T>
 __device__ void cn_dot(const CnRows& w, int tid, const char* smem, uint64_t* bars, unsigned ph, float* cnp,
-                       unsigned* landed, bool cp, int ncopy) {
+                       unsigned* landed, bool cp, int ncopy, int tma = 0) {
     const int warp = tid >> 5, lane = tid & 31;
     if (4 * warp >= w.nrows) return;
     if (cp) {
         cp_async_wait<0>();
         __syncwarp();
     } else {
-        mbar_wait(&bars[warp], ph);
+        mbar_wait(&bars[tma == 2 ? 0 : warp], ph);
     }
+    const int soff = CN_WB + warp * (tma == 1 ? CN_SWT : CN_SWB);
     if (lane == 0 && w.row0 < LR) atomicAdd(landed, 1u);
     const float4* X = reinterpret_cast<const float4*>(smem + CN_XOFF);
     float acc[4 * T];
@@ -785,7 +836,7 @@ __device__ void cn_dot(const CnRows& w, int tid, const char* smem, uint64_t* bar
             const int row = 4 * warp + r;
             const uint2 wq = *reinterpret_cast<const uint2*>(smem + row * CN_W + j * 8);
             const float4 w0 = i8x4_f(wq.x), w1 = i8x4_f(wq.y);
-            const float sc = h2f(reinterpret_cast<const uint16_t*>(smem + CN_WB + row * CN_SB)[j >> 2]);
+            const float sc = h2f(reinterpret_cast<const uint16_t*>(smem + soff + r * CN_SB)[j >> 2]);
 #pragma unroll
             for (int k = 0; k < T; ++k) acc[r * T + k] = fmaf(sc, dot8ff(w0, w1, x0[k], x1[k]), acc[r * T + k]);
         }
@@ -1092,14 +1143,28 @@ struct UpSmem {
     float *lo, *rp, *px, *g;
     uint16_t* sc;
 };
+// The 8-bit slice as one tensor copy (STRATA_DEC_HC3 & 4, hc_up_tma): 16-byte k-chunk c of row slot r = 32 stream + col
+// at c * UPCM_CH + 16 r (eight consecutive slots are one conflict-free ldmatrix matrix); scales at slot * SU8.
+constexpr int UPCM_SL = 32;                    // row slots per stream
+constexpr int UPCM_CH = HC * UPCM_SL * 16;     // bytes per k-chunk
+constexpr int UPCM = LR / 16 * UPCM_CH;        // the slice's bytes
+__device__ __forceinline__ int up_w8_bytes(int nc) { return nc * UPGB8 > UPCM ? nc * UPGB8 : UPCM; }
 __device__ __forceinline__ UpSmem up_smem(char* smem, int nc, int T, bool mma = false, bool q8 = false) {
     UpSmem u;
-    u.lo = reinterpret_cast<float*>(smem + (size_t) (mma ? nc * (q8 ? UPGB8 : UPGB) : 4 * nc * LR * 2));
+    u.lo = reinterpret_cast<float*>(smem + (size_t) (mma ? (q8 ? up_w8_bytes(nc) : nc * UPGB) : 4 * nc * LR * 2));
     u.rp = u.lo + T * (mma ? LOS : LR);
     u.px = u.rp + T * HC * nc;
     u.g = u.px + T * HC * nc;
-    u.sc = reinterpret_cast<uint16_t*>((reinterpret_cast<uintptr_t>(u.g + T * HC * nc) + 15) & ~(uintptr_t) 15);
+    u.sc = reinterpret_cast<uint16_t*>((reinterpret_cast<uintptr_t>(u.g + T * HC * nc) + 127) & ~(uintptr_t) 127);
     return u;
+}
+
+// Thread 0: the slice's 8-bit rows (32 slots per stream from column c0; slots past the slice hold other columns or
+// zeros) and their scales in up_smem's chunk layout, completing on bar.
+__device__ void hc_up_tma(UpSlice sl, char* smem, uint16_t* sc, const CUtensorMap* tm, uint64_t* bar) {
+    mbar_expect_tx(bar, UPCM + HC * UPCM_SL * SU8 * 2);
+    tma_4d(smem, &tm[0], 0, sl.c0, 0, 0, bar);
+    tma_3d(sc, &tm[1], 0, sl.c0, 0, bar);
 }
 
 // Before the down projection is done: R' (fused_gr.cu gr_up_multi_kernel's fmaf) and R' * w_norm for the slice.
@@ -1342,7 +1407,7 @@ __device__ __forceinline__ void split_f16(float a, float b, uint32_t& hi, uint32
 template <int T, bool BF = false, bool HI1 = false>
 __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char* smem, unsigned long long* dbg, int b,
                                 const float* cnp = nullptr, const float* cns = nullptr, bool out = false,
-                                uint16_t* bf = nullptr) {
+                                uint16_t* bf = nullptr, bool cm = false) {
     static_assert(T <= 8, "one mma column per token");
     const int lane = tid & 31, warp = tid >> 5, nc = sl.nc, c0 = sl.c0, g = lane >> 2, t4 = lane & 3;
     const UpSmem u = up_smem(smem, nc, T, true, true);
@@ -1367,18 +1432,37 @@ __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char*
         for (int c = 0; c < HC; ++c) rsr[j][c] = 2 * t4 + j < T ? s_rsv8[(2 * t4 + j) * HC + c] : 0.0f;
     stamp(dbg, b, 9, tid);
     const int rows = HC * nc;
-    if (BF && up_tile_row(warp, 0) < rows) {
-        const int ar = min(up_tile_row(warp, lane & 15), rows - 1);
-        const unsigned addr = smem_u32(smem + up_row_off8(ar) + (lane >> 4) * 16);
+    // cm: the slice in hc_up_tma's layout, warp w on slots 16 w .. 16 w + 15
+    const int ks = cm ? 2 * UPCM_CH : 32;   // bytes per k-step
+    const auto a_addr = [&]() {
+        return cm ? smem_u32(smem + (lane >> 4) * UPCM_CH + (16 * warp + (lane & 15)) * 16)
+                  : smem_u32(smem + up_row_off8(min(up_tile_row(warp, lane & 15), rows - 1)) + (lane >> 4) * 16);
+    };
+    const auto sc_row = [&](int i) { return u.sc + (cm ? 16 * warp + i : min(up_tile_row(warp, i), rows - 1)) * SU8; };
+    // the output row of m-index i: false when none
+    const auto out_row = [&](int i, int& c, int& dd) {
+        if (cm) {
+            const int sl8 = 16 * warp + i;
+            c = sl8 / UPCM_SL;
+            dd = sl8 - c * UPCM_SL;
+            return dd < nc;
+        }
+        const int r = up_tile_row(warp, i);
+        c = r / nc;
+        dd = r - c * nc;
+        return r < rows;
+    };
+    if (BF && (cm || up_tile_row(warp, 0) < rows)) {
+        const unsigned addr = a_addr();
         const uint4* B = reinterpret_cast<const uint4*>(bf) + lane;
-        const uint16_t* sc0 = u.sc + min(up_tile_row(warp, g), rows - 1) * SU8;
-        const uint16_t* sc1 = u.sc + min(up_tile_row(warp, g + 8), rows - 1) * SU8;
+        const uint16_t* sc0 = sc_row(g);
+        const uint16_t* sc1 = sc_row(g + 8);
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int s = 0; s < NG8; ++s) {
             uint32_t q[4];
             asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                : "=r"(q[0]), "=r"(q[1]), "=r"(q[2]), "=r"(q[3]) : "r"(addr + s * 32));
+                : "=r"(q[0]), "=r"(q[1]), "=r"(q[2]), "=r"(q[3]) : "r"(addr + s * ks));
             float gh[4] = {0.f, 0.f, 0.f, 0.f}, gl[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -1397,27 +1481,27 @@ __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char*
         stamp(dbg, b, 13, tid);   // warp 0's k-steps done
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int k = 2 * t4 + (j & 1), r = up_tile_row(warp, g + 8 * (j >> 1));
-            if (k >= T || r >= rows) continue;
-            const int c = r / nc, dd = r - c * nc, idx = (k * HC + c) * nc + dd;
+            const int k = 2 * t4 + (j & 1);
+            int c, dd;
+            if (!out_row(g + 8 * (j >> 1), c, dd) || k >= T) continue;
+            const int idx = (k * HC + c) * nc + dd;
             float rsc = rsr[j & 1][0];
 #pragma unroll
             for (int cc = 1; cc < HC; ++cc) rsc = c == cc ? rsr[j & 1][cc] : rsc;
             const float x = u.px[idx] * rsc;
             u.g[idx] = x * sigmoidf_(acc[j]);
         }
-    } else if (!BF && up_tile_row(warp, 0) < rows) {
-        const int ar = min(up_tile_row(warp, lane & 15), rows - 1);
-        const unsigned addr = smem_u32(smem + up_row_off8(ar) + (lane >> 4) * 16);
+    } else if (!BF && (cm || up_tile_row(warp, 0) < rows)) {
+        const unsigned addr = a_addr();
         const float* lb = u.lo + (g < T ? g : 0) * LOS + 4 * t4;
-        const uint16_t* sc0 = u.sc + min(up_tile_row(warp, g), rows - 1) * SU8;
-        const uint16_t* sc1 = u.sc + min(up_tile_row(warp, g + 8), rows - 1) * SU8;
+        const uint16_t* sc0 = sc_row(g);
+        const uint16_t* sc1 = sc_row(g + 8);
         float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int s = 0; s < NG8; ++s) {
             uint32_t q[4];
             asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                : "=r"(q[0]), "=r"(q[1]), "=r"(q[2]), "=r"(q[3]) : "r"(addr + s * 32));
+                : "=r"(q[0]), "=r"(q[1]), "=r"(q[2]), "=r"(q[3]) : "r"(addr + s * ks));
             float gh[4] = {0.f, 0.f, 0.f, 0.f}, gl[4] = {0.f, 0.f, 0.f, 0.f};   // the group's hi and lo chains
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -1439,9 +1523,10 @@ __device__ void hc_up_main_mma8(const HcFusedArgs& a, UpSlice sl, int tid, char*
         }
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int k = 2 * t4 + (j & 1), r = up_tile_row(warp, g + 8 * (j >> 1));
-            if (k >= T || r >= rows) continue;
-            const int c = r / nc, dd = r - c * nc, idx = (k * HC + c) * nc + dd;
+            const int k = 2 * t4 + (j & 1);
+            int c, dd;
+            if (!out_row(g + 8 * (j >> 1), c, dd) || k >= T) continue;
+            const int idx = (k * HC + c) * nc + dd;
             float rsc = rsr[j & 1][0];
 #pragma unroll
             for (int cc = 1; cc < HC; ++cc) rsc = c == cc ? rsr[j & 1][cc] : rsc;
@@ -1773,14 +1858,14 @@ constexpr int CAND_WORDS = 2 * NE + 2 * KT;   // hc_top10's shared memory per wa
 // Shared memory bytes an up item of nc columns uses (w_up rows, then UpSmem).
 template <int T>
 __device__ __forceinline__ int up_smem_bytes(int nc, bool mma = false, bool q8 = false) {
-    const int sc = q8 ? 16 + 4 * nc * SU8 * 2 : 0;
-    return sc + (mma ? nc * (q8 ? UPGB8 : UPGB) + (T * LOS + 3 * T * HC * nc) * 4
+    const int sc = q8 ? 128 + 4 * UPCM_SL * SU8 * 2 : 0;
+    return sc + (mma ? (q8 ? up_w8_bytes(nc) : nc * UPGB) + (T * LOS + 3 * T * HC * nc) * 4
                      : 4 * nc * LR * 2 + (T * LR + 3 * T * HC * nc) * 4);
 }
 
 // Q8: the matrices from the 8-bit copies (HcFusedArgs::q_*).
 template <int T, bool Q8>
-__global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
+__global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_constant__ HcLaunch L) {
     extern __shared__ __align__(128) char smem[];
     __shared__ __align__(8) uint64_t bars[UP_PIECES + 1];   // the w_up pieces, the router rows
     __shared__ __align__(8) uint64_t dbars[Q8 ? NSTAGE + 1 : 1];   // 8-bit down stages, their scales
@@ -1810,7 +1895,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
     bool cn_bars = false;  // cn: the staged item uses dbars
     bool warm = false;     // this CTA ran the top-10's code once
     if (cn && item >= it.down && item < it.up) {   // cn: the item's weights do not depend on the previous kernel
-        if constexpr (Q8) cn_bars = cn_issue(a, item - it.down, tid, smem, dbars, L.cn & 2);
+        if constexpr (Q8) cn_bars = cn_issue(a, item - it.down, tid, smem, dbars, L.cn & 2, L.tma, L.tm);
         staged = true;
     }
     if (L.early) {
@@ -1840,12 +1925,12 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             const int d = item - it.down;
             if (dbg != nullptr && tid == 0) dbg[b * 16 + 15] = 1;
             if constexpr (Q8) {
-                if (!staged) cn_bars = cn_issue(a, d, tid, smem, dbars, L.cn & 2);
+                if (!staged) cn_bars = cn_issue(a, d, tid, smem, dbars, L.cn & 2, L.tma, L.tm);
                 const CnRows w = cn_rows(a, d);
                 if (w.q != nullptr) {
                     cn_x<T>(a, w.hs, tid, smem, s_ssp, L.cns, d < CN_HS, L.cn_copies);
                     stamp(dbg, b, 2, tid);
-                    cn_dot<T>(w, tid, smem, dbars, dn_ph, L.cnp, &sy->nload.v, L.cn & 2, L.cn_copies);
+                    cn_dot<T>(w, tid, smem, dbars, dn_ph, L.cnp, &sy->nload.v, L.cn & 2, L.cn_copies, L.tma);
                 }
                 if (cn_bars) dn_ph ^= 1u;
             }
@@ -1887,8 +1972,10 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             const bool mma = L.upmma != 0;
             uint16_t* const sc8 = Q8 ? up_smem(smem, sl.nc, T, mma, true).sc : nullptr;
             const bool cp = Q8 && mma && (L.cn & 4);   // the slice by every thread's cp.async
+            const bool ut = Q8 && mma && L.up_tma && !cp;   // the slice by tensor copies (hc_up_tma)
             if (cp) hc_up_cp8(a, sl, smem, sc8, tid);
-            else if (Q8 && tid == 0)   // ahead of R'; cn: once enough w_down rows are in
+            else if (ut && tid == 0) hc_up_tma(sl, smem, sc8, &L.tm[6], &bars[0]);
+            else if (Q8 && !ut && tid == 0)   // ahead of R'; cn: once enough w_down rows are in
                 hc_up_issue8(a, sl, smem, bars, &sy->nload.v, cn ? (unsigned) L.cn_upw : (unsigned) it.ntask, mma, sc8);
             hc_up_pre<T>(a, sl, tid, smem, mma);
             const int bf_off = (up_smem_bytes<T>(sl.nc, mma, Q8) + 15) & ~15;
@@ -1897,7 +1984,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             warm = warm || dry;
             if (tid == 0) {
                 hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph, mma, !(Q8 && !mma),
-                             sc8, cp ? -1 : Q8 ? UP_PIECES : 0, (unsigned) it.nd, dbg, b);
+                             sc8, cp || ut ? -1 : Q8 ? UP_PIECES : 0, (unsigned) it.nd, dbg, b);
             } else if (dry) {
                 // while the down projection runs, warps 1..3 run the top-10 on fixed logits: its code is then in this
                 // SM's instruction caches if this CTA claims the top-10 item
@@ -1913,8 +2000,15 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
                                       L.t10_scratch + (size_t) b * 2 * KT + KT, tid & 31, cand, nullptr, b);
                 }
             }
-            if (cp) cp_async_wait<0>();
-            else up_ph ^= 1u;
+            if (cp) {
+                cp_async_wait<0>();
+            } else {
+                if (ut) {
+                    mbar_wait(&bars[0], up_ph);
+                    stamp(dbg, b, 10, tid);
+                }
+                up_ph ^= 1u;
+            }
             __syncthreads();
             if (Q8 && !mma) {   // the 8-bit slice widened while the down projection runs
                 hc_up_widen(sl, tid, smem, up_smem(smem, sl.nc, T, false, true).sc);
@@ -1926,11 +2020,11 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(HcLaunch L) {
             uint16_t* const bfp = reinterpret_cast<uint16_t*>(smem + bf_off);
             const int cpy = cn ? (item - it.up) % L.cn_copies : 0;
             const float *cnp = L.cnp + (size_t) cpy * CN_PART, *cns = L.cns + (size_t) cpy * CN_SSN;
-            if (Q8 && mma && cn && L.bf == 2) hc_up_main_mma8<T, true, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp);
-            else if (Q8 && mma && cn && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp);
-            else if (Q8 && mma && cn) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up);
-            else if (Q8 && mma && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, nullptr, nullptr, false, bfp);
-            else if (Q8 && mma) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b);
+            if (Q8 && mma && cn && L.bf == 2) hc_up_main_mma8<T, true, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp, ut);
+            else if (Q8 && mma && cn && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, bfp, ut);
+            else if (Q8 && mma && cn) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, cnp, cns, item == it.up, nullptr, ut);
+            else if (Q8 && mma && L.bf) hc_up_main_mma8<T, true>(a, sl, tid, smem, dbg, b, nullptr, nullptr, false, bfp, ut);
+            else if (Q8 && mma) hc_up_main_mma8<T>(a, sl, tid, smem, dbg, b, nullptr, nullptr, false, nullptr, ut);
             else if (mma) hc_up_main_mma<T>(a, sl, tid, smem, dbg, b);
             else if (L.ups) hc_up_main<T, true>(a, sl, tid, smem, true, dbg, b);
             else hc_up_main<T>(a, sl, tid, smem, true, dbg, b);
@@ -2226,9 +2320,12 @@ constexpr KernelFn kSkKernels[MAXT] = {hc_fused_sk_kernel<1>, hc_fused_sk_kernel
 // 4: 32 = lo as one f16 part in the up pass (half the mma; not bitwise, T-independent).
 // STRATA_DEC_HC2_UPW=<percent> (with 1): the up items request w_up once that share of the w_down rows is in.
 // STRATA_DEC_HC2_COPIES=<n> (with 1, default 1): copies of the down items' sums.
+// STRATA_DEC_HC3 (bits, with HC2 & 1; bitwise): 1 = each warp's w_down rows by two 2D tensor copies instead of eight
+// bulk copies, or 2 = a w_down item's rows by two tensor copies of thread 0 (not with HC2 & 8); 4 = an up slice by two
+// tensor copies in a chunk layout instead of ~45 bulk copies (not with HC2 & 16).
 struct SkConf {
     bool on = false;
-    int pf = 0, nu = 0, ups = 0, hcx = 0, upmma = 0, xh = 0, hc2 = 0, upw = 0, copies = 1;
+    int pf = 0, nu = 0, ups = 0, hcx = 0, upmma = 0, xh = 0, hc2 = 0, upw = 0, copies = 1, hc3 = 0;
 };
 const SkConf& sk_conf() {
     static const SkConf c = [] {
@@ -2253,6 +2350,8 @@ const SkConf& sk_conf() {
         k.upw = std::min(std::max(e ? std::atoi(e) : 0, 0), 100);
         e = std::getenv("STRATA_DEC_HC2_COPIES");
         k.copies = std::min(std::max(e ? std::atoi(e) : 1, 1), CN_MAXCOPY);
+        e = std::getenv("STRATA_DEC_HC3");
+        k.hc3 = e ? (int) std::strtol(e, nullptr, 0) : 0;
         return k;
     }();
     return c;
@@ -2579,6 +2678,71 @@ unsigned long long* dbg_slot(int T, bool router) {
     return g_insitu.d + (size_t) (g_insitu.n++) * g_insitu.nb * 16;
 }
 
+// cuTensorMapEncodeTiled from the driver; the maps of a read's 8-bit matrices, kept per q_down.
+using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
+                              const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
+                              CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+EncodeFn encode_fn() {
+    static const EncodeFn f = [] {
+        void* p = nullptr;
+        cudaDriverEntryPointQueryResult q{};
+        if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+            q != cudaDriverEntryPointSuccess) {
+            cudaGetLastError();
+            return (EncodeFn) nullptr;
+        }
+        return reinterpret_cast<EncodeFn>(p);
+    }();
+    return f;
+}
+// dims[0] elements of the type, innermost; strides (bytes) of dims 1.. ; box per dim.
+bool tmap(CUtensorMap* m, const void* base, CUtensorMapDataType ty, int rank, const cuuint64_t* dims,
+          const cuuint64_t* strides, const cuuint32_t* box) {
+    const EncodeFn f = encode_fn();
+    if (f == nullptr || base == nullptr) return false;
+    const cuuint32_t es[5] = {1, 1, 1, 1, 1};
+    return f(m, ty, (cuuint32_t) rank, const_cast<void*>(base), dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+             CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+// A row-major [rows][cols] matrix (row stride `stride` bytes), box [box_r][box_c].
+bool tmap_2d(CUtensorMap* m, const void* base, CUtensorMapDataType ty, uint64_t cols, uint64_t rows, uint64_t stride,
+             uint32_t box_c, uint32_t box_r) {
+    const cuuint64_t dim[2] = {cols, rows}, str[1] = {stride};
+    const cuuint32_t box[2] = {box_c, box_r};
+    return tmap(m, base, ty, 2, dim, str, box);
+}
+struct CnMaps {
+    CUtensorMap tm[8];
+    bool ok, up;
+};
+// False when the down maps failed; `up`: the up maps are in.
+bool cn_maps(const HcFusedArgs& h, CUtensorMap* tm, bool& up) {
+    static std::mutex mu;
+    static std::unordered_map<const void*, CnMaps> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = cache.find(h.q_down);
+    if (it == cache.end()) {
+        CnMaps c{};
+        constexpr auto U64 = CU_TENSOR_MAP_DATA_TYPE_UINT64, U16 = CU_TENSOR_MAP_DATA_TYPE_UINT16;
+        c.ok = tmap_2d(&c.tm[0], h.q_down, U64, D / 8, LR, D, CN_W / 8, 4) &&
+               tmap_2d(&c.tm[1], h.s_down, U16, D / G8, LR, D / G8 * 2, CN_W / G8, 4) &&
+               (h.q_inject == nullptr || (tmap_2d(&c.tm[2], h.q_inject, U64, D / 8, HC, D, CN_W / 8, 4) &&
+                                          tmap_2d(&c.tm[3], h.s_inject, U16, D / G8, HC, D / G8 * 2, CN_W / G8, 4))) &&
+               tmap_2d(&c.tm[4], h.q_down, U64, D / 8, LR, D, CN_W / 8, CN_RG) &&
+               tmap_2d(&c.tm[5], h.s_down, U16, D / G8, LR, D / G8 * 2, CN_W / G8, CN_RG);
+        // q_up [HC][N][LR] as (16 bytes, column, stream, k-chunk) -> hc_up_tma's chunk layout; s_up [HC][N][SU8]
+        const cuuint64_t qd[4] = {2, N, HC, LR / 16}, qs[3] = {LR, (cuuint64_t) N * LR, 16};
+        const cuuint32_t qb[4] = {2, UPCM_SL, HC, LR / 16};
+        const cuuint64_t sd[3] = {SU8, N, HC}, ss[2] = {SU8 * 2, (cuuint64_t) N * SU8 * 2};
+        const cuuint32_t sb[3] = {SU8, UPCM_SL, HC};
+        c.up = tmap(&c.tm[6], h.q_up, U64, 4, qd, qs, qb) && tmap(&c.tm[7], h.s_up, U16, 3, sd, ss, sb);
+        it = cache.emplace(h.q_down, c).first;
+    }
+    std::copy(it->second.tm, it->second.tm + 8, tm);
+    up = it->second.up;
+    return it->second.ok;
+}
+
 void hc_fused_read(const HcFusedArgs& a, void* stream) {
     const DevInfo& d = dev_info();
     if (!d.ok || a.T < 1 || a.T > MAXT || !a.R || !a.R_out || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs ||
@@ -2642,6 +2806,13 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.cnp = d.cn + (size_t) L.slot * CN_SLOT;
     L.cns = L.cnp + (size_t) CN_MAXCOPY * CN_PART;
     L.cn_copies = sk.copies;
+    if (L.cn && (sk.hc3 & 7)) {
+        bool up = false;
+        const bool down = cn_maps(L.a, L.tm, up);
+        L.tma = down && (L.cn & 3) == 1 ? sk.hc3 & 3 : 0;
+        if (L.tma == 3) L.tma = 0;
+        L.up_tma = up && (sk.hc3 & 4) && !(L.cn & 4) ? 1 : 0;
+    }
     static const int pre8 = [] { const char* e = std::getenv("STRATA_DEC_HC8_PRE"); return e ? std::atoi(e) : 3; }();
     L.pre8 = std::min(std::max(pre8, 0), NSTAGE);
     if (sk.on) {
