@@ -45,7 +45,8 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90: an IQ4_NL row
 inline constexpr int PLE_ROW_BYTES_Q5_0 = (PLE_HEAD_DIM / 32) * 22;       // 110: a Q5_0 row
-inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_Q5_0;
+inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;       // 170: a Q8_0 row
+inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_Q8_0;
 
 /// The artifact's own hash constants, transcribed from the GGUF metadata:
 ///

@@ -6,11 +6,13 @@
 //
 // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
+#include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/platform/direct_file.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -75,7 +77,7 @@ bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n
     return true;
 }
 
-// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0 PLE rows) is
+// row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (Q5_0) and 170 (Q8_0) are
 // run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific, so a second row
 // size is the correctness evidence for the generic path.
 int selftest(const std::string& dir, uint32_t rb) {
@@ -262,6 +264,34 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
     return g_fail ? 1 : 0;
 }
 
+// A Q8_0 PLE row (5 blocks of fp16 scale + 32 int8) decoded by the shared dequantizer against a plain
+// reference, on random rows with random scales.
+int q8_decode_check() {
+    std::mt19937 rng(11);
+    int bad = 0;
+    for (int t = 0; t < 2000; ++t) {
+        uint8_t row[k::PLE_ROW_BYTES_Q8_0];
+        for (auto& b : row) b = (uint8_t) rng();
+        for (int b = 0; b < k::PLE_HEAD_DIM / 32; ++b) {   // finite scales only
+            const uint16_t d = (uint16_t) (0x2400 + (rng() % 0x1800));
+            std::memcpy(row + b * 34, &d, 2);
+        }
+        float got[k::PLE_HEAD_DIM];
+        for (int b = 0; b < k::PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q8_0(row + b * 34, got + b * 32);
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+            uint16_t h;
+            std::memcpy(&h, row + (i / 32) * 34, 2);
+            const int e = (h >> 10) & 31, m = h & 1023;
+            const float d = (e == 0 ? std::ldexp((float) m, -24) : std::ldexp((float) (m + 1024), e - 25)) *
+                            ((h & 0x8000) ? -1.0f : 1.0f);
+            const float want = d * (float) (int8_t) row[(i / 32) * 34 + 2 + i % 32];
+            if (got[i] != want) ++bad;
+        }
+    }
+    std::printf("Q8_0 PLE row decode: %s\n", bad ? "FAILED" : "OK");
+    return bad ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -286,11 +316,13 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) {
-        // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (Q5_0 PLE rows) through the
+        // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0) and 170 (Q8_0) rows through the
         // same generic row_bytes path -- see the comment on selftest().
         const int r90 = selftest(dir, ng::ROW_BYTES);
-        const int r110 = selftest(dir, 110);
-        return r90 != 0 ? r90 : r110;
+        const int r110 = selftest(dir, k::PLE_ROW_BYTES_Q5_0);
+        const int r170 = selftest(dir, k::PLE_ROW_BYTES_Q8_0);
+        const int q8 = q8_decode_check();
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8;
     }
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit);
     std::fprintf(stderr, "nothing to do\n");

@@ -106,11 +106,13 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
 }
 
 // ---------------------------------------------------------------------------------------------------
+enum class PleFormat { IQ4_NL, Q5_0, Q8_0 };
+
 struct PleTable::Impl {
     GgufFile* file = nullptr;
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
-    bool q5_0 = false;                // Q5_0 rows (110 B), the mapped reader only
+    PleFormat fmt = PleFormat::IQ4_NL;
     mutable uint64_t bytes_read = 0;
     // Direct mode: the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
@@ -128,9 +130,15 @@ struct PleTable::Impl {
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
     void decode(const uint8_t* row, float* out160) const {
-        if (q5_0)
+        switch (fmt) {
+        case PleFormat::Q5_0:
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
-        else iq4nl_dequant_row(row, out160);
+            break;
+        case PleFormat::Q8_0:
+            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q8_0(row + (size_t) b * 34, out160 + b * 32);
+            break;
+        default: iq4nl_dequant_row(row, out160); break;
+        }
     }
 };
 
@@ -161,16 +169,19 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL or Q5_0 rows
-    impl_->q5_0 = std::strcmp(t->type_name(), "Q5_0") == 0;
-    impl_->rb = impl_->q5_0 ? PLE_ROW_BYTES_Q5_0 : PLE_ROW_BYTES;
-    if (!impl_->q5_0 && std::strcmp(t->type_name(), "IQ4_NL") != 0) {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL or Q5_0";
+    // IQ4_NL, Q5_0 or Q8_0 rows
+    if (std::strcmp(t->type_name(), "IQ4_NL") == 0) impl_->fmt = PleFormat::IQ4_NL;
+    else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
+    else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
+    else {
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0 or Q8_0";
         close();
         return false;
     }
-    // PleReader's row_bytes is a runtime parameter: Q5_0's 110 B rows go through the same generic path as the 90 B
-    // IQ4_NL rows (ple_reader_test --selftest covers both: straddling, caching, in-flight tickets, keep-alive).
+    impl_->rb = impl_->fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
+              : impl_->fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0 : PLE_ROW_BYTES;
+    // PleReader's row_bytes is a runtime parameter: every format's rows go through the same generic path
+    // (ple_reader_test --selftest covers straddling, caching, in-flight tickets, keep-alive).
     impl_->n_rows = t->shape[1];
     impl_->data = impl_->file->tensor_data(*t);
 
@@ -262,12 +273,14 @@ void PleTable::close() {
     impl_->data = nullptr;
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
-    impl_->q5_0 = false;
+    impl_->fmt = PleFormat::IQ4_NL;
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
 bool PleTable::locked() const { return impl_->locked; }
-const char* PleTable::format() const { return impl_->q5_0 ? "Q5_0" : "IQ4_NL"; }
+const char* PleTable::format() const {
+    return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0" : "IQ4_NL";
+}
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
