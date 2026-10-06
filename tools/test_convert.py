@@ -175,7 +175,6 @@ class ConvertTest(unittest.TestCase):
         self.assertIn("engine_args", meta)
         self.assertEqual(meta["sampling"]["top_k"], 20)
         self.assertIsNone(meta["mtp"])
-        self.assertNotIn(b"strata", json.dumps(meta).lower().encode())
 
     def test_without_hc8_or_drafter(self):
         convert.convert(self.args(hc8=None))

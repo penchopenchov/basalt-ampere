@@ -2,15 +2,14 @@
 
 Why this exists
 ---------------
-P1.S1 of the plan says the tiny synthetic model is "written as a real GGUF via `gguf-py`" using
-"at least `Q2_0`". That does not work: `gguf-py` has no `GGMLQuantizationType` member for type 42, so
-`GGMLQuantizationType(42)` raises `ValueError`. Verified in round 39 and again here.
+A tiny synthetic model "written as a real GGUF via `gguf-py`" with `Q2_0` does not work: `gguf-py` has no
+`GGMLQuantizationType` member for type 42, so `GGMLQuantizationType(42)` raises `ValueError`.
 
-`src/artifact/` needs a writer regardless - P1.S2 requires a reader with no ggml dependency, and the
-writer is its companion - so this is that writer in Python, where it can be validated immediately
-against `tools/gguf_reader.py` and against llama.cpp.
+`src/artifact/` needs a writer regardless - its reader has no ggml dependency, and the writer is its
+companion - so this is that writer in Python, where it can be validated immediately against
+`tools/gguf_reader.py` and against llama.cpp.
 
-Scope: enough to build the P1.S1 tiny model. It is NOT a general-purpose quantizer; the only
+Scope: enough to build the tiny synthetic model. It is NOT a general-purpose quantizer; the only
 quantizer implemented is `Q2_0`, and its contract is the Q2_0 contract:
     block = 64 elements, fp16 scale, 16 bytes of 2-bit codes, LSB-first, 4 codes per byte
     d = amax, code = clamp(round(w/d) + 1, 0, 3), symbol = code - 1  ->  {-1, 0, +1, +2}

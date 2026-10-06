@@ -78,8 +78,8 @@ int main(int argc, char** argv) {
                              "[--max-tokens N] [--flash-attn on|off|auto]\n");
         return 2;
     }
-    // On the CPU the GPU stays unseen: a CUDA build otherwise opens a context there (measured: 0.4-0.7 GB of VRAM,
-    // 150-260 expert slots less for the engine beside it).  Before anything reaches the CUDA runtime.
+    // On the CPU the GPU stays unseen: a CUDA build otherwise opens a context there (it takes hundreds of MiB
+    // of VRAM from the engine beside it).  Before anything reaches the CUDA runtime.
     if (!gpu) {
         setenv("CUDA_VISIBLE_DEVICES", "-1", 1);
     }

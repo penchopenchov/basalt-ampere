@@ -44,15 +44,15 @@ BYTE_TO_UNICODE = bytes_to_unicode()
 UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
 
 # The `qwen35` pre-tokenizer, transcribed from the ORACLE rather than from the family resemblance:
-# `.ref/llama.cpp/src/llama-vocab.cpp` L396, `case LLAMA_VOCAB_PRE_TYPE_QWEN35`.  The commented-out line
+# llama.cpp's `src/llama-vocab.cpp`, `case LLAMA_VOCAB_PRE_TYPE_QWEN35`.  The commented-out line
 # above it is the `tokenizer.json` original, and llama.cpp's active version differs from it - it spells the
 # contraction classes out instead of using `(?i:...)`, which is behaviourally the same.
 #
-# THE `\p{M}` IS THE WHOLE POINT OF THIS BEING TRANSCRIBED.  The QWEN3 pattern two cases earlier (L389) is
+# THE `\p{M}` IS THE WHOLE POINT OF THIS BEING TRANSCRIBED.  The QWEN3 pattern two cases earlier is
 # the same shape with `\p{L}` where this has `[\p{L}\p{M}]` and without `\p{M}` in the punctuation negation.
 # Writing the QWEN3 pattern for `qwen35` looks right, round-trips perfectly, and is wrong: a combining mark
 # is `\p{M}`, so without it the mark gets swallowed into the following punctuation run and a token like `_j`
-# never forms.  It cost 3 strings out of 1875 and only `tokenize_oracle_check` could see it.
+# never forms.  Only an oracle check can see it.
 QWEN35_PATTERN = (
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
     r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
@@ -96,10 +96,9 @@ class Tokenizer:
         #   * type 3 (CONTROL: `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`, ...) is matched ONLY when
         #     parse_special is set.
         #
-        # Measured, not assumed: with parse_special=False the oracle still emitted `<tool_response>` as one
-        # token and mine emitted four, and the three disagreements were exactly the type-4 cases while every
-        # type-3 case agreed.  Treating both classes alike costs 3 strings in 1229 and silently changes a chat
-        # prompt, because `<|im_end|>` decomposed into ordinary pieces is not the token the model expects.
+        # With parse_special=False the oracle still emits `<tool_response>` as one token, so the type-4
+        # cases must match always.  Treating both classes alike silently changes a chat prompt, because
+        # `<|im_end|>` decomposed into ordinary pieces is not the token the model expects.
         self.special_tokens: dict[str, int] = {}
         if token_types:
             for i, ty in enumerate(token_types):
@@ -282,7 +281,7 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern_source": "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
