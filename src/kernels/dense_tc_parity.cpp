@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -42,6 +43,8 @@ const Case CASES[] = {
     {"z IQ4_XS", 23, 2560, 6144, 136, {0, -1}},
     {"out Q6_K", 14, 6144, 2560, 210, {208, -1}},
     {"out IQ4_XS", 23, 6144, 2560, 136, {0, -1}},
+    {"out Q4_K", 12, 6144, 2560, 144, {0, 2}},
+    {"out Q5_K", 13, 6144, 2560, 176, {0, 2}},
     {"q Q6_K", 14, 2560, 12288, 210, {208, -1}},
     {"kv Q6_K", 14, 2560, 512, 210, {208, -1}},
     {"tail Q4_K", 12, 1024, 1000, 144, {0, 2}},
@@ -163,19 +166,37 @@ double time_graph(F&& call, int NL, cudaStream_t s, int reps = 7) {
     return 1000.0 * ms[ms.size() / 2] / NL;
 }
 
+// DTC_BENCH=<names, comma-separated substrings> picks the cases; DTC_BENCH_WARM=1 replays one weight copy (L2-warm)
 void bench(cudaStream_t s) {
-    const Case* sel[] = {&CASES[0], &CASES[1], &CASES[3], &CASES[4], &CASES[6], &CASES[8]};
-    std::printf("\nbench: us per call (median of 7 graph replays), GB/s of the weight bytes\n");
+    std::vector<const Case*> sel;
+    const char* pick = std::getenv("DTC_BENCH");
+    const bool warm = std::getenv("DTC_BENCH_WARM") != nullptr;
+    for (const Case& c : CASES) {
+        bool on = pick == nullptr ? (&c == &CASES[0] || &c == &CASES[1] || &c == &CASES[3] || &c == &CASES[4] ||
+                                     &c == &CASES[6] || &c == &CASES[10])
+                                  : false;
+        if (pick != nullptr) {
+            std::string all(pick), name(c.name);
+            for (std::size_t a = 0; a <= all.size();) {
+                std::size_t b = all.find(',', a);
+                if (b == std::string::npos) b = all.size();
+                if (b > a && name.find(all.substr(a, b - a)) != std::string::npos) on = true;
+                a = b + 1;
+            }
+        }
+        if (on) sel.push_back(&c);
+    }
+    std::printf("\nbench: us per call (median of 7 graph replays), GB/s of the weight bytes%s\n", warm ? ", L2-warm" : "");
     for (const Case* c : sel) {
         const std::size_t wb = strata::kernels::native_mmvq_weight_bytes(c->type, c->n_in, c->n_out);
-        const int NL = (int) std::max<std::size_t>(8, (400u << 20) / wb);
+        const int NL = warm ? 16 : (int) std::max<std::size_t>(8, (400u << 20) / wb);
         std::mt19937 rng(99u);
         const std::vector<uint8_t> w = make_weights(*c, rng);
         uint8_t* dw = nullptr;
         void* xq = nullptr;
         float *dx = nullptr, *y = nullptr;
         cudaMalloc(&dw, wb * NL);
-        for (int l = 0; l < NL; ++l) cudaMemcpy(dw + wb * l, w.data(), wb, cudaMemcpyHostToDevice);
+        for (int l = 0; l < (warm ? 1 : NL); ++l) cudaMemcpy(dw + wb * l, w.data(), wb, cudaMemcpyHostToDevice);
         cudaMalloc(&xq, strata::kernels::native_q8_1_bytes(c->n_in, 8));
         cudaMalloc(&dx, (std::size_t) 8 * c->n_in * 4);
         cudaMalloc(&y, (std::size_t) 8 * c->n_out * 4);
@@ -190,10 +211,10 @@ void bench(cudaStream_t s) {
         std::printf("   T   native us   GB/s   dtc us   GB/s   speedup\n");
         for (int T = 1; T <= 8; ++T) {
             const double tn = time_graph([&](int l) {
-                strata::kernels::native_mmvq(c->type, dw + wb * l, xq, y, c->n_in, c->n_out, T, s);
+                strata::kernels::native_mmvq(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
             }, NL, s);
             const double td = time_graph([&](int l) {
-                strata::kernels::dense_tc(c->type, dw + wb * l, xq, y, c->n_in, c->n_out, T, s);
+                strata::kernels::dense_tc(c->type, dw + wb * (warm ? 0 : l), xq, y, c->n_in, c->n_out, T, s);
             }, NL, s);
             std::printf("  %2d  %8.2f %7.0f %8.2f %7.0f   %.2fx\n", T, tn, wb / tn / 1e3, td, wb / td / 1e3, tn / td);
         }
