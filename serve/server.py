@@ -3158,6 +3158,7 @@ def main() -> int:
     ap.add_argument("--spec-min-p", type=float, help="stop drafting below this draft probability (default: the "
                                                      "model file's; 0 = always draft to the cap)")
     ap.add_argument("--mtp-max-t", type=int, help="the drafter's own window cap (default 0 = --spec)")
+    ap.add_argument("--no-vision", action="store_true", help="text only: no vision sidecar, no image input")
     ap.add_argument("--host", default="127.0.0.1",
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
                          "devices on your network (give --api-key)")
@@ -3208,7 +3209,7 @@ def main() -> int:
         listed = gpu_list(cfg)
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
-                a.model, a.exe, gpus=len(listed) if listed else None, vision=a.engine == "engine",
+                a.model, a.exe, gpus=len(listed) if listed else None, vision=a.engine == "engine" and not a.no_vision,
                 overrides={f: v for f, v in (("--spec", a.spec), ("--spec-min-p", a.spec_min_p),
                                              ("--mtp-max-t", a.mtp_max_t)) if v is not None}).items()
                 if k not in cfg})
