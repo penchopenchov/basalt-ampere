@@ -801,19 +801,6 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             fa[0].w_inject = nullptr; fa[0].eps = EPS; fa[0].lo = lo_; fa[0].rs = rs_; fa[0].mixed = sample_;
             if (T != 1) { err = "mtp: the one-kernel mixer read runs one row"; return false; }
             hc_fused_read(hcf_args(fa, 1, xn_), cs);
-        } else if (fuse_head_gr) {
-            FusedGrArgs fa[kFusedGrMaxT];
-            for (int t = 0; t < T; ++t) {
-                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = true;
-                fa[t].bo_prev = y_ + t * N; fa[t].inj_prev = inj2_ + t * HC;
-                fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
-                fa[t].w_down = bf16("hyper_connection_mixer.input_mix_weight_down.weight");
-                fa[t].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");
-                fa[t].w_inject = nullptr;
-                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
-                fa[t].inject_out = dummy_inj_; fa[t].mixed = sample_ + t * N;
-            }
-            fused_gr_read_multi(fa, T, xn_, cs);
         } else {
             for (int t = 0; t < T; ++t)
                 gr_read(R_ + (size_t) t * HC * N, f32("hyper_connection_mixer.hc_norm.weight"),
