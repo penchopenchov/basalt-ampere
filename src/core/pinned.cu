@@ -375,7 +375,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
             uint64_t remaining = layer_bytes[(size_t) L];
             uint64_t pos = 0;
             uint64_t h = 1469598103934665603ull;
-            // 64-bit seek: the pack is 42.9 GB, so the 32-bit `fseek` would wrap past 4 GiB
+            // 64-bit seek: the file is far larger than 4 GiB, so a 32-bit `fseek` would wrap
             if (fseeko(f, (off_t) (base + off), SEEK_SET) != 0) {
                 std::lock_guard<std::mutex> g(err_mu);
                 err = "seek to " + std::to_string(off) + " B failed in layer " + std::to_string(L);

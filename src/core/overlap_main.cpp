@@ -103,9 +103,9 @@ int main(int argc, char** argv) {
 
     // ---- SERIAL: the same operations on the SAME stream, so the GPU runs them one after another ----
     //
-    // NOT a sync-per-iteration loop.  The first version waited with `cudaStreamSynchronize` after every copy and
-    // measured 234.8 us/expert where a copy plus a GEMV is ~43 us: the baseline was dominated by the CPU
-    // round-trip, so the ratio of 0.095 mostly measured "with syncs" against "without syncs".  Putting both
+    // NOT a sync-per-iteration loop.  Waiting with `cudaStreamSynchronize` after every copy
+    // would make the baseline dominated by the CPU round-trip, so the ratio would mostly measure "with syncs"
+    // against "without syncs".  Putting both
     // operations on one stream expresses the same dependency with NO CPU involvement and ONE sync at the end,
     // which is what makes the comparison about overlap rather than about synchronisation.
     check(cudaStreamSynchronize(0), "pre sync");

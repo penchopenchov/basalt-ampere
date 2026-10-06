@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
         // sweep rather than one number because "bandwidth" without a transfer size is not a specification.
         std::printf("\nexpert stream over the pinned arena (host -> device, one reused destination):\n");
         const uint64_t granularities[] = {blob_bytes, 16 * blob_bytes, 512 * blob_bytes, bytes};
-        const char* names[] = {"1 blob (1.38 MB)", "16 blobs (22 MB)", "1 layer (707 MB)", "whole arena"};
+        const char* names[] = {"1 blob", "16 blobs", "1 layer", "whole arena"};
         for (int i = 0; i < 4; ++i) {
             const uint64_t g = granularities[i];
             if (g > bytes) continue;
@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
                         (double) ss.bytes / (1024.0 * 1024 * 1024), ss.seconds);
         }
         // And what it means, using the design's own constants, stated with the assumption attached.
-        const double best = 60.0;    // GB/s, replaced below by the measured best if it is larger
+        const double best = 60.0;    // GB/s
         (void) best;
         std::printf("\nper-token expert stream at E = 663.6 MB and hit rate h (VRAM-resident fraction):\n");
         std::printf("  %-8s %-14s %-14s %s\n", "h", "miss MB/token", "ms at 1 blob", "tok/s ceiling");
@@ -107,13 +107,12 @@ int main(int argc, char** argv) {
             const double ms = miss_mb / 1000.0 / (one.gib_per_second() * 1.073741824) * 1000.0;
             std::printf("  %-8.3f %-14.1f %-14.2f %.1f\n", h, miss_mb, ms, ms > 0 ? 1000.0 / ms : 0.0);
         }
-        std::printf("  h = 0.167 is the design's constant; h = 0.833 is its complement, shown because the\n"
-                    "  plan's E = 663.6 MB is the FULL expert set per token, so which fraction is cached is\n"
-                    "  the question the number hinges on.\n");
+        std::printf("  E is the FULL expert set per token, so which fraction is cached is the question the\n"
+                    "  number hinges on.\n");
     }
 
-    // The projection is the number the phase's <= 60 s target is about, and it is printed as a projection
-    // rather than as the result, because at --layers 2 this program has NOT loaded 33.97 GB.
+    // The projection is printed as a projection rather than as the result, because at --layers 2 this
+    // program has NOT loaded the full set.
     const double full = 33973862400.0;
     std::printf("projection for the full %.2f GiB at this rate: %.1f s\n", full / (1024.0 * 1024 * 1024),
                 full / (1024.0 * 1024 * 1024) / (st.gib_per_second() > 0 ? st.gib_per_second() : 1e-9));

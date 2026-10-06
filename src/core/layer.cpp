@@ -1076,7 +1076,7 @@ n += q8k_bytes(g.n_embd);
 // head_q8k
 n += basalt::kernels::gr_workspace_bytes(s);    return align_up16(n) + 256;}
 uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b) {    const basalt::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    Cursor c{(uint8_t*) base};    b.R = c.take<float>((uint64_t) g.hc * g.n_embd);    b.mixed = c.take<float>((uint64_t) g.n_embd);    b.block_out = c.take<float>((uint64_t) g.n_embd);    b.inject = c.take<float>((uint64_t) g.hc);    b.inject2 = c.take<float>((uint64_t) g.hc);    b.gr_rs = c.take<float>((uint64_t) g.hc);    b.head_q8k = c.take_bytes(q8k_bytes(g.n_embd));    uint8_t* grw = c.take_bytes(basalt::kernels::gr_workspace_bytes(s));    basalt::kernels::gr_workspace_init(s, grw, b.gr);    return c.used;}
-// ---- THE HALF-LEVEL C1 ORACLE.  `dump` is a HOST buffer of `2 * n_embd + 2 * hc + n_head * head_dim` floats
+// ---- THE HALF-LEVEL ORACLE.  `dump` is a HOST buffer of `2 * n_embd + 2 * hc + n_head * head_dim` floats
 // per layer; this enqueues one slice of it as a device-to-host copy.  **IT RUNS INSIDE THE CAPTURE**, which is
 // the point: the copy becomes a node of that layer's graph and replays with it, so the layer functions stay one
 // function each and no per-layer plumbing reaches `generate.cpp`.  A null `dump` is the default and skips the

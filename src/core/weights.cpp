@@ -427,7 +427,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                     case Conv::WidenF16: {
                         // fp16 bits -> f32.  EXACT: every fp16 value is an f32 value, including the
                         // subnormals, so this cannot change a single weight - which is why the engine may do
-                        // it at all, and why doing it costs 10.88 MiB rather than a second kernel family.
+                        // it at all, and why doing it costs a little memory rather than a second kernel family.
                         const uint64_t elems = n / 2;
                         out_bytes = elems * 4;
                         float* o = (float*) stage_out;

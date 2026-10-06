@@ -160,7 +160,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         sizes.reserve(selected.size());
         for (const auto& pair : selected) sizes.push_back((int64_t) lay.blob_bytes(pair.first));
     }
-    // Leave room for the CUDA context, staging and later driver allocations, especially under WDDM.
+    // Leave room for the CUDA context, staging and later driver allocations.
     if (needed + (512ull << 20) > free_bytes) {
         err = "CUDA" + std::to_string(device) + " experts: slots leave less than 512 MiB free; reduce --expert-cache-device" + std::to_string(device);
         close(); return false;
