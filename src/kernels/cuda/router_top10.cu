@@ -1,10 +1,10 @@
-// src/kernels/cuda/router_top10.cu - P2.S2: the MoE router.
+// src/kernels/cuda/router_top10.cu - the MoE router.
 //
 // P2.S2's spec: "BF16 GEMV, softmax / top-k / renormalize per the model definition; emits (expert_id, weight) x 10
 // per token".  This is the softmax/top-k/renormalize half; the BF16 GEMV that produces the logits is a
 // separate kernel and is NOT here.
 //
-// The semantics are transcribed from `ref/moe.py::router`, which is itself transcribed from llama-graph.cpp:
+// The semantics are transcribed from the Python reference, which is itself transcribed from llama-graph.cpp:
 //
 //     p   = softmax(logits)                       over ALL experts, not over the selected subset
 //     ids = stable argsort(-p)[:k]                ties break by INDEX, ascending
@@ -190,13 +190,6 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
 
 
 }  // namespace
-
-bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
-                          void* stream, int variant) {
-    (void) logits; (void) n_tokens; (void) n_expert; (void) k; (void) ids; (void) weights; (void) stream;
-    (void) variant;
-    return false;
-}
 
 void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
                   void* stream) {
