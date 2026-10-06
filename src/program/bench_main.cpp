@@ -988,8 +988,10 @@ int main(int argc, char** argv) {
 
     // what to run
     const bool quality_only = o.quality && !o.sel_decode && !o.sel_prefill;
-    if (!o.sel_decode && !quality_only) o.decode = {"conv", "struct", "prose"};
-    if (!o.sel_prefill && !quality_only) o.depths = {kPrefillBase};
+    if (!o.sel_decode && !o.sel_prefill && !quality_only) {   // one of -t / -p runs only what it names
+        o.decode = {"conv", "struct", "prose"};
+        o.depths = {kPrefillBase};
+    }
     auto wants = [&](const std::string& s) { return std::find(o.decode.begin(), o.decode.end(), s) != o.decode.end(); };
     const bool do_quality = o.quality;
     const bool do_decode = !o.decode.empty();
