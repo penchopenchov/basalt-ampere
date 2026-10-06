@@ -2037,7 +2037,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_a_reply_cut_while_thinking_is_named_in_the_log(self):
         """Max tokens reached inside the thinking gives an empty answer; the server log says what helps."""
-        hint = "reached max tokens while still thinking"
+        hint = "max tokens reached while thinking"
         for extra, said in (({"max_tokens": 10}, True), ({}, False)):
             with self.subTest(extra=extra):
                 out = io.StringIO()
