@@ -203,7 +203,6 @@ namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
 }  // namespace
 
-int arena_pin_cap_gib() { return -1; }   // no cap: the whole arena is pinned
 
 namespace {
 }  // namespace

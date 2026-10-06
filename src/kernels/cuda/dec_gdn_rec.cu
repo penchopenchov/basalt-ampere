@@ -365,6 +365,4 @@ void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream) {
     if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec_norm: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-int dec_gdnf_mode() { return 3; }
-
 }  // namespace strata::kernels

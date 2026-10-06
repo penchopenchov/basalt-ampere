@@ -1,19 +1,19 @@
-// src/kernels/dec_gdn_parity.cpp - the STRATA_DEC_GDN block against the per-stage verify kernels, bitwise.
+// src/kernels/dec_gdn_parity.cpp - the verify window's GDN block around dec_gdn_rec against the per-stage verify
+// kernels, bitwise.
 //
-//     build/dec_gdn_parity [--bench | --bench-only | --gdnf]
+//     build/dec_gdn_parity [--bench | --bench-only]
 //
 // The reference is the verify window's GDN sequence: native_quantize_q8_1 + native_mmvq (qkv, z),
-// gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi, native_quantize_q8_1 + native_mmvq (out).  The new path is
-// dec_gdn_inproj + dec_gdn_rec + dec_dense.  Every output both paths write (qkv, z, h, gate, beta, the q8_1 of y,
-// the out projection) must match bit for bit at the model's geometry, for T = 1..8 and every projection type the
-// model uses in every position; the state must be left untouched.  Weights are random bytes with normal fp16
-// scales (mmvq_multi_parity's rule), activations and state random normal.
+// gdn_conv_l2_multi, gdn_ab_multi, gdn_step_norm_multi, native_quantize_q8_1 + native_mmvq (out).  The path under
+// test is the native in/out projections around dec_gdn_rec (mode 1) or dec_gdn_rec_split + dec_gdn_rec_norm with z on
+// a side stream forked after qkv (mode 2) or after the q8_1 (mode 3).  Every output both paths write (qkv, z, h,
+// gate, beta, the q8_1 of y, the out projection) must match bit for bit at the model's geometry, for T = 1..8 and
+// every projection type the model uses in every position, and each column must equal the same column of an
+// eight-token window; the state must be left untouched.  Weights are random bytes with normal fp16 scales
+// (mmvq_multi_parity's rule), activations and state random normal.
 //
-// --gdnf: the STRATA_DEC_GDNF sequence (native in/out projections around dec_gdn_rec) against the reference, bitwise,
-// each column also against the same column of an eight-token window; then the bench with it as a third path.
-//
-// --bench: both paths timed as CUDA graphs over enough layers' distinct weights that the L2 holds none of them,
-// per stage and whole, in microseconds per layer and GB/s over the bytes each must move.
+// --bench: the reference and the three modes timed as CUDA graphs over enough layers' distinct weights that the L2
+// holds none of them, per stage and whole, in microseconds per layer and GB/s over the bytes each must move.
 #include "strata/kernels/dec_gdn.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/pdl.hpp"
@@ -188,24 +188,7 @@ void run_ref(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int
     }
 }
 
-void run_new(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, int stages = 7,
-             unsigned long long* stamps = nullptr) {
-    if (stages & 1) {
-        const DecMat m[2] = {{L.tq, L.wqkv, C, b.qkv}, {L.tz, L.wz, ZV, b.z}};
-        dec_gdn_inproj(x, N, T, m, 2, b.xq, s);
-    }
-    if (stages & 2) {
-        DecRecArgs a;
-        a.state = L.state; a.qkv = b.qkv; a.conv_w = L.conv_w; a.x = x; a.w_alpha = L.wa; a.w_beta = L.wb;
-        a.dt = L.dt; a.ssm_a = L.ssm_a; a.z = b.z; a.gamma = L.gamma; a.h = b.h; a.gate = b.gate; a.beta = b.beta;
-        a.y = nullptr; a.yq = b.yq; a.C = C; a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = EPS;
-        a.stamps = stamps;
-        dec_gdn_rec(a, T, s);
-    }
-    if (stages & 4) dec_dense(b.yq, ZV, T, DecMat{L.to, L.wo, N, b.bo}, s);
-}
-
-// STRATA_DEC_GDNF=mode: native in-projections, dec_gdn_rec (1) or dec_gdn_rec_split + dec_gdn_rec_norm with z on a
+// native in-projections, dec_gdn_rec (1) or dec_gdn_rec_split + dec_gdn_rec_norm with z on a
 // side stream forked after qkv (2) or after the q8_1 (3), native out projection on the q8_1 (stage masks as
 // run_ref's; a partial mask runs modes 2/3 on one stream)
 cudaStream_t g_side = nullptr;
@@ -225,7 +208,7 @@ void run_gdnf(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, in
     a.state = L.state; a.qkv = b.qkv; a.conv_w = L.conv_w; a.x = x; a.w_alpha = L.wa; a.w_beta = L.wb;
     a.dt = L.dt; a.ssm_a = L.ssm_a; a.z = b.z; a.gamma = L.gamma; a.h = b.h; a.gate = b.gate; a.beta = b.beta;
     a.y = nullptr; a.yq = b.yq; a.C = C; a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = EPS;
-    a.early_trigger = std::getenv("GDNF_TRIG") != nullptr;
+    a.early_trigger = true;
     a.o = b.y;
     if (stages & 1) {
         native_quantize_q8_1(x, b.xq, N, T, s);
@@ -240,7 +223,7 @@ void run_gdnf(const Layer& L, const float* x, Bufs& b, int T, cudaStream_t s, in
             if (fork && g_gdnf == 2) z_side();
             dec_gdn_rec_split(a, T, s);
             if (fork) CK(cudaStreamWaitEvent(s, g_join, 0));
-            PdlScope pn(true, fork && std::getenv("GDNF_JOIN_PDL") == nullptr);
+            PdlScope pn(true, fork);
             dec_gdn_rec_norm(a, T, s);
         }
     }
@@ -254,26 +237,19 @@ std::vector<V> down(const V* d, size_t n) {
     return h;
 }
 
-bool g_quiet = false;   // relaxed mode: differences are expected, report their size instead
-
-// bit differences between two float arrays; prints the first (or, quiet, the error relative to the array's scale)
+// bit differences between two float arrays; prints the first
 long long cmp_f(const char* what, const float* a, const float* b, size_t n, double& max_abs) {
     std::vector<float> ha = down(a, n), hb = down(b, n);
     long long d = 0;
-    double scale = 0, worst = 0;
-    for (size_t i = 0; i < n; ++i) scale = std::max(scale, std::fabs((double) ha[i]));
     for (size_t i = 0; i < n; ++i) {
         if (std::memcmp(&ha[i], &hb[i], 4) != 0) {
-            if (d == 0 && !g_quiet) std::printf("    %s[%zu]: ref %.9g new %.9g\n", what, i, ha[i], hb[i]);
+            if (d == 0) std::printf("    %s[%zu]: ref %.9g new %.9g\n", what, i, ha[i], hb[i]);
             ++d;
             const double e = std::fabs((double) ha[i] - hb[i]);
             if (e > max_abs) max_abs = e;
-            worst = std::max(worst, e);
         }
         if (!std::isfinite(ha[i]) || !std::isfinite(hb[i])) { std::printf("    %s[%zu] not finite\n", what, i); ++d; }
     }
-    if (g_quiet && d) std::printf("    %-5s %7lld/%-7zu differ, max abs %.3g = %.3g of max|ref| %.3g\n", what, d, n, worst,
-                                  worst / scale, scale);
     return d;
 }
 long long cmp_b(const char* what, const void* a, const void* b, size_t n) {
@@ -282,71 +258,6 @@ long long cmp_b(const char* what, const void* a, const void* b, size_t n) {
     for (size_t i = 0; i < n; ++i) d += ha[i] != hb[i];
     if (d) std::printf("    %s: %lld bytes differ\n", what, d);
     return d;
-}
-
-bool parity(cudaStream_t s) {
-    std::mt19937 rng(42);
-    const int combos[5][3] = {{14, 23, 14}, {23, 21, 13}, {12, 14, 21}, {13, 12, 23}, {14, 13, 12}};
-    Bufs r = make_bufs(), n = make_bufs();
-    bool ok = true;
-    for (const auto& cb : combos) {
-        Layer L = make_layer(cb[0], cb[1], cb[2], rng);
-        const std::vector<float> st0 = down(L.state, (size_t) S * HV * S + (size_t) C * 3);
-        for (int T = 1; T <= kDecMaxT; ++T) {
-            float* x = upload(randn((size_t) T * N, 1.f, rng));
-            clear(r, s); clear(n, s);
-            run_ref(L, x, r, T, s);
-            run_new(L, x, n, T, s);
-            CK(cudaStreamSynchronize(s));
-            double ma = 0;
-            long long d = 0;
-            d += cmp_f("qkv", r.qkv, n.qkv, (size_t) T * C, ma);
-            d += cmp_f("z", r.z, n.z, (size_t) T * ZV, ma);
-            d += cmp_f("gate", r.gate, n.gate, (size_t) T * HV, ma);
-            d += cmp_f("beta", r.beta, n.beta, (size_t) T * HV, ma);
-            d += cmp_f("h", r.h, n.h, (size_t) T * C, ma);
-            d += cmp_b("yq", r.yq, n.yq, native_q8_1_bytes(ZV, T));
-            d += cmp_f("out", r.bo, n.bo, (size_t) T * N, ma);
-            const std::vector<float> st1 = down(L.state, st0.size());
-            const bool st_ok = std::memcmp(st0.data(), st1.data(), st0.size() * 4) == 0;
-            std::printf("qkv %-6s z %-6s out %-6s T=%d: %s%s\n", fmt(cb[0]).name, fmt(cb[1]).name, fmt(cb[2]).name, T,
-                        d == 0 ? "bitwise" : ("DIFF " + std::to_string(d)).c_str(), st_ok ? "" : " STATE WRITTEN");
-            if (g_quiet) {   // the dense outputs of each column alone must equal the T-column call, bit for bit
-                Bufs one = make_bufs();
-                long long inv = 0;
-                double m0 = 0;
-                for (int t = 0; t < T; ++t) {
-                    const DecMat m[2] = {{L.tq, L.wqkv, C, one.qkv}, {L.tz, L.wz, ZV, one.z}};
-                    dec_gdn_inproj(x + (size_t) t * N, N, 1, m, 2, one.xq, s);
-                    dec_dense((const uint8_t*) n.yq + (size_t) t * native_q8_1_bytes(ZV, 1), ZV, 1, DecMat{L.to, L.wo, N, one.bo}, s);
-                    CK(cudaStreamSynchronize(s));
-                    g_quiet = false;
-                    inv += cmp_f("qkv@t", n.qkv + (size_t) t * C, one.qkv, C, m0);
-                    inv += cmp_f("z@t", n.z + (size_t) t * ZV, one.z, ZV, m0);
-                    inv += cmp_f("out@t", n.bo + (size_t) t * N, one.bo, N, m0);
-                    g_quiet = true;
-                }
-                std::printf("    column/T invariance: %s\n", inv == 0 ? "bitwise" : "BROKEN");
-                ok = ok && inv == 0 && st_ok;
-                continue;
-            }
-            ok = ok && d == 0 && st_ok;
-            if (d != 0 && std::getenv("DEC_DBG")) {
-                Bufs n2 = make_bufs(), r2 = make_bufs();
-                clear(n2, s); clear(r2, s);
-                run_new(L, x, n2, T, s);
-                run_ref(L, x, r2, T, s);
-                CK(cudaStreamSynchronize(s));
-                double m2 = 0;
-                std::printf("  new vs new: %lld, ref vs ref: %lld\n", cmp_f("qkv", n.qkv, n2.qkv, (size_t) T * C, m2),
-                            cmp_f("qkv", r.qkv, r2.qkv, (size_t) T * C, m2));
-                std::vector<float> hn = down(n.qkv, (size_t) T * C), hr = down(r.qkv, (size_t) T * C);
-                for (int t = 0; t < T; ++t) std::printf("  t%d: ref %.6g new %.6g\n", t, hr[(size_t) t * C], hn[(size_t) t * C]);
-            }
-            CK(cudaFree(x));
-        }
-    }
-    return ok;
 }
 
 bool parity_gdnf(cudaStream_t s) {
@@ -391,76 +302,7 @@ bool parity_gdnf(cudaStream_t s) {
     return ok;
 }
 
-// where the recurrence kernel's time goes: per phase, the mean over blocks of (stamp - first block's start)
-void rec_phases(cudaStream_t s) {
-    std::mt19937 rng(9);
-    Layer L = make_layer(14, 23, 14, rng);
-    Bufs b = make_bufs();
-    unsigned long long* st = nullptr;
-    CK(cudaMalloc(&st, 8 * HV * 4 * 10));
-    for (int T : {1, 2, 3, 4, 8}) {
-        float* x = upload(randn((size_t) T * N, 1.f, rng));
-        run_new(L, x, b, T, s, 1);
-        CK(cudaStreamSynchronize(s));
-        run_new(L, x, b, T, s, 2, st);
-        CK(cudaStreamSynchronize(s));
-        std::vector<unsigned long long> h = down(st, (size_t) HV * 4 * 10);
-        unsigned long long t0 = ~0ull;
-        for (int k = 0; k < HV * 4; ++k) t0 = std::min(t0, h[k * 10]);
-        std::printf("rec T=%d phases (us from first start, mean / max over blocks):", T);
-        for (int i = 0; i < 10; ++i) {
-            double m = 0, mx = 0;
-            for (int k = 0; k < HV * 4; ++k) { const double v = (h[k * 10 + i] - t0) / 1e3; m += v; mx = std::max(mx, v); }
-            std::printf(" %d:%.2f/%.2f", i, m / (HV * 4), mx);
-        }
-        std::printf("\n");
-        CK(cudaFree(x));
-    }
-}
-
-// the in-projection per weight type (qkv and z both of it): ref vs new, us per layer
-void fmt_sweep(cudaStream_t s) {
-    std::mt19937 rng(11);
-    float* x = upload(randn((size_t) kDecMaxT * N, 1.f, rng));
-    Bufs b = make_bufs();
-    cudaEvent_t e0, e1;
-    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-    for (const Fmt& f : FMTS) {
-        std::vector<Layer> Ls;
-        for (int i = 0; i < 8; ++i) Ls.push_back(make_layer(f.type, f.type, 14, rng));
-        const double mb = (mat_bytes(f.type, N, C) + mat_bytes(f.type, N, ZV)) / 1e6;
-        for (int T : {1, 3}) {
-            double us[2];
-            for (int path = 0; path < 2; ++path) {
-                cudaGraph_t g;
-                cudaGraphExec_t ge;
-                CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
-                {
-                    PdlScope ps(true, true);
-                    for (const Layer& L : Ls) (path ? run_new : run_ref)(L, x, b, T, s, 1, nullptr);
-                }
-                CK(cudaStreamEndCapture(s, &g));
-                CK(cudaGraphInstantiate(&ge, g, 0));
-                for (int w = 0; w < 3; ++w) CK(cudaGraphLaunch(ge, s));
-                CK(cudaEventRecord(e0, s));
-                for (int i = 0; i < 20; ++i) CK(cudaGraphLaunch(ge, s));
-                CK(cudaEventRecord(e1, s));
-                CK(cudaEventSynchronize(e1));
-                float ms = 0;
-                CK(cudaEventElapsedTime(&ms, e0, e1));
-                us[path] = ms * 1000.0 / 20 / Ls.size();
-                CK(cudaGraphExecDestroy(ge));
-                CK(cudaGraphDestroy(g));
-            }
-            std::printf("fmt %-6s T=%d in-proj (%.1f MB): ref %6.2f us  new %6.2f us (%5.0f GB/s)\n", f.name, T, mb, us[0],
-                        us[1], mb * 1e3 / us[1]);
-        }
-    }
-}
-
 void bench(cudaStream_t s) {
-    if (std::getenv("DEC_FMT_SWEEP")) { fmt_sweep(s); return; }
-    rec_phases(s);
     std::mt19937 rng(7);
     constexpr int NL = 12;   // distinct layers per graph: far more weight than the L2 holds
     const int types[NL][3] = {{23, 21, 14}, {14, 14, 14}, {12, 12, 13}, {14, 23, 14}, {13, 23, 12}, {14, 21, 14},
@@ -484,9 +326,9 @@ void bench(cudaStream_t s) {
     const int masks[4] = {1, 2, 4, 7};
     for (int T : {1, 2, 3, 4, 6, 8}) {
         for (int k = 0; k < 4; ++k) {
-            double us[5];
-            for (int path = 0; path < 5; ++path) {
-                g_gdnf = path - 1;
+            double us[4];
+            for (int path = 0; path < 4; ++path) {
+                g_gdnf = path;
                 cudaGraph_t g;
                 cudaGraphExec_t ge;
                 CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
@@ -494,8 +336,7 @@ void bench(cudaStream_t s) {
                     PdlScope ps(true, true);
                     for (const Layer& L : Ls) {
                         if (path == 0) run_ref(L, x, b, T, s, masks[k]);
-                        else if (path == 1) run_new(L, x, b, T, s, masks[k]);
-                        else run_gdnf(L, x, b, T, s, masks[k]);   // g_gdnf = path - 1
+                        else run_gdnf(L, x, b, T, s, masks[k]);
                     }
                 }
                 CK(cudaStreamEndCapture(s, &g));
@@ -513,8 +354,8 @@ void bench(cudaStream_t s) {
                 CK(cudaGraphDestroy(g));
             }
             const double bytes = (k == 3 ? (double) tot : (double) totw[k]) / NL;
-            std::printf("T=%d %-12s ref %6.2f us (%5.0f GB/s)  dec_gdn %6.2f  gdnf1 %6.2f  gdnf2 %6.2f  gdnf3 %6.2f us (%5.0f GB/s)\n",
-                        T, names[k], us[0], bytes / us[0] / 1e3, us[1], us[2], us[3], us[4], bytes / us[4] / 1e3);
+            std::printf("T=%d %-12s ref %6.2f us (%5.0f GB/s)  gdnf1 %6.2f  gdnf2 %6.2f  gdnf3 %6.2f us (%5.0f GB/s)\n",
+                        T, names[k], us[0], bytes / us[0] / 1e3, us[1], us[2], us[3], bytes / us[3] / 1e3);
         }
     }
 }
@@ -526,7 +367,6 @@ int main(int argc, char** argv) {
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, dev));
     if (p.major < 9) { std::printf("dec_gdn_parity: needs sm_90+ (have %d.%d)\n", p.major, p.minor); return 77; }
-    g_quiet = dec_gdn_mode() == 2;
     std::printf("%s: %d SMs, L2 %d MB, smem/block opt-in %zu KB\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 20,
                 p.sharedMemPerBlockOptin >> 10);
     cudaStream_t s;
@@ -535,15 +375,8 @@ int main(int argc, char** argv) {
     CK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&g_join, cudaEventDisableTiming));
-    if (mode == "--gdnf") {   // STRATA_DEC_GDNF: parity, then the bench
-        const bool ok = parity_gdnf(s);
-        std::printf("dec_gdn_parity --gdnf: %s\n", ok ? "PASS (bitwise, columns independent of T)" : "FAIL");
-        if (ok) bench(s);
-        return ok ? 0 : 1;
-    }
-    const bool ok = mode == "--bench-only" || parity(s);
-    if (mode != "--bench-only")
-        std::printf("dec_gdn_parity: %s\n", !ok ? "FAIL" : g_quiet ? "PASS (relaxed: errors above, column/T invariant)" : "PASS (bitwise)");
-    if (mode == "--bench" || mode == "--bench-only") bench(s);
+    const bool ok = mode == "--bench-only" || parity_gdnf(s);
+    if (mode != "--bench-only") std::printf("dec_gdn_parity: %s\n", ok ? "PASS (bitwise, columns independent of T)" : "FAIL");
+    if (ok && (mode == "--bench" || mode == "--bench-only")) bench(s);
     return ok ? 0 : 1;
 }

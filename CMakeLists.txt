@@ -200,7 +200,6 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
-                          src/kernels/cuda/dec_gdn_mm.cu
                           src/kernels/cuda/dec_gdn_rec.cu
                           src/kernels/cuda/dense_tc.cu
                           src/kernels/cuda/iq_kernels.cu
@@ -243,7 +242,6 @@ if(STRATA_ENABLE_CUDA)
       src/kernels/cuda/native_qsa_score.cu
       src/kernels/cuda/qsa_dec_fused.cu
       src/kernels/cuda/q5k_head.cu
-      src/kernels/cuda/dec_gdn_mm.cu
       PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")

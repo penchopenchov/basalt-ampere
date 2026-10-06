@@ -22,8 +22,6 @@ namespace strata::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
-/// The cap on the expert arena's CUDA registration in GiB: always -1 (the engine decides).
-int arena_pin_cap_gib();
 
 struct PinnedArena {
     void* base = nullptr;
