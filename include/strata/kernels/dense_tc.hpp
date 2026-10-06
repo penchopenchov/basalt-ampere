@@ -33,7 +33,7 @@ void dense_tc_pair(int type0, const void* w0, float* y0, int n_out0, int type1, 
                    const void* x_q8_1, int n_in, int ncols, void* stream);
 
 /// STRATA_DEC_PAIR (bits, default 0): 2 dense_tc_pair holds each warp's x fragments in registers across its tiles
-/// (n_in <= 3072; the same sums), 4 (with 2) two warp-sum buffers where one block per SM, 16 the hc read before the GDN qkv+z pair lets the pair in at its start, so the
+/// (n_in <= 3072; the same sums), 4 (with 2) two warp-sum buffers where one block per SM, 8 each tile into L2 one step before its copy, 16 the hc read before the GDN qkv+z pair lets the pair in at its start, so the
 /// pair's blocks stage their first tiles on the SMs the read leaves.
 int dense_tc_pair_mask();
 
