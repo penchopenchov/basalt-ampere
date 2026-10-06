@@ -280,6 +280,8 @@ struct Options {
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
+    /// The peer's experts are held only on the peer, not also in the RAM complement (needs --resident-experts).
+    bool peer_exclusive = false;
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
     int64_t peer_prefill_rows = -1;
@@ -642,6 +644,9 @@ void usage() {
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
+                 "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
+                 "                       also in RAM (less RAM).  The peer is filled from the file, and swaps of\n"
+                 "                       peer-held experts read the file.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
@@ -1345,6 +1350,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
+        else if (a == "--peer-exclusive") o.peer_exclusive = true;
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
@@ -1699,6 +1705,10 @@ int main(int argc, char** argv) {
     }
     if (o.remote_expert_opt && !o.serve) {
         std::fprintf(stderr, "basalt generate: --remote-expert-opt requires --serve\n");
+        return 2;
+    }
+    if (o.peer_exclusive && (o.peer_device < 1 || !o.resident_cpu_experts)) {
+        std::fprintf(stderr, "basalt generate: --peer-exclusive needs --peer-device and --resident-experts\n");
         return 2;
     }
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
@@ -4116,6 +4126,32 @@ int main(int argc, char** argv) {
         }
         return 0;
     };
+    // The peer tier's fill.  `exclusive` (--peer-exclusive): done before the RAM complement, which then leaves the
+    // peer's experts out, so they are read from the file here and held only on the peer.
+    auto open_peer = [&](bool exclusive) -> bool {
+        const auto tp0 = Clock::now();
+        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
+                       err, exclusive)) {
+            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
+            return false;
+        }
+        std::fprintf(stderr, "basalt generate: peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
+                             "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
+                     std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
+                     (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+        return true;
+    };
+    std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts only the peer holds (--peer-exclusive)
+    uint64_t peer_only_bytes = 0;
+    if (o.resident_cpu_experts && o.peer_exclusive && o.peer_device >= 1) {
+        if (!open_peer(true)) return 1;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                if (peer.has(l, e)) {
+                    peer_only.emplace_back((int32_t) l, (int32_t) e);
+                    peer_only_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(l);
+                }
+    }
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
     // hold are copied from the experts section into RAM once, so no decode or prompt step reads the file (the plain mmap
     // mode reads them through the OS file cache, which a small-RAM PC keeps giving back to the SSD).  Built here,
@@ -4133,7 +4169,7 @@ int main(int argc, char** argv) {
         // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
         const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
         if (adapt_fast_on) src.set_spares(o.adapt_swaps);
-        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
+        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, lend_from, o.resident_headroom,
                                                     o.resident_budget, &profile);
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
@@ -4141,7 +4177,7 @@ int main(int argc, char** argv) {
             // path (sized by the RAM alone) instead of none: the misses outside it read the same file bytes the mmap
             // fallback reads, so the answers are unchanged.  Nothing pinned: the fallback below.
             whole_err = err;
-            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, -1, o.resident_headroom,
+            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, -1, o.resident_headroom,
                                                    basalt::core::FileExpertSource::kResidentWhatFits, &profile);
             if (resident_ok) {
                 std::fprintf(stderr, "basalt generate: the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
@@ -4187,23 +4223,12 @@ int main(int argc, char** argv) {
     }
     // experts no RAM tier holds (none was asked for, or the RAM is short) are read from the file when needed
     if (srcp == &src && !src.complement_ready() && expert_total_bytes > cache_fill_bytes) {
-        basalt::core::LoadProgress::skipped(expert_total_bytes - cache_fill_bytes);
+        basalt::core::LoadProgress::skipped(expert_total_bytes - cache_fill_bytes - peer_only_bytes);
         basalt::core::LoadProgress::plan("ram", 0);
     }
-    // ---- the peer's experts: the ranked pairs the primary does not hold.  They are copies of experts the RAM
-    // complement holds, so with the complement built they are read from it, not from the file.
-    if (o.peer_device >= 1) {
-        const auto tp0 = Clock::now();
-        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
-                       err)) {
-            std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
-            return 1;
-        }
-        std::fprintf(stderr, "basalt generate: peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s); with the primary's "
-                             "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
-                     std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
-                     (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
-    }
+    // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
+    // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
+    if (o.peer_device >= 1 && !peer.valid() && !open_peer(false)) return 1;
     drive.d.peer = peer.valid() ? &peer : nullptr;
     if (o.serve) {
         if ((!no_spec && (o.spec < 2 || o.mtp.empty())) || o.prefill_chunk <= 0 ||

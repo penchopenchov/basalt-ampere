@@ -629,7 +629,7 @@ bool FileExpertSource::pin_cache_complement(
         lend_from_slot = -1;
     }
 
-    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
+    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots;
     uint64_t budget = std::numeric_limits<uint64_t>::max();
     if (bytes > 0 || lend) {
         // with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own allocations,
@@ -773,8 +773,12 @@ bool FileExpertSource::pin_cache_complement(
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
             if (offsets[index] != kNoComplement && !on_gpu[index]) progress_total += layer_blob_bytes_[(size_t) layer];
         }
+    // experts another GPU holds alone are placed by that tier's own phase
+    uint64_t extra_gpu_bytes = 0;
+    for (const auto& pr : additional_gpu_pairs) extra_gpu_bytes += layer_blob_bytes_[(size_t) pr.first];
     const uint64_t all_experts = expert_bytes();
-    if (all_experts > gpu_bytes + progress_total) LoadProgress::skipped(all_experts - gpu_bytes - progress_total);
+    if (all_experts > gpu_bytes + extra_gpu_bytes + progress_total)
+        LoadProgress::skipped(all_experts - gpu_bytes - extra_gpu_bytes - progress_total);
     LoadProgress::plan("ram", progress_total);
     LoadProgress progress("ram", progress_total);
     std::atomic<bool> failed{false};
@@ -887,7 +891,8 @@ bool FileExpertSource::pin_cache_complement(
                      complement_lent_slots_ < n_slots - lend_from_slot
                          ? " (the others are read from the file when lent: not enough RAM for them)" : "");
     if (!additional_gpu_pairs.empty()) {
-        std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
+        std::fprintf(stderr, "FileExpertSource: %zu experts held only by another GPU are not kept here (read from the "
+                             "file when needed)\n",
                      additional_gpu_pairs.size());
     }
     std::fflush(stderr);

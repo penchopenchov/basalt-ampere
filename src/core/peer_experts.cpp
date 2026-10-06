@@ -92,7 +92,7 @@ void PeerExperts::close() {
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
-                       std::string& err) {
+                       std::string& err, bool exclusive) {
     close();
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
@@ -173,8 +173,8 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     const bool advise = src.advise_pairs(pick.data(), (int64_t) std::min(kAhead, pick.size()));
     uint64_t fill_total = 0;
     for (const auto& pr : pick) fill_total += lay.blob_bytes(pr.first);
-    LoadProgress::plan(LoadProgress::cuda(device), fill_total, true);
-    LoadProgress progress(LoadProgress::cuda(device), fill_total, true);
+    LoadProgress::plan(LoadProgress::cuda(device), fill_total, !exclusive);
+    LoadProgress progress(LoadProgress::cuda(device), fill_total, !exclusive);
     for (size_t i = 0; i < pick.size(); ++i) {
         const auto& pr = pick[i];
         if (advise && i + kAhead < pick.size()) (void) src.advise_pairs(&pick[i + kAhead], 1);
