@@ -28,7 +28,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 # ------------------------------------------------------------------------------------------------ template
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     """The template refused the request's messages (e.g. "No user query found in messages."): a ValueError, so the
-    client gets a 400 with the template's message instead of a dropped connection (#365)."""
+    client gets a 400 with the template's message instead of a dropped connection."""
 
 
 class ChatTemplate:
@@ -136,9 +136,9 @@ def images_of(messages: list[dict]) -> list[str]:
             for item in m["content"] if item.get("type") == "image"]
 
 
-# #537: a literal <think> / </think> inside a message's text is plain text, not the model's reasoning markers.  The
+# a literal <think> / </think> inside a message's text is plain text, not the model's reasoning markers.  The
 # tokenizer matches those two strings as their special tokens everywhere (GGUF token type 4, as llama.cpp does), so
-# a user quoting "</think>" used to hand the model a real end-of-reasoning token.  Before the template is rendered
+# a user quoting "</think>" would hand the model a real end-of-reasoning token.  Before the template is rendered
 # they are swapped for these private-use characters, and the server encodes the spans they mark as ordinary text.
 THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 THINK_MARKS = {v: k for k, v in THINK_TAGS.items()}
@@ -171,7 +171,7 @@ def _has_tag(v) -> bool:
 
 
 def mark_think_literals(messages: list[dict], tools: list[dict] | None):
-    """#537: (messages, tools) with every literal <think> / </think> in their text swapped for THINK_TAGS' marks, and
+    """(messages, tools) with every literal <think> / </think> in their text swapped for THINK_TAGS' marks, and
     whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
     An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
     inline) keeps that one block as the model's markers, as before."""
@@ -214,13 +214,13 @@ def unmark_think_literals(prompt: str) -> tuple[str, list[tuple[int, int]]]:
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
-    turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
+    turn, some OpenAI clients a late "developer" message - so those become user messages, in place:
     merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
 
 
 def _object_list(value, name: str) -> list[dict]:
-    """#460: a request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
+    """A request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
     double-encoded, as a JSON string, which used to be iterated character by character and crashed on m.get: such a
     string is decoded.  Anything that is still not a list of objects is a ValueError, which the server answers with
     a 400 naming the field.  None (or no field) is an empty list, as a missing field always was."""
@@ -237,7 +237,7 @@ def _object_list(value, name: str) -> list[dict]:
 
 
 def _tool_list(value, wrapper: str | None) -> list[dict]:
-    """#592: a request's "tools" as a list of tool objects, each with a name - in the OpenAI shape
+    """A request's "tools" as a list of tool objects, each with a name - in the OpenAI shape
     {"type": "function", "function": {"name": ...}} (`wrapper` "function"; a bare {"name": ...} is still taken), or
     in the Anthropic shape {"name": ...} (`wrapper` None).  A value that is not (a string such as "auto", a list of
     names, an object without a name) is a ValueError - a 400 naming the field - where it used to take the request
@@ -296,8 +296,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
 
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
-    without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
-    renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    without "thinking", an effort or a budget gets the template's default (it thinks); False
+    renders it without thinking (the config's "anthropic_thinking": "on_request")."""
     messages = []
     system = req.get("system")
     if system:
@@ -343,12 +343,12 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
-        # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
+        # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks, since a
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
         # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
-        # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
+        # request that gives its own reasoning_budget_tokens asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
     return _late_system_to_user(messages), tools, kwargs
 
@@ -379,7 +379,7 @@ FUNC_END = "</function>"
 
 def param_end(text: str, final: bool = False) -> int:
     """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
-    `<parameter=` or `</function>` - the same text inside a value (a file that documents the call format, #210) is
+    `<parameter=` or `</function>` - the same text inside a value (a file that documents the call format) is
     part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
@@ -393,7 +393,7 @@ def param_end(text: str, final: bool = False) -> int:
 
 
 def call_end(text: str) -> int:
-    """Where a tool call's body ends (#210): the `</tool_call>` after the call's own `</function>`, found by walking
+    """Where a tool call's body ends: the `</tool_call>` after the call's own `</function>`, found by walking
     its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
     the call format ends at the first `</tool_call>`, as before."""
     s = text.lstrip()
@@ -659,7 +659,7 @@ class OutputParser:
 
     def finish(self) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211)."""
+        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it)."""
         out = []
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced

@@ -29,7 +29,7 @@ class ReloadableEngine(MockEngine):
 
 
 class MonitorOff(unittest.TestCase):
-    """#332 is opt-in: by default no prompt or answer is kept, and the monitor's endpoints do not exist."""
+    """Is opt-in: by default no prompt or answer is kept, and the monitor's endpoints do not exist."""
 
     def test_off_by_default(self):
         tok = ByteTokenizer()
@@ -78,7 +78,7 @@ class Monitor(unittest.TestCase):
             return response.status, json.loads(raw) if "application/json" in response.headers.get("Content-Type", "") else raw
 
     def chat(self, api="openai", **kwargs):
-        # Anthropic thinks only when asked (#278): "thinking" there, reasoning_effort for OpenAI
+        # Anthropic thinks only when asked: "thinking" there, reasoning_effort for OpenAI
         think = {"thinking": {"type": "enabled", "budget_tokens": 1024}} if api == "anthropic" else             {"reasoning_effort": "low"}
         return self.request("/v1/messages" if api == "anthropic" else "/v1/chat/completions",
                             {"messages": [{"role": "user", "content": "Say hello."}],
@@ -195,7 +195,7 @@ class Monitor(unittest.TestCase):
 
 
 class ConversationCacheCard(unittest.TestCase):
-    """#596: /metrics' "conversation_cache": the parked conversations from the engine's log lines, the budget and
+    """/metrics' "conversation_cache": the parked conversations from the engine's log lines, the budget and
     slots from its INFO line, and how much of the prompts the cache gave back."""
 
     PARK = ("basalt serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=104857600 evictions=0 "

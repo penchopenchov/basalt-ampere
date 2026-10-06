@@ -299,7 +299,7 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(cs[-1]["usage"]["prompt_tokens"], len(self.engine.prompts[1]))
 
     def test_a_call_the_output_ends_inside_is_not_run(self):
-        """#211: the model's turn ends inside an MCP call: nothing runs (it used to run with no arguments)."""
+        """The model's turn ends inside an MCP call: nothing runs."""
         script = call_script("fake__echo", text="hello from the tool")
         self.start(script[:script.index("from the tool")], "</think>\n\nnever")
         code, text = self.post({"basalt_mcp": True})

@@ -1,4 +1,4 @@
-"""#533: POST /v1/vram (opt-in hot VRAM resize) - the engine command, the route, the config key, a reserve kept for
+"""POST /v1/vram (opt-in hot VRAM resize) - the engine command, the route, the config key, a reserve kept for
 an unloaded engine and applied when it loads again."""
 import io
 import json

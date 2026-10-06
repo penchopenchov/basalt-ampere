@@ -1,4 +1,4 @@
-"""serve/test_runconfig.py - #564: the web page's Settings view of the run config (GET / POST /config), against the
+"""serve/test_runconfig.py - the web page's Settings view of the run config (GET / POST /config), against the
 mock engine: only the listed keys change, every other key of the file stays, a bad value changes nothing, and only
 basalt's own page may write it (JSON, no foreign Origin, the API key when one is set).
 

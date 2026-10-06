@@ -1,4 +1,4 @@
-"""serve/responses.py - #451: OpenAI's Responses API (POST /v1/responses), stateless, on the chat path.
+"""serve/responses.py - OpenAI's Responses API (POST /v1/responses), stateless, on the chat path.
 
 A Responses request becomes the same template messages, tools and kwargs a Chat Completions request does, runs through
 the same Service.run, and its events (reasoning, text, tool calls) come back as Responses output items and typed SSE
@@ -17,7 +17,7 @@ Codex CLI is the first client.  What it needs, and what this does:
   * the official event order: response.created, response.in_progress, response.output_item.added, deltas,
     ...done events, response.output_item.done, and response.completed / response.incomplete / response.failed.
 
-Based on #630 by CC-David-CC (the item/event assembler, namespace tools, call_id ordering of tool results).
+Based on a contribution by CC-David-CC (the item/event assembler, namespace tools, call_id ordering of tool results).
 """
 from __future__ import annotations
 
@@ -494,7 +494,7 @@ class Assembler:
         """The end: close what is open, then response.completed (or .incomplete when max_output_tokens ran out).
         `validate(text, finish)` checks a structured answer and returns its text (or raises)."""
         length = done.get("finish") == "length"
-        # a call still open was cut off (its tool_call never came, #211): incomplete, whatever the finish
+        # a call still open was cut off (its tool_call never came): incomplete, whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
         out = self.close("incomplete" if length or unfinished else "completed")
         if self.json_mode:

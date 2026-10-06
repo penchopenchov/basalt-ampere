@@ -1,4 +1,4 @@
-"""serve/test_responses.py - #451: the Responses API (POST /v1/responses) against the mock engine (no GPU, no pack).
+"""serve/test_responses.py - the Responses API (POST /v1/responses) against the mock engine (no GPU, no pack).
 
     python -m unittest serve.test_responses -v
 """

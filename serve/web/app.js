@@ -1,5 +1,5 @@
 // serve/web/app.js - the basalt web app: Chat, Monitor, About. No framework, no network beyond this server.
-// The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
+// The Monitor tab: a dashboard on the server's own /metrics.
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -151,7 +151,7 @@ function setMetric(key, value, unit, sub) {
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
-let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps
 async function poll() {
   try {
     const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
@@ -195,7 +195,7 @@ function render(m) {
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
-// #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
+// the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
 // conversations it parks in RAM when "--conversation-cache-mib N" is in the run config's args (opt-in)
 function since(t) {
   if (!t) return "";
@@ -275,7 +275,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
-  // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
+  // a model split across several cards: the cards show their total / mean / hottest, and each card's own
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
@@ -337,7 +337,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
-      // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
+      // the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
         (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
@@ -431,7 +431,7 @@ function renderMcp() {
   }).join("");
 }
 
-// ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
+// ------------------------------------------------------------------ Model settings (GET / POST /config)
 // A few documented keys of the run config (basalt-<model>.json), for every client, from the next start on.  The
 // server lists them, checks every value and keeps every other key of the file as it is.
 let cfgKeys = [];
@@ -889,7 +889,7 @@ $("export-btn").onclick = () => {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 };
 
-// pictures and text files: the attach button, dropping them on the chat, or pasting a picture (issue #30)
+// pictures and text files: the attach button, dropping them on the chat, or pasting a picture
 const TEXT_EXT = /\.(txt|md|markdown|rst|tex|py|pyi|ipynb|js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|jsonl|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|less|c|cc|cpp|cxx|h|hh|hpp|cu|cuh|rs|go|java|kt|kts|swift|rb|php|pl|lua|r|jl|scala|sql|sh|bash|zsh|fish|ps1|psm1|bat|cmd|diff|patch|gradle|cmake|mk|dockerfile|gitignore|proto|graphql)$/i;
 const MAX_TEXT_FILE = 512 * 1024;
 function isTextFile(f) {

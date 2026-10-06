@@ -1,4 +1,4 @@
-"""serve/telemetry.py - hardware readings for the web app's Monitor tab (idea from PR #22 by code-martin).
+"""serve/telemetry.py - hardware readings for the web app's Monitor tab.
 
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (libnvidia-ml.so.1, installed with every driver) through ctypes, so no pip package
@@ -162,7 +162,7 @@ class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
-        the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
+        the model is split across several - the gpu_* readings are then their total (memory, power,
         PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own."""
         self.extra = extra
         self.lock = threading.Lock()

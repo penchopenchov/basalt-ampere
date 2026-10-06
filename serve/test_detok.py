@@ -25,7 +25,7 @@ def find_tokenizer():
 
 
 class OldDetokenizer:
-    """The pre-0.1.22 algorithm: re-decode every generated id, hold a trailing U+FFFD."""
+    """The earlier algorithm: re-decode every generated id, hold a trailing U+FFFD."""
 
     def __init__(self, tok):
         self.tok, self.ids, self.sent = tok, [], 0
@@ -100,7 +100,7 @@ class Detok(unittest.TestCase):
         self.assertLess(late, early * 5 + 0.002)
 
 
-# ------------------------------------------------------------------ #268: the heap BPE for long words
+# ------------------------------------------------------------------ the heap BPE for long words
 _REAL = []
 
 
@@ -189,7 +189,7 @@ def synthetic_tokenizer(seed=268, n_merges=1500):
 
 
 class HeapBpe(unittest.TestCase):
-    """#268: words longer than HEAP_MIN symbols merge with a heap; the ids must be exactly the scan's."""
+    """Words longer than HEAP_MIN symbols merge with a heap; the ids must be exactly the scan's."""
 
     def parity(self, tok, texts):
         for k, text in enumerate(texts):

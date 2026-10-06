@@ -1,4 +1,4 @@
-"""#465: "parallel": N - several requests decode together in the engine's batch slots (--batch N).
+"""The config's "parallel": N - several requests decode together in the engine's batch slots (--batch N).
 
 A fake engine (a Python script speaking the engine's GEN / BGEN / BT / BDONE / BADM / BSTOP lines) runs behind the
 real BasaltEngine and Service, so the server's side is tested without a GPU: requests up to N run at once, more
@@ -298,7 +298,7 @@ class ParallelService(unittest.TestCase):
         return res
 
     def test_a_long_prompt_gives_way_to_a_short_one(self):
-        """#656: a long solo prompt read gives way at a chunk boundary; the short request is answered first, then the
+        """A long solo prompt read gives way at a chunk boundary; the short request is answered first, then the
         long one goes on (in the slot its part waited in) and is answered too."""
         self.start(2)
         long_q, short_q = "long " * 600, "short"

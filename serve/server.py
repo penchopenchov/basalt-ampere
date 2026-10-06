@@ -62,7 +62,7 @@ from serve.responses import ResponsesError, error_body as responses_error_body  
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
-# #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
+# the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
 EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
@@ -70,11 +70,11 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
                          "elaboration."}
 VISION_START = "<|vision_start|>"
-# #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
+# a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
-# #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
+# what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `basalt --serve` rejects prompt + max_new + 8 > context: keep the same margin here
@@ -82,12 +82,12 @@ CTX_SLACK = 8               # `basalt --serve` rejects prompt + max_new + 8 > co
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
-# #481: a running request whose engine prints nothing (no T, PP or any other line) for this long has lost step with the
+# a running request whose engine prints nothing (no T, PP or any other line) for this long has lost step with the
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
 ENGINE_SILENCE_S = 300.0
-# ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto, issue
-# #282), and the slowest PCs read ~100 tok/s, so a first chunk can take minutes before the first line.  Until the first
+# ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto)
+# and a slow PC can take minutes over a first chunk before the first line.  Until the first
 # PP the wait adds the chunk's tokens at PP_FLOOR_TOK_S; after one, a chunk may take PP_SLACK x the last one's time.
 PP_CHUNK_MAX = 32768
 PP_FLOOR_TOK_S = 50.0
@@ -127,11 +127,11 @@ class MockEngine:
 
 
 class EngineDied(RuntimeError):
-    """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+    """The engine process ended in the middle of a request (on Linux, usually the out-of-memory killer)."""
 
 
 class EngineStarting(RuntimeError):
-    """The engine is (re)starting and has not said READY yet (#344): no context size to plan a request with - a 503,
+    """The engine is (re)starting and has not said READY yet: no context size to plan a request with - a 503,
     not a 400 about the prompt."""
 
 
@@ -140,7 +140,7 @@ class ModelBusy(RuntimeError):
 
 
 class EngineSilent(EngineDied):
-    """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
+    """The engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
     EngineDied, so the request ends with an error and the next one starts the engine again."""
 
@@ -156,7 +156,7 @@ class GpuBusy(RuntimeError):
 
 
 ENGINE_REQUEST = re.compile(
-    # "+ 12288 of 98179 read": a request cancelled while its prompt was read (#471)
+    # "+ 12288 of 98179 read": a request cancelled while its prompt was read
     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
     r"\((?P<pp>[\d.]+) tok/s\), "
     r"(?P<gen>\d+) generated in (?P<gen_ms>[\d.]+) ms \((?P<tg>[\d.]+) tok/s\)")
@@ -171,8 +171,8 @@ DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cy
 
 
 def start_failure_hint(log: str | None, offset: int) -> str:
-    """#474: what to change when the engine stopped at the start because the MTP draft head did not fit the VRAM
-    left: the engine's own `basalt mtp:` lines after that failure (0.1.36+: what it needs, what is free, the smaller
+    """What to change when the engine stopped at the start because the MTP draft head did not fit the VRAM
+    left: the engine's own `basalt mtp:` lines after that failure (what it needs, what is free, the smaller
     subsets), else the same advice in words for an older engine.  "" for any other failure: the log says why."""
     if not log:
         return ""
@@ -190,7 +190,7 @@ def start_failure_hint(log: str | None, offset: int) -> str:
 
 
 def start_log_tail(log: str | None, offset: int, n: int = 20) -> str:
-    """#496: the last n lines this start wrote to the engine log, for the error when the engine ended before READY -
+    """The last n lines this start wrote to the engine log, for the error when the engine ended before READY -
     whatever the failure, the engine's own reason is in them (people posted the traceback without the log).  "" when
     there is no log or nothing in it from this start."""
     if not log:
@@ -234,7 +234,7 @@ def echo_requests(log_path: str, offset: int) -> None:
 
 
 def experts_loading_words(args: list, size: str) -> str:
-    """#505: what the start does with the experts, by the engine's flags (generate.cpp's option parsing): a RAM budget
+    """What the start does with the experts, by the engine's flags (generate.cpp's option parsing): a RAM budget
     copies the hottest N GiB into RAM (--resident-budget-gib), the resident low-RAM mode the ones the GPU does not hold
     (--resident-experts), plain --mmap-experts reads them from the model files through the OS file cache (nothing is
     loaded into RAM up front); otherwise all of them go into RAM."""
@@ -289,7 +289,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             cut = chunk.rfind(b"\n") + 1
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
-                if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
+                if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # mapped
                     say("arena", f"[basalt] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
                                  "         Please wait and don't close this window; the browser opens when it is ready.")
@@ -307,7 +307,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 
 
 class ConvCacheLog:
-    """#596: the engine's conversation cache as its log tells it (the engine writes "basalt serve: conversation
+    """The engine's conversation cache as its log tells it (the engine writes "basalt serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
     which is the log): read on from where it was last read, from the start of the engine's current run."""
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
@@ -364,7 +364,7 @@ class ConvCacheLog:
 
 
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
-    """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
+    """The Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
     mib = info.get("conversation_cache_mib")
     last = hist[-1] if hist else None
@@ -392,8 +392,8 @@ class BasaltEngine:
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
     """
-    silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
-    silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
+    silence_s = ENGINE_SILENCE_S         # main() sets the config's engine_silence_s (survives restart())
+    silent_note = None                   # why the server ended a silent engine (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
@@ -416,7 +416,7 @@ class BasaltEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
-        self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
+        self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -425,7 +425,7 @@ class BasaltEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
-        self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.info = {}                   # INFO key=value facts: kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.silent_note = None
@@ -435,11 +435,11 @@ class BasaltEngine:
             self.info["version"] = None
         if lazy:
             return
-        self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
+        self.unloaded = False            # `ended` stays True until READY (below): not alive while starting
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
-        self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
+        self.log_start = log_start                      # the Monitor's conversation cache reads from here
         if log:
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
                              daemon=True).start()
@@ -473,11 +473,11 @@ class BasaltEngine:
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") +
                                start_failure_hint(log, log_start) + start_log_tail(log, log_start))
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
-        # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
-        # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
+        # a locally built engine can sit next to another release's BUILD.json: engines that
+        # report their own version (INFO engine=) win, the manifest stays the fallback for the others
         if self.info.get("engine"):
             self.info["version"] = str(self.info["engine"])
-        self.ended = False                              # READY: alive from here (restart() set it True, #344)
+        self.ended = False                              # READY: alive from here (restart() set it True)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
         # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
@@ -510,7 +510,7 @@ class BasaltEngine:
         self.pump.start()
 
     def _pump(self):
-        proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
+        proc, lines = self.proc, self.lines             # this process's: a restart replaces both
         slot_q = self.slot_q
         for line in proc.stdout:
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
@@ -527,8 +527,8 @@ class BasaltEngine:
             q.put(None)
 
     def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
-        if getattr(self, "silent_note", None):          # #481: the server ended it, not the OS or the engine itself
+        """Why the engine most likely ended, from the end of its log: its own watchdog, else RAM."""
+        if getattr(self, "silent_note", None):          # the server ended it, not the OS or the engine itself
             return self.silent_note
         tail = ""
         try:
@@ -544,7 +544,7 @@ class BasaltEngine:
                         "line: " + line.strip() + " - please report it.")
         rc = self.proc.poll()
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("basalt", "ERR"))), "")
-        if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
+        if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
                     "report it with the log.")
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
@@ -572,14 +572,14 @@ class BasaltEngine:
     def restart(self, tries: int = 3):
         """Start the engine again (the same command) after it died; the new process has its own line queue.
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
-        exits before READY - a dead engine's VRAM can take a while to come back - is retried
-        (PR #637)."""
+        exits before READY - a dead engine's VRAM can take a while to come back - is retried.
+"""
         self.close()
         info = dict(self.info)
-        self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
+        self.starting = True                     # prepare() answers 503 "starting" meanwhile
         try:
             for i in range(tries):
-                # #344: not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
+                # not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
                 # READY, and a request that saw alive() in that window skipped load() and failed with "context
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
@@ -604,19 +604,19 @@ class BasaltEngine:
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
-        if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
+        if len(f) >= 9:                                   # the conversation cache's fields
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
-        if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
+        if len(f) >= 14:                                  # the expert tiers: RAM / file blobs, file MB
             self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
-        if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
+        if len(f) >= 15:                                  # the prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
-        if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
+        if len(f) >= 16:                                  # routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
-        """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
+        """`VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
         expert cache until that much VRAM is free, or grows it back when more is free; None: back to the reserve it
         started with.  -> the engine's figures (expert_slots, expert_cache_mib, vram_free_mib, ...); raises ValueError
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
@@ -795,7 +795,7 @@ class BasaltEngine:
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
-    YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
+    YIELDS_MAX = 2   # how often one request's prompt read gives way to a shorter waiting one
 
     def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
@@ -842,7 +842,7 @@ class BasaltEngine:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
     def _shorter_waiting(self, plen: int) -> bool:
-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+        """Someone waits for the control lines with a prompt under half this one's: worth giving way to."""
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
@@ -852,7 +852,7 @@ class BasaltEngine:
         its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
         slot's own BT lines until BDONE.  Several requests run at once; the control lines (prompt reading, admission)
         are taken one request at a time - and a long prompt read gives way at a chunk boundary to a waiting request
-        with a much shorter prompt (#656: `BYIELD <slot>`; the part read waits in a slot and the read goes on after).
+        with a much shorter prompt (`BYIELD <slot>`; the part read waits in a slot and the read goes on after).
         A consumer that stops early leaves the engine in step: the solo request is STOPped and read to its DONE, an
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
         self.progress = None
@@ -1097,7 +1097,7 @@ class BasaltEngine:
             return
         self.progress = None
         self.prefill_tok_s_mean = None
-        # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
+        # an image request takes the same sampling keys as text (greedy only when none is asked for)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
@@ -1106,7 +1106,7 @@ class BasaltEngine:
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
-        # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
+        # how long the engine may stay silent from here.  Until the first line: the request's first prompt
         # chunk at the slowest prompt reading on top of silence_s; a PP line resets it to its own chunk's time.
         silence = float(self.silence_s or 0)
         allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
@@ -1144,7 +1144,7 @@ class BasaltEngine:
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
-                        if silence > 0 and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
+                        if silence > 0 and rate > 0 and chunk > 0:   # the next chunk, as long as this one
                             allow = max(silence, PP_SLACK * chunk / rate)
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
@@ -1169,7 +1169,7 @@ class BasaltEngine:
                         self.proc.stdin.flush()
                     except OSError:
                         pass
-                # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
+                # never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
                 # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
                 heard = time.monotonic()
@@ -1191,7 +1191,7 @@ class BasaltEngine:
                         heard = time.monotonic()
 
     def _silent(self, what: str) -> EngineSilent:
-        """#481: end an engine that lost step with the server (its main thread waits for a command the server never
+        """End an engine that lost step with the server (its main thread waits for a command the server never
         sends), so the next request starts it again: killed now, its GPU and RAM go back with the process."""
         self.silent_note = ("The engine and the server lost step (a very slow PC can raise "
                             "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, keep "
@@ -1340,7 +1340,7 @@ class Vision:
                 self.proc.stdin.write(f"ENC {img} {out}\n")
                 self.proc.stdin.flush()
                 line = self.proc.stdout.readline().strip()
-            finally:                                                   # #352: also when the encoder's pipe is gone
+            finally:                                                   # also when the encoder's pipe is gone
                 img.unlink(missing_ok=True)
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
@@ -1371,7 +1371,7 @@ def gpu_list(cfg: dict) -> list[int]:
 
 
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
-    """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
+    """The engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
     default) or the engine is too old for it (said once; the prompt stays the default one).  ValueError for a value
     other than "start" / "end"."""
@@ -1387,7 +1387,7 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         known = False
     role = tok.encode("system", parse_special=True)
     if not known or len(role) != 1:
-        print("[basalt] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
+        print("[basalt] effort_position \"end\" needs an engine with --tail-role-token: the reasoning "
               "effort stays at the top of the prompt", flush=True)
         return None
     print("[basalt] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
@@ -1396,7 +1396,7 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
 
 
 def engine_silence_s(cfg: dict) -> float:
-    """#481: the config's "engine_silence_s" - seconds an engine may print nothing during a request before the server
+    """The config's "engine_silence_s" - seconds an engine may print nothing during a request before the server
     ends it (default ENGINE_SILENCE_S; 0 = wait forever).  ValueError for anything but a number >= 0."""
     v = cfg.get("engine_silence_s")
     if v is None:
@@ -1407,7 +1407,7 @@ def engine_silence_s(cfg: dict) -> float:
 
 
 def layer_split_value(cfg: dict) -> str:
-    """#644: the config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the FIRST LAYER of
+    """The config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the FIRST LAYER of
     each later GPU's share - one rising number per GPU after the first, e.g. "24,36,42" for 4 GPUs (layers 0-23 on the
     first card, 24-35, 36-41, 42 to the end) - as a string or a JSON list ([24, 36, 42]).  ValueError with the format
     and an example for anything else, such as per-card layer counts ("24,16,12,12")."""
@@ -1449,7 +1449,7 @@ def engine_args(cfg: dict) -> list[str]:
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
     if len(gpu_list(cfg)) > 1 and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
         args.append("--split-skip-if-fits")
-    # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
+    # "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
     # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512)
     if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:
         args.append("--vram-elastic")
@@ -1464,7 +1464,7 @@ PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyM
 
 
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
-    """#465 (opt-in): "parallel": N in the config - up to N requests decode together in the engine's batch slots
+    """"parallel": N in the config - up to N requests decode together in the engine's batch slots
     (--batch N); more wait their turn.  1 or absent: one request at a time, as before.  A value the engine cannot use
     is said and passed on: the engine warns and adjusts (recommend, never force)."""
     if "--batch" in args or "--slots" in args:
@@ -1500,7 +1500,7 @@ def profile_shape(path: str) -> tuple[int, int] | None:
 
 
 def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
-    """#477 (opt-in): "expert_profile_save": "<path>" in the config has the engine (0.1.36+) save what its adaptive
+    """"expert_profile_save": "<path>" in the config has the engine save what its adaptive
     tier learned there - on QUIT and every "expert_profile_save_every" minutes (10 by default, 0 = at QUIT only) -
     and the next start begins from it instead of the config's --expert-profile, when it is a profile of the same
     model (its header's layers and experts match); otherwise from the config's own, as before.  A relative path is
@@ -1526,7 +1526,7 @@ def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries (pip's nvidia packages, or the toolkit that
     compiled the engine) first on the library search path."""
     env = dict(os.environ)
-    if gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
+    if gpu_list(cfg):                              # the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # environment the config carries for the engine
@@ -1541,7 +1541,7 @@ def child_env(cfg: dict) -> dict:
 def vision_env(cfg: dict, env: dict) -> dict:
     """The image encoder's environment: the engine's, unless the config's vision section names its own "cuda_device"
     (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
-    keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes."""
+    keeps all of its own cards' VRAM.  Without it, nothing changes."""
     dev = (cfg.get("vision") or {}).get("cuda_device")
     if dev is None:
         return env
@@ -1613,23 +1613,23 @@ class Service:
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
-        self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
+        self.aliases: list[str] = []                  # other names of the model (the config's `aliases`)
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
+        # a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
-        self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
-        self.config_path = None                         # #564: the run config the web page's Settings view edits
+        self.conv_log = ConvCacheLog()                  # the parked conversations, from the engine's log
+        self.config_path = None                         # the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
-        # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
+        # browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
         # matters); empty = no CORS headers at all, as before
         self.cors_origins: list[str] = []
-        # #321: origins that count as basalt's own page for /settings and MCP tools, e.g. the web app reached through a
+        # origins that count as basalt's own page for /settings and MCP tools, e.g. the web app reached through a
         # reverse proxy or tunnel whose Host differs ("https://basalt.example.com"); never a wildcard
         self.trusted_origins: list[str] = []
         # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts;
@@ -1641,16 +1641,16 @@ class Service:
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
-        # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
+        # the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
         # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
         self.api_monitor = False
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
-        # since the server started (the Monitor's totals, issue #35)
+        # since the server started (the Monitor's totals)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
-                       "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
+                       "drafts_offered": 0, "drafts_accepted": 0}   # the MTP drafts, summed where reported
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -1662,10 +1662,10 @@ class Service:
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
         self.before_load = None
-        self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
-        self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
-        self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
-        self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.vram_reserve = None                         # the last POST /v1/vram reserve (None: the start's)
+        self.reasoning_budget_tokens = 0                 # the config's default thinking budget (0: none)
+        self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # one token this many times in a row ends a reply (0: off)
+        self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
@@ -1673,7 +1673,7 @@ class Service:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
     def set_aliases(self, aliases) -> None:
-        """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
+        """The config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
         ValueError for anything else."""
         if aliases is None:
             aliases = []
@@ -1691,13 +1691,13 @@ class Service:
         return [self.model, *self.aliases]
 
     def model_for(self, req) -> str:
-        """The name to answer with: the request's own when it is the model's name or an alias (#297), else the model's.
+        """The name to answer with: the request's own when it is the model's name or an alias, else the model's.
         Other names are still served, as before."""
         asked = req.get("model") if isinstance(req, dict) else None
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
 
     def reasoning_budget(self, req) -> int | None:
-        """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
+        """The most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
         config's.  0 (or less) means no budget, so a request can turn a configured one off.  ValueError (a 400) for
         anything that is not a whole number."""
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
@@ -1727,7 +1727,7 @@ class Service:
             return None
 
     def ensure_loaded(self):
-        """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
+        """Start the engine if it is not running (unloaded, or it died -), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
@@ -1760,16 +1760,16 @@ class Service:
                   "(a minute or two) ...", flush=True)
         self.engine.restart()
         print("[basalt] the engine is running again", flush=True)
-        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
+        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
                 print(f"[basalt] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
 
-    vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
+    vram_wait_s = 300.0                                  # how long POST /v1/vram waits for a running request
 
     def vram(self, reserve_mib: int | None) -> dict:
-        """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
+        """, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
         engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
         An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
@@ -1799,7 +1799,7 @@ class Service:
             self.fifo.release()
 
     def _say_died(self, e: Exception) -> None:
-        """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
+        """The server window's line for an engine that died (or was ended) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
         print(f"[basalt] {e}. {note} The next request starts the engine again."
@@ -1946,7 +1946,7 @@ class Service:
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
     def begin_request(self, path, req):
-        """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
+        """A monitor record for this request, or None when the monitor is off (nothing is kept then)."""
         if not self.api_monitor:
             return None
         raw = json.dumps(req, ensure_ascii=False, indent=2)
@@ -2007,7 +2007,7 @@ class Service:
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
-        if par:                                         # #465: the requests running together, slot by slot
+        if par:                                         # the requests running together, slot by slot
             with self.status_lock:
                 running = len(self.live_reqs)
             slots = self.engine.slots_view() if hasattr(self.engine, "slots_view") else []
@@ -2051,7 +2051,7 @@ class Service:
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
-            # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
+            # one request at a time (more wait their turn), or "parallel": N batch slots
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
@@ -2070,7 +2070,7 @@ class Service:
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
     def render_prompt(self, messages, tools, kwargs) -> str:
-        """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
+        """The template rendered.  With `effort_end`, a request with a non-default effort (low, medium or no
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
@@ -2088,7 +2088,7 @@ class Service:
         return history + tail + full[len(mine):]
 
     def encode_prompt(self, messages, tools, kwargs) -> list[int]:
-        """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
+        """The request's prompt: the template rendered and tokenized.  A <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are)."""
         marked, marked_tools, changed = mark_think_literals(messages, tools)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
@@ -2117,7 +2117,7 @@ class Service:
                 encoded = [self.vision.encode(src) for src in images]
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
-            # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
+            # say) is kept as plain text: it must not take an image's place, or the counts would not match.
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
@@ -2138,7 +2138,7 @@ class Service:
             self.embeddings.path = combined
         ctx = self.engine.max_context
         if ctx <= 0:
-            if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
+            if getattr(self.engine, "starting", False):   # (re)starting, not a prompt that is too long
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
             # a failed restart leaves max_context 0: check against the last known context, so the request reaches
             # run() - which starts the engine again - instead of failing with "exceeds the context (0)" forever
@@ -2156,7 +2156,7 @@ class Service:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's basalt-<model>.json to shorten it to the room left (#545)")
+                                 "model's basalt-<model>.json to shorten it to the room left")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -2188,7 +2188,7 @@ class Service:
         el = now - s.get("started", now)
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
-            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
+            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read
             print(f"[basalt] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
@@ -2198,14 +2198,14 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
-        budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
+        budget = self.reasoning_budget(sampling) if thinking else None   # opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
-        run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        run_tok, run_len, repeated = None, 0, False     # the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (--debug: dump raw model text)
@@ -2215,7 +2215,7 @@ class Service:
         engine_last0 = getattr(self.engine, "last", None)
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
-        # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
+        # with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
@@ -2231,7 +2231,7 @@ class Service:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
                             trace["state"] = "generating"
                         self.status["queued"] -= 1
-                    # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
+                    # it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
@@ -2271,7 +2271,7 @@ class Service:
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
-                                    repeated = True     # #606: a degenerate output, not an answer: end it here
+                                    repeated = True     # a degenerate output, not an answer: end it here
                                     break
                                 evs = parser.feed(detok.push(t))
                                 self._note(n, evs, st, rate)
@@ -2300,14 +2300,14 @@ class Service:
                                 gen.close()             # STOP+drain to THIS request's DONE while still holding the
                                 #                         fifo, so a stop-token break can't leave the shared engine
                                 #                         queue mid-drain for the next request to read as its own DONE
-                            except EngineSilent as e:   # #481: the STOP was never acknowledged: the engine is ended
+                            except EngineSilent as e:   # the STOP was never acknowledged: the engine is ended
                                 finish = "error"
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
                         if not wrap or cancel.is_set():
                             break
-                        # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
+                        # the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         budget = None
@@ -2331,12 +2331,12 @@ class Service:
                         print(f"[basalt] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "basalt-<model>.json; 0 turns this off). If a new request with a short prompt does the "
-                              "same, restart the server and report it (#606)", flush=True)
+                              "same, restart the server and report it", flush=True)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
                 finally:
-                    # #266: settle this request's status, history and totals while still holding the fifo: once
+                    # settle this request's status, history and totals while still holding the fifo: once
                     # it is released the next request sets its own status, which this must not record or clear
                     with self.status_lock:
                         if st.get("busy"):
@@ -2348,12 +2348,12 @@ class Service:
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                            # #588: the share the GPU read over PCIe (--pcie-frac) or another GPU computed - not in
+                            # the share the GPU read over PCIe (--pcie-frac) or another GPU computed - not in
                             # the hit rate's lookups, which is the VRAM share of the rest (None: an older engine)
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
-                            seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            seen = prompt_tokens_seen(len(ids), last)   # < len(ids) when cancelled mid-read
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
@@ -2367,7 +2367,7 @@ class Service:
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
-                                # #457: the speculative drafts from the DONE line (None: the engine did not say)
+                                # the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
                             t = self.totals
@@ -2393,14 +2393,14 @@ class Service:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             print(f"[basalt] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                            if finish == "length" and parser.state == "reasoning":   # #530
+                            if finish == "length" and parser.state == "reasoning":   # 0
                                 print("[basalt] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "basalt-<model>.json for every request) leaves room to answer", flush=True)
                             if DEBUG and raw_ids:
                                 print(f"[basalt] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
-                        st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
+                        st.pop("tail", None)                     # the answer's end is not kept once it is done
                         st.pop("tool", None)
                         if par:
                             self.live_reqs.pop(id(st), None)
@@ -2420,10 +2420,10 @@ class Service:
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
-    """#471: the prompt tokens a request got through - all of them, unless the engine's DONE line says a cancel stopped
+    """The prompt tokens a request got through - all of them, unless the engine's DONE line says a cancel stopped
     its prompt read part-way (then the reused ones plus those read).  /metrics' history and totals count these, so a
     cancelled read is neither recorded as the whole prompt nor given a rate from tokens it never read.  An engine
-    before 0.1.36 does not say (no `prompt_read`): the whole prompt, as before."""
+    that does not say (no `prompt_read`): the whole prompt, as before."""
     read = last.get("prompt_read")
     if read is None or last.get("finish") != "cancel":
         return prompt_tokens
@@ -2445,7 +2445,7 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             "predicted_n": generated, "predicted_ms": round(decode_ms, 1),
             "predicted_per_token_ms": round(decode_ms / decoded, 3) if decoded else None,
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
-            # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
+            # the speculative drafts, as llama.cpp names them: only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
 
@@ -2567,7 +2567,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     yield chunk({"role": "assistant", "content": ""})
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
-    finished = set()                               # ... and the ones whose final tool_call came (#211)
+    finished = set()                               # ... and the ones whose final tool_call came
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
         if kind == "ping":
             yield None
@@ -2596,7 +2596,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                                                           "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
                 calls += 1
         else:
-            # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
+            # a streamed call without its final tool_call is one the output ended inside: not "tool_calls"
             whole = calls and streamed.keys() <= finished
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
@@ -2638,7 +2638,7 @@ def openai_collect(chunks) -> dict:
         last = c
     calls = [by_index[i] for i in sorted(by_index)]
     if last["choices"][0]["finish_reason"] != "tool_calls":
-        calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
+        calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside
     msg = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning):
         msg["reasoning_content"] = "".join(reasoning)
@@ -2689,7 +2689,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     def close():
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
-    streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
+    streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
         if kind == "ping":
             yield None
@@ -2767,7 +2767,7 @@ def anthropic_collect(events) -> dict:
             b = blocks[-1]
             try:
                 b["input"] = json.loads(b.pop("_json") or "{}")
-            except ValueError:                     # a call the output ended inside (#211): it has no input to give
+            except ValueError:                     # a call the output ended inside: it has no input to give
                 blocks.pop()
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
@@ -2781,8 +2781,8 @@ def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
-        record = None                                       # #332: this request's monitor record, if kept
-        watch_done = None                                   # #430 #431: stops this request's disconnect watcher
+        record = None                                       # this request's monitor record, if kept
+        watch_done = None                                   # stops this request's disconnect watcher
 
         def log_message(self, fmt, *args):
             pass
@@ -2827,7 +2827,7 @@ def make_handler(svc: Service):
             return False
 
         def _watch_client(self, cancel: threading.Event) -> None:
-            """#430 #431: cancel the request as soon as its client hangs up.  A non-streamed request writes nothing
+            """Cancel the request as soon as its client hangs up.  A non-streamed request writes nothing
             until it ends, and a streamed one only a keep-alive per prompt chunk (and the first write after a hang-up
             usually still succeeds), so a dropped request kept the engine busy until its answer or the whole prompt
             was done.  Every 0.5 s: the socket readable with nothing to read (EOF) means the client closed it.  A
@@ -2852,13 +2852,13 @@ def make_handler(svc: Service):
             threading.Thread(target=watch, daemon=True, name="basalt-client-watch").start()
 
         def _note(self, **values):
-            """#332: what the monitor shows about this request (nothing when the monitor is off)."""
+            """What the monitor shows about this request (nothing when the monitor is off)."""
             if self.record is not None:
                 with svc.status_lock:
                     self.record.update(values)
 
         def _cors(self):
-            """#321: CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
+            """CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
             otherwise, so a browser keeps every other page away from the API, /settings, /unload and the MCP tools."""
             if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
                 return
@@ -2907,7 +2907,7 @@ def make_handler(svc: Service):
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # #213: constant-time
+            if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # constant-time
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -2949,7 +2949,7 @@ def make_handler(svc: Service):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
+                    # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all")
                     self._json(200, svc.metrics(all_requests="requests=all" in self.path))
                 return
             if path == "/api/requests" and svc.api_monitor:
@@ -2965,7 +2965,7 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
                 return
-            if path == "/config":                            # #564: the Settings view's keys of the run config
+            if path == "/config":                            # the Settings view's keys of the run config
                 if self._authorized():
                     self._config_get()
                 return
@@ -2986,7 +2986,7 @@ def make_handler(svc: Service):
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": svc.loaded(), "service": "basalt"})
             elif path == "/status":
-                if not self._authorized():                  # #212: it shows the end of the last answer
+                if not self._authorized():                  # it shows the end of the last answer
                     return
                 with svc.status_lock:
                     s = dict(svc.status)
@@ -3009,7 +3009,7 @@ def make_handler(svc: Service):
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
                         loaded = True
-                    if svc.aliases:                       # #297: the aliases, and each one listed under its own id
+                    if svc.aliases:                       # the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
                     self._json(200, {"object": "list", "data": data if loaded else []})
@@ -3032,7 +3032,7 @@ def make_handler(svc: Service):
         def do_POST(self):
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            path = self.path.split("?")[0].rstrip("/")   # Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path == "/settings":
@@ -3093,7 +3093,7 @@ def make_handler(svc: Service):
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
-                if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
+                if path == "/v1/vram":                       # give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):
                         return
                     r = req.get("reserve_mib")
@@ -3135,7 +3135,7 @@ def make_handler(svc: Service):
 
             except OSError:
                 self._note(outcome="disconnected")
-                raise                                        # as before #332: the server's own handling
+                raise                                        # as before: the server's own handling
             finally:
                 if self.watch_done is not None:
                     self.watch_done.set()
@@ -3223,7 +3223,7 @@ def make_handler(svc: Service):
             self._json(200, runconfig.view(cfg, svc.config_path))
 
         def _config_post(self):
-            """#564: change a few documented keys of the run config - JSON from basalt's own page only, as
+            """Change a few documented keys of the run config - JSON from basalt's own page only, as
             /settings (the key is checked before); every other key of the file stays as it is."""
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             if not self._own_page("the run config can be changed"):
@@ -3321,7 +3321,7 @@ def make_handler(svc: Service):
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("basalt_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
-            own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
+            own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # a second line of defence
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
@@ -3333,7 +3333,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # 1
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
@@ -3369,7 +3369,7 @@ def make_handler(svc: Service):
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _responses(self, req):
-            """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
+            """POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
@@ -3380,7 +3380,7 @@ def make_handler(svc: Service):
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # 1
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -3505,7 +3505,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            self._watch_client(cancel)                       # 1
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
@@ -3545,8 +3545,8 @@ class Server(ThreadingHTTPServer):
 
 
 def warn_tight_ram(arena_mib) -> None:
-    """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
-    system, the engine and this server, Linux ends the engine mid-answer when memory runs out (issue #27); say so at
+    """The model's experts live in RAM (INFO arena_mib).  With less than ~6 GB left beside them for the
+    system, the engine and this server, Linux ends the engine mid-answer when memory runs out; say so at
     start instead of after a lost answer."""
     if not isinstance(arena_mib, int) or arena_mib <= 0:
         return
@@ -3699,7 +3699,7 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
 
 
 def origins_of(value, key: str, wildcard: bool) -> list[str]:
-    """#321: a config's origin list ("https://chat.example.com" or a list of them) - scheme://host[:port], no path;
+    """A config's origin list ("https://chat.example.com" or a list of them) - scheme://host[:port], no path;
     "*" only where `wildcard` allows it.  A wrong entry stops the start rather than opening less or more than meant."""
     if value is None or value == "" or value == []:
         return []
@@ -3866,7 +3866,7 @@ def main() -> int:
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
-    a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
+    a.host = a.host or cfg.get("host") or "127.0.0.1"   # the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
@@ -3912,18 +3912,18 @@ def main() -> int:
               "loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             try:
-                split = layer_split_value(cfg)          # #644: before the (minutes-long) start
+                split = layer_split_value(cfg)          # before the (minutes-long) start
             except ValueError as e:
                 raise SystemExit(f"[basalt] config {e}")
             print(f"[basalt] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
         # a relative "exe" is the config's cwd's
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
-            silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
+            silence = engine_silence_s(cfg)             # checked before the (minutes-long) start
         except ValueError as e:
             raise SystemExit(f"[basalt] config {e}")
         try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
+            effort_end = effort_end_args(cfg, exe, tok)  # 8
         except ValueError as e:
             raise SystemExit(f"[basalt] config {e}")
         engine = BasaltEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
@@ -3941,7 +3941,7 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     try:
-        svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
+        svc.set_aliases(cfg.get("aliases"))             # other names the model answers to
     except ValueError as e:
         raise SystemExit(f"[basalt] config {e}")
     if svc.aliases:
@@ -3974,16 +3974,16 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
-    mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
+    mode = str(cfg.get("anthropic_thinking") or "model")   # "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[basalt] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
-    rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
+    rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[basalt] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
-    svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
-    if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
+    svc.effort_end = bool(effort_end)                   # "effort_position": "end" with an engine that has it
+    if cfg.get("reasoning_budget_tokens") is not None:  # a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
             budget = svc.reasoning_budget({})
@@ -3992,10 +3992,10 @@ def main() -> int:
         if budget:
             print(f"[basalt] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
-    svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
-    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on
+    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split
     if a.config:
-        svc.config_path = a.config                      # #564: the web page's Settings view
+        svc.config_path = a.config                      # the web page's Settings view
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
@@ -4020,7 +4020,7 @@ def main() -> int:
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
-        # issue #26: reachable from other devices - say at which address, and what can still block it
+        # reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
             print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
@@ -4032,7 +4032,7 @@ def main() -> int:
     if a.open and cfg.get("open_browser") is not False:   # the config's "open_browser": false wins
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
-    # #96: docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
+    # docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
     # the grace period with the engine still running. SIGTERM takes Ctrl+C's path below (QUIT to the engine).
     # SIGINT keeps Python's own handler, so Ctrl+C and a second Ctrl+C work as before.
     def on_sigterm(signum, frame):
