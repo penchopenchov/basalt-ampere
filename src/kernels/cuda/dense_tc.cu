@@ -711,7 +711,16 @@ struct PairMat {
     int type, n_out;
 };
 __host__ __device__ constexpr int sb_bytes(int type) {
-    return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 || type == 11 ? 110 : type == 42 ? 72 : 136;
+    return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : 136;
+}
+// with Q3_K and Q2_0 (dense_tc_pair_kernel's LQ build)
+__host__ __device__ constexpr int sb_bytes_lq(int type) {
+    return type == 11 ? 110 : type == 42 ? 72 : sb_bytes(type);
+}
+template<bool LQ>
+__host__ __device__ constexpr int pair_sb(int type) {
+    if constexpr (LQ) return sb_bytes_lq(type);
+    else return sb_bytes(type);
 }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 template<int TYPE>
@@ -795,8 +804,9 @@ __device__ __forceinline__ void pair_terms_xr(float (&acc)[4], const uint8_t* ro
 }
 
 // block blk of nblk (256 threads); smem: 128 + 4096 (DB: 8192) + 2048 (IQ3_S grid) + 2 slots of the larger tile.  XR:
-// the x fragments in registers (n_in <= 3072); DB: two warp-sum buffers, one barrier per tile less
-template<bool XR, bool DB>
+// the x fragments in registers (n_in <= 3072); DB: two warp-sum buffers, one barrier per tile less; LQ: Q3_K and Q2_0
+// tiles too (a build of their own, so the other formats' kernels stay as they were)
+template<bool XR, bool DB, bool LQ>
 __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* smem, PairMat m0, PairMat m1,
                                                     const uint8_t* __restrict__ x, int n_in, int ncols, int probe) {
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem);
@@ -808,7 +818,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
     const int hb = wp & 3, n = hb & 1;
     const int nchunk = n_in / 512, nb32 = n_in / 32;
     const int nt0 = (m0.n_out + 15) / 16, ntiles = nt0 + (m1.n_out + 15) / 16;
-    const int tb0 = 16 * (n_in / 256) * sb_bytes(m0.type), tb1 = 16 * (n_in / 256) * sb_bytes(m1.type);
+    const int tb0 = 16 * (n_in / 256) * pair_sb<LQ>(m0.type), tb1 = 16 * (n_in / 256) * pair_sb<LQ>(m1.type);
     const int slot_bytes = tb0 > tb1 ? tb0 : tb1;
     const int mine = blk < ntiles ? (ntiles - 1 - blk) / nblk + 1 : 0;
     if (m0.type == 21 || m1.type == 21)
@@ -818,7 +828,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         const bool second = tile >= nt0;
         const PairMat& m = second ? m1 : m0;
         const int lt = second ? tile - nt0 : tile;
-        const int row_bytes = (n_in / 256) * sb_bytes(m.type);
+        const int row_bytes = (n_in / 256) * pair_sb<LQ>(m.type);
         const int rows = min(16, m.n_out - lt * 16);
         const uint32_t bytes = (uint32_t) ((rows * row_bytes + 15) & ~15);
         const uint32_t sb = (uint32_t) __cvta_generic_to_shared(slots + (size_t) (i & 1) * slot_bytes);
@@ -847,7 +857,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         const bool second = tile >= nt0;
         const PairMat& m = second ? m1 : m0;
         const int row0 = (second ? tile - nt0 : tile) * 16;
-        const int row_bytes = (n_in / 256) * sb_bytes(m.type);
+        const int row_bytes = (n_in / 256) * pair_sb<LQ>(m.type);
         if (!(probe & 2)) {
             uint32_t done = 0;
             const uint32_t bb = (uint32_t) __cvta_generic_to_shared(bar + (i & 1)), par = (uint32_t) (i >> 1) & 1u;
@@ -860,7 +870,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
         const uint8_t* rowA = slot + g * row_bytes;
         const uint8_t* rowB = slot + (g + 8) * row_bytes;
         float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if constexpr (XR) {
+        if constexpr (XR && LQ) {
             switch (m.type) {
                 case 12: pair_terms_xr<12>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
                 case 13: pair_terms_xr<13>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
@@ -870,7 +880,15 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                 case 42: pair_terms_xr<42>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
                 default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
             }
-        } else {
+        } else if constexpr (XR) {
+            switch (m.type) {
+                case 12: pair_terms_xr<12>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 13: pair_terms_xr<13>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 14: pair_terms_xr<14>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                case 21: pair_terms_xr<21>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+                default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid, probe); break;
+            }
+        } else if constexpr (LQ) {
             switch (m.type) {
                 case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
                 case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
@@ -878,6 +896,14 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                 case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
                 case 11: pair_terms<11>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
                 case 42: pair_terms<42>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+            }
+        } else {
+            switch (m.type) {
+                case 12: pair_terms<12>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 13: pair_terms<13>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 14: pair_terms<14>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
+                case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
                 default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid, probe); break;
             }
         }
@@ -908,12 +934,12 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
 }
 #endif
 
-template<bool XR, bool DB>
+template<bool XR, bool DB, bool LQ>
 __global__ void __launch_bounds__(256) dense_tc_pair_kernel(PairMat m0, PairMat m1, const uint8_t* __restrict__ x,
                                                             int n_in, int ncols, int probe) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) uint8_t smem[];
-    dense_tc_pair_block<XR, DB>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
+    dense_tc_pair_block<XR, DB, LQ>((int) blockIdx.x, (int) gridDim.x, smem, m0, m1, x, n_in, ncols, probe);
 #elif defined(__CUDA_ARCH__)
     __trap();
 #endif
@@ -1109,7 +1135,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
 bool dense_tc_pair_supported(int t0, int t1, int n_in) noexcept {
     auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 11 || t == 42; };
     if (!ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
-    const int tb = 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
+    const int tb = 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
     return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb <= 99 * 1024;
 }
 
@@ -1120,22 +1146,25 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
         std::fprintf(stderr, "dense_tc_pair: types %d/%d n_in %d not supported\n", t0, t1, n_in);
         std::exit(1);
     }
-    int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes(t0), sb_bytes(t1));
+    int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
     static bool attr = false;
     if (!attr) {
-        for (auto k : {dense_tc_pair_kernel<false, false>, dense_tc_pair_kernel<true, false>,
-                       dense_tc_pair_kernel<true, true>})
+        for (auto k : {dense_tc_pair_kernel<false, false, false>, dense_tc_pair_kernel<true, false, false>,
+                       dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
+                       dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>})
             cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
         attr = true;
     }
+    const bool lq = t0 == 11 || t0 == 42 || t1 == 11 || t1 == 42;
     // STRATA_DEC_PAIR & 2: each warp's x fragments in registers across its tiles; & 4 (with 2): two warp-sum buffers
     // where the block is alone on its SM either way
     const bool xr = (g_pair & 2) && n_in <= 3072;
-    auto kern = xr ? dense_tc_pair_kernel<true, false> : dense_tc_pair_kernel<false, false>;
+    auto kern = lq ? (xr ? dense_tc_pair_kernel<true, false, true> : dense_tc_pair_kernel<false, false, true>)
+                   : (xr ? dense_tc_pair_kernel<true, false, false> : dense_tc_pair_kernel<false, false, false>);
     int occ = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, 256, smem);
     if (xr && (g_pair & 4) && occ == 1 && smem + 4096 <= 99 * 1024) {
-        kern = dense_tc_pair_kernel<true, true>;
+        kern = lq ? dense_tc_pair_kernel<true, true, true> : dense_tc_pair_kernel<true, true, false>;
         smem += 4096;
     }
     if (g_bps > 0 && g_bps < occ) occ = g_bps;
