@@ -27,6 +27,8 @@
 // logits.  Python wrote the manifest and already parses it correctly.
 #pragma once
 
+#include "basalt/core/model_file.hpp"
+
 #include <cstdint>
 #include <map>
 #include <set>
@@ -104,18 +106,32 @@ struct LoadReport {
     double upload_ms = 0.0;
 };
 
+/// The files a pack's rows refer to: the index and the byte ranges of its files, by the index's file id (0 dense,
+/// 1 embd, 2 experts, 3 extra).  Offsets in the index are relative to the start of the file's range.
+struct PackFiles {
+    FileRange index;
+    FileRange files[4];
+    /// `<dir>/index.txt` and the pack's own file names.
+    static PackFiles dir(const std::string& pack_dir);
+    /// The dense section and its index, from a .basalt (or any ModelSources).
+    static PackFiles from(const ModelSources& s);
+};
+
 class WeightTable {
 public:
     /// The arena size the index asks for, readable WITHOUT loading anything - so a caller can size its
     /// `DeviceArena` before committing to the load, and a plan that cannot fit is refused at startup rather
     /// than halfway through a 5 GB upload.
     /// With `skip`, the size of the compacted arena that holds every tensor EXCEPT the named ones.
+    static bool pool_bytes(const PackFiles& pack, uint64_t& out, std::string& err,
+                           const std::set<std::string>* skip = nullptr);
     static bool pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
                            const std::set<std::string>* skip = nullptr);
 
     /// The `code_bits` field of one row of `<pack_dir>/index.txt`, readable WITHOUT loading anything (0 = the
     /// pack stores the tensor unquantized, e.g. a --compat-bf16 key; -1 = no such row).  #326: the loader has
     /// to know this before it builds the skip set.
+    static bool index_code_bits(const PackFiles& pack, const std::string& name, int& code_bits, std::string& err);
     static bool index_code_bits(const std::string& pack_dir, const std::string& name, int& code_bits,
                                 std::string& err);
 
@@ -125,6 +141,8 @@ public:
     /// because the failure mode otherwise is a device write past the end of the arena.
     /// With `skip`, the named tensors are not read: their rows keep their metadata with `data == nullptr` and
     /// `resident == false`, and the other tensors are packed into the compacted arena `pool_bytes` sized.
+    bool load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
+              const std::set<std::string>* skip = nullptr);
     bool load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
               const std::set<std::string>* skip = nullptr);
 

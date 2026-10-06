@@ -7,6 +7,7 @@
 
 namespace basalt::core {
 class WeightTable;
+struct PackFiles;
 
 // Experimental GDN/QSA/shared-expert projection overrides. Upload unchanged native GGUF
 // blocks once, then attach them to the matching canonical WeightRef. Unsupported
@@ -34,6 +35,7 @@ public:
     /// the native kernel also reads, e.g. OrcaRouter's IQ3_XXS) serves the PLE from that row, so it is taken out
     /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
     static bool keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip, std::string& err);
+    static bool keep_unquantized_ple_key(const PackFiles& pack, std::set<std::string>& skip, std::string& err);
     uint64_t weight_bytes() const { return bytes_; }
     size_t tensor_count() const { return weights_.size(); }
 
