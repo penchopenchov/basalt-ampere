@@ -366,7 +366,7 @@ int main(int argc, char** argv) {
     int dev = 0;
     cudaDeviceProp p{};
     CK(cudaGetDeviceProperties(&p, dev));
-    if (p.major < 9) { std::printf("dec_gdn_parity: needs sm_90+ (have %d.%d)\n", p.major, p.minor); return 77; }
+    if (p.major < 9) { std::printf("dec_gdn_parity: needs thread-block clusters (compute capability %d.%d)\n", p.major, p.minor); return 77; }
     std::printf("%s: %d SMs, L2 %d MB, smem/block opt-in %zu KB\n", p.name, p.multiProcessorCount, p.l2CacheSize >> 20,
                 p.sharedMemPerBlockOptin >> 10);
     cudaStream_t s;

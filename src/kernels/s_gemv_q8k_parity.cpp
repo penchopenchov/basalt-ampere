@@ -5,11 +5,10 @@
 //
 //   1. the kernel against a host reference that dequantizes the SAME Q8_K bytes and the SAME S-form planes,
 //      in double - so what is under test is the indexing, not the format;
-//   2. the Q8_K activation is produced by the ACTUAL `quantize_q8_K`, which is byte-exact against ggml
-//      (round 198).  Building the activation by hand here would make this a test of two transcriptions;
+//   2. the Q8_K activation is produced by the ACTUAL `quantize_q8_K`, which is byte-exact against ggml.  Building the activation by hand here would make this a test of two transcriptions;
 //   3. **THE Q8_K-vs-FP16 GAP IS MEASURED**, because that is the number the whole activation-contract
-//      decision rests on and it has only ever been measured on Q2_0 weights (0.6175%) and on BF16 ones
-//      (0.141-0.156%).  A K-quant weight is a third case and it is the one the dense projections use.
+//      decision rests on and it differs by weight type (about 0.6% on Q2_0 weights, about 0.15% on BF16 ones).
+//      A K-quant weight is a third case and it is the one the dense projections use.
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/s_gemv.hpp"
@@ -73,8 +72,8 @@ struct Case {
 };
 
 /// THE RAGGED LAST BLOCK.  The split kernels give each warp one row and a block eight warps, so with
-/// `n_out % 8 != 0` the last block holds warps that have no row.  Those warps used to return BEFORE the
-/// codebook barrier - undefined behaviour that every real shape (a multiple of 8) avoided.  Here `n_out` is
+/// `n_out % 8 != 0` the last block holds warps that have no row.  Those warps must not return BEFORE the
+/// codebook barrier - undefined behaviour that every real shape (a multiple of 8) avoids.  Here `n_out` is
 /// deliberately ragged, every row is checked against the host reference over the same bytes, and a guard
 /// band past `n_out` must come back untouched: a warp without a row must neither hang the block nor write.
 /// (`compute-sanitizer --tool synccheck` on this binary is the direct check of the barrier itself.)

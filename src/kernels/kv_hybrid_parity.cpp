@@ -4,7 +4,7 @@
 // append and gather kernels invoked with the unused half's pointers folded onto the used pool, and the
 // fused decode attention's KV_MODE 3 (INT8 K, rotated Q4_0 V) followed by the output's inverse Hadamard.
 //   1. K: INT8 codes + FP16 scales bitwise vs the host reference (kv_q8.hpp's rules);
-//   2. V: after fwht256, Q4_0 blocks bitwise vs the host reference (kv_q4.hpp's rules, PR #21);
+//   2. V: after fwht256, Q4_0 blocks bitwise vs the host reference (kv_q4.hpp's rules);
 //   3. the composed gathers bitwise vs the host dequantization of those codes;
 //   4. qsa_decode_attn<3> + output fwht vs a host attention over the SAME dequantized K/V (fp32 math), and
 //      bounded against the fp32-true attention from the unquantized K/V.
@@ -321,7 +321,7 @@ int main() {
         max_deq = std::max(max_deq, (double) std::fabs(h_attn[i] - ref_deq[i]));
         max_true = std::max(max_true, (double) std::fabs(h_attn[i] - ref_true[i]));
     }
-    // The tensor-core prompt path (qsa_prompt_attn, 0.1.22+) takes hybrid pools as KV_MODE 3: INT8 K, and V
+    // The tensor-core prompt path (qsa_prompt_attn) takes hybrid pools as KV_MODE 3: INT8 K, and V
     // dequantized from its q4_0 blocks to fp16 at gather. Its summation order differs from the old kernel's
     // (accuracy-level, not bitwise - qsa_prompt_attn.hpp says the same of its int8 mode), so: tolerance check
     // against the SAME dequant reference, output un-rotated exactly as prefill.cpp does.

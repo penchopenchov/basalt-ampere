@@ -1,11 +1,11 @@
-// src/kernels/quantize_act_parity.cpp - P2.S2's parity test for the Q8_0 activation quantizer.
+// src/kernels/quantize_act_parity.cpp - parity test for the Q8_0 activation quantizer.
 //
-// THE CHECK IS ON THE BYTES, not on the round-tripped values.  `ref/quant.py::q8_0`'s central finding is that
+// THE CHECK IS ON THE BYTES, not on the round-tripped values.  the central finding is that
 // dividing by the fp16-rounded scale instead of the fp32 one changed 18 of 80 blocks' quantized integers
 // while leaving the dequantized values within a rounding step - so a comparison of VALUES would have passed
 // and the engine would still have disagreed with ggml.  Comparing the 34-byte block catches that directly.
 //
-// The reference is a host transcription of `ref/quant.py::q8_0`:
+// The reference is a host transcription of the Python reference:
 //
 //     d32 = amax / 127.0f                       (f32)
 //     d16 = fp16(d32)                           (stored, and used to DEQUANTIZE)
@@ -34,11 +34,10 @@ void check(cudaError_t e, const char* what) {
     }
 }
 
-// THE CONVERSIONS COME FROM `f16_bits.hpp`, and this test used to carry its own.  The private `f16_bits_to_f32`
-// below flushed fp16 SUBNORMALS to zero, and the private encoder returned NaN for finite fp16 overflow - both
-// invisible with the O(1) fixture this file has.  Round 198 validated the shared pair against 395 numpy
-// float16 vectors and all 65,536 reverse patterns, so the test now shares the implementation it is checking
-// instead of guessing at it independently.  Thin aliases keep the body below unchanged.
+// THE CONVERSIONS COME FROM `f16_bits.hpp`.  A private converter that flushes fp16 SUBNORMALS to zero or
+// returns NaN for finite fp16 overflow is invisible with an O(1) fixture.  The shared pair is validated against
+// 395 numpy float16 vectors and all 65,536 reverse patterns, so the test shares the implementation it is
+// checking.  Thin aliases keep the body below unchanged.
 using basalt::kernels::f16_from_f32;
 using basalt::kernels::f32_from_f16;
 inline uint16_t f32_to_f16_bits(float f) { return f16_from_f32(f); }
@@ -132,7 +131,7 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
 
 // A host transcription of ggml's `quantize_row_q8_K_ref` (ggml-quants.c L2768), including `nearest_int`.
 //
-// NOTE WHICH REFERENCE THIS IS.  `ref/quant.py::q8_K` is the numpy transcription and it multiplies in
+// NOTE WHICH REFERENCE THIS IS.  the Python reference is the numpy transcription and it multiplies in
 // FLOAT64 (`iscale * blk.astype(np.float64)`), while ggml multiplies in FLOAT32 before `nearest_int`.  The
 // oracle is ggml, so this follows ggml.  The two agree except where an f32 product lands exactly on a tie or
 // a rounding boundary, which is exactly the regime the "exact ties" case below constructs.
@@ -283,12 +282,12 @@ int main(int argc, char** argv) {
     // oracle here is GGML's C reference, and the traps are the two the source comments warn about.
     // ============================== the fp16 conversion itself ==============================
     //
-    // REGRESSION CHECK FOR A BUG THAT SHIPPED.  The private encoder in `quantize_act.cu` - and the identical
+    // REGRESSION CHECK.  The private encoder in `quantize_act.cu` - and the identical
     // one in `shared_expert.cu` - tested `if (exp >= 31)` to catch an out-of-range exponent, which conflates
     // an f32 INF/NAN (raw exponent 255) with a FINITE value too large for fp16.  Every finite overflow came
     // back as a NaN instead of saturating to inf.  **Neither file's fixture could see it, because every value
-    // in both is O(1)** - the Q8_0 case above scales by a max that is never near 65504.  Round 198's
-    // numpy-generated oracle caught it on the first run.
+    // in both is O(1)** - the Q8_0 case above scales by a max that is never near 65504.  A
+    // numpy-generated oracle catches it.
     //
     // The decoder in this same test had the matching defect in the other direction: it flushed fp16
     // SUBNORMALS to zero, so 0x0001 decoded as 0.0 instead of 2^-24.

@@ -178,7 +178,7 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
 void check_mmvq_mma(cudaStream_t s, std::mt19937& rng) {
     if (!k::iq_mmvq_mma_available()) {
         std::printf("IQ3_S    tensor-core iq_mmvq (MMVQ_MMA): not available on this device or build "
-                    "(sm_80+ CUDA): skipped\n");
+                    "(needs int8 tensor cores): skipped\n");
         return;
     }
     const bool env = k::iq_mmvq_mma();
@@ -418,8 +418,8 @@ void bench(cudaStream_t s, std::mt19937& rng) {
     }
 }
 
-// #606: both q8_1 activation quantizers (quantize_q8_1_rows and native_quantize_q8_1) against a host transcription
-// of the 0.1.38 formula: every finite block bit for bit; a block whose sum (or scale) overflowed fp16 is now stored
+// both q8_1 activation quantizers (quantize_q8_1_rows and native_quantize_q8_1) against a host transcription
+// of the formula: every finite block bit for bit; a block whose sum (or scale) overflows fp16 is stored
 // finite (the largest half, its sign), with its values in the int8 range.
 void check_q8_1_finite(cudaStream_t s, std::mt19937& rng) {
     const int n = 2560, rows = 3, nb = n / 32;

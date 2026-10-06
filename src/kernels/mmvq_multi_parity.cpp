@@ -333,7 +333,7 @@ int mma_section(cudaStream_t s) {
     namespace k = basalt::kernels;
     std::printf("\n=== tensor-core IQ4_XS (MMVQ_MMA) ===\n");
     if (!k::native_mmvq_mma_available()) {
-        std::printf("not available on this device or build (sm_80+ CUDA): skipped\n");
+        std::printf("not available on this device or build (needs int8 tensor cores): skipped\n");
         return 0;
     }
     const bool env = k::native_mmvq_mma();

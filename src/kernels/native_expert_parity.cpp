@@ -1,4 +1,4 @@
-// src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways.
+// src/kernels/native_expert_parity.cpp - one native expert three ways.
 //
 //     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
 //     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
@@ -9,7 +9,6 @@
 // activations).  (b) and (c) each differ from (a) by their activation rounding only (a few 1e-3 relative).  (c) runs
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
-// The synthetic mode and (d) follow the upstream engine 8029fa9.
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
@@ -155,7 +154,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             op[k] = got_c.data() + k * H;
         }
         cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
-        {   // #152: a token's rows must not depend on how many tokens share the call - each token alone (nt = 1)
+        {   // a token's rows must not depend on how many tokens share the call - each token alone (nt = 1)
             // against its row of the NT-token call above, bit for bit, gate/up and down
             size_t gu_diff = 0, dn_diff = 0;
             std::vector<float> one_ff(FF), one_out(H);
@@ -306,7 +305,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         basalt::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
         cudaStreamSynchronize(s);
         cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
-        {   // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (#242;
+        {   // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (
             // the formats without a decode-once split take the per-entry kernels either way)
             std::vector<float> old_g(got_g.size());
             const bool was = basalt::kernels::iq_old_kernels();
@@ -470,7 +469,7 @@ int check_q5_1_min(cudaStream_t s) {
                 "(largest per-block sum shift %.3g)  %s\n", e_q, e_s, shift, ok ? "ok" : "FAIL");
     return ok ? 0 : 1;
 }
-// #290: the BF16 token embedding (--embd-gguf) - iq_embed_rows and iq_dequant_f32 on a random BF16 table against
+// the BF16 token embedding - iq_embed_rows and iq_dequant_f32 on a random BF16 table against
 // the exact widening (bits << 16), every bit; rows gathered out of order, with repeats
 int check_bf16_embd(cudaStream_t s) {
     constexpr int kBf16 = 30;

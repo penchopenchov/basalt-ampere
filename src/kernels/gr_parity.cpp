@@ -1,6 +1,6 @@
-// src/kernels/gr_parity.cpp - P2.S2's test for the gated residual / hyper-connection.
+// src/kernels/gr_parity.cpp - test for the gated residual / hyper-connection.
 //
-// `ref/gr.py` opens by listing the details "a prose reading gets wrong", and every one of them is a reading
+// The Python reference opens by listing the details "a prose reading gets wrong", and every one of them is a reading
 // that has the RIGHT SHAPES and produces a PLAUSIBLE number.  So each is computed here the wrong way round and
 // required to differ materially BEFORE the kernel is judged against the right one.  A test that only does the
 // second half passes against either reading:
@@ -42,7 +42,7 @@ void check(cudaError_t e, const char* what) {
     }
 }
 
-/// The same rule the kernel uses, on the host - `ref/quant.py::bf16`.
+/// The same rule the kernel uses, on the host - the Python reference.
 float to_bf16(float f) {
     uint32_t i;
     std::memcpy(&i, &f, 4);
@@ -66,7 +66,7 @@ struct Opts {
     bool round_activation = true;  ///< false: pinned CUDA single-token BF16 MMVF contract
 };
 
-/// `ref/gr.py::gr_read`, transcribed with switches for the rival readings.
+/// the Python reference, transcribed with switches for the rival readings.
 void reference(const std::vector<float>& R, const std::vector<float>& w_norm,
                const std::vector<float>& w_down, const std::vector<float>& w_up,
                const std::vector<float>& w_inject, float eps, long long n_embd, long long hc, long long hc_lr,
@@ -147,8 +147,8 @@ double rel_diff(const std::vector<float>& a, const std::vector<float>& b, double
 /// Relative error against the magnitude of the TERMS, not of the result.
 ///
 /// `R + block_out * w` cancels wherever block_out*w is close to -R, and a plain |want-got|/|want| then
-/// reports the CONDITION NUMBER instead of the arithmetic.  This is the same metric mistake the project has
-/// now made four times: rounds 169 (Q4_K), 189 (RoPE), 194 (shared_expert) and this one.  For a sum, the
+/// reports the CONDITION NUMBER instead of the arithmetic.  Comparing against the result is a common metric
+/// mistake.  For a sum, the
 /// denominator is the sum of the term magnitudes.
 double rel_terms(double want, double got, double term_a, double term_b) {
     const double den = std::fabs(term_a) + std::fabs(term_b);
@@ -356,7 +356,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 
     cudaStream_t stream = nullptr;
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "multi stream");
-    // Max T forces the HIP kernel's full dynamic-LDS request: 8 * 1280 * sizeof(float) = 40 KiB.
+    // Max T forces the kernel's full dynamic shared-memory request: 8 * 1280 * sizeof(float) = 40 KiB.
     fused_gr_read_multi(args.data(), T, d_xn, stream);
     check(cudaStreamSynchronize(stream), "multi max-T sync");
     const Snapshot multi = snapshot();
@@ -459,12 +459,11 @@ int main(int argc, char** argv) {
     std::vector<float> w_up = bf16_weight((size_t) (hc_dim * hc_lr), 0.2f);
     std::vector<float> w_inject = bf16_weight((size_t) (hc * hc_dim), 0.05f);
 
-    // NO PERMUTATION: the kernel takes both matrices exactly as the manifest (and `ref/gr.py`) store them.
+    // NO PERMUTATION: the kernel takes both matrices exactly as the manifest (and the Python reference) store them.
     // `w_down` is (hc_lr, hc_dim) row-major and `w_up` is (hc_dim, hc_lr) row-major, so the bit-copy below is
-    // the whole conversion.  An earlier version of this kernel wanted both TRANSPOSED - the test built them
-    // that way and asserted the orientation observable - and that is gone because the warp-per-row mapping
-    // makes it unnecessary.  What replaces it is the general orientation trap further down: a weight array
-    // read with the wrong index expression must still produce a visibly different answer.
+    // the whole conversion.  The warp-per-row mapping needs no transposed copies.  The general orientation trap is
+    // further down: a weight array read with the wrong index expression must still produce a visibly
+    // different answer.
     std::vector<uint16_t> q_down(w_down.size()), q_up(w_up.size()), q_inject(w_inject.size());
     for (size_t i = 0; i < w_down.size(); ++i) q_down[i] = bf16_bits(w_down[i]);
     for (size_t i = 0; i < w_up.size(); ++i) q_up[i] = bf16_bits(w_up[i]);

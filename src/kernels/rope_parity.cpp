@@ -1,11 +1,11 @@
-// src/kernels/rope_parity.cpp - P2.S2's parity test for NEOX partial RoPE.
+// src/kernels/rope_parity.cpp - parity test for NEOX partial RoPE.
 //
 // TWO CHECKS, deliberately separated so each can be tight:
 //
 //   1. THE TABLE against the float64 reference - `theta ** (-2i/n_rot)`, `pos * inv`, `cos`/`sin`, all in
-//      double exactly as `ref/qsa.py::rope_freqs` does.  Compared as float32 after the cast, so a mismatch
+//      double exactly as the Python reference does.  Compared as float32 after the cast, so a mismatch
 //      here is a real arithmetic difference and not a formatting one.
-//   2. THE ROTATION against a host rotation written from `ref/qsa.py::rope_neox`, using the SAME table the
+//   2. THE ROTATION against a host rotation written from the Python reference, using the SAME table the
 //      kernel is given.  Both sides then perform identical float32 operations, so this is BIT-EXACT - and a
 //      bit-exact rotation plus a table that matches the reference means the composition matches too.
 //
@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
 
     // A RELATIVE TOLERANCE, NOT BIT EQUALITY.  *c - b*s is one of the expressions the compiler is free to
     // contract into an FMA, and the host and device compilers choose differently - so a handful of values
-    // differ in the last bit.  Round 167 established this the hard way: a bit-equality expectation that a
+    // differ in the last bit.  A bit-equality expectation that a
     // kernel cannot meet is a test that reports a correct kernel as broken.  The residual is reported, and if
     // it were structural (a wrong pairing, a wrong table entry) it would be O(1), not O(1 ULP).
     long long rot_bad = 0;
@@ -130,8 +130,7 @@ int main(int argc, char** argv) {
     long long first_bad = -1;
     // The denominator is the ROW'S INPUT MAGNITUDE, not the element's own value.  *c - b*s cancels, so an
     // element whose result is near zero reports a large relative error for a 1-ULP absolute one - which is the
-    // same metric mistake round 169 found on Q4_K's dot products, where the fix was to measure against
-    // sum|term| instead of the result.  Here the natural scale of the computation is the largest input in the
+    // usual metric mistake; the fix is to measure against sum|term| instead of the result.  Here the natural scale of the computation is the largest input in the
     // row, because every output element is a combination of two inputs with |cos|,|sin| <= 1.
     std::vector<double> row_scale((size_t) rows, 0.0);
     for (int r = 0; r < rows; ++r) {

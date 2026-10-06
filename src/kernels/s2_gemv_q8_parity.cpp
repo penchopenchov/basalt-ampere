@@ -2,7 +2,7 @@
 //
 // THREE CHECKS:
 //   1. The quantized-activation GEMV matches a host reference that quantizes the activation exactly as
-//      `ref/quant.py::q8_0` does and then dots it against the same weights.
+//      the Python reference does and then dots it against the same weights.
 //   2. **The gap is REAL and MEASURABLE in this project's own kernels**: the same weights driven by an FP16
 //      activation and by a Q8_0 activation must DIFFER, by roughly the activation contract's ~1%.  Without this
 //      the first check would pass on a kernel that quietly used fp16 anyway, and the round-186 gap would look
@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
         const double a = ref[(size_t) o], b = got[(size_t) o];
         sum_abs += std::fabs(a);
         // relative to the row magnitude is not needed here - these rows are not cancelling - but the metric is
-        // stated because round 169 and round 189 both showed the wrong denominator reads as a wrong kernel
+        // stated because the wrong denominator reads as a wrong kernel
         const double rel = std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30);
         if (!(rel <= worst)) worst = rel;
         // 1e-4, not 1e-5: the measured worst is 1.479e-05, which is FMA contraction over 2560 terms rather

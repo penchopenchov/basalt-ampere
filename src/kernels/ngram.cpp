@@ -1,4 +1,4 @@
-// src/kernels/ngram.cpp - P2.S4: the PLE n-gram hash and the IQ4_NL table read.
+// src/kernels/ngram.cpp - the PLE n-gram hash and the IQ4_NL table read.
 //
 // See include/basalt/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
 #include "basalt/kernels/ngram.hpp"
@@ -110,9 +110,9 @@ struct PleTable::Impl {
     GgufFile* file = nullptr;
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
-    bool q5_0 = false;                // #296: Q5_0 rows (110 B), the mapped reader only
+    bool q5_0 = false;                // Q5_0 rows (110 B), the mapped reader only
     mutable uint64_t bytes_read = 0;
-    // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
+    // Direct mode: the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
     basalt::ngram::PleReader reader;

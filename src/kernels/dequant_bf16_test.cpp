@@ -1,4 +1,4 @@
-// src/kernels/dequant_bf16_test.cpp - plan v0.3 P5: the device dequantizers against the artifact's validated CPU
+// src/kernels/dequant_bf16_test.cpp - the device dequantizers against the artifact's validated CPU
 // dequantizers (`basalt/artifact/dequant.hpp`), on one real tensor of every type the model uses.
 //
 //     dequant_bf16_test SHARD1.gguf [SHARD2.gguf]

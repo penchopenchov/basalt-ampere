@@ -247,8 +247,8 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
 
 // ------------------------------------------------------------------------------------------------ --bench
 // A window's 48 calls, one per layer, each with ITS OWN experts as the layers have: copies of the Setup's blobs in one
-// arena, so the weights stream from DRAM as in the engine.  (48 calls re-reading the same 28 experts - 73 MB, about an
-// Ada L2 - would read part of them from L2; the engine's layers share none.)
+// arena, so the weights stream from DRAM as in the engine.  (48 calls re-reading the same few experts would read part of them
+// from L2; the engine's layers share none.)
 struct Layers {
     uint8_t* arena = nullptr;
     std::vector<unsigned long long*> ptr;           // per layer: its groups' blobs (device)
@@ -309,8 +309,8 @@ float median(std::vector<float> v) {
 }
 
 // The two variants' launches ALTERNATE (v1-new, new-v1, ...) after a warm-up, and each reports its median: a card
-// under sustained load steps its clock down after a fraction of a second (an RTX 4080 SUPER went from 80 to 89 us
-// per gate/up call within one run), and whichever variant ran before the step would look faster.
+// under sustained load steps its clock down after a fraction of a second (a gate/up call can slow by over 10%
+// within one run), and whichever variant ran before the step would look faster.
 constexpr int kWarmPairs = 20, kPairs = 40;
 
 // the shape and variants --bench measures; each has a command-line flag (--bench-gu N, ...)

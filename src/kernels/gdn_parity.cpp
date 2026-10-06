@@ -1,6 +1,6 @@
-// src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms.
+// src/kernels/gdn_parity.cpp - test for the GDN recurrence, the conv and the two norms.
 //
-// `ref/gdn.py` carries eleven PROPERTY checks, several of which exist because a rival reading of the SOURCE
+// The Python reference carries eleven PROPERTY checks, several of which exist because a rival reading of the SOURCE
 // produces well-formed output.  The four that the kernels here can be wrong about are re-pinned below, each
 // asserted OBSERVABLE against a deliberately-wrong computation before the kernel is judged:
 //
@@ -12,7 +12,7 @@
 //      the LAST state row; reversing either is invisible on a symmetric state, so the state rows here are
 //      labelled so each position is identifiable.
 //   4. `l2_norm`'s `+ eps` is an absolute floor on the SQUARED NORM, not on the mean.  The mean reading
-//      differs by sqrt(S) = 11.3x at S = 128.  `ref/gdn.py` PROPERTY 1 instruments the derivation, so it is
+//      differs by sqrt(S) = 11.3x at S = 128.  the Python reference instruments the derivation, so it is
 //      not taken on trust there either.
 //
 // It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
@@ -44,7 +44,7 @@ float sigmoid_f(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 /// The reference's `gdn_step`, with switches for the rival readings.
 ///
 /// `state` is passed in the REFERENCE layout (S, S, h_v) - i.e. (i, j, h) - so that this function is a
-/// transcription of `ref/gdn.py` and not of the kernel.
+/// transcription of the Python reference and not of the kernel.
 void ref_step(std::vector<double>& state, const std::vector<float>& q, const std::vector<float>& k,
               const std::vector<float>& v, const std::vector<float>& gate, const std::vector<float>& beta,
               int S, int h_k, int h_v, std::vector<float>& o, bool modulo_heads, bool decay_first) {
@@ -69,7 +69,7 @@ void ref_step(std::vector<double>& state, const std::vector<float>& q, const std
     o = oo;
 }
 
-/// `ref/gdn.py::conv_step` in its own (d_conv, C) row-major orientation.
+/// the Python reference in its own (d_conv, C) row-major orientation.
 void ref_conv(std::vector<float>& cs, const std::vector<float>& x, const std::vector<float>& kern, int C,
               int dc, std::vector<float>& out) {
     out.assign((size_t) C, 0.0f);
@@ -225,7 +225,7 @@ int main(int argc, char** argv) {
     {
         const int C = 24, dc = 4;      // small, so the host reference is a plain loop
         // TWO DIFFERENT LAYOUTS MEET HERE, and this is where the first version of this test failed at 0.136.
-        // `ref/gdn.py` carries the conv state as (d_conv-1, C) ROW-MAJOR - (i, c) at i*C + c - because it is
+        // the Python reference carries the conv state as (d_conv-1, C) ROW-MAJOR - (i, c) at i*C + c - because it is
         // numpy.  The kernel carries it as (C, d_conv-1) with c fastest - c*(dc-1) + i - because that is
         // ggml's `ne = {d_conv-1, C}` with ne0 fast, and it is a runtime buffer so either is legal.  The
         // mapping between them is written out below rather than assumed, in both directions.
@@ -371,7 +371,7 @@ int main(int argc, char** argv) {
         std::printf("\n  %-42s rel %.3e\n", "out norm (rms * ssm_norm * sigmoid z)", rel);
         if (!(rel <= 1e-6)) ++bad;
 
-        // SiLU instead of sigmoid is the qwen3.5 reading; `ref/gdn.py` says this artifact does NOT use it
+        // SiLU instead of sigmoid is the qwen3.5 reading; the Python reference says this artifact does NOT use it
         std::vector<float> y_silu(y_ref.size());
         for (int h = 0; h < hv2; ++h) {
             double acc = 0;

@@ -8,7 +8,7 @@
 //   2. the residency map is consistent after every call (slot_block and page_table invert each other);
 //   3. no call overflowed, and the hit/miss counters add up;
 //   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool.
-// INT8, FP16 and Q4_0 (PR #21) pools.
+// INT8, FP16 and Q4_0 pools.
 #include "basalt/kernels/kv_q4.hpp"
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/kv_stream.hpp"

@@ -577,7 +577,7 @@ void bench() {
                     gb / us[0], us[1], gb / us[1], us[0] / us[1]);
     };
 
-    // per-hit path, decode: 9 hits of 10 (5090-like residency), 5 of 10, and the low-residency 1-3 hits, where the
+    // per-hit path, decode: 9 hits of 10 (high residency), 5 of 10, and the low-residency 1-3 hits, where the
     // new kernels' grid (80 gate/up blocks per hit) is below one block per SM - see `GROUPED_PAIR_MIN_HITS`
     for (const int n_hits : {9, 5, 3, 2, 1}) {
         std::vector<int32_t> slots((size_t) SETS * n_hits), dst(K);

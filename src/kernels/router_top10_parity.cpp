@@ -1,6 +1,6 @@
-// src/kernels/router_top10_parity.cpp - P2.S2's parity test for the MoE router.
+// src/kernels/router_top10_parity.cpp - parity test for the MoE router.
 //
-// The reference here is a HOST implementation of `ref/moe.py::router` written from the same specification the
+// The reference here is a HOST implementation of the Python reference written from the same specification the
 // kernel was written from - so this checks the kernel against the spec independently of the kernel, which is
 // the strongest thing available without running llama.cpp.  It is NOT a check against llama.cpp itself, and
 // that gap is stated rather than implied.

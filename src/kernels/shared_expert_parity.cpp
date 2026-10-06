@@ -1,12 +1,11 @@
-// src/kernels/shared_expert_parity.cpp - P2.S2's test for the shared expert.
+// src/kernels/shared_expert_parity.cpp - test for the shared expert.
 //
 // WHAT THIS CAN AND CANNOT CHECK TIGHTLY.  The weights are driven with FP16 activations because Q8_K is not
 // implemented, and the SwiGLU intermediate is converted to fp16 before the down projection - so the tolerance
-// here is set by that conversion (~1e-3) and NOT by the structure.  Round 193 measured the activation-format
-// choice at 0.6175% against the reference, which is the floor this test inherits and states.
+// here is set by that conversion (~1e-3) and NOT by the structure.  The activation-format choice sets a floor
+// of about 0.6% against the reference, which this test inherits and states.
 //
-// WHAT IT PINS DOWN TIGHTLY IS THE STRUCTURE, which is what the model definition records as having been believed
-// wrong for many rounds:
+// WHAT IT PINS DOWN TIGHTLY IS THE STRUCTURE, which the model definition records:
 //
 //   1. SILU ON GATE, not on up.  Both readings have the right shapes and give similar magnitudes, so the test
 //      computes the WHOLE reference the wrong way round and requires it to differ materially before comparing
@@ -39,11 +38,10 @@ void check(cudaError_t e, const char* what) {
     }
 }
 
-// THE CONVERSIONS COME FROM `f16_bits.hpp`, and this test used to carry its own copies.  The private
-// `f16_to_f32` here flushed fp16 SUBNORMALS to zero (`if (ex == 0) out = sign`), so 0x0001 decoded as 0.0
-// instead of 2^-24; and the private encoder returned NaN for finite fp16 overflow.  Neither is visible with
-// an O(1) fixture, which is exactly what this file had.  Using the shared, oracle-validated pair means the
-// test and the kernel cannot disagree about the conversion itself.
+// THE CONVERSIONS COME FROM `f16_bits.hpp`.  A private `f16_to_f32` that flushes fp16 SUBNORMALS to zero
+// decodes 0x0001 as 0.0 instead of 2^-24, and a private encoder can return NaN for finite fp16 overflow; neither
+// is visible with an O(1) fixture.  Using the shared, oracle-validated pair means the test and the kernel cannot
+// disagree about the conversion itself.
 // using-declarations rather than renames at the call sites, so the body below is untouched by the swap.
 using basalt::kernels::f16_from_f32;
 using basalt::kernels::f32_from_f16;
@@ -138,7 +136,7 @@ int main(int argc, char** argv) {
         hginp_bf16[(size_t) i] = basalt::kernels::bf16_from_f32(ginp[(size_t) i]);
     }
 
-    // ---- host reference, exactly as ref/moe.py writes it
+    // ---- host reference, exactly as the Python reference writes it
     auto reference = [&](bool silu_on_up, bool elementwise_gate) {
         std::vector<float> gp((size_t) n_ff, 0.0f), upp((size_t) n_ff, 0.0f);
         for (long long r = 0; r < n_ff; ++r) {
@@ -220,10 +218,9 @@ int main(int argc, char** argv) {
           "c ginpb");
 
     const basalt::kernels::SForm f{2, -1, 64, basalt::kernels::Codebook::Affine, false, /*act_kind=*/0};
-    // **THE ACTIVATION IS Q8_0, NOT FP16, AND THE FIXTURE HAS TO MATCH THE CONTRACT.**  The kernel used to take
-    // an fp16 activation for all three projections, which was simply the wrong `vec_dot_type` - and the
-    // reference here computed with the fp16 values, so the two agreed on a number the reference model would not
-    // produce.  A fixture that agrees with the kernel about the wrong activation is not a check.
+    // **THE ACTIVATION IS Q8_0, NOT FP16, AND THE FIXTURE HAS TO MATCH THE CONTRACT.**  An fp16 activation for
+    // the three projections is the wrong `vec_dot_type`, and a reference computed with the fp16 values would
+    // agree with the kernel on a number the reference model would not produce.  A fixture that agrees with the kernel about the wrong activation is not a check.
     hx0.assign((size_t) (n_embd / 32) * 34, 0);
     {
         float* d_xf = nullptr;
@@ -236,8 +233,8 @@ int main(int argc, char** argv) {
         d_x_used = d_x0;
         cudaFree(d_xf);
     }
-    // THE SCRATCH IS THE CALLER'S NOW.  It used to be four `cudaMalloc`s inside the kernel - illegal during
-    // stream capture AND a token-path allocation that P2.T10 forbids.  The fixture owns it here, exactly as the
+    // THE SCRATCH IS THE CALLER'S: allocation inside the kernel would be illegal during
+    // stream capture and a token-path allocation.  The fixture owns it here, exactly as the
     // layer does, so the test exercises the real contract instead of a private one.
     float* d_scratch = nullptr;
     check(cudaMalloc(&d_scratch, basalt::kernels::shared_expert_scratch_bytes(n_ff)), "m scratch");
@@ -404,8 +401,7 @@ int main(int argc, char** argv) {
 
     // ================= moe_combine: the two readings it exists to pin =================
     //
-    // `ref/moe.py` L156 is `routed + shared_expert(...)`, and the routed half is `out[t] += w[t,i] * g[0]`
-    // (L100).  Two rival readings both produce a plausible vector of the right shape:
+    // the Python reference is `routed + shared_expert(...)`, and the routed half is `out[t] += w[t,i] * g[0]`.  Two rival readings both produce a plausible vector of the right shape:
     //
     //   A. the routed sum is UNWEIGHTED (a plain sum of the k expert outputs), and
     //   B. the SHARED output is router-weighted like the routed ones.

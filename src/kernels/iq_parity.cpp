@@ -1,4 +1,4 @@
-// src/kernels/iq_parity.cpp - plan v0.3 P6: the i-quant kernels against gguf-py on generated rows.
+// src/kernels/iq_parity.cpp - the i-quant kernels against gguf-py on generated rows.
 //
 //     python tools/iq_fixture.py --out <dir> && build/iq_parity <dir>
 //

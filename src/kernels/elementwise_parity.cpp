@@ -1,4 +1,4 @@
-// src/kernels/elementwise_parity.cpp - P2.S5's test for the layer glue.
+// src/kernels/elementwise_parity.cpp - test for the layer glue.
 //
 // The ops are small; the CONVENTIONS in them are not, and each one is a place where a plausible reading
 // gives a plausible number:
@@ -10,7 +10,7 @@
 //   2. `ssm_a` IS NEGATIVE.  `gate = softplus(...) * ssm_a`, so `exp(gate) < 1` and the state DECAYS.  A
 //      fixture with a positive `ssm_a` would still produce finite output and the recurrence would blow up
 //      instead of decaying, so the sign is checked as a property and not assumed.
-//   3. `silu` IS COMPUTED IN DOUBLE then cast, because `ref/gdn.py`'s numpy does.  f32 `expf` differs in the
+//   3. `silu` IS COMPUTED IN DOUBLE then cast, because the Python reference's numpy does.  f32 `expf` differs in the
 //      last bits, and the test measures that rather than asserting it away.
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
         // The kernel accumulates in f32 over 256 terms; 1e-6 is loose enough for that and far tighter than the
         // 16x the rival readings are off by.
         if (!(r_got < 1e-6)) { std::printf("  *** rms_norm_weighted is WRONG ***\n"); ++bad; }
-        // and a null `w` must be legal, because `ref/qsa.py` allows it.
+        // and a null `w` must be legal, because the Python reference allows it.
         //
         // THE INPUT HAS TO BE RE-UPLOADED FIRST.  The kernel is IN PLACE, so `d_x` currently holds the
         // NORMALISED tensor from the call above; running it again normalises a second time and every element

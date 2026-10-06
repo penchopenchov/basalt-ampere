@@ -1,15 +1,14 @@
-// src/kernels/ple_parity.cpp - P2.S4's test: the n-gram hash, the IQ4_NL table read, and the PLE block.
+// src/kernels/ple_parity.cpp - test: the n-gram hash, the IQ4_NL table read, and the PLE block.
 //
 // THREE PARTS, THREE DIFFERENT ORACLES, and none of them is this project's own code:
 //
-//   A. THE HASH against `ref/ngram.py::ngram_rows`, via `ple_oracle_vectors.inc` (generated).  The properties
+//   A. THE HASH against the Python reference, via `ple_oracle_vectors.inc` (generated).  The properties
 //      are asserted OBSERVABLE first - XOR vs sum, `%` vs `&`, the cut DIRECTION, the NULL sentinel - because
 //      each rival reading produces a perfectly valid index in range.
 //   B. THE TABLE against numpy reading the ORIGINAL GGUF at the offset the validated `gguf_reader` reports.
-//   C. THE BLOCK against ggml's own graph, captured in `bench/micro/ple_in.bin` / `ple_out.bin` by
-//      `ple_layer_xcheck.cpp`.  That file records EVERY intermediate (key, value, gate, gated, normalized,
-//      conv_out, result), so a mismatch can be attributed to a stage instead of guessed at - and the weights
-//      in it were checked to be the artifact's real ones before this test was written.
+//   C. THE BLOCK against ggml's own graph, captured in two binary files (`--in` / `--out`).  The capture
+//      records EVERY intermediate (key, value, gate, gated, normalized, conv_out, result), so a mismatch can be
+//      attributed to a stage instead of guessed at.
 #include "basalt/kernels/ple.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/f16_bits.hpp"
@@ -41,9 +40,9 @@ void ck(cudaError_t e, const char* what) {
 
 /// TOLERANCE CHECKS MUST BE NaN-SAFE, and `x <= t` is not.
 ///
-/// `x <= t` AND `x > t` are BOTH false for NaN, so a check written either way can silently pass - round 197
-/// found `shared_expert_parity` printing a perfect score for an entirely-NaN fixture because the accumulator
-/// was `if (rel > worst) worst = rel;` and NaN is never greater.  Every comparison in this file goes through
+/// `x <= t` AND `x > t` are BOTH false for NaN, so a check written either way can silently pass - a parity test
+/// can print a perfect score for an entirely-NaN fixture when the accumulator is
+/// `if (rel > worst) worst = rel;`, because NaN is never greater.  Every comparison in this file goes through
 /// `le`/`gt`, which require the value to be FINITE first, and every compared pair is counted for non-finite
 /// entries and the count printed.  A NaN fixture is then a loud failure rather than a green line.
 bool le(double x, double t) { return std::isfinite(x) && x <= t; }
@@ -104,7 +103,7 @@ std::vector<uint8_t> read_at(const char* path, long long off, size_t n) {
     return v;
 }
 
-/// Only used for the pack, which is 5.4 GB rather than 28.8 GB - and even then the caller says which region.
+/// A whole file; the callers read only the regions they need from large files.
 std::vector<uint8_t> read_path(const char* path) {
     const long long n = file_size(path);
     if (n <= 0) return {};
@@ -241,19 +240,19 @@ int history_advance_regression() {
 int main(int argc, char** argv) {
     bool selftest = false;
     bool check_fixtures = false;
-    std::string pack = "pack/full";
+    std::string dense = "dense.bin";   // the dense section of a .basalt, extracted to a file
     // --gguf: the shard that holds the PLE table
     std::string gguf = "../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf";
-    std::string in_bin = "bench/micro/ple_in.bin", out_bin = "bench/micro/ple_out.bin";
+    std::string in_bin = "ple_in.bin", out_bin = "ple_out.bin";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--check-fixtures") check_fixtures = true;
-        else if (a == "--pack" && i + 1 < argc) pack = argv[++i];
+        else if (a == "--dense" && i + 1 < argc) dense = argv[++i];
         else if (a == "--gguf" && i + 1 < argc) gguf = argv[++i];
         else if (a == "--in" && i + 1 < argc) in_bin = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_bin = argv[++i];
-        else { std::fprintf(stderr, "usage: ple_parity [--selftest] [--check-fixtures] [--pack D] [--gguf F] [--in F] [--out F]\n");
+        else { std::fprintf(stderr, "usage: ple_parity [--selftest] [--check-fixtures] [--dense F] [--gguf F] [--in F] [--out F]\n");
                return 2; }
     }
     if (selftest && check_fixtures) {
@@ -272,11 +271,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ple_parity: required PLE table is missing or incompatible: %s (%s)\n", gguf.c_str(), err.c_str());
             return 2;
         }
-        const uint64_t pack_needed = std::max({o::kKeyCodesOffset + o::kKeyCodesBytes,
+        const uint64_t dense_needed = std::max({o::kKeyCodesOffset + o::kKeyCodesBytes,
             o::kKeyScalesOffset + o::kKeyScalesBytes, o::kValueOffset + o::kValueBytes});
-        const long long pack_size = file_size((pack + "/dense.bin").c_str());
-        if (pack_size < 0 || (uint64_t) pack_size < pack_needed) {
-            std::fprintf(stderr, "ple_parity: required dense pack is missing or truncated: %s/dense.bin\n", pack.c_str());
+        const long long dense_size = file_size(dense.c_str());
+        if (dense_size < 0 || (uint64_t) dense_size < dense_needed) {
+            std::fprintf(stderr, "ple_parity: required dense section is missing or truncated: %s\n", dense.c_str());
             return 2;
         }
         if (!load_capture(in_bin.c_str(), out_bin.c_str(), cap)) {
@@ -297,7 +296,7 @@ int main(int argc, char** argv) {
     const k::PleConsts C = k::ple_artifact_consts();
 
     // ============================ A. THE HASH ============================
-    std::printf("A. the n-gram hash, against ref/ngram.py with the artifact's own constants\n");
+    std::printf("A. the n-gram hash, against the Python reference with the artifact's own constants\n");
 
     // ---- the constants must be internally consistent BEFORE they are used: `head_offsets` is its own array
     //      in the metadata, so deriving it from `vocab_sizes` would hide a disagreement between them.
@@ -581,19 +580,19 @@ int main(int argc, char** argv) {
         return selftest || bad ? 1 : 0;
     }
 
-    // ---- the two quantized weights, from the PACK, not from the capture.
+    // ---- the two quantized weights, from the dense section, not from the capture.
     //      The capture holds `w_key` already dequantized to f32; the kernel needs the CODES AND SCALES, and
-    //      re-quantizing the f32 would be a different tensor.  Reading the pack is right and it was checked:
-    //      the pack's decode of row 0 reproduces the capture's w_key row 0 exactly (see the round entry).
-    //      Only the two regions are read, not all 5.4 GB of `dense.bin`.
+    //      re-quantizing the f32 would be a different tensor.  The dense section's decode of row 0 must
+    //      reproduce the capture's w_key row 0 exactly (checked below).
+    //      Only the two regions are read, not the whole section.
     std::vector<uint8_t> key_codes =
-        read_at((pack + "/dense.bin").c_str(), (long long) o::kKeyCodesOffset, (size_t) o::kKeyCodesBytes);
+        read_at(dense.c_str(), (long long) o::kKeyCodesOffset, (size_t) o::kKeyCodesBytes);
     const std::vector<uint8_t> raw_scales =
-        read_at((pack + "/dense.bin").c_str(), (long long) o::kKeyScalesOffset, (size_t) o::kKeyScalesBytes);
+        read_at(dense.c_str(), (long long) o::kKeyScalesOffset, (size_t) o::kKeyScalesBytes);
     const std::vector<uint8_t> raw_value =
-        read_at((pack + "/dense.bin").c_str(), (long long) o::kValueOffset, (size_t) o::kValueBytes);
+        read_at(dense.c_str(), (long long) o::kValueOffset, (size_t) o::kValueBytes);
     if (key_codes.empty() || raw_scales.empty() || raw_value.empty()) {
-        std::printf("  cannot read the ple_key/ple_value regions from %s/dense.bin\n", pack.c_str());
+        std::printf("  cannot read the ple_key/ple_value regions from %s\n", dense.c_str());
         return 2;
     }
     // fp16 -> f32 for the scales, which is what every S-form kernel in this project expects
@@ -604,14 +603,14 @@ int main(int argc, char** argv) {
         std::memcpy(&h, raw_scales.data() + i * 2, 2);
         key_scales[i] = k::f32_from_f16(h);
     }
-    // ple_value is BF16 promoted to 32 bits in the pack; take the high half, which is exact
+    // ple_value is BF16 promoted to 32 bits in the dense section; take the high half, which is exact
     std::vector<uint16_t> value_bf16(raw_value.size() / 4);
     for (size_t i = 0; i < value_bf16.size(); ++i) {
         uint32_t u;
         std::memcpy(&u, raw_value.data() + i * 4, 4);
         value_bf16[i] = (uint16_t) (u >> 16);
     }
-    // ple_conv1d is F16 in the pack; the capture holds it as f32 in ggml order, and the kernel wants F16
+    // ple_conv1d is F16 in the dense section; the capture holds it as f32 in ggml order, and the kernel wants F16
     std::vector<uint16_t> conv1d_f16(cap.w_conv.size());
     for (size_t i = 0; i < conv1d_f16.size(); ++i) conv1d_f16[i] = k::f16_from_f32(cap.w_conv[i]);
 
@@ -633,7 +632,7 @@ int main(int argc, char** argv) {
             else worst = (diff > worst) ? diff : worst;
         }
         std::printf("  %-46s %s (worst |d| %.3e, non-finite %lld)\n",
-                    "pack ple_key row 0 == the capture's w_key row 0",
+                    "dense ple_key row 0 == the capture's w_key row 0",
                     (le(worst, 0.0) && nf == 0) ? "yes" : "*** NO ***", worst, nf);
         if (!le(worst, 0.0) || nf) ++bad;
     }
@@ -711,7 +710,7 @@ int main(int argc, char** argv) {
         k::PleOut out{};
         out.key = d_ck; out.value = d_cv; out.gate = d_g; out.gated = d_gd;
         out.normalized = d_nm; out.conv = d_co; out.result = d_cr;
-        // the workspace is the caller's, and the sync the block used to do is now the caller's too
+        // the workspace and any synchronization are the caller's
     void* ple_ws = nullptr;
     ck(cudaMalloc(&ple_ws, k::ple_block_scratch_bytes()), "ple_block scratch");
     if (t == 0) {
@@ -766,7 +765,7 @@ int main(int argc, char** argv) {
             long long nf = 0;
             const double rel = rel_l1(want.data(), s.got->data(), s.n, &mag, &nf);
             // NaN-SAFE: `rel > worst_all` is false for NaN, so `fmax` here would silently report a perfect
-            // score for a fixture full of NaNs - round 197's exact failure.
+            // score for a fixture full of NaNs.
             worst_all = (rel > worst_all) ? rel : worst_all;
             if (nf) worst_all = std::nan("");
             const bool last = (std::strncmp(s.name, "result", 6) == 0);
@@ -980,7 +979,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- the trap that matters most: gated vs normalized as the conv input --------------------------
-    // `ref/ngram.py`'s docstring calls `terms` "the padded gated values"; the source pads `normalized`.
+    // the Python reference's docstring calls `terms` "the padded gated values"; the source pads `normalized`.
     // Feeding the conv the gated values instead is a one-word change with every shape intact, so it is
     // computed here and required to differ.
     {
@@ -1028,7 +1027,7 @@ int main(int argc, char** argv) {
 
     // ---- THE HOST f32 REFERENCE, which is what makes the gaps above ATTRIBUTABLE rather than mysterious.
     //
-    // `ple_layer_xcheck.cpp` builds ggml's graph with the weights as **F32 tensors** (`ggml_new_tensor_2d(...,
+    // The capture builds ggml's graph with the weights as **F32 tensors** (`ggml_new_tensor_2d(...,
     // GGML_TYPE_F32, ...)`).  `ggml_mul_mat` converts src1 to src0's `vec_dot_type`, so with an F32 weight
     // ggml performs NO activation conversion at all - while the real `ple_key` is Q2_0 (contract Q8_0) and the
     // real `ple_value` is BF16 (contract BF16).
@@ -1142,8 +1141,7 @@ int main(int argc, char** argv) {
     //
     // The dilated conv sums four terms and the sum CANCELS: `normalized` has mean |.| around 0.70 and the
     // result's is around 0.009, a factor of ~77.  Dividing by the result therefore reports the CONDITION
-    // NUMBER and not the arithmetic - the same metric mistake this project has made four times (rounds 169,
-    // 189, 194, 196), and it is what made `conv_out` look like the worst stage at 4.55e-02.
+    // NUMBER and not the arithmetic - the usual metric mistake, which makes `conv_out` look like the worst stage.
     {
         // `dev_conv` holds the LAST token after the loop above, and the capture is token-major.
         const float* oc = cap.conv_out.data() + (size_t) (cap.nt - 1) * hcd;

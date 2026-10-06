@@ -1,4 +1,4 @@
-// src/kernels/s_gemv_parity.cpp - P2.S2's parity test for the S-family GEMV.
+// src/kernels/s_gemv_parity.cpp - parity test for the S-family GEMV.
 //
 // Four source types, chosen to cover every branch the kernel has:
 //
@@ -14,8 +14,8 @@
 //
 // THE REFERENCE IS THE CHAIN: for each type the CPU side reconstructs the RAW GGUF block from the canonical
 // planes and decodes it with that type's scalar dequantizer from include/basalt/artifact/dequant.hpp - the
-// ones `bench/micro/dequant_xcheck` checks against **ggml's own** dequantizers.  Reconstructing raw from
-// canonical is the inverse of what the packer does, and it is written here independently of the packer so the
+// ones that are checked against **ggml's own** dequantizers.  Reconstructing raw from
+// canonical is the inverse of what the converter does, and it is written here independently of the converter so the
 // two are not the same code.
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/s_gemv.hpp"
@@ -101,8 +101,8 @@ double iq4_deq(const uint8_t* raw, float* out) {
 }
 
 // ---- Q8_0: raw = { fp16 d ; int8 qs[32] }, 32 elements.  The canonical code plane is UNSIGNED with bias
-// -128 (round 154's fix), so the raw int8 byte is exactly the canonical code reinterpreted - a straight copy,
-// which is why this type is the cheapest one to check and the one whose sign bug was found by the pack.
+// -128 , so the raw int8 byte is exactly the canonical code reinterpreted - a straight copy,
+// which is why this type is the cheapest one to check and the one whose sign bug is easy to make.
 int q8_0_to_raw(const uint8_t* codes, size_t co, const uint16_t* scale_bits, size_t so, uint8_t* raw) {
     const uint16_t d = scale_bits[so];
     raw[0] = (uint8_t) (d & 0xFF);
@@ -295,8 +295,7 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
 
 // ------------------------------------------------------------------ benchmark
 //
-// P2.S10 wants a first measurement and a ledger entry, and the objective is stated in tokens per second, so
-// the useful output is not GiB/s but "milliseconds of expert matvec per token".  Warm-up runs are discarded
+// The objective is stated in tokens per second, so the useful output is not GiB/s but "milliseconds of expert matvec per token".  Warm-up runs are discarded
 // (the first launch pays module load and page faults) and the MINIMUM is reported alongside the mean, because
 // the minimum is the one not polluted by another process on the machine.
 void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
@@ -542,16 +541,8 @@ int main(int argc, char** argv) {
     }
 
     std::printf("s_gemv: %zu type cases, %d rows over tolerance (tol %.1e)\n", cases.size(), total_bad, tol);
-    // Q4_K IS NOT PART OF THE DEFAULT RUN.  It FAILS: 128 of 128 rows, worst error 0.586 of sum|term| - a
-    // real difference, not cancellation (the condition number is 2.8e7 and the error is 1.6e7).  Either the
-    // kernel's offset handling or this test's reconstruction of a Q4_K block is wrong and the two have not
-    // been separated yet.  Running it by default would turn ctest red and hide regressions in the four cases
-    // that ARE verified; leaving it out silently would be worse.  It is one flag away, and it is recorded as
-    // OPEN in the project state.
-    // Q4_K is IN the default run as of round 171.  Rounds 169-170 gated it because it FAILED, and the
-    // failure was this test's own reconstruction of a Q4_K block - four decodes of a quarter-filled block per
-    // superblock - not the kernel.  It now agrees to 2.8e-07 of sum|term|, so the gate goes rather than
-    // staying as a habit: a gate that outlives its reason is a check that quietly stopped running.
+    // Q4_K is in the default run: it agrees to about 3e-7 of sum|term|, and a gate that outlives its reason is
+    // a check that quietly stopped running.
     test_q4k(n_in, n_out, tol, &total_bad);
     std::printf("s_gemv total: %d rows over tolerance\n", total_bad);
     if (bench) {

@@ -1,20 +1,20 @@
-// src/kernels/qsa_parity.cpp - P2.S2's test for the QSA cache, indexer, selection and attention.
+// src/kernels/qsa_parity.cpp - test for the QSA cache, indexer, selection and attention.
 //
-// `ref/qsa.py` carries eleven PROPERTY checks and `ref/model.py::_qsa` is the layer as the model runs it.  The
+// The Python reference carries eleven PROPERTY checks and is the layer as the model runs it.  The
 // readings a prose transcription gets WRONG, each of which produces a well-formed result of the right shape,
 // are computed here the wrong way round AND required to differ MATERIALLY before the kernel is judged against
 // the right one - a test that only does the second half passes against either reading:
 //
-//   1. `pooled[b]` is rotated at the block's FIRST cell.  The reference's PROPERTY 4 pins it against the
+//   1. `pooled[b]` is rotated at the block's FIRST cell.  The reference pins it against the
 //      block's LAST cell; both give a unit-norm vector and the same downstream shape.
-//   2. Pool THEN norm (`rms_norm(mean(x))`) and not norm THEN pool (`mean(rms_norm(x))`).  `ref/model.py` L358
+//   2. Pool THEN norm (`rms_norm(mean(x))`) and not norm THEN pool (`mean(rms_norm(x))`).  the Python reference
 //      is explicit, and the two differ whenever the four cells have different magnitudes.
 //   3. The spare slot's key is `rms_norm(raw[0])` - cell ZERO - and not the last raw key, and the tail cells
 //      map to THAT slot and not to the last complete block.  A three-row raw tail cannot produce it unless
 //      cell 0's key is kept, which is what makes this a real design constraint rather than a detail.
 //   4. The indexer's Relu is PER HEAD, summed afterwards.  `relu(sum_h dot_h)` is the rival reading and
 //      differs whenever any head's dot is negative.
-//   5. The q -> kv head map is `q / 12` (integer division), NOT `q % 2`.  `ref/qsa.py` PROPERTY 7 tests the
+//   5. The q -> kv head map is `q / 12` (integer division), NOT `q % 2`.  the Python reference tests the
 //      same thing; with 24 and 2 the two give [0 x12, 1 x12] and [0,1,0,1,...].
 //   6. The attention reads ONLY the selected cells.  The source writes -inf into the mask and zeros at the
 //      top-k indices, so an unselected cell has weight exactly zero even when it would score highest -
@@ -27,7 +27,7 @@
 //
 // THE METRIC.  Both sums here - the indexer's sum of four relu'd dots and the attention's weighted sum of
 // value rows - cancel, so a plain |want-got|/|want| reports the condition number instead of the arithmetic.
-// The project has made that mistake four times (rounds 169, 189, 194, 196); where a sum is compared below, the
+// Where a sum is compared below, the
 // denominator is the magnitude of the TERMS.
 //
 // WHAT SETS EACH TOLERANCE, because a tolerance nobody can explain is one nobody can tighten:
@@ -37,7 +37,7 @@
 //     plus all 65,536 fp16 patterns in the reverse direction.
 //   * the pooled block keys: 1e-6.  The pooling and the norm are double on both sides and are bit-exact
 //     BEFORE the rotation; the residual is `rope_neox_apply` (f32, reused rather than re-implemented) against
-//     the reference's float64 rotation, the class round 189 measured at ~1e-7.
+//     the reference's float64 rotation, a class of error around 1e-7.
 //   * the indexer scores: 1e-6 against Sum|dot_h| + |bias|, set by the fp32 storage of the pooled keys -
 //     2^-24 per element over a 128-term dot.
 //   * the selected ids: EXACT.  the capture format gives `indexer_ids` no tolerance.
@@ -140,7 +140,7 @@ void require(const std::string& name, bool ok, const std::string& detail = "") {
     if (!ok) ++g_bad;
 }
 
-// ================= the reference: ref/qsa.py + ref/model.py, in double =================
+// ================= the reference: the Python reference, in double =================
 
 /// Which of the rival readings to compute.  The defaults are the SOURCE's reading.
 struct Alt {
@@ -168,7 +168,7 @@ double mul_add_plain(double x, double y, double z) {
     return z + p;
 }
 
-/// `ref/qsa.py::rms_norm` in double, in place.  `w` may be empty (w = None).
+/// the Python reference in double, in place.  `w` may be empty (w = None).
 void ref_rms_norm(std::vector<double>& x, const std::vector<float>& w, float eps) {
     double ss = 0;
     for (double v : x) ss = mul_add_plain(v, v, ss);
@@ -176,7 +176,7 @@ void ref_rms_norm(std::vector<double>& x, const std::vector<float>& w, float eps
     for (size_t i = 0; i < x.size(); ++i) x[i] = x[i] * inv * (w.empty() ? 1.0 : (double) w[i]);
 }
 
-/// `ref/qsa.py::rope_neox` in double: NEOX pairs (i, i + n_rot/2), partial over the first n_rot dims.
+/// the Python reference in double: NEOX pairs (i, i + n_rot/2), partial over the first n_rot dims.
 ///
 /// `terms`, when given, receives the magnitude of each component's TERMS - `|a c| + |b s|` where the
 /// rotation subtracts - so a comparison can divide by that instead of by the result, which cancels.
@@ -267,7 +267,7 @@ std::vector<double> ref_pooled(const RefCache& c, const std::vector<float>& w_kn
     return pooled;
 }
 
-/// `ref/qsa.py::indexer_scores` - per CELL, after the `cell_block` mapping.
+/// the Python reference - per CELL, after the `cell_block` mapping.
 std::vector<double> ref_indexer_scores(const std::vector<double>& pooled, int64_t n_bid,
                                        const std::vector<double>& q_idx, int64_t idx_n_head, int64_t idx_dim,
                                        const std::vector<float>& bias, int64_t n_kv, const Alt& o) {
@@ -292,7 +292,7 @@ std::vector<double> ref_indexer_scores(const std::vector<double>& pooled, int64_
     return cell;
 }
 
-/// `ref/qsa.py::select_cells`, spelled with a stable sort rather than the kernel's threshold search, so the
+/// the Python reference, spelled with a stable sort rather than the kernel's threshold search, so the
 /// two are independent implementations of one rule: score DESCENDING, ties by ASCENDING index.
 std::vector<int32_t> ref_select(const std::vector<double>& scores, int64_t n_kv, int64_t top_k, bool dense) {
     std::vector<int32_t> idx((size_t) n_kv);
@@ -309,7 +309,7 @@ std::vector<int32_t> ref_select(const std::vector<double>& scores, int64_t n_kv,
     return idx;
 }
 
-/// `ref/qsa.py::qsa_attend` over an EXPLICIT selected set, reading K/V from whichever table the caller passes
+/// the Python reference over an EXPLICIT selected set, reading K/V from whichever table the caller passes
 /// so that one piece of code runs on the f64 keys and on the fp16 cache's exact f32 values.
 std::vector<double> ref_attend(const std::vector<double>& q, int64_t n_head, int64_t n_head_kv, int64_t head_dim,
                                const std::vector<int32_t>& ids, const std::vector<std::vector<double>>& k,
@@ -342,7 +342,7 @@ std::vector<double> ref_attend(const std::vector<double>& q, int64_t n_head, int
     return out;
 }
 
-/// `ref/model.py::_qsa`'s last two lines.
+/// the Python reference's last two lines.
 std::vector<double> ref_gate(const std::vector<double>& attn, const std::vector<double>& q_full, int64_t n_head,
                              int64_t head_dim, const Alt& o) {
     std::vector<double> out((size_t) n_head * head_dim, 0.0);
@@ -377,7 +377,7 @@ int main(int argc, char** argv) {
         else {
             std::fprintf(stderr, "usage: qsa_parity [--selftest] [--qsa-dense] [--bench]\n"
                                  "  --qsa-dense  attend to EVERY cell instead of the indexer's selection\n"
-                                 "               (P1.S4's isolation switch; the sparse selection is still run\n"
+                                 "               (isolation switch; the sparse selection is still run\n"
                                  "                and checked, against the reference's dense/sparse property)\n"
                                  "  --bench      time the kernels at 32K of context\n");
             return 2;
@@ -543,8 +543,8 @@ int main(int argc, char** argv) {
     for (int64_t t = 0; t < NT; ++t) {
         std::vector<double> kk((size_t) (NKV * HD)), vv((size_t) (NKV * HD)), rr((size_t) IDXD);
         for (int64_t i = 0; i < NKV * HD; ++i) { kk[(size_t) i] = gauss(rng); vv[(size_t) i] = gauss(rng); }
-        // cell MAGNITUDES 1, 4, 16, 64 - for the same reason round 196 gave its residual streams different
-        // scales: four i.i.d. rows of normal noise have nearly the same norm by accident, so "pool then norm"
+        // cell MAGNITUDES 1, 4, 16, 64, so the cells differ in norm: four i.i.d. rows of normal noise have nearly the
+        // same norm by accident, so "pool then norm"
         // and "norm then pool" would agree to within the noise and the fixture could not see its own trap.
         for (int64_t d = 0; d < IDXD; ++d) rr[(size_t) d] = gauss(rng) * std::pow(4.0, (double) (t % 4));
         for (int64_t d = 0; d < IDXD; ++d) raw_flat.push_back((float) rr[(size_t) d]);
@@ -662,7 +662,7 @@ int main(int argc, char** argv) {
 
         // (d) THE TRAP THIS FIXTURE CANNOT SEE, measured and reported rather than hidden.  `rms_norm` divides
         //     by sqrt(mean(x^2) + eps), so the 1/r in the mean cancels EXCEPT through eps: mean and sum differ
-        //     by ~eps/(2*mean(x^2)) relative.  `ref/qsa.py` L463-465 makes the same point about its own test.
+        //     by ~eps/(2*mean(x^2)) relative.  the Python reference makes the same point about its own test.
         {
             std::vector<double> psum = want_raw;
             for (auto& x : psum) x *= (double) R;
@@ -889,7 +889,7 @@ int main(int argc, char** argv) {
     }
 
     // ================= 5. qsa_attend on the loud-cell fixture =================
-    // `ref/qsa.py` PROPERTY 8's own numbers: a key with 100 in its first dim against zeros, a value of 10
+    // the Python reference's own numbers: a key with 100 in its first dim against zeros, a value of 10
     // against 1, and q[:,0] = 1.  The logit gap is 100/sqrt(256) = 6.25, so the loud cell takes ~99% of its
     // head's weight - and exactly zero when it is not in the selected set.
     {
@@ -955,7 +955,7 @@ int main(int argc, char** argv) {
         // The scale trap is NOT asserted on this fixture: its softmax is saturated (the loud cell holds 99%
         // of the weight, so removing a 16x logit scale moves it to 100% and the output by 1.09%).  It is
         // asserted on the random 2100-cell fixture below, where the logits are O(10) and the temperature
-        // actually matters.  This is round 196's lesson about a fixture that cannot see its own trap.
+        // actually matters.  A fixture that cannot see its own trap is not a check.
         std::printf("  %-48s %-6s %s\n", "  (the scale trap is measured on the random fixture)", "--",
                     "this fixture's softmax is saturated");
         {   // the mask: the same reference with and without the loud cell in the selected set
@@ -1169,8 +1169,8 @@ int main(int argc, char** argv) {
         Alt a11; a11.gate_sigmoid = false;
         sep_gate("silu instead of sigmoid on the QSA gate is observable", a11);
 
-        // DENSE vs SPARSE.  Below the bound the width IS n_kv, so the two paths must agree EXACTLY (P1.S4's
-        // isolation property, `ref/qsa.py` PROPERTY 9b); above it they must differ, or the switch is a no-op.
+        // DENSE vs SPARSE.  Below the bound the width IS n_kv, so the two paths must agree EXACTLY (the
+        // isolation property); above it they must differ, or the switch is a no-op.
         require("below the bound, dense and sparse are the SAME selection",
                 ref_select(sc_want, 2000, TOPK, false) == ref_select(sc_want, 2000, TOPK, true));
         {
@@ -1458,7 +1458,7 @@ int main(int argc, char** argv) {
     // The spare key (`dead`, and `pooled[0]` until the first block completes) rotates at angle 0.  Its sine is
     // 0 in every scaling, so the rotation is `v * cos_tab[0][pair]`: exactly `v` unscaled (row 0 is (1, 0), the
     // bit-exact value section 2 asserts), `v * mscale` under YaRN - the magnitude every other pooled row and
-    // the native kernel's spare carry.  The table kernel used to skip the rotation at position 0, which left
+    // the native kernel's spare carry.  Skipping the rotation at position 0 would leave
     // the spare the one unscaled key of a scaled cache.  Asserted per variant: the table spare is BIT-EXACTLY
     // the unscaled spare times row 0 on the rotated dims and the unscaled spare past them; `pooled[0]` equals
     // `dead`; the native spare carries the same factor (to f32 rounding: its mscale is formed in float); and

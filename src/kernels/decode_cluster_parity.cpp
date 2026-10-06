@@ -1,4 +1,4 @@
-// src/kernels/decode_cluster_parity.cpp - S19: the decode kernels on thread-block clusters (sm_90+) against the ones
+// src/kernels/decode_cluster_parity.cpp - the decode kernels on thread-block clusters against the ones
 // they replace, bit for bit (GPU, synthetic, no model).
 //
 //   QSA top-k : qsa_block_topk_cluster vs qsa_block_topk_ref -
@@ -11,7 +11,7 @@
 // from below the selection width (the identity) to 262,144 cells, every tail weight (n_kv mod 4), 1-16 queries; and
 // one CUDA graph that captures both cluster launches, replayed with new inputs.
 //
-//   decode_cluster_parity --selftest     parity (exit 0 = identical everywhere); skipped (exit 0) below sm_90
+//   decode_cluster_parity --selftest     parity (exit 0 = identical everywhere); skipped (exit 0) without cluster support
 //   decode_cluster_parity --bench        per-call times, old vs new, at 32K / 128K / 262K
 //
 // The one-CTA references are qsa_block_topk_ref and the one-block greedy kernel (greedy_one_block).
@@ -68,7 +68,7 @@ template <typename T> struct Dev {
     ~Dev() { cudaFree(p); }
     void put(const std::vector<T>& h) {
         ck(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "up");
-        // #548 #536: a pageable cudaMemcpy can return before its DMA lands, and the graph replays and the timing
+        // a pageable cudaMemcpy can return before its DMA lands, and the graph replays and the timing
         // cases run on a cudaStreamNonBlocking stream that does not wait for the legacy stream - so wait here
         ck(cudaDeviceSynchronize(), "up landed");
     }
@@ -261,7 +261,7 @@ int run_graph_case(std::mt19937& rng) {
     const bool l1 = k::qsa_block_topk_cluster(d_sc.p, d_st.p, nq, max_blocks, cap, s, d_new.p, cs);
     const bool l2 = k::sample_greedy_cluster(d_l.p, nq, nv, a_new.p, cs);
     ck(cudaStreamEndCapture(cs, &g), "end capture");
-    if (!l1 && !l2) {   // no cluster code here (a card or a build below sm_90): nothing to compare
+    if (!l1 && !l2) {   // no cluster code here (a card or a build without cluster support): nothing to compare
         if (g) cudaGraphDestroy(g);
         cudaStreamDestroy(cs);
         return -1;
