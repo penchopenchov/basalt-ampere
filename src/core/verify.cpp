@@ -163,6 +163,12 @@ int dec_qsaf_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_QSAF"); return e ? std::atoi(e) : 0; }();
     return m;
 }
+// STRATA_DEC_DTC2 & 8: the attention's hc read writes the projections' q8_1 rows (its up slices), no quantize launch
+// (bits 1 and 2: dense_tc.hpp)
+int dec_dtc2_mask() {
+    static const int m = [] { const char* e = std::getenv("STRATA_DEC_DTC2"); return e ? std::atoi(e) : 0; }();
+    return m;
+}
 // STRATA_DEC_COMMIT: 1 = the commit graph in two launches; 2 = its GDN part from STRATA_DEC_COMMIT_CTAS persistent
 // blocks (default 32) so it trickles beside the draft instead of filling the card
 int dec_commit_mode() {
@@ -1144,6 +1150,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             h.mixed = mixed_ + tb * N; h.xn = xn_ + (size_t) tb * HC * N;
             return h;
         };
+        const bool read_q8 = dec_hc && (dec_dtc2_mask() & 8) && hc_fused_q8_rows_ok();
         {
             // the read's first kernel follows a combine, copy or wait: a plain launch, except after the device-planned
             // tail's combine kernel (PDL2)
@@ -1151,6 +1158,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             PdlScope ps(pdl, !after_kernel);
             if (dec_hc) {
                 HcFusedArgs h = hc_args(0, pending, inj2_, inj_);
+                if (read_q8) h.xq = xq_;
                 h.pf[0] = wn[1]->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float);
                 if (dec_hc_pf) {   // the FFN read's weights and router, read after the mixer
                     const size_t mat = (size_t) g.hc_lr * HC * N * 2;
@@ -1216,7 +1224,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     dense_proj(2, wg->native_type, wg->native_data, xq_, z_, (int) N, (int) ZV, n, sh_cs_);
                     cudaEventRecord(ev_join_, sh_cs_);
                 };
-                native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 const bool pk_z = gdnf_fork && sh_hi_ != nullptr && (dec_pk_mask() & 2) && n <= 2;
                 if (pk_z) {   // STRATA_DEC_PK & 2: z at the greatest priority beside qkv, then the one-launch recurrence
                     cudaEventRecord(ev_fork_, cs);
@@ -1365,7 +1373,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (qsaf_wide) {
                     {
                         PdlScope ps(pdl);   // after the hc read
-                        native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                        if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                     }
                     cudaEventRecord(qev_[0], cs);
                     for (cudaStream_t q : qs_) cudaStreamWaitEvent(q, qev_[0], 0);
@@ -1409,7 +1417,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const bool iq_main = (dec_qsaf_mask() & 2) != 0;
                     {
                         PdlScope ps(pdl);   // after the hc read
-                        native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                        if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                     }
                     cudaEventRecord(ev_fork_, cs);
                     cudaStreamWaitEvent(qside, ev_fork_, 0);
@@ -1441,7 +1449,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 } else {
                 {
                     PdlScope ps(pdl);   // after the hc read, up to the K/V norms
-                    native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                    if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                     if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                     else for (int t = tb; t < te; ++t)
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);

@@ -90,6 +90,37 @@ __device__ __forceinline__ void hc_q8_1_store(float xi, HcQ81* __restrict__ y, i
     if (lane == 0) y[ib].ds = q8_1_ds(d, sum);
 }
 
+// A read without a router that writes xq: per q8_1 block of a token row, the columns of the up slices done so far
+// (the slice that completes a block quantizes it for every token and zeroes its count)
+__device__ unsigned g_hc_q8cnt[4][N / 32];
+
+// The up slice's mixed columns are written: count them per q8_1 block, and the slice that completes a block writes its
+// q8_1 rows (hc_q8_1_store on the stored values: the same bits as native_quantize_q8_1).
+template <int T>
+__device__ void hc_up_q8(const HcFusedArgs& a, int c0, int nc, int tid, unsigned* __restrict__ cnt) {
+    __shared__ int s_done[4];
+    const int j0 = c0 / 32, nj = (c0 + nc - 1) / 32 - j0 + 1;   // nc <= 32 * 3 + 1
+    __threadfence();
+    __syncthreads();
+    if (tid < nj) {
+        const int j = j0 + tid, lo = max(c0, 32 * j), hi = min(c0 + nc, 32 * j + 32);
+        const unsigned n = (unsigned) (hi - lo);
+        const bool done = atomicAdd(&cnt[j], n) + n == 32u;
+        if (done) {
+            cnt[j] = 0;
+            __threadfence();
+        }
+        s_done[tid] = done;
+    }
+    __syncthreads();
+    for (int w = tid >> 5; w < nj * T; w += WARPS) {
+        const int jj = w / T, k = w - jj * T;
+        if (!s_done[jj]) continue;
+        const int q = k * (N / 32) + j0 + jj;
+        hc_q8_1_store(__ldcg(a.mixed + (size_t) q * 32 + (tid & 31)), static_cast<HcQ81*>(a.xq), q, tid & 31);
+    }
+}
+
 // each counter in its own 256-byte block: the CTAs polling one do not queue behind the atomics on another
 struct alignas(256) HcCtr {
     unsigned v;
@@ -100,6 +131,7 @@ struct HcSync {
 // consecutive reads take different counter sets: a read's CTAs claim work before the previous kernel is done
 constexpr int NSLOT = 4;
 __device__ HcSync g_hc_sync[NSLOT];
+static_assert(sizeof(g_hc_q8cnt) / sizeof(g_hc_q8cnt[0]) == NSLOT, "a q8_1 count set per counter set");
 
 struct HcLaunch {
     HcFusedArgs a;
@@ -2089,6 +2121,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                 hcx_router_part<T>(sl, rw, mix, tid, L.racc);
                 stamp(dbg, b, 5, tid);
             }
+            if (a.xq != nullptr && a.w_router == nullptr) hc_up_q8<T>(a, sl.c0, sl.nc, tid, g_hc_q8cnt[L.slot]);
             cta_signal(&sy->up.v, tid);
             stamp(dbg, b, 3, tid);
         } else if (item >= it.t10) {
@@ -2801,6 +2834,10 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         !a.mixed || !a.xn || (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev)) ||
         (a.w_router && (!a.logits || !a.ids || !a.weights)) || (a.apply && a.inj_prev == a.inject_out)) {
         std::fprintf(stderr, "hc_fused_read: invalid arguments or unsupported device\n");
+        std::exit(1);
+    }
+    if (a.xq != nullptr && !hc_fused_q8_rows_ok()) {
+        std::fprintf(stderr, "hc_fused_read: xq needs the read's up or router items (not split-K, STRATA_DEC_HCX 1 / 3)\n");
         std::exit(1);
     }
     HcLaunch L{};
