@@ -459,35 +459,13 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     auto direct_run = [&] {
         run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s, true, stride);
     };
-    if (std::getenv("S20_IDSDIAG")) {   // which step overwrites the routing ids on the device
-        auto check = [&](const char* after) {
-            ck(cudaStreamSynchronize(s), "sync");
-            const std::vector<int32_t> d = download_i(fb.ids, (size_t) rows);
-            int64_t bad = 0;
-            for (size_t i = 0; i < (size_t) rows; ++i) bad += d[i] != ids[i];
-            std::printf("    ids on the device after %s: %lld of %lld differ (fb.ids %p, mb.dm %p..%p, fb.dm %p..%p)\n",
-                        after, (long long) bad, (long long) rows, fb.ids.p, mb.dm.p,
-                        (void*) (mb.dm.as<uint8_t>() + (size_t) rows * N * 4), fb.dm.p,
-                        (void*) (fb.dm.as<uint8_t>() + (size_t) rows * N * 4));
-        };
-        check("the upload");
-        mmq_run();
-        check("an MMQ run");
-        fused_run();
-        check("a fused run");
-        if (all_routed) {
-            direct_run();
-            check("an MMQ run without gathers");
-        }
-    }
     // ~1 s of both first (the clocks ramp up), then alternating rounds; the medians
-    const bool no_mmq = std::getenv("S20_NOMMQ") != nullptr;   // (debug: the fused runs alone)
-    for (float spent = 0; spent < 1000.0f;) spent += (no_mmq ? 0.0f : once(mmq_run)) + once(fused_run);
+    for (float spent = 0; spent < 1000.0f;) spent += once(mmq_run) + once(fused_run);
     std::vector<float> tm, tf, td;
     for (int rep = 0; rep < 8; ++rep) {
-        tm.push_back(no_mmq ? 1.0f : once(mmq_run));
+        tm.push_back(once(mmq_run));
         tf.push_back(once(fused_run));
-        if (all_routed && !no_mmq) td.push_back(once(direct_run));
+        if (all_routed) td.push_back(once(direct_run));
     }
     if (td.empty()) td.push_back(0.0f);
     std::sort(tm.begin(), tm.end());
@@ -547,28 +525,6 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
                         tbl[2], tbl[3], r.cnt[0], r.cnt[1], r.cnt[2], r.cnt[3]);
             throw std::runtime_error(std::string(p.name) + ": the grouping is wrong");
         }
-    }
-    if (std::getenv("S20_ROWDIAG")) {   // the pairs whose rows differ most: expert, its rows, the row's place
-        const std::vector<int32_t> fsrc = download_i(fb.src, (size_t) rows);
-        std::vector<std::pair<double, size_t>> worst;
-        for (size_t i = 0; i < (size_t) rows; ++i) {
-            const float* a = y_f.data() + (size_t) slot[i] * N;
-            const float* m = y_mmq.data() + (size_t) r.row_of[i] * N;
-            double me = 0, mr = 0;
-            for (int o = 0; o < N; ++o) { me = std::max(me, (double) std::fabs(a[o] - m[o])); mr = std::max(mr, (double) std::fabs(m[o])); }
-            worst.push_back({mr > 0 ? me / mr : me, i});
-        }
-        std::sort(worst.rbegin(), worst.rend());
-        for (int k = 0; k < 12; ++k) {
-            const size_t i = worst[(size_t) k].second;
-            const int e = ids[i];
-            // the expert's rows start at its first fused row: the smallest slot of its pairs
-            int32_t first = INT32_MAX;
-            for (size_t j = 0; j < (size_t) rows; ++j) if (ids[j] == e) first = std::min(first, slot[j]);
-            std::printf("    pair %zu token %zu expert %d (%d rows) fused row %d (+%d in the expert) max rel %.3e\n", i,
-                        i / K, e, r.cnt[(size_t) e], slot[i], slot[i] - first, worst[(size_t) k].first);
-        }
-        (void) fsrc;
     }
     // both against the double-precision reference on a sample of 96 pairs
     {

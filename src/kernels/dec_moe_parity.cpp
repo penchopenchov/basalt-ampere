@@ -116,14 +116,13 @@ double time_us(cudaStream_t s, int iters, const std::function<void()>& f) {
 // --stress N: N peer windows (48 rings each) of random routings - T 1..8, rings with no, few, many or only peer
 // entries, back to back, rung by CUDA0's route kernel or by the host, some abandoned midway - each under a watchdog:
 // a window that does not finish within 5 s is a hang (the words and the kernel's abort record are printed).  Every
-// finished window's last ring is checked bitwise against native_expert_grouped on the peer.  DM_STRESS_DUP=1 also
+// finished window's last ring is checked bitwise against native_expert_grouped on the peer.  `dup` (--stress-dup) also
 // routes tokens with repeated expert ids and ids past n_expert (the route kernel must keep them off the peer).
-// DM_STRESS_TORN=1: the host-rung rings carry an expert id with different tiers in different tokens (what the route
+// `torn` (--stress-torn): the host-rung rings carry an expert id with different tiers in different tokens (what the route
 // kernel publishes when it reads a residency table while an upload lands): the peer must neither hang nor fault.
-void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows) {
+void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows, bool dup, bool torn, unsigned seed) {
     const auto L = K::native_expert_layout(gt, dt, H, FF);
     constexpr int NX0 = 32, NP = 48, NX1 = 64, RINGS = 48;
-    const bool dup = std::getenv("DM_STRESS_DUP") != nullptr, torn = std::getenv("DM_STRESS_TORN") != nullptr;
     const auto* tg = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
     const auto* tu = gguf.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
     const auto* td = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
@@ -135,7 +134,7 @@ void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows) {
         std::memcpy(b + L.up_off, gguf.tensor_data(*tu) + E * L.up_off, L.up_off);
         std::memcpy(b + L.down_off, gguf.tensor_data(*td) + E * (L.bytes - L.down_off), L.bytes - L.down_off);
     }
-    std::mt19937 rng(std::getenv("DM_STRESS_SEED") ? (unsigned) std::atoi(std::getenv("DM_STRESS_SEED")) : 4242u);
+    std::mt19937 rng(seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> xh((size_t) MT * H);
     for (auto& v : xh) v = nd(rng);
@@ -406,15 +405,21 @@ void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
-        std::fprintf(stderr, "usage: dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]\n");
+        std::fprintf(stderr, "usage: dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N [--stress-dup] [--stress-torn] "
+                     "[--stress-seed N]]\n");
         return 2;
     }
     bool bench = false;
     int stress_n = 0;
+    bool stress_dup = false, stress_torn = false;
+    unsigned stress_seed = 4242u;
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) { bench = true; continue; }
         if (std::strcmp(argv[i], "--stress") == 0 && i + 1 < argc) { stress_n = std::atoi(argv[++i]); continue; }
+        if (std::strcmp(argv[i], "--stress-dup") == 0) { stress_dup = true; continue; }
+        if (std::strcmp(argv[i], "--stress-torn") == 0) { stress_torn = true; continue; }
+        if (std::strcmp(argv[i], "--stress-seed") == 0 && i + 1 < argc) { stress_seed = (unsigned) std::atoi(argv[++i]); continue; }
         std::stringstream ss(argv[i]);
         std::string t;
         while (std::getline(ss, t, ',')) layers.push_back(std::atoi(t.c_str()));
@@ -439,7 +444,7 @@ int main(int argc, char** argv) {
     if (layers.empty()) layers = auto_layers;
     if (stress_n > 0) {   // the first listed layer only
         if (!two || fmt[layers[0]].first < 0) { std::fprintf(stderr, "--stress: two cards and a layer with experts\n"); return 2; }
-        stress(gguf, layers[0], fmt[layers[0]].first, fmt[layers[0]].second, stress_n);
+        stress(gguf, layers[0], fmt[layers[0]].first, fmt[layers[0]].second, stress_n, stress_dup, stress_torn, stress_seed);
         std::printf("dec_moe_parity --stress: %s\n", g_fail ? "FAILED" : "no hang, bitwise equal");
         return g_fail ? 1 : 0;
     }
@@ -817,49 +822,6 @@ int main(int argc, char** argv) {
                     const auto t3 = down(d_p3, (size_t) n * H);
                     std::snprintf(what, sizeof what, "VRAM kind %d T=%d (%d groups)", kind, T, P.counts[0]);
                     report(what, l, ndiff_rows(a3, t3, rows), rows.size() * H);
-                }
-                if (std::getenv("DM_DEBUG")) {
-                    const auto sy = down(d_vsync, K::kDmCap + 1);
-                    int nz = 0;
-                    for (auto v : sy) nz += v != 0;
-                    std::printf("    sync words nonzero after: %d\n", nz);
-                    {   // gate/up of the fused call vs the grouped call's scratch (gate | up at the same offsets? no: compare per entry)
-                        const auto gf = down((const float*) d_vscr, (size_t) K::kDmCap * FF * 2);
-                        const size_t f = (size_t) n * FF * 4, fa = (f + 255) & ~(size_t) 255;
-                        const auto gg = down((const float*) dv[0].scr, (size_t) n * FF);
-                        const auto ug = down((const float*) ((uint8_t*) dv[0].scr + fa), (size_t) n * FF);
-                        size_t dg = 0, du = 0;
-                        for (size_t i = 0; i < (size_t) n * FF; ++i) {
-                            dg += std::memcmp(&gf[i], &gg[i], 4) != 0;
-                            du += std::memcmp(&gf[(size_t) K::kDmCap * FF + i], &ug[i], 4) != 0;
-                        }
-                        std::printf("    gate differs %zu, up differs %zu (of %zu)\n", dg, du, (size_t) n * FF);
-                        for (int rep = 0; rep < 4; ++rep) {
-                            ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
-                            if (rep & 1) ck(cudaMemsetAsync(d_vscr, 0xff, K::dec_moe_vram_scratch_bytes((int) FF), s0), "nan");
-                            K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_p3, d_vsync, s0);
-                            ck(cudaStreamSynchronize(s0), "vram2");
-                            const auto c3 = down(d_p3, (size_t) n * H);
-                            size_t zeros = 0, nans = 0;
-                            for (int r : rows)
-                                for (int64_t c = 0; c < H; ++c) {
-                                    const float v = c3[(size_t) r * H + c];
-                                    zeros += v == 0.0f && a3[(size_t) r * H + c] != 0.0f;
-                                    nans += std::isnan(v);
-                                }
-                            std::printf("    rerun %d (%s scratch) differs from grouped: %zu (zeros %zu nans %zu)\n", rep,
-                                        rep & 1 ? "NaN" : "kept", ndiff_rows(a3, c3, rows), zeros, nans);
-                        }
-                    }
-                    for (int g = 0; g < P.counts[0]; ++g)
-                        for (int e = P.start[g]; e < P.start[g + 1]; ++e) {
-                            const int i = P.dst[e];
-                            size_t d = 0, first = H;
-                            for (int64_t c = 0; c < H; ++c)
-                                if (std::memcmp(&a3[(size_t) i * H + c], &b3[(size_t) i * H + c], 4) != 0) { ++d; if (first == (size_t) H) first = c; }
-                            if (d) std::printf("    group %d entry %d (n %d): %zu differ, first col %zu\n", g, e,
-                                               P.start[g + 1] - P.start[g], d, first);
-                        }
                 }
                 cudaFree(d_p3);
             }

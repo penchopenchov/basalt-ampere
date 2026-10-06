@@ -246,11 +246,9 @@ double time_graph(F&& call, int NL, cudaStream_t s, int reps = 7) {
     return 1000.0 * ms[ms.size() / 2] / NL;
 }
 
-// DTC_BENCH=<names, comma-separated substrings> picks the cases; DTC_BENCH_WARM=1 replays one weight copy (L2-warm)
-void bench(cudaStream_t s) {
+// --bench-cases NAMES (comma-separated substrings) picks the cases; --bench-warm replays one weight copy (L2-warm)
+void bench(cudaStream_t s, const char* pick, bool warm) {
     std::vector<const Case*> sel;
-    const char* pick = std::getenv("DTC_BENCH");
-    const bool warm = std::getenv("DTC_BENCH_WARM") != nullptr;
     for (const Case& c : CASES) {
         bool on = pick == nullptr ? (&c == &CASES[0] || &c == &CASES[1] || &c == &CASES[3] || &c == &CASES[4] ||
                                      &c == &CASES[7] || &c == &CASES[12])
@@ -302,7 +300,7 @@ void bench(cudaStream_t s) {
     }
 }
 
-// DTC_BENCH_PAIR=1: dense_tc_pair of qkv + z against dense_tc qkv then native z, L2-cold
+// --bench-pair: dense_tc_pair of qkv + z against dense_tc qkv then native z, L2-cold
 void bench_pair(cudaStream_t s) {
     const int pairs[][2] = {{0, 6}, {1, 5}, {3, 5}, {0, 4}, {1, 6}, {3, 6}};
     std::printf("\npair bench: us per call (median of 7 graph replays)\n");
@@ -362,19 +360,34 @@ int main(int argc, char** argv) {
     }
     cudaStream_t s;
     cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-    const bool only_bench = argc > 1 && std::string(argv[1]) == "--bench-only";
+    bool only_bench = false, run_bench = false, pair_only = false, bench_pair_on = false, warm = false;
+    const char* pick = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--bench-only") only_bench = run_bench = true;
+        else if (a == "--bench") run_bench = true;
+        else if (a == "--pair-only") pair_only = true;          // only the dense_tc_pair checks
+        else if (a == "--bench-pair") bench_pair_on = true;
+        else if (a == "--bench-warm") warm = true;
+        else if (a == "--bench-cases" && i + 1 < argc) pick = argv[++i];
+        else {
+            std::printf("usage: dense_tc_parity [--bench | --bench-only] [--bench-cases NAMES] [--bench-warm] "
+                        "[--bench-pair] [--pair-only]\n");
+            return 2;
+        }
+    }
     bool ok = true;
     if (!only_bench) {
-        if (std::getenv("DTC_PAIR_ONLY") == nullptr)   // DTC_PAIR_ONLY=1: only the dense_tc_pair checks
+        if (!pair_only)
             for (const Case& c : CASES)
                 if (c.type != 21 || c.n_in % 2048 == 0) ok = parity(c, s) && ok;
         const int pairs[][2] = {{0, 6}, {1, 5}, {2, 4}, {3, 6}, {0, 5}, {16, 17}, {3, 17}, {20, 21}, {16, 21}, {1, 17},
                                 {20, 17}};
         for (const auto& pr : pairs) ok = pair_parity(CASES[pr[0]], CASES[pr[1]], s) && ok;
     }
-    if (argc > 1 && (std::string(argv[1]) == "--bench" || only_bench)) {
-        if (std::getenv("DTC_BENCH_PAIR") != nullptr) bench_pair(s);
-        else bench(s);
+    if (run_bench) {
+        if (bench_pair_on) bench_pair(s);
+        else bench(s, pick, warm);
     }
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

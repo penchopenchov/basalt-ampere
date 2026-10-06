@@ -4,14 +4,12 @@
 //
 //     build/native_grouped_parity           the checks (a ctest; needs the GPU)
 //     build/native_grouped_parity --bench   the checks, then v1/new timings of 48 calls in a graph (a window's layers)
+//     --gu2 also checks the gate/up pair kernel; --bench-gu/-down/-ff/-t/-gy/-phase/-sizes/-ab shape the timings
 //
 // Every gate/up format with every down format; calls of 0..cap groups of 1..T entries each (an empty call is what the
 // verify window's PCIe call usually is), entries from 0 and from past 0 (the PCIe call's follow the VRAM call's),
 // scattered destinations, stale scratch, grid_groups 0 (= cap), 1, 2, 3, 4 and above cap: the output must be BITWISE
 // equal to v1's, the rows the call must not write included (both start from the same NaN pattern).
-//
-// With GU_MMA=1 the new launches take IQ3_XXS gate/up on the tensor-core kernel (sm_80+ CUDA) while v1 keeps
-// the dp4a one, so the IQ3_XXS rows check it against the dp4a kernel, bitwise as well (and --bench times the two).
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
@@ -315,39 +313,43 @@ float median(std::vector<float> v) {
 // per gate/up call within one run), and whichever variant ran before the step would look faster.
 constexpr int kWarmPairs = 20, kPairs = 40;
 
-void bench(cudaStream_t s, std::mt19937& rng) {
+// the shape and variants --bench measures; each has a command-line flag (--bench-gu N, ...)
+struct BenchOptions {
+    int gu = 21, down = 23, ff = 768, t = 4, gy = 0, phase = 0;
+    std::string sizes;    // another window's group sizes, e.g. "6,6,5,3,1"
+    std::string ab;       // "gu2": A / B of the new launches without / with the gate/up pair kernel
+};
+
+void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
     std::printf("\n--bench: microseconds per call, a window's 48 calls in a graph, each layer with its own experts (the\n"
                 "weights stream from DRAM as in the engine); v1 / new (grid_groups): medians of %d launches each,\n"
                 "alternating, after %d warm-up pairs - idle GPU assumed\n", kPairs, kWarmPairs);
-    // a verify window's shape: 4 tokens x 10 experts, 2560 x 768 IQ3_S / IQ4_XS experts (BENCH_GU / _DOWN /
-    // _FF for another pack's: 18 / 20 / 640 is IQ3_XXS with IQ4_NL down projections)
-    auto env_int = [](const char* n, int d) { const char* v = std::getenv(n); return v ? std::atoi(v) : d; };
-    Setup S(env_int("BENCH_GU", 21), env_int("BENCH_DOWN", 23), 2560, env_int("BENCH_FF", 768),
-            env_int("BENCH_T", 4), 10, 32, rng, s);
+    // a verify window's shape: 4 tokens x 10 experts, 2560 x 768 IQ3_S / IQ4_XS experts (--bench-gu / --bench-down /
+    // --bench-ff for other formats: 18 / 20 / 640 is IQ3_XXS with IQ4_NL down projections)
+    Setup S(bo.gu, bo.down, 2560, bo.ff, bo.t, 10, 32, rng, s);
     std::vector<int> vram(16, 1);
     vram.insert(vram.end(), 12, 2);                                   // 28 groups, 40 entries
-    if (const char* v = std::getenv("BENCH_SIZES")) {          // another window's group sizes, e.g. "6,6,5,3,1"
+    if (!bo.sizes.empty()) {
         vram.clear();
-        for (const char* q = v; *q;) { vram.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+        for (const char* q = bo.sizes.c_str(); *q;) { vram.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
     }
     const struct { const char* what; std::vector<int> sizes; int64_t gy; } rows[] = {
         {"no group (the PCIe call at pcie_frac 0)", {}, 4},
         {"1 group of 2 entries (a PCIe call)", {2}, 4},
-        {"28 groups, 40 entries (a VRAM call)", vram, env_int("BENCH_GY", 0)},
+        {"28 groups, 40 entries (a VRAM call)", vram, bo.gy},
     };
-    const char* ab = std::getenv("BENCH_AB");
-    const bool ab_gu2 = ab != nullptr && std::string(ab) == "gu2";   // B: BENCH_GU2 (default 1)
-    k::native_expert_set_mode(-1, env_int("BENCH_PHASE", 0));   // 1: gate/up + SwiGLU only, 2: down only
-    if (ab_gu2) std::printf("  A / B: the new launches without / with DEC_GU2\n");
+    const bool ab_gu2 = bo.ab == "gu2";
+    k::native_expert_set_mode(-1, bo.phase);   // 1: gate/up + SwiGLU only, 2: down only
+    if (ab_gu2) std::printf("  A / B: the new launches without / with the gate/up pair kernel\n");
     cudaEvent_t e0, e1;
     ck(cudaEventCreate(&e0), "event");
     ck(cudaEventCreate(&e1), "event");
     for (const auto& r : rows) {
         const int ng = S.plan_sizes(r.sizes, 0, rng);
         const Layers Ls(S, ng);                                       // 48 x 28 experts: 3.7 GB for the VRAM call
-        // BENCH_AB=gu2: the new launches without / with native_gu2_kernel instead of v1 / new
+        // --bench-ab gu2: the new launches without / with native_gu2_kernel instead of v1 / new
         cudaGraphExec_t ga = ab_gu2 ? make_graph(s, S, Ls, false, r.gy, 0) : make_graph(s, S, Ls, true, 0);
-        cudaGraphExec_t gb = make_graph(s, S, Ls, false, r.gy, ab_gu2 ? env_int("BENCH_GU2", 1) : -1);
+        cudaGraphExec_t gb = make_graph(s, S, Ls, false, r.gy, ab_gu2 ? 1 : -1);
         std::vector<float> ta, tb;
         for (int i = 0; i < kWarmPairs + kPairs; ++i) {
             const bool a_first = i % 2 == 0;
@@ -367,32 +369,44 @@ void bench(cudaStream_t s, std::mt19937& rng) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
+    bool do_bench = false, gu2 = false;
+    BenchOptions bo;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto num = [&](int& dst) { if (i + 1 < argc) dst = std::atoi(argv[++i]); };
+        if (a == "--bench") do_bench = true;
+        else if (a == "--gu2") gu2 = true;   // also check the gate/up pair kernel (2560-value rows only)
+        else if (a == "--bench-gu") num(bo.gu);
+        else if (a == "--bench-down") num(bo.down);
+        else if (a == "--bench-ff") num(bo.ff);
+        else if (a == "--bench-t") num(bo.t);
+        else if (a == "--bench-gy") num(bo.gy);
+        else if (a == "--bench-phase") num(bo.phase);
+        else if (a == "--bench-sizes" && i + 1 < argc) bo.sizes = argv[++i];
+        else if (a == "--bench-ab" && i + 1 < argc) bo.ab = argv[++i];
+        else {
+            std::printf("usage: native_grouped_parity [--gu2] [--bench [--bench-gu N] [--bench-down N] [--bench-ff N] "
+                        "[--bench-t N] [--bench-gy N] [--bench-phase N] [--bench-sizes LIST] [--bench-ab gu2]]\n");
+            return 2;
+        }
+    }
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
-    {
-        const char* m = std::getenv("GU_MMA");
-        const bool mma = m != nullptr && m[0] != '\0' && m[0] != '0';
-        std::printf("gate/up: %s\n", mma ? "GU_MMA=1 - IQ3_XXS on the tensor-core kernel where the device "
-                                          "has it (sm_80+ CUDA), v1 on dp4a: checked bitwise"
-                                        : "the dp4a kernels (GU_MMA=1 checks the tensor-core one)");
-    }
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 8})        // GU_FMTS
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
     check(18, 20, 2560, 640, s, rng);
     check(18, 20, 512, 256, s, rng, 12);                                // groups of more than 8 entries
-    {   // DEC_GU2=1: the new launches take native_gu2_kernel (2560-value rows only), v1 the multi kernel
-        const char* g = std::getenv("DEC_GU2");
-        if (g != nullptr && (g[0] == '1' || g[0] == '2')) {
+    {   // --gu2: the new launches take native_gu2_kernel (2560-value rows only), v1 the multi kernel
+        if (gu2) {
             for (int gu : {16, 17, 18, 21, 22, 42})
                 for (int dt : {20, 42}) check(gu, dt, 2560, 640, s, rng, gu == 18 ? 8 : 6);
             check(22, 20, 2560, 512, s, rng, 3);
         }
     }
-    if (do_bench) bench(s, rng);
+    if (do_bench) bench(s, rng, bo);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);
     return g_fail ? 1 : 0;

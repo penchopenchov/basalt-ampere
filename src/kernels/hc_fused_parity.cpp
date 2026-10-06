@@ -1,7 +1,7 @@
 // src/kernels/hc_fused_parity.cpp - hc_fused_read against the kernels it replaces (fused_gr_read_multi, then the
 // MMVF router GEMV and the native top-10), bit for bit on every output, with real geometry and random inputs; then
 // the time of both with the weights hot in L2 and cold (L2 overwritten before every read).  DEC_HC8=1: the
-// fused read on 8-bit copies of the matrices (run with HC_TOL=1).
+// fused read on 8-bit copies of the matrices (run with --tol).
 //
 //     build/hc_fused_parity [iters] [T min] [T max]
 #include "basalt/kernels/bf16_gemv.hpp"
@@ -35,8 +35,20 @@ static uint16_t bf16(float x) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const int iters = argc > 1 ? std::atoi(argv[1]) : 200;
-    const int t_lo = argc > 2 ? std::atoi(argv[2]) : 1, t_hi = argc > 3 ? std::atoi(argv[3]) : 8;
+    // hc_fused_parity [ITERS [T_LO [T_HI]]] [--tol] [--stamp-reps N] [--block T:K,...]
+    std::vector<std::string> pos;
+    bool tol = false;
+    int stamp_reps = 1;
+    std::string block_list = "2:4,2:100,2:165,6:4,6:100,8:169";
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--tol") tol = true;
+        else if (a == "--stamp-reps" && i + 1 < argc) stamp_reps = std::max(1, std::atoi(argv[++i]));
+        else if (a == "--block" && i + 1 < argc) block_list = argv[++i];
+        else pos.push_back(a);
+    }
+    const int iters = pos.size() > 0 ? std::atoi(pos[0].c_str()) : 200;
+    const int t_lo = pos.size() > 1 ? std::atoi(pos[1].c_str()) : 1, t_hi = pos.size() > 2 ? std::atoi(pos[2].c_str()) : 8;
     if (!K::hc_fused_supported()) {
         std::printf("hc_fused_parity: the fused read does not run on this device\n");
         return 1;
@@ -186,10 +198,9 @@ int main(int argc, char** argv) {
     };
 
     int failures = 0;
-    // HC_TOL=1 (a path that is not bitwise): per output the max |diff| against the plain kernels (and relative to the
+    // --tol (a path that is not bitwise): per output the max |diff| against the plain kernels (and relative to the
     // largest |value|), routed experts that differ, and - bit for bit - each token's outputs against the same token in a
     // window of t_hi tokens
-    const bool tol = std::getenv("HC_TOL") && std::getenv("HC_TOL")[0] == '1';
     std::vector<std::vector<float>> by_t(t_hi + 1);
     for (int T = t_lo; T <= t_hi; ++T)
         for (int mode = 0; mode < 3; ++mode) {   // 0: attention-side read, 1: FFN read + router, 2: the head's read
@@ -356,9 +367,8 @@ int main(int argc, char** argv) {
         std::vector<unsigned long long> h((size_t) sms * 16);
         static const char* const ph[15] = {"start", "dep-wait", "input", "role-done", "rtr-in", "rtr-done", "top10", "exit",
                                            "ticket", "up-lo", "norm-wr/w-in", "norm-sig/dn-in", "t10-smax", "t10-cand", "t10-rank"};
-        // HC_STAMP_REPS=<n>: the median over n reads of each phase's min/max over CTAs
-        const char* re = std::getenv("HC_STAMP_REPS");
-        const int reps = re ? std::max(1, std::atoi(re)) : 1;
+        // --stamp-reps N: the median over N reads of each phase's min/max over CTAs
+        const int reps = stamp_reps;
         for (int T : {1, 2, 3}) {
             if (T < t_lo || T > t_hi) continue;
             for (int cold = 0; cold < 2; ++cold) {
@@ -419,8 +429,7 @@ int main(int argc, char** argv) {
         cudaHostGetDevicePointer((void**) &d_started, h_started, 0);
         cudaStream_t sb;
         cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking);
-        const char* e = std::getenv("HC_BLOCK");
-        std::string bs = e ? e : "2:4,2:100,2:165,6:4,6:100,8:169";
+        const std::string bs = block_list;
         size_t p0 = 0;
         int stuck = 0;
         while (p0 < bs.size()) {
