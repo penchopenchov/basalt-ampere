@@ -1,4 +1,4 @@
-# basalt: a local inference engine for one NVIDIA Blackwell (sm_120) GPU.
+# basalt: a local inference engine for one NVIDIA GPU.
 cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
@@ -22,11 +22,11 @@ endif()
 # the CUDA language gives the .cu compile rules but not the imported targets, so `CUDA::cudart` is brought in
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
-# Blackwell (sm_120) only: the kernels use its instructions and nothing else is tested.
+# One architecture only: the kernels use its instructions and nothing else is tested.
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
   if(NOT _base STREQUAL "120")
-    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for sm_120 only")
+    message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}': basalt builds for compute capability 12.0 only")
   endif()
 endforeach()
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
@@ -114,8 +114,6 @@ target_link_libraries(basalt-overlap PRIVATE core kernels ${_gpu_runtime_target}
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
 add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
                         src/kernels/cuda/s_gemv.cu
-                        src/kernels/cuda/s2_gemv_quads.cu
-                        src/kernels/cuda/s2_gemv_fast.cu
                         src/kernels/cuda/router_top10.cu
                         src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/rope.cu
@@ -436,8 +434,8 @@ add_executable(sampler_parity src/kernels/sampler_parity.cpp)
 target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME sampler_parity COMMAND sampler_parity --selftest)
-# the decode QSA top-k and the greedy argmax on thread-block clusters (sm_90+) vs the one-CTA kernels, bitwise,
-# captured in a graph too (GPU, synthetic, no model; skips below sm_90); --bench: per-call times
+# the decode QSA top-k and the greedy argmax on thread-block clusters vs the one-CTA kernels, bitwise,
+# captured in a graph too (GPU, synthetic, no model; skips without cluster support); --bench: per-call times
 add_executable(decode_cluster_parity src/kernels/decode_cluster_parity.cpp)
 target_include_directories(decode_cluster_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(decode_cluster_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -710,7 +708,7 @@ target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda 
 target_link_libraries(mmq PUBLIC ggml-base ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC mmq)
 if(BUILD_TESTING)
-  # the fused int8 experts against a double-precision reference and the MMQ path (exit 77 below sm_80)
+  # the fused int8 experts against a double-precision reference and the MMQ path (exit 77 without int8 tensor cores)
   add_executable(prefill_fused_moe_test tests/cuda/prefill_fused_moe_test.cpp)
   target_link_libraries(prefill_fused_moe_test PRIVATE mmq ggml-base ${_gpu_runtime_target})
   add_test(NAME prefill_fused_moe_test COMMAND prefill_fused_moe_test)

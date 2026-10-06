@@ -59,20 +59,6 @@ void s_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, const 
 void s_gemv_split(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
                   float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row);
 
-// S2 ONLY, with the code load amortised over four consecutive elements (they share one byte) and the
-// activation load over four halves (one 64-bit word).  S2 is 31.64 GiB of the 38 GiB pack, so it is the kernel
-// whose instruction count matters.  No `offset` - S2 has none, and a parameter that is always null is a
-// parameter that will eventually be passed by mistake.
-void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales, float* y, int64_t n_in,
-                   int64_t n_out, int threads_per_row);
-
-// S2 with two further instruction reductions: `x` staged in SHARED memory once per block instead of re-read
-// from global by every output row, and the code unpack replaced by a 256-entry constant-memory table of
-// float4 (one broadcast load per four elements instead of shifts, masks and an int-to-float convert).
-// `stage_x` selects the staging so the two can be measured against each other rather than assumed.
-void s2_gemv_fast(const uint16_t* x, const uint8_t* codes, const float* scales, float* y, int64_t n_in,
-                  int64_t n_out, int threads_per_row, bool stage_x);
-
 // The same computation as `s_gemv_split` but launched on `stream` (a cudaStream_t passed as void*, so this
 // header stays free of CUDA types) and WITHOUT synchronising.  It exists because the architecture's premise -
 // that the expert stream overlaps with the compute that consumes it - cannot be measured through an entry
