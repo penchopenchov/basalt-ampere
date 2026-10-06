@@ -2,6 +2,7 @@
 
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
     python -m serve.server --engine engine --config config.json --port 8080   (the real engine, resident)
+    python -m serve.server --engine engine --model m.basalt --exe build/basalt   (the same from a .basalt model file)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /metrics and GET /api/logs (the stats page's feeds). One sequence at a time behind a
@@ -3329,6 +3330,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "engine"], default="mock")
     ap.add_argument("--config", help="engine config (JSON: exe, args, cwd, tokenizer, model_name)")
+    ap.add_argument("--model", help="a .basalt model file: the engine, tokenizer, sampling and vision come from it "
+                                    "(with --exe, instead of --config)")
+    ap.add_argument("--exe", help="the basalt binary to run the model with (with --model)")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
@@ -3361,6 +3365,8 @@ def main() -> int:
     ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
                                           "server's model; also \"before_load\" in the config, a string or a list)")
     a = ap.parse_args()
+    if a.model and a.config:
+        ap.error("--model replaces --config; give one of them")
     global DEBUG, REQUEST_LINES
     DEBUG, REQUEST_LINES = a.debug, a.request_lines
     logs = LogBuffer()                                  # GET /api/logs: this process's output, and the engine's
@@ -3368,6 +3374,17 @@ def main() -> int:
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    if a.model:
+        if not a.exe:
+            ap.error("--model needs --exe (the basalt binary)")
+        from serve import modelfile
+        listed = gpu_list(cfg)
+        try:
+            cfg.update({k: v for k, v in modelfile.model_config(
+                a.model, a.exe, gpus=len(listed) if listed else None, vision=a.engine == "engine").items()
+                if k not in cfg})
+        except (OSError, ValueError, KeyError) as e:
+            ap.error(f"{a.model}: {e}")
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
@@ -3391,7 +3408,7 @@ def main() -> int:
         tok = ST.Tokenizer(tokens, merges, types)
     if a.engine == "engine":
         if not cfg:
-            ap.error("--engine engine needs --config")
+            ap.error("--engine engine needs --config, or --model with --exe")
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
@@ -3399,6 +3416,9 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[server] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        if lazy and cfg.get("vision") and a.model:
+            print("[server] lazy loading is text-only: the vision encoder stays off", flush=True)
+            del cfg["vision"]
         if lazy and cfg.get("vision"):
             ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):
