@@ -887,7 +887,7 @@ void RouterLookahead::run() {
         const auto t0 = std::chrono::steady_clock::now();
         want.clear();
         // The router dot is AVX2 (kq_avx2.cpp); a CPU without AVX2 (the experimental older-CPU builds) takes the AVX1
-        // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the Strata_Dirigo fork (rwkeyes): an
+        // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the upstream fork (rwkeyes): an
         // AVX-only Xeon E5-2687W died here (vpmovzxwd) on its first request.  An estimate only (which experts to
         // prefetch); the order of the additions differs between the three, the output does not depend on it.
         if (basalt::kernels::cpu::cpu_avx2_ok()) {
@@ -1804,7 +1804,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.peer != nullptr && !ext) {         // multi-GPU: start the second GPU's share before the CPU's own work
         std::string perr;
         if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
-            std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+            std::fprintf(stderr, "basalt: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts could not be launched";
             d.fail_layer = d.layers;
@@ -1913,7 +1913,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.peer != nullptr && !ext) {         // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;
         if (!d.peer->finish(out, perr)) {
-            std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+            std::fprintf(stderr, "basalt: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts failed";
             d.fail_layer = d.layers;
@@ -2404,7 +2404,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
             st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
     }
-    std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
+    std::fprintf(stderr, "basalt generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
                  why.c_str());
     if (!st.ok) {
         delete a;

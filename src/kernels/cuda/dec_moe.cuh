@@ -253,8 +253,8 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
         dm_stat_record(stats, plan, layer);
         return;
     }
-    if (plan->counts[2] > 0) while (*peer_done < ring) strata_spin_pause();
-    if (plan->counts[3] > 0) while (*host_flag < ring) strata_spin_pause();
+    if (plan->counts[2] > 0) while (*peer_done < ring) spin_pause();
+    if (plan->counts[3] > 0) while (*host_flag < ring) spin_pause();
     __threadfence_system();
 }
 
@@ -792,7 +792,7 @@ __device__ __forceinline__ bool dm_grid_sync(const DmWatch& w, unsigned int* bar
         while (true) {
             asm volatile("ld.acquire.gpu.u32 %0, [%1];" : "=r"(v) : "l"(bar) : "memory");
             if (v >= target) break;
-            strata_spin_pause();
+            spin_pause();
             if ((++spins & 255u) != 0u) continue;
             if (*(volatile unsigned int*) w.abort != 0u) { ok = false; break; }
             if (blockIdx.x == 0 && *w.seq_m == 0xffffffffu) {
@@ -849,7 +849,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             if (tid == 0) {
                 uint32_t v = 0xffffffffu;   // an aborted window stops here
                 if (*(volatile unsigned int*) abort == 0u)
-                    while (((v = *a.seq_m) & 0xffffu) < ring) strata_spin_pause();
+                    while (((v = *a.seq_m) & 0xffffu) < ring) spin_pause();
                 __threadfence_system();
                 s_seq = v;
             }

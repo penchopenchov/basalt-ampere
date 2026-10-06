@@ -59,9 +59,9 @@ inline __m256i sc32(int s) { return _mm256_set1_epi16(s); }
 //
 // Computed at COMPILE time (constexpr), so this file has no static constructor at all.  This TU is compiled
 // for AVX2, and a runtime constructor here runs before main() on every CPU: MSVC turned its variable shift
-// into BMI2 `shlx` (#391, demetree: strata.exe exited 0xC000001D before printing anything on a Sandy Bridge
+// into BMI2 `shlx` (#391, demetree: the engine exited 0xC000001D before printing anything on a Sandy Bridge
 // Xeon) and GCC vectorised the loop into AVX2 (`vpbroadcastb`, found on an AVX-only Xeon E5 by the
-// Strata_Dirigo fork).  ksigns_iq2xs[i] is i's 7 bits plus an even-parity bit 7 (ggml-common.h); a const
+// upstream fork).  ksigns_iq2xs[i] is i's 7 bits plus an even-parity bit 7 (ggml-common.h); a const
 // array is not usable in a constant expression, so the byte is derived the same way here, and
 // native_expert_parity checks these kernels against ggml-cpu's.
 struct EvenSigns {

@@ -1,10 +1,10 @@
-// tools/vision/strata_vision.cpp - the image half of Strata's multimodal path.
+// tools/vision/vision.cpp - the image half of the engine's multimodal path.
 //
 // Turns an image into the embeddings the text model reads in place of its <|image_pad|> tokens, with llama.cpp's
 // mtmd library and the model's mmproj file (vision encoder + projector).  The engine does the rest: it places the
 // rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in generate.cpp).
 //
-//   strata-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu] [--threads N]
+//   basalt-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu] [--threads N]
 //                 [--max-tokens N] [--flash-attn on|off|auto]
 //
 // Resident: prints "READY <n_embd>", then per stdin line
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (mmproj.empty() || model.empty()) {
-        std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
+        std::fprintf(stderr, "usage: basalt-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
                              "[--max-tokens N] [--flash-attn on|off|auto]\n");
         return 2;
     }
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         return 1;
     }
-    std::fprintf(stderr, "strata-vision: model files loaded in %.1f s\n",
+    std::fprintf(stderr, "basalt-vision: model files loaded in %.1f s\n",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
     // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
     int n_embd = 0;
@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     // what is really left; allocating later, on a GPU the engine has filled, would starve the engine.  (A square
     // image well above any cap; mtmd scales it to the token limit.)  On the CPU there is no VRAM to reserve, and the
     // warm-up would only delay the engine's start by one encode.
-    if (!gpu) std::fprintf(stderr, "strata-vision: on the CPU, %d threads, no warm-up\n", threads);
+    if (!gpu) std::fprintf(stderr, "basalt-vision: on the CPU, %d threads, no warm-up\n", threads);
     else {
         const auto warm_t0 = std::chrono::steady_clock::now();
         const uint32_t side = 2048;
@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
                     warm_tokens = (int) mtmd_input_chunk_get_n_tokens(ch);
             }
         }
-        std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s\n", warm_tokens,
+        std::fprintf(stderr, "basalt-vision: warmed up at %d image tokens in %.1f s\n", warm_tokens,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count());
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);

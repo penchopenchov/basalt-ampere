@@ -873,7 +873,7 @@ template <bool GU> bool setup_v2(int& occ) {
         o < 1)
         return false;
     occ = std::min(occ, o);
-    std::fprintf(stderr, "strata: prompt experts, v2 %s kernel: %d registers, %zu bytes local, %d bytes shared\n",
+    std::fprintf(stderr, "basalt: prompt experts, v2 %s kernel: %d registers, %zu bytes local, %d bytes shared\n",
                  GU ? "gate/up" : "down", fa.numRegs, (size_t) fa.localSizeBytes, V2<GU>::SMEM);
     return true;
 }

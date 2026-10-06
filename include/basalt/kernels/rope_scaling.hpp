@@ -15,7 +15,7 @@
 // numerical contract (the same standing `native_rope.cu` declares): ramp, correction dims, the
 // interpolation mix and the mscale formula below are line-for-line that source, with the MIT
 // attribution at each helper.  The one deliberate deviation is bookkeeping: ggml's device kernel
-// speaks in even dim indices (`i0`) and halves them inside the ramp, while every Strata rope kernel
+// speaks in even dim indices (`i0`) and halves them inside the ramp, while every the engine rope kernel
 // speaks in PAIR indices - so `rope_yarn_ramp` here takes the pair index and compares it against
 // `corr_dims` directly.  Same numbers, one less division per call site.
 //
@@ -131,7 +131,7 @@ private:
 ///
 /// ggml/src/ggml-cuda/rope.cu `rope_yarn_ramp`: `1 - clamp(y, 0, 1)` with
 /// `y = (i0 / 2 - low) / max(0.001, high - low)`.  ggml passes the even dim index `i0`; this takes
-/// the pair index (ggml's `i0/2`) so Strata's pair-indexed kernels don't re-derive the mapping.  The
+/// the pair index (ggml's `i0/2`) so the engine's pair-indexed kernels don't re-derive the mapping.  The
 /// 0.001 floor on the denominator is ggml's, kept verbatim: `corr_dims` can produce low == high.
 ROPE_SCALING_HD inline float rope_yarn_ramp(float low, float high, int pair) {
     const float y = ((float) pair - low) / (high - low > 0.001f ? high - low : 0.001f);

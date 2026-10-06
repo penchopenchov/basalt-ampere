@@ -259,7 +259,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         if (mlock((const void*) a0, a1 - a0) == 0) {
             impl_->locked = true;
         } else {
-            std::fprintf(stderr, "strata: PLE table mlock failed (%s; raise `ulimit -l`): touching its pages instead\n",
+            std::fprintf(stderr, "basalt: PLE table mlock failed (%s; raise `ulimit -l`): touching its pages instead\n",
                          std::strerror(errno));
             volatile uint8_t sink = 0;
             for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;

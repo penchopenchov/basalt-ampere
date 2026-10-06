@@ -7,6 +7,6 @@
 
 /// Yield the thread while a doorbell flag is being polled.  The length of the pause is a backoff hint, not a
 /// contract.
-__device__ __forceinline__ void strata_spin_pause() {
+__device__ __forceinline__ void spin_pause() {
     __nanosleep(100);
 }

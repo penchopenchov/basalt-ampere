@@ -727,7 +727,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) strata_spin_pause();
+    while (*flag < value) spin_pause();
     __threadfence_system();
 }
 }  // namespace
@@ -827,7 +827,7 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
 }
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
-    while (*flag < value) strata_spin_pause();
+    while (*flag < value) spin_pause();
     __threadfence_system();
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,

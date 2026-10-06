@@ -86,7 +86,7 @@ bool cpu_avx2_ok() {
 
 bool cpu_avx1_ok() {
     // AVX (Sandy Bridge, 2011): AVX + OSXSAVE with the OS saving the YMM state; FMA, F16C and AVX2 not needed.
-    // From the Strata_Dirigo fork (rwkeyes).
+    // From the upstream fork (rwkeyes).
     static const bool ok = [] {
         if (cpu_isa_cap() < 1) return false;
         unsigned r[4] = {0, 0, 0, 0};
@@ -155,9 +155,9 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             if (!line.empty() && line[0] == '#') {
                 // "# strata native experts vN: ...".  A version this engine does not know may mean columns it
                 // would misread, so it is refused rather than parsed as far as the known columns go.
-                static const char tag[] = "# strata native experts v";
-                if (line.compare(0, sizeof tag - 1, tag) == 0) {
-                    L.version = std::atoi(line.c_str() + sizeof tag - 1);
+                static const char kPackHeader[] = "# strata native experts v";
+                if (line.compare(0, sizeof kPackHeader - 1, kPackHeader) == 0) {
+                    L.version = std::atoi(line.c_str() + sizeof kPackHeader - 1);
                     if (L.version > kExpertLayoutVersion) {
                         err = "native_experts.txt is v" + std::to_string(L.version) + "; this engine reads up to v" +
                               std::to_string(kExpertLayoutVersion) + " (the pack was written by a newer tools/"

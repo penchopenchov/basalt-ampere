@@ -42,7 +42,7 @@ int main() {
     check(r0.size() == 12 && r0[0] == Pair(0, 2) && r0[1] == Pair(1, 1) && r0[2] == Pair(2, 0) &&
           r0[3] == Pair(1, 3) && r0[4] == Pair(0, 1) && r0[5] == Pair(0, 0), "without heat: resident, then prior");
 
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "strata_profile_save_test";
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "profile_save_test";
     std::filesystem::create_directories(dir);
     const std::string path = (dir / "learned.bin").string();
     std::string err;

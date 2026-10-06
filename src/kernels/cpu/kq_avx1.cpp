@@ -1,4 +1,4 @@
-// src/kernels/cpu/kq_avx1.cpp - the AVX1 router dot for older CPUs (see kq_avx1.hpp).  From rwkeyes' Strata_Dirigo
+// src/kernels/cpu/kq_avx1.cpp - the AVX1 router dot for older CPUs (see kq_avx1.hpp).  From rwkeyes' upstream
 // fork (MIT), its AVX1 floor.
 //
 // Measured on the hardware this exists for (Xeon E5-2665, 2x8 cores, AVX only) for one layer's router

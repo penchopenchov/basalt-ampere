@@ -49,7 +49,7 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
 void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src,
            void* stream);
 
-/// Experts [e0, e1) of one layer (e1 - e0 <= kMaxBatch); blob[e - e0]: the Strata Q2_0 blob of expert e on the
+/// Experts [e0, e1) of one layer (e1 - e0 <= kMaxBatch); blob[e - e0]: the the engine Q2_0 blob of expert e on the
 /// device (16-byte aligned), read only for an expert with rows.
 struct Batch {
     int e0 = 0, e1 = 0;

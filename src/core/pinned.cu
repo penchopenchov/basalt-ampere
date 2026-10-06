@@ -27,7 +27,7 @@ namespace basalt::core {
 namespace {
 
 constexpr uint64_t kSharedArenaHeaderBytes = 4096;
-constexpr char kSharedArenaMagic[16] = "STRATA-ARENA-V1";
+constexpr char kSharedArenaMagic[16] = "BASALT-ARENA-V1";
 
 struct SharedArenaHeader {
     char magic[16];

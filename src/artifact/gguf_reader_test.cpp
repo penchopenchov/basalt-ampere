@@ -51,7 +51,7 @@ std::filesystem::path write_gguf(const std::vector<std::string>& names) {
         put<uint64_t>(b, 32 * i);    // offset from data_start
     }
     b.resize((b.size() + 31) / 32 * 32 + 32 * names.size(), 0);
-    const auto path = std::filesystem::temp_directory_path() / "strata_gguf_reader_test.gguf";
+    const auto path = std::filesystem::temp_directory_path() / "gguf_reader_test.gguf";
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
     return path;
 }

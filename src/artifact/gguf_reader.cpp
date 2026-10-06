@@ -1,4 +1,4 @@
-// src/artifact/gguf_reader.cpp - the `strata-gguf` CLI.  The reader itself is header-only in
+// src/artifact/gguf_reader.cpp - the `basalt-gguf` CLI.  The reader itself is header-only in
 // include/basalt/artifact/gguf_reader.hpp; this file is just the entry point, so it cannot drift
 // from the library it exercises.
 #include "basalt/artifact/gguf_reader.hpp"

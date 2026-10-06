@@ -1,4 +1,4 @@
-// src/artifact/dequant.cpp - the `strata-dequant` CLI (dequantize a GGUF tensor and dump F32).
+// src/artifact/dequant.cpp - the `basalt-dequant` CLI (dequantize a GGUF tensor and dump F32).
 // The dequantizers themselves are header-only in include/basalt/artifact/dequant.hpp.
 #include "basalt/artifact/dequant.hpp"
 

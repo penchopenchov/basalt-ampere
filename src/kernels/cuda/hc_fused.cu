@@ -2281,7 +2281,7 @@ bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
     c.srow = srow;
     if (cudaMalloc((void**) &c.q, c.bytes) != cudaSuccess) {
         cudaGetLastError();
-        std::fprintf(stderr, "strata hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
+        std::fprintf(stderr, "basalt hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
         return false;
     }
     c.s = reinterpret_cast<uint16_t*>(c.q + n);

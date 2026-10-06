@@ -1,7 +1,7 @@
 // include/basalt/artifact/gguf_split.hpp - the shards of a split model.  Separate from gguf_reader.hpp, which
 // includes <windows.h>, so any translation unit can resolve a model's shards.
 //
-// From eddoursul/Strata 8029fa9 (gguf_split_paths), with one change of contract: upstream's model_shards()
+// From the upstream engine 8029fa9 (gguf_split_paths), with one change of contract: upstream's model_shards()
 // skipped a shard it could not open and returned the rest, so a download that was still running (or a shard
 // deleted by hand) produced a model with some layers missing and an error much later, or none.  A missing shard
 // is now an error that names it.

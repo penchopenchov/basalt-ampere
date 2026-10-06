@@ -1,4 +1,4 @@
-// src/core/overlap_main.cpp - `strata-overlap`: does streaming an expert overlap with computing on it?
+// src/core/overlap_main.cpp - `basalt-overlap`: does streaming an expert overlap with computing on it?
 //
 // THE ARCHITECTURE'S CENTRAL PREMISE.  Only (1 - h) of a token's expert weights are in VRAM, so the rest must
 // cross the bus while the GPU is working.  If the copy and the compute do not overlap, the per-token cost is
@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
         else if (a == "--experts") experts = std::atoi(val());
         else if (a == "--tpr") threads_per_row = std::atoi(val());
         else {
-            std::fprintf(stderr, "usage: strata-overlap --file experts.bin [--experts N] [--tpr N]\n");
+            std::fprintf(stderr, "usage: basalt-overlap --file experts.bin [--experts N] [--tpr N]\n");
             return 2;
         }
     }

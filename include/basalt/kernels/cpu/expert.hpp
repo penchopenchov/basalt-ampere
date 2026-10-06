@@ -50,7 +50,7 @@ inline constexpr size_t O_D_CODES = 2ull * FF * ROW_GU;
 inline constexpr size_t O_GU_SCALES = O_D_CODES + 1ull * H * ROW_D;
 inline constexpr size_t O_D_SCALES = O_GU_SCALES + 2ull * FF * SC_GU * 2;
 
-/// One activation in Strata's planar storage: `QKA` elements per chunk.
+/// One activation in the engine's planar storage: `QKA` elements per chunk.
 /// The default legacy quantizer uses FP32 scales and half-away rounding. It is
 /// not the pinned ggml CPU Q8_0 contract; expert_set_oracle_q8_0 selects that
 /// experimental contract (FP16-rounded scales and x86 nearest-even codes).

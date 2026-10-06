@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 int main() {
-    char path[] = "/tmp/strata-shared-arena-XXXXXX";
+    char path[] = "/tmp/basalt-shared-arena-XXXXXX";
     const int fd = mkstemp(path);
     if (fd < 0) {
         std::perror("mkstemp");

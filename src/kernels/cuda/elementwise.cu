@@ -213,7 +213,7 @@ __global__ void doorbell_ring_kernel(uint32_t* seq) {
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
     const uint32_t want = *seq;
-    while (*flag != want) strata_spin_pause();
+    while (*flag != want) spin_pause();
     __threadfence_system();
 }
 

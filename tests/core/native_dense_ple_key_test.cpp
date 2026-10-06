@@ -38,7 +38,7 @@ struct TempDir {
     fs::path path;
     TempDir() {
         path = fs::temp_directory_path() /
-               ("strata-ple-key-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+               ("basalt-ple-key-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         fs::create_directories(path);
     }
     ~TempDir() {

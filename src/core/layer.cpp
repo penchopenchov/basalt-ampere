@@ -543,7 +543,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // mtp.cpp). Streamed mode is refused outright; generate.cpp validates it too, this is the backstop.
     if (g_kv_hybrid && ring_cells <= 0) {
         if (p.mode == 1) {
-            std::fprintf(stderr, "strata: hybrid K8V4 KV does not support --kv-resident streaming\n");
+            std::fprintf(stderr, "basalt: hybrid K8V4 KV does not support --kv-resident streaming\n");
             return 0;
         }
         st.kv_hybrid = true;
@@ -620,7 +620,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // the driver may pin only a small amount of host memory in all, which is less than a long context of
             // 8-bit KV needs
-            if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
+            if (p.mode == 1) std::fprintf(stderr, "basalt: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
                                  "WSL the driver pins only about 1 GiB in all)\n", (double) bytes / 1073741824.0,
                                  (double) g_kv_host_bytes / 1073741824.0);

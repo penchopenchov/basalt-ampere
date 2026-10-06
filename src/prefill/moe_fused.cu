@@ -1,5 +1,5 @@
 // src/prefill/moe_fused.cu - see include/basalt/prefill/moe_fused.hpp (#136: the Q2_0 pack's prompt experts on
-// Strata's own int8 tensor-core kernels, with the grouping on the GPU).
+// the engine's own int8 tensor-core kernels, with the grouping on the GPU).
 //
 // The arithmetic.  A Q2_0 block is 64 weights w = d_w * (q - 1), q in 0..3, four codes per byte, weight j of a block
 // in byte j / 4 at bits 2 * (j % 4).  An activation block of 32 values is x = d_x * a with a = round(x / d_x) in
@@ -40,7 +40,7 @@ void ck(cudaError_t e, const char* what) {
 constexpr int AB = 80;                  // activation bytes per 64 values: 64 codes, then {d0, c0, d1, c1}
 constexpr int MAGIC = 0x4B400000;       // the bits of 1.5 * 2^23
 constexpr float MAGICF = 12582912.0f;
-// The Strata Q2_0 blob (moe_mmq.cu strata_q2_kernel, kernels.cu blob_dequant_kernel): gate/up codes [1280][640 B]
+// The the engine Q2_0 blob (moe_mmq.cu q2_kernel, kernels.cu blob_dequant_kernel): gate/up codes [1280][640 B]
 // (rows interleaved: gate of feature f at row 2f, its up at 2f + 1), down codes [2560][160 B], gate/up scales
 // [1280][40] fp16, down scales [2560][10] fp16.
 constexpr size_t O_GU_CODES = 0, O_D_CODES = (size_t) 1280 * 640, O_GU_SC = O_D_CODES + (size_t) 2560 * 160,

@@ -1,4 +1,4 @@
-// src/plan/plan_main.cpp - the `strata-plan` CLI: print the memory plan, or say why it does not close.
+// src/plan/plan_main.cpp - the `basalt-plan` CLI: print the memory plan, or say why it does not close.
 //
 // The engine must adapt to the GPU it is running on, so the plan is computed from measured free VRAM and the
 // requested context rather than configured by hand.  This tool is that computation on its own, which is what
@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
             next(v);
             free_vram = v;
         } else if (a == "--help" || a == "-h") {
-            std::printf("usage: strata-plan [--max-context N] [--vram BYTES] [--dense B] [--embd B]\n"
+            std::printf("usage: basalt-plan [--max-context N] [--vram BYTES] [--dense B] [--embd B]\n"
                         "                   [--workspace B] [--state B] [--pool B]\n"
                         "  --state defaults to the geometry's own GDN recurrence + conv history, NOT to 0:\n"
                         "  the flag used to default to zero and nothing passed it, so the planner silently\n"
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
         std::printf("%s", basalt::plan::to_string(p).c_str());
         return 0;
     } catch (const basalt::plan::DoesNotClose& e) {
-        std::fprintf(stderr, "strata-plan: %s\n", e.what());
+        std::fprintf(stderr, "basalt-plan: %s\n", e.what());
         return 1;
     }
 }

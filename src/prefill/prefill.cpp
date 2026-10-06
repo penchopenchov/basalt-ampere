@@ -988,7 +988,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(prev);
     if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
-    std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk, with compact group "
+    std::fprintf(stderr, "basalt prefill: peer GPU %d computes its experts' rows of each prompt chunk, with compact group "
                          "buffers%s; %zu MiB left free on it\n", pp->dev,
                  pp->ps_frac > 0.0 ? (", streaming " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
                                       "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
@@ -1579,7 +1579,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (fused_l) {
                         if (static bool said = false; !said) {
                             said = true;
-                            std::fprintf(stderr, "strata: prompt experts on the fused int8 kernels\n");
+                            std::fprintf(stderr, "basalt: prompt experts on the fused int8 kernels\n");
                         }
                         // the layer's input to int8 once per token; the rows of each expert from the router's ids
                         if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
@@ -1796,7 +1796,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
                                                                P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
                                         else
-                                            mmq::gather_strata_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
+                                            mmq::gather_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
                                         if (psl >= 0) {   // the slot is free once gathered
                                             cudaEventRecord(P.pused[(size_t) psl], ps);
                                             ++P.pk;
@@ -1946,7 +1946,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                        mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 } else {
-                                    mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                    mmq::gather_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
                                 if (slot >= 0 && !group_gather) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;

@@ -30,10 +30,10 @@ struct DeviceInfo {
 
 // How many devices the runtime enumerates, numbered as CUDA_VISIBLE_DEVICES numbers them; 0 when
 // there is none (or no usable runtime).  `device_info` throws on a card this binary cannot run, so a caller that LISTS
-// every card (`strata-device --list-devices`) counts them with this first.
+// every card (`basalt-device --list-devices`) counts them with this first.
 int device_count();
 
-// One line per device for `strata-device --list-devices`, without the arch check that `device_info` applies:
+// One line per device for `basalt-device --list-devices`, without the arch check that `device_info` applies:
 // "compute capability 12.0, 31.4 GiB", plus the device's name.  false when
 // the runtime cannot describe it.
 bool device_summary(int ordinal, std::string& name, std::string& detail);

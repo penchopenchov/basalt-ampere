@@ -9,7 +9,7 @@
 // activations).  (b) and (c) each differ from (a) by their activation rounding only (a few 1e-3 relative).  (c) runs
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
-// The synthetic mode and (d) follow eddoursul/Strata 8029fa9.
+// The synthetic mode and (d) follow the upstream engine 8029fa9.
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/expert.hpp"

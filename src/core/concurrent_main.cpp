@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(val());
         else if (a == "--gpu-roles") gpu_roles = std::atoi(val());
         else {
-            std::fprintf(stderr, "usage: strata-concurrent --file experts.bin [--experts N] "
+            std::fprintf(stderr, "usage: basalt-concurrent --file experts.bin [--experts N] "
                                  "[--cpu-threads N] [--gpu-roles N]\n");
             return 2;
         }

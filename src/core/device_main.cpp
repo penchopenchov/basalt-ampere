@@ -1,4 +1,4 @@
-// src/core/device_main.cpp - `strata-device`: report the GPU, the plan, and exercise the arena.
+// src/core/device_main.cpp - `basalt-device`: report the GPU, the plan, and exercise the arena.
 //
 // This is P2.S1's "startup prints the memory plan vs actual cudaMemGetInfo" bullet, on its own so it can run
 // without the model.  It is also the run-time half of the sm_120 policy: CMake refuses to COMPILE for another
@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: strata-device [--selftest] [--list-devices]\n"
+            std::printf("usage: basalt-device [--selftest] [--list-devices]\n"
                         "  --list-devices  every GPU the runtime enumerates, numbered as HIP_VISIBLE_DEVICES /\n"
                         "                  CUDA_VISIBLE_DEVICES number them, and whether this binary can run it\n");
             return 0;
@@ -89,11 +89,11 @@ int main(int argc, char** argv) {
             } catch (const basalt::core::CudaError&) {
                 std::printf("selftest: over-allocation refused as required\n");
             }
-            std::printf("strata-device selftest OK\n");
+            std::printf("basalt-device selftest OK\n");
         }
         return 0;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-device: %s\n", e.what());
+        std::fprintf(stderr, "basalt-device: %s\n", e.what());
         return 1;
     }
 }

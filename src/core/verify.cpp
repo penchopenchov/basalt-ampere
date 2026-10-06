@@ -195,7 +195,7 @@ void release_live_verifiers(std::FILE* f) {
             const Clock::time_point t0 = Clock::now();
             const bool done = v->release_gpu_waits(5000);
             if (f != nullptr)
-                std::fprintf(f, "strata: released the verify window's GPU waits: the GPU %s\n",
+                std::fprintf(f, "basalt: released the verify window's GPU waits: the GPU %s\n",
                              done ? ("finished in " + std::to_string((long long) ms_since(t0)) + " ms").c_str()
                                   : "did not finish within 5 s");
         }
@@ -211,7 +211,7 @@ void note_fallback(const char* what, int a, int b) {
     static std::set<std::tuple<std::string, int, int>> seen;
     std::lock_guard<std::mutex> lk(mu);
     if (seen.insert({what, a, b}).second)
-        std::fprintf(stderr, "strata verify: fallback: %s (types %d / %d)\n", what, a, b);
+        std::fprintf(stderr, "basalt verify: fallback: %s (types %d / %d)\n", what, a, b);
 }
 // a dense projection of the window: dense_tc where dense_tc_mask has the projection's bit and the type, else
 // native_mmvq (either one for every window width, so a column's value never depends on T)
@@ -324,7 +324,7 @@ bool Verifier::dm_init(std::string& err) {
         if (!dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)) why = "an expert format the kernels do not cover";
     }
     if (why != nullptr) {
-        std::fprintf(stderr, "strata verify: the device-planned MoE tail is off: %s\n", why);
+        std::fprintf(stderr, "basalt verify: the device-planned MoE tail is off: %s\n", why);
         return true;
     }
     DecMoe* d = new DecMoe;
@@ -381,7 +381,7 @@ bool Verifier::dm_init(std::string& err) {
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
     }
-    std::fprintf(stderr, "strata verify: the MoE tail planned on the device%s\n",
+    std::fprintf(stderr, "basalt verify: the MoE tail planned on the device%s\n",
                  d->pdev >= 0 ? (", the peer card served by a persistent kernel (" + std::to_string(d->pblocks) +
                                  " blocks)").c_str() : "");
     return true;
@@ -517,7 +517,7 @@ void Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g) {
         }
     }
     add(wt.find("output_hc_down.weight"), wt.find("output_hc_up.weight"), nullptr);
-    std::fprintf(stderr, "strata hc8: 8-bit hyper-connection copies, %.0f MiB of VRAM\n",
+    std::fprintf(stderr, "basalt hc8: 8-bit hyper-connection copies, %.0f MiB of VRAM\n",
                  (double) basalt::kernels::hc8_bytes() / 1048576.0);
 }
 
@@ -702,7 +702,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             err = "verify: side stream create failed";
             return false;
         }
-        std::fprintf(stderr, "strata verify: side-stream mask %d: side branches at stream priority %d\n", dec_pk_mask(), greatest);
+        std::fprintf(stderr, "basalt verify: side-stream mask %d: side branches at stream priority %d\n", dec_pk_mask(), greatest);
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
@@ -748,7 +748,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
     if (!dm_init(err)) return false;
-    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
+    std::fprintf(stderr, "basalt verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
     return true;
@@ -1880,7 +1880,7 @@ bool Verifier::capture(int T, std::string& err) {
     const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
     auto retry_plain = [&](const std::string& why) {
-        std::fprintf(stderr, "strata verify: the %d-token window failed with programmatic dependent launch (%s): capturing it without\n", T,
+        std::fprintf(stderr, "basalt verify: the %d-token window failed with programmatic dependent launch (%s): capturing it without\n", T,
                      why.c_str());
         (void) cudaGetLastError();
         pdl_off_ = true;
@@ -1920,10 +1920,10 @@ bool Verifier::capture(int T, std::string& err) {
     const cudaError_t ue = cudaGraphUpload(exec_[T], cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     if (pdl_try)
-        std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s), %ld programmatic "
+        std::fprintf(stderr, "basalt verify: captured the %d-token window (upload %s, sync %s), %ld programmatic "
                              "dependent launches\n", T, cudaGetErrorString(ue), cudaGetErrorString(us), pdl_n);
     else
-        std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
+        std::fprintf(stderr, "basalt verify: captured the %d-token window (upload %s, sync %s)\n", T,
                      cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
 }
@@ -2283,7 +2283,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
         cudaMemset(dm_->wstat, 0, w.size() * 8);
         const double nw = (double) dm_->wstat_windows;
-        std::fprintf(stderr, "strata verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
+        std::fprintf(stderr, "basalt verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
                      dm_->wstat_t / nw, basalt::kernels::dec_moe_stats_text(w.data(), nw).c_str());
         dm_->wstat_windows = 0;
         dm_->wstat_t = 0;
@@ -2454,7 +2454,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
-    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
+    std::fprintf(stderr, "basalt verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
     return true;
 }
@@ -2487,7 +2487,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     cudaStreamSynchronize(cs_);
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
-    std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
+    std::fprintf(stderr, "basalt verify: captured the batch window over slots %s\n", list.c_str());
     return true;
 }
 

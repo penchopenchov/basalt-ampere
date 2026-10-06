@@ -1,4 +1,4 @@
-// src/core/load_main.cpp - `strata-load`: the expert arena load, measurable at any scale.
+// src/core/load_main.cpp - `basalt-load`: the expert arena load, measurable at any scale.
 //
 // P2.S1 gives this a target (<= 60 s cold, <= 10 s warm for 33.97 GB) and a method (8 threads, 16 MB chunks,
 // a checksum per layer).  The size is a FLAG rather than hard-coded because the honest way to measure a 34 GB
@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-pin") pin = false;
         else if (a == "--stream") stream = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: strata-load --file experts.bin [--layers N] [--threads N] [--chunk-mb N]\n"
+            std::printf("usage: basalt-load --file experts.bin [--layers N] [--threads N] [--chunk-mb N]\n"
                         "                   [--no-pin]\n");
             return 0;
         } else {

@@ -1,6 +1,6 @@
 // Arithmetic adapted from gated_delta_net.cu at pinned llama.cpp
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d. Only state addressing differs:
-// each warp owns one Strata (head,column) and retains its four rows in registers.
+// each warp owns one (head,column) and retains its four rows in registers.
 // Compile with --use_fast_math to match the pinned CUDA implementation.
 //
 // MIT License

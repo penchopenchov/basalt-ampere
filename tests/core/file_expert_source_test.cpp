@@ -32,7 +32,7 @@ struct TempDirectory {
 
     TempDirectory() {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        path = fs::temp_directory_path() / ("strata-file-source-test-" + std::to_string(stamp));
+        path = fs::temp_directory_path() / ("basalt-file-source-test-" + std::to_string(stamp));
         fs::create_directories(path);
     }
 

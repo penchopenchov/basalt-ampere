@@ -147,7 +147,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                 err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB, nor place it in VRAM";
                 return false;
             }
-            std::fprintf(stderr, "strata: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
+            std::fprintf(stderr, "basalt: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
                          (unsigned long long) (bytes_ >> 20));
             dev_ = d;
         } else {

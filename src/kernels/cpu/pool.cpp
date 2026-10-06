@@ -155,7 +155,7 @@ bool pin_this_thread(int core, [[maybe_unused]] int worker = -1) {
     if (core < 0) return false;
     const int error = detail::pin_thread_to_cpu(core);
     if (error != 0)
-        std::fprintf(stderr, "strata cpu pool: affinity for worker %d (CPU %d) failed: %d; previous affinity kept\n",
+        std::fprintf(stderr, "basalt cpu pool: affinity for worker %d (CPU %d) failed: %d; previous affinity kept\n",
                      worker, core, error);
     return error == 0;
 }
@@ -168,7 +168,7 @@ ThreadAffinity pin_current_thread(int core) {
     int error = detail::get_thread_affinity(previous.mask);
     if (error == 0) error = detail::pin_thread_to_cpu(core);
     if (error != 0) {
-        std::fprintf(stderr, "strata cpu pool: host affinity for CPU %d failed: %d; previous affinity kept\n", core, error);
+        std::fprintf(stderr, "basalt cpu pool: host affinity for CPU %d failed: %d; previous affinity kept\n", core, error);
         return {};
     }
     previous.valid = true;
@@ -179,7 +179,7 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
     if (!previous.valid) return;
     const int error = detail::set_thread_affinity(previous.mask);
     if (error != 0)
-        std::fprintf(stderr, "strata cpu pool: host affinity restoration failed: %d\n", error);
+        std::fprintf(stderr, "basalt cpu pool: host affinity restoration failed: %d\n", error);
 }
 
 namespace {
@@ -326,7 +326,7 @@ int ExpertPool::claim(uint32_t epoch) {
 
 uint32_t ExpertPool::begin_batch(int n) {
     if (n < 0 || n > 0xffff) {
-        std::fprintf(stderr, "strata: expert pool batch of %d jobs is out of range\n", n);
+        std::fprintf(stderr, "basalt: expert pool batch of %d jobs is out of range\n", n);
         std::abort();
     }
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
@@ -349,7 +349,7 @@ void ExpertPool::wait_parked(const char* what) {
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
         else if (now - t0 > kStall) {
-            std::fprintf(stderr, "strata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
+            std::fprintf(stderr, "basalt: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again\n",
                          what, parked_.load(), n_);
             basalt::core::release_gpu_waits(stderr);   // the GPU may be spinning on this layer's flag
@@ -372,7 +372,7 @@ void ExpertPool::wait_done(int n) {
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
         else if (now - t0 > kStall) {
-            std::fprintf(stderr, "strata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
+            std::fprintf(stderr, "basalt: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again\n",
                          d, n, parked_.load(), n_);
             basalt::core::release_gpu_waits(stderr);

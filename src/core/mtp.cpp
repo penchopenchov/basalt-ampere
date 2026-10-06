@@ -226,7 +226,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                 t.off = off;
             }
             blob.swap(kept);
-            std::fprintf(stderr, "strata hc8: the draft layer's hyper-connection matrices as 8-bit copies only (%.1f MiB "
+            std::fprintf(stderr, "basalt hc8: the draft layer's hyper-connection matrices as 8-bit copies only (%.1f MiB "
                                  "of bf16 left out)\n", (double) staged / 1048576.0);
         }
         const cudaError_t alloc = cudaMalloc((void**) &dense_, blob.size());
@@ -284,7 +284,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
-        std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
+        std::fprintf(stderr, "basalt mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         cudaGetLastError();
         cudaFree(state_arena_);
         st_ = QsaState{};
@@ -379,7 +379,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (basalt::core::diagnostics().profile && cudaMalloc((void**) &gstamp_, 16) == cudaSuccess)
         cudaMemset(gstamp_, 0, 16);
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
-    std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
+    std::fprintf(stderr, "basalt mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
                  (double) vram_ / 1048576.0, (double) g.n_expert * basalt::kernels::cpu::BLOB / 1048576.0,
                  (double) tensors_.back().off / 1048576.0, files_s,
                  files_s > 0 ? ((double) g.n_expert * basalt::kernels::cpu::BLOB + (double) tensors_.back().off) /
@@ -408,7 +408,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
     const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
     const size_t scratch = basalt::kernels::coupled_draft_scratch_bytes((int) nv);
     if (scratch == 0) {
-        std::fprintf(stderr, "strata mtp: coupled draft sampling: %lld draft logits are too wide for the coupled sampler; "
+        std::fprintf(stderr, "basalt mtp: coupled draft sampling: %lld draft logits are too wide for the coupled sampler; "
                              "argmax drafts\n", (long long) nv);
         return true;
     }
@@ -440,7 +440,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         return false;
     }
     coupled_ok_ = true;
-    std::fprintf(stderr, "strata mtp: coupled draft sampling on: sampled requests draft with the "
+    std::fprintf(stderr, "basalt mtp: coupled draft sampling on: sampled requests draft with the "
                          "target's chain and Philox draw over %lld tokens\n", (long long) nv);
     return true;
 }
@@ -471,7 +471,7 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
         std::snprintf(b, sizeof(b), " and %.0f MiB is free", (double) free_b / 1048576.0);
         free_s = b;
     }
-    std::fprintf(stderr, "strata mtp: the draft head over %lld tokens needs %.0f MiB of VRAM%s.\n",
+    std::fprintf(stderr, "basalt mtp: the draft head over %lld tokens needs %.0f MiB of VRAM%s.\n",
                  (long long) n_tokens, mib(n_tokens), free_s.c_str());
     struct Subset { const char* name; int64_t tokens; const char* what; };
     static const Subset smaller[] = {{"cyrillic", 58963, "English, code and the Cyrillic script"},
@@ -485,13 +485,13 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
             opts += b;
         }
     if (!opts.empty())
-        std::fprintf(stderr, "strata mtp: hint: a smaller draft vocabulary needs less VRAM: %s. Start once with it - "
+        std::fprintf(stderr, "basalt mtp: hint: a smaller draft vocabulary needs less VRAM: %s. Start once with it - "
                              "./setup.sh --draft-vocab en - and the model "
-                             "keeps it (\"draft_vocab\" in its strata-*.json config); or a smaller --context in "
+                             "keeps it (\"draft_vocab\" in its config); or a smaller --context in "
                              "setup.\n",
                      opts.c_str());
     else
-        std::fprintf(stderr, "strata mtp: hint: this is already the smallest shipped draft vocabulary: a smaller "
+        std::fprintf(stderr, "basalt mtp: hint: this is already the smallest shipped draft vocabulary: a smaller "
                              "--context (or closing what else uses the GPU) leaves it room.\n");
 }
 }  // namespace
@@ -526,7 +526,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
-            std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
+            std::fprintf(stderr, "basalt mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             // the base rows: the leading ids up to the first descent (tools/draft_vocab.py appends added ids after
             // the base in id order)
@@ -541,7 +541,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                         if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 1;
                     for (int64_t i = 0; i < n_tier1_; ++i)
                         if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 0;
-                    std::fprintf(stderr, "strata mtp: draft head tiers: %lld base rows, %lld added rows read after an "
+                    std::fprintf(stderr, "basalt mtp: draft head tiers: %lld base rows, %lld added rows read after an "
                                          "added token\n", (long long) n_tier1_,
                                  (long long) (n_dvocab_ - n_tier1_));
                 }
@@ -1022,7 +1022,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
     }
     if (!ok) {
         const cudaError_t e = cudaGetLastError();
-        std::fprintf(stderr, "strata mtp: the conditional draft graph failed (%s%s%s); one graph per "
+        std::fprintf(stderr, "basalt mtp: the conditional draft graph failed (%s%s%s); one graph per "
                              "step from now on\n",
                      cudaGetErrorString(e), err.empty() ? "" : ", ", err.c_str());
         if (exec) cudaGraphExecDestroy(exec);
