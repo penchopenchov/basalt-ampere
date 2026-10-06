@@ -88,9 +88,8 @@ int main(int argc, char** argv) {
     llama_backend_init();
 
     const auto load_t0 = std::chrono::steady_clock::now();
-    // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
-    // STRATA_READ_AHEAD=0 turns it off, as in the engine
-    if (const char* ra = std::getenv("STRATA_READ_AHEAD"); ra == nullptr || std::atoi(ra) != 0) {
+    // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached
+    {
         const int fd = open(mmproj.c_str(), O_RDONLY);
         if (fd >= 0) {
             const off_t n = lseek(fd, 0, SEEK_END);
@@ -133,10 +132,9 @@ int main(int argc, char** argv) {
     if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }
     // Warm up at the LARGEST picture before READY: the encoder's GPU work buffers are allocated now, not at the first
     // real picture.  The server starts this process before the engine, so the engine sizes its expert cache from
-    // what is really left; allocating ~1 GB later, on a GPU the engine has filled, made Windows page GPU memory and
-    // the engine crawl to a standstill.  (A square image well above any cap; mtmd scales it to the token limit.)
-    // On the CPU there is no VRAM to reserve, and the warm-up would only delay the engine's start by one encode
-    // (~6 s at 1,024 tokens).
+    // what is really left; allocating later, on a GPU the engine has filled, would starve the engine.  (A square
+    // image well above any cap; mtmd scales it to the token limit.)  On the CPU there is no VRAM to reserve, and the
+    // warm-up would only delay the engine's start by one encode.
     if (!gpu) std::fprintf(stderr, "strata-vision: on the CPU, %d threads, no warm-up\n", threads);
     else {
         const auto warm_t0 = std::chrono::steady_clock::now();
