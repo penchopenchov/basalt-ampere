@@ -12,12 +12,7 @@
 
 namespace basalt::core {
 
-bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
-                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
-    return read_expert_profile(FileRange(path), true, n_layers, n_expert, ranked, slots, err);
-}
-
-bool read_expert_profile(const FileRange& range, bool with_magic, int64_t n_layers, int64_t n_expert,
+bool read_expert_profile(const FileRange& range, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
     const std::string& path = range.path;
     std::vector<uint8_t> raw_file;
@@ -27,17 +22,6 @@ bool read_expert_profile(const FileRange& range, bool with_magic, int64_t n_laye
         return false;
     }
     size_t at = 0;
-    if (with_magic) {
-        if (raw_file.size() < 4) {
-            err = "read_expert_profile: " + path + " is too short to hold a header";
-            return false;
-        }
-        if (std::memcmp(raw_file.data(), "STRP", 4) != 0) {
-            err = "read_expert_profile: " + path + " does not start with STRP";
-            return false;
-        }
-        at = 4;
-    }
     uint32_t hdr[5] = {0, 0, 0, 0, 0};
     if (raw_file.size() - at < sizeof hdr) {
         err = "read_expert_profile: " + path + " is too short to hold a header";
@@ -139,8 +123,8 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
         err = "write_expert_profile: cannot create " + tmp;
         return false;
     }
-    // the format is little-endian (make_profile.py's "<"): so is every machine this engine runs on
-    bool ok = std::fwrite("STRP", 1, 4, f) == 4 && std::fwrite(hdr, 4, 5, f) == 5 &&
+    // the format is little-endian: so is every machine this engine runs on
+    bool ok = std::fwrite(hdr, 4, 5, f) == 5 &&
               (pairs.empty() || std::fwrite(pairs.data(), 2, pairs.size(), f) == pairs.size()) &&
               std::fwrite(table.data(), 4, table.size(), f) == table.size();
     ok = (std::fclose(f) == 0) && ok;

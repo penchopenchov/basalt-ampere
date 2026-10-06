@@ -1956,19 +1956,15 @@ int main(int argc, char** argv) {
     const bool stage_trim = multi_gpu && !split_auto && !split_at.empty() && o.trim_stage_weights;
     if (o.trim_stage_weights && !stage_trim)
         std::fprintf(stderr, "basalt generate: --trim-stage-weights needs an explicit --layer-split (ignored)\n");
-    // keep_routers: CUDA0 with --mmap-experts keeps every layer's router (ffn_gate_inp) - the file tier's
-    // routing-aware prefetch (RouterLookahead, below) copies all of them from CUDA0's arena, and would otherwise turn
-    // itself off
-    auto add_foreign = [&](int64_t lb, int64_t le, std::set<std::string>& out, bool keep_routers) {
+    auto add_foreign = [&](int64_t lb, int64_t le, std::set<std::string>& out) {
         for_each_index_name(pack_files.index, [&](const std::string& n) {
             if (n.rfind("blk.", 0) != 0 || n.find("ple") != std::string::npos) return;
-            if (keep_routers && n.ends_with(".ffn_gate_inp.weight")) return;
             const int64_t l = std::atoll(n.c_str() + 4);
             if (l < lb || l >= le) out.insert(n);
         });
     };
     if (stage_trim) {
-        add_foreign(0, split_at[0], skip, o.mmap_experts);
+        add_foreign(0, split_at[0], skip);
         basalt::core::NativeDense::set_layer_range(0, (int) split_at[0]);
         std::fprintf(stderr, "basalt generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
                      (long long) split_at[0] - 1);
@@ -2310,7 +2306,7 @@ int main(int argc, char** argv) {
         std::string perr;
         const bool remote = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         if (remote || o.expert_profile.empty() ||
-            !basalt::core::read_expert_profile(srcs.profile, srcs.profile_magic, g.n_layers, g.n_expert, prof, pslots, perr)) {
+            !basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, prof, pslots, perr)) {
             std::fprintf(stderr, "basalt generate: --split-skip-if-fits: %s; the split stays\n",
                          remote ? "remote expert caches are in use" : perr.empty() ? "no expert profile" : perr.c_str());
         } else {
@@ -2364,7 +2360,7 @@ int main(int argc, char** argv) {
         uint64_t pool_s = pool_bytes;
         if (stage_trim) {
             const int64_t lb = split_at[i], le = i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers;
-            add_foreign(lb, le, skip_s, false);
+            add_foreign(lb, le, skip_s);
             basalt::core::NativeDense::set_layer_range((int) lb, (int) le);
             if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_s, err, &skip_s)) {
                 std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
@@ -2438,7 +2434,7 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
-        if (!basalt::core::read_expert_profile(srcs.profile, srcs.profile_magic, g.n_layers, g.n_expert, profile, pslots, err)) {
+        if (!basalt::core::read_expert_profile(srcs.profile, g.n_layers, g.n_expert, profile, pslots, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return 1;
         }
@@ -2873,15 +2869,6 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::fprintf(stderr, "basalt generate: experts via mmap (--mmap-experts)\n");
-        // with a RAM budget the hottest experts live in it, and the rest are read from the drive unbuffered when the
-        // file cache could not keep them beside the budget anyway - the mapped reads' page faults are small requests
-        // on the critical path, and their pages take the RAM the budget was sized for
-        if (o.resident_budget > 0) {
-            std::string why;
-            const bool ub = src.set_unbuffered(o.resident_budget, why);
-            std::fprintf(stderr, "basalt generate: the file tier reads %s (%s)\n",
-                         ub ? "unbuffered" : "through the file cache", why.c_str());
-        }
         srcp = &src;
     } else {
         const uint64_t pin_limit = 0;   // the whole arena is pinned
@@ -3151,12 +3138,9 @@ int main(int argc, char** argv) {
         const bool per_layer = xcache.per_layer_admission();
         const int64_t want = per_layer ? (int64_t) profile.size()
                                        : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        // an unbuffered file tier reads the pairs in batches of 64, the next batch while this one is copied
-        std::future<void> ahead;
-        auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
         // mapped reads: advise the next `fill_ahead` pairs so their reads overlap
         int64_t fill_ahead = 0;
-        if (!per_layer && srcp == &src && !src.unbuffered()) {
+        if (!per_layer && srcp == &src) {
             fill_ahead = 256;
             if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
             std::fprintf(stderr, "basalt generate: the profile fill asks for %lld pairs ahead\n",
@@ -3165,11 +3149,6 @@ int main(int argc, char** argv) {
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
         for (int64_t i = 0; i < want; ++i) {
-            if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
-                if (ahead.valid()) ahead.get();
-                else read_batch(i);
-                if (i + 64 < want) ahead = std::async(std::launch::async, read_batch, i + 64);
-            }
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == basalt::core::kNotResident) {
@@ -3375,30 +3354,6 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
-    // Routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE input
-    // predicts its experts and their pages are warmed meanwhile.  It only warms pages.
-    basalt::core::RouterLookahead lookahead;
-    if (srcp == &src && src.warms()) {
-        std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
-        bool ok = true;
-        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const basalt::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
-            ok = w != nullptr && w->kind == basalt::core::WeightKind::Bf16InF32 &&
-                 w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
-            if (!ok) break;
-            routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
-            ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
-        }
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, 10, &src, err)) {
-            drive.d.lookahead = &lookahead;
-            std::fprintf(stderr, "basalt generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
-        } else {
-            (void) cudaGetLastError();
-            std::fprintf(stderr, "basalt generate: routing-aware prefetch off (%s)\n",
-                         ok ? err.c_str() : "the routers are not BF16 in the arena");
-            err.clear();
-        }
-    }
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.
@@ -7405,8 +7360,7 @@ int main(int argc, char** argv) {
         const int64_t pcie0 = drive.d.pcie_experts;
         // CS-T: the file tier since the decode began (the prompt path's copies are before this)
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
-        const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
-        const double fms0 = src.file_ms();
+        const uint64_t fall0 = src.file_read_bytes();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
@@ -7664,20 +7618,9 @@ int main(int argc, char** argv) {
                         "the file\n", "resident RAM", (double) src.resident_bytes() / 1073741824.0,
                         (long long) src.exchanges(), (long long) src.file_reads());
         if (srcp == &src) {  // CS-T: the RAM and file tiers (the GPU cache's share is the hit rate above)
-            const double fms = src.file_ms() - fms0, fmb = (double) (src.file_blob_bytes() - fbytes0) / 1e6;
-            std::printf("%-24s decode: RAM %lld blobs, files %lld blobs, %.1f MB read from the files (%.2f MB/round, "
-                        "%.1f ms/round of reading, %.2f GB/s per reading thread); prompt copies %.1f MB\n",
+            std::printf("%-24s decode: RAM %lld blobs, files %lld blobs, %.1f MB read from the files\n",
                         "expert tiers", (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
-                        fmb, rounds > 0 ? fmb / rounds : 0.0, rounds > 0 ? fms / rounds : 0.0,
-                        fms > 0 ? fmb / fms : 0.0,
-                        (double) (fall0 - fbytes0) / 1e6);
-            if (drive.d.lookahead != nullptr)
-                std::printf("%-24s %lld experts warmed, %lld of the file tier's %lld blob reads had been warmed (%.1f%%); "
-                            "predictor %.1f ms/round on its thread, %lld layers skipped (still busy)\n", "routing prefetch",
-                            (long long) src.warmed(), (long long) src.warmed_hits(),
-                            (long long) (src.file_reads() - files0),
-                            src.file_reads() > files0 ? 100.0 * (double) src.warmed_hits() / (double) (src.file_reads() - files0) : 0.0,
-                            rounds > 0 ? drive.d.lookahead->busy_ms() / rounds : 0.0, (long long) drive.d.lookahead->skipped());
+                        (double) (src.file_read_bytes() - fall0) / 1e6);
         }
         if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",

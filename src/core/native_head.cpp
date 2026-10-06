@@ -110,9 +110,7 @@ NativeEmbed::~NativeEmbed() {
 bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
     try {
         const basalt::GgufModel model(shards);
-        // --embd-gguf's one-tensor file (tools/embd_bf16_pack.py) says "strata-embd": only its tensor is checked
-        const basalt::MetaValue* arch = model.meta().get("general.architecture");
-        err = arch != nullptr && arch->s == "strata-embd" ? std::string() : basalt::check_architecture(model.meta());
+        err = basalt::check_architecture(model.meta());
         if (!err.empty()) { err = "native embedding: " + err; return false; }
         size_t at = 0;
         const basalt::TensorInfo* t = model.find("token_embd.weight", &at);

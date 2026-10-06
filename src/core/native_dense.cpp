@@ -63,11 +63,6 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
-bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
-                                           std::string& err) {
-    return keep_unquantized_ple_key(PackFiles::dir(pack_dir), skip, err);
-}
-
 bool NativeDense::keep_unquantized_ple_key(const PackFiles& pack, std::set<std::string>& skip, std::string& err) {
     const std::string key = "blk.1.ple_key.weight";
     if (!skip.count(key)) return true;

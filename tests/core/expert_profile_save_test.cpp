@@ -1,5 +1,5 @@
 // #477: --expert-profile-save's profile - rank_learned_profile's order (resident first, then the counted routing, then
-// the profile the engine started from) and write_expert_profile's file, byte for byte tools/make_profile.py's format,
+// the profile the engine started from) and write_expert_profile's file, byte for byte the profile format,
 // read back by read_expert_profile.  CPU only: no device is touched.
 #include "basalt/core/expert_cache.hpp"
 
@@ -48,9 +48,8 @@ int main() {
     std::string err;
     check(basalt::core::write_expert_profile(path, L, E, r, err), "written");
     check(!std::filesystem::exists(path + ".tmp"), "no temporary file left");
-    // the bytes make_profile.write_profile would write for the same ranking
-    std::vector<uint8_t> want(4);
-    std::memcpy(want.data(), "STRP", 4);
+    // the profile format's bytes for the same ranking
+    std::vector<uint8_t> want;
     auto u32 = [&](uint32_t v) { for (int b = 0; b < 4; ++b) want.push_back((uint8_t) (v >> (8 * b))); };
     auto u16 = [&](uint32_t v) { want.push_back((uint8_t) v); want.push_back((uint8_t) (v >> 8)); };
     for (uint32_t v : {1u, 3u, 4u, 12u, 12u}) u32(v);
@@ -63,16 +62,16 @@ int main() {
         got.resize(std::fread(got.data(), 1, got.size(), f));
         std::fclose(f);
     }
-    check(got == want, "the file is make_profile.py's format, byte for byte");
+    check(got == want, "the file is the profile format, byte for byte");
     std::vector<Pair> back;
     int64_t slots = 0;
-    check(basalt::core::read_expert_profile(path, L, E, back, slots, err) && back == r && slots == 12,
+    check(basalt::core::read_expert_profile(basalt::core::FileRange(path), L, E, back, slots, err) && back == r && slots == 12,
           "read back by the loader");
     // a second save replaces the first (the rename over an existing file)
     check(basalt::core::write_expert_profile(path, L, E, r0, err), "written again");
-    check(basalt::core::read_expert_profile(path, L, E, back, slots, err) && back == r0, "replaced");
+    check(basalt::core::read_expert_profile(basalt::core::FileRange(path), L, E, back, slots, err) && back == r0, "replaced");
     check(!basalt::core::write_expert_profile(path, L, E, {{3, 0}}, err), "a pair out of range is refused");
-    check(basalt::core::read_expert_profile(path, L, E, back, slots, err) && back == r0,
+    check(basalt::core::read_expert_profile(basalt::core::FileRange(path), L, E, back, slots, err) && back == r0,
           "a refused save keeps the file");
     std::filesystem::remove_all(dir);
     if (fails == 0) std::puts("expert_profile_save_test: OK");

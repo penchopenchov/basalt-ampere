@@ -35,17 +35,9 @@ namespace basalt::core {
 
 class NativeHead;
 
-/// The drafter's files: an mtp runtime directory's, or the `mtp/...` sections of a .basalt.
+/// The drafter's files: the `mtp/...` sections of a .basalt.
 struct MtpFiles {
-    FileRange dense, index, experts, draft_vocab;   ///< dense.bin, dense.txt, experts.bin, draft_vocab.bin (optional)
-    static MtpFiles dir(const std::string& rt_dir) {
-        MtpFiles f;
-        f.dense = FileRange(rt_dir + "/dense.bin");
-        f.index = FileRange(rt_dir + "/dense.txt");
-        f.experts = FileRange(rt_dir + "/experts.bin");
-        f.draft_vocab = FileRange(rt_dir + "/draft_vocab.bin");
-        return f;
-    }
+    FileRange dense, index, experts, draft_vocab;   ///< dense, dense.index, experts, draft_vocab (optional)
     static MtpFiles from(const ModelSources& s) {
         MtpFiles f;
         f.dense = s.mtp_dense;
@@ -63,10 +55,8 @@ public:
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
-    /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
-    /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
-    bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768);
+    /// Loads the draft layer's files and allocates its K/V and buffers for up to `max_t` rows.
+    /// Call before the VRAM expert tier is sized.
     bool load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
     /// The draft layer's hyper-connection matrices that have 8-bit copies, as ("mtp." + tensor name, key) for

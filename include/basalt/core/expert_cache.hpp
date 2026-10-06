@@ -28,23 +28,15 @@ namespace basalt::core {
 /// in the two places that use it.
 inline constexpr int32_t kNotResident = -1;
 
-/// **THE STATIC RESIDENCY PLAN, READ BACK FROM THE FILE `tools/make_profile.py` WROTE.**
+/// The expert profile, the model's `profile` section: `version, n_layers, n_expert, slots, n_ranked` (uint32,
+/// little-endian), then `n_ranked` `(layer, expert)` pairs (uint16 each) ranked by descending routing frequency, then
+/// an `n_layers x n_expert` int32 table of each pair's rank (-1: not ranked).  `--expert-profile-save` writes the
+/// same bytes.  A profile ranked by frequency over a whole trace beats filling the tier with the first distinct
+/// experts a run routes.
 ///
-/// `profile.bin` is `STRP`, then `version, n_layers, n_expert, slots, n_ranked`, then `n_ranked` `(layer, expert)` pairs
-/// ranked by descending routing frequency, then a `n_layers x n_expert` frequency table.
-///
-/// **WHY A PROFILE AND NOT A COMPULSORY-MISS POLICY.**  Compulsory-miss fills with the first `S` DISTINCT experts the
-/// run happens to route, which is whatever the prompt touched first.  A profile ranked by frequency over a whole trace
-/// does better, and the CPU's half of the drain is linear in the hit rate.  The point of reading it from a file is that
-/// a profile built on ONE prompt can be scored on ANOTHER, which is the only way to know whether it transfers.
-///
-/// The frequency table is not returned: it is the profile's own working, and the engine measures the hit rate by
-/// running rather than by re-deriving what the file claims.
-bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
-                         std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
-/// The same from a byte range: a profile file (`with_magic`) or a .basalt's `profile` section (the file without its
-/// 4-byte magic).
-bool read_expert_profile(const FileRange& range, bool with_magic, int64_t n_layers, int64_t n_expert,
+/// The frequency table is not returned: the engine measures the hit rate by running rather than by re-deriving what
+/// the file claims.
+bool read_expert_profile(const FileRange& range, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
 
 /// --expert-profile-save: what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair - the
@@ -58,9 +50,8 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
                                                               const std::vector<double>& heat,
                                                               const std::vector<std::pair<int32_t, int32_t>>& prior);
 
-/// Writes `ranked` in tools/make_profile.py's format, byte for byte: `STRP`, `1, n_layers, n_expert, n_ranked,
-/// n_ranked` (uint32), the pairs (uint16 layer, uint16 expert), then the n_layers x n_expert int32 table of each pair's
-/// rank (-1: not ranked).  Atomically: a `<path>.tmp` beside it, renamed over `path` once complete, so a reader (the
+/// Writes `ranked` in the profile format: `1, n_layers, n_expert, n_ranked, n_ranked` (uint32), the pairs (uint16
+/// layer, uint16 expert), then the n_layers x n_expert int32 table of each pair's rank (-1: not ranked).  Atomically: a `<path>.tmp` beside it, renamed over `path` once complete, so a reader (the
 /// next start) never sees half a file.  False with `err` when it could not be written.
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                           const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);

@@ -58,16 +58,6 @@ struct Seg {
     Conv conv = Conv::Copy;
 };
 
-const char* file_name(int id) {
-    switch (id) {
-        case 0: return "dense.bin";
-        case 1: return "embd.bin";
-        case 2: return "experts.bin";
-        case 3: return "extra.bin";   // plan v0.3 P6: a native pack's float tensors that the base pack quantized
-        default: return nullptr;
-    }
-}
-
 /// UTF-16 path for CreateFile-free portability: the loader uses `std::fopen`, which on Windows takes an ANSI
 /// path.  The pack lives beside the executable in practice, but a pack under a user directory with a
 /// non-ASCII name would silently fail to open, so the caller gets the errno rather than a null pointer.
@@ -98,33 +88,11 @@ struct IndexText {
 
 }  // namespace
 
-PackFiles PackFiles::dir(const std::string& pack_dir) {
-    PackFiles p;
-    p.index = FileRange(pack_dir + "/index.txt");
-    for (int i = 0; i < 4; ++i) p.files[i] = FileRange(pack_dir + "/" + file_name(i));
-    return p;
-}
-
 PackFiles PackFiles::from(const ModelSources& s) {
     PackFiles p;
     p.index = s.dense_index;
     p.files[0] = s.dense;
     return p;
-}
-
-bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
-                             const std::set<std::string>* skip) {
-    return pool_bytes(PackFiles::dir(pack_dir), out, err, skip);
-}
-
-bool WeightTable::index_code_bits(const std::string& pack_dir, const std::string& name, int& code_bits,
-                                  std::string& err) {
-    return index_code_bits(PackFiles::dir(pack_dir), name, code_bits, err);
-}
-
-bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
-                       const std::set<std::string>* skip) {
-    return load(PackFiles::dir(pack_dir), arena_base, arena_bytes, err, skip);
 }
 
 bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& err,

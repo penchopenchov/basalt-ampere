@@ -116,9 +116,7 @@ struct Alloc {
 struct Stager {
     // the pinned ring's depth: how far the host copies can run ahead of the DMAs of the unpinned experts' blobs
     int kRing = 16;
-    // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
-    // role slices; a pointer to it would not live as long as the queue)
-    struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
+    struct Job { const uint8_t* src; size_t bytes; };
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
@@ -187,11 +185,7 @@ struct Stager {
                 // was a ring entry the routing skipped (an event never recorded returns at once)
                 cudaEventSynchronize(dma_done[b]);
                 const Job& jb = jobs[(size_t) j];
-                if (jb.from == nullptr) std::memcpy(buf[b], jb.src, jb.bytes);
-                else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
-                    std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
-                    std::abort();
-                }
+                std::memcpy(buf[b], jb.src, jb.bytes);
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
@@ -586,13 +580,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
-        // A GGUF read in place: most of a chunk's blobs are page faults on the SSD, so the copies need many reads in
-        // flight (more threads and a deeper ring than for every other source)
-        bool files = false;
-        for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
-            for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
-        const int threads = files ? 32 : std::max(2, std::min(4, hw / 4));
-        if (files) m.stager->kRing = 4 * threads;
+        const int threads = std::max(2, std::min(4, hw / 4));
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
     }
     m.steps_host.resize(T * basalt::kernels::kStepCount);
@@ -1268,10 +1256,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
-                    if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
-                        job = (int) js.size();
-                        js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
-                    } else {
+                    {
                         b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
                         if (ps_on && m.src->pinned(l, e)) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
@@ -1855,10 +1840,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
-                                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
-                                    continue;
-                                }
                                 const uint8_t* b = m.src->blob(l, e);
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
                                 js.push_back({b, (size_t) lay.blob_bytes(l)});
@@ -1873,7 +1854,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % STAGE;
                             const auto th = Clock::now();
-                            const bool pinned = m.src->pinned(l, e);   // pinned: never transient
+                            const bool pinned = m.src->pinned(l, e);
                             const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (pinned) {

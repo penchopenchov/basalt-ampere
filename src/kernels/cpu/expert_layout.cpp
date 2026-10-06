@@ -6,7 +6,6 @@
 #include <cstring>
 #include <string>
 #include <cpuid.h>
-#include <fstream>
 #include <sstream>
 
 namespace basalt::kernels::cpu {
@@ -134,22 +133,13 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 }
 
 
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
-    std::ifstream in(pack_dir + "/native_experts.txt", std::ios::binary);
-    if (!in) return expert_layout_load_text(std::string(), n_layers, n_expert, err);
-    std::stringstream buf;
-    buf << in.rdbuf();
-    return expert_layout_load_text(buf.str(), n_layers, n_expert, err);
-}
-
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
-    if (text.empty()) {   // no per-layer table: the canonical layout
-        L.total = (uint64_t) n_layers * (uint64_t) n_expert * (uint64_t) BLOB;
-        g_layout = L;
-        return true;
+    if (text.empty()) {
+        err = "the expert layout is empty";
+        return false;
     }
     std::istringstream in(text);
     L.native = true;
@@ -161,26 +151,20 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             if (!line.empty() && line[0] == '#') {
-                // "# experts vN: ..." (a .basalt) or "# strata native experts vN: ..." (a pack).  A version this
-                // engine does not know may mean columns it would misread, so it is refused rather than parsed as
-                // far as the known columns go.
+                // "# experts vN: ...".  A version this engine does not know may mean columns it would misread,
+                // so it is refused rather than parsed as far as the known columns go.
                 static const char kHeader[] = "# experts v";
-                static const char kPackHeader[] = "# strata native experts v";
-                const char* ver = nullptr;
-                if (line.compare(0, sizeof kHeader - 1, kHeader) == 0) ver = line.c_str() + sizeof kHeader - 1;
-                else if (line.compare(0, sizeof kPackHeader - 1, kPackHeader) == 0) ver = line.c_str() + sizeof kPackHeader - 1;
-                if (ver != nullptr) {
-                    L.version = std::atoi(ver);
+                if (line.compare(0, sizeof kHeader - 1, kHeader) == 0) {
+                    L.version = std::atoi(line.c_str() + sizeof kHeader - 1);
                     if (L.version > kExpertLayoutVersion) {
-                        err = "native_experts.txt is v" + std::to_string(L.version) + "; this engine reads up to v" +
-                              std::to_string(kExpertLayoutVersion) + " (the pack was written by a newer tools/"
-                              "iq_pack.py: update the engine, or repack with this one)";
+                        err = "the expert layout is v" + std::to_string(L.version) + "; this engine reads up to v" +
+                              std::to_string(kExpertLayoutVersion) + " (the model was converted by a newer "
+                              "tools/convert.py: update the engine)";
                         return false;
                     }
                 }
-                // v3 packs record their expert count in the header; a pruned model (GSQ-RCO Coder) ships
-                // fewer experts than the canonical geometry the caller passes, which is a compile-time
-                // default, so the header wins.
+                // the header records the expert count; a pruned model ships fewer experts than the geometry the
+                // caller passes, which is a compile-time default, so the header wins.
                 const size_t at = line.find("(n_expert ");
                 if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
             }
@@ -188,49 +172,17 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
         }
         std::istringstream ss(line);
         long long l = -1, gt = -1, dt = -1;
-        unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;
+        unsigned long long off = 0, blob = 0;
         if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers) {
-            err = "native_experts.txt: a malformed line: " + line;
+            err = "expert layout: a malformed line: " + line;
             return false;
         }
         NativeFmt f;
         if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
         if (f.bytes != blob) {
-            err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
+            err = "expert layout: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
             return false;
-        }
-        if (ss >> go >> uo >> dox) {   // v2 lines: the GGUF offsets
-            if (L.gguf_off.empty()) L.gguf_off.assign((size_t) (3 * n_layers), 0);
-            L.gguf_off[(size_t) (3 * l)] = go;
-            L.gguf_off[(size_t) (3 * l + 1)] = uo;
-            L.gguf_off[(size_t) (3 * l + 2)] = dox;
-            std::string file;             // v3: the shard that holds this layer (a file name beside --native)
-            if (ss >> file) {
-                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) (3 * n_layers), std::string());
-                // One name covers all three roles.  When a shard boundary falls inside a layer the packer writes
-                // "gate,up,down" instead (v4), an empty field meaning the --native shard.  A GGUF file name has no
-                // comma, so the split is unambiguous; an engine older than v4 fails to open such a "file" loudly.
-                // The comma form is from #255 (gopinath87607).
-                std::vector<std::string> parts;
-                for (size_t from = 0;;) {
-                    const size_t comma = file.find(',', from);
-                    parts.push_back(file.substr(from, comma == std::string::npos ? comma : comma - from));
-                    if (comma == std::string::npos) break;
-                    from = comma + 1;
-                }
-                if (parts.size() == 1) {
-                    const std::string one = parts[0];   // not parts.assign(3, parts[0]): that aliases the element
-                    parts.assign(3, one);                //   the assignment is about to overwrite
-                }
-                std::string extra;
-                if (parts.size() != 3 || (ss >> extra)) {
-                    err = "native_experts.txt: layer " + std::to_string(l) + ": the shard column is one name or "
-                          "gate,up,down, not: " + line;
-                    return false;
-                }
-                for (size_t r = 0; r < 3; ++r) L.gguf_file[(size_t) (3 * l) + r] = parts[r];
-            }
         }
         L.fmt[(size_t) l] = f;
         L.offset[(size_t) l] = off;
@@ -240,7 +192,7 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
     uint64_t at = 0;
     for (int64_t l = 0; l < n_layers; ++l) {
         if (L.offset[(size_t) l] != at) {
-            err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
+            err = "expert layout: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
         at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;

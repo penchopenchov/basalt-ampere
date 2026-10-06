@@ -1,9 +1,8 @@
-// include/basalt/kernels/cpu/expert_layout.hpp - plan v0.3 P6: where each routed expert lives in experts.bin.
+// include/basalt/kernels/cpu/expert_layout.hpp - where each routed expert lives in the model's `experts` section.
 //
-// A Q2_0 pack (tools/pack.py) has one blob size for every layer, `BLOB`, in the the engine expert form.  A
-// native pack (tools/iq_pack.py, the IQ2_XS / IQ3_XXS files) keeps each expert's raw GGUF slices, so the blob
-// size and the formats change from layer to layer; `native_experts.txt` says how.  Everything that touches an
-// expert blob - the arena, the VRAM tier, the prompt path, the CPU pool, the GPU window - asks this table.
+// The experts keep their raw GGUF slices, so the blob size and the formats change from layer to layer; the
+// `experts.layout` section says how.  Everything that touches an expert blob - the arena, the VRAM tier, the prompt
+// path, the CPU pool, the GPU window - asks this table.
 #pragma once
 
 #include "basalt/kernels/cpu/expert.hpp"
@@ -18,19 +17,11 @@ namespace basalt::kernels::cpu {
 struct ExpertLayout {
     bool native = false;
     int64_t n_layers = 0, n_expert = NE;
-    std::vector<NativeFmt> fmt;           ///< per layer (native packs)
+    std::vector<NativeFmt> fmt;           ///< per layer
     std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
-    /// Plan v0.3 P6: per layer, the absolute offsets of the gate / up / down tensors in their GGUF files, so the
-    /// arena can be filled from the GGUF itself when the pack has no experts.bin (3 x n_layers, 0 = unknown).
-    std::vector<uint64_t> gguf_off;
-    /// Per layer PER ROLE (3 x n_layers, `3 * layer + role`, matching `gguf_off`), the GGUF file - a name beside
-    /// the --native shard - that holds that role's tensor.  Empty = the --native shard itself.  Per role because a
-    /// shard boundary can fall inside a layer: Unsloth's UD-Q4_K_XL has layer 11's down in shard 2 and its gate
-    /// and up in shard 3 (native_experts.txt v4, the `gate,up,down` shard column).
-    std::vector<std::string> gguf_file;
-    int version = 0;                      ///< native_experts.txt's header version (0 = none given)
+    int version = 0;                      ///< the layout header's version (0 = none given)
     uint64_t max_blob = BLOB;
-    uint64_t total = 0;                   ///< experts.bin size
+    uint64_t total = 0;                   ///< the experts section's size
 
     uint64_t blob_bytes(int64_t layer) const { return native ? bytes[(size_t) layer] : (uint64_t) BLOB; }
     uint64_t layer_offset(int64_t layer) const {
@@ -57,7 +48,7 @@ bool cpu_sse42_ok();
 /// The cap on the probes above (3 = no cap, 2 = AVX2, 1 = AVX, 0 = SSE4.2); always 3.  ggml-cpu keeps what it was
 /// compiled for.
 int cpu_isa_cap();
-/// Whether a native pack's layer of this ggml type runs on the engine's own Q2_0 kernels (AVX2 / AVX-512).  On a
+/// Whether a layer of this ggml type runs on the engine's own Q2_0 kernels (AVX2 / AVX-512).  On a
 /// CPU without AVX2 (a native, non-portable build: ggml-cpu compiled for this CPU's SSE) a Q2_0 layer takes
 /// ggml-cpu's own Q2_0 vec_dot like every other native type: slower, but it runs.
 inline bool q2_native_kernels(int type) { return type == 42 && cpu_avx2_ok(); }
@@ -68,16 +59,12 @@ void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* co
                  int r0, int r1);
 void act_quant_any(const float* x, int n, ActQ& a);
 
-/// The process-wide layout (canonical Q2_0 until `expert_layout_load` finds a native pack).
+/// The process-wide layout (empty until `expert_layout_load_text` succeeds).
 const ExpertLayout& expert_layout();
-/// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
-/// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
-/// The same from the text of the layout (a pack's native_experts.txt, a .basalt's `experts.layout`); empty text is the
-/// canonical layout.  The header may read "# experts vN" or "# strata native experts vN".
+/// Loads the layout from its text (the model's `experts.layout` section: "# experts vN: ..." then one line per layer,
+/// `layer gu_type d_type offset blob_bytes`; further columns are ignored).  A newer version is refused.
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err);
-/// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
-/// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
-inline constexpr int kExpertLayoutVersion = 4;
+/// The newest layout version this engine reads.
+inline constexpr int kExpertLayoutVersion = 5;
 
 }  // namespace basalt::kernels::cpu

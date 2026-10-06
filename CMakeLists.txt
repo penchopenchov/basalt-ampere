@@ -228,7 +228,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
   add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
   set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
 endif()
-# the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
+# the learned expert profile (--expert-profile-save): its order and file format (CPU only)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
   enable_testing()
   add_executable(expert_profile_save_test tests/core/expert_profile_save_test.cpp)
@@ -237,8 +237,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
   set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
 endif()
 if(BUILD_TESTING)
-  # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
-  # synthetic GGUF shards at the real expert dimensions
+  # the expert layout text: real models' layouts and the refusals
   add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
   target_link_libraries(expert_layout_test PRIVATE engine)
   add_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
@@ -248,12 +247,12 @@ if(BUILD_TESTING)
   target_link_libraries(model_file_test PRIVATE engine)
   add_test(NAME model_file_test COMMAND model_file_test)
   set_tests_properties(model_file_test PROPERTIES TIMEOUT 60)
-  # a native pack's BF16 (--compat-bf16) PLE key stays in the arena; a quantized key row loads as before
+  # a PLE key held unquantized in the dense index stays in the arena; a quantized key row loads as before
   add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
   target_link_libraries(native_dense_ple_key_test PRIVATE engine)
   add_test(NAME native_dense_ple_key_test COMMAND native_dense_ple_key_test)
   set_tests_properties(native_dense_ple_key_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
-  # per-layer admission on a sized (native pack) cache starts each layer in its own range
+  # per-layer admission on a sized cache starts each layer in its own range
   add_executable(expert_cache_per_layer_test tests/core/expert_cache_per_layer_test.cpp)
   target_link_libraries(expert_cache_per_layer_test PRIVATE engine)
   add_test(NAME expert_cache_per_layer_test COMMAND expert_cache_per_layer_test)
@@ -743,9 +742,6 @@ if(BUILD_TESTING)
   add_executable(q5_projection_parity src/kernels/q5_projection_parity.cpp)
   target_include_directories(q5_projection_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(q5_projection_parity PRIVATE kernels artifact ggml-base ${_gpu_runtime_target})
-  # the FP8 PLE table (tools/ple_fp8_pack.py) through PleTable vs the checkpoint's own values
-  add_executable(ple_fp8_parity src/kernels/ple_fp8_parity.cpp)
-  target_link_libraries(ple_fp8_parity PRIVATE kernels ${_gpu_runtime_target})
 endif()
 
 if(BUILD_TESTING)

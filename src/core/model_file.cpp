@@ -412,27 +412,12 @@ bool ModelFile::register_gguf_view(std::string& err) const {
 
 // ================================ the sources ================================
 
-void pack_dir_sources(const std::string& dir, ModelSources& s) {
-    s.dense = FileRange(dir + "/dense.bin");
-    s.dense_index = FileRange(dir + "/index.txt");
-    s.experts = FileRange(dir + "/experts.bin");
-    s.experts_layout = FileRange(dir + "/native_experts.txt");
-}
-
-void mtp_dir_sources(const std::string& dir, ModelSources& s) {
-    s.mtp_dense = FileRange(dir + "/dense.bin");
-    s.mtp_dense_index = FileRange(dir + "/dense.txt");
-    s.mtp_experts = FileRange(dir + "/experts.bin");
-    s.mtp_draft_vocab = FileRange(dir + "/draft_vocab.bin");
-}
-
 void model_sources(const ModelFile& m, ModelSources& s) {
     s.dense = m.range("dense");
     s.dense_index = m.range("dense.index");
     s.experts = m.range("experts");
     s.experts_layout = m.range("experts.layout");
     s.profile = m.range("profile");
-    s.profile_magic = false;
     s.hc8 = m.range("hc8");
     s.mtp_dense = m.range("mtp/dense");
     s.mtp_dense_index = m.range("mtp/dense.index");

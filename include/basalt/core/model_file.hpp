@@ -1,8 +1,7 @@
 #pragma once
 // Reader for the .basalt model file (the layout is in model_format.hpp), and the byte ranges the loaders read.
 //
-// Every loader that used to open one file by path takes a FileRange instead: a path, an offset and a size.  The
-// old command-line flags give ranges that cover whole files (offset 0); `--model` gives the sections of one file.
+// Every loader takes a FileRange: a path, an offset and a size; `--model` gives the sections of one file.
 // A section is 2 MiB aligned in the file, so a range can be mapped, and read with O_DIRECT at its own offsets.
 //
 // The source tensors in the `gguf` section are served through the GGUF reader (basalt/artifact/gguf_reader.hpp):
@@ -115,20 +114,14 @@ private:
     bool meta_loaded_ = false;
 };
 
-/// Where each loader reads from.  `--pack` and friends fill whole-file ranges; `--model` fills sections.
+/// Where each loader reads from: the sections of the .basalt.
 struct ModelSources {
     FileRange dense, dense_index, experts, experts_layout, profile, hc8;
     FileRange mtp_dense, mtp_dense_index, mtp_experts, mtp_draft_vocab;
-    /// Whether `profile` starts with the 4-byte profile magic (a profile file does, the .basalt section does not).
-    bool profile_magic = true;
     /// The file that serves the source GGUF tensors and metadata when they come from a .basalt, else empty.
     std::string model_path;
 };
 
-/// The ranges of a pack directory (dense.bin, index.txt, experts.bin, native_experts.txt).
-void pack_dir_sources(const std::string& dir, ModelSources& s);
-/// The ranges of an mtp runtime directory (dense.bin, dense.txt, experts.bin, draft_vocab.bin).
-void mtp_dir_sources(const std::string& dir, ModelSources& s);
 /// The ranges of a .basalt's sections (those that exist).
 void model_sources(const ModelFile& m, ModelSources& s);
 

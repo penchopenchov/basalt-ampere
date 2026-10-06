@@ -176,11 +176,6 @@ const void* MtpDrafter::q8(const char* name) const {
     return nullptr;
 }
 
-bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-                      int64_t window) {
-    return load(MtpFiles::dir(rt_dir), g, ss, max_t, err, window);
-}
-
 bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window) {
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there

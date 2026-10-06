@@ -86,7 +86,7 @@ int main() {
         hc8_bytes.assign(std::istreambuf_iterator<char>(f), {});
     }
     const std::string layout =
-        "# experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] (n_expert 2, total 0)\n";
+        "# experts v5: layer gu_type d_type offset blob_bytes (n_expert 2, total 0)\n";
 
     const std::string path = write_model(d.path / "m.basalt", {{"meta", meta}, {"gguf", gg}, {"hc8", hc8_bytes},
                                                                 {"experts.layout", layout}});
@@ -135,10 +135,8 @@ int main() {
         // a header of the .basalt spelling with no rows is refused as incomplete, not for its header
         const bool ok = basalt::kernels::cpu::expert_layout_load_text(std::string(text.begin(), text.end()), 2, 2, err);
         check(!ok && err.find("missing or not contiguous") != std::string::npos,
-              "\"# experts v3\" is read as a layout header: " + err);
-        check(basalt::kernels::cpu::expert_layout_load_text(std::string(), 2, 2, err) &&
-                  !basalt::kernels::cpu::expert_layout().native,
-              "empty text is the canonical layout");
+              "\"# experts v5\" is read as a layout header: " + err);
+        check(!basalt::kernels::cpu::expert_layout_load_text(std::string(), 2, 2, err), "empty text is refused");
     }
     {
         std::map<std::string, Hc8Copy> back;
