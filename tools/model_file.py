@@ -17,7 +17,8 @@ import struct
 MAGIC = b"BASALTMF"
 VERSION = 1
 SECTION_ALIGN = 2 << 20
-HEADER_BYTES = 4096
+HEADER_BYTES = 64 << 10
+TENSOR_ALIGN = 4096                            # within the `gguf` section
 HEADER = struct.Struct("<8sIIQ40s")           # 64 bytes
 ENTRY = struct.Struct("<64sQQ32s16s")         # 128 bytes
 MAX_SECTIONS = (HEADER_BYTES - HEADER.size) // ENTRY.size

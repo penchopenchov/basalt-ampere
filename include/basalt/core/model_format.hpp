@@ -2,7 +2,7 @@
 // The .basalt model file: one file holds everything the engine, the server and the vision sidecar load.
 //
 // Layout (little-endian):
-//   [0, 4096)            FileHeader, then n_sections SectionEntry records (the table fits in the first 4 KiB)
+//   [0, 64 KiB)          FileHeader, then n_sections SectionEntry records (the table fits in the first 64 KiB)
 //   every section        starts at a multiple of kSectionAlign, so it can be mapped, read with O_DIRECT and
 //                        backed by huge pages; the bytes between sections are zero
 //
@@ -11,7 +11,7 @@
 //
 // Sections (v1):
 //   meta                     JSON: format/version, model name, geometry, the source GGUF metadata the engine reads
-//                            (`gguf_kv`), the type and shape of every `gguf/...` section (`tensors`), the engine's
+//                            (`gguf_kv`), the type, shape, size and offset in `gguf` of every source tensor (`tensors`), the engine's
 //                            default arguments (`engine_args`), default sampling (`sampling`), provenance (source
 //                            files, sizes, sha256, converter version) and the license / attribution text
 //   tokenizer/<file>         the tokenizer directory's files (tokenizer.json, vocab.json, merges.txt,
@@ -20,8 +20,9 @@
 //   dense.index              its tensor index (text, first line "# dense index v3")
 //   experts                  the routed experts' blobs (a pack's experts.bin)
 //   experts.layout           their per-layer layout (text, first line "# experts v3"; offsets relative to `experts`)
-//   gguf/<tensor name>       a source GGUF tensor the engine reads in place (e.g. token_embd.weight,
-//                            per_layer_token_embd.weight), raw bytes; type and shape in meta.tensors
+//   gguf                     every non-expert tensor of the source GGUFs (token_embd.weight,
+//                            per_layer_token_embd.weight, ...), raw bytes, each starting at a multiple of
+//                            kTensorAlign within the section; meta.tensors[name].offset is relative to the section
 //   mtp/dense, mtp/dense.index, mtp/experts, mtp/draft_vocab
 //                            the drafter (the files of an mtp runtime directory)
 //   profile                  the default expert profile
@@ -35,7 +36,8 @@ namespace basalt::core {
 constexpr char kModelMagic[8] = {'B', 'A', 'S', 'A', 'L', 'T', 'M', 'F'};
 constexpr uint32_t kModelVersion = 1;
 constexpr uint64_t kSectionAlign = 2ull << 20;
-constexpr uint64_t kHeaderBytes = 4096;
+constexpr uint64_t kHeaderBytes = 64ull << 10;
+constexpr uint64_t kTensorAlign = 4096;
 
 struct FileHeader {
     char magic[8];           ///< kModelMagic
