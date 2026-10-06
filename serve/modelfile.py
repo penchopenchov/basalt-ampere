@@ -105,8 +105,10 @@ def vision_config(mf: ModelFile, exe: str) -> dict | None:
 
 
 def with_arg(args: list[str], flag: str, value) -> list[str]:
-    """`args` with `flag value` replaced, or appended when absent."""
+    """`args` with `flag value` replaced, or appended when absent; a value of True is a bare switch."""
     out = list(args)
+    if value is True:
+        return out if flag in out else out + [flag]
     if flag in out:
         out[out.index(flag) + 1] = str(value)
     else:

@@ -104,6 +104,14 @@ class Peer(Tmp):
                                       overrides={"--spec": 0, "--mtp-max-t": 4})["args"]
         self.assertEqual(args, ["--model", path, "--spec", "0", "--spec-min-p", "0.5", "--mtp-max-t", "4"])
 
+    def test_switch_override_is_added_once(self):
+        path = self.build(meta={**META, "engine_args": ["--spec", "7"]})
+        args = modelfile.model_config(path, str(self.exe), gpus=1, overrides={"--peer-exclusive": True})["args"]
+        self.assertEqual(args, ["--model", path, "--spec", "7", "--peer-exclusive"])
+        path = self.build(meta={**META, "engine_args": ["--peer-exclusive"]})
+        args = modelfile.model_config(path, str(self.exe), gpus=1, overrides={"--peer-exclusive": True})["args"]
+        self.assertEqual(args.count("--peer-exclusive"), 1)
+
     def test_file_args_win(self):
         path = self.build(meta={**META, "engine_args": ["--peer-device", "-1"]})
         args = modelfile.model_config(path, str(self.exe), gpus=2)["args"]
