@@ -1063,25 +1063,17 @@ class DraftHeadHint(unittest.TestCase):
 class StartFailureLog(unittest.TestCase):
     """Whatever stopped the engine before READY, the error carries this start's last log lines."""
 
-    def test_the_last_lines_of_this_start(self):
-        from serve.server import start_log_tail
+    def test_the_last_line_of_this_start(self):
+        from serve.server import start_last_line
         d = tempfile.mkdtemp()
         p = Path(d) / "engine.log"
         before = "basalt serve: an earlier start's line\n"
-        p.write_text(before + "".join(f"basalt serve: line {i}\n" for i in range(30)) + "\n"
-                     "basalt serve: cannot open the pack\n", encoding="utf-8")
-        tail = start_log_tail(str(p), len(before.encode()))
-        self.assertIn("the engine log's last lines:", tail)
-        self.assertIn("cannot open the pack", tail)
-        self.assertIn("line 29", tail)
-        self.assertNotIn("line 10\n", tail + "\n")                 # 20 lines: 11..29 and the last one
-        self.assertIn("line 11", tail)
-        self.assertNotIn("earlier start", tail)
-        short = start_log_tail(str(p), len(before.encode()), n=3)
-        self.assertEqual(short.count("\n  "), 3)
-        self.assertEqual(start_log_tail(str(p), p.stat().st_size), "")   # nothing from this start
-        self.assertEqual(start_log_tail(None, 0), "")
-        self.assertEqual(start_log_tail(str(Path(d) / "missing.log"), 0), "")
+        p.write_text(before + "basalt serve: line 1\nbasalt generate: cannot open the pack\n"
+                     "basalt warning: slow disk\n\n", encoding="utf-8")
+        self.assertEqual(start_last_line(str(p), len(before.encode())), "cannot open the pack")
+        self.assertEqual(start_last_line(str(p), p.stat().st_size), "")   # nothing from this start
+        self.assertEqual(start_last_line(None, 0), "")
+        self.assertEqual(start_last_line(str(Path(d) / "missing.log"), 0), "")
 
     def test_the_start_error_has_them(self):
         import serve.server as server
@@ -1094,12 +1086,40 @@ class StartFailureLog(unittest.TestCase):
             with mock.patch.object(server.subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
                     mock.patch.object(server, "narrate_start", lambda *a, **k: None):
-                with self.assertRaises(RuntimeError) as cm:
+                with self.assertRaises(server.EngineStartError) as cm:
                     ProcessEngine("basalt", [], log=str(log))
-            text = str(cm.exception)
-            self.assertIn("exited before it was ready", text)
-            self.assertIn("cannot open the pack packs/x", text)
-            self.assertNotIn("an earlier start", text)
+            self.assertEqual(str(cm.exception), "cannot open the pack packs/x")
+            self.assertEqual(cm.exception.log, str(log))
+
+    def test_a_silent_exit_still_says_something(self):
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as d:
+            script, log = Path(d) / "fake_engine.py", Path(d) / "engine.log"
+            script.write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
+            real = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
+                    mock.patch.object(server, "narrate_start", lambda *a, **k: None):
+                with self.assertRaises(server.EngineStartError) as cm:
+                    ProcessEngine("basalt", [], log=str(log))
+            self.assertIn("exited before it was ready", str(cm.exception))
+
+    def test_a_failed_reload_says_so_and_raises_engine_died(self):
+        import serve.server as server
+        eng = mock.Mock(unloaded=True)
+        eng.loaded = lambda: False
+        eng.restart.side_effect = server.EngineStartError("no room", "/x/engine.log")
+        svc = server.Service.__new__(server.Service)
+        svc.engine, svc.vision, svc.before_load, svc.min_free_vram_mib = eng, None, None, 0
+        svc.vram_reserve = None
+        out = io.StringIO()
+        with mock.patch.object(server.Service, "loaded", lambda self: False), \
+                mock.patch.object(server.Service, "_vision_down", lambda self: False), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(server.EngineDied):
+                svc.ensure_loaded()
+        self.assertIn("[server] error: no room", out.getvalue())
+        self.assertIn("[server] engine log: /x/engine.log", out.getvalue())
 
 
     def test_the_engines_own_error_is_the_message(self):

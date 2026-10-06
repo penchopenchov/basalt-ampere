@@ -133,8 +133,13 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (on Linux, usually the out-of-memory killer)."""
 
 
-class EngineStartError(RuntimeError):
-    """The engine ended its start with its own `basalt error:` line(s); the message is just their text."""
+class EngineStartError(EngineDied):
+    """The engine ended before READY; the message is its own `basalt error:` line(s), else its last log line.
+    `log` is the engine log's path, if any.  An EngineDied: a request that triggered the start answers 503."""
+
+    def __init__(self, message: str, log: str | None = None):
+        super().__init__(message)
+        self.log = log
 
 
 class EngineStarting(RuntimeError):
@@ -194,25 +199,25 @@ def start_failure_hint(log: str | None, offset: int) -> str:
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
 
 
-def start_log_tail(log: str | None, offset: int, n: int = 20) -> str:
-    """The last n lines this start wrote to the engine log, for the error when the engine ended before READY -
-    whatever the failure, the engine's own reason is in them (people posted the traceback without the log).  "" when
-    there is no log or nothing in it from this start."""
+def start_last_line(log: str | None, offset: int) -> str:
+    """The last meaningful line this start wrote to the engine log (without its `basalt generate:` prefix), for the
+    error when the engine ended before READY without an error line of its own.  "" when there is none."""
     if not log:
         return ""
     try:
         with open(log, "rb") as f:
             f.seek(0, 2)
-            start = max(offset, f.tell() - 64 * 1024)   # enough for 20 lines, never an earlier start's
+            start = max(offset, f.tell() - 64 * 1024)   # never an earlier start's lines
             f.seek(start)
             text = f.read().decode("utf-8", "replace")
     except (OSError, ValueError):
         return ""
     lines = text.splitlines()[1 if start > offset else 0:]   # not a line cut in half
-    lines = [x.rstrip() for x in lines if x.strip()][-n:]
-    if not lines:
-        return ""
-    return "\nthe engine log's last lines:\n" + "\n".join("  " + x for x in lines)
+    for x in reversed(lines):
+        x = x.strip()
+        if x and not x.startswith("basalt warning:"):
+            return x.removeprefix("basalt generate: ").removeprefix("basalt serve: ")
+    return ""
 
 
 def echo_requests(log_path: str, offset: int) -> None:
@@ -586,10 +591,11 @@ class ProcessEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            if errors := start_errors(log, log_start):   # its own reason, short, instead of the log tail
-                raise EngineStartError("; ".join(dict.fromkeys(errors)))
-            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") +
-                               start_failure_hint(log, log_start) + start_log_tail(log, log_start))
+            if errors := start_errors(log, log_start):   # its own reason, short
+                reason = "; ".join(dict.fromkeys(errors))
+            else:
+                reason = start_last_line(log, log_start) or "the engine exited before it was ready"
+            raise EngineStartError(reason + start_failure_hint(log, log_start), log)
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
         # a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=) win, the manifest stays the fallback for the others
@@ -698,7 +704,7 @@ class ProcessEngine:
                 try:
                     self.__init__(*self.spawn)
                     break
-                except RuntimeError:
+                except EngineStartError:
                     try:
                         self.proc.wait(timeout=60)
                     except (subprocess.TimeoutExpired, OSError):
@@ -1684,7 +1690,13 @@ class Service:
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[server] warning: the engine stopped (exit code {code}), restarting it", flush=True)
-        self.engine.restart()
+        try:
+            self.engine.restart()
+        except EngineStartError as e:                   # a line, not a traceback: the next request tries again
+            print(f"[server] error: {e}", flush=True)
+            if e.log:
+                print(f"[server] engine log: {e.log}", flush=True)
+            raise
         print("[server] engine running again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # the reserve asked for last
             try:
@@ -2715,7 +2727,7 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineDied) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
@@ -3434,6 +3446,8 @@ def main() -> int:
             engine = ProcessEngine(cfg["exe"], engine_args(cfg), log=cfg.get("log"), env=env, lazy=lazy)
         except EngineStartError as e:
             print(f"[server] error: {e}", file=sys.stderr, flush=True)
+            if e.log:
+                print(f"[server] engine log: {e.log}", file=sys.stderr, flush=True)
             return 1
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
