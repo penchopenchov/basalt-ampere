@@ -76,58 +76,10 @@ __global__ void quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __res
     }
 }
 
-/// **THE HIT PATH'S QUANTIZER, AND IT EXISTS TO REPRODUCE `act_quant_q8_1` EXACTLY (R4.2h, round 331).**
-///
-/// The engine computes every routed expert twice.  MISSES go through `cpu/expert.cpp:138 act_quant_q8_1`
-/// into the VNNI kernel; HITS went through `quantize_q8_0` above.  **Those are not the same quantization**,
-/// and round 330 measured the difference with both real implementations linked
-/// (`bench/micro/act_quant_parity.cu`):
-///
-///     int8 activations differing : 0 of 2560                       <- this rule's ties are measure-zero
-///     chunks whose SCALE differs : 80 of 80, max rel 4.761e-04     <- 2^-11: fp32 vs the block's fp16
-///
-/// The scale is the difference that matters: `ActQ::scale` is `float` and the CPU kernel multiplies by it
-/// (`expert.cpp:92`), while `row_dot_s2_q8` read `f16_at(xb)` out of the `block_q8_0`.  So this variant
-/// writes the SAME 34-byte blocks (the kernel's indexing is unchanged) **and** a parallel fp32 scale array
-/// carrying `d32` unrounded.
-///
-/// It also adopts the CPU's ROUNDING RULE - multiply by the reciprocal, round half AWAY FROM ZERO - rather
-/// than this file's `rint`.  That is deliberate and it is the opposite of the direction the comment above
-/// argues for.  `quantize_q8_0` was tuned to match **ggml's Q8_0 bytes**, which is right for the pack and for
-/// `moe_hit_parity`.  This function's job is different: it must match **this engine's own CPU reference**,
-/// because a hit and a miss for the same expert on the same layer have to produce the same number.  The CPU
-/// path is the reference - C1 passes on it - so the hit path is brought to it, not the reverse.
-__global__ void quantize_q8_0_scaled_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
-                                            float* __restrict__ scales, long long n_blocks) {
-    const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= n_blocks) return;
-    const float* xb = x + b * QK8_0;
-    uint8_t* out = blocks + b * 34;
-
-    float amax = 0.0f;
-    for (int i = 0; i < QK8_0; ++i) amax = fmaxf(amax, fabsf(xb[i]));
-    // VERBATIM from `cpu/expert.cpp:144-145`, including the `amax > 0` guard, so the fp32 value written here
-    // is bit-identical to the `s` the CPU path used.
-    const float s = amax > 0.f ? amax / 127.f : 0.f;
-    const float inv = s > 0.f ? 1.f / s : 0.f;
-    scales[b] = s;
-
-    const uint16_t d16bits = f16_from_f32(s);
-    out[0] = (uint8_t) (d16bits & 0xFF);
-    out[1] = (uint8_t) (d16bits >> 8);
-    for (int i = 0; i < QK8_0; ++i) {
-        // VERBATIM from `cpu/expert.cpp:159-162`: reciprocal multiply, then `t + copysign(0.5, t)` truncated
-        // toward zero, which is `lround`'s rule - round half away from zero.
-        const float t = xb[i] * inv;
-        const float r = t + (t >= 0.f ? 0.5f : -0.5f);
-        int v = (int) r;
-        v = v < -127 ? -127 : (v > 127 ? 127 : v);
-        out[2 + i] = (uint8_t) (int8_t) v;
-    }
-}
-
-// quantize_q8_0_scaled_kernel with a warp per block (a lane per value): the same amax (max is exact in any order),
-// scale and rounding, so the same bytes and scales
+// The hit path's quantizer, a warp per block (a lane per value).  It writes the same 34-byte block_q8_0 layout as
+// quantize_q8_0 plus a parallel fp32 scale array carrying the scale unrounded, and uses the CPU path's rounding rule
+// (multiply by the reciprocal, round half away from zero), so a hit and a miss for the same expert produce the same
+// number.  The max is exact in any order.
 __global__ void quantize_q8_0_scaled_warp_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
                                                  float* __restrict__ scales, long long n_blocks) {
     const long long b = ((long long) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -266,7 +218,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (stream == nullptr) cudaDeviceSynchronize();
 }
 
-/// See `quantize_q8_0_scaled_kernel`.  Writes the same 34-byte `block_q8_0` layout as `quantize_q8_0`, plus
+/// Writes the same 34-byte `block_q8_0` layout as `quantize_q8_0`, plus
 /// `scales[n/32]` carrying the fp32 `s` the CPU path used - so a hit can be computed with the CPU's
 /// multiplier instead of the block's fp16 `d`.  `scales` must not be null.
 void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_t n, void* stream) {
