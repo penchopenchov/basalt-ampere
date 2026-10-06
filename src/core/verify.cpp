@@ -144,7 +144,8 @@ int dec_pk_mask() {
 bool dec_pk() { return dec_pk_mask() != 0; }
 // STRATA_DEC_GLUE (bit mask): 1 = in windows of 2+ tokens with STRATA_DEC_PK & 4, no route launch on the main stream:
 // the hc read's router items write the FFN input's q8_1 rows, the gate/up launch builds CUDA0's plan itself
-// (dec_moe_glue: co-resident blocks, each plans once) and the ring's launch the tiers' kinds
+// (dec_moe_glue: co-resident blocks, each plans once) and the ring's launch the tiers' kinds; 2 = with 1, the ring's
+// work in one more block of that launch (no ring launch beside)
 int dec_glue_mask() {
     static const int m = [] { const char* e = std::getenv("STRATA_DEC_GLUE"); return e ? std::atoi(e) : 0; }();
     return m;
@@ -993,6 +994,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork[2] = {false, false};   // STRATA_DEC_PK & 4: the group's ring stream is joined in post
     bool glue_on[2] = {false, false};     // STRATA_DEC_GLUE & 1: post's gate/up launch plans the group's VRAM share
+    DmRouteArgs glue_ring[2];             // STRATA_DEC_GLUE & 2: the ring's work for post's gate/up launch
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
@@ -1542,7 +1544,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             static const int peer_cap = [] { const char* v = std::getenv("STRATA_PEER_CAP"); return v ? std::atoi(v) : 0; }();
             ra.peer_cap = peer_cap;
             PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
-            if (pk_ring) {   // the ring beside, CUDA0's plan and rows here
+            if (glue_on[grp] && (dec_glue_mask() & 2)) {   // the ring's work inside post's gate/up launch
+                glue_ring[grp] = ra;
+                glue_ring[grp].mode = 2; glue_ring[grp].kinds = true;
+                ring_fork[grp] = false;
+            } else if (pk_ring) {   // the ring beside, CUDA0's plan and rows here
                 cudaEventRecord(ev_ring_, cs);
                 cudaStreamWaitEvent(ring_hi_, ev_ring_, 0);
                 DmRouteArgs rp = ra;
@@ -1692,6 +1698,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 ga.ids = ids_ + tb * K; ga.ptab = dm_->ptab0 + l * g.n_expert;
                 ga.n_tok = n; ga.k = (int) K; ga.n_expert = (int) g.n_expert;
                 ga.plan = P; ga.xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
+                if (dec_glue_mask() & 2) { ga.ring_on = true; ga.ring = glue_ring[grp]; }
                 dec_moe_glue(L, ga, hit_scratch_, parts_out, (int) cap, cs);
             } else if (dm_->vram >= 0)
                 dec_moe_vram(L, P, nat_xq_ + (size_t) tb * (N / 32) * 36, dm_->vscr, parts_out, dm_->vsync, cs, dm_->vram,

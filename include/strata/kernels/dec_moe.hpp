@@ -82,6 +82,10 @@ struct DmGlueArgs {
     int n_tok = 0, k = 0, n_expert = 0;
     DmPlan* plan = nullptr;
     const void* xq = nullptr;                    ///< device: n_tok q8_1 rows
+    /// STRATA_DEC_GLUE & 2: one more block does the ring's work (`ring`, mode 2 with kinds; the mapped q8_1 rows
+    /// copied from xq) instead of a route launch
+    bool ring_on = false;
+    DmRouteArgs ring;
 };
 /// Whether dec_moe_glue covers L (the STRATA_DEC_GU2=2 chain's formats and settings).
 bool dec_moe_glue_ok(const NativeExpertLayout& L);

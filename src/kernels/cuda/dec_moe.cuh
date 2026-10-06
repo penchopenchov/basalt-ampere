@@ -258,6 +258,84 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
 }
 
 // ---------------------------------------------------------------- STRATA_DEC_GLUE & 1: the route inside gate/up
+// STRATA_DEC_GLUE & 2: dm_route_kernel's mode 2 (with kinds) in one block, the mapped q8_1 rows copied from `xq` (the
+// same q8_1_store bits); called after the block's pdl_wait
+__device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
+    __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap];
+    __shared__ int32_t r_ncpu, r_npeer, r_nvram;
+    const int n = a.n_tok * a.k;
+    if (tid == 0) { r_ncpu = 0; r_npeer = 0; r_nvram = 0; }
+    if (tid < n) r_ids[tid] = __ldcg(a.ids + tid);
+    __syncthreads();
+    if (tid < n) {
+        const int32_t e = r_ids[tid];
+        bool ok = e >= 0 && e < a.n_expert;
+        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = r_ids[j] != e;
+        int kd = -1;
+        if (ok) {
+            if (a.res0[e] >= 0) kd = 0;
+            else if (a.res1 != nullptr && a.res1[e] >= 0) kd = 2;
+        }
+        r_kind[tid] = kd;
+    }
+    __syncthreads();
+    if (a.peer_cap > 0) {   // dm_route_kernel's cap: the peer's groups past peer_cap go to the CPU pool
+        int first = tid;
+        const bool pe = tid < n && r_kind[tid] == 2;
+        if (pe)
+            for (int j = 0; j < tid; ++j)
+                if (r_ids[j] == r_ids[tid] && r_kind[j] == 2) { first = j; break; }
+        if (tid < kDmCap) r_pf[tid] = pe && first == tid;
+        __syncthreads();
+        int rank = 0;
+        if (pe)
+            for (int j = 0; j < first; ++j) rank += r_pf[j];
+        __syncthreads();
+        if (pe && rank >= a.peer_cap) r_kind[tid] = -1;
+        __syncthreads();
+    }
+    if (tid < n) {
+        if (r_kind[tid] < 0) atomicAdd(&r_ncpu, 1);
+        else if (r_kind[tid] == 2) atomicAdd(&r_npeer, 1);
+        else atomicAdd(&r_nvram, 1);
+    }
+    __syncthreads();
+    if (tid < n) {
+        a.ring_m->ids[tid] = r_ids[tid];
+        a.ring_m->kind[tid] = r_kind[tid];
+        if (a.kinds) a.plan->kind[tid] = r_kind[tid];
+    }
+    if (tid == 0) {
+        DmRing* r = a.ring_m;
+        r->n_tok = a.n_tok;
+        r->layer = a.layer;
+        r->n_vram = r_nvram;
+        r->n_peer = r_npeer;
+        r->n_cpu = r_ncpu;
+        if (a.kinds) {
+            a.plan->counts[2] = r_npeer;
+            a.plan->counts[3] = r_ncpu;
+        }
+    }
+    if (r_npeer > 0) {   // the q8_1 rows, 16 bytes at a time (a row is n_embd / 32 blocks of 36 bytes)
+        const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;
+        for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
+    }
+    if (r_ncpu > 0) {
+        const int n4 = a.n_tok * a.n_embd / 4;
+        for (int i = tid; i < n4; i += blockDim.x) ((float4*) a.x_m)[i] = __ldcg((const float4*) a.x + i);
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        if (a.stats != nullptr) a.stats[0] = dm_clock();
+        __threadfence_system();
+        *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_npeer > 0 ? 1u << 28 : 0u);
+        *(volatile uint32_t*) a.host_seq_m = a.ring;
+        __threadfence_system();
+    }
+}
+
 // native_gu2_kernel's rows with the VRAM plan built in the block (dm_route_kernel's kinds and dm_group for the VRAM
 // tier: an entry is CUDA0's when its id is valid, not repeated within its token and ptab holds its blob).  The blocks
 // are co-resident and loop over native_gu2_kernel's (row block, group row) items, gy group rows, so each plans once.
@@ -272,6 +350,16 @@ __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExp
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     const bool lead = blockIdx.x == 0;
     if (!lead) pdl_trigger();   // the lead block lets the SwiGLU and down launches start once the plan is out
+    const int nwork = (int) gridDim.x - (a.ring_on ? 1 : 0);
+    if (a.ring_on && (int) blockIdx.x == nwork) {   // the ring's block
+        if (tid < 32 && tid * 32 < a.n_expert) {   // the layer's residency rows into L2
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res0 + tid * 32));
+            if (a.ring.res1 != nullptr) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res1 + tid * 32));
+        }
+        pdl_wait();
+        dm_glue_ring(a.ring, a.xq, tid);
+        return;
+    }
     const uint32_t* s_grid = gu2::stage_grid<TG>(s_grid_buf, tid);
     if (tid == 0 && (int) blockIdx.x * 16 < a.n_expert)   // the layer's table into L2
         asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + blockIdx.x * 16));
@@ -313,7 +401,7 @@ __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExp
     const int warp = tid >> 5, lane = tid & 31, nx = (int) (2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS;
     const int items = nx * min(gy, ng);
     const auto* xq = (const block_q8_1*) a.xq;
-    for (int it = blockIdx.x; it < items; it += gridDim.x) {
+    for (int it = blockIdx.x; it < items; it += nwork) {
         const int bx = it % nx, by = it / nx;
         const int row = bx * GU2_ROWS + 2 * warp;   // rows row, row + 1: both gate or both up
         if (row >= 2 * L.n_ff) continue;
@@ -1460,7 +1548,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratc
     const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * gy;
     static const int blocks_env = [] { const char* v = std::getenv("STRATA_DEC_GLUE_BLOCKS"); return v ? std::atoi(v) : 0; }();
     auto go = [&](auto kernel, int resident) {
-        const int nb = std::max(1, std::min(items, blocks_env > 0 ? blocks_env : resident));
+        const int nb = std::max(1, std::min(items, blocks_env > 0 ? blocks_env : resident)) + (a.ring_on ? 1 : 0);
         launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, gy);
     };
     switch (L.gu_type) {

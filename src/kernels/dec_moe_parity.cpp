@@ -732,6 +732,38 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < n; ++i) if (kind[i] == 0) rows.push_back(i);
                 std::snprintf(what, sizeof what, "glue rows T=%d (%d groups)", T, P.counts[0]);
                 report(what, l, ndiff_rows(a4, b4, rows), rows.size() * H);
+                {   // the ring's work in the launch: the ring, the mapped rows, the words and the kinds as route's
+                    const std::vector<uint8_t> ring0((const uint8_t*) (h_rings + 5), (const uint8_t*) (h_rings + 6));
+                    const std::vector<uint8_t> xm0((const uint8_t*) (h_x + (size_t) 5 * MT * H),
+                                                   (const uint8_t*) (h_x + (size_t) 5 * MT * H + (size_t) T * H));
+                    const size_t nq = (size_t) T * H / 32 * 36;
+                    const std::vector<uint8_t> xqm0(h_xq + 5 * xq_stride, h_xq + 5 * xq_stride + nq);
+                    std::memset(h_rings + 5, 0, sizeof(K::DmRing));
+                    std::memset(h_x + (size_t) 5 * MT * H, 0, (size_t) T * H * 4);
+                    std::memset(h_xq + 5 * xq_stride, 0, nq);
+                    h_words[0] = h_words[16] = 0;
+                    ck(cudaMemset(d_plan, 0xee, sizeof(K::DmPlan)), "memset");
+                    ck(cudaMemsetAsync(d_p4, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
+                    K::DmGlueArgs gr = ga;
+                    gr.ring_on = true; gr.ring = r2;
+                    K::dec_moe_glue(L, gr, dv[0].scr, d_p4, n, s0);
+                    ck(cudaStreamSynchronize(s0), "glue ring");
+                    K::DmPlan P3;
+                    ck(cudaMemcpy(&P3, d_plan, sizeof P3, cudaMemcpyDeviceToHost), "plan");
+                    size_t bad4 = std::memcmp(P.counts, P3.counts, sizeof P.counts) != 0;
+                    for (int g = 0; g <= P.counts[0]; ++g) bad4 += P.start[g] != P3.start[g] || (g < P.counts[0] && P.ptr[g] != P3.ptr[g]);
+                    for (int e = 0; e < P.counts[1]; ++e) bad4 += P.dst[e] != P3.dst[e] || P.tok[e] != P3.tok[e];
+                    for (int i = 0; i < n; ++i) bad4 += P.kind[i] != P3.kind[i];
+                    bad4 += std::memcmp(ring0.data(), h_rings + 5, ring0.size()) != 0;
+                    if (nc > 0) bad4 += std::memcmp(xm0.data(), h_x + (size_t) 5 * MT * H, xm0.size()) != 0;
+                    if (np > 0) bad4 += std::memcmp(xqm0.data(), h_xq + 5 * xq_stride, nq) != 0;
+                    bad4 += h_words[0] != 6 || (h_words[16] & 0xffffu) != 6;
+                    std::snprintf(what, sizeof what, "glue ring T=%d", T);
+                    report(what, l, bad4, (size_t) n);
+                    const auto c4 = down(d_p4, (size_t) n * H);
+                    std::snprintf(what, sizeof what, "glue ring rows T=%d", T);
+                    report(what, l, ndiff_rows(a4, c4, rows), rows.size() * H);
+                }
                 if (bench) {
                     const double ug = time_us(s0, 200, [&] { K::dec_moe_glue(L, ga, dv[0].scr, d_p4, n, s0); });
                     const double ur = time_us(s0, 200, [&] {
