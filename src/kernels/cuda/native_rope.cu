@@ -40,8 +40,8 @@ bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
     return x <= y ? y - x < an : x - y < bn;
 }
 // TAB: the angles from the session's float64 table.  The host launches <false> whenever
-// no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
-// with it merely skipped at run time, the compiled default path changed its results).
+// no table applies - the default - so the default kernel does not contain the table read (merely skipping it at run time
+// would change the compiled default path's results).
 template <bool TAB>
 __global__ void apply(const float* x, float* out, int rows, int width,
                       int n_rot, float theta_scale, float freq_scale, float corr_low, float corr_high,
@@ -80,7 +80,7 @@ int mrope_dev() {
 void mrope_table_set(const int32_t* device_table) { mrope_tab[mrope_dev()].store(device_table, std::memory_order_relaxed); }
 const int32_t* mrope_table() { return mrope_tab[mrope_dev()].load(std::memory_order_relaxed); }
 namespace {
-// #280: the float64 angle table of each device, set at session init (before any graph is captured)
+// The float64 angle table of each device, set at session init (before any graph is captured)
 struct RopeReg {
     RopeTab tab;
     RopeScaling scaling;

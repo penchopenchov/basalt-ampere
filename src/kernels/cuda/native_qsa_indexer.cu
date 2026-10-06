@@ -1,5 +1,5 @@
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
-// src/models/qwen4exp.cpp; ggml/src/ggml-cuda/{set-rows.cu,norm.cu,rope.cu}.
+// the qwen4exp graph; ggml/src/ggml-cuda/{set-rows.cu,norm.cu,rope.cu}.
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -40,8 +40,8 @@ __device__ float warp_sum(float x) {
     return x;
 }
 // TAB: the angles from the session's float64 table.  The host launches <false> whenever
-// no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
-// with it merely skipped at run time, the compiled default path changed its results).
+// no table applies - the default - so the default kernel does not contain the table read (merely skipping it at run time
+// would change the compiled default path's results).
 template <bool TAB>
 __device__ __forceinline__ void append_one(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_base, const float* __restrict__ gamma, float epsilon,

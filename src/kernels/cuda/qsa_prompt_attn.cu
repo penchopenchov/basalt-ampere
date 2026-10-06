@@ -26,11 +26,7 @@ constexpr int CH = D1_CH;         // cells per chunk
 constexpr int THREADS = 128;      // 4 warps: scores by cell (8 each), p.v by dimension (64 each = one int8 scale group)
 constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free fragment loads)
 
-// m16n8k16 with f16 inputs needs sm_80.  Turing (sm_75) has m16n8k8 with the SAME A/B/C register mapping, so the
-// k=16 step is two k=8 steps on the fragments as they are already laid out: a[0]/a[1] are rows gid/gid+8 at k columns
-// 2*tig..2*tig+1 (b[0]'s k rows), a[2]/a[3] the same rows at k columns 2*tig+8..2*tig+9 (b[1]'s k rows).  The
-// products then add into the same FP32 C registers in the order hi-part-0, hi-part-1, which is the order the k16
-// instruction accumulates in as well - but the sum now rounds twice, so the two paths do not agree bit for bit.
+// m16n8k16 with f16 inputs and FP32 accumulation.
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
@@ -52,7 +48,8 @@ __device__ __forceinline__ uint32_t pack_h2(float lo_k, float hi_k) {   // eleme
     return *reinterpret_cast<uint32_t*>(&h);
 }
 
-// KV_MODE 1: int8 codes + fp16 scale per 64 values. KV_MODE 0: fp16 values (scales 1).
+// KV_MODE 1: int8 codes + fp16 scale per 64 values (served by `prompt_attn_i8_kernel`, not instantiated from
+// this template). KV_MODE 0: fp16 values (scales 1).
 // KV_MODE 3 (hybrid K8V4): K as mode 1, V as mode 0 - the row's q4_0 blocks are dequantized to fp16 at
 // gather, so everything downstream of the load is the mode-0 V path; the caller un-rotates the output.
 // KV_MODE 4 (Q4_0 K and V, `--kv q4_0`): mode 1 with a scale per 32 values - each q4_0 block's codes enter as exact

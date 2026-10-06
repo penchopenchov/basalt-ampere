@@ -1,4 +1,4 @@
-// src/kernels/cuda/gdn.cu - P2.S2: the gated delta-net's non-projection parts.
+// src/kernels/cuda/gdn.cu - the gated delta-net's non-projection parts.
 //
 // See include/basalt/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.
@@ -112,7 +112,7 @@ __global__ void gdn_conv_kernel(float* __restrict__ cs, const float* __restrict_
 
 /// `build_gdn_l2_norm`, one warp per row: x / sqrt(sum(x^2) + eps) over the last axis.
 ///
-/// The sum is accumulated in DOUBLE, as `ref/gdn.py` does (`l2_norm(q.astype(np.float64), eps)`), because the
+/// The sum is accumulated in DOUBLE, as the Python reference does (`l2_norm(q.astype(np.float64), eps)`), because the
 /// reference deliberately computes this one in float64 and then casts - so matching its precision is part of
 /// transcribing it.
 __global__ void gdn_l2_kernel(float* __restrict__ x, int cols, float eps) {
@@ -204,16 +204,14 @@ void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream) 
 
 /// `beta = sigmoid(beta)`, in place, over the `h_v` per-head scalars.
 ///
-/// **THIS IS `build_layer_attn_linear` L889, AND LEAVING IT OUT WAS THE C1 BUG.**  The reference computes
+/// **THIS IS `build_layer_attn_linear`'s SIGMOID, AND LEAVING IT OUT IS WRONG.**  The reference computes
 /// `beta = ggml_sigmoid(ssm_beta @ cur)` and hands the RESULT to the delta net; `gdn_step_kernel` is documented
 /// as `d[h,j] = (v[h,j] - sk[h,j]) * beta[h]` and applies no sigmoid of its own, so the layer glue owes it one.
-/// The engine passed the raw pre-activation, which is unbounded and signed - the delta-net write strength then
-/// stops being a fraction and the whole recurrence is wrong from layer 0.
+/// Passing the raw pre-activation, which is unbounded and signed, makes the delta-net write strength stop being
+/// a fraction and the whole recurrence wrong from layer 0.
 ///
-/// **IT SURVIVED `gdn_parity` BECAUSE THAT TEST SUPPLIES ITS OWN `beta`.**  The kernel was always right; only
-/// the glue between the projection and the kernel was wrong, and `ref/gdn.py` (`beta = sigmoid(wbeta @ x)`) and
-/// `ref/model.py` (`beta = G.sigmoid(proj(...))`) both get it right - so the two transcriptions agreed with
-/// each other and neither was ever compared against the C++ that actually runs.
+/// **`gdn_parity` CANNOT SEE IT, BECAUSE THAT TEST SUPPLIES ITS OWN `beta`.**  The step kernel is right; the
+/// glue between the projection and the kernel is what owes the sigmoid, so the layer-level parity test is the check.
 __global__ void gdn_beta_gate_kernel(float* __restrict__ beta, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) beta[i] = sigmoid_f(beta[i]);

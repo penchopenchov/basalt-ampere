@@ -1,8 +1,6 @@
-// src/kernels/cpu/expert.cpp - P2.S3: the Q2_0 expert kernel, promoted from bench/micro/cpu_s2.cpp.
+// src/kernels/cpu/expert.cpp - the Q2_0 expert kernel.
 //
-// The body is the validated kernel, moved rather than rewritten: it carries the P0.T2 parity result
-// (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
-// include/basalt/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
+// See include/basalt/kernels/cpu/expert.hpp first; it says why each piece is shaped this way.
 #include "basalt/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
@@ -110,10 +108,8 @@ void quantize_oracle_q8_0(const float* x, int n, ActQ& a) {
 
 /// 2-bit unpack via VPMULTISHIFTQB.
 ///
-/// ARGUMENT ORDER IS (control, data) AND WAS DETERMINED EMPIRICALLY (`bench/micro/probe_multishift.cpp`).
-/// The Intel guide states (a=data, b=control); using that produced 43 of 64 wrong codes.  `plan.md`'s sketch
-/// passes the shift pattern first, which is correct - so a "fix" that swapped it to match the guide was the
-/// bug, not the fix.  Within each 64-bit lane, output byte i is `(u16 >> 2i) & 0xFF`, so AND 3 yields the
+/// ARGUMENT ORDER IS (control, data), determined empirically: the Intel guide states
+/// (a=data, b=control), and following it produces wrong codes.  Within each 64-bit lane, output byte i is `(u16 >> 2i) & 0xFF`, so AND 3 yields the
 /// eight 2-bit codes in order.
 ///
 /// The result is the 32 codes of ONE ACTIVATION CHUNK (4 qword lanes), which is the unit the Q8_1 scale is
@@ -501,7 +497,7 @@ void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n
     }
 }
 
-// ================================ plan v0.3 P6: Q2_0 rows in the GGUF block layout ================================
+// ================================ Q2_0 rows in the GGUF block layout ================================
 //
 // The IQ model files keep their down projections in Q2_0 GGUF blocks (fp16 d, then 16 code bytes: 18 bytes per
 // 64 weights, interleaved), which ggml-cpu computes with a scalar loop on x86.  This is `row_dot_multi_z` with
@@ -581,14 +577,11 @@ void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_toke
 }
 
 void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool quant_acts) {
-    // BOTH STAGES, which is what `quant_acts` promises and what `bench/micro/cpu_s2.cpp` does NOT do.
-    //
-    // The original's comment says the oracle "consume[s] the SAME INT8 activation values the VNNI path uses,
-    // at both stages", but its code quantizes only the INTERMEDIATE - the gate/up projections still see raw
-    // f32 `x`.  Feeding it an already-quantized input (which is what the engine does) makes the two coincide
-    // and hides the discrepancy entirely; feeding it a raw f32 input makes the comparison one between two
-    // DIFFERENT computations, and the gap measured here was 1.19e-02 - three times P2.S3's tolerance, and
-    // read as a kernel bug when it was a fixture bug.
+    // BOTH STAGES, which is what `quant_acts` promises: the oracle consumes the SAME INT8 activation values
+    // the VNNI path uses, at the gate/up projections and at the intermediate.  Leaving the gate/up projections on
+    // raw f32 `x` coincides when the caller passes an already-quantized input (as the engine does) and hides the
+    // discrepancy; with a raw f32 input the comparison is between two DIFFERENT computations and reads as a
+    // kernel bug.
     float xq[H];
     const float* x = x_in;
     if (quant_acts) {

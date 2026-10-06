@@ -1,10 +1,10 @@
-// src/kernels/cpu/expert_parity.cpp - P2.S3's test for the CPU expert path.
+// src/kernels/cpu/expert_parity.cpp - test for the CPU expert path.
 //
 // WHAT IS BEING CHECKED, and the two tolerances are different questions:
 //
 //   1. VNNI vs the scalar oracle with `quant_acts = true`.  Both sides consume the SAME INT8 activation
 //      values, so the only difference is FP32 evaluation ORDER.  This is the check that proves the KERNEL -
-//      the VNNI unpack, the 32-element chunk split, the scalar correction term - and P2.S3 asks for 3e-3.
+//      the VNNI unpack, the 32-element chunk split, the scalar correction term - and the tolerance is 3e-3.
 //   2. VNNI vs the oracle with `quant_acts = false`.  Now the oracle uses exact FP32 activations, so the gap
 //      IS the activation contract.  It is REPORTED, not asserted tightly,
 //      because it is a property of the model's quantisation and not of this code.
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
                 feat.usable() ? "all present" : feat.reason());
     if (!feat.usable()) {
         std::printf("      the VNNI path cannot run here; only the scalar oracle can be exercised.\n");
-        std::printf("      P2.S3's kernel check is SKIPPED, not passed.\n");
+        std::printf("      the kernel check is SKIPPED, not passed.\n");
         std::printf("\nexpert_parity: 0 failures, 1 SKIPPED\n");
         return 0;
     }
@@ -165,9 +165,9 @@ int main(int argc, char** argv) {
     }
 
     // ---- 1. the kernel, against an oracle fed the SAME activations
-    std::printf("  %-44s rel %.3e   (P2.S3 asks <= 3e-3, mean |ref| %.4f)\n", "VNNI vs scalar (INT8 acts)",
+    std::printf("  %-44s rel %.3e   (tolerance <= 3e-3, mean |ref| %.4f)\n", "VNNI vs scalar (INT8 acts)",
                 rel_kernel, mag);
-    if (!(rel_kernel <= 3e-3)) { std::printf("    *** over P2.S3's 3e-3 ***\n"); ++bad; }
+    if (!(rel_kernel <= 3e-3)) { std::printf("    *** over the 3e-3 tolerance ***\n"); ++bad; }
 
     // ---- 2. the activation contract's own cost, reported rather than asserted
     std::printf("  %-44s rel %.3e   (the cost of the contract, REPORTED)\n",

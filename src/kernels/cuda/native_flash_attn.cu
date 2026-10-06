@@ -122,7 +122,7 @@ __global__ void attend(const float* __restrict__ q, const half* __restrict__ k,
                     const int d = 2 * (i + j);
                     const float a = cell < width ? __half2float(v[(cell * 2 + kv) * 256 + d]) : 0.0f;
                     const float b = cell < width ? __half2float(v[(cell * 2 + kv) * 256 + d + 1]) : 0.0f;
-                    // The pinned sm120a binary contracts the old-accumulator
+                    // The pinned reference binary contracts the old-accumulator
                     // rescale with the FIRST addition: fma(rescale,old,round(V*w)).
                     // Later columns use fma(V,w,acc). Explicit intrinsics retain
                     // that order despite this adapter's masked-load branches.

@@ -117,7 +117,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         return topo;
     }
 
-    // Hybrid CPU on Linux:
+    // Hybrid CPU:
     std::vector<int> p_primaries;
     std::vector<int> p_siblings;
     std::vector<int> e_cores;

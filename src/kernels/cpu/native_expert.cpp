@@ -1,4 +1,4 @@
-// src/kernels/cpu/native_expert.cpp - plan v0.3 P6: native (GGUF-form) experts on the CPU through ggml-cpu.
+// src/kernels/cpu/native_expert.cpp - native (GGUF-form) experts on the CPU through ggml-cpu.
 // See the header.  Nothing here is the engine's own arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
 #include "basalt/kernels/cpu/native_expert.hpp"
@@ -92,7 +92,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     static const bool avx2 = cpu_avx2_ok();
     // The multi-token kernels run for every group size, so a token's expert rows round the same alone as in a
     // group and greedy output does not depend on how many drafts a verify window held.
-    // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
+    // A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
     // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
     static const bool cpu512 = cpu_avx512_ok();

@@ -1,9 +1,9 @@
-// src/kernels/cuda/ple.cu - P2.S4: the PLE block's GPU half.
+// src/kernels/cuda/ple.cu - the PLE block's GPU half.
 //
 // See include/basalt/kernels/ple.hpp for the structure and for the `normalized`-is-the-conv-input finding.
 //
 // The legacy arithmetic below follows the captured CPU ggml graph
-// (`bench/micro/ple_in.bin` / `ple_out.bin`, produced by `ple_layer_xcheck.cpp`):
+// (captured input and output vectors):
 //
 //   * `rms_norm` accumulates `(double)(x*x)` with the PRODUCT rounded in f32 first - that is literally what
 //     `ggml_compute_forward_rms_norm_f32` does (`sum += (ggml_float)(x[i00]*x[i00])` with `ggml_float` =
@@ -142,7 +142,7 @@ __global__ void bcast_kernel(const float* __restrict__ value, const float* __res
 /// That is why no `terms` buffer is built: three taps come from the caller's history and one from `norm`.
 ///
 /// `kW` IS GGML-NATIVE: `kW[k + kern*c]`.  The manifest's shape is [4, 10240] with ne0 = 4 fast, and
-/// `ref/ngram.py`'s (4, 10240) numpy `kernel[k][c]` is the TRANSPOSE of that.  The source's own view
+/// the Python reference's (4, 10240) numpy `kernel[k][c]` is the TRANSPOSE of that.  The source's own view
 /// (`ggml_view_2d(model.layers[il].ple_conv1d, 1, hc_dim, nb[1], k*nb[0])`) settles which one is meant.
 __global__ void conv_kernel(const float* __restrict__ hist, const float* __restrict__ norm,
                             const uint16_t* __restrict__ kW, float* __restrict__ out, int hc_dim, int kern,
@@ -155,7 +155,7 @@ __global__ void conv_kernel(const float* __restrict__ hist, const float* __restr
         // ROW-FASTEST: `hist[row + nhist*c]`.  The conv state is `ggml_reshape_3d(state, d_conv-1,
         // conv_channels, n_seqs)`, so ne0 = hist varies fastest and the flat index is row + hist*channel.
         // Channel-slowest (`row*hc_dim + c`) is the natural thing to write and would read a transposed state -
-        // `ple_layer_xcheck.cpp` L79-83 records getting this wrong once already.
+        // getting this wrong fails ggml's own assert.
         const float v = (row == nhist) ? norm[c] : hist[(size_t) row + (size_t) nhist * c];
         acc += f32_from_f16(kW[k + kern * c]) * v;
     }
@@ -239,22 +239,11 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     const size_t float_bytes = (size_t) (5 * hc_dim + n_embd + hc) * sizeof(float);
     cudaStream_t st = (cudaStream_t) stream;
 
-    // One allocation for every intermediate.
-    //
-    // THE ENGINE WILL NOT DO THIS.  P2.T10 requires zero token-path allocations, and the fix is the same one
-    // `gr_read` already uses: a caller-owned workspace carved once at startup.  It is done this way here
-    // because this function's job in P2.S4 is to be CORRECT and comparable against the oracle, and matching
-    // `shared_expert.cu`'s existing shape keeps the diff small.  Recorded rather than hidden.
-    //
     // FIVE SEPARATE hc_dim BUFFERS, deliberately.  `key` and `normalized` are both needed at the end for the
-    // oracle comparison, so aliasing one onto the other - which the first version did - silently returns the
-    // WRONG `key`.  Two buffers of the same size look like an obvious saving and the only thing it saves is
+    // oracle comparison, so aliasing one onto the other would silently return the WRONG `key`.  Two buffers of the same size look like an obvious saving and the only thing it saves is
     // 40 KB.
-    // **THE WORKSPACE IS CARVED FROM THE CALLER'S, NOT ALLOCATED.**  Three `cudaMalloc`s and a
-    // `cudaStreamSynchronize` used to live here, and inside a stream capture both are errors: the engine
-    // reported `ple_block: scratch: operation not permitted when stream is capturing`, and a token-path
-    // allocation is a P2.T10 violation besides.  The comment this replaces already said the right shape was
-    // "a caller-owned workspace carved once at startup"; this is that.
+    // **THE WORKSPACE IS CARVED FROM THE CALLER'S, NOT ALLOCATED**: allocation and synchronization are errors
+    // inside a stream capture, and the token path makes no allocations.
     const size_t q8_bytes = (size_t) (n_embd / 32) * 34;
     if (scratch == nullptr) {
         std::fprintf(stderr, "ple_block: scratch is null; the caller owns it (see ple_block_scratch_bytes)\n");

@@ -1,4 +1,4 @@
-// src/kernels/cuda/elementwise.cu - P2.S5's glue kernels.  See the header for why each exists.
+// src/kernels/cuda/elementwise.cu - the glue kernels.  See the header for why each exists.
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/dp4a.hpp"
 
@@ -72,7 +72,7 @@ __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict
 __global__ void silu_kernel(float* __restrict__ x, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    // DOUBLE then cast, matching `ref/gdn.py`'s numpy: its arrays are f32 but `np.exp` on an f32 array is
+    // DOUBLE then cast, matching the Python reference's numpy: its arrays are f32 but `np.exp` on an f32 array is
     // computed to f32 precision by a different algorithm than `expf`, and the reference is the oracle.  The
     // difference is in the last bits and this is one line.
     const double v = (double) x[i];
@@ -101,7 +101,7 @@ __global__ void rms_norm_weighted_kernel(float* __restrict__ x, const float* __r
     float acc = 0.0f;
     for (int64_t c = lane; c < cols; c += 32) acc += r[c] * r[c];
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
-    // The MEAN, not the sum: `ref/qsa.py::rms_norm` divides by `np.mean(np.square(x))`.  Broadcasting the
+    // The MEAN, not the sum: the Python reference divides by `np.mean(np.square(x))`.  Broadcasting the
     // reciprocal from lane 0 keeps all 32 lanes on the same value - computing `rsqrt` per lane would be the
     // same number but a needless 32-way divergence in the last bit.
     float inv = 0.0f;
@@ -189,23 +189,19 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// doorbell_ring(d_seq, *(h_seq) + 1u) - and that is a CLONED LITERAL: the expression is evaluated on the HOST
 /// at CAPTURE time, so the graph rings 1 on every replay and a host waiting for a change waits forever.  It
 /// would have looked like a working doorbell on the first token, which is the worst way for it to be wrong.
-/// **THE FENCE IS NOT DECORATION, AND ITS ABSENCE WAS COSTING ~10 ms PER TOKEN ON THE HOST SIDE.**
+/// **THE FENCE IS NOT DECORATION.**
 ///
 /// The ring PUBLISHES three buffers the host is about to read - `h_x_f`, `h_ids`, `h_weights` - so the increment
 /// must be ordered after their writes, or the host can observe the ring and then read a payload that has not
 /// landed.  `__threadfence_system()` is what orders them, and it covers the HOST as well as the device, which is
 /// the whole point: the reader is the CPU.
 ///
-/// Without it the host loop was compensating with a driver call.  `session_loop` polled with `cudaEventQuery`
-/// on EVERY spin iteration, because round 195 had measured that a memory-only spin never saw the datum flip -
-/// and that measurement was right about the symptom and wrong about the cause.  The cause is this missing fence:
-/// the write was not ordered into host-visible memory, so no amount of reading it would show it, and the driver
-/// call was flushing the whole pipeline enough to make it appear.  A 10-22 us driver call per iteration is a
-/// very expensive substitute for one fence instruction.
+/// Without it a memory-only spin never sees the datum flip: the write is not ordered into host-visible memory,
+/// so no amount of reading it shows it, and only a driver call flushing the pipeline makes it appear.  The fence
+/// orders the write; `session_loop` still makes its per-iteration driver call.
 ///
-/// **THE STORE IS VOLATILE**, like `doorbell_publish_kernel`'s.  On RDNA4 (gfx1201) a plain store to mapped pinned
-/// memory stays in the GPU's L2 until the stream is synchronized - the host never saw the ring (tests/hip/handoff:
-/// 0 of 100 rings seen without a sync; volatile, a system-scope atomic store or a fence after the store: 100 of 100).
+/// **THE STORE IS VOLATILE**, like `doorbell_publish_kernel`'s.  A plain store to mapped pinned
+/// memory may stay in the GPU's L2 until the stream is synchronized, so the host would never see the ring.
 __global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
     *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
@@ -326,7 +322,7 @@ __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const i
     }
 }
 
-// #649 (HIP, DOORBELL_STORE=1): the same publish, but the ring is STORED (the step's own number, known at
+// The same publish, but the ring is STORED (the step's own number, known at
 // capture) instead of read-modify-written over PCIe - one store, no read of host memory from the GPU.
 __global__ void doorbell_publish_value_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                               const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,

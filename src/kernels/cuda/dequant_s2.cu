@@ -1,7 +1,7 @@
-// src/kernels/cuda/dequant_s2.cu - P2.S2's first naive kernel.
+// src/kernels/cuda/dequant_s2.cu - the naive S2 decode kernel.
 //
-// S2 is Q2_0's canonical form and 31.64 GiB of the artifact is Q2_0, so this is the single hottest decode in
-// the engine.  The canonical plane layout is the pack format: codes packed 4 per byte LSB-first
+// S2 is Q2_0's canonical form and most of the artifact is Q2_0, so this is the single hottest decode in
+// the engine.  The canonical plane layout is: codes packed 4 per byte LSB-first
 // (element i at byte i/4, bits (i%4)*2 - Q2_0's own convention, kept for every form) and one FP32 scale per
 // group (64 elements for S2).  The decode is `(code + code_bias) * scale` with `code_bias = -1`, the
 // subtraction inside the INTEGER domain, which is what makes it bit-exact.

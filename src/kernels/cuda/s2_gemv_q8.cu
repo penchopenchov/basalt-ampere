@@ -1,17 +1,15 @@
 // src/kernels/cuda/s2_gemv_q8.cu - the S2 GEMV that consumes Q8_0 ACTIVATIONS, as ggml does.
 //
-// THE GAP THIS CLOSES (round 186).  `ggml_mul_mat` converts src1 - the ACTIVATION - to the weight's
-// `vec_dot_type` before the dot product, and for Q2_0 that is Q8_0.  The CUDA kernels built in rounds 166-177
-// take FP16 activations instead, while the CPU expert path (`bench/micro/cpu_s2.cpp`) already quantizes to int8
-// and uses `vpdpbusd`.  Left that way the two paths compute different numbers for different experts of the SAME
-// token, and the measured size of the difference is the activation contract itself: 0.9498% relative, against
-// P2.S2's 1e-3 tolerance for FP16 paths.
+// THE GAP THIS CLOSES.  `ggml_mul_mat` converts src1 - the ACTIVATION - to the weight's
+// `vec_dot_type` before the dot product, and for Q2_0 that is Q8_0.  FP16-activation kernels would differ
+// from the CPU expert path, which quantizes to int8 and uses `vpdpbusd`, so the two paths would compute
+// different numbers for different experts of the SAME token; the size of the difference is the activation
+// contract itself, about 1% relative, far above the 1e-3 tolerance for FP16 paths.
 //
 // This is the CORRECTNESS version, not the fast one.  It dequantizes each activation (`xq * dx`) inside the
-// loop and does the same float arithmetic as `s2_gemv_quads`; the speed win available here is `__dp4a`, which
-// turns four int8 MACs into one instruction, and that belongs to Phase 3 once the numerics are settled.  The
-// phase's rule is the simplest correct kernel first, and a dp4a version whose numerics are wrong would be
-// indistinguishable from a fast one.
+// loop and does the same float arithmetic as the plain S2 kernels; the speed win available here is `__dp4a`, which
+// turns four int8 MACs into one instruction.  The simplest correct kernel comes first, because a dp4a version
+// whose numerics are wrong would be indistinguishable from a fast one.
 //
 // Layout: activations are (n_in/32) ggml Q8_0 blocks, 34 bytes each - `fp16 d` then `int8 qs[32]` - produced by
 // `basalt::kernels::quantize_q8_0`.  A quad of four elements lies inside one 32-element block, so the block

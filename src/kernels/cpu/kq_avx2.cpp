@@ -7,7 +7,7 @@
 // over blocks: everything that depends only on the weights (the 4-bit unpacking, the 6-bit scales and mins, the
 // fifth bits, the absolute values of the Q8_0 weights, the fp16 scales) is done once per block, and every token then
 // runs exactly ggml's integer chain and ggml's float operations in ggml's order - so each token's result is ggml's
-// to the bit (native_expert_parity checks it), whatever the number of tokens.  Unlike the i-quant kernels (#152)
+// to the bit (native_expert_parity checks it), whatever the number of tokens.  Unlike the i-quant kernels
 // the group size therefore never changes an answer.
 //
 // The gain is the weight-side work and the weight bytes, read once per verify window instead of once per token.

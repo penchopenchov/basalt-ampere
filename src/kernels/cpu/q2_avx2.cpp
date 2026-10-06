@@ -1,4 +1,4 @@
-// src/kernels/cpu/q2_avx2.cpp - plan v0.3 P6: the Q2_0 expert rows and the activation quantizer for CPUs
+// src/kernels/cpu/q2_avx2.cpp - the Q2_0 expert rows and the activation quantizer for CPUs
 // without AVX-512 (Intel Core 12th-14th gen and Core Ultra, AMD Zen 2/3).
 //
 // Compiled with AVX2 only, so nothing here can fault on those CPUs.  The arithmetic is the AVX-512 kernels':

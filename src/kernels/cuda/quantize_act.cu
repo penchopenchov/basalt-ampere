@@ -1,14 +1,13 @@
-// src/kernels/cuda/quantize_act.cu - P2.S2: quantize an activation the way ggml converts src1.
+// src/kernels/cuda/quantize_act.cu - quantize an activation the way ggml converts src1.
 //
 // WHY THIS EXISTS AT ALL.  `ggml_mul_mat` converts the ACTIVATION (src1) to the weight's `vec_dot_type`
-// before the dot product - the rule established over rounds 119-136 and written into `ref/quant.py` as
-// `apply_src1`.  The CPU expert path already honours it (`bench/micro/cpu_s2.cpp` quantizes to int8 and uses
-// `vpdpbusd`), and its P0.T2 parity passes at 1.461e-06.  The GPU kernels added in rounds 166-177 take FP16
-// activations instead.  **Left that way, the two paths would compute different numbers for different experts
+// before the dot product.  The CPU expert path already honours it (it quantizes to int8 and uses
+// `vpdpbusd`), while the GPU kernels that take FP16 activations do not.  **Left that way, the two paths would
+// compute different numbers for different experts
 // of the SAME token** - not a tolerance question, an inconsistency inside one forward pass.
 //
-// Q2_0 IS THE CASE THAT MATTERS: the routed experts are all Q2_0, `Q2_0 -> Q8_0`, and that is 31.64 GiB of the
-// 38 GiB pack.  Q8_K (for the K-quants and IQ4_XS) is the other half of the table and is not here yet.
+// Q2_0 IS THE CASE THAT MATTERS: the routed experts are all Q2_0, `Q2_0 -> Q8_0`, and that is most of the
+// model.  Q8_K (for the K-quants and IQ4_XS) is the other half of the table and is not here yet.
 //
 // THE THREE SUBTLETIES, each of which was paid for once already and is transcribed rather than recalled:
 //
@@ -35,13 +34,10 @@ namespace {
 
 constexpr int QK8_0 = 32;
 
-// THE fp16 CONVERSION LIVES IN `basalt/kernels/f16_bits.hpp`, and this file used to carry its own copy.
-//
-// Round 198 found the private copy wrong in a way no fixture here could see: it tested `if (exp >= 31)` to
-// detect an out-of-range exponent, which conflates an f32 INF/NAN (raw exponent 255) with a FINITE value too
-// large for fp16.  Every finite overflow - 1e30, 65536, 1e45 - came back as a NaN instead of saturating to
-// inf, and this file's fixture is O(1) throughout, so it passed.  A numpy-generated oracle caught it on its
-// first run.  Three copies of a converter whose failure mode is silent wrong bits was two copies too many.
+// THE fp16 CONVERSION LIVES IN `basalt/kernels/f16_bits.hpp`, one copy for every kernel: a private copy that
+// tests `if (exp >= 31)` to detect an out-of-range exponent conflates an f32 INF/NAN (raw exponent 255) with a
+// FINITE value too large for fp16, so every finite overflow - 1e30, 65536, 1e45 - comes back as a NaN instead of
+// saturating to inf, and an O(1) fixture cannot see it.
 
 
 __global__ void quantize_q8_0_kernel(const float* __restrict__ x, uint8_t* __restrict__ blocks,
@@ -124,7 +120,7 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, float* _
 constexpr int QK_K = 256;
 constexpr int Q8K_BYTES = 292;
 
-/// ggml's `nearest_int` (ggml-quants.c L621), transcribed rather than replaced.
+/// ggml's `nearest_int` (ggml-quants.c), transcribed rather than replaced.
 ///
 /// The magic number is 1.5 * 2^23: adding it forces the mantissa's integer part into the low bits, and the
 /// mask/subtract recover it.  The reason it is transcribed and not written as `rintf` is that the two differ

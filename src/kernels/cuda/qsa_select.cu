@@ -152,7 +152,7 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
 }
 
 
-// ---- QSA select on tensor cores (perf-review, after D-1): the block scores of many queries are one GEMM,
+// ---- QSA select on tensor cores the block scores of many queries are one GEMM,
 // rows (query, indexer head) x columns (blocks), K = 128, with relu per head summed. 3xTF32 (each operand split
 // into a TF32 hi and lo part, hi*hi + hi*lo + lo*hi) keeps FP32-level accuracy; the summation order differs from
 // the warp kernel, so a score can move in its last bits and a near-tie can select differently (not bitwise).
@@ -591,15 +591,15 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
     }
 }
 
-// ---- the decode top-k on a thread-block cluster (sm_90+; S19).  One CTA per query (block_topk_reg_kernel, or
+// ---- the decode top-k on a thread-block cluster (needs thread-block clusters).  One CTA per query (block_topk_reg_kernel, or
 // block_topk_kernel above 33,792 blocks: a --max-context over ~135K) makes four radix passes and two scans over up to
 // 65,538 blocks on ONE SM while the rest of the GPU idles - a decode window has 1-5 queries.  Here a cluster of CL_N
 // CTAs shares a query: CTA r holds the keys of blocks [r * per, (r + 1) * per) in shared memory, builds the digit
 // histogram of its keys, and PUSHES it into slot r of every CTA's `hin` (distributed shared memory); after one cluster
 // barrier each CTA sums the CL_N slots itself, so all of them take the same digit.  The emit pass needs each CTA's
 // cells above / at the threshold: pushed the same way, then each CTA offsets its own by the ranks before it.
-// RTX 5070, per call at capacity = context (decode_cluster_parity --bench): 21.9 -> 15.6 us at 32K, 58 -> 18 at 128K,
-// 200 -> 22 at 262K (the one-CTA kernels' digit search was serial, too: one thread over 256 bins per pass).
+// The one-CTA kernels' digit search is serial too: one thread over 256 bins per pass (decode_cluster_parity --bench
+// times both).
 //
 // IDENTICAL IDS, by construction rather than by luck: the threshold thr (the width-th largest key, cells counted with
 // their weights) and `above` (cells with a larger key) are pure functions of the multiset of (key, weight) - integer
@@ -842,7 +842,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
     if (nq <= 0) return true;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535 * TC_QT) return false;
-    {   // sm_80 or newer (TF32 MMA); an older card keeps the warp kernel
+    {   // TF32 MMA needs a recent card; an older one keeps the warp kernel
         static int cc_major[64] = {};
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -896,7 +896,7 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
     if (nq <= 0) return true;
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || nq > 65535 || max_blocks <= 0) return false;
     const size_t smem = (size_t) ((max_blocks + CL_N - 1) / CL_N) * sizeof(uint32_t);
-    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not. It needs sm_90+ (the
+    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not. It needs thread-block clusters (the
     // card's) AND code built for it: a build with only older code JIT-compiles their PTX, whose
     // copy of this kernel is a trap - the function's PTX version says which. `opt`: the dynamic shared memory opted in.
     static int ok[64] = {};

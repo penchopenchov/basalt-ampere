@@ -12,7 +12,7 @@
 // **THE SUMMATION ORDER IS NOT THE CPU's AND CANNOT BE.**  Lane `L` takes chunks `L, L+32, ...` and the
 // partials are reduced through shuffle; the CPU walks every chunk in order with its own accumulator shape.
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
-// the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
+// the same reason.  `moe_hit_parity` is the check.
 #include "basalt/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/dp4a.hpp"
 
@@ -55,12 +55,11 @@ __device__ __forceinline__ float f16_at(const uint8_t* p) {
 ///
 /// Returns the lane's partial.  `codes` is `n_in/4` bytes and `scales` `n_in/QK` fp16, both for THIS row.
 ///
-/// **`x_scales` IS R4.2h AND IT IS OPTIONAL ON PURPOSE.**  When it is non-null the activation's multiplier
+/// **`x_scales` IS OPTIONAL ON PURPOSE.**  When it is non-null the activation's multiplier
 /// comes from an fp32 array instead of the block's fp16 `d`.  The CPU pool multiplies by the fp32
-/// `ActQ::scale` (`cpu/expert.cpp:92`), and the two disagreed by **4.761e-04 relative on 80 of 80 chunks**
-/// (`bench/micro/act_quant_parity.cu`), which is what made a cache hit compute a different expert from a
-/// cache miss.  Null keeps the previous fp16 behaviour **exactly**, so `moe_hit_parity` - which passes no
-/// scales - still measures the kernel it always measured.
+/// `ActQ::scale`, and the two differ by up to 2^-11 relative per chunk, which would make a cache hit compute
+/// a different expert from a cache miss.  Null uses the fp16 `d`, so `moe_hit_parity` - which passes no
+/// scales - measures that kernel.
 __device__ __forceinline__ float row_dot_s2_q8(const uint8_t* __restrict__ codes,
                                                const uint8_t* __restrict__ scales,
                                                const uint8_t* __restrict__ x_q8_0, int n_chunks, int lane,
@@ -110,12 +109,12 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 /// GATE AND UP, ONE WARP PER ROW.
 ///
-/// **THE ROWS ARE INTERLEAVED AND THE FIRST VERSION OF THIS GOT IT WRONG.**  In the blob, row-SLOT `i` of the
+/// **THE ROWS ARE INTERLEAVED, AND GETTING IT WRONG IS SILENT.**  In the blob, row-SLOT `i` of the
 /// `2*FF` gate/up rows is gate row `i/2` when `i` is even and up row `(i-1)/2` when it is odd - that is what
-/// `O_GU_CODES + (2r)*ROW_GU` and `+ (2r+1)*ROW_GU` mean in `expert.cpp`.  This kernel decoded the correct
-/// code row for slot `i` and then wrote it to output slot `i` of a layout whose first `FF` entries are gate and
-/// whose last `FF` are up, which pairs `silu(gate[r]) * up[r]` with the WRONG `up` for every `r`.  It produced
-/// finite, plausible numbers.  `moe_hit_parity` caught it on the first run, at worst relative error 2.2e+03.
+/// `O_GU_CODES + (2r)*ROW_GU` and `+ (2r+1)*ROW_GU` mean in `expert.cpp`.  Decoding the correct
+/// code row for slot `i` and writing it to output slot `i` of a layout whose first `FF` entries are gate and
+/// whose last `FF` are up would pair `silu(gate[r]) * up[r]` with the WRONG `up` for every `r`, with finite,
+/// plausible numbers.  `moe_hit_parity` catches it.
 ///
 /// So slot `i` is DECODED from row-slot `i` and WRITTEN to the output slot its parity says it belongs to.
 __global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
@@ -134,7 +133,7 @@ __global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* 
     const int lane = threadIdx.x & 31;
 
     const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
-    if (tok_div > 0) {   // plan v0.3 P6 verify window: each hit reads its own token's activation
+    if (tok_div > 0) {   // verify window: each hit reads its own token's activation
         const int tok = dst_index[h] / tok_div;
         x_q8_0 += (size_t) tok * (size_t) (H / 32) * 34;
         if (x_scales != nullptr) x_scales += (size_t) tok * (size_t) (H / 32);
@@ -476,8 +475,8 @@ void check(const char* who, void* stream) {
         std::exit(1);
     }
     // Deliberately NOT synchronising for a non-null stream: this is called once per layer from a captured
-    // graph's worth of work, and `finish()`'s null-stream sync in `s_gemv.cu` is the pattern that made a whole
-    // round of measurements the driver's cost instead of the kernel's (Memory/ERRORS.md RC-7).
+    // graph's worth of work, and `finish()`'s null-stream sync in `s_gemv.cu` would turn timings
+    // into the driver's cost instead of the kernel's.
     (void) stream;
 }
 
@@ -556,7 +555,7 @@ uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n
     if (n_hits <= 0) return 0;
     const uint64_t gu = (uint64_t) n_hits * (uint64_t) (2 * n_ff) * 4;
     const uint64_t q8 = (uint64_t) n_hits * (uint64_t) (n_ff / 32) * 34;
-    // R4.2h: the fp32 scales for the INTERMEDIATE's own quantization, one per 32-element chunk per hit.
+    // the fp32 scales for the INTERMEDIATE's own quantization, one per 32-element chunk per hit.
     const uint64_t hs = (uint64_t) n_hits * (uint64_t) (n_ff / 32) * 4;
     const uint64_t xh = (uint64_t) (n_embd / 32) * 4;
     return ((gu + 15) & ~15ull) + ((q8 + 15) & ~15ull) + 2 * ((hs + 15) & ~15ull) +
@@ -591,7 +590,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
     }
     // 3. the intermediate's own contract, which is `ggml_mul_mat`'s rule and NOT a choice: the down weight is
     //    Q2_0, whose `vec_dot_type` is Q8_0.  `gate_up` holds the pairs; the product went into the first half.
-    //    **R4.2h: the CPU quantizes this intermediate into `a2` with fp32 scales too** (`expert.cpp:232`), so
+    //    **the CPU quantizes this intermediate into `a2` with fp32 scales too** (`expert.cpp`), so
     //    when the caller supplies `x_scales` the intermediate gets the CPU's contract as well - otherwise the
     //    down projection would keep the very disagreement the gate/up projection just had removed.
     if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, n_hits * (int64_t) FF, stream);

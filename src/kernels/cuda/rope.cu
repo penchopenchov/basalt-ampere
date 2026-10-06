@@ -1,7 +1,6 @@
-// src/kernels/cuda/rope.cu - P2.S2: NEOX partial RoPE.
+// src/kernels/cuda/rope.cu - NEOX partial RoPE.
 //
-// Semantics from `ref/qsa.py` (`rope_freqs` + `rope_neox`), which `bench/micro/rope_xcheck` validates against
-// the oracle:
+// Semantics from the Python reference (`rope_freqs` + `rope_neox`), validated against the oracle:
 //
 //     inv[i] = theta ** (-2i / n_rot)          i in [0, n_rot/2)
 //     ang    = pos * inv

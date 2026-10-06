@@ -137,7 +137,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
     }
 }
 
-// ================================ plan v0.3 P6: T tokens, one weight read ================================
+// ================================ T tokens, one weight read ================================
 struct GrMulti {
     FusedGrArgs a[kFusedGrMaxT];
     float* xn;
@@ -193,10 +193,9 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
 // TILEV = xn floats per token staged at a time.  The tile only changes the staging granularity: the lane's chunk
 // order (lane + 32*q within the tile, tiles ascending) is strictly increasing for either value, so the results are
 // bitwise identical to `gr_down_kernel` for both.  2560 stages 320 chunks of 8 per tile (10 per lane); cards whose
-// opt-in below 8 * 2560 * 4 B slices the tokens - sm_75 (64 KiB) carries 6 tokens of it - run TILEV 1280 instead,
+// shared-memory opt-in is below 8 * 2560 * 4 B slice the tokens and run TILEV 1280 instead,
 // which fits all eight tokens in one 40 KiB launch and stages 160 chunks of 8 (5 per lane, half the registers held
-// for the weight prefetch); smaller tiles raise how many blocks share an SM (the 41-block grid), e.g. three blocks
-// of four tokens instead of one on sm_75.
+// for the weight prefetch); smaller tiles raise how many blocks share an SM.
 template <int TILEV, int MAX_T = kFusedGrMaxT>
 __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
     pdl_wait();
@@ -318,15 +317,15 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
 //  - the norm (split and staged): one block per token AND stream instead of one per token.  Each thread visits
 //    exactly the elements, in the order, it visited for that stream in the plain read, so every sum of squares and rs
 //    is the same; then it recomputes its R' * w_norm and writes it times rs (the plain read stored the product and
-//    scaled it in place: the same two roundings).  On an RTX 4080 SUPER, the plain read's norm took 0.58 ms per
-//    4-token round (96 launches of 1-4 blocks), this one 0.23 ms.
+//    scaled it in place: the same two roundings).  The plain read's norm launches 1-4 blocks per
+//    token and layer; this one fills the machine.
 //  - the down projection, split: the plain read's kernel.
 //  - the down projection, staged: the plain read's 8 rows per block and lane order, but the activations arrive by
 //    cp.async in half-stream tiles, two in flight, so no thread waits on a chain of loads, and they sit in shared
 //    memory as two planes (floats 0-3 and 4-7 of every 8), so a warp's reads hit no bank twice.  The next tile's
 //    weights are loaded while the current one is used.  A tile is 160 = 5 x 32 chunks of 8, so a lane still
-//    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Before sm_80
-//    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
+//    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Without cp.async
+//    support the staging is a plain copy: the same bits, only not asynchronous.
 constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;
 constexpr int H_TILE = 1280;                          // staged tile: half a stream = 160 chunks of 8, 5 per lane
 constexpr int HQ = H_TILE / 8 / 32;
@@ -570,13 +569,13 @@ void launch_staged(int depth, const GrMulti& c, dim3 grid, size_t smem, cudaStre
 }
 
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
-// stages n_tok * TILEV floats (1280 on sm_75, 2560 elsewhere), staged two tiles of n_tok * H_TILE.  The shared-memory
+// stages n_tok * TILEV floats (1280 with a small opt-in, 2560 otherwise), staged two tiles of n_tok * H_TILE.  The shared-memory
 // opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
 int down_chunk(bool staged, int* tile_out) {
     static bool attr[64] = {};
     static int chunk[64] = {};   // tokens the plain down kernel may carry in one launch on this card
     static int chunk_staged[64] = {};  // the same for staged
-    static int tile[64] = {};    // the plain down kernel's TILEV on this card (1280 on sm_75, 2560 elsewhere)
+    static int tile[64] = {};    // the plain down kernel's TILEV on this card (1280 with a small opt-in, 2560 otherwise)
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) {

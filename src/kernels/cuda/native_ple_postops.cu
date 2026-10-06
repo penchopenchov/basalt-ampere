@@ -1,5 +1,5 @@
 // Arithmetic adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
-// src/models/qwen4exp.cpp and ggml-cuda/{reduce_rows.cuh,sumrows.cu,unary.cu}.
+// the qwen4exp graph and ggml-cuda/{reduce_rows.cuh,sumrows.cu,unary.cu}.
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors
 // Permission is hereby granted, free of charge, to any person obtaining a copy

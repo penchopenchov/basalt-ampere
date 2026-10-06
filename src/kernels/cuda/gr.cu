@@ -56,11 +56,11 @@ __device__ __forceinline__ void store_activation(uint16_t* dst, int i, float x) 
     dst[i] = f32_to_bf16_bits(x);
 }
 
-/// silu and sigmoid exactly as `ref/gr.py` writes them - in FLOAT, not double.
+/// silu and sigmoid exactly as the Python reference writes them - in FLOAT, not double.
 ///
 /// This is the opposite of `shared_expert.cu`, which uses double, and the difference is not stylistic:
-/// `ref/gr.py`'s arrays are float32, so `x / (1.0 + np.exp(-x))` evaluates in float32 under NEP 50, while
-/// `ref/moe.py` works in float64.  Matching the reference's PRECISION is part of transcribing it.
+/// the Python reference's arrays are float32, so `x / (1.0 + np.exp(-x))` evaluates in float32 under NEP 50, while
+/// the Python reference works in float64.  Matching the reference's PRECISION is part of transcribing it.
 __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -100,7 +100,7 @@ __device__ float block_sumf(float v, double* scratch_raw) {
 
 /// Block-wide sum in DOUBLE, broadcast to every thread.
 ///
-/// Double because `ref/gr.py` reduces in float64 for the norm and the bottleneck, and because a block-wide
+/// Double because the Python reference reduces in float64 for the norm and the bottleneck, and because a block-wide
 /// f32 sum of 2560 squares is a different number from the reference's; the shuffle tree here also reorders
 /// the additions, so the only defence is enough precision that the order stops mattering.
 ///
@@ -129,7 +129,7 @@ __device__ double block_sum(double v, double* scratch) {
 /// A per-thread accumulator is only a sum when the block is narrower than the row, which is why this is a
 /// block reduction: with `n_embd` equal to the thread count every thread would hold exactly one element and
 /// normalise by its own square.  That mistake is silent - it produces a plausible vector of the right shape -
-/// and it is what `gr_parity`'s `mixed vs reference` caught at 2.0e+01 in round 196.
+/// and it is what `gr_parity`'s `mixed vs reference` check exists to catch.
 template <bool FP32_ACT>
 __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w_norm, float eps,
                                int n_embd, float* __restrict__ xn, uint16_t* __restrict__ xq) {

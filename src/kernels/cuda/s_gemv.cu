@@ -1,4 +1,4 @@
-// src/kernels/cuda/s_gemv.cu - P2.S2: the S-family GEMV, one thread per output row.
+// src/kernels/cuda/s_gemv.cu - the S-family GEMV, one thread per output row.
 //
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
 // vector loads.  The kernel is templated on the code WIDTH (a compile-time property of the unpacking loop) and
@@ -67,11 +67,10 @@ __device__ __forceinline__ float q8k_at(const uint8_t* __restrict__ x, long long
 /// **THE Q8_0 ACTIVATION**, which is what the LEGACY block formats want: `block_q8_0` is `{fp16 d; int8 qs[32]}`,
 /// 34 bytes per 32 elements, produced by `quantize_q8_0`.
 ///
-/// THE ENGINE HAD NO GEMV FOR THIS, and it was the last activation-contract gap (LEDGER L54).  It was described
-/// as "Q8_K is not implemented", which is not the situation: `ffn_down_shexp` is IQ4_NL/Q4_0/Q5_0/Q8_0 in EVERY
-/// layer, whose `vec_dot_type` is Q8_0 - and its `n_in` is 640, which is not a multiple of 256, so **Q8_K is
-/// STRUCTURALLY IMPOSSIBLE for it rather than merely absent**.  Every other legacy tensor in the pack is Q2_0,
-/// whose attributes happen to be S2's, which is how the S2-only kernel covered them and the hole stayed hidden.
+/// `ffn_down_shexp` is IQ4_NL/Q4_0/Q5_0/Q8_0 in EVERY layer, whose `vec_dot_type` is Q8_0 - and its `n_in` is
+/// 640, which is not a multiple of 256, so **Q8_K is STRUCTURALLY IMPOSSIBLE for it**.  Every other legacy
+/// tensor in the model is Q2_0, whose attributes happen to be S2's, which is how an S2-only kernel could cover
+/// them and hide the hole.
 constexpr int Q8_0_BLOCK_BYTES = 34;
 constexpr int Q8_0_BLOCK_ELEMS = 32;
 
@@ -152,10 +151,9 @@ __global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint
     // THE CODEBOOK, IN SHARED MEMORY.  16 bytes, loaded once per block by the first 16 threads, instead of a
     // divergent constant read per element - measured at 2.12x of this whole kernel (see the note on `kIq4Nl`).
     //
-    // THE LOAD AND THE BARRIER COME BEFORE THE EARLY RETURN, as in `s_gemv_q8k_kernel`.  The return used to
-    // sit above them, so whenever `n_out % 8 != 0` the last block's surplus warps left before a barrier the
-    // others still waited at - undefined behaviour that every shape in the pack (a multiple of 8) happened to
-    // avoid.  `o` is per-WARP, so the return below keeps whole warps together and the shuffle reduction's
+    // THE LOAD AND THE BARRIER COME BEFORE THE EARLY RETURN, as in `s_gemv_q8k_kernel`.  The return must not
+    // sit above them: whenever `n_out % 8 != 0` the last block's surplus warps would leave before a barrier the
+    // others still wait at - undefined behaviour.  `o` is per-WARP, so the return below keeps whole warps together and the shuffle reduction's
     // full mask stays valid.
     __shared__ signed char s_iq4nl[16];
     if (threadIdx.x < 16) s_iq4nl[threadIdx.x] = kIq4Nl[threadIdx.x];
@@ -182,8 +180,8 @@ __global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint
     // group whenever `group_elems % 8 == 0` - the launcher asserts that, and every group size this format
     // defines (16, 32, 64) satisfies it.
     //
-    // The loop used to take `i = lane, lane+32, ...` - a STRIDE, chosen so consecutive lanes read consecutive
-    // activations - and paid a code load, a shift-and-mask, and a scale load FOR EVERY ELEMENT.  But four
+    // A loop taking `i = lane, lane+32, ...` - a STRIDE, so that consecutive lanes read consecutive
+    // activations - pays a code load, a shift-and-mask, and a scale load FOR EVERY ELEMENT.  But four
     // consecutive elements share one code word (1, 2 or 4 bytes depending on width) and lie in one group,
     // because every group size this format defines is a multiple of four.  So a lane takes a QUAD:
     //
@@ -205,12 +203,10 @@ __global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint
     constexpr int QW = 4 * CODE_BITS / 8;              // 1 for S2, 2 for S4, 4 for S8
     constexpr unsigned MASK = (1u << CODE_BITS) - 1u;
     long long i = (long long) lane * QE;
-    // **`#pragma unroll 4` WAS TRIED HERE AND DID NOTHING.**  Measured: 184.6 -> 183.9 GB/s at n_out 10240,
-    // with `s_gemv_parity` and `s_gemv_q8k_parity` both still clean.  The hypothesis it was testing is L93 -
-    // that this kernel's flat ~6 ns per output row is a bytes-in-flight limit, one code load and one scale
-    // load per lane-iteration with only 20 iterations.  A 4x unroll issues four of each before the first is
-    // consumed, so either the compiler was already doing it or **the limit is not instruction scheduling.**
-    // Removed rather than kept, because a hint that does not change the timing is a claim that is not true.
+    // **NO `#pragma unroll 4` HERE: IT DOES NOTHING.**  A flat per-row time is not a bytes-in-flight limit that
+    // a 4x unroll (four code loads and four scale loads before the first is consumed) would lift, so either the
+    // compiler already does it or the limit is not instruction scheduling.  A hint that does not change the
+    // timing is a claim that is not true.
     //
     // What it does NOT rule out is the structural version of the same idea: QE is 4, so a lane consumes ONE
     // 2-byte code word per iteration.  Widening QE to 8 or 16 changes the LOADS THEMSELVES - two or four

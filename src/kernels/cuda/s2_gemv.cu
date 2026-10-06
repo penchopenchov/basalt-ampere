@@ -1,4 +1,4 @@
-// src/kernels/cuda/s2_gemv.cu - P2.S2: the S2 GEMV, one thread per output row.
+// src/kernels/cuda/s2_gemv.cu - the S2 GEMV, one thread per output row.
 //
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
 // vector loads, no __ldg hints.  Phase 3 changes this file; the parity test is what says whether a change is

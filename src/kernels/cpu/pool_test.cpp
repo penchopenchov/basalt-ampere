@@ -1,4 +1,4 @@
-// src/kernels/cpu/pool_test.cpp - P2.S3's test for the expert pool.
+// src/kernels/cpu/pool_test.cpp - test for the expert pool.
 //
 // The pool's correctness claims are small and specific, so they are checked directly rather than through a
 // timing number:
@@ -179,12 +179,10 @@ int main(int argc, char** argv) {
         if (size_bad) ++bad;
     }
 
-    // ---- and the number that matters for the ledger: c for one layer, 10 experts over 48 layers.
+    // ---- and the number that matters: c for one layer, 10 experts over 48 layers.
     //
-    // BEST OF N, not a mean.  The first version divided a 10-run total by 10 and reported 6.604 ms per layer -
-    // 2.1 GB/s against L9's measured 42.55 - purely because a CUDA build was running on the same 6-core
-    // machine at the time.  A mean over a contended machine measures the contention; a best-of measures the
-    // instrument, and every other timing tool in this project already takes the best.  The spread is printed
+    // BEST OF N, not a mean.  A mean over a contended machine measures the contention; a best-of measures the
+    // instrument, and every other timing tool in this project takes the best.  The spread is printed
     // so a contended run is visible rather than being read as a regression.
     {
         const int REPS = 20;
@@ -204,10 +202,9 @@ int main(int argc, char** argv) {
                     median / (best > 0 ? best : 1));
         std::printf("  %-44s %7.3f ms   -> %.1f tok/s for the full 48 layers\n",
                     "extrapolated to 48 layers", best * 48, 1000.0 / (best * 48));
-        std::printf("  L9 measured 42.55 GB/s on 6 cores; this pool uses %d workers (core 0 is left to the\n",
-                    pool.workers());
-        std::printf("  host loop), so %.1f GB/s x 6/%d = %.1f GB/s is the per-core comparison.\n",
-                    gbs, pool.workers(), gbs * 6.0 / pool.workers());
+        std::printf("  this pool uses %d workers (core 0 is left to the host loop), so %.1f GB/s x 6/%d = %.1f GB/s\n"
+                    "  is the 6-core comparison.\n",
+                    pool.workers(), gbs, pool.workers(), gbs * 6.0 / pool.workers());
         if (median / (best > 0 ? best : 1) > 1.5)
             std::printf("  *** the spread is over 1.5x: this machine was CONTENDED and the median is not a\n"
                         "      property of the pool.  Re-run on a quiet machine before quoting it. ***\n");

@@ -1,4 +1,4 @@
-// src/kernels/cpu/iq_avx512.cpp - plan v0.3 P6: the i-quant expert rows in 512-bit lanes, several tokens at once.
+// src/kernels/cpu/iq_avx512.cpp - the i-quant expert rows in 512-bit lanes, several tokens at once.
 //
 // ggml-cpu's x86 dot products for these formats are AVX2 and single-token: every token re-decodes the weights
 // and a sign is applied with five instructions per 32 values.  Here 64 values are decoded once (8 or 16 grid

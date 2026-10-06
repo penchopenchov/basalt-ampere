@@ -171,7 +171,7 @@ __global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
     const float xi = x[i];
     const float amax = warp_max(fabsf(xi));
     const float sum = warp_sum(xi);
-    const float d = q8_1_finite(amax / 127.0f);   // #606: q8_1_finite.hpp - the same bits for every finite block
+    const float d = q8_1_finite(amax / 127.0f);   // q8_1_finite.hpp - the same bits for every finite block
     const int8_t q = q8_1_quant(xi, d, amax);
     y[i / Q8K].qs[i % Q8K] = q;
     if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
@@ -818,14 +818,14 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
     }
 }
 
-// ============================ plan v0.3 P3: ncols = 2..8 (speculative verify, small batches) ============================
+// ============================ ncols = 2..8 (speculative verify, small batches) ============================
 //
 // One generic kernel for every format, parameterized by the format's iteration traits below, which are
 // transcribed from the ncols = 1 kernels above (same thread-to-block mapping, same blocks per iteration, same
 // small-K rule). Column j reads activation blocks x + j * (n_in / 32) and writes y + j * n_out. Each (column,
 // row) value is accumulated over kbx in the same order, summed across warps in the same order and reduced with
 // the same warp tree as the ncols = 1 kernel, so every column is BITWISE equal to a single-column call on that
-// column (checked by bench/micro/native_mmvq_multi.cpp). The ncols = 1 kernels are untouched.
+// column (checked by mmvq_multi_parity). The ncols = 1 kernels are untouched.
 constexpr int MAX_NCOLS = 8;
 
 // Each format splits its dot product into `load` (everything that depends only on the weight block: codes,
@@ -1358,7 +1358,7 @@ __global__ void __launch_bounds__(256, 2) native_iq4_xs_mma_kernel(const IQ4XSBl
         }
     }
 #elif defined(__CUDA_ARCH__)
-    __trap();   // the host launches it only where device code for sm_80+ was built
+    __trap();   // the host launches it only where device code for int8 MMA was built
 #endif
 }
 
@@ -1368,8 +1368,8 @@ bool g_mmvq_mma = false;
 // the fewest columns that take it (one more where the projection narrows its input)
 int g_mmvq_mma_min_t = 4;
 std::atomic<long> g_mmvq_mma_launches{0};
-// The current device's SM count if it runs native_iq4_xs_mma_kernel (sm_80+, the card's or EMULATE_CC's, with
-// sm_80+ device code in this build), else 0; per device
+// The current device's SM count if it runs native_iq4_xs_mma_kernel (int8 MMA, with
+// device code for it in this build), else 0; per device
 int mmvq_mma_sms() {
     static int known[64] = {};   // 0 unknown, -1 no, else the SM count
     int dev = 0;

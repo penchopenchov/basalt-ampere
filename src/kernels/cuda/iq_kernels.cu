@@ -2202,7 +2202,7 @@ constexpr int g_dec_gy = 24;
 // IQ3_XXS gate/up on int8 tensor cores (1), or only for the calls whose caller asks (2): off (0)
 constexpr int g_gu_mma = 0;
 thread_local int t_gu_mma_hint = 0;
-// Whether native_gu_mma_kernel runs on the current device at L's shapes: sm_80+ with sm_80+ device code in this
+// Whether native_gu_mma_kernel runs on the current device at L's shapes: int8 MMA with device code for it in this
 // build, n_embd in whole chunks (rows 4-byte aligned), the shared memory without opt-in
 bool gu_mma_usable(const NativeExpertLayout& L) {
     if (L.n_embd <= 0 || L.n_embd % 512 != 0 || L.n_ff % kGmRows != 0 || gu_mma_smem(L.n_embd) > 48 * 1024)
@@ -2226,7 +2226,7 @@ bool g_mmvq_mma = false;
 // the fewest columns that take it
 int g_mmvq_mma_min_t = 4;
 std::atomic<long> g_mmvq_mma_launches{0};
-// The current device's SM count if it runs mmvq_iq3s_mma_kernel (sm_80+ with sm_80+ device code in this build),
+// The current device's SM count if it runs mmvq_iq3s_mma_kernel (int8 MMA with device code for it in this build),
 // else 0; per device
 int mmvq_mma_sms() {
     static int known[64] = {};   // 0 unknown, -1 no, else the SM count

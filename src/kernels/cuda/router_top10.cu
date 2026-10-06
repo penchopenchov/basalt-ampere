@@ -1,7 +1,7 @@
 // src/kernels/cuda/router_top10.cu - the MoE router.
 //
-// P2.S2's spec: "BF16 GEMV, softmax / top-k / renormalize per the model definition; emits (expert_id, weight) x 10
-// per token".  This is the softmax/top-k/renormalize half; the BF16 GEMV that produces the logits is a
+// Softmax / top-k / renormalize per the model definition; emits (expert_id, weight) x 10
+// per token.  This is the softmax/top-k/renormalize half; the BF16 GEMV that produces the logits is a
 // separate kernel and is NOT here.
 //
 // The semantics are transcribed from the Python reference, which is itself transcribed from llama-graph.cpp:
@@ -16,29 +16,17 @@
 // mathematically identical (softmax is shift-invariant) but it moves the renormalisation, and the CLAMP is
 // part of the renormalisation.  Reproducing the gather form is what makes the clamp land in the same place.
 //
-// WHY THIS IS NO LONGER "NAIVE BY DESIGN", AND WHAT THE OLD REASONING GOT WRONG.
-//
-// The first version was ONE THREAD PER TOKEN: k passes over the experts, each pass recomputing
-// `exp((double) l[e] - mx)` for every expert.  Its comment justified that with
-//
-//     "5,120 operations per token against 2.36e9 weights of expert matvec - three orders of magnitude smaller
-//      than the thing it feeds, so the simplest correct version is also fast enough"
-//
-// **That is a statement about OPERATION COUNT and it says nothing about TIME, because all 5,120 operations were
-// on ONE THREAD while the matvec has thousands.**  Measured (round 218, stage-by-stage inside one block):
-//
-//     moe_layer   4.077 ms      router_top10   3.387 ms      bf16 gemv   0.270 ms
-//
-// 3.39 ms per layer x 48 layers = 163 ms of a 289 ms token - **56% of the whole forward pass, in a kernel that
-// reads 2.6 MB.**  It was invisible in `router_top10_parity` because that test runs the kernel ONCE and checks
-// the right ids, and invisible in every per-layer test for the same reason.
+// WHY IT IS NOT ONE THREAD PER TOKEN.  The router is tiny in OPERATION COUNT (about 5,000 operations per token)
+// but operation count says nothing about TIME when all of them sit on ONE THREAD while the matvec it feeds
+// has thousands.  A single-thread version costs milliseconds per layer, a large share of the whole forward pass,
+// in a kernel that reads 2.6 MB - and it is invisible in a parity test that runs the kernel once.
 //
 // WHAT IS PARALLELISED AND WHAT IS DELIBERATELY NOT:
 //
 //   * the MAX is a tree reduction of `fmaxf`, which is exact and order-independent - bit-identical to the
 //     serial scan it replaces;
-//   * the 512 EXPONENTIALS are computed ONCE each, in parallel.  The old kernel computed them ELEVEN TIMES
-//     (once for the softmax, then again inside every one of the k passes).  This is where the 3.4 ms was;
+//   * the 512 EXPONENTIALS are computed ONCE each, in parallel.  A serial version recomputes them in every one
+//     of the k passes, and that is where the time goes;
 //   * the DOUBLE SUM is still accumulated on ONE thread in ASCENDING order.  512 double adds is about a
 //     microsecond and it keeps the accumulation order - and therefore the last bits - identical to the
 //     reference-faithful serial version.  Parallelising it would be a free speedup and a silent change to the
@@ -47,10 +35,9 @@
 //
 //         rank(e) = #{ f : p[f] > p[e] }  +  #{ f < e : p[f] == p[e] }
 //
-//     which IS "stable descending argsort, ties by ascending index" - the same order the repeated-maximum loop
-//     produced - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
-//     comparisons and that is the right trade here: n = 512, every comparison is independent, and the old
-//     version was O(k*n) with a serial `exp` inside.
+//     which IS "stable descending argsort, ties by ascending index" - the same order a repeated-maximum loop
+//     produces - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
+//     comparisons and that is the right trade here: n = 512 and every comparison is independent.
 #include "basalt/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>

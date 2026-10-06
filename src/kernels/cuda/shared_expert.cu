@@ -1,6 +1,6 @@
-// src/kernels/cuda/shared_expert.cu - P2.S2: the shared expert.
+// src/kernels/cuda/shared_expert.cu - the shared expert.
 //
-// `ref/moe.py::shared_expert`, transcribed:
+// the Python reference, transcribed:
 //
 //     h = silu(x @ gate_shexp.T) * (x @ up_shexp.T)      <- SILU GOES ON GATE, not on up
 //     h = h @ down_shexp.T                                (nt, n_embd)
@@ -44,13 +44,11 @@ namespace {
 constexpr int THREADS = 128;
 bool native_bf16 = false;
 
-// `f32_to_f16` used to live here as a private copy.  Round 198 found it - and the identical one in
-// `quantize_act.cu` - returning a NaN for every FINITE value that overflows fp16 (1e30, 65536, 1e45) instead
-// of saturating to inf, because `exp >= 31` conflates an f32 inf/NaN with an out-of-range finite exponent.
-// This file's fixture is all O(1), so it could not see it.  The conversion now lives in one place, with the
-// regimes spelled out.
+// The fp16 conversion lives in one place (`f16_bits.hpp`), with the regimes spelled out: a private copy that
+// tests `exp >= 31` conflates an f32 inf/NaN with an out-of-range finite exponent and returns a NaN for every
+// FINITE value that overflows fp16 (1e30, 65536, 1e45) instead of saturating to inf.
 
-// silu(x) = x / (1 + exp(-x)), written as `ref/moe.py` writes it, in DOUBLE then cast - the reference works in
+// silu(x) = x / (1 + exp(-x)), written as the Python reference writes it, in DOUBLE then cast - the reference works in
 // float64 and a float32 exp differs in the last bits.  The multiplication by `up` is the reference's order.
 __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
                               float* __restrict__ out, int n) {
@@ -87,18 +85,15 @@ __global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict
 // whose memory floor is 0.009 ms.  It is seven kernels, and six of them are GEMVs or elementwise passes over
 // 640-2560 elements.  This is the one that cannot be explained by bandwidth.
 //
-// THE DOUBLE ACCUMULATOR IS KEPT.  `ref/gr.py` reduces in float64 and `block_sum` in `gr.cu` exists for the
+// THE DOUBLE ACCUMULATOR IS KEPT.  the Python reference reduces in float64 and `block_sum` in `gr.cu` exists for the
 // same reason - the summation order of a tree is not the reference's, so the defence is enough precision that
 // the order stops mattering.  What changes is the CHAIN: ten terms per thread instead of 2560, then a
 // tree-reduce.  Through a sigmoid, a 1e-16 relative difference in the dot is not a difference.
 //
 // **BOTH OPERANDS ARE BF16, AND THAT IS THE REFERENCE'S CONTRACT, NOT A STORAGE DETAIL.**  `gate_inp_shexp` is a
 // BF16 weight, so ggml converts the activation to its `vec_dot_type` - BF16 - exactly as it does for the router.
-//  This kernel used to take `const float* w` while the LOADER had already
-// re-rounded the tensor to 2 B/elem, so it read 2560 floats out of a 5120-byte buffer: 5120 B past the end of
-// the tensor, inside the 4.5 GiB arena, where nothing faults.  The dot came out astronomically large, sigmoid
-// saturated to 1.0, and `scale_kernel` multiplied the shared expert's output by it - which is why the FIRST
-// symptom was 2560 non-finite outputs rather than a wrong scalar.
+// The loader re-rounds the tensor to 2 B/elem, so reading it as `const float* w` would read 2560 floats out
+// of a 5120-byte buffer: 5120 B past the end of the tensor, inside the arena, where nothing faults.
 //
 // A wrong scalar here is the quiet failure mode: sigmoid bounds the damage to [0,1], so a gate that should be
 // 0.5 and reads 1.0 scales the shared expert by 2x and produces perfectly finite, perfectly plausible logits.
@@ -260,8 +255,8 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                              "(see shared_expert_scratch_bytes)\n");
         std::exit(1);
     }
-    // CARVED FROM THE CALLER'S SCRATCH.  This used to be four `cudaMalloc`s and four `cudaFree`s per call, which
-    // is illegal during stream capture AND a token-path allocation - P2.T10 forbids both.
+    // CARVED FROM THE CALLER'S SCRATCH: allocation is illegal during stream capture and the token path
+    // makes none.
     uint8_t* p = (uint8_t*) scratch;
     const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~15ull;
     const uint64_t q0 = ((uint64_t) (n_ff / 32) * 34 + 15) & ~15ull;
@@ -309,8 +304,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
             swiglu_kernel<<<g_ff, THREADS, 0, (cudaStream_t) stream>>>(gate, up, gate, (int) n_ff);
 
         // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
-        // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
-        // justification beyond "the kernel takes fp16".
+        // what `ggml_mul_mat` does for every matmul in the model.
         if (native_down) {
             native_quantize_q8_1(gate, native->q8_1, (int) n_ff, 1, stream);
             native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);

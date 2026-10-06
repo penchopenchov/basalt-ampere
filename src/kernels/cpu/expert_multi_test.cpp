@@ -1,8 +1,8 @@
-// src/kernels/cpu/expert_multi_test.cpp - plan v0.3 P6: one expert, several tokens (CPU only, synthetic data).
+// src/kernels/cpu/expert_multi_test.cpp - one expert, several tokens (CPU only, synthetic data).
 //
 //   expert_multi_test              bitwise check: s2_expert_vnni_multi vs s2_expert_vnni_q per token, n = 1..8
 //   expert_multi_test --bench [E]  time per expert for n = 1..5 over E synthetic experts (default 256 = 354 MB,
-//                                  far beyond L3, so the blob comes from DRAM as it does in the engine); 1 thread
+//                                  far beyond the last-level cache, so the blob comes from DRAM as it does in the engine); 1 thread
 //
 // The bench measures the speculation model's `extra_use_cost`: the CPU time of each extra token routed to an
 // expert, as a fraction of reading the expert once (tools/spec_economics.py assumes 0.2).

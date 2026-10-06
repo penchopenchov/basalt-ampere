@@ -109,11 +109,11 @@ private:
 static bool expect_affinity(const std::vector<int>& expected, const char* label) {
     std::vector<int> actual;
     if (!get_affinity(actual)) {
-        std::fprintf(stderr, "Linux affinity test: %s: cannot query current affinity\n", label);
+        std::fprintf(stderr, "affinity test: %s: cannot query current affinity\n", label);
         return false;
     }
     if (actual != expected) {
-        std::fprintf(stderr, "Linux affinity test: %s: expected %zu CPUs, observed %zu\n",
+        std::fprintf(stderr, "affinity test: %s: expected %zu CPUs, observed %zu\n",
                      label, expected.size(), actual.size());
         return false;
     }
@@ -135,7 +135,7 @@ static bool topology_respects_current_mask() {
     if (topology.worker_cores.empty()) return false;
     for (int core : topology.worker_cores) {
         if (!std::binary_search(allowed.begin(), allowed.end(), core)) {
-            std::fprintf(stderr, "Linux affinity test: topology selected disallowed CPU %d\n", core);
+            std::fprintf(stderr, "affinity test: topology selected disallowed CPU %d\n", core);
             return false;
         }
     }
@@ -172,7 +172,7 @@ static bool round_trip_high_cpu(const std::vector<int>& allowed, bool require_hi
     const auto it = std::find_if(allowed.begin(), allowed.end(), [](int id) { return id >= 64; });
     if (it == allowed.end()) {
         if (require_high) {
-            std::fprintf(stderr, "Linux affinity test: --require-high-cpu requested, but no allowed CPU ID is >= 64\n");
+            std::fprintf(stderr, "affinity test: --require-high-cpu requested, but no allowed CPU ID is >= 64\n");
             return false;
         }
         std::puts("SKIP high-CPU affinity path: no allowed CPU ID is >= 64 (use --require-high-cpu to require it)");
@@ -181,7 +181,7 @@ static bool round_trip_high_cpu(const std::vector<int>& allowed, bool require_hi
     const int target = allowed.front() == *it ? (allowed.size() > 1 ? allowed.back() : *it) : allowed.front();
     if (target == *it) {
         if (require_high) {
-            std::fprintf(stderr, "Linux affinity test: --require-high-cpu needs at least two allowed CPUs to test restoration\n");
+            std::fprintf(stderr, "affinity test: --require-high-cpu needs at least two allowed CPUs to test restoration\n");
             return false;
         }
         std::puts("SKIP high-CPU affinity round trip: only one CPU is allowed, so no meaningful pin transition is possible");
@@ -237,7 +237,7 @@ static bool failed_pin_preserves_affinity() {
     std::vector<int> after;
     const bool helper_unchanged = get_affinity(after) && before == after;
     if (error == 0) {
-        std::fprintf(stderr, "Linux affinity test: pin_thread_to_cpu(INT_MAX) unexpectedly succeeded\n");
+        std::fprintf(stderr, "affinity test: pin_thread_to_cpu(INT_MAX) unexpectedly succeeded\n");
         return false;
     }
     const auto invalid = cpu::pin_current_thread(INT_MAX);
@@ -245,7 +245,7 @@ static bool failed_pin_preserves_affinity() {
     std::vector<int> after_public;
     const bool public_unchanged = get_affinity(after_public) && before == after_public;
     if (!helper_unchanged || invalid.valid || !public_unchanged)
-        std::fprintf(stderr, "Linux affinity test: failed pin changed the observed affinity or returned a valid snapshot\n");
+        std::fprintf(stderr, "affinity test: failed pin changed the observed affinity or returned a valid snapshot\n");
     return helper_unchanged && !invalid.valid && public_unchanged;
 }
 
@@ -261,7 +261,7 @@ int main(int argc, char** argv) {
 
     OriginalAffinity original;
     if (!original.capture()) {
-        std::fprintf(stderr, "Linux affinity test: cannot capture original thread affinity\n");
+        std::fprintf(stderr, "affinity test: cannot capture original thread affinity\n");
         return 1;
     }
     const auto allowed = original.ids();
@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
     const bool restored = original.restore() && expect_affinity(allowed, "final original affinity cleanup");
     if (!ok || !restored) return 1;
 
-    std::printf("Linux affinity test: full, sparse/nested, worker helper, invalid-target, failed-pin, and cleanup checks passed (%zu allowed CPUs)\n",
+    std::printf("affinity test: full, sparse/nested, worker helper, invalid-target, failed-pin, and cleanup checks passed (%zu allowed CPUs)\n",
                 allowed.size());
     return 0;
 }

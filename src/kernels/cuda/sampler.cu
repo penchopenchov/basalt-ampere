@@ -7,7 +7,7 @@
 // and TEMPERATURE AFTER THE TRUNCATION FILTERS.  Every order produces a valid token, so only a comparison at the
 // distribution level can tell them apart; the parity test does that against an independently computed distribution.
 //
-// `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary (on sm_90+ without penalties,
+// `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary (with thread-block clusters and without penalties,
 // `sampler_greedy_cluster_kernel`: the same token from a cluster of 8 CTAs per row).  The sampled chain has two
 // implementations that pick the same token, bit for bit:
 //   - the SPLIT top_k (default): `sampler_split_part_kernel` cuts each row into 4,096-logit blocks over the whole
@@ -155,7 +155,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     }
 }
 
-/// /// **THE SAME ARGMAX ON A THREAD-BLOCK CLUSTER (sm_90+), FOR THE CALLS WITHOUT PENALTIES.**  One block per token
+/// /// **THE SAME ARGMAX ON A THREAD-BLOCK CLUSTER, FOR THE CALLS WITHOUT PENALTIES.**  One block per token
 /// /// reading a long row on one SM with one load in flight per thread is latency-bound, for every verify window and
 /// /// every draft step.  Here a cluster of `kAmCtas` CTAs shares the row, each thread keeps four loads in flight, and
 /// /// the CTAs' results meet in CTA 0's shared memory (distributed shared memory).
@@ -821,7 +821,7 @@ int2* split_scratch(void* stream, size_t entries) {
 bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* out, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return true;
     if (n_tokens > 65535) return false;
-    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - sm_90+, code built
+    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - thread-block clusters, code built
     // for it (an older build's PTX holds a trap: the PTX version says which), and room for one cluster of kAmCtas CTAs.
     static int ok[64] = {};
     int dev = 0;
@@ -917,7 +917,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
                                : 0;
     if (p.greedy || p.temperature <= 0.0f) {
-        // Without penalties (shmem == 0: no window) on sm_90+, a cluster of CTAs per token - the same token; see
+        // Without penalties (shmem == 0: no window) with cluster support, a cluster of CTAs per token - the same token; see
         // `sampler_greedy_cluster_kernel`.
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
