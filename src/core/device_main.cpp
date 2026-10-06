@@ -25,8 +25,8 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::printf("usage: basalt-device [--selftest] [--list-devices]\n"
-                        "  --list-devices  every GPU the runtime enumerates, numbered as HIP_VISIBLE_DEVICES /\n"
-                        "                  CUDA_VISIBLE_DEVICES number them, and whether this binary can run it\n");
+                        "  --list-devices  every GPU the runtime enumerates, numbered as\n"
+                        "                  CUDA_VISIBLE_DEVICES numbers them, and whether this binary can run it\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
