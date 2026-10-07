@@ -104,6 +104,8 @@ int main(int argc, char** argv) {
     float corr = 0.7f;
     bool with_wait = true;
     int only = -1;
+    bool trace = false;
+    bool hot = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto num = [&](int& v) { if (i + 1 < argc) v = std::atoi(argv[++i]); };
@@ -117,6 +119,8 @@ int main(int argc, char** argv) {
         else if (a == "--corr" && i + 1 < argc) corr = (float) std::atof(argv[++i]);
         else if (a == "--nowait") with_wait = false;
         else if (a == "--only") num(only);
+        else if (a == "--trace") trace = true;
+        else if (a == "--hot") hot = true;   // experts alias a few blobs: weights stay in L2 (compute-only timing)
         else if (a == "--exp" && i + 1 < argc) {
             const std::string kv = argv[++i];
             const size_t eq = kv.find('=');
@@ -162,6 +166,7 @@ int main(int argc, char** argv) {
         std::vector<unsigned long long> p(NE);
         for (int e = 0; e < NE; ++e) {
             uint8_t* d = y.arena + slot * (size_t) e;
+            if (hot) { p[e] = (unsigned long long) blobs[e % nblobs]; continue; }
             ck(cudaMemcpy(d, blobs[(e * 7 + l * 13 + e / nblobs) % nblobs], L.bytes, cudaMemcpyDeviceToDevice), "blob");
             p[e] = (unsigned long long) d;
         }
@@ -261,12 +266,15 @@ int main(int argc, char** argv) {
         K::dec_moe_combine(parts, m_rows, m_rows, plan, wts, shared, out_ref, N, KT, T, nullptr, nullptr, (uint32_t) (l + 1), cs,
                            with_wait, nullptr);
     };
+    unsigned long long* d_trace = dalloc<unsigned long long>(K::PK_T_SLOTS);
+    bool tracing = false;
     auto pk = [&](int l, int T, bool first_plain) {
         hc(l, T, first_plain);
         shared_chain(l, T, true);
         K::PkMoeArgs a;
         a.ids = ids; a.weights = wts; a.ptab = lay[l].ptab; a.n_tok = T; a.k = KT; a.n_expert = NE; a.xq = xq;
         a.shared = shared; a.out = out_pk; a.parts = parts; a.sync = sync; a.shared_flag = true;
+        if (tracing) a.trace = d_trace;
         K::PdlScope ps(true);
         K::pk_moe_experts(L, a, scratch, cs);
     };
@@ -302,6 +310,53 @@ int main(int argc, char** argv) {
         std::printf("T %d: %.1f distinct experts/layer; pk vs ref over %d layers: %s (%zu differ, %zu non-finite ref)\n", T,
                     groups / NL, NL, bad ? "FAIL" : "bitwise equal", bad, nonfinite);
         fails += bad != 0;
+
+        if (trace) {
+            // per-stage stamps of the persistent launch, microseconds after the first block left the PDL wait (the hc read's end)
+            using namespace K;
+            std::vector<std::vector<double>> col(PK_T_SLOTS);
+            double distinct = 0;
+            tracing = true;
+            for (int i = 0; i < 6 + reps; ++i) {
+                const int l = i % NL;
+                std::vector<unsigned long long> init(PK_T_SLOTS, 0);
+                for (int s2 : {PK_T_ENTRY_MIN, PK_T_WAIT_MIN, PK_T_PLAN_MIN, PK_T_GU_FIRST, PK_T_GU_END_MIN, PK_T_DOWN_FIRST, PK_T_BLOCK_END_MIN})
+                    init[s2] = ~0ull;
+                ck(cudaMemcpy(d_trace, init.data(), init.size() * 8, cudaMemcpyHostToDevice), "trace init");
+                pk(l, T, true);
+                ck(cudaStreamSynchronize(cs), "sync");
+                ck(cudaStreamSynchronize(sh), "sync");
+                std::vector<unsigned long long> h(PK_T_SLOTS);
+                ck(cudaMemcpy(h.data(), d_trace, h.size() * 8, cudaMemcpyDeviceToHost), "trace");
+                std::vector<int32_t> hid((size_t) T * KT);
+                ck(cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost), "ids");
+                if (i < 6) continue;
+                distinct += std::set<int32_t>(hid.begin(), hid.end()).size();
+                const double t0 = (double) h[PK_T_WAIT_MIN];
+                for (int s2 = 0; s2 < PK_T_SLOTS; ++s2) {
+                    const bool sum = s2 == PK_T_GU_BUSY || s2 == PK_T_DOWN_BUSY || s2 == PK_T_SWIGLU_WAIT;
+                    const bool cnt = s2 == PK_T_GU_ITEMS || s2 == PK_T_DOWN_ITEMS;
+                    col[s2].push_back(cnt ? (double) h[s2] : sum ? h[s2] * 1e-3 : ((double) h[s2] - t0) * 1e-3);
+                }
+            }
+            tracing = false;
+            auto md = [&](int s2) { auto v = col[s2]; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+            const double ne = distinct / reps;
+            const double gub = ne * L.down_off, dnb = ne * (L.bytes - L.down_off);
+            std::printf("  T %d trace: %.1f distinct experts, gate/up %.1f MB, down %.1f MB (us after the hc read's end, medians)\n", T, ne,
+                        gub / 1e6, dnb / 1e6);
+            std::printf("    first block in %.1f  last block in %.1f  plan %.1f..%.1f  gu first start %.1f  first gu end %.1f  last gu end %.1f\n",
+                        md(PK_T_ENTRY_MIN), md(PK_T_ENTRY_MAX), md(PK_T_PLAN_MIN), md(PK_T_PLAN_MAX), md(PK_T_GU_FIRST), md(PK_T_GU_END_MIN), md(PK_T_GU_LAST));
+            std::printf("    first down start %.1f  last down end %.1f  shared seen %.1f  combine end %.1f  first block done %.1f  last block done %.1f\n",
+                        md(PK_T_DOWN_FIRST), md(PK_T_DOWN_LAST), md(PK_T_SHARED_SEEN), md(PK_T_COMBINE_END), md(PK_T_BLOCK_END_MIN), md(PK_T_BLOCK_END));
+            const double gus = md(PK_T_GU_LAST) - md(PK_T_PLAN_MAX), dns = md(PK_T_DOWN_LAST) - md(PK_T_GU_LAST);
+            std::printf("    gu items %.0f (mean %.2f us, busy %.0f block-us), down items %.0f (mean %.2f us, busy %.0f block-us), swiglu wait %.0f block-us\n",
+                        md(PK_T_GU_ITEMS), md(PK_T_GU_BUSY) / md(PK_T_GU_ITEMS), md(PK_T_GU_BUSY), md(PK_T_DOWN_ITEMS),
+                        md(PK_T_DOWN_BUSY) / md(PK_T_DOWN_ITEMS), md(PK_T_DOWN_BUSY), md(PK_T_SWIGLU_WAIT));
+            std::printf("    gate/up phase (plan end -> last gu end) %.1f us = %.2f TB/s;  down phase (last gu end -> last down end) %.1f us = %.2f TB/s\n", gus,
+                        gub / gus * 1e-6, dns, dnb / dns * 1e-6);
+            continue;
+        }
 
         // ---- time: NL layers per graph, ref and pk alternating
         cudaGraph_t g[2];

@@ -20,6 +20,15 @@ struct PkShared {
     int32_t ng, ne, last;
 };
 
+// optional stage stamps (PkMoeArgs::trace): device nanosecond clock folded into min/max/sum slots
+__device__ __forceinline__ unsigned long long pk_now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ void pk_tmin(unsigned long long* t, int slot) { atomicMin(t + slot, pk_now()); }
+__device__ __forceinline__ void pk_tmax(unsigned long long* t, int slot) { atomicMax(t + slot, pk_now()); }
+
 __device__ __forceinline__ unsigned int pk_arrive(unsigned int* p) {
     unsigned int v;
     asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(v) : "l"(p) : "memory");
@@ -87,17 +96,21 @@ __device__ __forceinline__ void pk_combine_span(const PkMoeArgs& a, const Native
 }
 
 template<int TG, int TD>
-__global__ void __launch_bounds__(256) pk_moe_kernel(PkMoeArgs a, NativeExpertLayout L, float* __restrict__ gate,
+__global__ void __launch_bounds__(256, 2) pk_moe_kernel(PkMoeArgs a, NativeExpertLayout L, float* __restrict__ gate,
                                                      float* __restrict__ up) {
     __shared__ PkShared sm;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     unsigned int* done = a.sync + kPkSyncGroups;
     unsigned int* span = a.sync + kPkSyncSpans;
+    unsigned long long* const tr = tid == 0 ? a.trace : nullptr;
+    if (tr) { pk_tmin(tr, PK_T_ENTRY_MIN); pk_tmax(tr, PK_T_ENTRY_MAX); }
     const uint32_t* s_grid = gu2::stage_grid<TG>(sm.grid, tid);
     if (tid == 0 && (int) blockIdx.x * 16 < a.n_expert)   // the layer's table into L2
         asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + blockIdx.x * 16));
     pdl_wait();
+    if (tr) { pk_tmin(tr, PK_T_WAIT_MIN); pk_tmax(tr, PK_T_WAIT_MAX); }
     pk_plan(sm, a, tid);
+    if (tr) { pk_tmin(tr, PK_T_PLAN_MIN); pk_tmax(tr, PK_T_PLAN_MAX); }
     const int ng = sm.ng;
     const int nx = (int) (2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS;
     const auto* xq = (const block_q8_1*) a.xq;
@@ -106,10 +119,19 @@ __global__ void __launch_bounds__(256) pk_moe_kernel(PkMoeArgs a, NativeExpertLa
     for (int it = blockIdx.x; it < nx * ng; it += gridDim.x) {
         const int bx = it % nx, by = it / nx;
         const int row = bx * GU2_ROWS + 2 * warp;
+        unsigned long long t0 = 0;
+        if (tr) { t0 = pk_now(); atomicMin(tr + PK_T_GU_FIRST, t0); }
         if (row < 2 * L.n_ff)
             gu2::pair<TG>((const uint8_t*) sm.gptr[by], row, sm.start[by], sm.start[by + 1], sm.tok, xq, L, gate, up,
                           s_grid, lane);
         __syncthreads();
+        if (tr) {
+            const unsigned long long t1 = pk_now();
+            atomicMax(tr + PK_T_GU_LAST, t1);
+            atomicMin(tr + PK_T_GU_END_MIN, t1);
+            atomicAdd(tr + PK_T_GU_BUSY, t1 - t0);
+            atomicAdd(tr + PK_T_GU_ITEMS, 1ull);
+        }
         if (tid == 0) red_release_add_gpu(done + by, 1u);
     }
 
@@ -121,6 +143,8 @@ __global__ void __launch_bounds__(256) pk_moe_kernel(PkMoeArgs a, NativeExpertLa
         const int g = it / nsp, sp = it - g * nsp;
         const int e0 = sm.start[g], e1 = sm.start[g + 1];
         __syncthreads();
+        unsigned long long tw0 = 0;
+        if (tr) tw0 = pk_now();
         if (g != g_staged) {
             if (tid == 0)
                 while (ld_acquire_gpu(done + g) < (unsigned) nx) __nanosleep(20);
@@ -128,6 +152,12 @@ __global__ void __launch_bounds__(256) pk_moe_kernel(PkMoeArgs a, NativeExpertLa
             dm_swiglu_q8(gate, up, e0, e1, (int) L.n_ff, sm.hq, tid);
             g_staged = g;
             __syncthreads();
+        }
+        unsigned long long td0 = 0;
+        if (tr) {
+            td0 = pk_now();
+            atomicAdd(tr + PK_T_SWIGLU_WAIT, td0 - tw0);
+            atomicMin(tr + PK_T_DOWN_FIRST, td0);
         }
 #pragma unroll
         for (int sb = 0; sb < SUB; ++sb)
@@ -143,6 +173,12 @@ __global__ void __launch_bounds__(256) pk_moe_kernel(PkMoeArgs a, NativeExpertLa
                 *(float4*) (a.parts + (size_t) sm.dst[e0 + e] * L.n_embd + r0) = *(const float4*) &sm.out[e * kPkSpan + c * 4];
         }
         __syncthreads();
+        if (tr) {
+            const unsigned long long t1 = pk_now();
+            atomicMax(tr + PK_T_DOWN_LAST, t1);
+            atomicAdd(tr + PK_T_DOWN_BUSY, t1 - td0);
+            atomicAdd(tr + PK_T_DOWN_ITEMS, 1ull);
+        }
         if (tid == 0) sm.last = pk_arrive(span + sp) + 1u == (unsigned) ng;
         __syncthreads();
         if (sm.last) {   // every group's rows of this span are in: the combine
@@ -151,10 +187,13 @@ __global__ void __launch_bounds__(256) pk_moe_kernel(PkMoeArgs a, NativeExpertLa
                     while (ld_acquire_gpu(a.sync + kPkSyncShared) == 0u) __nanosleep(32);
                 __syncthreads();
             }
+            if (tr) pk_tmax(tr, PK_T_SHARED_SEEN);
             pk_combine_span(a, L, sp, tid);
+            if (tr) pk_tmax(tr, PK_T_COMBINE_END);
             if (tid == 0) span[sp] = 0u;
         }
     }
+    if (tr) { pk_tmax(tr, PK_T_BLOCK_END); pk_tmin(tr, PK_T_BLOCK_END_MIN); }
     pdl_trigger();   // the next layer's read may start on the SMs this launch leaves (every shared-row wait is past)
     // the last block to arrive zeroes the counters for the next launch
     __syncthreads();

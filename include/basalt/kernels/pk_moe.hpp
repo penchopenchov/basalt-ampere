@@ -29,6 +29,14 @@ struct PkMoeArgs {
     unsigned int* sync = nullptr;                ///< device: kPkSyncWords zeroed words
     /// the shared rows are final once sync[1] is nonzero (pk_moe_shared_done); false: they are final at launch
     bool shared_flag = false;
+    unsigned long long* trace = nullptr;         ///< device: PK_T_SLOTS words of stage stamps, or null
+};
+
+/// Stage-stamp slots of PkMoeArgs::trace (device nanosecond clock; *_MIN slots start at ~0, the rest at 0).
+enum PkTrace {
+    PK_T_ENTRY_MIN, PK_T_ENTRY_MAX, PK_T_WAIT_MIN, PK_T_WAIT_MAX, PK_T_PLAN_MIN, PK_T_PLAN_MAX, PK_T_GU_FIRST, PK_T_GU_LAST,
+    PK_T_GU_END_MIN, PK_T_GU_BUSY, PK_T_GU_ITEMS, PK_T_DOWN_FIRST, PK_T_DOWN_LAST, PK_T_DOWN_BUSY, PK_T_DOWN_ITEMS,
+    PK_T_SWIGLU_WAIT, PK_T_SHARED_SEEN, PK_T_COMBINE_END, PK_T_BLOCK_END, PK_T_BLOCK_END_MIN, PK_T_SLOTS
 };
 
 /// Whether pk_moe_experts covers L.
