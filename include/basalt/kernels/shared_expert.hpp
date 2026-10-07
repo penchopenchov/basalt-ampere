@@ -38,10 +38,6 @@ struct NativeSharedWeights {
     const void* up_data = nullptr;
     const void* down_data = nullptr;
     void* q8_1 = nullptr;
-    const void* x_q8_1 = nullptr;   // optional pre-quantized Q8_1 input for gate/up in shared_expert_multi
-    /// shared_expert_multi leaves out the scalar gate (its GEMV and the sigmoid scale of the output): the caller
-    /// computes the gate itself and the output stays unscaled
-    bool defer_gate = false;
 };
 
 /// Bytes of caller-owned scratch `shared_expert` needs.  **THE KERNEL ALLOCATES NOTHING**:

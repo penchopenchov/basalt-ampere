@@ -100,10 +100,8 @@ struct DecMoe {
     void* pscr = nullptr;
     unsigned int* parr = nullptr;
     int pblocks = 0;
-    int ptg = 0, ptd = 0;   // the formats every layer shares, for the peer kernel's specialised build (0: mixed)
     bool pq2 = false;   // a layer's gate/up is Q2_0: the peer kernel's Q2_0 build
     bool peer_live = false;                  ///< a peer window was launched and not yet waited for
-    int peer_p2 = 0;                         ///< DmPeerArgs::p2 (the peer2_* gates)
     // pinned staging of the residency uploads (gate host_pin): the copies take their source from here, so the call does
     // not wait for the stream; a ring of slots, each reused only after the window's stream sync
     uint8_t* pin = nullptr;
@@ -371,18 +369,7 @@ bool Verifier::dm_init(std::string& err) {
             ls[(size_t) l] = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             d->pq2 |= f.gu_type == 42;
         }
-        if (exp_flag("peer3_spec", 0) != 0) {
-            const auto& f0 = lay.fmt[0];
-            bool same = true;
-            for (int64_t l = 0; l < g.n_layers; ++l)
-                same &= lay.fmt[(size_t) l].gu_type == f0.gu_type && lay.fmt[(size_t) l].d_type == f0.d_type;
-            if (same) { d->ptg = f0.gu_type; d->ptd = f0.d_type; }
-            std::map<int, int> pairs;
-            for (int64_t l = 0; l < g.n_layers; ++l) ++pairs[lay.fmt[(size_t) l].gu_type * 100 + lay.fmt[(size_t) l].d_type];
-            for (const auto& pr : pairs) std::fprintf(stderr, "basalt verify: peer formats %d x gate/up %d down %d\n", pr.second, pr.first / 100, pr.first % 100);
-            std::fprintf(stderr, "basalt verify: peer kernel %s\n", same ? "specialised" : "generic");
-        }
-        d->pblocks = dec_moe_peer_blocks(d->pq2, d->ptg, d->ptd);
+        d->pblocks = dec_moe_peer_blocks(d->pq2);
         ok = d->pblocks > 0 && cudaStreamCreateWithFlags(&d->ps, cudaStreamNonBlocking) == cudaSuccess &&
              cudaMalloc((void**) &d->ptab, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab, 0, (size_t) LE * 8) == cudaSuccess &&
@@ -391,14 +378,9 @@ bool Verifier::dm_init(std::string& err) {
              cudaMalloc(&d->pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
-        d->peer_p2 = (exp_flag("peer2_grid", 0) != 0 ? 1 : 0) | (exp_flag("peer2_dpf", 0) != 0 ? 2 : 0) |
-                     (exp_flag("peer2_grp", 0) != 0 ? 4 : 0) | (exp_flag("peer2_poll", 0) != 0 ? 8 : 0) |
-                     ((int) exp_flag("peer3_warm", 0) << 4);
-        d->tag = exp_flag("tail_tag", 1) != 0;
-        if (d->tag) {
-            d->rows_words = (size_t) (T * K * N);
-            for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
-        }
+        d->tag = true;
+        d->rows_words = (size_t) (T * K * N);
+        for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
     }
@@ -981,7 +963,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork[2] = {false, false};   // the group's ring stream is joined in post
-    bool sh_gate_deferred[2] = {false, false};   // the shared expert's gate is left to the combine
     bool glue_on[2] = {false, false};   // post's gate/up launch plans the group's VRAM share
     DmRouteArgs glue_ring[2];   // the ring's work for post's gate/up launch
     auto pre = [&](int64_t l, int grp) -> bool {
@@ -1593,7 +1574,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
         if (dm) {   // the tiers, CUDA0's plan, the q8_1 rows and the rings in one launch
-            static const int bell_fast = (int) basalt::core::exp_flag("peer3_bell", 0);
             DmRouteArgs ra;
             ra.ids = ids_ + tb * K; ra.x = xm; ra.n_tok = n; ra.k = (int) K; ra.n_embd = (int) N;
             ra.n_expert = (int) g.n_expert; ra.layer = (int) l;
@@ -1608,7 +1588,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
-            ra.fast = bell_fast;
             PdlScope pr(false);   // after the router's kernel: a plain launch
             if (glue_on[grp]) {   // the ring's work inside post's gate/up launch
                 glue_ring[grp] = ra;
@@ -1660,26 +1639,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
-            // the read's q8_1 rows serve the shared gate/up, and the scalar gate runs on the ring's idle stream; its
-            // scale is applied in the combine
-            static const int x_sh = (int) basalt::core::exp_flag("moe_sh", 0);   // bit 0: the read's q8_1 rows, bit 1: the gate
-            const bool sh_side = x_sh != 0 && glue_on[grp] && sh_fork && ring_hi_ != nullptr && shared_expert_native_bf16_enabled();
-            if (sh_side && (x_sh & 1)) nsw.x_q8_1 = nat_xq_ + (size_t) tb * (N / 32) * 36;
-            if (sh_side && (x_sh & 2)) {
-                nsw.defer_gate = true;
-                cudaEventRecord(ev_ring_, cs);
-                cudaStreamWaitEvent(ring_hi_, ev_ring_, 0);
-                {
-                    PdlScope pp(false);
-                    if (n > 1) bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wgi->data, sh_g_ + tb, 1, N, 1, n, ring_hi_);
-                    else bf16_gemv_fp32_mmvf(xm, (const uint16_t*) wgi->data, sh_g_ + tb, N, 1, ring_hi_);
-                }
-                cudaEventRecord(ev_ring_join_, ring_hi_);
-                ring_fork[grp] = true;
-                sh_gate_deferred[grp] = true;
-            } else {
-                sh_gate_deferred[grp] = false;
-            }
             {
             if (!shared_expert_native_bf16_enabled()) {
                 f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
@@ -1814,7 +1773,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
                                 shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs, true,
-                                sh_gate_deferred[grp] ? sh_g_ + tb : nullptr,
                                 dm_->tag && dm_->wstat == nullptr ? dm_->m_w + 16 : nullptr);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else if (n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
@@ -2417,9 +2375,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
             pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
             pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
-            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32; pa.p2 = dm_->peer_p2;
+            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
             if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
-                !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2, dm_->ptg, dm_->ptd)) {
+                !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
                 err = "verify: the peer window did not launch";
                 return false;
             }

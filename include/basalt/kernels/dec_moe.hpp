@@ -65,8 +65,6 @@ struct DmRouteArgs {
     float* sh_part = nullptr;        ///< device: its gate's partial sums, n_embd / 256 per token in order
     unsigned long long* stats = nullptr;   ///< DM_WAIT_STATS (kDmStatWords, device) or null: the doorbell's time
     int peer_cap = 0;                ///< PEER_CAP: the peer's groups past this many go to the CPU pool (0: no cap)
-    int fast = 0;                    ///< peer3_bell: bit 0 no fence between the stats stamp and the doorbell, 1 the q8_1 rows
-                                     ///< to mapped memory before the tiers are known, 2 no fence after the doorbell
     bool kinds = false;              ///< mode 2: also every entry's tier into plan->kind and counts[2], counts[3]
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
@@ -88,9 +86,6 @@ struct DmGlueArgs {
     /// copied from xq) instead of a route launch
     bool ring_on = false;
     DmRouteArgs ring;
-    /// The SwiGLU pass runs inside the gate/up launch (the last block to finish a group's rows does the group's), and
-    /// each down block waits for its group only, instead of for a SwiGLU launch.
-    bool fuse = false;
 };
 /// Whether dec_moe_glue covers L (the DEC_GU2=2 chain's formats and settings).
 bool dec_moe_glue_ok(const NativeExpertLayout& L);
@@ -112,7 +107,6 @@ struct DmPeerArgs {
     void* scratch = nullptr;                     ///< peer device: dec_moe_peer_scratch_bytes
     unsigned int* arrive = nullptr;              ///< peer device: 4 words zeroed before the launch (arrivals, barrier, abort)
     unsigned long long* stamps_m = nullptr;      ///< tests: block 0's phase times per ring (8 each), or null
-    int p2 = 0;                                  ///< gates: 1 codebook kept in shared memory across rings, 2 down rows prefetched to L2, 4 fast grouping, 8 staggered doorbell reads
     int gu2 = 0;                                 ///< the grid formats' gate/up two rows a warp (DEC_GU2 sets it)
     uint32_t* diag_m = nullptr;                  ///< mapped, kDmDiagWords zeroed words: the abort record, or null
 };
@@ -125,13 +119,12 @@ constexpr int kDmDiagWords = 16;
 std::string dec_moe_peer_diag(const uint32_t* diag);
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff);
 /// Blocks the peer kernel runs with on the current device (all co-resident); 0 when it cannot run there.  q2: the
-/// kernel for a model with Q2_0 gate/up layers; tg/td: the formats every layer shares (the kernel specialised to
-/// them), 0 for the generic kernel (as dec_moe_peer_launch's).
-int dec_moe_peer_blocks(bool q2 = false, int tg = 0, int td = 0);
+/// kernel for a model with Q2_0 gate/up layers.
+int dec_moe_peer_blocks(bool q2 = false);
 /// Whether the persistent kernels cover this layer's expert formats.
 bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Launches the peer window (cooperative) on `stream` of the current device; false on a launch error.
-bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2 = false, int tg = 0, int td = 0);
+bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2 = false);
 
 /// DM_WAIT_STATS: per layer, the times of the doorbell, CUDA0's own work done and each tier landed (CUDA0's
 /// clock), summed per peer-entry count and per layer.  Words: [0, 4) the layer's times; kDmStatBucket + 8 b + j for
@@ -172,16 +165,13 @@ void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long lon
 /// entry i at row i of each), summed with the router weights in native_moe_combine_multi's order, plus `shared`.
 /// With peer_done_m, every block first waits for the tiers the plan uses (peer_done_m / host_flag_m >= ring); null:
 /// dec_moe_wait ran before it.  Built with native_moe.cu's math.  `dep` (DEC_GLUE & 4, null words): a
-/// programmatic dependent of a dec_moe_wait launched with `trigger`.  `shared_gate` (null words only): the shared
-/// row is scaled by sigmoid of its token's entry here, as sigmoid_scale_rows_kernel scales it.  `tag_done` (null
-/// words, dep): the peer's rows carry their own arrival, a row dword still holding dec_moe_tag_word() is not yet
+/// programmatic dependent of a dec_moe_wait launched with `trigger`.  `tag_done` (null words, dep): the peer's rows carry their own arrival, a row dword still holding dec_moe_tag_word() is not yet
 /// written; the combine polls them (tag_done >= ring ends the poll for a released window) and restores the word after
 /// reading, so dec_moe_wait runs with `skip_peer`.
 constexpr uint32_t dec_moe_tag_word() { return 0x7fa5a5a5u; }
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
-                     void* stream, bool dep = false, const float* shared_gate = nullptr,
-                     const volatile uint32_t* tag_done = nullptr);
+                     void* stream, bool dep = false, const volatile uint32_t* tag_done = nullptr);
 
 }  // namespace basalt::kernels

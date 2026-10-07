@@ -126,7 +126,7 @@ __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* 
 template<int KM, bool DEP, bool TAG = false>
 __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                    const DmPlan* __restrict__ plan, const float* __restrict__ weights,
-                                   const float* __restrict__ shared, const float* __restrict__ shared_gate,
+                                   const float* __restrict__ shared,
                                    float* __restrict__ output, int64_t n_embd, int k,
                                    const volatile uint32_t* tag_done = nullptr, uint32_t ring = 0) {
     __shared__ int s_kind[16];
@@ -150,10 +150,6 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
         }
     }
     float4 h = shared ? *reinterpret_cast<const float4*>(shared + tk * n_embd + col) : make_float4(0.f, 0.f, 0.f, 0.f);
-    if (shared && shared_gate) {   // sigmoid_scale_rows_kernel's scale, rounded before the add
-        const float gt = __fdividef(1.0f, 1.0f + __expf(-shared_gate[tk]));
-        h.x = __fmul_rn(h.x, gt); h.y = __fmul_rn(h.y, gt); h.z = __fmul_rn(h.z, gt); h.w = __fmul_rn(h.w, gt);
-    }
     if constexpr (DEP) pdl_wait();
 #pragma unroll
     for (int j = 0; j < KM; ++j) {
@@ -197,7 +193,7 @@ constexpr bool dm_combine4_on() { return true; }
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
-                     void* stream, bool dep, const float* shared_gate, const volatile uint32_t* tag_done) {
+                     void* stream, bool dep, const volatile uint32_t* tag_done) {
     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
         throw std::invalid_argument("dec_moe_combine requires a stream, width, 1..15 experts, tokens");
     if (dm_combine4_on() && peer_done_m == nullptr && n_embd % 4 == 0 && k <= 10) {
@@ -213,20 +209,19 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         const int ki = int(k);
         if (dep && tag_done != nullptr)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki, tag_done, ring);
+                                      shared, output, n_embd, ki, tag_done, ring);
         else if (dep)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki,
+                                      shared, output, n_embd, ki,
                                       (const volatile uint32_t*) nullptr, 0u);
         else
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki,
+                                      shared, output, n_embd, ki,
                                       (const volatile uint32_t*) nullptr, 0u);
         const auto error = cudaGetLastError();
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
         return;
     }
-    if (shared_gate) throw std::invalid_argument("dec_moe_combine: a shared gate needs the wait-free combine");
     dm_combine_kernel<<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0,
                         static_cast<cudaStream_t>(stream)>>>(parts, peer_rows_m, cpu_rows_m, plan, weights, shared,
                                                              output, n_embd, int(k), peer_done_m, host_flag_m, ring);

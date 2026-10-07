@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
             K::dec_moe_wait(plan, m_w + 16, m_flag, (uint32_t) (l + 1), cs, nullptr, l, true);
         }
         K::dec_moe_combine(parts, m_rows, m_rows, plan, wts, shared, out_ref, N, KT, T, nullptr, nullptr, (uint32_t) (l + 1), cs,
-                           with_wait, nullptr);
+                           with_wait);
     };
     unsigned long long* d_trace = dalloc<unsigned long long>(K::PK_T_SLOTS);
     bool tracing = false;
