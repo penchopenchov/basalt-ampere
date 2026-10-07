@@ -416,6 +416,11 @@ target_include_directories(shared_expert_parity PRIVATE ${_gpu_include_directori
 target_link_libraries(shared_expert_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
 
+# the MoE half of a decode layer: the engine's launch sequence against the persistent experts kernel (GPU, synthetic)
+add_executable(pk_moe_bench src/kernels/pk_moe_bench.cpp)
+target_include_directories(pk_moe_bench PRIVATE ${_gpu_include_directories})
+target_link_libraries(pk_moe_bench PRIVATE kernels ${_gpu_runtime_target})
+
 add_executable(hc_fused_parity src/kernels/hc_fused_parity.cpp)
 target_include_directories(hc_fused_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(hc_fused_parity PRIVATE kernels ${_gpu_runtime_target})
