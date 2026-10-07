@@ -2595,7 +2595,8 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         bool up = false;
         const bool down = cn_maps(L.a, L.tm, up);
         L.tma = down ? 1 : 0;
-        L.up_tma = up ? 1 : 0;
+        static const int x_hce = (int) core::exp_flag("hc3_early", 0);
+        L.up_tma = up ? ((x_hce & 2) ? 2 : 1) : 0;
         L.late_w = 0;
     }
     L.pre8 = std::min(3, NSTAGE);

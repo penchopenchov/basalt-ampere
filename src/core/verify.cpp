@@ -1084,7 +1084,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         {
             // the read's first kernel follows a combine, copy or wait: a plain launch, except after the device-planned
             // tail's combine kernel (PDL2)
-            const bool after_kernel = (pdl2_mask() & 32) && pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
+            static const int x_hce = (int) basalt::core::exp_flag("hc3_early", 0);
+            const bool after_kernel = ((pdl2_mask() & 32) || (x_hce & 1)) && pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
             PdlScope ps(pdl, !after_kernel);
             if (dec_hc) {
                 HcFusedArgs h = hc_args(0, pending, inj2_, inj_);

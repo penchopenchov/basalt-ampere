@@ -23,6 +23,7 @@
 #include "basalt/kernels/native_moe.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/core/diag.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
@@ -128,8 +129,10 @@ template<int KM, bool DEP>
 __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                    const DmPlan* __restrict__ plan, const float* __restrict__ weights,
                                    const float* __restrict__ shared, const float* __restrict__ shared_gate,
-                                   float* __restrict__ output, int64_t n_embd, int k) {
+                                   float* __restrict__ output, int64_t n_embd, int k, int early) {
     __shared__ int s_kind[16];
+    // early: the next kernel (the hc read) may start its blocks and stage weights while this one waits
+    if (DEP && early) pdl_launch_dependents();
     const int64_t tk = blockIdx.y;
     if (threadIdx.x < k) s_kind[threadIdx.x] = plan->kind[tk * k + threadIdx.x];
     __syncthreads();
@@ -191,12 +194,13 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         cfg.attrs = at;
         cfg.numAttrs = dep ? 1 : 0;
         const int ki = int(k);
+        static const int x_early = (int) basalt::core::exp_flag("hc3_early", 0) & 1;
         if (dep)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki);
+                                      shared, shared_gate, output, n_embd, ki, x_early);
         else
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki);
+                                      shared, shared_gate, output, n_embd, ki, x_early);
         const auto error = cudaGetLastError();
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
         return;
