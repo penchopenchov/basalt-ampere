@@ -125,11 +125,12 @@ __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* 
 // DEC_GLUE & 4: the same sums, four columns a thread with every row loaded before the first add; DEP: a
 // programmatic dependent of dec_moe_wait - CUDA0's rows, the weights and the shared row (all final once the wait
 // kernel runs) are loaded before pdl_wait, only the mapped tiers' rows after it
-template<int KM, bool DEP>
+template<int KM, bool DEP, bool TAG = false>
 __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                    const DmPlan* __restrict__ plan, const float* __restrict__ weights,
                                    const float* __restrict__ shared, const float* __restrict__ shared_gate,
-                                   float* __restrict__ output, int64_t n_embd, int k, int early, int late) {
+                                   float* __restrict__ output, int64_t n_embd, int k, int early, int late,
+                                   const volatile uint32_t* tag_done = nullptr, uint32_t ring = 0) {
     __shared__ int s_kind[16];
     // early: the next kernel (the hc read) may start its blocks and stage weights while this one waits
     if (DEP && early) pdl_launch_dependents();
@@ -160,7 +161,25 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
         const int kd = s_kind[j];
-        if (kd != 0) v[j] = __ldcv(reinterpret_cast<const float4*>((kd == 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col));
+        if (TAG && kd == 2) {
+            // the row's own words say it arrived: poll until none is the tag word; a released window (tag_done past
+            // ring) ends the poll after one more read, with whatever the rows hold
+            float4* const src = const_cast<float4*>(reinterpret_cast<const float4*>(peer_rows + (tk * k + j) * n_embd + col));
+            constexpr unsigned tag = 0x7fa5a5a5u;
+            unsigned spins = 0;
+            bool rel = false;
+            while (true) {
+                const float4 r = __ldcv(src);
+                if (__float_as_uint(r.x) != tag && __float_as_uint(r.y) != tag && __float_as_uint(r.z) != tag &&
+                    __float_as_uint(r.w) != tag) {
+                    v[j] = r;
+                    break;
+                }
+                if (rel) { v[j] = r; break; }
+                if ((++spins & 63u) == 0u && *tag_done >= ring) { __threadfence_system(); rel = true; }
+            }
+            __stcs(src, make_float4(__uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag)));
+        } else if (kd != 0) v[j] = __ldcv(reinterpret_cast<const float4*>((kd == 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col));
         else if (late) {
             const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
             v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
@@ -184,7 +203,7 @@ constexpr bool dm_combine4_on() { return true; }
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
-                     void* stream, bool dep, const float* shared_gate) {
+                     void* stream, bool dep, const float* shared_gate, const volatile uint32_t* tag_done) {
     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
         throw std::invalid_argument("dec_moe_combine requires a stream, width, 1..15 experts, tokens");
     if (dm_combine4_on() && peer_done_m == nullptr && n_embd % 4 == 0 && k <= 10) {
@@ -200,12 +219,17 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         const int ki = int(k);
         static const int x_early = (int) basalt::core::exp_flag("hc3_early", 1) & 1;
         const int x_late = (basalt::kernels::pdls_bits() & 16) ? 1 : 0;
-        if (dep)
+        if (dep && tag_done != nullptr)
+            (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
+                                      shared, shared_gate, output, n_embd, ki, x_early, x_late, tag_done, ring);
+        else if (dep)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki, x_early, x_late);
+                                      shared, shared_gate, output, n_embd, ki, x_early, x_late,
+                                      (const volatile uint32_t*) nullptr, 0u);
         else
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki, x_early, x_late);
+                                      shared, shared_gate, output, n_embd, ki, x_early, x_late,
+                                      (const volatile uint32_t*) nullptr, 0u);
         const auto error = cudaGetLastError();
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
         return;

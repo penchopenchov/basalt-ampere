@@ -147,9 +147,11 @@ constexpr int kDmStatWords = kDmStatCpu + 16;
 std::string dec_moe_stats_text(const unsigned long long* w, double windows);
 
 /// CUDA0's spin until the tiers this layer uses have landed (the combine waits by itself; this one is for profiles).
-/// `trigger`: the next launch (a programmatic dependent) may start while this one waits.
+/// `trigger`: the next launch (a programmatic dependent) may start while this one waits.  `skip_peer`: the peer's
+/// rows are polled by the combine (its tag_done), so only the CPU pool's word is waited for.
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
-                  uint32_t ring, void* stream, unsigned long long* stats = nullptr, int layer = 0, bool trigger = false);
+                  uint32_t ring, void* stream, unsigned long long* stats = nullptr, int layer = 0, bool trigger = false,
+                  bool skip_peer = false);
 
 /// CUDA0's VRAM share of the plan in one launch (gate/up, SwiGLU, down; native_expert_grouped's rows bit for bit):
 /// entry e's row into row plan->dst[e] of `out`.  `sync`: kDmCap + 1 zeroed device words, left zeroed.
@@ -171,10 +173,15 @@ void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long lon
 /// With peer_done_m, every block first waits for the tiers the plan uses (peer_done_m / host_flag_m >= ring); null:
 /// dec_moe_wait ran before it.  Built with native_moe.cu's math.  `dep` (DEC_GLUE & 4, null words): a
 /// programmatic dependent of a dec_moe_wait launched with `trigger`.  `shared_gate` (null words only): the shared
-/// row is scaled by sigmoid of its token's entry here, as sigmoid_scale_rows_kernel scales it.
+/// row is scaled by sigmoid of its token's entry here, as sigmoid_scale_rows_kernel scales it.  `tag_done` (null
+/// words, dep): the peer's rows carry their own arrival, a row dword still holding dec_moe_tag_word() is not yet
+/// written; the combine polls them (tag_done >= ring ends the poll for a released window) and restores the word after
+/// reading, so dec_moe_wait runs with `skip_peer`.
+constexpr uint32_t dec_moe_tag_word() { return 0x7fa5a5a5u; }
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
-                     void* stream, bool dep = false, const float* shared_gate = nullptr);
+                     void* stream, bool dep = false, const float* shared_gate = nullptr,
+                     const volatile uint32_t* tag_done = nullptr);
 
 }  // namespace basalt::kernels

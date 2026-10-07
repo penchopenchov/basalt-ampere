@@ -88,6 +88,9 @@ struct DecMoe {
     uint8_t* h_xq = nullptr; uint8_t* m_xq = nullptr;
     uint32_t* h_w = nullptr; uint32_t* m_w = nullptr;
     float* h_rows = nullptr; float* m_rows = nullptr;
+    bool tag = false;       ///< the combine polls the peer's rows (each dword not yet written holds the tag word)
+    size_t rows_words = 0;
+    bool tag_dirty = false; ///< a released window may have left written rows behind
     size_t x_stride = 0, xq_stride = 0;      ///< per ring, floats / bytes
     // the peer card
     int pdev = -1;
@@ -227,6 +230,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     if (dm_ != nullptr) {   // the peer window stops at its next ring; CUDA0's waits on it pass
         *(volatile uint32_t*) (dm_->h_w + 0) = UINT32_MAX;
         *(volatile uint32_t*) (dm_->h_w + 16) = UINT32_MAX;
+        dm_->tag_dirty = true;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -390,6 +394,11 @@ bool Verifier::dm_init(std::string& err) {
         d->peer_p2 = (exp_flag("peer2_grid", 0) != 0 ? 1 : 0) | (exp_flag("peer2_dpf", 0) != 0 ? 2 : 0) |
                      (exp_flag("peer2_grp", 0) != 0 ? 4 : 0) | (exp_flag("peer2_poll", 0) != 0 ? 8 : 0) |
                      ((int) exp_flag("peer3_warm", 0) << 4);
+        d->tag = exp_flag("tail_tag", 0) != 0;
+        if (d->tag) {
+            d->rows_words = (size_t) (T * K * N);
+            for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
+        }
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
     }
@@ -1821,13 +1830,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (dm) {
             {
                 PdlScope pw(pdl && (basalt::kernels::pdls_bits() & 16));   // the tier wait polls during the down kernel
-                dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, true);
+                dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, true, dm_->tag && dm_->wstat == nullptr);
             }   // true: the combine is the wait's programmatic dependent
             stamp(l, 23, grp);
             try {
                 dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
                                 shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs, true,
-                                sh_gate_deferred[grp] ? sh_g_ + tb : nullptr);
+                                sh_gate_deferred[grp] ? sh_g_ + tb : nullptr,
+                                dm_->tag && dm_->wstat == nullptr ? dm_->m_w + 16 : nullptr);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else if (n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
@@ -2415,6 +2425,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         *(volatile uint32_t*) (dm_->h_w + 0) = 0;
         *(volatile uint32_t*) (dm_->h_w + 16) = 0;
         *(volatile uint32_t*) (dm_->h_w + 32) = 0;
+        if (dm_->tag && dm_->tag_dirty) {   // a released window left rows written: back to unwritten
+            for (size_t i = 0; i < dm_->rows_words; ++i)
+                ((volatile uint32_t*) dm_->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            dm_->tag_dirty = false;
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (dm_->pdev >= 0) {
             const OnDevice on(dm_->pdev);
