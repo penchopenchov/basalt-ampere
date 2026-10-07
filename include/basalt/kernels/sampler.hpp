@@ -71,12 +71,6 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
                           const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
                           void* scratch, int32_t* out_id, float* out_prob, void* stream);
 
-// The same with the selection path named: 0 the split sampler's stage (the reference), 1..3 the draft-only stage
-// with k read on the device and narrower warps.  `coupled_draft_sample` takes the path from the cpl_fast gate.
-void coupled_draft_sample_v(int variant, float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub,
-                            int id_vocab, const SamplerParams* params, int32_t* ring, int cap, int j,
-                            const int32_t* step_rec, void* scratch, int32_t* out_id, float* out_prob, void* stream);
-
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.
 // `tail` is what the state consumed before the window, `window[0]` the fed-back token and `window[1..]` the

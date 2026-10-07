@@ -430,9 +430,8 @@ void bench_sampled() {
     cudaStreamDestroy(s);
 }
 
-// `--coupled`: the draft-only coupled selection (variants 1..3 of coupled_draft_sample_v) against the split
-// sampler's stage (variant 0), bitwise on id, probability bits, ring entry and the penalised logits, and against
-// sample_tokens (the verify sampler) over the same logits; then a per-call time for each variant.
+// `--coupled`: the draft-only coupled selection against sample_tokens (the verify sampler) over the same penalised
+// logits (the id), and its ring entry; then a per-call time.
 int coupled_parity() {
     using namespace basalt::kernels;
     const int cap = 256, max_t = 8;
@@ -482,48 +481,30 @@ int coupled_parity() {
             const int32_t cell = (int32_t) (rng() % 100000);
             void* d_p = upload(&p, sizeof p);
             void* d_step = upload(&cell, 4);
-            int variant_id[4];
-            float variant_pr[4];
-            int variant_ring[4];
-            std::vector<float> variant_l[4];
-            for (int v = 0; v < 4; ++v) {
-                check(cudaMemcpy(d_l, l.data(), (size_t) nv * 4, cudaMemcpyHostToDevice), "logits");
-                void* d_ring = upload(ring.data(), ring.size() * 4);
-                coupled_draft_sample_v(v, d_l, nv, (const int32_t*) d_sub, (const int32_t*) d_inv, id_vocab,
-                                       (const SamplerParams*) d_p, (int32_t*) d_ring, cap, j, (const int32_t*) d_step,
-                                       d_scr, d_o, d_pr, s);
-                check(cudaStreamSynchronize(s), "sync");
-                check(cudaMemcpy(&variant_id[v], d_o, 4, cudaMemcpyDeviceToHost), "id");
-                check(cudaMemcpy(&variant_pr[v], d_pr, 4, cudaMemcpyDeviceToHost), "prob");
-                std::vector<int32_t> r2(ring.size());
-                check(cudaMemcpy(r2.data(), d_ring, r2.size() * 4, cudaMemcpyDeviceToHost), "ring");
-                variant_ring[v] = r2[(size_t) (cap + j)];
-                variant_l[v].resize((size_t) nv);
-                check(cudaMemcpy(variant_l[v].data(), d_l, (size_t) nv * 4, cudaMemcpyDeviceToHost), "l");
-                cudaFree(d_ring);
-            }
-            // the verify sampler over the penalised logits of the reference run, same counter, no further penalty
+            check(cudaMemcpy(d_l, l.data(), (size_t) nv * 4, cudaMemcpyHostToDevice), "logits");
+            void* d_ring = upload(ring.data(), ring.size() * 4);
+            coupled_draft_sample(d_l, nv, (const int32_t*) d_sub, (const int32_t*) d_inv, id_vocab,
+                                 (const SamplerParams*) d_p, (int32_t*) d_ring, cap, j, (const int32_t*) d_step, d_scr,
+                                 d_o, d_pr, s);
+            check(cudaStreamSynchronize(s), "sync");
+            int cid = 0;
+            check(cudaMemcpy(&cid, d_o, 4, cudaMemcpyDeviceToHost), "id");
+            std::vector<int32_t> r2(ring.size());
+            check(cudaMemcpy(r2.data(), d_ring, r2.size() * 4, cudaMemcpyDeviceToHost), "ring");
+            cudaFree(d_ring);
+            // the verify sampler over the penalised logits, same counter, no further penalty
             SamplerParams q = p;
             q.counter = (uint64_t) cell + 1;
             q.penalty_last_n = 0;
-            check(cudaMemcpy(d_l, variant_l[0].data(), (size_t) nv * 4, cudaMemcpyHostToDevice), "logits");
             sample_tokens(d_l, 1, nv, nullptr, 0, q, d_o, s);
             check(cudaStreamSynchronize(s), "sync");
             int vid = 0;
             check(cudaMemcpy(&vid, d_o, 4, cudaMemcpyDeviceToHost), "id");
             ++ncase;
-            bool ok = variant_id[0] == vid + 25;
-            for (int v = 1; v < 4; ++v) {
-                uint32_t a, b;
-                std::memcpy(&a, &variant_pr[0], 4);
-                std::memcpy(&b, &variant_pr[v], 4);
-                ok = ok && variant_id[v] == variant_id[0] && a == b && variant_ring[v] == variant_ring[0] &&
-                     std::memcmp(variant_l[v].data(), variant_l[0].data(), (size_t) nv * 4) == 0;
-            }
+            const bool ok = cid == vid + 25 && r2[(size_t) (cap + j)] == cid;
             if (!ok) {
                 ++nfail;
-                std::printf("  FAIL nv %d case %d: ids %d %d %d %d verify %d\n", nv, c, variant_id[0], variant_id[1],
-                            variant_id[2], variant_id[3], vid + 25);
+                std::printf("  FAIL nv %d case %d: id %d verify %d\n", nv, c, cid, vid + 25);
             }
             cudaFree(d_p);
             cudaFree(d_step);
@@ -544,26 +525,25 @@ int coupled_parity() {
             void* d_p = upload(&p, sizeof p);
             int32_t cell = 9;
             void* d_step = upload(&cell, 4);
-            for (int v = 0; v < 4; ++v) {
+            {
                 cudaEvent_t e0, e1;
                 check(cudaEventCreate(&e0), "ev");
                 check(cudaEventCreate(&e1), "ev");
                 const int iters = 200;
-                for (int w = 0; w < 5; ++w)
-                    coupled_draft_sample_v(v, d_l, nv, (const int32_t*) d_sub, (const int32_t*) d_inv, id_vocab,
-                                           (const SamplerParams*) d_p, (int32_t*) d_ring, cap, 0, (const int32_t*) d_step,
-                                           d_scr, d_o, d_pr, s);
+                auto call = [&] {
+                    coupled_draft_sample(d_l, nv, (const int32_t*) d_sub, (const int32_t*) d_inv, id_vocab,
+                                         (const SamplerParams*) d_p, (int32_t*) d_ring, cap, 0, (const int32_t*) d_step,
+                                         d_scr, d_o, d_pr, s);
+                };
+                for (int w = 0; w < 5; ++w) call();
                 check(cudaEventRecord(e0, s), "rec");
-                for (int it = 0; it < iters; ++it)
-                    coupled_draft_sample_v(v, d_l, nv, (const int32_t*) d_sub, (const int32_t*) d_inv, id_vocab,
-                                           (const SamplerParams*) d_p, (int32_t*) d_ring, cap, 0, (const int32_t*) d_step,
-                                           d_scr, d_o, d_pr, s);
+                for (int it = 0; it < iters; ++it) call();
                 check(cudaEventRecord(e1, s), "rec");
                 check(cudaEventSynchronize(e1), "sync");
                 float ms = 0.0f;
                 check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
-                std::printf("  bench: coupled sample nv %d variant %d: %7.1f us per call (penalize+select+merge, %.0f KB read)\n",
-                            nv, v, 1000.0 * (double) ms / iters, nv * 4.0 / 1024.0);
+                std::printf("  bench: coupled sample nv %d: %7.1f us per call (penalize+select+merge, %.0f KB read)\n",
+                            nv, 1000.0 * (double) ms / iters, nv * 4.0 / 1024.0);
                 cudaEventDestroy(e0);
                 cudaEventDestroy(e1);
             }

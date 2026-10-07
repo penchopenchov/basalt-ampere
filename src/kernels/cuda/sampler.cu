@@ -713,45 +713,6 @@ __global__ void coupled_penalize_kernel(float* __restrict__ logits, int nv, cons
     }
 }
 
-/// The merge of `sampler_split_merge_kernel` (lists of `kpart` entries, the request's top_k taken from them), then
-/// `sampled_tail_warp` with the counter of the row that will verify this draft.  Lane 0 maps the pick to its token
-/// id, writes it and its probability, and appends it to the ring for the next draft's penalty window.
-__global__ void __launch_bounds__(32)
-coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kpart,
-                     const SamplerParams* __restrict__ dp, const int* __restrict__ step_rec,
-                     const int* __restrict__ sub_to_id, int* __restrict__ ring, int cap, int j, int* __restrict__ out_id,
-                     float* __restrict__ out_prob) {
-    const int lane = (int) threadIdx.x;
-    SamplerParams p = *dp;
-    p.counter = basalt::core::coupled_draft_counter((int64_t) step_rec[0]);
-    const int k = sampled_k(p.top_k, nv);    // <= kpart: the first k of a union lie in the first k of each list
-    __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
-    __shared__ int sel_ids[kSelMax];
-    __shared__ float sel_logit[kSelMax];
-    __shared__ double ex[kSelMax];
-    __shared__ int pick[1];
-    __shared__ float prob[1];
-    for (int e = lane; e < n_blocks * kpart; e += 32) lists[e] = cand[e];
-    __syncwarp();
-    warp_merge_lists(lists, n_blocks, kpart, k, nv, [&](int i, float v, int id) {
-        if (lane == 0) { sel_ids[i] = id < nv ? id : 0; sel_logit[i] = v; }
-    });
-    __syncwarp();
-    if (p.greedy || p.temperature <= 0.0f) {   // never launched for greedy requests; the argmax, defensively
-        if (lane == 0) { pick[0] = sel_ids[0]; prob[0] = 1.0f; }
-    } else {
-        sampled_tail_warp<true>(sel_ids, sel_logit, k, p, 0, pick, ex, prob);
-    }
-    __syncwarp();
-    if (lane == 0) {
-        const int s = pick[0];
-        const int id = sub_to_id != nullptr ? sub_to_id[s] : s;
-        *out_id = id;
-        *out_prob = prob[0];
-        ring[cap + j] = id;
-    }
-}
-
 /// Draft-only selection stage: the same exact top-k of every block's logits as `sampler_split_part_kernel`, but
 /// with the request's own k (read from the device copy of the chain) instead of the widest list, and narrower
 /// warps (`kPer` logits per lane, `kWarps` warps per block) so every round scans less and more warps run.  The
@@ -803,11 +764,13 @@ coupled_part_kernel(const float* __restrict__ l, int n_vocab, const SamplerParam
     }
 }
 
-/// `coupled_merge_kernel` reading only the first k entries of each block list.
+/// The merge of the block lists (the first k entries of each, the request's top_k), then `sampled_tail_warp` with the
+/// counter of the row that will verify this draft.  Lane 0 maps the pick to its token id, writes it and its
+/// probability, and appends it to the ring for the next draft's penalty window.
 __global__ void __launch_bounds__(32)
-coupled_merge_fast_kernel(const int2* __restrict__ cand, int n_blocks, int nv, const SamplerParams* __restrict__ dp,
-                          const int* __restrict__ step_rec, const int* __restrict__ sub_to_id, int* __restrict__ ring,
-                          int cap, int j, int* __restrict__ out_id, float* __restrict__ out_prob) {
+coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, const SamplerParams* __restrict__ dp,
+                     const int* __restrict__ step_rec, const int* __restrict__ sub_to_id, int* __restrict__ ring,
+                     int cap, int j, int* __restrict__ out_id, float* __restrict__ out_prob) {
     const int lane = (int) threadIdx.x;
     SamplerParams p = *dp;
     p.counter = basalt::core::coupled_draft_counter((int64_t) step_rec[0]);
@@ -1048,7 +1011,6 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 
 namespace {
 int coupled_blocks(int nv) { return (nv + kSplitBlockSpan - 1) / kSplitBlockSpan; }
-int coupled_kpart(int nv) { return nv < kSelMax ? nv : kSelMax; }
 void coupled_check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -1069,11 +1031,11 @@ void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapp
     coupled_check("coupled_draft_stage");
 }
 
-void coupled_draft_sample_v(int variant, float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub,
-                            int id_vocab, const SamplerParams* params, int32_t* ring, int cap, int j,
-                            const int32_t* step_rec, void* scratch, int32_t* out_id, float* out_prob, void* stream) {
+void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
+                          const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
+                          void* scratch, int32_t* out_id, float* out_prob, void* stream) {
     const cudaStream_t s = (cudaStream_t) stream;
-    const int n_blocks = coupled_blocks(nv), kpart = coupled_kpart(nv);
+    const int n_blocks = coupled_blocks(nv);
     if (nv <= 0 || n_blocks > kSplitMaxBlocks || scratch == nullptr) {
         std::fprintf(stderr, "coupled_draft_sample: %d logits need scratch and at most %d blocks\n", nv, kSplitMaxBlocks);
         std::exit(1);
@@ -1081,35 +1043,13 @@ void coupled_draft_sample_v(int variant, float* logits, int nv, const int32_t* s
     coupled_penalize_kernel<<<1, 1024, (unsigned) ((nv + 31) / 32) * sizeof(unsigned), s>>>(logits, nv, id_to_sub,
                                                                                            id_vocab, params, ring, cap, j);
     coupled_check("coupled_penalize");
-    if (variant <= 0) {
-        // the selection of the split sampler, unchanged: every 4,096-logit block's first `kpart` (the widest list,
-        // since the request's top_k is only known on the device), penalties already applied above
-        sampler_split_part_kernel<<<dim3((unsigned) n_blocks, 1u), kSplitWarps * 32, 0, s>>>(
-            logits, nv, nullptr, 0, SamplerParams{}, kpart, n_blocks, (int2*) scratch);
-        coupled_check("coupled_draft split part");
-        coupled_merge_kernel<<<1, 32, 0, s>>>((const int2*) scratch, n_blocks, nv, kpart, params, step_rec, sub_to_id,
-                                              ring, cap, j, out_id, out_prob);
-        coupled_check("coupled_draft merge");
-        return;
-    }
-    // block span 4,096 in every variant, so the scratch bound is the same
+    // the block span is 4,096, so the scratch bound is that of the split sampler
     int2* cand = (int2*) scratch;
-    const unsigned nb = (unsigned) n_blocks;
-    if (variant == 1) coupled_part_kernel<8, 16><<<nb, 512, 0, s>>>(logits, nv, params, cand);
-    else if (variant == 2) coupled_part_kernel<16, 8><<<nb, 256, 0, s>>>(logits, nv, params, cand);
-    else coupled_part_kernel<32, 4><<<nb, 128, 0, s>>>(logits, nv, params, cand);
+    coupled_part_kernel<8, 16><<<(unsigned) n_blocks, 512, 0, s>>>(logits, nv, params, cand);
     coupled_check("coupled_draft part");
-    coupled_merge_fast_kernel<<<1, 32, 0, s>>>(cand, n_blocks, nv, params, step_rec, sub_to_id, ring, cap, j, out_id,
-                                               out_prob);
+    coupled_merge_kernel<<<1, 32, 0, s>>>(cand, n_blocks, nv, params, step_rec, sub_to_id, ring, cap, j, out_id,
+                                          out_prob);
     coupled_check("coupled_draft merge");
-}
-
-void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
-                          const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
-                          void* scratch, int32_t* out_id, float* out_prob, void* stream) {
-    static const int variant = (int) basalt::core::exp_flag("cpl_fast", 1);
-    coupled_draft_sample_v(variant, logits, nv, sub_to_id, id_to_sub, id_vocab, params, ring, cap, j, step_rec, scratch,
-                           out_id, out_prob, stream);
 }
 
 }  // namespace basalt::kernels
