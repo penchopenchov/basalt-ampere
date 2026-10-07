@@ -94,10 +94,8 @@ namespace {
 __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                   const DmPlan* __restrict__ plan, const float* __restrict__ weights,
                                   const float* __restrict__ shared, float* __restrict__ output, int64_t n_embd, int k,
-                                  const volatile uint32_t* peer_done, const volatile uint32_t* host_flag, uint32_t ring,
-                                  int early) {
+                                  const volatile uint32_t* peer_done, const volatile uint32_t* host_flag, uint32_t ring) {
     __shared__ int s_kind[16];
-    if (early) pdl_launch_dependents();   // the next hc read may stage its weights
     const int64_t tk = blockIdx.y;
     if (threadIdx.x == 0 && peer_done != nullptr) {
         if (plan->counts[2] > 0) while (*peer_done < ring) __nanosleep(100);
@@ -129,11 +127,11 @@ template<int KM, bool DEP, bool TAG = false>
 __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                    const DmPlan* __restrict__ plan, const float* __restrict__ weights,
                                    const float* __restrict__ shared, const float* __restrict__ shared_gate,
-                                   float* __restrict__ output, int64_t n_embd, int k, int early, int late,
+                                   float* __restrict__ output, int64_t n_embd, int k,
                                    const volatile uint32_t* tag_done = nullptr, uint32_t ring = 0) {
     __shared__ int s_kind[16];
-    // early: the next kernel (the hc read) may start its blocks and stage weights while this one waits
-    if (DEP && early) pdl_launch_dependents();
+    // the next kernel (the hc read) may start its blocks and stage weights while this one waits
+    if (DEP) pdl_launch_dependents();
     const int64_t tk = blockIdx.y;
     if (threadIdx.x < k) s_kind[threadIdx.x] = plan->kind[tk * k + threadIdx.x];
     __syncthreads();
@@ -146,7 +144,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
         w[j] = weights[j];
-        if (s_kind[j] == 0 && !late) {   // late: the wait kernel may start before the down kernel ends
+        if (s_kind[j] == 0) {
             const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
             v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
         }
@@ -180,10 +178,6 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
             }
             __stcs(src, make_float4(__uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag)));
         } else if (kd != 0) v[j] = __ldcv(reinterpret_cast<const float4*>((kd == 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col));
-        else if (late) {
-            const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
-            v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
-        }
     }
     float sx = v[0].x * w[0], sy = v[0].y * w[0], sz = v[0].z * w[0], sw = v[0].w * w[0];
 #pragma unroll
@@ -217,18 +211,16 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         cfg.attrs = at;
         cfg.numAttrs = dep ? 1 : 0;
         const int ki = int(k);
-        static const int x_early = (int) basalt::core::exp_flag("hc3_early", 1) & 1;
-        const int x_late = (basalt::kernels::pdls_bits() & 16) ? 1 : 0;
         if (dep && tag_done != nullptr)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki, x_early, x_late, tag_done, ring);
+                                      shared, shared_gate, output, n_embd, ki, tag_done, ring);
         else if (dep)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki, x_early, x_late,
+                                      shared, shared_gate, output, n_embd, ki,
                                       (const volatile uint32_t*) nullptr, 0u);
         else
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki, x_early, x_late,
+                                      shared, shared_gate, output, n_embd, ki,
                                       (const volatile uint32_t*) nullptr, 0u);
         const auto error = cudaGetLastError();
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
@@ -237,8 +229,7 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
     if (shared_gate) throw std::invalid_argument("dec_moe_combine: a shared gate needs the wait-free combine");
     dm_combine_kernel<<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0,
                         static_cast<cudaStream_t>(stream)>>>(parts, peer_rows_m, cpu_rows_m, plan, weights, shared,
-                                                             output, n_embd, int(k), peer_done_m, host_flag_m, ring,
-                                                             pdl2_mask() & 32);
+                                                             output, n_embd, int(k), peer_done_m, host_flag_m, ring);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

@@ -1098,10 +1098,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         {
             // the read's first kernel follows a combine, copy or wait: a plain launch, except after the device-planned
             // tail's combine kernel (PDL2)
-            static const int x_hce = (int) basalt::core::exp_flag("hc3_early", 1);
-            static const int x_ps = (basalt::kernels::pdls_bits() = (int) basalt::core::exp_flag("ps_pdl", 15));
-            (void) x_ps;
-            const bool after_kernel = ((pdl2_mask() & 32) || (x_hce & 1)) && pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
+            const bool after_kernel = pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
             PdlScope ps(pdl, !after_kernel);
             if (dec_hc) {
                 HcFusedArgs h = hc_args(0, pending, inj2_, inj_);
@@ -1111,8 +1108,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                !is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT &&
                                dec_gdnf_mode() != 0;
                 // a QSA layer's query projection follows (qsaf_wide path): its blocks start with the read
-                static const int x_qsa = (int) basalt::core::exp_flag("qsa_early", 1);
-                if (x_qsa && read_q8 && is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT) {
+                if (read_q8 && is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT) {
                     const QsaState& st0 = ss.qsa_states[qsa_idx[(size_t) l]];
                     h.next_early = st0.kv_int8 && !st0.kv_rot && !st0.kv_hybrid && !st0.kv_q4 && native_qsa_enabled() &&
                                    native_rope_enabled() && qsa_dec_fused_supported(s) &&
@@ -1330,8 +1326,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool qsaf_wide = fused_pre && (qb || n == 1) && qs_[0] != nullptr;
                 // the indexer appends on a branch of their own and the K/V appends joined before the selection's
                 // consumers, so the query post runs beside them
-                static const bool x_split = basalt::core::exp_flag("qsa2_split", 0) != 0;
-                const bool kv_split = qsaf_wide && x_split && qs_[3] != nullptr;
                 if (qsaf_wide) {
                     {
                         PdlScope ps(pdl);   // after the hc read
@@ -1351,13 +1345,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                   n, qs_[2]);
                     }
                     cudaEventRecord(qev_[2], qs_[2]);
-                    if (kv_split) {
-                        cudaStreamWaitEvent(qs_[3], qev_[2], 0);
-                        QsaDecKvPost ip = kv_post_args();
-                        ip.part = 2;
-                        qsa_dec_kv_post(ip, n, s, rope_scaling(), qs_[3]);
-                        cudaEventRecord(qev_[4], qs_[3]);
-                    }
                     {
                         PdlScope pz(pdl, true);
                         bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
@@ -1369,14 +1356,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                    n, qs_[0]);
                     }
                     cudaStreamWaitEvent(qs_[0], qev_[1], 0);
-                    if (kv_split) {
-                        QsaDecKvPost kp = kv_post_args();
-                        kp.part = 1;
-                        qsa_dec_kv_post(kp, n, s, rope_scaling(), qs_[0]);
-                    } else {
-                        cudaStreamWaitEvent(qs_[0], qev_[2], 0);
-                        qsa_dec_kv_post(kv_post_args(), n, s, rope_scaling(), qs_[0]);
-                    }
+                    cudaStreamWaitEvent(qs_[0], qev_[2], 0);
+                    qsa_dec_kv_post(kv_post_args(), n, s, rope_scaling(), qs_[0]);
                     cudaEventRecord(qev_[3], qs_[0]);
                     cudaEventRecord(qev_[1], qs_[2]);
                     {
@@ -1384,8 +1365,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         dense_proj(8, wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                    (int) (NH * 2 * HD), n, cs);
                     }
-                    if (kv_split) cudaStreamWaitEvent(cs, qev_[4], 0);
-                    else cudaStreamWaitEvent(cs, qev_[3], 0);
+                    cudaStreamWaitEvent(cs, qev_[3], 0);
                     cudaStreamWaitEvent(cs, qev_[1], 0);
                     for (int i = 7; i <= 9; ++i) stamp(l, i, grp);
                     qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
@@ -1507,19 +1487,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 } else {
                 {
-                    const int psb = basalt::kernels::pdls_bits();
                     {
-                        PdlScope pb(pdl && (psb & 8));   // after the query post kernel
+                        PdlScope pb(pdl);   // after the query post kernel
                         qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
                                          max_blocks_, s, scores_ + (size_t) tb * max_blocks_, cs, -1, true);
                     }
-                    PdlScope pt(pdl && (psb & 4));   // after the scores kernel
+                    PdlScope pt(pdl);   // after the scores kernel
                     qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                    sel_ + (size_t) tb * cap_, cs);
                 }
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
-                if (kv_split) cudaStreamWaitEvent(cs, qev_[3], 0);
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
@@ -1527,7 +1505,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fused_gate = native_qsa_enabled() && !st.kv_rot && !st.kv_hybrid &&
                              qsa_dec_attn_supported(pools, s);
                 attn_q8 = fused_gate && !st.kv_rot && !st.kv_hybrid;
-                PdlScope pa(pdl && (basalt::kernels::pdls_bits() & 2));   // the chunks after the top-k, the merge after them
+                PdlScope pa(pdl);   // the chunks after the top-k, the merge after them
                 if (fused_gate)
                     qsa_dec_attn(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_, s,
                                  attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs,
@@ -1631,7 +1609,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
             ra.fast = bell_fast;
-            PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
+            PdlScope pr(false);   // after the router's kernel: a plain launch
             if (glue_on[grp]) {   // the ring's work inside post's gate/up launch
                 glue_ring[grp] = ra;
                 glue_ring[grp].mode = 2; glue_ring[grp].kinds = true;
@@ -1707,7 +1685,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
             }
             try {
-                PdlScope psh(pdl && (basalt::kernels::pdls_bits() & 32), true);   // the side chain's kernels follow each other
+                PdlScope psh(false);   // the side chain's kernels follow each other
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream);
             } catch (const std::exception& e) {
@@ -1829,7 +1807,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (dm) {
             {
-                PdlScope pw(pdl && (basalt::kernels::pdls_bits() & 16));   // the tier wait polls during the down kernel
+                PdlScope pw(false);
                 dec_moe_wait(dm_->plan, dm_->m_w + 16, m_flag_, ring, cs, dm_->wstat, (int) l, true, dm_->tag && dm_->wstat == nullptr);
             }   // true: the combine is the wait's programmatic dependent
             stamp(l, 23, grp);

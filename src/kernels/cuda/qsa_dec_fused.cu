@@ -222,7 +222,7 @@ __device__ __forceinline__ void q_post_dev(const QsaDecQPost& a, int n, int n_he
 
 template <bool TAB>
 __global__ void __launch_bounds__(THREADS) kv_post_kernel(QsaDecKvPost a, int n, int n_kv, int page_size, RopeArgs ra) {
-    kv_post_dev<TAB>(a, n, n_kv, page_size, ra, blockIdx.x + (a.part == 2 ? n * n_kv : 0));
+    kv_post_dev<TAB>(a, n, n_kv, page_size, ra, blockIdx.x);
 }
 template <bool TAB>
 __global__ void __launch_bounds__(THREADS) q_post_kernel(QsaDecQPost a, int n, int n_head, int idx_heads, RopeArgs ra) {
@@ -261,9 +261,7 @@ void qsa_dec_kv_post(const QsaDecKvPost& a, int n, const QsaShapes& s, const Rop
         std::exit(1);
     }
     const RopeArgs ra = rope_args(scaling);
-    const unsigned blocks = a.part == 2 ? (a.idx_raw != nullptr ? 1u : 0u)
-                                        : (unsigned) (n * s.n_head_kv + (a.part == 0 && a.idx_raw != nullptr ? 1 : 0));
-    if (blocks == 0) return;
+    const unsigned blocks = (unsigned) (n * s.n_head_kv + (a.idx_raw != nullptr ? 1 : 0));
     if (ra.rt.cos != nullptr)
         kv_post_kernel<true><<<blocks, THREADS, 0, (cudaStream_t) stream>>>(a, n, (int) s.n_head_kv, (int) s.page_size, ra);
     else

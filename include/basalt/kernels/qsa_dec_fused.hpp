@@ -35,7 +35,6 @@ struct QsaDecKvPost {
     float* tail_snap = nullptr;         ///< non-null: the tail ((idx_block - 1) * idx_dim) copied here first
     int max_cells = 0;
     float eps = 1e-6f;
-    int part = 0;                       ///< 0: everything; 1: the K/V rows only; 2: the indexer tail snapshot and appends only
 };
 
 struct QsaDecQPost {

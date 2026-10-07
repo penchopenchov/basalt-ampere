@@ -23,13 +23,6 @@ inline constexpr bool pdl2_requested() { return true; }
 /// trigger.
 inline constexpr int pdl2_mask() { return 64; }
 
-/// Boundary-level PDL parts under test (host side, set once at setup from `--exp ps_pdl`): 1 attention merge trigger,
-/// 2 attention chunk/merge as dependents, 4 block top-k as dependent, 8 query post trigger + block scores as dependent.
-inline int& pdls_bits() {
-    static int v = 0;
-    return v;
-}
-
 struct PdlState {
     bool on = false;
     int plain = 0;   // launches still to go the plain way

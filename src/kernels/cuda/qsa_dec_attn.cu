@@ -97,7 +97,6 @@ struct AttnArgs {
     const float* q_full;       // non-null: the gated output too
     float* attn_gated;
     void* xq;                  // non-null (with the gated output): the gated rows' q8_1 blocks
-    int early;                 // 1: the merge starts its dependent early
 };
 
 // k8 of the row's dimensions [d0, d0+8) as the reference's load8 computes them
@@ -391,14 +390,14 @@ __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi,
 template <int KV_MODE>
 __global__ void __launch_bounds__(THREADS) attn_chunk_v2(AttnArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    if (a.early & 2) pdl_launch_dependents();
+    pdl_launch_dependents();
     pdl_wait();
     attn_chunk_dev<KV_MODE>(a, blockIdx.x, blockIdx.y, blockIdx.z, *reinterpret_cast<ChunkSmem<KV_MODE>*>(smem_raw));
 }
 
 __global__ void __launch_bounds__(THREADS) attn_merge_v2(AttnArgs a) {
     extern __shared__ __align__(16) float msm[];
-    if (a.early & 1) pdl_launch_dependents();
+    pdl_launch_dependents();
     pdl_wait();
     attn_merge_dev(a, blockIdx.x, blockIdx.y, msm, msm + a.n_chunks, msm + 2 * a.n_chunks);
 }
@@ -449,7 +448,6 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     a.attn_gated = q_full != nullptr ? attn_gated : nullptr;
     cudaStream_t st = (cudaStream_t) stream;
     a.xq = a.attn_gated != nullptr ? xq : nullptr;
-    a.early = pdls_bits();
     const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     if (mode == 1) {
         constexpr size_t bytes = sizeof(ChunkSmem<1>);
