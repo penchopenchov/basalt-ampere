@@ -502,6 +502,12 @@ REQUEST_LINES = False    # --request-lines: echo the engine's per-request summar
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 
 
+# The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
+# finished): the process may stay alive and even print DONE, but it must not take another request.
+FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
+                  "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
+
+
 class ProcessEngine:
     """The resident engine: `basalt --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -646,6 +652,15 @@ class ProcessEngine:
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both
         slot_q = self.slot_q
         for line in proc.stdout:
+            if line.startswith(FATAL_PREFIXES):         # checked before batch routing: a fatal line is never a slot's
+                if self.proc is proc:
+                    self.silent_note = "unrecoverable verification failure: " + line[4:].strip()
+                    self.ended = True
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                break                                   # publish EOF, never the trailing DONE
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -1002,6 +1017,8 @@ class ProcessEngine:
         with a much shorter prompt (`BYIELD <slot>`; the part read waits in a slot and the read goes on after).
         A consumer that stops early leaves the engine in step: the solo request is STOPped and read to its DONE, an
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
+        if not self.alive():
+            raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
@@ -1220,6 +1237,8 @@ class ProcessEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        if not self.alive():
+            raise EngineDied("the engine is unavailable; this request was not sent")
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
