@@ -787,6 +787,23 @@ int main(int argc, char** argv) {
                     std::snprintf(what, sizeof what, "glue ring rows T=%d", T);
                     report(what, l, ndiff_rows(a4, c4, rows), rows.size() * H);
                 }
+                {   // the SwiGLU pass inside the gate/up launch, down blocks released per group: the same rows, call after call
+                    K::DmGlueArgs gf = ga;
+                    gf.fuse = true;
+                    size_t badf = 0;
+                    for (int rep = 0; rep < 24; ++rep) {
+                        ck(cudaMemsetAsync(d_p4, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
+                        K::dec_moe_glue(L, gf, dv[0].scr, d_p4, n, s0);
+                        ck(cudaStreamSynchronize(s0), "glue fuse");
+                        badf += ndiff_rows(a4, down(d_p4, (size_t) n * H), rows);
+                    }
+                    std::snprintf(what, sizeof what, "glue fuse rows T=%d x24", T);
+                    report(what, l, badf, rows.size() * H * 24);
+                    if (bench) {
+                        const double uf = time_us(s0, 200, [&] { K::dec_moe_glue(L, gf, dv[0].scr, d_p4, n, s0); });
+                        std::printf("  bench: T=%d glue fuse %.2f us\n", T, uf);
+                    }
+                }
                 if (bench) {
                     const double ug = time_us(s0, 200, [&] { K::dec_moe_glue(L, ga, dv[0].scr, d_p4, n, s0); });
                     const double ur = time_us(s0, 200, [&] {

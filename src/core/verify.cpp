@@ -904,6 +904,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork[2] = {false, false};   // the group's ring stream is joined in post
+    bool sh_gate_deferred[2] = {false, false};   // the shared expert's gate is left to the combine
     bool glue_on[2] = {false, false};   // post's gate/up launch plans the group's VRAM share
     DmRouteArgs glue_ring[2];   // the ring's work for post's gate/up launch
     auto pre = [&](int64_t l, int grp) -> bool {
@@ -1563,6 +1564,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
+            // the read's q8_1 rows serve the shared gate/up, and the scalar gate runs on the ring's idle stream; its
+            // scale is applied in the combine
+            static const int x_sh = (int) basalt::core::exp_flag("moe_sh", 0);   // bit 0: the read's q8_1 rows, bit 1: the gate
+            const bool sh_side = x_sh != 0 && glue_on[grp] && sh_fork && ring_hi_ != nullptr && shared_expert_native_bf16_enabled();
+            if (sh_side && (x_sh & 1)) nsw.x_q8_1 = nat_xq_ + (size_t) tb * (N / 32) * 36;
+            if (sh_side && (x_sh & 2)) {
+                nsw.defer_gate = true;
+                cudaEventRecord(ev_ring_, cs);
+                cudaStreamWaitEvent(ring_hi_, ev_ring_, 0);
+                {
+                    PdlScope pp(false);
+                    if (n > 1) bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wgi->data, sh_g_ + tb, 1, N, 1, n, ring_hi_);
+                    else bf16_gemv_fp32_mmvf(xm, (const uint16_t*) wgi->data, sh_g_ + tb, N, 1, ring_hi_);
+                }
+                cudaEventRecord(ev_ring_join_, ring_hi_);
+                ring_fork[grp] = true;
+                sh_gate_deferred[grp] = true;
+            } else {
+                sh_gate_deferred[grp] = false;
+            }
             {
             if (!shared_expert_native_bf16_enabled()) {
                 f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
@@ -1692,7 +1713,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 23, grp);
             try {
                 dec_moe_combine(parts_ + (size_t) tb * K * N, dm_->m_rows, m_ymiss_, dm_->plan, w_ + tb * K,
-                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs, true);
+                                shared_ + tb * N, bo_ + tb * N, N, K, n, nullptr, nullptr, ring, cs, true,
+                                sh_gate_deferred[grp] ? sh_g_ + tb : nullptr);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else if (n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {

@@ -86,6 +86,9 @@ struct DmGlueArgs {
     /// copied from xq) instead of a route launch
     bool ring_on = false;
     DmRouteArgs ring;
+    /// The SwiGLU pass runs inside the gate/up launch (the last block to finish a group's rows does the group's), and
+    /// each down block waits for its group only, instead of for a SwiGLU launch.
+    bool fuse = false;
 };
 /// Whether dec_moe_glue covers L (the DEC_GU2=2 chain's formats and settings).
 bool dec_moe_glue_ok(const NativeExpertLayout& L);
@@ -163,10 +166,11 @@ void dec_moe_peer_math_test(const NativeExpertLayout& L, const unsigned long lon
 /// entry i at row i of each), summed with the router weights in native_moe_combine_multi's order, plus `shared`.
 /// With peer_done_m, every block first waits for the tiers the plan uses (peer_done_m / host_flag_m >= ring); null:
 /// dec_moe_wait ran before it.  Built with native_moe.cu's math.  `dep` (DEC_GLUE & 4, null words): a
-/// programmatic dependent of a dec_moe_wait launched with `trigger`.
+/// programmatic dependent of a dec_moe_wait launched with `trigger`.  `shared_gate` (null words only): the shared
+/// row is scaled by sigmoid of its token's entry here, as sigmoid_scale_rows_kernel scales it.
 void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* cpu_rows_m, const DmPlan* plan,
                      const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
-                     void* stream, bool dep = false);
+                     void* stream, bool dep = false, const float* shared_gate = nullptr);
 
 }  // namespace basalt::kernels

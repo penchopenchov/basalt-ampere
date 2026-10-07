@@ -1667,9 +1667,45 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     }
 }
 
+// Per-group hand-off between the gate/up kernel and the down kernel: gu_done[g] counts the group's finished gate/up
+// warp items, h_ready[g] is set once the group's SwiGLU rows are in hq, h_taken[g] counts the down blocks that have
+// seen it.  Each word is back at zero when the group has been consumed, so a call needs no reset.
+constexpr int kDmSyncGroups = 128;
+__device__ unsigned int g_dm_sync[3 * kDmSyncGroups];
+
+__device__ __forceinline__ unsigned int ld_acquire_gpu(const unsigned int* p) {
+    unsigned int v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_release_gpu(unsigned int* p, unsigned int v) {
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+__device__ __forceinline__ void red_release_add_gpu(unsigned int* p, unsigned int v) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+// the block's groups (g0, g0 + gstride, ..) of the down kernel: wait until each one's SwiGLU rows are in hq
+__device__ __forceinline__ void dm_wait_hq(int ng, int g0, int gstride, unsigned int n_blocks) {
+    if (threadIdx.x == 0) {
+        unsigned int* ready = g_dm_sync + kDmSyncGroups;
+        unsigned int* taken = g_dm_sync + 2 * kDmSyncGroups;
+        for (int g = g0; g < ng; g += gstride) {
+            while (ld_acquire_gpu(ready + g) == 0u) __nanosleep(32);
+            if (atomicAdd(taken + g, 1u) == n_blocks - 1) {   // the last block to see it clears the group
+                taken[g] = 0u;
+                ready[g] = 0u;
+            }
+        }
+    }
+    __syncthreads();
+}
+
 // native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent - the
-// block's first group's weight rows are prefetched into L2 before the wait.
-template<int TD, bool DEP = false>
+// block's first group's weight rows are prefetched into L2 before the wait.  FUSE: the wait is per group, for the
+// gate/up kernel's SwiGLU step (dm_glue_gu_kernel with fuse), not for the previous kernel's end.
+template<int TD, bool DEP = false, bool FUSE = false>
 __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
@@ -1684,7 +1720,8 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
         const uint8_t* p = (const uint8_t*) grp_ptr[blockIdx.y] + L.down_off + (size_t) r0 * L.d_row;
         for (int o = threadIdx.x * 128; o < nr * (int) L.d_row; o += 256 * 128)
             asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
-        pdl_wait();
+        if constexpr (FUSE) dm_wait_hq(ng, blockIdx.y, gridDim.y, gridDim.x);
+        else pdl_wait();
     }
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
@@ -2357,9 +2394,10 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
-                 float* out, bool dep = false) {
+                 float* out, bool dep = false, bool fuse = false) {
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if (dep && fuse) launch_dependent(native_down_multi_kernel<TD, true, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (dep) launch_dependent(native_down_multi_kernel<TD, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else native_down_multi_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
