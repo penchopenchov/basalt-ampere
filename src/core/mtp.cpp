@@ -889,7 +889,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         if (!mixer_q8) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         // the argmax drafts over the base rows only on tier 0 (the coupled sampler keeps the whole subset)
-        const int64_t nv = sub ? ((tier_ == 0 && !coupled_rec_) ? n_tier1_ : n_dvocab_) : n_vocab_;
+        static const bool cpl_base = basalt::core::exp_flag("cpl_base", 0) != 0;   // coupled draft over the base rows only
+        const int64_t nv = sub ? (((tier_ == 0 && !coupled_rec_) || (coupled_rec_ && cpl_base)) ? n_tier1_ : n_dvocab_)
+                               : n_vocab_;
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
         // another order: last bits)
         if (!coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
