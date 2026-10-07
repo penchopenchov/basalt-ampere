@@ -84,18 +84,16 @@ def gpu_count(visible_env: str | None = None) -> int:
     return sum(1 for line in out.splitlines() if line.startswith("GPU "))
 
 
-def vision_config(mf: ModelFile, exe: str) -> dict | None:
+def vision_config(mf: ModelFile, exe: str) -> dict:
     """The vision sidecar's config (`basalt-vision` beside the engine binary, the projector and a vocab-only text
-    model unpacked from the file), or None with a one-line reason printed when the model runs text-only."""
+    model unpacked from the file).  ValueError says what is missing: vision was asked for, so no silent text-only."""
     side = Path(exe).resolve().parent / VISION_EXE
     if "vision/mmproj" not in mf.sections:
-        return None
+        raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision / --vision-cpu")
     if not side.is_file():
-        print(f"[server] warning: {side} not found, text-only (build the vision sidecar)", flush=True)
-        return None
+        raise ValueError(f"{side} not found (build the vision sidecar), or drop --vision / --vision-cpu")
     if "vision/text_vocab" not in mf.sections:
-        print(f"[server] warning: {mf.path} has no vision/text_vocab section, text-only", flush=True)
-        return None
+        raise ValueError("this model file has no vision/text_vocab section; drop --vision / --vision-cpu")
     vdir = cache_dir(mf) / "vision"
     mmproj, vocab = vdir / "mmproj.gguf", vdir / "text_vocab.gguf"
     for name, dest in (("vision/mmproj", mmproj), ("vision/text_vocab", vocab)):
@@ -116,10 +114,11 @@ def with_arg(args: list[str], flag: str, value) -> list[str]:
     return out
 
 
-def model_config(path: str, exe: str, gpus: int | None = None, vision: bool = True,
+def model_config(path: str, exe: str, gpus: int | None = None, vision: bool | str = False,
                  overrides: dict | None = None) -> dict:
     """The engine settings the model file implies, with `overrides` ({flag: value}) replacing the file's
-    engine arguments.  A second visible GPU becomes the engine's peer expert tier unless they already say."""
+    engine arguments.  `vision` (False, True or "cpu"; True runs the encoder on the GPU) adds the vision sidecar and
+    raises ValueError when it cannot be set up.  A second visible GPU becomes the engine's peer expert tier unless they already say."""
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
@@ -135,6 +134,7 @@ def model_config(path: str, exe: str, gpus: int | None = None, vision: bool = Tr
            "tokenizer": str(extract_tokenizer(mf))}
     v = vision_config(mf, exe) if vision else None
     if v:
+        v["gpu"] = vision != "cpu"
         cfg["vision"] = v
         if "--vision" not in args:   # the engine takes image embeddings only when told
             args.append("--vision")

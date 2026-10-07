@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -1040,6 +1041,14 @@ class GpuChoice(unittest.TestCase):
         plain = child_env({})                     # no choice: the environment as it was (existing installs)
         self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
+
+    def test_vision_sidecar_args(self):
+        from serve.server import Vision
+        for gpu, want in ((True, ["--gpu"]), (False, [])):
+            with mock.patch.object(Vision, "_start"):
+                v = Vision({"exe": "x", "mmproj": "m", "model": "t", "gpu": gpu})
+            self.assertEqual(v.spawn[0], ["x", "--mmproj", "m", "--model", "t"] + want)
+            shutil.rmtree(v.dir, ignore_errors=True)
 
     def test_vision_device(self):
         # with two cards listed the image encoder takes the second; the engine's environment stays as it was

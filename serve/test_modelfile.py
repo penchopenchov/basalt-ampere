@@ -94,7 +94,7 @@ class Peer(Tmp):
     def test_vision_tells_the_engine(self):
         path = self.build(vision=True)
         (self.exe.parent / "basalt-vision").write_text("")
-        cfg = modelfile.model_config(path, str(self.exe), gpus=1)
+        cfg = modelfile.model_config(path, str(self.exe), gpus=1, vision=True)
         self.assertIn("vision", cfg)
         self.assertIn("--vision", cfg["args"])
 
@@ -139,20 +139,35 @@ class Vision(Tmp):
         path = self.build(vision=True)
         side = self.exe.parent / "basalt-vision"
         side.write_text("")
-        v = modelfile.model_config(path, str(self.exe), gpus=1)["vision"]
+        v = modelfile.model_config(path, str(self.exe), gpus=1, vision=True)["vision"]
         self.assertEqual(v["exe"], str(side.resolve()))
         self.assertEqual(Path(v["mmproj"]).read_bytes(), b"MMPROJ" * 100)
         self.assertEqual(Path(v["model"]).read_bytes(), b"VOCAB")
         self.assertEqual([p.name for p in Path(v["mmproj"]).parent.iterdir() if ".gguf." in p.name], [])
 
-    def test_text_only_when_the_sidecar_is_missing(self):
+    def test_off_by_default(self):
         path = self.build(vision=True)
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            cfg = modelfile.model_config(path, str(self.exe), gpus=1)
+        (self.exe.parent / "basalt-vision").write_text("")
+        cfg = modelfile.model_config(path, str(self.exe), gpus=1)
         self.assertNotIn("vision", cfg)
-        self.assertEqual(len(buf.getvalue().strip().splitlines()), 1)
-        self.assertIn("text-only", buf.getvalue())
+        self.assertNotIn("--vision", cfg["args"])
+
+    def test_gpu_or_cpu_encoder(self):
+        path = self.build(vision=True)
+        (self.exe.parent / "basalt-vision").write_text("")
+        self.assertTrue(modelfile.model_config(path, str(self.exe), gpus=1, vision=True)["vision"]["gpu"])
+        self.assertFalse(modelfile.model_config(path, str(self.exe), gpus=1, vision="cpu")["vision"]["gpu"])
+
+    def test_error_when_the_sidecar_is_missing(self):
+        path = self.build(vision=True)
+        with self.assertRaisesRegex(ValueError, "basalt-vision"):
+            modelfile.model_config(path, str(self.exe), gpus=1, vision=True)
+
+    def test_error_when_the_model_has_no_projector(self):
+        path = self.build(vision=False)
+        (self.exe.parent / "basalt-vision").write_text("")
+        with self.assertRaisesRegex(ValueError, "projector"):
+            modelfile.model_config(path, str(self.exe), gpus=1, vision="cpu")
 
 
 class Cli(Tmp):
@@ -175,6 +190,24 @@ class Cli(Tmp):
         with mock.patch("sys.stderr", err):
             e = self.run_main("--engine", "engine", "--model", path, "--exe", str(self.exe), "--gpu", "x")
         self.assertEqual(getattr(e, "code", None), 2)
+
+    def test_vision_flags_reach_model_config(self):
+        from serve import server
+        path = self.build(vision=True)
+        base = ["--engine", "engine", "--model", path, "--exe", str(self.exe), "--gpu", "0"]
+        for flags, want in (([], False), (["--vision"], True), (["--vision-cpu"], "cpu"), (["--vision", "--vision-cpu"], "cpu")):
+            with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
+                    mock.patch("sys.stderr", io.StringIO()):
+                self.run_main(*base, *flags)
+            self.assertEqual(mc.call_args.kwargs["vision"], want, flags)
+
+    def test_vision_without_sidecar_is_a_startup_error(self):
+        path = self.build(vision=True)
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            e = self.run_main("--engine", "engine", "--model", path, "--exe", str(self.exe), "--gpu", "0", "--vision")
+        self.assertEqual(getattr(e, "code", None), 2)
+        self.assertIn("basalt-vision", err.getvalue())
 
 
 if __name__ == "__main__":

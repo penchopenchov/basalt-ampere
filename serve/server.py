@@ -10,7 +10,7 @@
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /metrics and GET /api/logs (the stats page's feeds). One sequence at a time behind a
 FIFO (plan: one resident sequence).
-Images (optional, when the model file carries a vision encoder): OpenAI image_url parts and Anthropic image blocks (base64
+Images (off by default; --vision encodes on the GPU, --vision-cpu on the CPU; needs a model file with a vision encoder): OpenAI image_url parts and Anthropic image blocks (base64
 data, http(s) URLs or local file paths) go through `basalt-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.
@@ -1406,7 +1406,7 @@ class Vision:
     sends the same picture again (every turn, with most clients) encodes it once."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
-        args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
+        args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.stopped = False
@@ -2082,7 +2082,7 @@ class Service:
         images = images_of(messages)
         if images:
             if self.vision is None:
-                raise ValueError("this server was started without the vision encoder (no vision encoder), "
+                raise ValueError("this server was started without image input (--vision or --vision-cpu), "
                                  "so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
@@ -3544,7 +3544,11 @@ def main() -> int:
     ap.add_argument("--spec-min-p", type=float, help="stop drafting below this draft probability (default: the "
                                                      "model file's; 0 = always draft to the cap)")
     ap.add_argument("--mtp-max-t", type=int, help="the drafter's own window cap (default 0 = --spec)")
-    ap.add_argument("--no-vision", action="store_true", help="text only: no vision sidecar, no image input")
+    ap.add_argument("--vision", action="store_true",
+                    help="image input, encoded on the GPU (off by default: the encoder holds VRAM; with two cards "
+                         "listed in --gpu it uses the second)")
+    ap.add_argument("--vision-cpu", action="store_true",
+                    help="image input, encoded on the CPU (no VRAM, slower; wins over --vision)")
     ap.add_argument("--peer-exclusive", action="store_true",
                     help="the peer card's experts live only there, not also in RAM: less RAM, slower prefill")
     ap.add_argument("--host", default="127.0.0.1",
@@ -3597,7 +3601,7 @@ def main() -> int:
         listed = gpu_list(cfg)
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
-                a.model, a.exe, gpus=len(listed) if listed else None, vision=a.engine == "engine" and not a.no_vision,
+                a.model, a.exe, gpus=len(listed) if listed else None, vision=("cpu" if a.vision_cpu else True) if a.engine == "engine" and (a.vision or a.vision_cpu) else False,
                 overrides={f: v for f, v in (("--spec", a.spec), ("--spec-min-p", a.spec_min_p),
                                              ("--mtp-max-t", a.mtp_max_t),
                                              ("--peer-exclusive", a.peer_exclusive or None)) if v is not None}).items()
