@@ -424,8 +424,8 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     stage_ = exp_flag("draft_stage", 1) != 0;
     tail_ = exp_flag("draft_tail", 1) != 0;
     l2_ = (int) exp_flag("draft_l2", 1);
-    pf_mode_ = (int) exp_flag("draft2_pf", 0);
-    hxq_ = exp_flag("draft2_hxq", 0) != 0;
+    pf_mode_ = (int) exp_flag("draft2_pf", 1);
+    hxq_ = exp_flag("draft2_hxq", 1) != 0;
     if (l2_ != 0 && (cudaStreamCreateWithPriority(&cs3_, cudaStreamNonBlocking, prio) != cudaSuccess ||
                      cudaEventCreateWithFlags(&ev_pf_, cudaEventDisableTiming) != cudaSuccess ||
                      cudaEventCreateWithFlags(&ev_pfj_, cudaEventDisableTiming) != cudaSuccess)) {
