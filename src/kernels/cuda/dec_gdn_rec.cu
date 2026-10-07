@@ -174,6 +174,16 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     if (a.early_trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
     // this block has started: the barrier the ranks wait on before writing into each other's shared memory
     if (!SPLIT) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
+    // predecessor passed its own wait on the hc read), so they are computed while the projections still run
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    __syncthreads();
+    for (int job = rg; job < 2 * T; job += RG) {   // (gate, token) jobs over the four warps
+        const int t = job >> 1;
+        const bool is_beta = job & 1;
+        const float v = ab_one(a, sm.wab[is_beta], is_beta, t, lane, dt, sa);
+        if (lane == 0) (is_beta ? sm.b : sm.g)[t] = v;
+    }
     pdl_wait();
     stamp(a, 2);
 
@@ -185,14 +195,6 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         xk[t] = t < T ? a.qkv[(size_t) t * C + ck] : 0.0f;
         xv[t] = t < T && rg == 1 ? a.qkv[(size_t) t * C + cv] : 0.0f;
         zz[t] = t < T && rg == 0 && !SPLIT ? a.z[(size_t) t * value_dim + head * S + col] : 0.0f;
-    }
-    asm volatile("cp.async.wait_all;" ::: "memory");
-    __syncthreads();
-    for (int job = rg; job < 2 * T; job += RG) {   // (gate, token) jobs over the four warps
-        const int t = job >> 1;
-        const bool is_beta = job & 1;
-        const float v = ab_one(a, sm.wab[is_beta], is_beta, t, lane, dt, sa);
-        if (lane == 0) (is_beta ? sm.b : sm.g)[t] = v;
     }
     stamp(a, 3);
 
