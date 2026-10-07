@@ -628,12 +628,16 @@ class ProcessEngine:
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
-        self.slot_cv = threading.Condition()
-        self.waiting = 0                                # requests waiting for the control lines (ctl)
-        self.wait_lens: list[list[int]] = []            # ... their prompt lengths (a long read gives way to short ones)
-        self.ctl_epoch = 0                              # how often the control lines were taken
+        # the admission state belongs to the server, not to one engine process: restart() runs this again while
+        # requests still wait on these objects, so they are made once and kept
+        if "slot_cv" not in self.__dict__:
+            self.slot_cv = threading.Condition()
+            self.waiting = 0                            # requests waiting for the control lines (ctl)
+            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+            self.ctl_epoch = 0                          # how often the control lines were taken
+            self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
+        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
-        self.ctl = threading.Lock()                     # one admission or solo request on the control lines at a time
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -670,14 +674,16 @@ class ProcessEngine:
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return "the engine's watchdog stopped it: " + line.strip()
-        rc = self.proc.poll()
+        proc = self.proc                                 # None while a restart has not started the next one yet
+        rc = proc.poll() if proc is not None else None
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("basalt", "ERR"))), "")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why
             return f"the engine exited (code {rc}), last log line: {last}"
         return "probably out of RAM (sudo dmesg | grep -i 'out of memory')"
 
     def alive(self) -> bool:
-        return self.proc is not None and not getattr(self, "ended", False) and self.proc.poll() is None
+        proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
+        return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
     def exit_code(self):
         if self.proc is None:
@@ -699,10 +705,10 @@ class ProcessEngine:
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
         exits before READY - a dead engine's VRAM can take a while to come back - is retried.
 """
-        self.close()
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile
         try:
+            self.close()
             for i in range(tries):
                 # not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
                 # READY, and a request that saw alive() in that window skipped load() and failed with "context
@@ -723,6 +729,8 @@ class ProcessEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
+            with self.slot_cv:                   # wake the requests that waited through it: they go on with the new
+                self.slot_cv.notify_all()        # engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -821,7 +829,7 @@ class ProcessEngine:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
-        except OSError:                                  # the pipe is gone: the engine died (not the client)
+        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
     def _control(self, cancel, on_token, stop_when=None):
@@ -869,15 +877,19 @@ class ProcessEngine:
                 self._ctl_result = ("done", None)
                 return
 
-    def _drain_control(self, until: str, timeout: float = 300.0):
+    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
-        request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered)."""
+        request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
+        `born`: the engine process (self.gen) the request started on; once that one is gone there is nothing to
+        drain, and the lines now are its successor's."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
+            if born is not None and (self.gen != born or not self.alive()):
+                return None
             try:
-                line = self.lines.get(timeout=max(0.1, end - time.monotonic()))
+                line = self.lines.get(timeout=max(0.1, min(1.0, end - time.monotonic())))
             except queue.Empty:
-                break
+                continue
             if line is None:
                 return None
             if line.startswith("DONE"):
@@ -890,16 +902,20 @@ class ProcessEngine:
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
+        if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+            return
         try:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
+        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
+
         def wait():
             end = time.monotonic() + 600.0
             tail = list(stream or [])
             while time.monotonic() < end:
                 try:
-                    line = self.slot_q[slot].get(timeout=5.0)
+                    line = q.get(timeout=5.0)
                 except queue.Empty:
                     continue
                 if line is None:
@@ -912,9 +928,9 @@ class ProcessEngine:
                         tail = []
                 if line.startswith("BDONE "):
                     break
-            self.slot_held[slot] = tail[:-1] if stream and tail else []
+            held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
-                self.slot_busy[slot] = False
+                busy[slot] = False
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
@@ -930,10 +946,17 @@ class ProcessEngine:
         beat = time.monotonic()
         try:
             while True:
+                if not self.alive() and not getattr(self, "starting", False):
+                    # the engine is gone and nobody is starting it again: this request was not sent, so it ends now
+                    # instead of waiting for control lines nothing will answer on (during a restart it keeps waiting)
+                    raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
                 if turn and self.ctl.acquire(timeout=0.5):
-                    break
+                    if self.alive():
+                        break
+                    self.ctl.release()                  # it died (or is being restarted) while this one was getting
+                    turn = False                        # the lines: not the engine this request was meant for
                 if not turn:
                     with self.slot_cv:
                         self.slot_cv.wait(timeout=0.5)
@@ -944,8 +967,9 @@ class ProcessEngine:
                     yield None
         finally:
             with self.slot_cv:
-                self.waiting -= 1
-                self.wait_lens.remove(entry)
+                self.waiting = max(0, self.waiting - 1)
+                if entry in self.wait_lens:
+                    self.wait_lens.remove(entry)
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
@@ -986,7 +1010,7 @@ class ProcessEngine:
         ok = yield from self._take_control(cancel, len(prompt))
         if not ok:
             return
-        holding = True
+        holding, born = True, self.gen                  # (born: the engine process it has the control lines of)
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
@@ -997,7 +1021,7 @@ class ProcessEngine:
                     ok = yield from self._take_control(cancel, len(prompt))
                     if not ok:
                         return
-                    holding = True
+                    holding, born = True, self.gen
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
@@ -1065,7 +1089,7 @@ class ProcessEngine:
                         ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
                         if not ok:
                             return
-                        holding = True
+                        holding, born = True, self.gen
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
@@ -1149,11 +1173,13 @@ class ProcessEngine:
         finally:
             # a consumer that left early (or an error): keep the engine and this server in step
             try:
+                if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
+                    phase = "none"                      # its engine is gone: nothing to stop or drain
                 if phase == "solo":
                     self._send("STOP")
-                    self._drain_control("DONE")
+                    self._drain_control("DONE", born=born)
                 elif phase == "admit":
-                    line = self._drain_control("BADM")
+                    line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
             except EngineDied:
@@ -1332,7 +1358,10 @@ class ProcessEngine:
             if self.proc.poll() is not None:
                 if self.pump is not None:
                     self.pump.join(timeout=2)
-                self.proc.stdin.close()
+                try:
+                    self.proc.stdin.close()             # buffered data may flush again after the engine has exited
+                except OSError:
+                    pass
                 self.proc.stdout.close()
                 if self.log not in (None, subprocess.DEVNULL):
                     self.log.close()
