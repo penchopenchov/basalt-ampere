@@ -194,7 +194,7 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         cfg.attrs = at;
         cfg.numAttrs = dep ? 1 : 0;
         const int ki = int(k);
-        static const int x_early = (int) basalt::core::exp_flag("hc3_early", 0) & 1;
+        static const int x_early = (int) basalt::core::exp_flag("hc3_early", 1) & 1;
         if (dep)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
                                       shared, shared_gate, output, n_embd, ki, x_early);
