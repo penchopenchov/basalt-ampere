@@ -2587,7 +2587,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.no_dry = L.cn;
     L.lo_stage = L.cn;
     static const int x_nf = (int) core::exp_flag("hc_nofence", 0);
-    static const int x_pkg = (int) core::exp_flag("hc2_pkg", 0);
+    static const int x_pkg = (int) core::exp_flag("hc2_pkg", 198);
     L.pkg = L.cn ? x_pkg : 0;
     L.no_fence = x_nf || (L.pkg & 64);
     L.lg64 = d.lg + (size_t) L.slot * MAXT * NE;
