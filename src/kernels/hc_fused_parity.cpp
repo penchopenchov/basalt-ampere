@@ -51,11 +51,6 @@ int main(int argc, char** argv) {
         else if (a == "--rotpad" && i + 1 < argc) rotpad = std::atoi(argv[++i]);
         else if (a == "--stress" && i + 1 < argc) stress = std::atoi(argv[++i]);
         else if (a == "--check-only") check_only = true;
-        else if (a == "--exp" && i + 1 < argc) {
-            const std::string kv = argv[++i];
-            const size_t eq = kv.find('=');
-            basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
-        }
         else if (a == "--block" && i + 1 < argc) block_list = argv[++i];
         else pos.push_back(a);
     }
