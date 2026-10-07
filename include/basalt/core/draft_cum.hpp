@@ -47,7 +47,7 @@ inline float draft_cum_env() {
 /// window's value is fixed before its drafts are made and shared by the host rule and the device graph.
 struct DraftCumAdapt {
     static bool enabled() {
-        static const bool on = exp_flag("spk2_adapt", 0) != 0;
+        static const bool on = exp_flag("spk2_adapt", 1) != 0;
         return on;
     }
     float base = draft_cum_env();   ///< the threshold while nothing is known (and with the gate off)
