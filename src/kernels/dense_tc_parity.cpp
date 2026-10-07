@@ -300,8 +300,8 @@ void bench(cudaStream_t s, const char* pick, bool warm) {
     }
 }
 
-// --bench-pair: dense_tc_pair of qkv + z against dense_tc qkv then native z, L2-cold
-void bench_pair(cudaStream_t s) {
+// --bench-pair: dense_tc_pair of qkv + z against dense_tc qkv then native z, L2-cold (--bench-warm: L2-warm)
+void bench_pair(cudaStream_t s, bool warm) {
     const int pairs[][2] = {{0, 6}, {1, 5}, {3, 5}, {0, 4}, {1, 6}, {3, 6}};
     std::printf("\npair bench: us per call (median of 7 graph replays)\n");
     for (const auto& pr : pairs) {
@@ -309,15 +309,15 @@ void bench_pair(cudaStream_t s) {
         const std::size_t wba = basalt::kernels::native_mmvq_weight_bytes(a.type, a.n_in, a.n_out);
         const std::size_t wbb = basalt::kernels::native_mmvq_weight_bytes(b.type, b.n_in, b.n_out);
         const std::size_t wb = ((wba + 255) & ~(std::size_t) 255) + ((wbb + 255) & ~(std::size_t) 255);
-        const int NL = (int) std::max<std::size_t>(8, (400u << 20) / wb);
+        const int NL = warm ? 16 : (int) std::max<std::size_t>(8, (400u << 20) / wb), NW = warm ? 1 : NL;
         std::mt19937 rng(5u);
         const std::vector<uint8_t> w0 = make_weights(a, rng), w1 = make_weights(b, rng);
         uint8_t* dw = nullptr;
         void* xq = nullptr;
         float *dx = nullptr, *y0 = nullptr, *y1 = nullptr;
-        cudaMalloc(&dw, wb * NL);
+        cudaMalloc(&dw, wb * NW);
         const std::size_t off1 = (wba + 255) & ~(std::size_t) 255;
-        for (int l = 0; l < NL; ++l) {
+        for (int l = 0; l < NW; ++l) {
             cudaMemcpy(dw + wb * l, w0.data(), wba, cudaMemcpyHostToDevice);
             cudaMemcpy(dw + wb * l + off1, w1.data(), wbb, cudaMemcpyHostToDevice);
         }
@@ -334,11 +334,13 @@ void bench_pair(cudaStream_t s) {
         std::printf("%-10s + %-10s %.1f MB  floor %.2f us at 1.79 TB/s\n   T   serial us   pair us   GB/s\n", a.name,
                     b.name, (wba + wbb) / 1e6, (wba + wbb) / 1.79e6);
         for (int T = 1; T <= 4; ++T) {
-            const double ts = time_graph([&](int l) {
+            const double ts = time_graph([&](int l0) {
+                const int l = warm ? 0 : l0;
                 basalt::kernels::dense_tc(a.type, dw + wb * l, xq, y0, a.n_in, a.n_out, T, s);
                 basalt::kernels::native_mmvq(b.type, dw + wb * l + off1, xq, y1, b.n_in, b.n_out, T, s);
             }, NL, s);
-            const double tp = time_graph([&](int l) {
+            const double tp = time_graph([&](int l0) {
+                const int l = warm ? 0 : l0;
                 basalt::kernels::dense_tc_pair(a.type, dw + wb * l, y0, a.n_out, b.type, dw + wb * l + off1, y1, b.n_out,
                                                xq, a.n_in, T, s);
             }, NL, s);
@@ -386,7 +388,7 @@ int main(int argc, char** argv) {
         for (const auto& pr : pairs) ok = pair_parity(CASES[pr[0]], CASES[pr[1]], s) && ok;
     }
     if (run_bench) {
-        if (bench_pair_on) bench_pair(s);
+        if (bench_pair_on) bench_pair(s, warm);
         else bench(s, pick, warm);
     }
     std::printf("%s\n", ok ? "PASS" : "FAIL");
