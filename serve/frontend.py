@@ -141,11 +141,16 @@ def images_of(messages: list[dict]) -> list[str]:
 # a user quoting "</think>" would hand the model a real end-of-reasoning token.  Before the template is rendered
 # they are swapped for these private-use characters, and the server encodes the spans they mark as ordinary text.
 THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
-THINK_MARKS = {v: k for k, v in THINK_TAGS.items()}
+# The vision markers the same way: they are special tokens only where the template writes them for an image item;
+# the same strings in a message's text must not take a picture's place.
+VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
+               "<|video_pad|>": "\U000F0E06"}
+LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
+THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 
 
 def _mark(text: str) -> str:
-    for tag, mark in THINK_TAGS.items():
+    for tag, mark in LITERAL_TAGS.items():
         text = text.replace(tag, mark)
     return text
 
@@ -162,7 +167,7 @@ def _mark_deep(v):
 
 def _has_tag(v) -> bool:
     if isinstance(v, str):
-        return "<think>" in v or "</think>" in v
+        return any(tag in v for tag in LITERAL_TAGS)
     if isinstance(v, dict):
         return any(_has_tag(x) for x in v.values())
     if isinstance(v, list):
@@ -171,7 +176,8 @@ def _has_tag(v) -> bool:
 
 
 def mark_think_literals(messages: list[dict], tools: list[dict] | None):
-    """(messages, tools) with every literal <think> / </think> in their text swapped for THINK_TAGS' marks, and
+    """(messages, tools) with every literal <think> / </think> or vision marker in their text swapped for
+    LITERAL_TAGS' marks, and
     whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
     An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
     inline) keeps that one block as the model's markers, as before."""
