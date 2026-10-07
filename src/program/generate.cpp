@@ -1384,6 +1384,12 @@ int main(int argc, char** argv) {
         else if (a == "--wait-stats") basalt::core::diagnostics().wait_stats = true;
         else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = next("--draft-log");
+        else if (a == "--exp") {
+            const std::string kv = next("--exp");
+            const size_t eq = kv.find('=');
+            if (eq == std::string::npos || eq == 0) { std::fprintf(stderr, "basalt generate: --exp needs NAME=VALUE\n"); return 2; }
+            basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
+        }
         else if (a == "--ppl-base") ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") ppl_out = next("--ppl-out");
         else if (a == "--shared-late") o.shared_late = true;
