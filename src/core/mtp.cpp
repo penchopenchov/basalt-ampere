@@ -421,9 +421,9 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     }
     basalt::kernels::hc_fused_init();
     pdl_ = exp_flag("draft_pdl", 0) != 0;
-    stage_ = exp_flag("draft_stage", 0) != 0;
-    tail_ = exp_flag("draft_tail", 0) != 0;
-    l2_ = (int) exp_flag("draft_l2", 0);
+    stage_ = exp_flag("draft_stage", 1) != 0;
+    tail_ = exp_flag("draft_tail", 1) != 0;
+    l2_ = (int) exp_flag("draft_l2", 1);
     if (l2_ != 0 && (cudaStreamCreateWithPriority(&cs3_, cudaStreamNonBlocking, prio) != cudaSuccess ||
                      cudaEventCreateWithFlags(&ev_pf_, cudaEventDisableTiming) != cudaSuccess ||
                      cudaEventCreateWithFlags(&ev_pfj_, cudaEventDisableTiming) != cudaSuccess)) {
