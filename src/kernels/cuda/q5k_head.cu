@@ -175,7 +175,8 @@ struct Top {
 
 template <int NC, bool TOP = false>
 __device__ __forceinline__ void q5k_rows_10(const Q5KBlock* __restrict__ w, const XCol* xc, float* __restrict__ y,
-                                            int n_out, int row0, int stride, int lane, Top* top = nullptr) {
+                                            int n_out, int row0, int stride, int lane, Top* top = nullptr,
+                                            const int32_t* __restrict__ map = nullptr) {
     constexpr int NCH = 5;
     const int a = lane / 16, kqs = 2 * (lane % 16);
     const int kb[NCH] = {a, a + 8, a + 2, a + 4, a + 6};
@@ -207,8 +208,12 @@ __device__ __forceinline__ void q5k_rows_10(const Q5KBlock* __restrict__ w, cons
 #pragma unroll
             for (int v = 1; v < VT; ++v) t += p[v][j];
             t = warp_sum(t);
+            if constexpr (TOP) {
+                // a row whose id is negative holds no token: it never wins and adds nothing to the sum
+                if (map != nullptr && map[row] < 0) t = __int_as_float(0xff800000);
+                else top->take(t, row);
+            }
             if (lane == 0) y[(size_t) j * n_out + row] = t;
-            if constexpr (TOP) top->take(t, row);
         }
 #pragma unroll
         for (int c = 0; c < NCH; ++c) cur[c] = nxt[c];
@@ -270,7 +275,7 @@ __global__ void __launch_bounds__(WPB * WARP) q5k_head_top1_kernel(const Q5KBloc
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     Top top;
     top.init();
-    q5k_rows_10<1, true>(w, xc, y, n_out, blockIdx.x * WPB + warp, gridDim.x * WPB, lane, &top);
+    q5k_rows_10<1, true>(w, xc, y, n_out, blockIdx.x * WPB + warp, gridDim.x * WPB, lane, &top, map);
     if (lane == 0) wt[warp] = top;
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -374,6 +379,18 @@ bool q5k_head_top1(const void* weights, const void* x_q8_1, float* y, int n_in, 
         std::exit(1);
     }
     return true;
+}
+
+namespace {
+__global__ void mask_unmapped_kernel(float* __restrict__ y, const int32_t* __restrict__ map, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && map[i] < 0) y[i] = __int_as_float(0xff800000);
+}
+}  // namespace
+
+void q5k_head_mask_unmapped(float* y, const int32_t* map, int n, void* stream) {
+    if (n <= 0) return;
+    mask_unmapped_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(y, map, n);
 }
 
 void q5k_head_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {

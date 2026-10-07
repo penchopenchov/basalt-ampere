@@ -6388,6 +6388,7 @@ int main(int argc, char** argv) {
             if (mtp_on) {
                 if (resume > 0) mtp.kv_restore(resume);
                 mtp.set_prompt_len(n);
+                mtp.begin_request(ids.data(), (int64_t) ids.size());
             }
             const int64_t read_from = resume;
             conversations.limit_reuse(read_from);
@@ -7462,6 +7463,7 @@ int main(int argc, char** argv) {
         }
         ver.set_sampling(sp);   // the CLI's own sampling; no penalties here
         if (use_mtp) mtp.set_draft_sampling(sp);   // sampled drafts (a no-op without --coupled-draft)
+        if (use_mtp) mtp.begin_request(o.tokens.data(), (int64_t) o.tokens.size());
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA has the host call cudaMemcpyAsync + cudaLaunchHostFunc inside a
         // verify window while the GPU spins on the flag they raise, and the host can get stuck in that cudaMemcpyAsync

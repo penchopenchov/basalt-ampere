@@ -66,6 +66,9 @@ public:
     std::vector<std::pair<std::string, const void*>> hc8_keys() const;
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
+    /// A new request (gate dvocab_ctx): the draft head's extra rows are cleared, and the tokens of the prompt that the
+    /// draft subset lacks queue for them.
+    void begin_request(const int64_t* prompt, int64_t n);
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     /// The cumulative draft rule's threshold for the next draft() chain (default: the rule's own).
@@ -246,6 +249,15 @@ private:
     int tier_ = 1;
     int tier2_recent_ = 0;
     std::vector<uint8_t> tier2_;   ///< token id -> 1 when only the added rows hold it
+    // context rows (gate dvocab_ctx): n_xcap_ spare rows after the base rows, filled per request with the head rows of
+    // tokens the subset lacks that the prompt or the text so far holds; an unused row has id -1 (never drafted)
+    int64_t n_xcap_ = 0, xbase_ = 0, n_xused_ = 0;
+    std::vector<uint8_t> in_sub_;   ///< token id -> 1 when the subset holds it or a context row does
+    std::vector<int32_t> xpend_;    ///< tokens waiting for a context row
+    std::vector<int32_t> xlist_;    ///< the tokens of the used context rows
+    int32_t* dxids_ = nullptr;      ///< staging for a fill (n_xcap_ ids)
+    void ctx_note(int64_t t);
+    void ctx_flush(cudaStream_t cs);
     void* top_scratch_ = nullptr;   ///< the head's fused argmax partials
     unsigned long long* gstamp_ = nullptr;   ///< --profile: the round's first and the draft's last GPU time
     FileRange draft_vocab_;   ///< the draft head's token subset, when the files have one

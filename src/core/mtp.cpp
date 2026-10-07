@@ -473,7 +473,11 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
     if (dhead_ == nullptr) {
         if (!draft_vocab_.empty() && draft_vocab_.exists()) {
             const long size = (long) draft_vocab_.size();
-            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+            if (size >= 4 && size % 4 == 0) {
+                const int64_t cx = (int64_t) exp_flag("dvocab_ctx", 0);
+                const uint64_t xr = cx == 1 ? 2048 : (uint64_t) std::max<int64_t>(0, cx);
+                bytes += (uint64_t) (size / 4 + xr) * head_row_bytes + (uint64_t) size + xr * 8;
+            }
         }
     }
     // coupled draft sampling (only when enabled): an upper bound - the id -> subset map, the penalty ring,
@@ -573,37 +577,55 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     if (dhead_ == nullptr) {
         std::vector<uint8_t> raw;
         if (read_file(draft_vocab_, raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
-            n_dvocab_ = (int64_t) (raw.size() / 4);
+            const int64_t n_raw = (int64_t) (raw.size() / 4);
+            const int32_t* ids = (const int32_t*) raw.data();
+            // the base rows: the leading ids up to the first descent (added ids follow the base in id order)
+            int64_t n_base = n_raw;
+            for (int64_t i = 1; i < n_raw; ++i)
+                if (ids[i] < ids[i - 1]) { n_base = i; break; }
+            // context rows follow the base rows (gate dvocab_ctx: the value is the row count, 1 = 2048)
+            const int64_t cx = exp_flag("dvocab_ctx", 0);
+            if (cx != 0 && !coupled_draft_env() && head->type() == 13 && n_raw > 0) n_xcap_ = cx == 1 ? 2048 : cx;
+            xbase_ = n_base;
+            std::vector<int32_t> map((size_t) (n_raw + n_xcap_));
+            std::copy(ids, ids + n_base, map.begin());
+            std::fill(map.begin() + n_base, map.begin() + n_base + n_xcap_, -1);
+            std::copy(ids + n_base, ids + n_raw, map.begin() + n_base + n_xcap_);
+            n_dvocab_ = n_raw + n_xcap_;
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+            if (cudaMalloc((void**) &dvocab_, map.size() * 4) != cudaSuccess ||
+                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess ||
+                (n_xcap_ > 0 && cudaMalloc((void**) &dxids_, (size_t) n_xcap_ * 4) != cudaSuccess)) {
                 err = "mtp: the draft head does not fit";
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
-            if (exp_flag("spec_log", 0) != 0) diag_map_.assign((const int32_t*) raw.data(), (const int32_t*) raw.data() + n_dvocab_);
+            // unused context rows read the first row's weights for the gather, then take their id -1
+            std::vector<int32_t> gmap = map;
+            for (int32_t& v : gmap) if (v < 0) v = ids[0];
+            cudaMemcpy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
             basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
+            cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
+            if (exp_flag("spec_log", 0) != 0) diag_map_ = map;
+            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + map.size() * 4 + (uint64_t) n_xcap_ * 4;
             std::fprintf(stderr, "basalt mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
-            // the base rows: the leading ids up to the first descent (added ids follow the base in id order)
-            n_tier1_ = n_dvocab_;
-            {
-                const int32_t* ids = (const int32_t*) raw.data();
-                for (int64_t i = 1; i < n_dvocab_; ++i)
-                    if (ids[i] < ids[i - 1]) { n_tier1_ = i; break; }
-                if (n_tier1_ < n_dvocab_) {
-                    tier2_.assign((size_t) n_vocab_, 0);
-                    for (int64_t i = n_tier1_; i < n_dvocab_; ++i)
-                        if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 1;
-                    for (int64_t i = 0; i < n_tier1_; ++i)
-                        if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 0;
-                    std::fprintf(stderr, "basalt mtp: draft head tiers: %lld base rows, %lld added rows read after an "
-                                         "added token\n", (long long) n_tier1_,
-                                 (long long) (n_dvocab_ - n_tier1_));
-                }
+            n_tier1_ = n_base + n_xcap_;
+            if (n_xcap_ > 0) {
+                in_sub_.assign((size_t) n_vocab_, 0);
+                for (int64_t i = 0; i < n_raw; ++i)
+                    if (ids[i] >= 0 && ids[i] < n_vocab_) in_sub_[(size_t) ids[i]] = 1;
+                std::fprintf(stderr, "basalt mtp: draft head context rows: %lld\n", (long long) n_xcap_);
+            }
+            if (n_base < n_raw) {
+                tier2_.assign((size_t) n_vocab_, 0);
+                for (int64_t i = n_base; i < n_raw; ++i)
+                    if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 1;
+                for (int64_t i = 0; i < n_base; ++i)
+                    if (ids[i] >= 0 && ids[i] < n_vocab_) tier2_[(size_t) ids[i]] = 0;
+                std::fprintf(stderr, "basalt mtp: draft head tiers: %lld base rows, %lld added rows read after an "
+                                     "added token\n", (long long) n_base, (long long) (n_raw - n_base));
             }
         }
     }
@@ -902,6 +924,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        if (sub && n_xcap_ > 0)   // rows without a token never win
+            for (int t = 0; t < T; ++t) q5k_head_mask_unmapped(head_logits_ + (size_t) t * nv, dvocab_, (int) nv, cs);
         if (diag_ != nullptr && !coupled_rec_ && T == 1)   // the step's logits to the host, for the draft-tree study
             cudaMemcpyAsync(diag_ + (size_t) coupled_j_ * (size_t) diag_stride_, head_logits_, (size_t) nv * sizeof(float),
                             cudaMemcpyDeviceToHost, cs);
@@ -1317,11 +1341,50 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     return true;
 }
 
+void MtpDrafter::ctx_note(int64_t t) {
+    if (n_xcap_ == 0 || t < 0 || t >= n_vocab_ || in_sub_[(size_t) t]) return;
+    if ((int64_t) xlist_.size() + (int64_t) xpend_.size() >= n_xcap_) return;
+    in_sub_[(size_t) t] = 1;
+    xpend_.push_back((int32_t) t);
+}
+
+void MtpDrafter::begin_request(const int64_t* prompt, int64_t n) {
+    if (n_xcap_ == 0) return;
+    const OnDevice on_device(device_);
+    for (int32_t t : xlist_) in_sub_[(size_t) t] = 0;
+    for (int32_t t : xpend_) in_sub_[(size_t) t] = 0;
+    if (n_xused_ > 0) cudaMemsetAsync(dvocab_ + xbase_, 0xff, (size_t) n_xused_ * 4, cs_);   // ids -1
+    if (!diag_map_.empty()) std::fill(diag_map_.begin() + xbase_, diag_map_.begin() + xbase_ + n_xcap_, -1);
+    xlist_.clear();
+    xpend_.clear();
+    n_xused_ = 0;
+    for (int64_t i = 0; i < n; ++i) ctx_note(prompt[i]);
+}
+
+// The queued tokens' head rows into the next free context rows, ahead of the draft graphs on the same stream.
+void MtpDrafter::ctx_flush(cudaStream_t cs) {
+    if (xpend_.empty()) return;
+    const int64_t n = (int64_t) xpend_.size();
+    const int64_t row_bytes = (int64_t) head_->row_bytes();
+    const int64_t at = xbase_ + n_xused_;
+    cudaMemcpyAsync(dxids_, xpend_.data(), (size_t) n * 4, cudaMemcpyHostToDevice, cs);
+    basalt::kernels::gather_rows((const uint8_t*) head_->weights(), row_bytes, dxids_, n, dhead_ + at * row_bytes, cs);
+    cudaMemcpyAsync(dvocab_ + at, dxids_, (size_t) n * 4, cudaMemcpyDeviceToDevice, cs);
+    if (!diag_map_.empty()) std::copy(xpend_.begin(), xpend_.end(), diag_map_.begin() + at);
+    xlist_.insert(xlist_.end(), xpend_.begin(), xpend_.end());
+    n_xused_ += n;
+    xpend_.clear();
+}
+
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
+    if (n_xcap_ > 0) {   // the window's committed picks (rows 0..a) may hold names the subset lacks
+        for (int t = 0; t <= a; ++t) ctx_note(tokens[t]);
+        ctx_flush(cs_);
+    }
     const int max_steps = std::min(max_t_ - 1, max_drafts_);
     if (!tier2_.empty()) {   // every row for a while after a token only the added rows hold
         for (int t = 0; t < T; ++t)

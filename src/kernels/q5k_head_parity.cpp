@@ -144,6 +144,71 @@ int main(int argc, char** argv) {
                     logit_bad ? "FAIL" : "bitwise", logit_bad, id_bad ? "FAIL" : "equal", id_bad, max_rel);
         if (logit_bad || id_bad || max_rel > 1e-5) fail = 1;
     }
+    // rows without a token (negative id): the fused argmax skips them, and the mask sets their logits to -inf
+    {
+        void* scratch = nullptr;
+        int* d_id = nullptr;
+        float* d_p = nullptr;
+        int32_t* d_map = nullptr;
+        ck(cudaMalloc(&scratch, k::q5k_head_top1_scratch_bytes()), "scratch");
+        ck(cudaMemset(scratch, 0, k::q5k_head_top1_scratch_bytes()), "scratch0");
+        ck(cudaMalloc(&d_id, 64), "id"); ck(cudaMalloc(&d_p, 64), "p");
+        const int rr = std::min(rows, 106299);
+        std::vector<int32_t> map((size_t) rr);
+        for (int i = 0; i < rr; ++i) map[(size_t) i] = (i % 5 == 2 || i >= rr - 2048) ? -1 : 3 * i + 7;
+        ck(cudaMalloc(&d_map, map.size() * 4), "map");
+        ck(cudaMemcpy(d_map, map.data(), map.size() * 4, cudaMemcpyHostToDevice), "map up");
+        int bad = 0;
+        double max_rel = 0;
+        for (int col = 0; col < MT; ++col) {
+            const void* xc = (const char*) xq + (size_t) col * k::native_q8_1_bytes(n_in, 1);
+            k::native_mmvq(13, w, xc, y0, n_in, rr, 1, s);
+            k::q5k_head_top1(w, xc, y1, n_in, rr, d_map, d_id, d_p, scratch, s);
+            ck(cudaStreamSynchronize(s), "sync");
+            std::vector<float> a((size_t) rr), b((size_t) rr);
+            ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "la");
+            ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "lb");
+            int best = -1;
+            for (int i = 0; i < rr; ++i) {
+                if (map[(size_t) i] < 0) { bad += !(std::isinf(b[(size_t) i]) && b[(size_t) i] < 0); continue; }
+                bad += std::memcmp(&a[(size_t) i], &b[(size_t) i], 4) != 0;
+                if (best < 0 || a[(size_t) i] > a[(size_t) best]) best = i;
+            }
+            double sum = 0;
+            for (int i = 0; i < rr; ++i)
+                if (map[(size_t) i] >= 0) sum += std::exp((double) a[(size_t) i] - (double) a[(size_t) best]);
+            int id;
+            float p;
+            ck(cudaMemcpy(&id, d_id, 4, cudaMemcpyDeviceToHost), "id");
+            ck(cudaMemcpy(&p, d_p, 4, cudaMemcpyDeviceToHost), "p");
+            bad += id != map[(size_t) best];
+            max_rel = std::max(max_rel, std::fabs((double) p - 1.0 / sum) * sum);
+            // the mask after the plain head
+            k::q5k_head_mmvq(w, xc, y1, n_in, rr, 1, s);
+            k::q5k_head_mask_unmapped(y1, d_map, rr, s);
+            ck(cudaStreamSynchronize(s), "sync");
+            ck(cudaMemcpy(b.data(), y1, b.size() * 4, cudaMemcpyDeviceToHost), "lb2");
+            for (int i = 0; i < rr; ++i)
+                bad += map[(size_t) i] < 0 ? !(std::isinf(b[(size_t) i]) && b[(size_t) i] < 0)
+                                           : std::memcmp(&a[(size_t) i], &b[(size_t) i], 4) != 0;
+        }
+        float t_map = 0, t_plain = 0;
+        for (int rep = 0; rep < 2; ++rep) {
+            cudaEventRecord(e0, s);
+            for (int it = 0; it < iters; ++it) k::q5k_head_top1(w, xq, y1, n_in, rr, d_map, d_id, d_p, scratch, s);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&t_map, e0, e1);
+            cudaEventRecord(e0, s);
+            for (int it = 0; it < iters; ++it) k::q5k_head_top1(w, xq, y1, n_in, rr, nullptr, d_id, d_p, scratch, s);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&t_plain, e0, e1);
+        }
+        std::printf("top1 with holes, rows %d: %s (%d bad), probability max rel diff %.2e | with map %.1f us, without %.1f us\n",
+                    rr, bad ? "FAIL" : "bitwise", bad, max_rel, 1e3 * t_map / iters, 1e3 * t_plain / iters);
+        if (bad || max_rel > 1e-5) fail = 1;
+    }
     std::printf("%s\n", fail ? "q5k_head_parity: FAIL" : "q5k_head_parity: OK (bitwise)");
     return fail;
 }
