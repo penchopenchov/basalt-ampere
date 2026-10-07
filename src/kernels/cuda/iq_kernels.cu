@@ -1759,7 +1759,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                                 if (use_pre) row_dot_40_sub8<TD, 2, true, true>(wr, s_hq, off2, 2, t, s2, pre);
                                 else row_dot_40_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
                             } else row_dot_40_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t];
+                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = t == 0 ? s2[0] : s2[1];
                         } else {
                             int off[GRP_NC];
 #pragma unroll
@@ -1805,7 +1805,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                             const int off2[2] = { 0, 20 };
                             float s2[2];
                             row_dot_20_sub16<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
-                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t];
+                            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = t == 0 ? s2[0] : s2[1];
                         } else {
                             int off[GRP_NC];
 #pragma unroll
