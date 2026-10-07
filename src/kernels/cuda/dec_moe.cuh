@@ -137,6 +137,71 @@ __device__ __forceinline__ void dm_group_fast(const int32_t* s_ids, const int32_
     __syncthreads();
 }
 
+// dm_group_fast's plan from a key array (the id of a device entry, -1 else; padded to a multiple of four) read four
+// entries at a time.  Leaves s_pos to the caller (no closing barrier): entry tid's place is s_gstart[first] + rank.
+__device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int tid, int32_t* s_first, int32_t* s_cnt,
+                                              int32_t* s_gstart, int32_t* s_gidx, int32_t* start, int32_t* s_ng,
+                                              int32_t* s_ne, int& first_out, int& rank_out) {
+    static_assert(kDmCap == 128, "the scan takes four entries a lane");
+    int first = tid, rank = 0, cnt = 0;
+    const int32_t e = tid < n ? s_key[tid] : -1;
+    const bool mine = e >= 0;
+    if (mine) {
+        const int n4 = (n + 3) & ~3;
+#pragma unroll 4
+        for (int j = 0; j < n4; j += 4) {
+            const int4 k4 = *(const int4*) (s_key + j);
+            const bool m0 = k4.x == e, m1 = k4.y == e, m2 = k4.z == e, m3 = k4.w == e;
+            first = m3 && j + 3 < first ? j + 3 : first;
+            first = m2 && j + 2 < first ? j + 2 : first;
+            first = m1 && j + 1 < first ? j + 1 : first;
+            first = m0 && j < first ? j : first;
+            rank += (m0 && j < tid) + (m1 && j + 1 < tid) + (m2 && j + 2 < tid) + (m3 && j + 3 < tid);
+            cnt += (int) m0 + (int) m1 + (int) m2 + (int) m3;
+        }
+    }
+    const bool is_first = mine && first == tid;
+    if (tid < kDmCap) {
+        s_first[tid] = is_first;
+        s_cnt[tid] = is_first ? cnt : 0;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        int f[4], c[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            f[q] = s_first[4 * tid + q];
+            c[q] = s_cnt[4 * tid + q];
+        }
+        int fi = f[0] + f[1] + f[2] + f[3], ci = c[0] + c[1] + c[2] + c[3];
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int fu = __shfl_up_sync(0xffffffffu, fi, d), cu = __shfl_up_sync(0xffffffffu, ci, d);
+            if (tid >= d) { fi += fu; ci += cu; }
+        }
+        const int ng = __shfl_sync(0xffffffffu, fi, 31), ne = __shfl_sync(0xffffffffu, ci, 31);
+        int gi = fi - (f[0] + f[1] + f[2] + f[3]), es = ci - (c[0] + c[1] + c[2] + c[3]);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if (f[q]) {
+                s_gidx[4 * tid + q] = gi;
+                s_gstart[4 * tid + q] = es;
+                start[gi] = es;
+            }
+            gi += f[q];
+            es += c[q];
+        }
+        if (tid == 0) {
+            start[ng] = ne;
+            *s_ng = ng;
+            *s_ne = ne;
+        }
+    }
+    __syncthreads();
+    first_out = first;
+    rank_out = rank;
+}
+
 // Block 0 plans CUDA0's groups and publishes the ring's header; the other blocks quantize the FFN input (256 values
 // each) into the device q8_1 rows and, for the tiers that need them, into mapped memory.  The last block to finish
 // rings both doorbells.  Mode 1 keeps only the plan and the device rows, mode 2 only the ring (DmRouteArgs::mode).
@@ -428,11 +493,12 @@ __device__ void dm_glue_sw(int idx, int ng, const int32_t* s_start, int n_ff, un
 
 template<int TG>
 __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L, float* __restrict__ gate,
-                                                         float* __restrict__ up, block_q8_1* __restrict__ hq, int gy, int fast_group) {
+                                                         float* __restrict__ up, block_q8_1* __restrict__ hq, int gy, int fast_group, int pro) {
     __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap], s_start[kDmCap + 1], s_tok[kDmCap];
     __shared__ unsigned long long s_p[kDmCap], s_ptr[kDmCap];
     __shared__ int32_t s_ng, s_ne;
+    __shared__ alignas(16) int32_t s_key[kDmCap];
     __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     const bool lead = blockIdx.x == 0;
@@ -452,24 +518,52 @@ __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExp
     if (tid == 0 && (int) blockIdx.x * 16 < a.n_expert)   // the layer's table into L2
         asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + blockIdx.x * 16));
     pdl_wait();
-    if (tid < n) s_ids[tid] = __ldcg(a.ids + tid);
-    __syncthreads();
-    if (tid < n) {
-        const int32_t e = s_ids[tid];
-        bool ok = e >= 0 && e < a.n_expert;
-        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
-        const unsigned long long p = ok ? a.ptab[e] : 0ull;
-        s_p[tid] = p;
-        s_kind[tid] = p != 0ull ? 0 : -1;
+    if (pro) {
+        // the table entry is read at once, beside the id's validity check
+        const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
+        const unsigned long long praw = (e0 >= 0 && e0 < a.n_expert) ? a.ptab[e0] : 0ull;
+        if (tid < n) s_ids[tid] = e0;
+        __syncthreads();
+        int32_t key = -1;
+        if (tid < n) {
+            bool ok = e0 >= 0 && e0 < a.n_expert;
+            for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e0;
+            const unsigned long long p = ok ? praw : 0ull;
+            s_p[tid] = p;
+            s_kind[tid] = p != 0ull ? 0 : -1;
+            key = p != 0ull ? e0 : -1;
+        }
+        if (tid < kDmCap) s_key[tid] = key;
+        __syncthreads();
+        int first = 0, rank = 0;
+        dm_group_keys(s_key, n, tid, s_first, s_cnt, s_gstart, s_gidx, s_start, &s_ng, &s_ne, first, rank);
+        if (tid < n && s_kind[tid] == 0) {
+            const int pos = s_gstart[first] + rank;
+            s_pos[tid] = pos;
+            s_tok[pos] = tid / a.k;
+            if (s_first[tid]) s_ptr[s_gidx[tid]] = s_p[tid];
+        }
+        __syncthreads();
+    } else {
+        if (tid < n) s_ids[tid] = __ldcg(a.ids + tid);
+        __syncthreads();
+        if (tid < n) {
+            const int32_t e = s_ids[tid];
+            bool ok = e >= 0 && e < a.n_expert;
+            for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
+            const unsigned long long p = ok ? a.ptab[e] : 0ull;
+            s_p[tid] = p;
+            s_kind[tid] = p != 0ull ? 0 : -1;
+        }
+        __syncthreads();
+        if (fast_group) dm_group_fast(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
+        else dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
+        if (tid < n && s_kind[tid] == 0) {
+            s_tok[s_pos[tid]] = tid / a.k;
+            if (s_first[tid]) s_ptr[s_gidx[tid]] = s_p[tid];
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    if (fast_group) dm_group_fast(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
-    else dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
-    if (tid < n && s_kind[tid] == 0) {
-        s_tok[s_pos[tid]] = tid / a.k;
-        if (s_first[tid]) s_ptr[s_gidx[tid]] = s_p[tid];
-    }
-    __syncthreads();
     const int ng = s_ng;
     if (lead) {
         DmPlan* P = a.plan;
@@ -1383,6 +1477,7 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scratch, float* out, int cap, void* stream) {
     static const bool x_fuse = core::exp_flag("moe_fuse", 0) != 0;
     static const int x_grp = core::exp_flag("gu_grp", 1) != 0;
+    static const int x_pro = core::exp_flag("gu2_pro", 0) != 0;
     DmGlueArgs a = a_in;
     a.fuse = a.fuse || x_fuse;
     if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap) {
@@ -1398,7 +1493,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * gy;
     auto go = [&](auto kernel, int resident) {
         const int nb = std::max(1, std::min(items, resident)) + (a.ring_on ? 1 : 0) + (a.fuse ? kDmSwBlocks : 0);
-        launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, hq, gy, x_grp);
+        launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, hq, gy, x_grp, x_pro);
     };
     switch (L.gu_type) {
         case 16: go(dm_glue_gu_kernel<16>, dm_glue_blocks<16>()); break;

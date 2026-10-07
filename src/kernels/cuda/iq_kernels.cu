@@ -8,6 +8,7 @@
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/core/diag.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -918,23 +919,24 @@ __device__ __forceinline__ void row_dot_multi(const uint8_t* row, const block_q8
 
 // 8-lane sub-warp row dot for K = nb * ipb == 40 (TD == 20, IQ4_NL with n_ff == 640):
 // 4 rows per warp (32 rows per 256-thread block), 100% active lanes, bitwise identical addition tree to row_dot_multi.
-template<int TY, int NC, bool EXACT_N = false>
+template<int TY, int NC, bool EXACT_N = false, bool PRE = false>
 __device__ __forceinline__ void row_dot_40_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
-                                                int t, float (&s)[NC]) {
+                                                int t, float (&s)[NC], const typename Split<TY>::W* pw = nullptr) {
     using F = Fmt<TY>;
     using S = Split<TY>;
 #pragma unroll
     for (int c = 0; c < NC; ++c) s[c] = 0.0f;
-    for (int k = t; k < 40; k += 32) {
-        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-        const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int k = t + 32 * i, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const typename S::W w = PRE ? pw[i] : S::load(row, kbx, iqs);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
     }
     {
         const int k = t + 16, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-        const typename S::W w = S::load(row, kbx, iqs);
+        const typename S::W w = PRE ? pw[2] : S::load(row, kbx, iqs);
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             if (EXACT_N || c < n) {
@@ -949,14 +951,14 @@ __device__ __forceinline__ void row_dot_40_sub8(const uint8_t* row, const block_
     for (int c = 0; c < NC; ++c) s8[c] = 0.0f;
     {
         const int k = t + 8, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-        const typename S::W w = S::load(row, kbx, iqs);
+        const typename S::W w = PRE ? pw[3] : S::load(row, kbx, iqs);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (EXACT_N || c < n) s8[c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
     }
     {
         const int k = t + 24, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-        const typename S::W w = S::load(row, kbx, iqs);
+        const typename S::W w = PRE ? pw[4] : S::load(row, kbx, iqs);
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             if (EXACT_N || c < n) {
@@ -1705,7 +1707,7 @@ __device__ __forceinline__ void dm_wait_hq(int ng, int g0, int gstride, unsigned
 // native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent - the
 // block's first group's weight rows are prefetched into L2 before the wait.  FUSE: the wait is per group, for the
 // gate/up kernel's SwiGLU step (dm_glue_gu_kernel with fuse), not for the previous kernel's end.
-template<int TD, bool DEP = false, bool FUSE = false>
+template<int TD, bool DEP = false, bool FUSE = false, bool PRE = false>
 __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
@@ -1714,6 +1716,26 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                                                                 float* __restrict__ out) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
+    // PRE: this thread's weight words for the block's first group are loaded before the wait (the weights do not
+    // depend on the previous kernel), so the first entry batch starts with them in registers
+    typename Split<TD>::W pre[5];
+    bool pre_ok = false;
+    if constexpr (DEP && PRE && TD == 20) {
+        if (L.n_ff == 640) {
+            const int r = blockIdx.x * 32 + (threadIdx.x >> 3), t = threadIdx.x & 7;
+            if (r < L.n_embd) {
+                const uint8_t* wr = (const uint8_t*) grp_ptr[blockIdx.y] + L.down_off + (size_t) r * L.d_row;
+                using F = Fmt<TD>;
+                constexpr int ks[5] = { 0, 32, 16, 8, 24 };
+#pragma unroll
+                for (int i = 0; i < 5; ++i) {
+                    const int k = t + ks[i];
+                    pre[i] = Split<TD>::load(wr, k / F::ipb, F::step * (k % F::ipb));
+                }
+                pre_ok = true;
+            }
+        }
+    }
     if constexpr (DEP) {
         const int rows = L.n_ff == 640 ? (TD == 20 ? 32 : TD == 42 ? 16 : 8) : 8;
         const int r0 = blockIdx.x * rows, nr = min(rows, (int) L.n_embd - r0);
@@ -1737,6 +1759,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                 const int e0 = grp_start[g], e1 = grp_start[g + 1];
                 for (int e = e0; e < e1; e += GRP_NC) {
                     const int n = min(GRP_NC, e1 - e);
+                    const bool use_pre = PRE && pre_ok && g == blockIdx.y && e == e0;
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
                     const int words = n * (20 * 9);
                     __syncthreads();
@@ -1746,19 +1769,28 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                         if (n == 1) {
                             const int off1[1] = { 0 };
                             float s1[1];
-                            row_dot_40_sub8<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
+                            if constexpr (PRE) {
+                                if (use_pre) row_dot_40_sub8<TD, 1, true, true>(wr, s_hq, off1, 1, t, s1, pre);
+                                else row_dot_40_sub8<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
+                            } else row_dot_40_sub8<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
                             if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0];
                         } else if (n == 2) {
                             const int off2[2] = { 0, 20 };
                             float s2[2];
-                            row_dot_40_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
+                            if constexpr (PRE) {
+                                if (use_pre) row_dot_40_sub8<TD, 2, true, true>(wr, s_hq, off2, 2, t, s2, pre);
+                                else row_dot_40_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
+                            } else row_dot_40_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
                             if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t];
                         } else {
                             int off[GRP_NC];
 #pragma unroll
                             for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * 20;
                             float s[GRP_NC];
-                            row_dot_40_sub8<TD, GRP_NC>(wr, s_hq, off, n, t, s);
+                            if constexpr (PRE) {
+                                if (use_pre) row_dot_40_sub8<TD, GRP_NC, false, true>(wr, s_hq, off, n, t, s, pre);
+                                else row_dot_40_sub8<TD, GRP_NC>(wr, s_hq, off, n, t, s);
+                            } else row_dot_40_sub8<TD, GRP_NC>(wr, s_hq, off, n, t, s);
 #pragma unroll
                             for (int c = 0; c < GRP_NC; ++c)
                                 if (c < n && t == c) out[(size_t) ent_dst[e + c] * L.n_embd + r] = s[c];
@@ -2395,9 +2427,11 @@ template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out, bool dep = false, bool fuse = false) {
+    static const bool x_dpre = core::exp_flag("gu2_dpre", 0) != 0;
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (dep && fuse) launch_dependent(native_down_multi_kernel<TD, true, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if (dep && TD == 20 && x_dpre) launch_dependent(native_down_multi_kernel<TD, true, false, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (dep) launch_dependent(native_down_multi_kernel<TD, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else native_down_multi_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
