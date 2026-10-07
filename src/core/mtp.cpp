@@ -582,6 +582,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 return false;
             }
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+            if (exp_flag("spec_log", 0) != 0) diag_map_.assign((const int32_t*) raw.data(), (const int32_t*) raw.data() + n_dvocab_);
             basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
@@ -607,6 +608,11 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
+    if (diag_ == nullptr && exp_flag("spec_log", 0) != 0) {
+        diag_stride_ = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
+        if (cudaHostAlloc((void**) &diag_, (size_t) max_t_ * (size_t) diag_stride_ * sizeof(float), cudaHostAllocDefault) != cudaSuccess)
+            diag_ = nullptr;
+    }
     if (top_scratch_ == nullptr) {
         const size_t b = basalt::kernels::q5k_head_top1_scratch_bytes();
         if (cudaMalloc(&top_scratch_, b) != cudaSuccess) { err = "mtp: the draft head's argmax scratch does not fit"; return false; }
@@ -886,7 +892,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const int64_t nv = sub ? ((tier_ == 0 && !coupled_rec_) ? n_tier1_ : n_dvocab_) : n_vocab_;
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
         // another order: last bits)
-        if (!coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr &&
+        if (!coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
             return true;
@@ -894,6 +900,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        if (diag_ != nullptr && !coupled_rec_ && T == 1)   // the step's logits to the host, for the draft-tree study
+            cudaMemcpyAsync(diag_ + (size_t) coupled_j_ * (size_t) diag_stride_, head_logits_, (size_t) nv * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
@@ -1095,6 +1104,31 @@ bool MtpDrafter::step_end(int64_t HCN, int j) {
         return false;
     ctail_done_ = c != nullptr;
     return true;
+}
+
+int MtpDrafter::diag_top(int j, int k, int32_t* ids, float* probs) const {
+    if (diag_ == nullptr || j < 0 || j >= max_t_) return 0;
+    const bool sub = dhead_ != nullptr;
+    const int64_t nv = sub ? (tier_ == 0 ? n_tier1_ : n_dvocab_) : n_vocab_;
+    const float* l = diag_ + (size_t) j * (size_t) diag_stride_;
+    std::vector<std::pair<float, int64_t>> best;
+    float mx = l[0];
+    for (int64_t i = 1; i < nv; ++i) mx = std::max(mx, l[i]);
+    double sum = 0.0;
+    for (int64_t i = 0; i < nv; ++i) {
+        sum += std::exp((double) (l[i] - mx));
+        if ((int) best.size() < k || l[i] > best.back().first) {
+            best.emplace_back(l[i], i);
+            std::sort(best.begin(), best.end(), [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+            if ((int) best.size() > k) best.pop_back();
+        }
+    }
+    for (size_t i = 0; i < best.size(); ++i) {
+        const int64_t r = best[i].second;
+        ids[i] = sub && (size_t) r < diag_map_.size() ? diag_map_[(size_t) r] : (int32_t) r;
+        probs[i] = (float) (std::exp((double) (best[i].first - mx)) / sum);
+    }
+    return (int) best.size();
 }
 
 void MtpDrafter::end_branches() {

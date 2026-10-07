@@ -104,6 +104,9 @@ public:
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
     bool coupled() const { return coupled_active_; }
+    /// Diagnostic (gate spec_log): the top-k tokens and softmax probabilities of the last draft's step j, from the
+    /// draft head's logits kept per step.  Returns the count written (0 when the diagnostic is off).
+    int diag_top(int j, int k, int32_t* ids, float* probs) const;
     /// Called once by the next draft() right after its graphs are launched (the host's own work in their shadow).
     void set_launch_hook(std::function<void()> fn) { launch_hook_ = std::move(fn); }
 
@@ -227,6 +230,9 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
+    float* diag_ = nullptr;                         ///< spec_log: the draft head's logits per chain step (pinned)
+    int64_t diag_stride_ = 0;
+    std::vector<int32_t> diag_map_;                 ///< spec_log: the draft head's row -> token id
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;

@@ -6783,6 +6783,14 @@ int main(int argc, char** argv) {
                 std::fprintf(draft_log, "R temp=%g min_p=%g S=%d\n", (double) req_temperature, req_spec_min_p, S_mtp);
                 std::fflush(draft_log);
             }
+            // spec_log: per window, the target's sampling distribution at each verified row beside the draft head's top-4
+            // of the draft that row checks, for offline tree-draft studies (written next to --draft-log as FILE.tk)
+            static FILE* const tk_log = basalt::core::exp_flag("spec_log", 0) != 0 && !basalt::core::diagnostics().draft_log.empty()
+                ? std::fopen((basalt::core::diagnostics().draft_log + ".tk").c_str(), "a") : nullptr;
+            struct TkStep { int n = 0; int32_t id[4] = {}; float p[4] = {}; };
+            TkStep tk_prev[16];
+            bool tk_valid = false;
+            if (tk_log != nullptr) { std::fprintf(tk_log, "R temp=%g S=%d\n", (double) req_temperature, S_mtp); std::fflush(tk_log); }
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
@@ -6865,6 +6873,43 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                if (tk_log != nullptr && tk_valid && !from_sfx && ppl == nullptr && req_temperature > 0.0) {
+                    std::vector<float> lg((size_t) n_vocab);
+                    std::fprintf(tk_log, "W %d %d\n", T, a);
+                    for (int j = 0; j < T; ++j) {
+                        if (j > a) {   // past the first miss: only the draft side
+                            std::fprintf(tk_log, "R %d - - T D", j);
+                            for (int i = 0; i < tk_prev[j].n; ++i) std::fprintf(tk_log, " %d:%.5f", (int) tk_prev[j].id[i], (double) tk_prev[j].p[i]);
+                            std::fputc('\n', tk_log);
+                            continue;
+                        }
+                        if (!ver.copy_logits(j, lg.data())) break;
+                        // top_k, top_p, then temperature over the survivors: the sampler chain without penalties
+                        std::vector<int> ord((size_t) n_vocab);
+                        for (int i = 0; i < n_vocab; ++i) ord[(size_t) i] = i;
+                        const int K = std::max(1, std::min<int>(req_top_k > 0 ? req_top_k : 20, (int) n_vocab));
+                        std::partial_sort(ord.begin(), ord.begin() + K, ord.end(), [&](int x, int y) {
+                            return lg[(size_t) x] > lg[(size_t) y] || (lg[(size_t) x] == lg[(size_t) y] && x < y);
+                        });
+                        const double mx = lg[(size_t) ord[0]];
+                        std::vector<double> e((size_t) K);
+                        double s1 = 0.0;
+                        for (int i = 0; i < K; ++i) s1 += (e[(size_t) i] = std::exp((double) lg[(size_t) ord[(size_t) i]] - mx));
+                        int keep = K;
+                        double cum = 0.0;
+                        for (int i = 0; i < K; ++i) { cum += e[(size_t) i] / s1; if (cum >= (double) req_top_p) { keep = i + 1; break; } }
+                        double s2 = 0.0;
+                        for (int i = 0; i < keep; ++i) s2 += (e[(size_t) i] = std::exp(((double) lg[(size_t) ord[(size_t) i]] - mx) / (double) req_temperature));
+                        std::fprintf(tk_log, "R %d %d %d", j, j + 1 < T ? (int) window[(size_t) j + 1] : -1, (int) outv[(size_t) j]);
+                        std::fprintf(tk_log, " T");
+                        for (int i = 0; i < std::min(keep, 8); ++i) std::fprintf(tk_log, " %d:%.5f", ord[(size_t) i], e[(size_t) i] / s2);
+                        std::fprintf(tk_log, " D");
+                        for (int i = 0; i < tk_prev[j].n; ++i) std::fprintf(tk_log, " %d:%.5f", (int) tk_prev[j].id[i], (double) tk_prev[j].p[i]);
+                        std::fputc('\n', tk_log);
+                    }
+                    std::fflush(tk_log);
+                }
+                tk_valid = false;
                 const Clock::time_point tw1 = Clock::now();
                 bool adapt_ok = true;
                 const bool do_adapt = !drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0 &&
@@ -6984,6 +7029,12 @@ int main(int argc, char** argv) {
                         mtp.set_launch_hook(after_launch);
                         drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                         mtp.set_launch_hook(nullptr);
+                        if (tk_log != nullptr && drafted) {
+                            for (int j = 0; j < 16 && j < S_mtp; ++j) {
+                                tk_prev[j].n = mtp.diag_top(j, 4, tk_prev[j].id, tk_prev[j].p);
+                            }
+                            tk_valid = true;
+                        }
                     }
                     if (!after_ran) after_launch();
                     basalt::core::decode_events().stamp(0);
