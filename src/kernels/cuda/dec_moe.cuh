@@ -1477,7 +1477,7 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scratch, float* out, int cap, void* stream) {
     static const bool x_fuse = core::exp_flag("moe_fuse", 0) != 0;
     static const int x_grp = core::exp_flag("gu_grp", 1) != 0;
-    static const int x_pro = core::exp_flag("gu2_pro", 0) != 0;
+    static const int x_pro = core::exp_flag("gu2_pro", 1) != 0;
     DmGlueArgs a = a_in;
     a.fuse = a.fuse || x_fuse;
     if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap) {

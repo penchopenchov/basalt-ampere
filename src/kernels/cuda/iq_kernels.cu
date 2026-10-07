@@ -2427,7 +2427,7 @@ template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out, bool dep = false, bool fuse = false) {
-    static const bool x_dpre = core::exp_flag("gu2_dpre", 0) != 0;
+    static const bool x_dpre = core::exp_flag("gu2_dpre", 1) != 0;
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (dep && fuse) launch_dependent(native_down_multi_kernel<TD, true, true>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
