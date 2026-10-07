@@ -1077,6 +1077,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 h.next_early = read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
                                !is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT &&
                                dec_gdnf_mode() != 0;
+                // a QSA layer's query projection follows (qsaf_wide path): its blocks start with the read
+                static const int x_qsa = (int) basalt::core::exp_flag("qsa_early", 0);
+                if (x_qsa && read_q8 && is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT) {
+                    const QsaState& st0 = ss.qsa_states[qsa_idx[(size_t) l]];
+                    h.next_early = st0.kv_int8 && !st0.kv_rot && !st0.kv_hybrid && !st0.kv_q4 && native_qsa_enabled() &&
+                                   native_rope_enabled() && qsa_dec_fused_supported(s) &&
+                                   qs_[0] != nullptr;
+                }
                 h.pf[0] = wn[1]->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float);
                 hc_fused_read(h, cs);
             } else {
