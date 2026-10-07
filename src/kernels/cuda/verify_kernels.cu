@@ -607,7 +607,7 @@ __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __rest
         float c = 1.0f;
         for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
         c = c * basalt::core::draft_cum_acc(p);
-        keep = c >= cum_th;
+        keep = c >= __int_as_float(min_p_bits[1]);   // the window's threshold rides beside min_p
     }
     cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
     for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);
@@ -687,7 +687,7 @@ __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32
         float c = 1.0f;
         for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
         c = c * basalt::core::draft_cum_acc(p);
-        keep = c >= cum_th;
+        keep = c >= __int_as_float(min_p_bits[1]);   // the window's threshold rides beside min_p
     }
     cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
     for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);

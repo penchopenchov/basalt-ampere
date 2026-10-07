@@ -979,7 +979,7 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
     const int ra = 2 * max_t_ - 1;
     if (stage_) {   // the catch-up reads rows below 2T only: the draft row's records are staged with the rest
         MtpStageSeg sg[6] = {{tok_, m_tok_, T}, {step_, m_step_, (int) (rows * 4)}, {pos_, m_pos_, (int) (rows * NH)},
-                             {row_, m_row_, all_rows ? 3 : 2}, {}, {}};
+                             {row_, m_row_, all_rows ? 4 : 2}, {}, {}};
         int ns = 4;
         if (!all_rows) {
             sg[ns++] = {step_ + ra * 4, m_step_ + ra * 4, 4};
@@ -990,7 +990,7 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
         copy_i32_from_mapped(tok_, m_tok_, T, cs_);
         copy_i32_from_mapped(step_, m_step_, rows * 4, cs_);
         copy_i32_from_mapped(pos_, m_pos_, rows * NH, cs_);
-        copy_i32_from_mapped(row_, m_row_, all_rows ? 3 : 2, cs_);
+        copy_i32_from_mapped(row_, m_row_, all_rows ? 4 : 2, cs_);
         copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
     }
     if (gstamp_ != nullptr) gpu_stamp(gstamp_, 0, cs_);
@@ -1356,6 +1356,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::memcpy(&h_row_[2], &min_p, sizeof(float));   // read by the conditional graph only
+    const float cum_th = cum_th_ >= 0.0f ? cum_th_ : draft_cum_env();
+    std::memcpy(&h_row_[3], &cum_th, sizeof(float));
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
@@ -1431,7 +1433,6 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         wait_step(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pr[basalt::kernels::kVerifyMaxT];
-        const float cum_th = draft_cum_env();
         float pj = ((volatile float*) h_prob_)[0];
         pr[0] = pj;
         if (probs) probs[0] = pj;

@@ -6741,6 +6741,7 @@ int main(int argc, char** argv) {
             int32_t x = (int32_t) ids[(size_t) (n - 1)];
             std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob((size_t) S, 0.0f);
+            basalt::core::DraftCumAdapt cum_adapt;   // this request's draft threshold
             std::vector<int32_t> sbuf((size_t) S, 0);
             if (o.suffix_draft > 0) {
                 sfx.reset();
@@ -6802,7 +6803,7 @@ int main(int argc, char** argv) {
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, (float) req_spec_min_p, basalt::core::draft_cum_env())) ++T;
+                    while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, (float) req_spec_min_p, cum_adapt.th())) ++T;
                 }
                 if (first_window) T = 1;
                 if (ppl != nullptr) {
@@ -7031,6 +7032,8 @@ int main(int argc, char** argv) {
                     if (hist_n > 0 && mtp_on && mtp.coupled() && will_draft)
                         mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                     basalt::core::decode_gaps().mark(5);
+                    if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
+                    mtp.set_cum_th(cum_adapt.th());
                     bool drafted = true;
                     if (will_draft && mtp_on) {
                         mtp.set_launch_hook(after_launch);
@@ -7111,6 +7114,8 @@ int main(int argc, char** argv) {
                 if (hist_n > 0 && mtp_on && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 basalt::core::decode_gaps().mark(5);
+                if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
+                mtp.set_cum_th(cum_adapt.th());
                 const bool drafted = eos || produced_n >= max_new || !mtp_on ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
@@ -7560,6 +7565,7 @@ int main(int argc, char** argv) {
         int32_t x = (int32_t) tok;
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
+        basalt::core::DraftCumAdapt cum_adapt;
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
         // the first window is the last prompt token alone (it produces the first generated token and the MTP's
         // first cell)
@@ -7584,7 +7590,7 @@ int main(int argc, char** argv) {
             int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
-                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, (float) o.spec_min_p, basalt::core::draft_cum_env())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, (float) o.spec_min_p, cum_adapt.th())) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;
@@ -7658,6 +7664,8 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
+            if (use_mtp && !from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
+            if (use_mtp) mtp.set_cum_th(cum_adapt.th());
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
             if (adapt_thr.joinable()) adapt_thr.join();

@@ -11,6 +11,8 @@
 
 #include "basalt/core/diag.hpp"
 
+#include <cmath>
+
 #if defined(__CUDACC__)
 #define DRAFT_CUM_HD __host__ __device__
 #else
@@ -38,5 +40,35 @@ inline float draft_cum_env() {
     static const float th = (float) exp_flag("spk_th", 0.35);
     return th;
 }
+
+/// Per-request threshold (--exp spk2_adapt=1, read once).  The threshold falls from the base toward kLo as the
+/// request's drafts are accepted more often than the bin table predicts: when they run well, longer windows pay.  The
+/// observed and expected accepted counts decay per window; the ratio sets the threshold along a linear ramp.  The
+/// window's value is fixed before its drafts are made and shared by the host rule and the device graph.
+struct DraftCumAdapt {
+    static bool enabled() {
+        static const bool on = exp_flag("spk2_adapt", 0) != 0;
+        return on;
+    }
+    float base = draft_cum_env();   ///< the threshold while nothing is known (and with the gate off)
+    double obs = 0.0, exp = 0.0;
+    float cur = base;
+
+    float th() const { return cur; }
+
+    /// One verified window of the MTP chain: `n` drafts were offered with probabilities probs[0..n), `acc` accepted.
+    void observe(const float* probs, int n, int acc) {
+        if (!enabled() || !(base > 0.0f) || n <= 0) return;
+        constexpr double kDecay = 0.97, kRlo = 0.9, kRhi = 1.1;
+        constexpr float kLo = 0.25f;
+        double c = 1.0, e = 0.0;
+        for (int j = 0; j < n; ++j) { c *= (double) draft_cum_acc(probs[j]); e += c; }
+        obs = obs * kDecay + (double) acc;
+        exp = exp * kDecay + e;
+        if (exp < 0.5) return;
+        const double t = std::fmin(std::fmax((obs / exp - kRlo) / (kRhi - kRlo), 0.0), 1.0);
+        cur = base + (float) t * (std::fmin(kLo, base) - base);
+    }
+};
 
 }  // namespace basalt::core

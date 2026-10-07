@@ -68,6 +68,8 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// The cumulative draft rule's threshold for the next draft() chain (default: the rule's own).
+    void set_cum_th(float th) { cum_th_ = th; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: the serve state check hashes it)
     const QsaState& kv_state() const { return st_; }
@@ -229,6 +231,7 @@ private:
     int32_t *h_tok_ = nullptr, *m_tok_ = nullptr, *h_step_ = nullptr, *m_step_ = nullptr;
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
+    float cum_th_ = -1.0f;   // < 0: the rule's own threshold
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     float* diag_ = nullptr;                         ///< spec_log: the draft head's logits per chain step (pinned)
     int64_t diag_stride_ = 0;
