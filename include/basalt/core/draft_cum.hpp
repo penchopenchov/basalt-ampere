@@ -9,6 +9,8 @@
 // Only what is proposed changes: acceptance and outputs stay exact.
 #pragma once
 
+#include "basalt/core/diag.hpp"
+
 #if defined(__CUDACC__)
 #define DRAFT_CUM_HD __host__ __device__
 #else
@@ -31,7 +33,10 @@ DRAFT_CUM_HD inline bool draft_keep(const float* probs, int j, float min_p, floa
     return c >= th;
 }
 
-/// The rule's threshold (0 would switch it off, the min_p rule).
-inline constexpr float draft_cum_env() { return 0.35f; }
+/// The rule's threshold (--exp spk_th=V; 0 switches the rule off, the min_p rule), read once.
+inline float draft_cum_env() {
+    static const float th = (float) exp_flag("spk_th", 0.35);
+    return th;
+}
 
 }  // namespace basalt::core
