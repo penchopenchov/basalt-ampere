@@ -518,6 +518,7 @@ class ProcessEngine:
     """
     silence_s = ENGINE_SILENCE_S         # an attribute of its own: restart() keeps it
     silent_note = None                   # why the server ended a silent engine (death_note says it)
+    last_err = None                      # an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     stderr_sink = None                   # callable(line): the engine's stderr when there is no log file (main() sets it)
 
@@ -554,6 +555,7 @@ class ProcessEngine:
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.silent_note = None
+        self.last_err = None
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -651,6 +653,7 @@ class ProcessEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both
         slot_q = self.slot_q
+        line = None
         for line in proc.stdout:
             if line.startswith(FATAL_PREFIXES):         # checked before batch routing: a fatal line is never a slot's
                 if self.proc is proc:
@@ -670,6 +673,8 @@ class ProcessEngine:
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
+            if line and line.startswith("ERR"):         # why it exited, though no request may read it (a failed
+                self.last_err = line[4:].strip()        # batch window: every request reads its own slot)
         lines.put(None)
         for q in slot_q:
             q.put(None)
@@ -691,6 +696,8 @@ class ProcessEngine:
                 return "the engine's watchdog stopped it: " + line.strip()
         proc = self.proc                                 # None while a restart has not started the next one yet
         rc = proc.poll() if proc is not None else None
+        if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
+            return f"the engine exited (code {rc}) after it reported: {self.last_err}"
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("basalt", "ERR"))), "")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why
             return f"the engine exited (code {rc}), last log line: {last}"
@@ -874,6 +881,10 @@ class ProcessEngine:
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                     self.progress = (int(f[1]), int(f[2]))
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                if not stopped and cancel.is_set():
+                    # a Stop during the prompt read goes out at once, not after the first token
+                    self._send("STOP")
+                    stopped = True
                 yield None
             elif line.startswith("DONE"):
                 self._parse_done(line)
