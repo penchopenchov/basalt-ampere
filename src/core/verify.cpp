@@ -102,7 +102,7 @@ struct DecMoe {
     int pblocks = 0;
     bool pq2 = false;   // a layer's gate/up is Q2_0: the peer kernel's Q2_0 build
     bool peer_live = false;                  ///< a peer window was launched and not yet waited for
-    // pinned staging of the residency uploads (gate host_pin): the copies take their source from here, so the call does
+    // pinned staging of the residency uploads: the copies take their source from here, so the call does
     // not wait for the stream; a ring of slots, each reused only after the window's stream sync
     uint8_t* pin = nullptr;
     size_t pin_stride = 0;
@@ -353,12 +353,10 @@ bool Verifier::dm_init(std::string& err) {
     if (!ok) { err = "verify: device-planned MoE buffers"; return false; }
     d->shadow0.assign((size_t) LE, INT32_MIN);
     d->shadow1.assign((size_t) LE, -1);
-    if (exp_flag("host_pin", 1) != 0) {   // [res0 | ptab0 | res1 | ptab1] per slot
-        d->pin_stride = (size_t) LE * 24;
-        if (cudaHostAlloc((void**) &d->pin, d->pin_stride * DecMoe::kPinSlots, cudaHostAllocPortable) != cudaSuccess) {
-            cudaGetLastError();
-            d->pin = nullptr;
-        }
+    d->pin_stride = (size_t) LE * 24;   // [res0 | ptab0 | res1 | ptab1] per slot
+    if (cudaHostAlloc((void**) &d->pin, d->pin_stride * DecMoe::kPinSlots, cudaHostAllocPortable) != cudaSuccess) {
+        cudaGetLastError();
+        d->pin = nullptr;
     }
     if (peer_ != nullptr && peer_->valid()) {
         const OnDevice on(peer_->device());
@@ -1156,7 +1154,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
                     ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
                     ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
-                    ra.early_trigger = pdl && (pdl2_mask() & 64);   // PDL2: the out projection stages its weights
+                    ra.early_trigger = pdl;   // PDL2: the out projection stages its weights
                     {
                         PdlScope pr(pdl);
                         dec_gdn_rec(ra, n, cs);
@@ -1202,7 +1200,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
                     ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = xq_;
                     ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
-                    ra.early_trigger = pdl && (pdl2_mask() & 64);   // PDL2: the out projection stages its weights
+                    ra.early_trigger = pdl;   // PDL2: the out projection stages its weights
                     if (gdnf_fork) {
                         if (gdnf == 2) gdnf_z_side();
                         ra.o = y_;

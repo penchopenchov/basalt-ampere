@@ -18,11 +18,6 @@ inline constexpr bool pdl_requested() { return true; }
 /// The decode chain's kernels start their dependents early (pdl_launch_dependents) and stage their first weights
 /// before pdl_wait, so each stage's weight reads begin during the previous stage's tail.
 inline constexpr bool pdl2_requested() { return true; }
-/// The PDL2 parts in use: 1 hc read trigger, 2 hc down weights before the wait, 4 dense GEMV rows into L2 before the
-/// wait, 8 dense GEMV trigger, 16 q8_1 trigger, 32 combine trigger + hc read and route as dependents, 64 GDN norm
-/// trigger.
-inline constexpr int pdl2_mask() { return 64; }
-
 struct PdlState {
     bool on = false;
     int plain = 0;   // launches still to go the plain way
