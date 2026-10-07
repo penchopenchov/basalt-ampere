@@ -1582,9 +1582,9 @@ def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_c
     the engine's."""
     if not vision:
         return "[server] vision: off (--vision or --vision-cpu to enable)"
-    took = f", ready in {ready_s:.1f} s"
+    took = f" in {ready_s:.1f} s"
     if not vision.get("gpu"):
-        return f"[server] vision: ready on the CPU, {max(1, (os.cpu_count() or 2) // 2)} threads{took}"
+        return f"[server] vision: ready on the CPU ({max(1, (os.cpu_count() or 2) // 2)} threads){took}"
     listed = gpu_list(cfg)
     card = listed[1] if len(listed) > 1 else listed[0] if listed else 0
     n = name(card)
