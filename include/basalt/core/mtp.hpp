@@ -179,8 +179,23 @@ private:
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     uint8_t* xq2_ = nullptr;
     bool par_ = false, pre_next_ = false, have_pre_ = false, fork_open_ = false;
-    void fork(cudaStream_t cs) { cudaEventRecord(ev_fork_, cs); cudaStreamWaitEvent(cs2_, ev_fork_, 0); }
-    void join(cudaStream_t cs) { cudaEventRecord(ev_join_, cs2_); cudaStreamWaitEvent(cs, ev_join_, 0); }
+    bool stage_ = false;   ///< the round's host-mapped inputs staged by one launch
+    bool tail_ = false;    ///< a step's end (token, probability, conditional handles) in one launch
+    struct CondTail { unsigned long long h[8]; int n; float cum_th; };
+    const CondTail* ctail_ = nullptr;   ///< the conditional handles the step being recorded ends with
+    bool ctail_done_ = false;           ///< that step's end already set them
+    bool step_end(int64_t HCN, int j);
+    int l2_ = 0;                          ///< draft_l2 parts: 1 projections, 2 head rows, 4 shared expert
+    cudaStream_t cs3_ = nullptr;          ///< the weight prefetch stream of the round and chain graphs
+    cudaEvent_t ev_pf_ = nullptr, ev_pfj_ = nullptr;
+    bool pf_open_ = false;
+    void prefetch_begin(cudaStream_t cs);
+    void prefetch_end(cudaStream_t cs);
+    bool pdl_ = false;   ///< the round and chain graphs launch their kernels as programmatic dependents
+    // the first kernel after a fork or join follows another stream's node, so it launches the plain way
+    void fork(cudaStream_t cs) { cudaEventRecord(ev_fork_, cs); cudaStreamWaitEvent(cs2_, ev_fork_, 0); pdl_plain(); }
+    void join(cudaStream_t cs) { cudaEventRecord(ev_join_, cs2_); cudaStreamWaitEvent(cs, ev_join_, 0); pdl_plain(); }
+    static void pdl_plain();
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< a prompt's rows' token / step / position records, uploaded at once

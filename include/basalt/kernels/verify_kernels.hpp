@@ -112,6 +112,17 @@ void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, fl
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
                     const int32_t* min_p_bits, void* stream, float cum_th = 0.0f, const float* hist = nullptr,
                     int j = 0);
+/// The draft round's staging in one launch: each of up to 6 int segments (dst, host-mapped src, count) by a block of its
+/// own, and `n_f` floats (a multiple of 4, 16-byte aligned) from `f_src` to `f_dst` by the other blocks; the same copies
+/// as copy_i32_from_mapped and copy_from_mapped.
+struct MtpStageSeg { int32_t* dst; const int32_t* src; int n; };
+void mtp_stage(const MtpStageSeg* segs, int n_segs, float* f_dst, const float* f_src, int64_t n_f, void* stream);
+/// The draft chain's step end in one launch: tok_dst[0] = ids[row], out[j] = ids[row] and out_p[j] = probs[row] for
+/// row = *row_dev (the residual is not carried), then, with n > 0, mtp_draft_cond's handles for the same row.  False
+/// (nothing launched) when n > 0 and the build has no conditional graph nodes.
+bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, int32_t* out, int j, const float* probs,
+                  float* out_p, const unsigned long long* h, int n, const int32_t* min_p_bits, float cum_th,
+                  const float* hist, void* stream);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// A sliding attention window: for `n` step records (kStepCount ints each, n_kv at [1]) the selection becomes the

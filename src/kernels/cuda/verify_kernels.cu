@@ -9,6 +9,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -625,6 +627,88 @@ bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, cons
 bool mtp_draft_cond(const unsigned long long*, int, const float*, const int32_t*, const int32_t*, void*, float, const float*,
                     int) { return false; }
 #endif
+
+namespace {
+struct MtpStageArgs {
+    MtpStageSeg s[6];
+    int ns;
+    float4* fdst;
+    const volatile float4* fsrc;
+    long long n4;
+};
+__global__ void mtp_stage_kernel(MtpStageArgs a) {
+    if ((int) blockIdx.x < a.ns) {
+        const MtpStageSeg g = a.s[blockIdx.x];
+        for (int i = threadIdx.x; i < g.n; i += blockDim.x) g.dst[i] = ((const volatile int32_t*) g.src)[i];
+        return;
+    }
+    const int nb = (int) gridDim.x - a.ns;
+    for (long long i = (long long) (blockIdx.x - a.ns) * blockDim.x + threadIdx.x; i < a.n4;
+         i += (long long) nb * blockDim.x) {
+        const float4 v = const_cast<const float4*>(a.fsrc)[i];
+        a.fdst[i] = v;
+    }
+}
+}  // namespace
+
+void mtp_stage(const MtpStageSeg* segs, int n_segs, float* f_dst, const float* f_src, int64_t n_f, void* stream) {
+    if (n_segs < 0 || n_segs > 6 || n_f % 4 != 0 || ((uintptr_t) f_dst | (uintptr_t) f_src) % 16 != 0) {
+        std::fprintf(stderr, "mtp_stage: bad arguments\n");
+        std::exit(1);
+    }
+    MtpStageArgs a{};
+    for (int i = 0; i < n_segs; ++i) a.s[i] = segs[i];
+    a.ns = n_segs;
+    a.fdst = (float4*) f_dst;
+    a.fsrc = (const volatile float4*) f_src;
+    a.n4 = n_f / 4;
+    const int fb = n_f > 0 ? (int) std::min<long long>((a.n4 + 255) / 256, 30) : 0;
+    mtp_stage_kernel<<<n_segs + fb, 256, 0, (cudaStream_t) stream>>>(a);
+    check("mtp_stage");
+}
+
+namespace {
+struct StepEndCond { unsigned long long h[8]; };
+__global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ row_dev,
+                                    int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p,
+                                    StepEndCond hs, int n, const int32_t* __restrict__ min_p_bits, float cum_th,
+                                    const float* hist) {
+    const int row = *row_dev;
+    const int32_t tok = ids[row];
+    const float p = probs[row];
+    *tok_dst = tok;
+    ((volatile float*) out_p)[j] = p;
+    __threadfence_system();
+    ((volatile int32_t*) out)[j] = tok;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12040
+    if (n <= 0) return;
+    bool keep = p >= __int_as_float(*min_p_bits);
+    if (cum_th > 0.0f) {   // the same products, in the same order, as draft_keep on the host
+        float c = 1.0f;
+        for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
+        c = c * basalt::core::draft_cum_acc(p);
+        keep = c >= cum_th;
+    }
+    cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
+    for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);
+#endif
+}
+}  // namespace
+
+bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, int32_t* out, int j, const float* probs,
+                  float* out_p, const unsigned long long* h, int n, const int32_t* min_p_bits, float cum_th,
+                  const float* hist, void* stream) {
+#if !(defined(CUDART_VERSION) && CUDART_VERSION >= 12040)
+    if (n > 0) return false;
+#endif
+    if (n > 8) { std::fprintf(stderr, "mtp_step_end: n out of range\n"); std::exit(1); }
+    StepEndCond hs{};
+    for (int k = 0; k < n; ++k) hs.h[k] = h[k];
+    mtp_step_end_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, row_dev, tok_dst, out, j, probs, out_p, hs, n, min_p_bits,
+                                                            cum_th, hist);
+    check("mtp_step_end");
+    return true;
+}
 
 namespace {
 __global__ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long long stride) {

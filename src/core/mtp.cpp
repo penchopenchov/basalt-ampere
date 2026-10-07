@@ -36,6 +36,8 @@
 #include "basalt/kernels/shared_expert.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/ngram.hpp"
+#include "basalt/kernels/dense_tc.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -127,6 +129,11 @@ bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
 
 }  // namespace
 
+void MtpDrafter::pdl_plain() {
+    basalt::kernels::PdlState& ps = basalt::kernels::pdl_state();
+    if (ps.on) ps.plain = 1;
+}
+
 MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
@@ -149,6 +156,9 @@ MtpDrafter::~MtpDrafter() {
     if (h_chist_) cudaFreeHost(h_chist_);
     if (cs_) cudaStreamDestroy(cs_);
     if (cs2_) cudaStreamDestroy(cs2_);
+    if (cs3_) cudaStreamDestroy(cs3_);
+    if (ev_pf_) cudaEventDestroy(ev_pf_);
+    if (ev_pfj_) cudaEventDestroy(ev_pfj_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (dense_) cudaFree(dense_);
@@ -410,6 +420,16 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         return false;
     }
     basalt::kernels::hc_fused_init();
+    pdl_ = exp_flag("draft_pdl", 0) != 0;
+    stage_ = exp_flag("draft_stage", 0) != 0;
+    tail_ = exp_flag("draft_tail", 0) != 0;
+    l2_ = (int) exp_flag("draft_l2", 0);
+    if (l2_ != 0 && (cudaStreamCreateWithPriority(&cs3_, cudaStreamNonBlocking, prio) != cudaSuccess ||
+                     cudaEventCreateWithFlags(&ev_pf_, cudaEventDisableTiming) != cudaSuccess ||
+                     cudaEventCreateWithFlags(&ev_pfj_, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "mtp: prefetch stream";
+        return false;
+    }
     {
         if (basalt::kernels::hc8_enabled()) {   // the draft layer's reads on 8-bit copies too
             const int LR = (int) g.hc_lr, D = (int) (g.hc * g.n_embd), HCn = (int) g.hc;
@@ -625,6 +645,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     const bool kv_fused = st_.kv_int8 && !st_.kv_q4 && !st_.kv_rot && native_rope_enabled() &&
                           qsa_dec_fused_supported(s);
     const bool kv_par = par_ && full && !reuse_row && kv_fused;
+    std::optional<basalt::kernels::PdlScope> pdl_scope;
+    if (pdl_ && par_) pdl_scope.emplace(true, true);
     try {
         auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
@@ -930,17 +952,29 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
     const int64_t rows = all_rows ? 2 * (int64_t) max_t_ : 2 * (int64_t) T;
-    copy_i32_from_mapped(tok_, m_tok_, T, cs_);
-    copy_i32_from_mapped(step_, m_step_, rows * 4, cs_);
-    copy_i32_from_mapped(pos_, m_pos_, rows * NH, cs_);
-    copy_i32_from_mapped(row_, m_row_, all_rows ? 3 : 2, cs_);
-    copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
     const int ra = 2 * max_t_ - 1;
+    if (stage_) {   // the catch-up reads rows below 2T only: the draft row's records are staged with the rest
+        MtpStageSeg sg[6] = {{tok_, m_tok_, T}, {step_, m_step_, (int) (rows * 4)}, {pos_, m_pos_, (int) (rows * NH)},
+                             {row_, m_row_, all_rows ? 3 : 2}, {}, {}};
+        int ns = 4;
+        if (!all_rows) {
+            sg[ns++] = {step_ + ra * 4, m_step_ + ra * 4, 4};
+            sg[ns++] = {pos_ + ra * NH, m_pos_ + ra * NH, (int) NH};
+        }
+        mtp_stage(sg, ns, Rin_, window_R_, (int64_t) T * HCN, cs_);
+    } else {
+        copy_i32_from_mapped(tok_, m_tok_, T, cs_);
+        copy_i32_from_mapped(step_, m_step_, rows * 4, cs_);
+        copy_i32_from_mapped(pos_, m_pos_, rows * NH, cs_);
+        copy_i32_from_mapped(row_, m_row_, all_rows ? 3 : 2, cs_);
+        copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
+    }
     if (gstamp_ != nullptr) gpu_stamp(gstamp_, 0, cs_);
     par_ = true;
+    prefetch_begin(cs_);
     bool ok = record_forward(T, -1, cs_, err);
     if (ok) {
-        if (!all_rows) {
+        if (!all_rows && !stage_) {
             copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
             copy_i32_from_mapped(pos_ + ra * NH, m_pos_ + ra * NH, NH, cs_);
         }
@@ -951,7 +985,7 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
         coupled_rec_ = false;
     }
     end_branches();
-    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok) ok = step_end(HCN, 0);
     if (ok && gstamp_ != nullptr) gpu_stamp(gstamp_, 1, cs_);
     return ok;
 }
@@ -970,16 +1004,72 @@ bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string
     coupled_j_ = j;
     par_ = true;
     have_pre_ = pre_next_ = par_;   // every full row hands the next its hidden input
-    const bool ok = record_forward(1, row, cs_, err);
+    prefetch_begin(cs_);
+    bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     end_branches();
-    if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok) ok = step_end(HCN, j);
     if (ok && gstamp_ != nullptr) gpu_stamp(gstamp_, 1, cs_);
     return ok;
 }
 
+// The weights of the layer and the head, in the order the chain reads them, brought into L2 by a stream of its own
+// while the chain's latency-bound kernels run; joined back by end_branches.
+void MtpDrafter::prefetch_begin(cudaStream_t cs) {
+    if (l2_ == 0 || !par_) return;
+    const ModelGeometry& g = *g_;
+    const int64_t N = g.n_embd, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
+    auto q8_bytes = [&](int64_t rows, int64_t cols) { return (size_t) (rows * (cols / 32) * 34); };
+    auto pf = [&](const void* w, size_t bytes) { basalt::kernels::dense_tc_l2_prefetch(w, bytes, cs3_); };
+    cudaEventRecord(ev_pf_, cs);
+    cudaStreamWaitEvent(cs3_, ev_pf_, 0);
+    if (l2_ & 1) {
+        pf(q8("fc_embedding.weight"), q8_bytes(N, N));
+        pf(q8("self_attn.k_proj.weight"), q8_bytes(NKV * HD, N));
+        pf(q8("self_attn.v_proj.weight"), q8_bytes(NKV * HD, N));
+        pf(q8("self_attn.q_proj.weight"), q8_bytes(NH * 2 * HD, N));
+        pf(q8("self_attn.o_proj.weight"), q8_bytes(N, NH * HD));
+    }
+    if (l2_ & 4) {
+        pf(q8("mlp.shared_expert.gate_proj.weight"), q8_bytes(g.n_ff, N));
+        pf(q8("mlp.shared_expert.up_proj.weight"), q8_bytes(g.n_ff, N));
+        pf(q8("mlp.shared_expert.down_proj.weight"), q8_bytes(N, g.n_ff));
+    }
+    if (l2_ & 2) {
+        const bool sub = dhead_ != nullptr;
+        const int64_t nv = sub ? (tier_ == 0 ? n_tier1_ : n_dvocab_) : n_vocab_;
+        pf(sub ? dhead_ : head_->weights(), (size_t) nv * head_->row_bytes());
+    }
+    pf_open_ = true;
+}
+
+void MtpDrafter::prefetch_end(cudaStream_t cs) {
+    if (!pf_open_) return;
+    cudaEventRecord(ev_pfj_, cs3_);
+    cudaStreamWaitEvent(cs, ev_pfj_, 0);
+    pf_open_ = false;
+}
+
+// The end of chain step j: its token and probability to the mapped outputs and the next step's token; with draft_tail
+// one launch that also sets the conditional handles this step ends with (the next step's input residual is the
+// hidden input already computed beside the head, so the residual is not carried).
+bool MtpDrafter::step_end(int64_t HCN, int j) {
+    using namespace basalt::kernels;
+    if (!tail_) {
+        mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+        return true;
+    }
+    const CondTail* c = ctail_;
+    if (!mtp_step_end(out_ids_, row_ + 1, tok_, m_out_, j, probs_, m_prob_, c ? c->h : nullptr, c ? c->n : 0, row_ + 2,
+                      c ? c->cum_th : 0.0f, m_prob_, cs_))
+        return false;
+    ctail_done_ = c != nullptr;
+    return true;
+}
+
 void MtpDrafter::end_branches() {
     if (fork_open_) join(cs_);
+    prefetch_end(cs_);
     fork_open_ = par_ = pre_next_ = have_pre_ = false;
 }
 
@@ -1024,8 +1114,16 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
     cudaGraphNode_t prev = nullptr;
     if (ok) ok = cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
     if (ok) {
-        const bool rec = record_round(T, coupled, true, err) &&
-                         mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env(), m_prob_, 0);
+        CondTail ct{};
+        for (int k = 0; k + 1 < steps; ++k) ct.h[k] = hv[k + 1];
+        ct.n = steps - 1;
+        ct.cum_th = draft_cum_env();
+        ctail_ = tail_ ? &ct : nullptr;
+        ctail_done_ = false;
+        bool rec = record_round(T, coupled, true, err);
+        ctail_ = nullptr;
+        if (rec && !ctail_done_)
+            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env(), m_prob_, 0);
         cudaGraph_t g0 = nullptr;
         const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
         ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
@@ -1044,8 +1142,16 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         ok = cudaStreamBeginCaptureToGraph(cs_, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal) ==
              cudaSuccess;
         if (!ok) break;
+        CondTail ct{};
+        ct.h[0] = hv[j + 1];
+        ct.n = 1;
+        ct.cum_th = draft_cum_env();
+        ctail_ = tail_ && j + 1 < steps ? &ct : nullptr;
+        ctail_done_ = false;
         bool rec = record_step(j, coupled, false, err);
-        if (rec && j + 1 < steps) rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env(), m_prob_, j);
+        ctail_ = nullptr;
+        if (rec && j + 1 < steps && !ctail_done_)
+            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env(), m_prob_, j);
         cudaGraph_t captured = nullptr;   // the body itself, owned by the node
         ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
         prev = node;
