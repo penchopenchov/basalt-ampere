@@ -97,6 +97,7 @@ struct DecMoe {
     void* pscr = nullptr;
     unsigned int* parr = nullptr;
     int pblocks = 0;
+    int ptg = 0, ptd = 0;   // the formats every layer shares, for the peer kernel's specialised build (0: mixed)
     bool pq2 = false;   // a layer's gate/up is Q2_0: the peer kernel's Q2_0 build
     bool peer_live = false;                  ///< a peer window was launched and not yet waited for
     int peer_p2 = 0;                         ///< DmPeerArgs::p2 (the peer2_* gates)
@@ -366,7 +367,18 @@ bool Verifier::dm_init(std::string& err) {
             ls[(size_t) l] = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             d->pq2 |= f.gu_type == 42;
         }
-        d->pblocks = dec_moe_peer_blocks(d->pq2);
+        if (exp_flag("peer3_spec", 0) != 0) {
+            const auto& f0 = lay.fmt[0];
+            bool same = true;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                same &= lay.fmt[(size_t) l].gu_type == f0.gu_type && lay.fmt[(size_t) l].d_type == f0.d_type;
+            if (same) { d->ptg = f0.gu_type; d->ptd = f0.d_type; }
+            std::map<int, int> pairs;
+            for (int64_t l = 0; l < g.n_layers; ++l) ++pairs[lay.fmt[(size_t) l].gu_type * 100 + lay.fmt[(size_t) l].d_type];
+            for (const auto& pr : pairs) std::fprintf(stderr, "basalt verify: peer formats %d x gate/up %d down %d\n", pr.second, pr.first / 100, pr.first % 100);
+            std::fprintf(stderr, "basalt verify: peer kernel %s\n", same ? "specialised" : "generic");
+        }
+        d->pblocks = dec_moe_peer_blocks(d->pq2, d->ptg, d->ptd);
         ok = d->pblocks > 0 && cudaStreamCreateWithFlags(&d->ps, cudaStreamNonBlocking) == cudaSuccess &&
              cudaMalloc((void**) &d->ptab, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab, 0, (size_t) LE * 8) == cudaSuccess &&
@@ -376,7 +388,8 @@ bool Verifier::dm_init(std::string& err) {
              cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
         d->peer_p2 = (exp_flag("peer2_grid", 0) != 0 ? 1 : 0) | (exp_flag("peer2_dpf", 0) != 0 ? 2 : 0) |
-                     (exp_flag("peer2_grp", 0) != 0 ? 4 : 0) | (exp_flag("peer2_poll", 0) != 0 ? 8 : 0);
+                     (exp_flag("peer2_grp", 0) != 0 ? 4 : 0) | (exp_flag("peer2_poll", 0) != 0 ? 8 : 0) |
+                     ((int) exp_flag("peer3_warm", 0) << 4);
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
     }
@@ -1558,6 +1571,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
         if (dm) {   // the tiers, CUDA0's plan, the q8_1 rows and the rings in one launch
+            static const int bell_fast = (int) basalt::core::exp_flag("peer3_bell", 0);
             DmRouteArgs ra;
             ra.ids = ids_ + tb * K; ra.x = xm; ra.n_tok = n; ra.k = (int) K; ra.n_embd = (int) N;
             ra.n_expert = (int) g.n_expert; ra.layer = (int) l;
@@ -1572,6 +1586,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
+            ra.fast = bell_fast;
             PdlScope pr(pdl && (pdl2_mask() & 32));   // after the router's kernel
             if (glue_on[grp]) {   // the ring's work inside post's gate/up launch
                 glue_ring[grp] = ra;
@@ -2350,7 +2365,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
             pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32; pa.p2 = dm_->peer_p2;
             if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
-                !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
+                !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2, dm_->ptg, dm_->ptd)) {
                 err = "verify: the peer window did not launch";
                 return false;
             }

@@ -65,6 +65,8 @@ struct DmRouteArgs {
     float* sh_part = nullptr;        ///< device: its gate's partial sums, n_embd / 256 per token in order
     unsigned long long* stats = nullptr;   ///< DM_WAIT_STATS (kDmStatWords, device) or null: the doorbell's time
     int peer_cap = 0;                ///< PEER_CAP: the peer's groups past this many go to the CPU pool (0: no cap)
+    int fast = 0;                    ///< peer3_bell: bit 0 no fence between the stats stamp and the doorbell, 1 the q8_1 rows
+                                     ///< to mapped memory before the tiers are known, 2 no fence after the doorbell
     bool kinds = false;              ///< mode 2: also every entry's tier into plan->kind and counts[2], counts[3]
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
@@ -123,12 +125,13 @@ constexpr int kDmDiagWords = 16;
 std::string dec_moe_peer_diag(const uint32_t* diag);
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff);
 /// Blocks the peer kernel runs with on the current device (all co-resident); 0 when it cannot run there.  q2: the
-/// kernel for a model with Q2_0 gate/up layers (as dec_moe_peer_launch's).
-int dec_moe_peer_blocks(bool q2 = false);
+/// kernel for a model with Q2_0 gate/up layers; tg/td: the formats every layer shares (the kernel specialised to
+/// them), 0 for the generic kernel (as dec_moe_peer_launch's).
+int dec_moe_peer_blocks(bool q2 = false, int tg = 0, int td = 0);
 /// Whether the persistent kernels cover this layer's expert formats.
 bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Launches the peer window (cooperative) on `stream` of the current device; false on a launch error.
-bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2 = false);
+bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2 = false, int tg = 0, int td = 0);
 
 /// DM_WAIT_STATS: per layer, the times of the doorbell, CUDA0's own work done and each tier landed (CUDA0's
 /// clock), summed per peer-entry count and per layer.  Words: [0, 4) the layer's times; kDmStatBucket + 8 b + j for

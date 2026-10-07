@@ -404,6 +404,10 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
     __shared__ int32_t r_ncpu, r_npeer, r_nvram;
     const int n = a.n_tok * a.k;
     if (tid == 0) { r_ncpu = 0; r_npeer = 0; r_nvram = 0; }
+    const bool spec = (a.fast & 2) != 0 && a.res1 != nullptr;
+    const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;
+    if (spec)   // the peer's rows go out while the tiers are classified (a peer without entries ignores them)
+        for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
     if (tid < n) r_ids[tid] = __ldcg(a.ids + tid);
     __syncthreads();
     if (tid < n) {
@@ -456,8 +460,7 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
             a.plan->counts[3] = r_ncpu;
         }
     }
-    if (r_npeer > 0) {   // the q8_1 rows, 16 bytes at a time (a row is n_embd / 32 blocks of 36 bytes)
-        const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;
+    if (r_npeer > 0 && !spec) {   // the q8_1 rows, 16 bytes at a time (a row is n_embd / 32 blocks of 36 bytes)
         for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
     }
     if (r_ncpu > 0) {
@@ -468,10 +471,10 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
     __syncthreads();
     if (tid == 0) {
         if (a.stats != nullptr) a.stats[0] = dm_clock();
-        __threadfence_system();
+        if ((a.fast & 1) == 0) __threadfence_system();
         *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_npeer > 0 ? 1u << 28 : 0u);
         *(volatile uint32_t*) a.host_seq_m = a.ring;
-        __threadfence_system();
+        if ((a.fast & 4) == 0) __threadfence_system();
     }
 }
 
@@ -879,7 +882,7 @@ __device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm,
 template<int TG, int TD, bool Q2 = false>
 __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, float* gate,
                            float* up, float* out, unsigned int* done, int b, int nb, bool gu2 = false,
-                           const DmWatch* watch = nullptr, int* grid_key = nullptr, bool down_pf = false) {
+                           const DmWatch* watch = nullptr, int* grid_key = nullptr, bool down_pf = false, int p3 = 0) {
     const int tid = threadIdx.x;
     if (tid == 0) sm.stop = 0;
     constexpr bool SG = kStageIqGrid<TG>;
@@ -888,6 +891,23 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     const bool g2 = K2 && gu2 && gu2_usable(L);
     // grid_key: the peer keeps the codebook in shared memory across rings of one format (the key names it)
     const int gkey = (TG * 2 + (g2 ? 1 : 0)) + 1;
+    // p3 bit 0: this warp's two gate/up rows into L1 ahead of the codebook staging, so the item's loads in rounds
+    // overlap one memory latency; bit 1: the block's next item as well
+    const int warp = tid >> 5, lane = tid & 31;
+    auto warm = [&](int it) {
+        const int ng_ = sm.ng, nrb_ = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS);
+        if (it >= ng_ * nrb_) return;
+        const int g = it / nrb_, rb = it - g * nrb_;
+        const int row = rb * GU2_ROWS + 2 * warp;
+        if (row >= 2 * L.n_ff) return;
+        const bool is_up = row >= L.n_ff;
+        const int r = is_up ? row - (int) L.n_ff : row;
+        const uint8_t* wr = (const uint8_t*) sm.gptr[g] + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+        const uintptr_t lo = (uintptr_t) wr & ~(uintptr_t) 127, hi = (uintptr_t) (wr + 2 * L.gu_row);
+        const uintptr_t a = lo + (uintptr_t) lane * 128;
+        if (a < hi) asm volatile("prefetch.global.L1 [%0];" ::"l"(a));
+    };
+    if (g2 && (p3 & 1) != 0) warm(b);
     const uint32_t* s_grid;
     if (grid_key != nullptr && *(volatile int*) grid_key == gkey) {
         s_grid = (g2 || SG) ? sm.grid : nullptr;
@@ -899,9 +919,9 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     const int ng = sm.ng;
     const int ir = g2 ? GU2_ROWS : GU_ROWS;
     const int nrb = (int) ((2 * L.n_ff + ir - 1) / ir);
-    const int warp = tid >> 5, lane = tid & 31;
     for (int it = b; it < ng * nrb; it += nb) {
         const int g = it / nrb, rb = it - g * nrb;
+        if (g2 && (p3 & 2) != 0) warm(it + nb);
         if constexpr (K2) {
             const int row = rb * GU2_ROWS + 2 * warp;
             if (g2) {
@@ -977,10 +997,10 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
 template<bool Q2 = false>
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
                                float* out, unsigned int* done, int b, int nb, bool gu2 = false,
-                               const DmWatch* watch = nullptr, int* grid_key = nullptr, bool down_pf = false) {
+                               const DmWatch* watch = nullptr, int* grid_key = nullptr, bool down_pf = false, int p3 = 0) {
     switch (L.gu_type * 100 + L.d_type) {
 #define DM_CASE(TG, TD) \
-        case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch, grid_key, down_pf); break;
+        case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch, grid_key, down_pf, p3); break;
         DM_PAIRS(DM_CASE)
 #undef DM_CASE
         default: break;
@@ -1036,7 +1056,9 @@ __device__ __forceinline__ bool dm_grid_sync(const DmWatch& w, unsigned int* bar
 // Every wait inside a ring is bounded: a down wait past kDmWaitLimitNs, a corrupt ring or the host's release aborts
 // the window (a record in diag_m, done_m past every ring) and the kernel exits.
 // Q2: Q2_0 gate/up rows two a warp as well (a build of its own, so the other formats' kernel stays as it was)
-template<bool Q2>
+// PG/PD: the model's gate/up and down formats when every layer shares them (the kernel then carries one expert path
+// instead of the format switch); 0: the switch
+template<bool Q2, int PG = 0, int PD = 0>
 __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     __shared__ DmShared sm;
     __shared__ uint32_t s_seq;
@@ -1130,8 +1152,12 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         }
         if (big && tid == 0) dm_abort(w, &sm, 2u, 0u, -1, 0u, 0u);
         stamp(s, 2);
-        if (!bad && !big)
-            dm_experts_any<Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w, (a.p2 & 1) != 0 ? &s_gkey : nullptr, (a.p2 & 2) != 0);
+        if (!bad && !big) {
+            if constexpr (PG != 0)
+                dm_experts<PG, PD, Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w, (a.p2 & 1) != 0 ? &s_gkey : nullptr, (a.p2 & 2) != 0, a.p2 >> 4);
+            else
+                dm_experts_any<Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w, (a.p2 & 1) != 0 ? &s_gkey : nullptr, (a.p2 & 2) != 0, a.p2 >> 4);
+        }
         stamp(s, 3);
         __threadfence_system();
         ++served;
@@ -1667,12 +1693,23 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
     return gu && d && n_ff == 640 && n_embd % 256 == 0 && !g_old_kernels && !g_grouped_v1;
 }
 
-int dec_moe_peer_blocks(bool q2) {
+// The peer kernel for the model's formats: the specialised instance of (tg, td) when it is one of the covered pairs
+// (tg == 0: the generic kernel).
+static const void* dm_peer_fn(bool q2, int tg, int td) {
+    if (tg != 0 && (tg == 42) == q2) {
+#define DM_SEL(TG, TD) \
+        if (tg == TG && td == TD) return (const void*) (TG == 42 ? (const void*) dm_peer_kernel<true, TG, TD> : (const void*) dm_peer_kernel<false, TG, TD>);
+        DM_PAIRS(DM_SEL)
+#undef DM_SEL
+    }
+    return q2 ? (const void*) dm_peer_kernel<true> : (const void*) dm_peer_kernel<false>;
+}
+
+int dec_moe_peer_blocks(bool q2, int tg, int td) {
     int dev = 0, sms = 0, coop = 0, per = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev) != cudaSuccess ||
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, q2 ? dm_peer_kernel<true> : dm_peer_kernel<false>, kDmThreads,
-                                                      0) != cudaSuccess) {
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_peer_fn(q2, tg, td), kDmThreads, 0) != cudaSuccess) {
         cudaGetLastError();
         return 0;
     }
@@ -1680,11 +1717,11 @@ int dec_moe_peer_blocks(bool q2) {
     return sms * per;
 }
 
-bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2) {
+bool dec_moe_peer_launch(const DmPeerArgs& a, int blocks, void* stream, bool q2, int tg, int td) {
     DmPeerArgs args = a;
     args.gu2 = 1;
     void* params[] = {&args};
-    const cudaError_t e = cudaLaunchCooperativeKernel((const void*) (q2 ? dm_peer_kernel<true> : dm_peer_kernel<false>),
+    const cudaError_t e = cudaLaunchCooperativeKernel(dm_peer_fn(q2, tg, td),
                                                       dim3((unsigned) blocks),
                                                       dim3(kDmThreads), params, 0, (cudaStream_t) stream);
     if (e != cudaSuccess) {
