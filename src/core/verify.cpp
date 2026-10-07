@@ -2033,7 +2033,7 @@ bool Verifier::capture_commit(std::string& err) {
                 q.max_cells = (int) st.max_cells;
             }
             if (ok) {
-                gdn_commit_layers(ga, cs_, (int) exp_flag("draft2_cb", kCommitBlocks));
+                gdn_commit_layers(ga, cs_, kCommitBlocks);
                 native_qsa_indexer_commit_layers(qa, s, rope_scaling(), cs_);
             }
         }
