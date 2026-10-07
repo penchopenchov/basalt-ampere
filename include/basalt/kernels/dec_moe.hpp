@@ -110,6 +110,7 @@ struct DmPeerArgs {
     void* scratch = nullptr;                     ///< peer device: dec_moe_peer_scratch_bytes
     unsigned int* arrive = nullptr;              ///< peer device: 4 words zeroed before the launch (arrivals, barrier, abort)
     unsigned long long* stamps_m = nullptr;      ///< tests: block 0's phase times per ring (8 each), or null
+    int p2 = 0;                                  ///< gates: 1 codebook kept in shared memory across rings, 2 down rows prefetched to L2, 4 fast grouping, 8 staggered doorbell reads
     int gu2 = 0;                                 ///< the grid formats' gate/up two rows a warp (DEC_GU2 sets it)
     uint32_t* diag_m = nullptr;                  ///< mapped, kDmDiagWords zeroed words: the abort record, or null
 };

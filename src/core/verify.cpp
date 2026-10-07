@@ -99,6 +99,7 @@ struct DecMoe {
     int pblocks = 0;
     bool pq2 = false;   // a layer's gate/up is Q2_0: the peer kernel's Q2_0 build
     bool peer_live = false;                  ///< a peer window was launched and not yet waited for
+    int peer_p2 = 0;                         ///< DmPeerArgs::p2 (the peer2_* gates)
     // pinned staging of the residency uploads (gate host_pin): the copies take their source from here, so the call does
     // not wait for the stream; a ring of slots, each reused only after the window's stream sync
     uint8_t* pin = nullptr;
@@ -374,6 +375,8 @@ bool Verifier::dm_init(std::string& err) {
              cudaMalloc(&d->pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
+        d->peer_p2 = (exp_flag("peer2_grid", 0) != 0 ? 1 : 0) | (exp_flag("peer2_dpf", 0) != 0 ? 2 : 0) |
+                     (exp_flag("peer2_grp", 0) != 0 ? 4 : 0) | (exp_flag("peer2_poll", 0) != 0 ? 8 : 0);
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
     }
@@ -2030,7 +2033,7 @@ bool Verifier::capture_commit(std::string& err) {
                 q.max_cells = (int) st.max_cells;
             }
             if (ok) {
-                gdn_commit_layers(ga, cs_, kCommitBlocks);
+                gdn_commit_layers(ga, cs_, (int) exp_flag("draft2_cb", kCommitBlocks));
                 native_qsa_indexer_commit_layers(qa, s, rope_scaling(), cs_);
             }
         }
@@ -2345,7 +2348,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
             pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
             pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
-            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
+            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32; pa.p2 = dm_->peer_p2;
             if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
                 !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
                 err = "verify: the peer window did not launch";

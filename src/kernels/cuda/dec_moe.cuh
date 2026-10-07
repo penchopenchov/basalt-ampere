@@ -356,6 +356,19 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     }
 }
 
+// The word's value after four reads started 250 ns apart (each is a bus round trip, longer than that gap): a value
+// that lands is seen within the gap rather than within a round trip.  Words only grow, so the largest read is the latest.
+__device__ __forceinline__ uint32_t dm_poll4(const volatile uint32_t* p) {
+    const uint32_t a = *p;
+    __nanosleep(250);
+    const uint32_t b = *p;
+    __nanosleep(250);
+    const uint32_t c = *p;
+    __nanosleep(250);
+    const uint32_t d = *p;
+    return max(max(a, b), max(c, d));
+}
+
 // both tiers' words polled together, each one's landing time kept (S[2] the peer, S[4] the CPU pool, S[3] both)
 __device__ void dm_poll_tiers(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
                               uint32_t ring, unsigned long long* S) {
@@ -866,16 +879,23 @@ __device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm,
 template<int TG, int TD, bool Q2 = false>
 __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, float* gate,
                            float* up, float* out, unsigned int* done, int b, int nb, bool gu2 = false,
-                           const DmWatch* watch = nullptr) {
+                           const DmWatch* watch = nullptr, int* grid_key = nullptr, bool down_pf = false) {
     const int tid = threadIdx.x;
     if (tid == 0) sm.stop = 0;
     constexpr bool SG = kStageIqGrid<TG>;
     // gu2: gate/up items of GU2_ROWS rows, two a warp (native_gu2_kernel's rows, the same bits); Q2: Q2_0's too
     constexpr bool K2 = Q2 ? kGu2Q2<TG> : kGu2<TG>;
     const bool g2 = K2 && gu2 && gu2_usable(L);
+    // grid_key: the peer keeps the codebook in shared memory across rings of one format (the key names it)
+    const int gkey = (TG * 2 + (g2 ? 1 : 0)) + 1;
     const uint32_t* s_grid;
-    if constexpr (K2) s_grid = g2 ? gu2::stage_grid<TG>(sm.grid, tid) : stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
-    else s_grid = stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
+    if (grid_key != nullptr && *(volatile int*) grid_key == gkey) {
+        s_grid = (g2 || SG) ? sm.grid : nullptr;
+    } else {
+        if constexpr (K2) s_grid = g2 ? gu2::stage_grid<TG>(sm.grid, tid) : stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
+        else s_grid = stage_iq_grid<TG, SG>(sm.grid, tid, kDmThreads);
+        if (grid_key != nullptr && tid == 0) *(volatile int*) grid_key = gkey;
+    }
     const int ng = sm.ng;
     const int ir = g2 ? GU2_ROWS : GU_ROWS;
     const int nrb = (int) ((2 * L.n_ff + ir - 1) / ir);
@@ -899,6 +919,17 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
         __threadfence();
         __syncthreads();
         if (tid == 0) atomicAdd(done + g, 1u);
+    }
+    if (down_pf) {   // this block's down rows into L2 while the other blocks finish their gate/up items
+        const int sp_n = (int) ((L.n_embd + kDmSpan - 1) / kDmSpan);
+        for (int it = b; it < ng * sp_n; it += nb) {
+            const int g = it / sp_n, sp = it - g * sp_n;
+            const uint8_t* base = (const uint8_t*) sm.gptr[g] + L.down_off + (size_t) sp * kDmSpan * L.d_row;
+            const int rows = min((int) kDmSpan, (int) L.n_embd - sp * kDmSpan);
+            const size_t bytes = (size_t) rows * L.d_row;
+            for (size_t o = (size_t) tid * 128; o < bytes; o += (size_t) kDmThreads * 128)
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(base + o));
+        }
     }
     constexpr int R = dm_down_rows<TD>(), SUB = kDmSpan / R;
     const int nsp = (int) ((L.n_embd + kDmSpan - 1) / kDmSpan);
@@ -946,10 +977,10 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
 template<bool Q2 = false>
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
                                float* out, unsigned int* done, int b, int nb, bool gu2 = false,
-                               const DmWatch* watch = nullptr) {
+                               const DmWatch* watch = nullptr, int* grid_key = nullptr, bool down_pf = false) {
     switch (L.gu_type * 100 + L.d_type) {
 #define DM_CASE(TG, TD) \
-        case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
+        case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch, grid_key, down_pf); break;
         DM_PAIRS(DM_CASE)
 #undef DM_CASE
         default: break;
@@ -1010,7 +1041,9 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     __shared__ DmShared sm;
     __shared__ uint32_t s_seq;
     __shared__ int32_t s_ok;
+    __shared__ int s_gkey;
     const int tid = threadIdx.x;
+    if (tid == 0) s_gkey = 0;
     const int nb = gridDim.x;
     float* gate = (float*) a.scratch;
     float* up = gate + (size_t) kDmCap * a.n_ff;
@@ -1041,7 +1074,8 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             if (tid == 0) {
                 uint32_t v = 0xffffffffu;   // an aborted window stops here
                 if (*(volatile unsigned int*) abort == 0u)
-                    while (((v = *a.seq_m) & 0xffffu) < ring) spin_pause();
+                    if ((a.p2 & 8) != 0) while (((v = dm_poll4(a.seq_m)) & 0xffffu) < ring) {}
+                    else while (((v = *a.seq_m) & 0xffffu) < ring) spin_pause();
                 __threadfence_system();
                 s_seq = v;
             }
@@ -1080,7 +1114,8 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             sm.kind[tid] = hdr->kind[tid];
         }
         __syncthreads();
-        dm_group(sm.ids, sm.kind, n, 2, tid, sm.first, sm.cnt, sm.gstart, sm.gidx, sm.pos, sm.start, &sm.ng, &sm.ne);
+        if ((a.p2 & 4) != 0) dm_group_fast(sm.ids, sm.kind, n, 2, tid, sm.first, sm.cnt, sm.gstart, sm.gidx, sm.pos, sm.start, &sm.ng, &sm.ne);
+        else dm_group(sm.ids, sm.kind, n, 2, tid, sm.first, sm.cnt, sm.gstart, sm.gidx, sm.pos, sm.start, &sm.ng, &sm.ne);
         if (tid < n && sm.kind[tid] == 2) {
             sm.tok[sm.pos[tid]] = tid / a.k;
             sm.dst[sm.pos[tid]] = tid;
@@ -1096,7 +1131,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         if (big && tid == 0) dm_abort(w, &sm, 2u, 0u, -1, 0u, 0u);
         stamp(s, 2);
         if (!bad && !big)
-            dm_experts_any<Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w);
+            dm_experts_any<Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w, (a.p2 & 1) != 0 ? &s_gkey : nullptr, (a.p2 & 2) != 0);
         stamp(s, 3);
         __threadfence_system();
         ++served;
