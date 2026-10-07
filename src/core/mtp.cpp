@@ -127,12 +127,10 @@ bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
 
-}  // namespace
+// spare rows the draft head carries after the base rows, for the head rows of tokens the subset lacks
+constexpr int64_t kDraftCtxRows = 512;
 
-void MtpDrafter::pdl_plain() {
-    basalt::kernels::PdlState& ps = basalt::kernels::pdl_state();
-    if (ps.on) ps.plain = 1;
-}
+}  // namespace
 
 MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
@@ -420,15 +418,9 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         return false;
     }
     basalt::kernels::hc_fused_init();
-    pdl_ = exp_flag("draft_pdl", 0) != 0;
-    stage_ = exp_flag("draft_stage", 1) != 0;
-    tail_ = exp_flag("draft_tail", 1) != 0;
-    l2_ = (int) exp_flag("draft_l2", 1);
-    pf_mode_ = (int) exp_flag("draft2_pf", 1);
-    hxq_ = exp_flag("draft2_hxq", 1) != 0;
-    if (l2_ != 0 && (cudaStreamCreateWithPriority(&cs3_, cudaStreamNonBlocking, prio) != cudaSuccess ||
-                     cudaEventCreateWithFlags(&ev_pf_, cudaEventDisableTiming) != cudaSuccess ||
-                     cudaEventCreateWithFlags(&ev_pfj_, cudaEventDisableTiming) != cudaSuccess)) {
+    if (cudaStreamCreateWithPriority(&cs3_, cudaStreamNonBlocking, prio) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_pf_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_pfj_, cudaEventDisableTiming) != cudaSuccess) {
         err = "mtp: prefetch stream";
         return false;
     }
@@ -474,8 +466,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
         if (!draft_vocab_.empty() && draft_vocab_.exists()) {
             const long size = (long) draft_vocab_.size();
             if (size >= 4 && size % 4 == 0) {
-                const int64_t cx = (int64_t) exp_flag("dvocab_ctx", 512);
-                const uint64_t xr = cx == 1 ? 2048 : (uint64_t) std::max<int64_t>(0, cx);
+                const uint64_t xr = (uint64_t) kDraftCtxRows;
                 bytes += (uint64_t) (size / 4 + xr) * head_row_bytes + (uint64_t) size + xr * 8;
             }
         }
@@ -583,9 +574,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             int64_t n_base = n_raw;
             for (int64_t i = 1; i < n_raw; ++i)
                 if (ids[i] < ids[i - 1]) { n_base = i; break; }
-            // context rows follow the base rows (gate dvocab_ctx: the value is the row count, 1 = 2048)
-            const int64_t cx = exp_flag("dvocab_ctx", 512);
-            if (cx != 0 && !coupled_draft_env() && head->type() == 13 && n_raw > 0) n_xcap_ = cx == 1 ? 2048 : cx;
+            // context rows follow the base rows
+            if (!coupled_draft_env() && head->type() == 13 && n_raw > 0) n_xcap_ = kDraftCtxRows;
             xbase_ = n_base;
             std::vector<int32_t> map((size_t) (n_raw + n_xcap_));
             std::copy(ids, ids + n_base, map.begin());
@@ -675,8 +665,6 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     const bool kv_fused = st_.kv_int8 && !st_.kv_q4 && !st_.kv_rot && native_rope_enabled() &&
                           qsa_dec_fused_supported(s);
     const bool kv_par = par_ && full && !reuse_row && kv_fused;
-    std::optional<basalt::kernels::PdlScope> pdl_scope;
-    if (pdl_ && par_) pdl_scope.emplace(true, true);
     try {
         auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
@@ -706,13 +694,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 embedding_gather_dev(codes, scales, offsets, tok_, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
                                      (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, ce);
             }
-            if (pf_mode_ == 3 && par_) pf_fork(ce, 1 | 2 | 4 | 8);
             native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, ce);
             native_quantize_q8_1(en_, xqe, (int) N, T, ce);
             native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xqe, e2_, (int) N, (int) N, T, ce);
             if (!(have_pre_ && full)) record_hidden(Rin_, T, xq_, cs);
             if (par_) join(cs);
-            if (pf_mode_ == 1 || pf_mode_ == 2) pf_fork(cs, pf_mode_ == 1 ? 15 : 14);
+            pf_fork(cs);
             add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
             // ---- the attention hyper-connection
             bool q8_done = false;
@@ -729,7 +716,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 }
                 if (par_ && dec_draft_hcf()) {
                     HcFusedArgs h = hcf_args(fa, T, xn_);
-                    if (hxq_ && hc_fused_q8_rows_ok()) { h.xq = xq_; q8_done = true; }   // mixed's q8_1 rows from the read
+                    if (hc_fused_q8_rows_ok()) { h.xq = xq_; q8_done = true; }   // mixed's q8_1 rows from the read
                     hc_fused_read(h, cs);
                 } else if (T == 1)   // one row: the per-row read (its own rounding)
                     gr_read(R_, fa[0].w_norm, fa[0].w_down, fa[0].w_up, fa[0].w_inject, EPS, gs, ss.block.gr, mixed_, inj_,
@@ -790,10 +777,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
         if (kv_par) join(cs);
         bool aq_done = false;
-        if (!st_.kv_rot && qsa_dec_attn_supported(pools, s)) {   // the gate in the merge
-            aq_done = hxq_;
-            qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs, qfull_, attn32_,
-                         aq_done ? (void*) xq_ : nullptr);
+        if (!st_.kv_rot && qsa_dec_attn_supported(pools, s)) {   // the gate in the merge writes the q8_1 rows
+            aq_done = true;
+            qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs, qfull_, attn32_, (void*) xq_);
         } else {
             qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
             if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
@@ -878,7 +864,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                     gr_write(R_ + (size_t) t * HC * N, y_ + t * N, inj2_ + t * HC, gs, R_ + (size_t) t * HC * N, cs);
             }
         }
-        // pre_next_: the next chain step's hidden input from this row's final residual (what mtp_select hands on),
+        // pre_next_: the next chain step's hidden input from this row's final residual (what the step end hands on),
         // on the second stream beside the mixer read and the head; joined by the caller
         auto fork_next_hidden = [&] {
             if (!(pre_next_ && par_ && T == 1)) return;
@@ -898,7 +884,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             fa[0].w_inject = nullptr; fa[0].eps = EPS; fa[0].lo = lo_; fa[0].rs = rs_; fa[0].mixed = sample_;
             if (T != 1) { err = "mtp: the one-kernel mixer read runs one row"; return false; }
             HcFusedArgs h = hcf_args(fa, 1, xn_);
-            if (hxq_ && hc_fused_q8_rows_ok()) { h.xq = xq_; mixer_q8 = true; }
+            if (hc_fused_q8_rows_ok()) { h.xq = xq_; mixer_q8 = true; }
             hc_fused_read(h, cs);
         } else {
             for (int t = 0; t < T; ++t)
@@ -911,9 +897,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         if (!mixer_q8) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         // the argmax drafts over the base rows only on tier 0 (the coupled sampler keeps the whole subset)
-        static const bool cpl_base = basalt::core::exp_flag("cpl_base", 0) != 0;   // coupled draft over the base rows only
-        const int64_t nv = sub ? (((tier_ == 0 && !coupled_rec_) || (coupled_rec_ && cpl_base)) ? n_tier1_ : n_dvocab_)
-                               : n_vocab_;
+        const int64_t nv = sub ? ((tier_ == 0 && !coupled_rec_) ? n_tier1_ : n_dvocab_) : n_vocab_;
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
         // another order: last bits)
         if (!coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
@@ -1001,7 +985,7 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
     const int64_t rows = all_rows ? 2 * (int64_t) max_t_ : 2 * (int64_t) T;
     const int ra = 2 * max_t_ - 1;
-    if (stage_) {   // the catch-up reads rows below 2T only: the draft row's records are staged with the rest
+    {   // the catch-up reads rows below 2T only: the draft row's records are staged with the rest
         MtpStageSeg sg[6] = {{tok_, m_tok_, T}, {step_, m_step_, (int) (rows * 4)}, {pos_, m_pos_, (int) (rows * NH)},
                              {row_, m_row_, all_rows ? 4 : 2}, {}, {}};
         int ns = 4;
@@ -1010,22 +994,11 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
             sg[ns++] = {pos_ + ra * NH, m_pos_ + ra * NH, (int) NH};
         }
         mtp_stage(sg, ns, Rin_, window_R_, (int64_t) T * HCN, cs_);
-    } else {
-        copy_i32_from_mapped(tok_, m_tok_, T, cs_);
-        copy_i32_from_mapped(step_, m_step_, rows * 4, cs_);
-        copy_i32_from_mapped(pos_, m_pos_, rows * NH, cs_);
-        copy_i32_from_mapped(row_, m_row_, all_rows ? 4 : 2, cs_);
-        copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
     }
     if (gstamp_ != nullptr) gpu_stamp(gstamp_, 0, cs_);
     par_ = true;
-    prefetch_begin(cs_);
     bool ok = record_forward(T, -1, cs_, err);
     if (ok) {
-        if (!all_rows && !stage_) {
-            copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
-            copy_i32_from_mapped(pos_ + ra * NH, m_pos_ + ra * NH, NH, cs_);
-        }
         coupled_rec_ = coupled;
         coupled_j_ = 0;
         pre_next_ = par_;
@@ -1033,16 +1006,16 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
         coupled_rec_ = false;
     }
     end_branches();
-    if (ok) ok = step_end(HCN, 0);
+    if (ok) ok = step_end(0);
     if (ok && gstamp_ != nullptr) gpu_stamp(gstamp_, 1, cs_);
     return ok;
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
-// residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
+// residual and token (left in tok_[0] by the previous step); draft j and its probability to the mapped outputs.
 bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string& err) {
     using namespace basalt::kernels;
-    const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
+    const int64_t NH = g_->n_head;
     const int row = max_t_ + j - 1;
     if (copy_records) {
         copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
@@ -1052,59 +1025,29 @@ bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string
     coupled_j_ = j;
     par_ = true;
     have_pre_ = pre_next_ = par_;   // every full row hands the next its hidden input
-    prefetch_begin(cs_);
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     end_branches();
-    if (ok) ok = step_end(HCN, j);
+    if (ok) ok = step_end(j);
     if (ok && gstamp_ != nullptr) gpu_stamp(gstamp_, 1, cs_);
     return ok;
 }
 
-// The weights of the layer and the head, in the order the chain reads them, brought into L2 by a stream of its own
-// while the chain's latency-bound kernels run; joined back by end_branches.
-void MtpDrafter::prefetch_begin(cudaStream_t cs) {
-    if (l2_ == 0 || !par_) return;
-    const ModelGeometry& g = *g_;
-    const int64_t N = g.n_embd;
-    auto q8_bytes = [&](int64_t rows, int64_t cols) { return (size_t) (rows * (cols / 32) * 34); };
-    auto pf = [&](const void* w, size_t bytes) { basalt::kernels::dense_tc_l2_prefetch(w, bytes, cs3_); };
-    if (pf_mode_ == 0 || (l2_ & 6) != 0) {
-        cudaEventRecord(ev_pf_, cs);
-        cudaStreamWaitEvent(cs3_, ev_pf_, 0);
-        pf_open_ = true;
-    }
-    if (pf_mode_ == 0) pf_fork(cs, 1 | 2 | 4 | 8);
-    else if (pf_mode_ == 2) pf_fork(cs, 1);
-    if (l2_ & 4) {
-        pf(q8("mlp.shared_expert.gate_proj.weight"), q8_bytes(g.n_ff, N));
-        pf(q8("mlp.shared_expert.up_proj.weight"), q8_bytes(g.n_ff, N));
-        pf(q8("mlp.shared_expert.down_proj.weight"), q8_bytes(N, g.n_ff));
-    }
-    if (l2_ & 2) {
-        const bool sub = dhead_ != nullptr;
-        const int64_t nv = sub ? (tier_ == 0 ? n_tier1_ : n_dvocab_) : n_vocab_;
-        pf(sub ? dhead_ : head_->weights(), (size_t) nv * head_->row_bytes());
-    }
-}
-
-// Projection weights into L2 by the prefetch stream from this point of `from` on: parts 1 fc_embedding, 2 k and v,
-// 4 q, 8 o.
-void MtpDrafter::pf_fork(cudaStream_t from, int parts) {
-    if ((l2_ & 1) == 0 || !par_) return;
+// The attention projections' weights (fc_embedding, k, v, q, o) into L2 by the prefetch stream, from this point of
+// `from` on, while the chain's latency-bound kernels run; joined back by end_branches.
+void MtpDrafter::pf_fork(cudaStream_t from) {
+    if (!par_) return;
     const ModelGeometry& g = *g_;
     const int64_t N = g.n_embd, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
     auto q8_bytes = [&](int64_t rows, int64_t cols) { return (size_t) (rows * (cols / 32) * 34); };
     auto pf = [&](const void* w, size_t bytes) { basalt::kernels::dense_tc_l2_prefetch(w, bytes, cs3_); };
     cudaEventRecord(ev_pf_, from);
     cudaStreamWaitEvent(cs3_, ev_pf_, 0);
-    if (parts & 1) pf(q8("fc_embedding.weight"), q8_bytes(N, N));
-    if (parts & 2) {
-        pf(q8("self_attn.k_proj.weight"), q8_bytes(NKV * HD, N));
-        pf(q8("self_attn.v_proj.weight"), q8_bytes(NKV * HD, N));
-    }
-    if (parts & 4) pf(q8("self_attn.q_proj.weight"), q8_bytes(NH * 2 * HD, N));
-    if (parts & 8) pf(q8("self_attn.o_proj.weight"), q8_bytes(N, NH * HD));
+    pf(q8("fc_embedding.weight"), q8_bytes(N, N));
+    pf(q8("self_attn.k_proj.weight"), q8_bytes(NKV * HD, N));
+    pf(q8("self_attn.v_proj.weight"), q8_bytes(NKV * HD, N));
+    pf(q8("self_attn.q_proj.weight"), q8_bytes(NH * 2 * HD, N));
+    pf(q8("self_attn.o_proj.weight"), q8_bytes(N, NH * HD));
     pf_open_ = true;
 }
 
@@ -1115,15 +1058,11 @@ void MtpDrafter::prefetch_end(cudaStream_t cs) {
     pf_open_ = false;
 }
 
-// The end of chain step j: its token and probability to the mapped outputs and the next step's token; with draft_tail
-// one launch that also sets the conditional handles this step ends with (the next step's input residual is the
-// hidden input already computed beside the head, so the residual is not carried).
-bool MtpDrafter::step_end(int64_t HCN, int j) {
+// The end of chain step j: its token and probability to the mapped outputs and the next step's token, in one launch
+// that also sets the conditional handles this step ends with (the next step's input residual is the hidden input
+// already computed beside the head, so the residual is not carried).
+bool MtpDrafter::step_end(int j) {
     using namespace basalt::kernels;
-    if (!tail_) {
-        mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
-        return true;
-    }
     const CondTail* c = ctail_;
     if (!mtp_step_end(out_ids_, row_ + 1, tok_, m_out_, j, probs_, m_prob_, c ? c->h : nullptr, c ? c->n : 0, row_ + 2,
                       c ? c->cum_th : 0.0f, m_prob_, cs_))
@@ -1207,13 +1146,13 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         CondTail ct{};
         for (int k = 0; k + 1 < steps; ++k) ct.h[k] = hv[k + 1];
         ct.n = steps - 1;
-        ct.cum_th = draft_cum_env();
-        ctail_ = tail_ ? &ct : nullptr;
+        ct.cum_th = kDraftCumBase;
+        ctail_ = &ct;
         ctail_done_ = false;
         bool rec = record_round(T, coupled, true, err);
         ctail_ = nullptr;
         if (rec && !ctail_done_)
-            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env(), m_prob_, 0);
+            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, kDraftCumBase, m_prob_, 0);
         cudaGraph_t g0 = nullptr;
         const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
         ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
@@ -1235,13 +1174,13 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         CondTail ct{};
         ct.h[0] = hv[j + 1];
         ct.n = 1;
-        ct.cum_th = draft_cum_env();
-        ctail_ = tail_ && j + 1 < steps ? &ct : nullptr;
+        ct.cum_th = kDraftCumBase;
+        ctail_ = j + 1 < steps ? &ct : nullptr;
         ctail_done_ = false;
         bool rec = record_step(j, coupled, false, err);
         ctail_ = nullptr;
         if (rec && j + 1 < steps && !ctail_done_)
-            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_env(), m_prob_, j);
+            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, kDraftCumBase, m_prob_, j);
         cudaGraph_t captured = nullptr;   // the body itself, owned by the node
         ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
         prev = node;
@@ -1419,7 +1358,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::memcpy(&h_row_[2], &min_p, sizeof(float));   // read by the conditional graph only
-    const float cum_th = cum_th_ >= 0.0f ? cum_th_ : draft_cum_env();
+    const float cum_th = cum_th_ >= 0.0f ? cum_th_ : kDraftCumBase;
     std::memcpy(&h_row_[3], &cum_th, sizeof(float));
     std::atomic_thread_fence(std::memory_order_seq_cst);
 

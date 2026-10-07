@@ -492,22 +492,6 @@ __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_voca
     }
 }
 
-__global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t stride, const int32_t* __restrict__ ids,
-                                  const int32_t* __restrict__ row_dev, float* __restrict__ R_dst,
-                                  int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p) {
-    const int row = *row_dev;
-    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < stride; i += (int64_t) gridDim.x * blockDim.x)
-        R_dst[i] = R_src[(size_t) row * stride + i];
-    __syncthreads();
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        const int32_t tok = ids[row];
-        *tok_dst = tok;
-        if (probs != nullptr && out_p != nullptr) ((volatile float*) out_p)[j] = probs[row];
-        __threadfence_system();
-        if (out != nullptr) ((volatile int32_t*) out)[j] = tok;
-    }
-}
-
 __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int32_t* __restrict__ steps) {
     const int i = threadIdx.x;
     if (i >= n) return;
@@ -542,13 +526,6 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
     if (n < 1 || n > 1024) { std::fprintf(stderr, "ident_hits: n out of range\n"); std::exit(1); }
     ident_hits_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(ids, n, slot, dst, count);
     check("ident_hits");
-}
-
-void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
-                int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
-    mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
-                                                            probs, out_p);
-    check("mtp_select");
 }
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {

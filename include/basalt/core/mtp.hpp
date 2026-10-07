@@ -66,7 +66,7 @@ public:
     std::vector<std::pair<std::string, const void*>> hc8_keys() const;
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
-    /// A new request (gate dvocab_ctx): the draft head's extra rows are cleared, and the tokens of the prompt that the
+    /// A new request: the draft head's extra rows are cleared, and the tokens of the prompt that the
     /// draft subset lacks queue for them.
     void begin_request(const int64_t* prompt, int64_t n);
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
@@ -187,26 +187,17 @@ private:
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     uint8_t* xq2_ = nullptr;
     bool par_ = false, pre_next_ = false, have_pre_ = false, fork_open_ = false;
-    bool stage_ = false;   ///< the round's host-mapped inputs staged by one launch
-    bool tail_ = false;    ///< a step's end (token, probability, conditional handles) in one launch
     struct CondTail { unsigned long long h[8]; int n; float cum_th; };
     const CondTail* ctail_ = nullptr;   ///< the conditional handles the step being recorded ends with
     bool ctail_done_ = false;           ///< that step's end already set them
-    bool step_end(int64_t HCN, int j);
-    int l2_ = 0;                          ///< draft_l2 parts: 1 projections, 2 head rows, 4 shared expert
+    bool step_end(int j);
     cudaStream_t cs3_ = nullptr;          ///< the weight prefetch stream of the round and chain graphs
     cudaEvent_t ev_pf_ = nullptr, ev_pfj_ = nullptr;
     bool pf_open_ = false;
-    int pf_mode_ = 0;   ///< draft2_pf: when the projection weights are prefetched (0 round start, 1 after the input branches, 2 fc_embedding first then the rest, 3 after the embedding gather)
-    void pf_fork(cudaStream_t from, int parts);
-    bool hxq_ = false;    ///< draft2_hxq: the hyper-connection reads and the attention merge write the next projection's q8_1 rows
-    void prefetch_begin(cudaStream_t cs);
+    void pf_fork(cudaStream_t from);
     void prefetch_end(cudaStream_t cs);
-    bool pdl_ = false;   ///< the round and chain graphs launch their kernels as programmatic dependents
-    // the first kernel after a fork or join follows another stream's node, so it launches the plain way
-    void fork(cudaStream_t cs) { cudaEventRecord(ev_fork_, cs); cudaStreamWaitEvent(cs2_, ev_fork_, 0); pdl_plain(); }
-    void join(cudaStream_t cs) { cudaEventRecord(ev_join_, cs2_); cudaStreamWaitEvent(cs, ev_join_, 0); pdl_plain(); }
-    static void pdl_plain();
+    void fork(cudaStream_t cs) { cudaEventRecord(ev_fork_, cs); cudaStreamWaitEvent(cs2_, ev_fork_, 0); }
+    void join(cudaStream_t cs) { cudaEventRecord(ev_join_, cs2_); cudaStreamWaitEvent(cs, ev_join_, 0); }
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< a prompt's rows' token / step / position records, uploaded at once
@@ -249,7 +240,7 @@ private:
     int tier_ = 1;
     int tier2_recent_ = 0;
     std::vector<uint8_t> tier2_;   ///< token id -> 1 when only the added rows hold it
-    // context rows (gate dvocab_ctx): n_xcap_ spare rows after the base rows, filled per request with the head rows of
+    // context rows: n_xcap_ spare rows after the base rows, filled per request with the head rows of
     // tokens the subset lacks that the prompt or the text so far holds; an unused row has id -1 (never drafted)
     int64_t n_xcap_ = 0, xbase_ = 0, n_xused_ = 0;
     std::vector<uint8_t> in_sub_;   ///< token id -> 1 when the subset holds it or a context row does

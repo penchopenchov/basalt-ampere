@@ -92,11 +92,6 @@ void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64
 void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_embd, int hc, int n_tok, void* stream);
 /// Every routed expert is resident (slot = expert id): slot[i] = ids[i], dst[i] = i, *count = n.
 void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t* count, void* stream);
-/// The draft chain's next input: R_dst[:] = R_src[row], tok_dst[0] = ids[row], out[j] = ids[row], with
-/// row = *row_dev (device memory).  `out` may be mapped host memory.
-void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
-                int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs = nullptr,
-                float* out_p = nullptr);
 /// dst row i = src row ids[i] (row_bytes each, multiple of 16), for n rows.
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream);
 /// ids[t] = table[ids[t]] for n entries (a subset index back to a token id).

@@ -35,22 +35,15 @@ DRAFT_CUM_HD inline bool draft_keep(const float* probs, int j, float min_p, floa
     return c >= th;
 }
 
-/// The rule's threshold (--exp spk_th=V; 0 switches the rule off, the min_p rule), read once.
-inline float draft_cum_env() {
-    static const float th = (float) exp_flag("spk_th", 0.35);
-    return th;
-}
+/// The rule's base threshold: what a request starts from and the device graph's default.
+constexpr float kDraftCumBase = 0.35f;
 
-/// Per-request threshold (--exp spk2_adapt=1, read once).  The threshold falls from the base toward kLo as the
+/// Per-request threshold.  The threshold falls from the base toward kLo as the
 /// request's drafts are accepted more often than the bin table predicts: when they run well, longer windows pay.  The
 /// observed and expected accepted counts decay per window; the ratio sets the threshold along a linear ramp.  The
 /// window's value is fixed before its drafts are made and shared by the host rule and the device graph.
 struct DraftCumAdapt {
-    static bool enabled() {
-        static const bool on = exp_flag("spk2_adapt", 1) != 0;
-        return on;
-    }
-    float base = draft_cum_env();   ///< the threshold while nothing is known (and with the gate off)
+    float base = kDraftCumBase;   ///< the threshold while nothing is known
     double obs = 0.0, exp = 0.0;
     float cur = base;
 
@@ -58,7 +51,7 @@ struct DraftCumAdapt {
 
     /// One verified window of the MTP chain: `n` drafts were offered with probabilities probs[0..n), `acc` accepted.
     void observe(const float* probs, int n, int acc) {
-        if (!enabled() || !(base > 0.0f) || n <= 0) return;
+        if (n <= 0) return;
         constexpr double kDecay = 0.97, kRlo = 0.9, kRhi = 1.1;
         constexpr float kLo = 0.25f;
         double c = 1.0, e = 0.0;
