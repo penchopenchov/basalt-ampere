@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> pos;
     bool tol = false;
     int stamp_reps = 1;
-    int rot = 0, rotpad = 0;   // --rot N: the timing and stamp runs cycle through N weight sets (every read starts with its matrices out of L2)
+    int rot = 0, rotpad = 0, stress = 0;   // --rot N: the timing and stamp runs cycle through N weight sets (every read starts with its matrices out of L2)
     std::string block_list = "2:4,2:100,2:165,6:4,6:100,8:169";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
         else if (a == "--stamp-reps" && i + 1 < argc) stamp_reps = std::max(1, std::atoi(argv[++i]));
         else if (a == "--rot" && i + 1 < argc) rot = std::max(0, std::atoi(argv[++i]));
         else if (a == "--rotpad" && i + 1 < argc) rotpad = std::atoi(argv[++i]);
+        else if (a == "--stress" && i + 1 < argc) stress = std::atoi(argv[++i]);
         else if (a == "--exp" && i + 1 < argc) {
             const std::string kv = argv[++i];
             const size_t eq = kv.find('=');
@@ -286,7 +287,14 @@ int main(int argc, char** argv) {
                     for (int pt : {0, 1, 4, 5, 6})
                         if (cnt[pt]) std::printf(" %s max %.2e (rel %.2e) mean %.2e |", part_name[pt], mx[pt],
                                                  ref[pt] > 0 ? mx[pt] / ref[pt] : 0.0, sum[pt] / cnt[pt]);
-                    std::printf(" routed experts differing %d of %d\n", idiff, router ? T * KT : 0);
+                    uint64_t hsh = 1469598103934665603ull;   // the fused read's bits, to compare runs of different gates
+                    for (size_t i = 0; i < v[1].size(); ++i) {
+                        uint32_t u;
+                        std::memcpy(&u, &v[1][i], 4);
+                        hsh = (hsh ^ u) * 1099511628211ull;
+                    }
+                    std::printf(" routed experts differing %d of %d | hash %016llx\n", idiff, router ? T * KT : 0,
+                                (unsigned long long) hsh);
                     if (mode == 1 && apply == 1) by_t[T] = v[1];
                     continue;
                 }
@@ -357,6 +365,51 @@ int main(int argc, char** argv) {
     }
     std::printf("hc_fused_parity: %d differing cases (T %d..%d, 3 modes, with and without the pending write)\n",
                 failures, t_lo, t_hi);
+
+    // --stress N: N reads of random window widths and token orders, 16 at a time with no host wait between them
+    // (consecutive reads overlap through PDL); every output must equal the first read of the same (T, order)
+    if (stress > 0) {
+        constexpr int NS = 16;
+        Out so[NS];
+        for (auto& x : so) alloc_out(x);
+        std::mt19937 kr(5);
+        std::vector<std::vector<float>> first(8 * 8);
+        long mism = 0, reads = 0;
+        for (int base = 0; base < stress; base += NS) {
+            int key[NS];
+            for (int i = 0; i < NS; ++i) {
+                const Out saved = o[1];
+                o[1] = so[i];
+                reset(1);
+                o[1] = saved;
+            }
+            for (int i = 0; i < NS; ++i) {
+                const int T = 1 + (int) (kr() % 8), seed = (int) (kr() % 8);
+                key[i] = (T - 1) * 8 + seed;
+                std::vector<float> r((size_t) T * D);
+                for (int t = 0; t < T; ++t)
+                    std::memcpy(&r[(size_t) t * D], &R[(size_t) ((seed + 3 * t) % TM) * D], (size_t) D * 4);
+                const Out saved = o[1];
+                o[1] = so[i];
+                cudaMemcpyAsync(o[1].R, r.data(), r.size() * 4, cudaMemcpyHostToDevice, s);
+                run(1, T, true, true, true);
+                o[1] = saved;
+            }
+            cudaStreamSynchronize(s);
+            for (int i = 0; i < NS; ++i) {
+                const int T = key[i] / 8 + 1;
+                const Out saved = o[1];
+                o[1] = so[i];
+                const std::vector<float> v = fetch(1, T);
+                o[1] = saved;
+                ++reads;
+                if (first[key[i]].empty()) first[key[i]] = v;
+                else if (std::memcmp(v.data(), first[key[i]].data(), v.size() * 4) != 0) ++mism;
+            }
+        }
+        std::printf("hc_fused_parity: stress %ld reads, %ld differ from the first read of their (T, order) (must be 0)\n", reads, mism);
+        failures += mism ? 1 : 0;
+    }
 
     // time: hot (back to back) and cold (192 MB written before each read, then R, bo and w_norm rewritten as the
     // previous kernels leave them; the read alone timed)
