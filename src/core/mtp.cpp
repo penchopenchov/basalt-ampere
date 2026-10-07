@@ -424,6 +424,8 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     stage_ = exp_flag("draft_stage", 1) != 0;
     tail_ = exp_flag("draft_tail", 1) != 0;
     l2_ = (int) exp_flag("draft_l2", 1);
+    pf_mode_ = (int) exp_flag("draft2_pf", 0);
+    hxq_ = exp_flag("draft2_hxq", 0) != 0;
     if (l2_ != 0 && (cudaStreamCreateWithPriority(&cs3_, cudaStreamNonBlocking, prio) != cudaSuccess ||
                      cudaEventCreateWithFlags(&ev_pf_, cudaEventDisableTiming) != cudaSuccess ||
                      cudaEventCreateWithFlags(&ev_pfj_, cudaEventDisableTiming) != cudaSuccess)) {
@@ -676,13 +678,16 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 embedding_gather_dev(codes, scales, offsets, tok_, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
                                      (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, ce);
             }
+            if (pf_mode_ == 3 && par_) pf_fork(ce, 1 | 2 | 4 | 8);
             native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, ce);
             native_quantize_q8_1(en_, xqe, (int) N, T, ce);
             native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xqe, e2_, (int) N, (int) N, T, ce);
             if (!(have_pre_ && full)) record_hidden(Rin_, T, xq_, cs);
             if (par_) join(cs);
+            if (pf_mode_ == 1 || pf_mode_ == 2) pf_fork(cs, pf_mode_ == 1 ? 15 : 14);
             add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
             // ---- the attention hyper-connection
+            bool q8_done = false;
             {
                 FusedGrArgs fa[kFusedGrMaxT];
                 for (int t = 0; t < T; ++t) {
@@ -694,16 +699,18 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                     fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
                     fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N;
                 }
-                if (par_ && dec_draft_hcf())
-                    hc_fused_read(hcf_args(fa, T, xn_), cs);
-                else if (T == 1)   // one row: the per-row read (its own rounding)
+                if (par_ && dec_draft_hcf()) {
+                    HcFusedArgs h = hcf_args(fa, T, xn_);
+                    if (hxq_ && hc_fused_q8_rows_ok()) { h.xq = xq_; q8_done = true; }   // mixed's q8_1 rows from the read
+                    hc_fused_read(h, cs);
+                } else if (T == 1)   // one row: the per-row read (its own rounding)
                     gr_read(R_, fa[0].w_norm, fa[0].w_down, fa[0].w_up, fa[0].w_inject, EPS, gs, ss.block.gr, mixed_, inj_,
                             cs);
                 else
                     fused_gr_read_multi(fa, T, xn_, cs);
             }
             // ---- attention: K/V into the layer's own cache, then (full) dense attention over every cell
-            native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
+            if (!q8_done) native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
             if (kv_par) fork(cs);   // K/V on the second stream, beside Q
             const cudaStream_t ckv = kv_par ? cs2_ : cs;
             native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, ckv);
@@ -754,8 +761,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
         if (kv_par) join(cs);
+        bool aq_done = false;
         if (!st_.kv_rot && qsa_dec_attn_supported(pools, s)) {   // the gate in the merge
-            qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs, qfull_, attn32_);
+            aq_done = hxq_;
+            qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs, qfull_, attn32_,
+                         aq_done ? (void*) xq_ : nullptr);
         } else {
             qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
             if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
@@ -763,7 +773,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH,
                                       (int) HD, cs);
         }
-        native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
+        if (!aq_done) native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.o_proj.weight"), xq_, bo_, (int) (NH * HD), (int) N, T, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         bool routed = false;   // the read ran the router too
@@ -850,6 +860,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         };
         if (!fold_write) fork_next_hidden();
         // ---- the final mixer and the main model's head
+        bool mixer_q8 = false;
         if (par_ && dec_draft_hcf()) {
             FusedGrArgs fa[1];
             fa[0].R = R_; fa[0].R_out = R_; fa[0].apply = true; fa[0].bo_prev = y_; fa[0].inj_prev = inj2_;
@@ -858,7 +869,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             fa[0].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");
             fa[0].w_inject = nullptr; fa[0].eps = EPS; fa[0].lo = lo_; fa[0].rs = rs_; fa[0].mixed = sample_;
             if (T != 1) { err = "mtp: the one-kernel mixer read runs one row"; return false; }
-            hc_fused_read(hcf_args(fa, 1, xn_), cs);
+            HcFusedArgs h = hcf_args(fa, 1, xn_);
+            if (hxq_ && hc_fused_q8_rows_ok()) { h.xq = xq_; mixer_q8 = true; }
+            hc_fused_read(h, cs);
         } else {
             for (int t = 0; t < T; ++t)
                 gr_read(R_ + (size_t) t * HC * N, f32("hyper_connection_mixer.hc_norm.weight"),
@@ -867,7 +880,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                         sample_ + t * N, dummy_inj_, cs);
         }
         if (fold_write) fork_next_hidden();
-        native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
+        if (!mixer_q8) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         // the argmax drafts over the base rows only on tier 0 (the coupled sampler keeps the whole subset)
         const int64_t nv = sub ? ((tier_ == 0 && !coupled_rec_) ? n_tier1_ : n_dvocab_) : n_vocab_;
@@ -1018,18 +1031,16 @@ bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string
 void MtpDrafter::prefetch_begin(cudaStream_t cs) {
     if (l2_ == 0 || !par_) return;
     const ModelGeometry& g = *g_;
-    const int64_t N = g.n_embd, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
+    const int64_t N = g.n_embd;
     auto q8_bytes = [&](int64_t rows, int64_t cols) { return (size_t) (rows * (cols / 32) * 34); };
     auto pf = [&](const void* w, size_t bytes) { basalt::kernels::dense_tc_l2_prefetch(w, bytes, cs3_); };
-    cudaEventRecord(ev_pf_, cs);
-    cudaStreamWaitEvent(cs3_, ev_pf_, 0);
-    if (l2_ & 1) {
-        pf(q8("fc_embedding.weight"), q8_bytes(N, N));
-        pf(q8("self_attn.k_proj.weight"), q8_bytes(NKV * HD, N));
-        pf(q8("self_attn.v_proj.weight"), q8_bytes(NKV * HD, N));
-        pf(q8("self_attn.q_proj.weight"), q8_bytes(NH * 2 * HD, N));
-        pf(q8("self_attn.o_proj.weight"), q8_bytes(N, NH * HD));
+    if (pf_mode_ == 0 || (l2_ & 6) != 0) {
+        cudaEventRecord(ev_pf_, cs);
+        cudaStreamWaitEvent(cs3_, ev_pf_, 0);
+        pf_open_ = true;
     }
+    if (pf_mode_ == 0) pf_fork(cs, 1 | 2 | 4 | 8);
+    else if (pf_mode_ == 2) pf_fork(cs, 1);
     if (l2_ & 4) {
         pf(q8("mlp.shared_expert.gate_proj.weight"), q8_bytes(g.n_ff, N));
         pf(q8("mlp.shared_expert.up_proj.weight"), q8_bytes(g.n_ff, N));
@@ -1040,6 +1051,25 @@ void MtpDrafter::prefetch_begin(cudaStream_t cs) {
         const int64_t nv = sub ? (tier_ == 0 ? n_tier1_ : n_dvocab_) : n_vocab_;
         pf(sub ? dhead_ : head_->weights(), (size_t) nv * head_->row_bytes());
     }
+}
+
+// Projection weights into L2 by the prefetch stream from this point of `from` on: parts 1 fc_embedding, 2 k and v,
+// 4 q, 8 o.
+void MtpDrafter::pf_fork(cudaStream_t from, int parts) {
+    if ((l2_ & 1) == 0 || !par_) return;
+    const ModelGeometry& g = *g_;
+    const int64_t N = g.n_embd, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
+    auto q8_bytes = [&](int64_t rows, int64_t cols) { return (size_t) (rows * (cols / 32) * 34); };
+    auto pf = [&](const void* w, size_t bytes) { basalt::kernels::dense_tc_l2_prefetch(w, bytes, cs3_); };
+    cudaEventRecord(ev_pf_, from);
+    cudaStreamWaitEvent(cs3_, ev_pf_, 0);
+    if (parts & 1) pf(q8("fc_embedding.weight"), q8_bytes(N, N));
+    if (parts & 2) {
+        pf(q8("self_attn.k_proj.weight"), q8_bytes(NKV * HD, N));
+        pf(q8("self_attn.v_proj.weight"), q8_bytes(NKV * HD, N));
+    }
+    if (parts & 4) pf(q8("self_attn.q_proj.weight"), q8_bytes(NH * 2 * HD, N));
+    if (parts & 8) pf(q8("self_attn.o_proj.weight"), q8_bytes(N, NH * HD));
     pf_open_ = true;
 }
 

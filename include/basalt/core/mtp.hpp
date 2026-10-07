@@ -189,6 +189,9 @@ private:
     cudaStream_t cs3_ = nullptr;          ///< the weight prefetch stream of the round and chain graphs
     cudaEvent_t ev_pf_ = nullptr, ev_pfj_ = nullptr;
     bool pf_open_ = false;
+    int pf_mode_ = 0;   ///< draft2_pf: when the projection weights are prefetched (0 round start, 1 after the input branches, 2 fc_embedding first then the rest, 3 after the embedding gather)
+    void pf_fork(cudaStream_t from, int parts);
+    bool hxq_ = false;    ///< draft2_hxq: the hyper-connection reads and the attention merge write the next projection's q8_1 rows
     void prefetch_begin(cudaStream_t cs);
     void prefetch_end(cudaStream_t cs);
     bool pdl_ = false;   ///< the round and chain graphs launch their kernels as programmatic dependents
