@@ -3,6 +3,7 @@
 // Built WITHOUT fast math, like fused_gr.cu, so the hc arithmetic below is fused_gr.cu's expressions compiled the
 // same way.  The router part reproduces kernels built WITH fast math (the MMVF GEMV and the native top-10): those
 // operations are spelled out as the flush-to-zero PTX instructions that build emits.
+#include "basalt/core/diag.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
@@ -2472,6 +2473,7 @@ bool cn_maps(const HcFusedArgs& h, CUtensorMap* tm, bool& up) {
     return it->second.ok;
 }
 
+
 void hc_fused_read(const HcFusedArgs& a, void* stream) {
     const DevInfo& d = dev_info();
     if (!d.ok || a.T < 1 || a.T > MAXT || !a.R || !a.R_out || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs ||
@@ -2525,14 +2527,16 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     }
     const bool q8 = L.a.q_down != nullptr;
     L.cn = q8 && L.nb - CN_ND >= CN_MIN_NU ? 1 : 0;
-    L.bf = 0;
+    static const int x_bf = (int) core::exp_flag("hc_bf", 0);
+    L.bf = x_bf;
     L.cn_upw = 0;
     L.cnp = d.cn + (size_t) L.slot * CN_SLOT;
     L.cns = L.cnp + (size_t) CN_MAXCOPY * CN_PART;
     L.cn_copies = 1;
     L.no_dry = L.cn;
     L.lo_stage = L.cn;
-    L.no_fence = 0;
+    static const int x_nf = (int) core::exp_flag("hc_nofence", 0);
+    L.no_fence = x_nf;
     if (L.cn) {
         bool up = false;
         const bool down = cn_maps(L.a, L.tm, up);

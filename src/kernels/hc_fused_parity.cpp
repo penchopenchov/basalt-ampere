@@ -4,6 +4,7 @@
 // fused read on 8-bit copies of the matrices (run with --tol).
 //
 //     build/hc_fused_parity [iters] [T min] [T max]
+#include "basalt/core/diag.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
@@ -39,11 +40,19 @@ int main(int argc, char** argv) {
     std::vector<std::string> pos;
     bool tol = false;
     int stamp_reps = 1;
+    int rot = 0, rotpad = 0;   // --rot N: the timing and stamp runs cycle through N weight sets (every read starts with its matrices out of L2)
     std::string block_list = "2:4,2:100,2:165,6:4,6:100,8:169";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--tol") tol = true;
         else if (a == "--stamp-reps" && i + 1 < argc) stamp_reps = std::max(1, std::atoi(argv[++i]));
+        else if (a == "--rot" && i + 1 < argc) rot = std::max(0, std::atoi(argv[++i]));
+        else if (a == "--rotpad" && i + 1 < argc) rotpad = std::atoi(argv[++i]);
+        else if (a == "--exp" && i + 1 < argc) {
+            const std::string kv = argv[++i];
+            const size_t eq = kv.find('=');
+            basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
+        }
         else if (a == "--block" && i + 1 < argc) block_list = argv[++i];
         else pos.push_back(a);
     }
@@ -130,6 +139,32 @@ int main(int argc, char** argv) {
         cudaMemcpyAsync(dbo, dRbak, bo.size() * 4, cudaMemcpyDeviceToDevice, s);
         cudaMemcpyAsync(dwn, dwnbak, wn.size() * 4, cudaMemcpyDeviceToDevice, s);
     };
+    struct WSet {
+        uint16_t *wd, *wu, *wi, *wr;
+    };
+    std::vector<WSet> ws;
+    int wcur = -1;   // >= 0: f = 1 reads this weight set
+    for (int i = 0; i < rot; ++i) {
+        WSet w{};
+        if (rotpad > 0) {   // address space between the sets: every read starts on pages its predecessors did not touch
+            void* pad = nullptr;
+            cudaMalloc(&pad, (size_t) rotpad << 20);
+        }
+        cudaMalloc((void**) &w.wd, wd.size() * 2);
+        cudaMalloc((void**) &w.wu, wu.size() * 2);
+        cudaMalloc((void**) &w.wi, wi.size() * 2);
+        cudaMalloc((void**) &w.wr, wr.size() * 2);
+        cudaMemcpy(w.wd, wd.data(), wd.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(w.wu, wu.data(), wu.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(w.wi, wi.data(), wi.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(w.wr, wr.data(), wr.size() * 2, cudaMemcpyHostToDevice);
+        if (q8) {
+            K::hc8_prepare(w.wd, LR, D);
+            K::hc8_prepare(w.wu, D, LR);
+            K::hc8_prepare(w.wi, HC, D);
+        }
+        ws.push_back(w);
+    }
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
@@ -137,6 +172,7 @@ int main(int argc, char** argv) {
     // f = 0: the reference kernels; f = 1: the fused read
     auto run = [&](int f, int T, bool apply, bool inject, bool router) {
         Out& x = o[f];
+
         K::PdlScope ps(true);
         if (f == 0) {
             K::FusedGrArgs a[TM];
@@ -154,10 +190,11 @@ int main(int argc, char** argv) {
             }
         } else {
             K::HcFusedArgs a;
+            const WSet w = wcur >= 0 ? ws[wcur] : WSet{dwd, dwu, dwi, dwr};
             a.T = T; a.R = x.R; a.R_out = x.R; a.apply = apply; a.bo_prev = dbo; a.inj_prev = dinj;
-            a.w_norm = dwn; a.w_down = dwd; a.w_up = dwu; a.w_inject = inject ? dwi : nullptr;
+            a.w_norm = dwn; a.w_down = w.wd; a.w_up = w.wu; a.w_inject = inject ? w.wi : nullptr;
             a.lo = x.lo; a.rs = x.rs; a.inject_out = x.io; a.mixed = x.mix; a.xn = x.xn;
-            if (router) { a.w_router = dwr; a.logits = x.logits; a.ids = x.ids; a.weights = x.w; }
+            if (router) { a.w_router = w.wr; a.logits = x.logits; a.ids = x.ids; a.weights = x.w; }
             K::hc_fused_read(a, s);
         }
     };
@@ -350,6 +387,17 @@ int main(int argc, char** argv) {
                     tot += ms;
                 }
                 cold[f] = 1e3 * tot / ci;
+                if (f == 1 && rot) {   // back to back over the weight sets: each read's matrices are out of L2
+                    for (int i = 0; i < 2 * rot; ++i) { wcur = i % rot; run(1, T, true, true, router); }
+                    cudaEventRecord(e0, s);
+                    for (int i = 0; i < iters; ++i) { wcur = i % rot; run(1, T, true, true, router); }
+                    cudaEventRecord(e1, s);
+                    cudaEventSynchronize(e1);
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    wcur = -1;
+                    std::printf("T %d %-12s | rotating over %d weight sets: fused %6.1f us (%5.0f GB/s)\n", T,
+                                router ? "read+router" : "read", rot, 1e3 * ms / iters, bytes_f / (1e3 * ms / iters) / 1e3);
+                }
             }
             std::printf("T %d %-12s | hot: old %6.1f us  fused %6.1f us (%5.0f GB/s) | cold: old %6.1f us  fused %6.1f us "
                         "(%5.0f GB/s)\n",
@@ -371,15 +419,20 @@ int main(int argc, char** argv) {
         const int reps = stamp_reps;
         for (int T : {1, 2, 3}) {
             if (T < t_lo || T > t_hi) continue;
+            for (int rt = 0; rt < 2; ++rt)
             for (int cold = 0; cold < 2; ++cold) {
+                if (rot && !cold) continue;
+                if (!rot && rt == 0) continue;
                 std::vector<double> acc[3][15][2];
                 for (int rep = 0; rep < reps; ++rep) {
-                    for (int i = 0; i < 3; ++i) run(1, T, true, true, true);
-                    if (cold) evict(1, 1);
+                    if (rot) wcur = (rep * 3) % rot;
+                    for (int i = 0; i < 3; ++i) { run(1, T, true, true, rt != 0); if (rot) wcur = (wcur + 1) % rot; }
+                    if (cold && !rot) evict(1, 1);
                     cudaMemsetAsync(ddbg, 0, (size_t) sms * 128, s);
                     K::hc_fused_set_debug(ddbg);
-                    run(1, T, true, true, true);
+                    run(1, T, true, true, rt != 0);
                     K::hc_fused_set_debug(nullptr);
+                    wcur = -1;
                     cudaStreamSynchronize(s);
                     cudaMemcpy(h.data(), ddbg, h.size() * 8, cudaMemcpyDeviceToHost);
                     unsigned long long t0 = ~0ull;
@@ -395,8 +448,8 @@ int main(int argc, char** argv) {
                             if (mx >= 0) { acc[grp][i][0].push_back(mn); acc[grp][i][1].push_back(mx); }
                         }
                 }
-                std::printf("T %d %s phases (us, median over %d reads of min/max over CTAs; CTAs with a down item | an up item "
-                            "| the top-10 item):\n", T, cold ? "cold" : "hot", reps);
+                std::printf("T %d %s%s phases (us, median over %d reads of min/max over CTAs; CTAs with a down item | an up item "
+                            "| the top-10 item):\n", T, rt ? "router " : "", rot ? "rotating" : cold ? "cold" : "hot", reps);
                 for (int grp = 0; grp < 3; ++grp) {
                     bool any = false;
                     for (int i = 0; i < 15; ++i) any = any || !acc[grp][i][0].empty();
