@@ -1107,7 +1107,7 @@ void coupled_draft_sample_v(int variant, float* logits, int nv, const int32_t* s
 void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
                           const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
                           void* scratch, int32_t* out_id, float* out_prob, void* stream) {
-    static const int variant = (int) basalt::core::exp_flag("cpl_fast", 0);
+    static const int variant = (int) basalt::core::exp_flag("cpl_fast", 1);
     coupled_draft_sample_v(variant, logits, nv, sub_to_id, id_to_sub, id_vocab, params, ring, cap, j, step_rec, scratch,
                            out_id, out_prob, stream);
 }
