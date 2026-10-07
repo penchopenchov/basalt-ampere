@@ -394,7 +394,7 @@ bool Verifier::dm_init(std::string& err) {
         d->peer_p2 = (exp_flag("peer2_grid", 0) != 0 ? 1 : 0) | (exp_flag("peer2_dpf", 0) != 0 ? 2 : 0) |
                      (exp_flag("peer2_grp", 0) != 0 ? 4 : 0) | (exp_flag("peer2_poll", 0) != 0 ? 8 : 0) |
                      ((int) exp_flag("peer3_warm", 0) << 4);
-        d->tag = exp_flag("tail_tag", 0) != 0;
+        d->tag = exp_flag("tail_tag", 1) != 0;
         if (d->tag) {
             d->rows_words = (size_t) (T * K * N);
             for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
