@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> pos;
     bool tol = false;
     int stamp_reps = 1;
+    bool check_only = false;   // --check-only: stop after the output checks (for the sanitizers)
     int rot = 0, rotpad = 0, stress = 0;   // --rot N: the timing and stamp runs cycle through N weight sets (every read starts with its matrices out of L2)
     std::string block_list = "2:4,2:100,2:165,6:4,6:100,8:169";
     for (int i = 1; i < argc; ++i) {
@@ -49,6 +50,7 @@ int main(int argc, char** argv) {
         else if (a == "--rot" && i + 1 < argc) rot = std::max(0, std::atoi(argv[++i]));
         else if (a == "--rotpad" && i + 1 < argc) rotpad = std::atoi(argv[++i]);
         else if (a == "--stress" && i + 1 < argc) stress = std::atoi(argv[++i]);
+        else if (a == "--check-only") check_only = true;
         else if (a == "--exp" && i + 1 < argc) {
             const std::string kv = argv[++i];
             const size_t eq = kv.find('=');
@@ -410,6 +412,8 @@ int main(int argc, char** argv) {
         std::printf("hc_fused_parity: stress %ld reads, %ld differ from the first read of their (T, order) (must be 0)\n", reads, mism);
         failures += mism ? 1 : 0;
     }
+
+    if (check_only) return failures ? 1 : 0;
 
     // time: hot (back to back) and cold (192 MB written before each read, then R, bo and w_norm rewritten as the
     // previous kernels leave them; the read alone timed)
