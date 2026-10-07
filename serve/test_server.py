@@ -1050,6 +1050,16 @@ class GpuChoice(unittest.TestCase):
             self.assertEqual(v.spawn[0], ["x", "--mmproj", "m", "--model", "t"] + want)
             shutil.rmtree(v.dir, ignore_errors=True)
 
+    def test_vision_startup_line(self):
+        from serve.server import vision_line
+        self.assertEqual(vision_line(None, {}), "[server] vision: off (--vision or --vision-cpu to enable)")
+        cpu = vision_line({"gpu": False}, {}, 2.34)
+        self.assertRegex(cpu, r"^\[server\] vision: ready on the CPU, \d+ threads, ready in 2\.3 s$")
+        self.assertEqual(vision_line({"gpu": True}, {"gpu": "0,1"}, 5.0, name=lambda i: f"card{i}"),
+                         "[server] vision: ready on GPU 1 (card1), ready in 5.0 s")
+        self.assertEqual(vision_line({"gpu": True}, {}, 5.0, name=lambda i: None),
+                         "[server] vision: ready on GPU 0, ready in 5.0 s")
+
     def test_vision_device(self):
         # with two cards listed the image encoder takes the second; the engine's environment stays as it was
         from serve.server import child_env, vision_env

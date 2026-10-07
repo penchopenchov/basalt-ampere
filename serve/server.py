@@ -1410,17 +1410,20 @@ class Vision:
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.stopped = False
+        self.ready_s = 0.0                              # how long the last start took to reach READY
         self._start()
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
 
     def _start(self):
         args, log, env = self.spawn
+        t0 = time.time()
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
                                      text=True, encoding="utf-8", bufsize=1, env=env)
         line = self.proc.stdout.readline()
         if not line.startswith("READY"):
             raise RuntimeError("the vision encoder did not start: " + line.strip())
+        self.ready_s = time.time() - t0
         self.stopped = False
 
     def alive(self) -> bool:
@@ -1560,6 +1563,32 @@ def vision_env(cfg: dict, env: dict) -> dict:
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     env["CUDA_VISIBLE_DEVICES"] = str(gpus[1])
     return env
+
+
+def gpu_card_name(index: int) -> str | None:
+    """The marketing name of one card, from a single nvidia-smi query at startup; None when it cannot be had."""
+    try:
+        out = subprocess.run(["nvidia-smi", "-i", str(index), "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=5)
+        name = out.stdout.strip().splitlines()[0].strip() if out.returncode == 0 and out.stdout.strip() else ""
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return name.removeprefix("NVIDIA GeForce ").removeprefix("NVIDIA ") or None
+
+
+def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_card_name) -> str:
+    """The startup line about the image encoder: off, or where it runs and how long it took to be ready.  The
+    card is numbered as nvidia-smi numbers it: the second listed card when two are listed (see vision_env), else
+    the engine's."""
+    if not vision:
+        return "[server] vision: off (--vision or --vision-cpu to enable)"
+    took = f", ready in {ready_s:.1f} s"
+    if not vision.get("gpu"):
+        return f"[server] vision: ready on the CPU, {max(1, (os.cpu_count() or 2) // 2)} threads{took}"
+    listed = gpu_list(cfg)
+    card = listed[1] if len(listed) > 1 else listed[0] if listed else 0
+    n = name(card)
+    return f"[server] vision: ready on GPU {card}{f' ({n})' if n else ''}{took}"
 
 
 class ByteTokenizer:
@@ -3643,6 +3672,7 @@ def main() -> int:
         if cfg.get("vision"):
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env))
+        print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
         if lazy:
             print("[server] model unloaded, the first request loads it", flush=True)
         if cfg.get("log"):                              # the engine's stderr goes to its log file: follow it
