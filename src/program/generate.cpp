@@ -4589,8 +4589,8 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // say what frees VRAM
-                std::fprintf(stderr, "basalt serve: the GPU has too little free VRAM for the prompt path: turn images "
-                                     "off (--no-vision), close other programs using the GPU, use a shorter "
+                std::fprintf(stderr, "basalt serve: the GPU has too little free VRAM for the prompt path: move images "
+                                     "to the CPU (--vision-cpu) or off, close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
