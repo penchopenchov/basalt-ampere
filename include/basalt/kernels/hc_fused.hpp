@@ -1,6 +1,6 @@
 // include/basalt/kernels/hc_fused.hpp - the hyper-connection read of a verify window as ONE kernel.
 //
-// The same outputs as fused_gr_read_multi (and, optionally, the router after it), bit for bit:
+// The same operations as fused_gr_read_multi (and, optionally, the router after it), on the matrices' 8-bit copies:
 //
 //   R' = R + bo_prev * 2 sigmoid(inj_prev / hc)                  (when apply)
 //   rs[c] = rsqrt(mean(R'[c]^2) + eps),  xn = R' * w_norm * rs
@@ -9,11 +9,11 @@
 //   logits = w_router . mixed,  (ids, weights) = top-10 of softmax(logits)   (when w_router)
 //
 // One CTA per SM; the work is a queue of items in dependency order, handed on through counters in global memory
-// instead of kernel boundaries: the norm of (token, stream) pairs, 81 down items (four rows each, weights and
-// activations streamed through a shared-memory ring), one up item per remaining CTA (its slice of w_up bulk-copied
-// into shared memory) and 81 router items, the last of which runs the top-10.  A CTA claims items in order and waits
-// only on earlier items, so the read finishes even when other work holds some of the SMs.  Every value is computed with the operations, and in the order, of the kernels
-// it replaces (fused_gr.cu's read, the BF16 MMVF router GEMV and the native top-10), so the outputs are the same bits.
+// instead of kernel boundaries: 88 down items (the matrices' 8-bit rows over half-streams of the stream rows, each
+// forming R' and x itself), one up item per remaining CTA (its slice of w_up copied into shared memory by tensor
+// copies), 81 router items and the top-10 item.  A CTA claims items in order and waits only on earlier items, so the
+// read finishes even when other work holds some of the SMs.  The matrices are read from their 8-bit copies, so the
+// outputs are not the bf16 kernels' bits; every token's outputs are independent of the window width and its column.
 //
 // `pf` / `pf_bytes`: up to four ranges (e.g. the next read's weights) prefetched into L2 once this read is done.
 #pragma once
@@ -44,15 +44,15 @@ struct HcFusedArgs {
     float* logits = nullptr;            ///< [T][512]
     int32_t* ids = nullptr;             ///< [T][10]
     float* weights = nullptr;           ///< [T][10]
-    /// mixed's q8_1 rows (36-byte blocks, [T][n_embd / 32]), or null: written by the router items (DEC_GLUE),
-    /// or without a router by the up slices (DEC_DTC2 & 8); needs hc_fused_q8_rows_ok
+    /// mixed's q8_1 rows (36-byte blocks, [T][n_embd / 32]), or null: written by the router items, or without a
+    /// router by the up slices
     void* xq = nullptr;
     const void* pf[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t pf_bytes[4] = {0, 0, 0, 0};
     /// let the next kernel in at the start (its blocks take the SMs this read's blocks leave)
     bool next_early = false;
-    /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null = the
-    /// bf16 matrices.  hc_fused_read fills them from hc8_prepare's copies when DEC_HC8=1.
+    /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null: found
+    /// from the copies hc8_prepare / hc8_upload registered for the bf16 matrices (every read needs them).
     const int8_t* q_down = nullptr;
     const uint16_t* s_down = nullptr;   ///< f16 [hc_lr][hc * n_embd / 32]
     const int8_t* q_up = nullptr;
@@ -61,10 +61,10 @@ struct HcFusedArgs {
     const uint16_t* s_inject = nullptr; ///< f16 [hc][hc * n_embd / 32]
 };
 
-/// DEC_HC8=1: the read uses 8-bit copies of its matrices (not bitwise; every token's outputs stay independent
-/// of T and column).  DEC_HC8_PRE=<n> (default 3): down stages requested before the norm is done.
+/// The hyper-connection reads use 8-bit copies of their matrices (every token's outputs stay independent of T and
+/// column).
 bool hc8_enabled();
-/// Whether a read writes HcFusedArgs::xq (not split-K, not DEC_HCX=2 / 4).
+/// Whether a read writes HcFusedArgs::xq.
 bool hc_fused_q8_rows_ok();
 /// Quantize the bf16 matrix w [rows][cols] (cols a multiple of 32) to an 8-bit copy on the current device, once per
 /// pointer, outside any stream capture.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
@@ -78,8 +78,7 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
 bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes = nullptr);
 /// Bytes held by the 8-bit copies.
 size_t hc8_bytes();
-/// DEC_HC8=1 with the bf16 matrices dropped from VRAM (not with DEC_HC_SK=1, whose read is bf16 only;
-/// DEC_HC8_KEEP=1 keeps them beside the copies).
+/// The bf16 matrices are dropped from VRAM: the 8-bit copies are all there is.
 bool hc8_only();
 /// Quantize the bf16 matrix staged at w (the caller frees it afterwards) and register the copy under the copy's own
 /// address, which stands for the matrix from then on: every reader resolves it with hc8_view.  nullptr: no VRAM.
