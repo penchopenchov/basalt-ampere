@@ -4953,7 +4953,7 @@ int main(int argc, char** argv) {
             }
         };
         // host_late: the peer's swaps land a window after their copies are queued, so no window waits for a copy
-        const bool peer_late = basalt::core::exp_flag("host_late", 0) != 0;
+        const bool peer_late = basalt::core::exp_flag("host_late", 1) != 0;
         bool peer_landing = false;
         auto apply_pending = [&](bool wait, bool exchanges = true) {
             if (peer.valid()) {
@@ -5106,8 +5106,8 @@ int main(int argc, char** argv) {
         struct XSwap { int32_t layer, in, out, slot; uint64_t off; bool xchg, promo, p2p; };
         const bool peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
         std::vector<XSwap> xq;
-        const bool xq_pre = basalt::core::exp_flag("host_pre", 0) != 0;
-        const bool xq_post = xq_pre && basalt::core::exp_flag("host_post", 0) != 0;
+        const bool xq_pre = basalt::core::exp_flag("host_pre", 1) != 0;
+        const bool xq_post = xq_pre && basalt::core::exp_flag("host_post", 1) != 0;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
         auto xq_round = [&]() -> bool {
             const auto at0 = Clock::now();

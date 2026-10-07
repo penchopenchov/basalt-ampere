@@ -349,7 +349,7 @@ bool Verifier::dm_init(std::string& err) {
     if (!ok) { err = "verify: device-planned MoE buffers"; return false; }
     d->shadow0.assign((size_t) LE, INT32_MIN);
     d->shadow1.assign((size_t) LE, -1);
-    if (exp_flag("host_pin", 0) != 0) {   // [res0 | ptab0 | res1 | ptab1] per slot
+    if (exp_flag("host_pin", 1) != 0) {   // [res0 | ptab0 | res1 | ptab1] per slot
         d->pin_stride = (size_t) LE * 24;
         if (cudaHostAlloc((void**) &d->pin, d->pin_stride * DecMoe::kPinSlots, cudaHostAllocPortable) != cudaSuccess) {
             cudaGetLastError();
