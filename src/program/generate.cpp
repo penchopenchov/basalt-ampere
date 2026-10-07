@@ -95,6 +95,68 @@
 #include <vector>
 
 namespace {
+// One unit of background work at a time, run either on a fresh thread or on a worker that stays alive between jobs
+// (waking a parked thread is much quicker than creating one).  `join` waits for the job in flight.
+class JobRunner {
+public:
+    explicit JobRunner(bool pooled) : pooled_(pooled) {}
+    ~JobRunner() {
+        join();
+        if (worker_.joinable()) {
+            { std::lock_guard<std::mutex> lk(mu_); quit_ = true; }
+            cv_.notify_one();
+            worker_.join();
+        }
+    }
+    JobRunner(const JobRunner&) = delete;
+    JobRunner& operator=(const JobRunner&) = delete;
+    void run(std::function<void()> fn) {
+        busy_ = true;
+        if (!pooled_) { th_ = std::thread(std::move(fn)); return; }
+        if (!worker_.joinable()) worker_ = std::thread([this] { loop(); });
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            job_ = std::move(fn);
+            state_.store(1, std::memory_order_release);
+        }
+        cv_.notify_one();
+    }
+    bool joinable() const { return busy_; }
+    void join() {
+        if (!busy_) return;
+        if (!pooled_) th_.join();
+        else
+            while (state_.load(std::memory_order_acquire) != 0) {   // spin: the caller has nothing else to do
+#if defined(__x86_64__)
+                __builtin_ia32_pause();
+#endif
+            }
+        busy_ = false;
+    }
+private:
+    void loop() {
+        for (;;) {
+            std::function<void()> f;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return quit_ || state_.load(std::memory_order_acquire) == 1; });
+                if (state_.load(std::memory_order_acquire) != 1) return;
+                f = std::move(job_);
+            }
+            f();
+            state_.store(0, std::memory_order_release);
+        }
+    }
+    const bool pooled_;
+    bool busy_ = false;
+    std::thread th_, worker_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::function<void()> job_;
+    std::atomic<int> state_{0};   // 0 idle, 1 job queued or running
+    bool quit_ = false;
+};
+
 // A start-ending failure: one `basalt error:` line, which the server shows as the reason.  Returns the exit code.
 int fatal_start_error(const std::string& text) {
     std::fprintf(stderr, "basalt error: %s\n", text.c_str());
@@ -5107,6 +5169,8 @@ int main(int argc, char** argv) {
         const bool peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
         std::vector<XSwap> xq;
         const bool xq_pre = basalt::core::exp_flag("host_pre", 1) != 0;
+        const bool adapt_early = basalt::core::exp_flag("host2_early", 0) != 0;
+        const bool peer_land = basalt::core::exp_flag("host2_land", 0) != 0;
         const bool xq_post = xq_pre && basalt::core::exp_flag("host_post", 1) != 0;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
         auto xq_round = [&]() -> bool {
@@ -6708,11 +6772,8 @@ int main(int argc, char** argv) {
             static const bool chain = basalt::core::Verifier::chain_on();
             int adapt_age = 2;   // loop tops since the last adaptive round
             bool applied_early = false;
-            struct Joined {
-                std::thread t;
-                ~Joined() { if (t.joinable()) t.join(); }
-            } apply_j;
-            std::thread& apply_thr = apply_j.t;
+            const bool job_pool = basalt::core::exp_flag("host2_pool", 0) != 0;
+            JobRunner apply_thr(job_pool), adapt_thr(job_pool);
             bool copy_live = false, copy_done = false;   // exchanges applied early whose RAM copies are under way
             if (cancelled) finish = "cancel";
             // --draft-log FILE: one line per window (T, accepted, draft probabilities, ms) for draft-policy study
@@ -6805,7 +6866,6 @@ int main(int argc, char** argv) {
                 }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
-                std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 const bool do_adapt = !drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0 &&
                                       (adapt_fast ? xq_stage == 0
@@ -6816,7 +6876,7 @@ int main(int argc, char** argv) {
                         if (do_adapt) adapt_age = 0;
                         basalt::core::decode_events().tag(1u << 0);
                         basalt::core::decode_events().tag(1u << (6 + xq_stage));
-                        adapt_thr = std::thread([&] {
+                        adapt_thr.run([&] {
                             const auto ta = Clock::now();
                             basalt::core::decode_events().stamp(8);
                             adapt_ok = xq_stage != 0 ? xq_advance() : xq_round();
@@ -6830,7 +6890,7 @@ int main(int argc, char** argv) {
                     }
                     if (!do_adapt) return;
                     adapt_age = 0;
-                    adapt_thr = std::thread([&] {
+                    adapt_thr.run([&] {
                         const auto ta = Clock::now();
                         adapt_ok = adapt();
                         if (chain && adapt_ok) {   // the evictions' residency, uploaded beside the draft
@@ -6854,6 +6914,42 @@ int main(int argc, char** argv) {
                     const int wprob_n = std::min(S_mtp, 16);
                     if (draft_log != nullptr)
                         for (int i = 0; i < wprob_n; ++i) wprob[i] = first_window || from_sfx ? -1.0f : dprob[(size_t) i];
+                    // the adaptive round and the swaps' residency, beside the commit and the draft
+                    auto adapt_side = [&] {
+                        const bool quiet = !do_adapt && xq_stage == 0;   // no adaptive step beside this one
+                        spawn_adapt();
+                        // the swaps' residency at the next window, then their RAM copies a share per draft
+                        applied_early = adapt_age == 1 && !do_adapt && !pending.empty();
+                        // host2_land: the peer's swaps that the next loop top would land land here instead, beside the draft
+                        const bool land = peer_land && quiet && peer.valid() && peer_landing && !applied_early &&
+                                          adapt_age + 1 >= 2;
+                        if (applied_early || copy_live || land) {
+                            const bool boundary = applied_early, copies = applied_early || copy_live;
+                            if (copies) {
+                                copy_live = true;
+                                copy_done = false;
+                            }
+                            basalt::core::decode_events().tag(1u << 2);
+                            apply_thr.run([&, boundary, land, copies] {
+                                if (land) {
+                                    peer.apply_pending(true);
+                                    peer_landing = false;
+                                    std::string perr;
+                                    if (!ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                                }
+                                if (boundary) {
+                                    apply_pending(true, false);
+                                    std::string perr;
+                                    if (!ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                                }
+                                if (copies) copy_done = !src.exchanges_staged() || src.copy_exchanges(8ull << 20);
+                            });
+                        }
+                    };
+                    // host2_early: started before the commit and draft launches, so it is done by the time they finish
+                    const bool side_done = adapt_early;
+                    basalt::core::decode_events().stamp(9);
+                    if (side_done) adapt_side();
                     if (!ver.commit(a + 1, err, 2)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
@@ -6867,23 +6963,7 @@ int main(int argc, char** argv) {
                     auto after_launch = [&] {
                         after_ran = true;
                         commit_ok = ver.commit(a + 1, cerr, 1);
-                        spawn_adapt();
-                        // the swaps' residency at the next window, then their RAM copies a share per draft
-                        applied_early = adapt_age == 1 && !do_adapt && !pending.empty();
-                        if (applied_early || copy_live) {
-                            const bool boundary = applied_early;
-                            copy_live = true;
-                            copy_done = false;
-                            basalt::core::decode_events().tag(1u << 2);
-                            apply_thr = std::thread([&, boundary] {
-                                if (boundary) {
-                                    apply_pending(true, false);
-                                    std::string perr;
-                                    if (!ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
-                                }
-                                copy_done = !src.exchanges_staged() || src.copy_exchanges(8ull << 20);
-                            });
-                        }
+                        if (!side_done) adapt_side();
                         for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                             std::printf("T %d\n", (int) outv[(size_t) i]);
                             basalt::core::progress_beat();

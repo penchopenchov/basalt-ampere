@@ -2190,7 +2190,7 @@ std::string DecodeEvents::report() {
     }
     // the host's stations between a draft's return and the next launch: mean interval for gaps over 0.1 ms and the rest
     for (int big_set = 1; big_set >= 0; --big_set) {
-        double sum[8] = {}, th[3] = {};
+        double sum[8] = {}, th[4] = {};
         long n = 0, thn = 0;
         for (size_t i = 0; i < idle.size(); ++i) {
             if ((idle[i].first > 0.1) != (big_set == 1)) continue;
@@ -2201,13 +2201,13 @@ std::string DecodeEvents::report() {
             for (int k = 0; k < 5; ++k) sum[k] += h[(size_t) k + 1] - h[(size_t) k];
             sum[5] += idle[i].first;
             sum[6] += v[7][i];
-            if (h[8] > 0 && h[7] > 0 && h[6] > 0) { th[0] += h[8] - h[0]; th[1] += h[6] - h[8]; th[2] += h[7] - h[6]; ++thn; }
+            if (h[8] > 0 && h[7] > 0 && h[6] > 0) { th[3] += h[9] > 0 ? h[8] - h[9] : 0; th[0] += h[8] - h[0]; th[1] += h[6] - h[8]; th[2] += h[7] - h[6]; ++thn; }
             ++n;
         }
         if (n == 0) continue;
         if (thn > 0) {
-            std::snprintf(b, sizeof b, " | adapt thread (windows with one, %s gaps): start after stamp0 %.3f, work %.3f, presync %.3f",
-                          big_set ? "big" : "small", th[0] / (double) thn, th[1] / (double) thn, th[2] / (double) thn);
+            std::snprintf(b, sizeof b, " | adapt thread (windows with one, %s gaps): start after stamp0 %.3f, work %.3f, presync %.3f, start after spawn %.3f",
+                          big_set ? "big" : "small", th[0] / (double) thn, th[1] / (double) thn, th[2] / (double) thn, th[3] / (double) thn);
             out += b;
         }
         std::snprintf(b, sizeof b, " | host %s gaps (n %ld) ms: draft>adapt-join %.3f join>loop-end %.3f loop-end>top %.3f top>run-dm_sync %.3f dm_sync>launch %.3f (GPU idle %.3f, of it run-entry>launch %.3f)",
