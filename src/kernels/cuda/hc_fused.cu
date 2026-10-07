@@ -154,7 +154,7 @@ struct alignas(256) HcCtr {
     unsigned v;
 };
 struct HcSync {
-    HcCtr q, norm, down, up, router, exit, nload;
+    HcCtr q, norm, down, up, router, exit, nload, epoch;
 };
 // consecutive reads take different counter sets: a read's CTAs claim work before the previous kernel is done
 constexpr int NSLOT = 4;
@@ -193,6 +193,9 @@ struct HcLaunch {
     int late_w;      // cn, up_tma: the slice's copy waited on after lo is formed
     int lo_stage;    // cn: an up item's copy of the down items' sums by bulk copies into shared memory (cn_lo's lbar)
     int no_dry;      // cn: the up items skip the top-10 dry run (a down item's CTA claims the top-10 and warms itself)
+    int pkg;         // hc2_pkg bits: 2 = no up-item signal when no router follows; 4 = the router's logits to the top-10
+                     // item as tagged data; 64 = no_fence; 128 = an up item that sees every item claimed skips its last claim
+    unsigned long long* lg64;   // pkg & 4: [MAXT][NE] logits tagged with the read's epoch (tag << 32 | f32 bits)
     CUtensorMap tm[8];   // q_down, s_down, q_inject, s_inject by four rows; q_down, s_down by CN_RG rows; q_up, s_up
 };
 
@@ -265,6 +268,30 @@ __device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
     unsigned v;
     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
     return v;
+}
+// A value carried with the read's tag in one 64-bit access: a reader that sees the tag sees the value.
+__device__ __forceinline__ unsigned long long ld_tagged_raw(const unsigned long long* p) {
+    unsigned long long v;
+    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_tagged(unsigned long long* p, float v, unsigned tag) {
+    const unsigned long long x = ((unsigned long long) tag << 32) | __float_as_uint(v);
+    asm volatile("st.relaxed.gpu.global.u64 [%0], %1;" ::"l"(p), "l"(x) : "memory");
+}
+// Reads again, all together, every value of w whose tag is not `tag` (addr(i): its address), until none is missing.
+template <int M, class F>
+__device__ __forceinline__ void tagged_settle(unsigned long long (&w)[M], unsigned tag, const F& addr) {
+    bool bad;
+    do {
+        bad = false;
+#pragma unroll
+        for (int i = 0; i < M; ++i)
+            if ((unsigned) (w[i] >> 32) != tag) {
+                w[i] = ld_tagged_raw(addr(i));
+                bad = true;
+            }
+    } while (bad);
 }
 // every thread's writes so far, then one release increment
 __device__ __forceinline__ void cta_signal(unsigned* ctr, int tid) {
@@ -1566,7 +1593,8 @@ __device__ __forceinline__ float warp_sum16_ftz(float (&v)[16], int lane) {
 // and 24 zeros - for every row and token at once; the xor trees run 16 values at a time (warp_sum16_ftz).
 template <int T, int RMAX = RT_MAX_ROWS>
 __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0, int e1, int tid,
-                               float* partials /* [RMAX * T][WARPS] */) {
+                               float* partials /* [RMAX * T][WARPS] */, unsigned long long* lg64 = nullptr,
+                               unsigned tag = 0) {
     const int lane = tid & 31, warp = tid >> 5, ne = e1 - e0;
     constexpr int PAIRS = N / 2 / THREADS;   // 5
     constexpr int TG = T < 4 ? T : 4;        // tokens per pass
@@ -1625,7 +1653,10 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
                 }
                 const float sum = warp_sum16_ftz(v, lane);
                 const int m = r * 16 + (lane >> 1), e = m / TG, q = m - e * TG;
-                if ((lane & 1) == 0 && m < NV && e < ne && k0 + q < T) a.logits[(size_t) (k0 + q) * NE + e0 + e] = sum;
+                if ((lane & 1) == 0 && m < NV && e < ne && k0 + q < T) {
+                    a.logits[(size_t) (k0 + q) * NE + e0 + e] = sum;
+                    if (lg64 != nullptr) st_tagged(lg64 + (size_t) (k0 + q) * NE + e0 + e, sum, tag);
+                }
             }
         }
         __syncthreads();
@@ -1640,7 +1671,8 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
 // (when non-null).
 template <bool FIX = false>
 __device__ void hc_top10(const float* logits, int32_t* ids, float* weights, int lane, uint32_t* cand,
-                         unsigned long long* dbg, int b, const unsigned long long* fx = nullptr) {
+                         unsigned long long* dbg, int b, const unsigned long long* fx = nullptr,
+                         const unsigned long long* tg = nullptr, unsigned tag = 0) {
     float values[16];
     if constexpr (FIX) {
         long long q[16];
@@ -1651,6 +1683,13 @@ __device__ void hc_top10(const float* logits, int32_t* ids, float* weights, int 
             values[i] = (float) ((double) q[i] * 0x1p-32);
             if (logits != nullptr) const_cast<float*>(logits)[lane + i * 32] = values[i];
         }
+    } else if (tg != nullptr) {   // the logits as tagged data
+        unsigned long long w[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) w[i] = ld_tagged_raw(tg + lane + i * 32);
+        tagged_settle(w, tag, [&](int i) { return tg + lane + i * 32; });
+#pragma unroll
+        for (int i = 0; i < 16; ++i) values[i] = __uint_as_float((unsigned) w[i]);
     } else {
 #pragma unroll
         for (int i = 0; i < 16; ++i) values[i] = __ldcg(logits + lane + i * 32);
@@ -1744,8 +1783,9 @@ __device__ void hc_top10(const float* logits, int32_t* ids, float* weights, int 
 
 // One copy of the top-10's code for the hcx item and its dry runs, so the dry runs load the code the item runs.
 __device__ __noinline__ void hc_top10_item(const float* logits, int32_t* ids, float* weights, int lane, uint32_t* cand,
-                                           unsigned long long* dbg, int b) {
-    hc_top10(logits, ids, weights, lane, cand, dbg, b);
+                                           unsigned long long* dbg, int b, const unsigned long long* tg = nullptr,
+                                           unsigned tag = 0) {
+    hc_top10(logits, ids, weights, lane, cand, dbg, b, nullptr, tg, tag);
 }
 __device__ __noinline__ void hc_top10_item_fx(const unsigned long long* fx, float* logits, int32_t* ids, float* weights,
                                               int lane, uint32_t* cand, unsigned long long* dbg, int b) {
@@ -1845,11 +1885,13 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
     __shared__ float s_ssp[Q8 ? MAXT * WARPS : 1];   // cn: the sums of squares per (token, warp)
     __shared__ float s_rs;
     __shared__ int s_item, s_last;
+    __shared__ unsigned s_tag;
     const HcFusedArgs& a = L.a;
     const int b = blockIdx.x, tid = threadIdx.x, nb = L.nb;
     unsigned long long* dbg = L.dbg;
     HcSync* sy = &g_hc_sync[L.slot];
     const bool cn = Q8 && L.cn != 0;
+    const bool tgl = (L.pkg & 4) != 0 && a.w_router != nullptr;   // the logits as tagged data
     const Items<T> it(nb, L.nu, a.w_router != nullptr, L.hcx, cn);
     stamp(dbg, b, 0, tid);
     if (tid == 0) {
@@ -1858,15 +1900,18 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             for (int p = 0; p <= NSTAGE; ++p) mbar_init(&dbars[p], cn ? 1 : ROWS);
         mbar_init(&lbar, 1);
         s_item = (int) atomicAdd(&sy->q.v, 1u);
+        s_tag = *reinterpret_cast<const volatile unsigned*>(&sy->epoch.v) + 1u;   // the read's tag: its counter set's use count
     }
     __syncthreads();
     int item = s_item;
+    const unsigned tag = s_tag;
     // constant data before the previous kernel is waited on
     NormRegs nr;
     if (item < it.ntask) hc_norm_pre(a, item & 3, tid, nr);
     bool staged = false;   // the first down item's prologue ran before the wait
     bool cn_bars = false;  // cn: the staged item uses dbars
     bool warm = false;     // this CTA ran the top-10's code once
+    unsigned qpeek = 0;    // an up item: the queue's claim count seen while it runs
     if (cn && item >= it.down && item < it.up) {   // cn: the item's weights do not depend on the previous kernel
         if constexpr (Q8) cn_bars = cn_issue(a, item - it.down, tid, smem, dbars, L.cn & 2, L.tma, L.tm);
         staged = true;
@@ -1968,6 +2013,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             const unsigned lst_p = (unsigned) (T * CN_HS * CN_ROWS * 4), lst_s = (unsigned) (T * CN_HS * 4);
             const bool lst = Q8 && mma && cn && L.lo_stage && !dry && lst_off + (int) (lst_p + lst_s) <= SMEM;
             float* const lsm = reinterpret_cast<float*>(smem + lst_off);
+            if (tid == 0 && (L.pkg & 128)) qpeek = *reinterpret_cast<const volatile unsigned*>(&sy->q.v);
             if (tid == 0) {
                 hc_up_stream(a, sl, smem, bars, &sy->nload.v, (unsigned) it.ntask, &sy->down.v, up_ph, mma, !(Q8 && !mma),
                              sc8, cp || ut ? -1 : Q8 ? UP_PIECES : 0, (unsigned) it.nd, dbg, b, !L.no_fence);
@@ -2044,7 +2090,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             }
             if (a.xq != nullptr && a.w_router == nullptr && !up_q8_inline(a, sl.c0, sl.nc))
                 hc_up_q8<T>(a, sl.c0, sl.nc, tid, g_hc_q8cnt[L.slot]);
-            cta_signal(&sy->up.v, tid);
+            if (!((L.pkg & 2) && a.w_router == nullptr)) cta_signal(&sy->up.v, tid);   // nothing waits on it without a router
             stamp(dbg, b, 3, tid);
         } else if (item >= it.t10) {
             // the top-10 once every router row (hcx 2: up slice) has added its logits: warp k takes token k
@@ -2058,7 +2104,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                 __syncthreads();
             }
             if (L.hcx == 2) cta_wait(&sy->up.v, (unsigned) it.nu, tid, !L.no_fence);
-            else cta_wait(&sy->router.v, (unsigned) ND, tid, !L.no_fence);
+            else if (!tgl) cta_wait(&sy->router.v, (unsigned) ND, tid, !L.no_fence);
             stamp(dbg, b, 8, tid);
             const int k = tid >> 5;
             uint32_t* cand = reinterpret_cast<uint32_t*>(smem) + k * CAND_WORDS;
@@ -2067,7 +2113,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
                                  a.weights + (size_t) k * KT, tid & 31, cand, tid < 32 ? dbg : nullptr, b);
             else if (k < T)
                 hc_top10_item(a.logits + (size_t) k * NE, a.ids + (size_t) k * KT, a.weights + (size_t) k * KT, tid & 31,
-                              cand, tid < 32 ? dbg : nullptr, b);
+                              cand, tid < 32 ? dbg : nullptr, b, tgl ? L.lg64 + (size_t) k * NE : nullptr, tag);
             __syncthreads();
             stamp(dbg, b, 6, tid);
         } else {
@@ -2082,10 +2128,11 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             mbar_wait(&bars[UP_PIECES], rt_ph);
             rt_ph ^= 1u;
             stamp(dbg, b, 4, tid);
-            hc_router_rows<T>(a, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p));
+            hc_router_rows<T>(a, reinterpret_cast<const uint16_t*>(smem), e0, e1, tid, reinterpret_cast<float*>(rt_p),
+                              tgl ? L.lg64 : nullptr, tag);
             stamp(dbg, b, 5, tid);
             if (it.end > it.t10) {   // the top-10 item waits on the count
-                cta_signal(&sy->router.v, tid);
+                if (!tgl) cta_signal(&sy->router.v, tid);   // tagged logits: the top-10 item reads them as they land
                 if (tid == 0) s_last = 0;
                 if (a.xq != nullptr) {   // the item's share of mixed's q8_1 blocks, while the top-10 runs
                     const int nq = T * (N / 32), q0 = r * nq / ND, q1 = (r + 1) * nq / ND;
@@ -2117,7 +2164,8 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
         staged = false;
         up_staged = false;
         __syncthreads();
-        if (tid == 0) s_item = (int) atomicAdd(&sy->q.v, 1u);
+        // every item already claimed (an up item saw as many claims as items): the next claim could only return past the end
+        if (tid == 0) s_item = (L.pkg & 128) && item >= it.up && item < it.rt && qpeek >= (unsigned) it.end ? it.end : (int) atomicAdd(&sy->q.v, 1u);
         __syncthreads();
         item = s_item;
     }
@@ -2135,7 +2183,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
     if (tid == 0) {
         __threadfence();
         if (atomicAdd(&sy->exit.v, 1u) == (unsigned) nb - 1) {
-            sy->q.v = 0; sy->norm.v = 0; sy->down.v = 0; sy->up.v = 0; sy->router.v = 0; sy->nload.v = 0; sy->exit.v = 0;
+            sy->epoch.v += 1u; sy->q.v = 0; sy->norm.v = 0; sy->down.v = 0; sy->up.v = 0; sy->router.v = 0; sy->nload.v = 0; sy->exit.v = 0;
             __threadfence();
         }
     }
@@ -2187,6 +2235,7 @@ struct DevInfo {
     unsigned long long* t10 = nullptr;    // [NE] fixed logits (fixed point), [NE] the same as f32 (in NE / 2 words), then
                                           // [sms][2 * KT] float scratch
     unsigned long long* racc = nullptr;   // [NSLOT][MAXT][NE]
+    unsigned long long* lg = nullptr;     // [NSLOT][MAXT][NE] tagged router logits (zero: no tag)
     float* cn = nullptr;                  // [NSLOT][MAXT * CN_HS * CN_ROWS + MAXT * CN_HS]
 };
 constexpr size_t CN_SLOT = (size_t) CN_MAXCOPY * (CN_PART + CN_SSN);
@@ -2210,7 +2259,9 @@ const DevInfo& dev_info() {
                cudaMalloc((void**) &d.xc, (size_t) NCOPY * MAXT * D * sizeof(float)) == cudaSuccess &&
                cudaMalloc((void**) &d.t10, (size_t) NE * 12 + (size_t) sms * 2 * KT * 4) == cudaSuccess &&
                cudaMalloc((void**) &d.racc, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&
-               cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess;
+               cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess &&
+               cudaMalloc((void**) &d.lg, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&
+               cudaMemset(d.lg, 0, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess;
         if (d.ok) {   // distinct logits with a few ties, so the dry run takes the usual path
             std::vector<unsigned long long> v(NE);
             std::vector<float> f(NE);
@@ -2536,7 +2587,10 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.no_dry = L.cn;
     L.lo_stage = L.cn;
     static const int x_nf = (int) core::exp_flag("hc_nofence", 0);
-    L.no_fence = x_nf;
+    static const int x_pkg = (int) core::exp_flag("hc2_pkg", 0);
+    L.pkg = L.cn ? x_pkg : 0;
+    L.no_fence = x_nf || (L.pkg & 64);
+    L.lg64 = d.lg + (size_t) L.slot * MAXT * NE;
     if (L.cn) {
         bool up = false;
         const bool down = cn_maps(L.a, L.tm, up);
