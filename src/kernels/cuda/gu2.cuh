@@ -11,7 +11,13 @@
 // a sign byte's masks come from prmt's sign-replicating mode instead of the SIMD compare and subtract.
 #pragma once
 
+#ifndef GU2_EARLY
+#define GU2_EARLY 0
+#endif
+
 namespace gu2 {
+
+constexpr bool kGu2Early = GU2_EARLY != 0;
 
 __device__ __forceinline__ uint32_t ldw(const uint8_t* p) { return __ldg((const unsigned int*) p); }
 
@@ -69,10 +75,17 @@ template<int TY> struct Fmt2;
 template<> struct Fmt2<16> {   // IQ2_XXS: 66-byte blocks
     static constexpr int kGridWords = 512;
     using W = Split<16>::W;
-    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) {
+    struct R { uint32_t q, aux; uint32_t dw; };
+    __device__ static R raw(const uint8_t* row, int k) {
         const uint8_t* b = row + (k >> 3) * 66;
-        uint32_t q, aux;
-        int2_at(b + 2 + 8 * (k & 7), q, aux);
+        R t;
+        int2_at(b + 2 + 8 * (k & 7), t.q, t.aux);
+        t.dw = *(const unsigned short*) b;
+        return t;
+    }
+    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) { return decode(raw(row, k), grid); }
+    __device__ static W decode(const R& t, const uint32_t* grid) {
+        const uint32_t q = t.q, aux = t.aux;
         const char* gb = (const char*) grid;
         W r;
 #pragma unroll
@@ -84,7 +97,7 @@ template<> struct Fmt2<16> {   // IQ2_XXS: 66-byte blocks
             r.g[2 * p + 1] = neg(gp.y, m1);
         }
         r.ls = aux >> 27 | 1;
-        r.dw = __half2float(*(const __half*) b);
+        r.dw = __half2float(__ushort_as_half((unsigned short) t.dw));
         return r;
     }
     __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
@@ -97,14 +110,21 @@ template<> struct Fmt2<16> {   // IQ2_XXS: 66-byte blocks
 template<> struct Fmt2<17> {   // IQ2_XS: 74-byte blocks
     static constexpr int kGridWords = 1024;
     using W = Split<17>::W;
-    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) {
+    struct R { uint32_t q0, q1, sc, dw; };
+    __device__ static R raw(const uint8_t* row, int k) {
         const uint8_t* b = row + (k >> 3) * 74;
         const int j = k & 7;
-        uint32_t q0, q1;
-        int2_at(b + 2 + 8 * j, q0, q1);
+        R t;
+        int2_at(b + 2 + 8 * j, t.q0, t.q1);
+        t.sc = b[66 + j];
+        t.dw = *(const unsigned short*) b;
+        return t;
+    }
+    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) { return decode(raw(row, k), grid); }
+    __device__ static W decode(const R& t, const uint32_t* grid) {
+        const uint32_t q0 = t.q0, q1 = t.q1, sc = t.sc;
         const char* gb = (const char*) grid;
         W r;
-        const uint32_t sc = b[66 + j];
         r.ls0 = (int) (sc & 0x0Fu);
         r.ls1 = (int) (sc >> 4);
 #pragma unroll
@@ -116,7 +136,7 @@ template<> struct Fmt2<17> {   // IQ2_XS: 74-byte blocks
             r.g[2 * p + 0] = neg(gp.x, m0);
             r.g[2 * p + 1] = neg(gp.y, m1);
         }
-        r.dw = __half2float(*(const __half*) b);
+        r.dw = __half2float(__ushort_as_half((unsigned short) t.dw));
         return r;
     }
     __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
@@ -129,11 +149,21 @@ template<> struct Fmt2<17> {   // IQ2_XS: 74-byte blocks
 template<> struct Fmt2<22> {   // IQ2_S: 82-byte blocks (d, 32 grid bytes, 32 sign bytes, qh[8], scales[8])
     static constexpr int kGridWords = 2048;
     using W = Split<22>::W;
-    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) {
+    struct R { uint32_t qs, sg, qh, sc, dw; };
+    __device__ static R raw(const uint8_t* row, int k) {
         const uint8_t* b = row + (k >> 3) * 82;
         const int j = k & 7;
-        const uint32_t qs = int_at(b + 2 + 4 * j), sg = int_at(b + 34 + 4 * j);
-        const uint32_t qh = b[66 + j], sc = b[74 + j];
+        R t;
+        t.qs = int_at(b + 2 + 4 * j);
+        t.sg = int_at(b + 34 + 4 * j);
+        t.qh = b[66 + j];
+        t.sc = b[74 + j];
+        t.dw = *(const unsigned short*) b;
+        return t;
+    }
+    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) { return decode(raw(row, k), grid); }
+    __device__ static W decode(const R& t, const uint32_t* grid) {
+        const uint32_t qs = t.qs, sg = t.sg, qh = t.qh, sc = t.sc;
         const uint2* g64 = (const uint2*) grid;
         W r;
         r.ls0 = (int) (sc & 0x0Fu);
@@ -146,7 +176,7 @@ template<> struct Fmt2<22> {   // IQ2_S: 82-byte blocks (d, 32 grid bytes, 32 si
             r.g[2 * p + 0] = neg(gp.x, m0);
             r.g[2 * p + 1] = neg(gp.y, m1);
         }
-        r.dw = __half2float(*(const __half*) b);
+        r.dw = __half2float(__ushort_as_half((unsigned short) t.dw));
         return r;
     }
     __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
@@ -159,12 +189,19 @@ template<> struct Fmt2<22> {   // IQ2_S: 82-byte blocks (d, 32 grid bytes, 32 si
 template<> struct Fmt2<18> {   // IQ3_XXS: 98-byte blocks (d, 64 grid bytes, 8 words of signs and scale)
     static constexpr int kGridWords = 256;
     using W = Split<18>::W;
-    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) {
+    struct R { uint32_t q0, q1, aux, dw; };
+    __device__ static R raw(const uint8_t* row, int k) {
         const uint8_t* b = row + (k >> 3) * 98;
         const int j = k & 7;
-        uint32_t q0, q1;
-        int2_at(b + 2 + 8 * j, q0, q1);
-        const uint32_t aux = int_at(b + 66 + 4 * j);
+        R t;
+        int2_at(b + 2 + 8 * j, t.q0, t.q1);
+        t.aux = int_at(b + 66 + 4 * j);
+        t.dw = *(const unsigned short*) b;
+        return t;
+    }
+    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) { return decode(raw(row, k), grid); }
+    __device__ static W decode(const R& t, const uint32_t* grid) {
+        const uint32_t q0 = t.q0, q1 = t.q1, aux = t.aux;
         const char* gb = (const char*) grid;
         W r;
 #pragma unroll
@@ -178,7 +215,7 @@ template<> struct Fmt2<18> {   // IQ3_XXS: 98-byte blocks (d, 64 grid bytes, 8 w
             r.g[2 * p + 1] = neg(g1, m1);
         }
         r.ls = (int) (aux >> 28);
-        r.dw = __half2float(*(const __half*) b);
+        r.dw = __half2float(__ushort_as_half((unsigned short) t.dw));
         return r;
     }
     __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
@@ -192,12 +229,23 @@ template<> struct Fmt2<18> {   // IQ3_XXS: 98-byte blocks (d, 64 grid bytes, 8 w
 template<> struct Fmt2<21> {   // IQ3_S: 110-byte blocks (d, 64 grid bytes, qh[8], 32 sign bytes, scales[4])
     static constexpr int kGridWords = 512;
     using W = Split<21>::W;
-    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) {
+    struct R { uint32_t q0, q1, qh, sg, sc, dw; int j; };
+    __device__ static R raw(const uint8_t* row, int k) {
         const uint8_t* b = row + (k >> 3) * 110;
         const int j = k & 7;
-        uint32_t q0, q1;
-        int2_at(b + 2 + 8 * j, q0, q1);
-        const uint32_t qh = b[66 + j], sg = int_at(b + 74 + 4 * j), sc = b[106 + (j >> 1)];
+        R t;
+        int2_at(b + 2 + 8 * j, t.q0, t.q1);
+        t.qh = b[66 + j];
+        t.sg = int_at(b + 74 + 4 * j);
+        t.sc = b[106 + (j >> 1)];
+        t.dw = *(const unsigned short*) b;
+        t.j = j;
+        return t;
+    }
+    __device__ static W load(const uint8_t* row, int k, const uint32_t* grid) { return decode(raw(row, k), grid); }
+    __device__ static W decode(const R& t, const uint32_t* grid) {
+        const uint32_t q0 = t.q0, q1 = t.q1, qh = t.qh, sg = t.sg, sc = t.sc;
+        const int j = t.j;
         W r;
 #pragma unroll
         for (int p = 0; p < 4; ++p) {
@@ -210,7 +258,7 @@ template<> struct Fmt2<21> {   // IQ3_S: 110-byte blocks (d, 64 grid bytes, qh[8
             r.g[2 * p + 1] = neg(g1, m1);
         }
         r.ls = 1 + 2 * (int) ((sc >> 4 * (j & 1)) & 0x0Fu);
-        r.dw = __half2float(*(const __half*) b);
+        r.dw = __half2float(__ushort_as_half((unsigned short) t.dw));
         return r;
     }
     __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
@@ -223,7 +271,10 @@ template<> struct Fmt2<21> {   // IQ3_S: 110-byte blocks (d, 64 grid bytes, qh[8
 template<> struct Fmt2<42> {   // Q2_0: 18-byte blocks of 64 values, two calls a block; Split<42>'s words
     static constexpr int kGridWords = 4;   // no grid
     using W = Split<42>::W;
-    __device__ static W load(const uint8_t* row, int k, const uint32_t*) { return Split<42>::load(row, k >> 1, k & 1); }
+    using R = W;
+    __device__ static R raw(const uint8_t* row, int k) { return Split<42>::load(row, k >> 1, k & 1); }
+    __device__ static W decode(const R& t, const uint32_t*) { return t; }
+    __device__ static W load(const uint8_t* row, int k, const uint32_t*) { return raw(row, k); }
     __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
         int s = 0;
 #pragma unroll
@@ -251,7 +302,7 @@ __device__ __forceinline__ const uint32_t* stage_grid(uint32_t* s, int tid) {
 
 // rows r0, r0 + 1 (gate or up rows r of `dst`; row A at rowA, row B row_bytes after it) for the n <= NC entries
 // from e: entry e + c's activation is xq + ent_tok[e + c] * 80 (2560 values)
-template<int TY, int NC>
+template<int TY, int NC, bool EARLY>
 __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r, int e, int n,
                                       const int32_t* __restrict__ ent_tok, const block_q8_1* __restrict__ xq,
                                       float* __restrict__ dst, int n_ff, const uint32_t* grid, int lane) {
@@ -263,11 +314,25 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
     float sA[NC], sB[NC];
 #pragma unroll
     for (int c = 0; c < NC; ++c) sA[c] = sB[c] = 0.0f;
+    const int k2 = 64 + (lane & 15);
+    typename F::R ra[2], rb2[2], r2;
+    if constexpr (EARLY) {   // every raw weight load of the item is issued before the first decode
+#pragma unroll
+        for (int it = 0; it < 2; ++it) {
+            ra[it] = F::raw(rowA, lane + 32 * it);
+            rb2[it] = F::raw(rowB, lane + 32 * it);
+        }
+        r2 = F::raw(lane < 16 ? rowA : rowB, k2);
+    }
 #pragma unroll
     for (int it = 0; it < 2; ++it) {
         const int k = lane + 32 * it;
-        const typename F::W wa = F::load(rowA, k, grid);
-        const typename F::W wb = F::load(rowB, k, grid);
+        if constexpr (!EARLY) {
+            ra[it] = F::raw(rowA, k);
+            rb2[it] = F::raw(rowB, k);
+        }
+        const typename F::W wa = F::decode(ra[it], grid);
+        const typename F::W wb = F::decode(rb2[it], grid);
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             if (c < n) {
@@ -279,8 +344,8 @@ __device__ __forceinline__ void rows2(const uint8_t* rowA, int row_bytes, int r,
             }
         }
     }
-    const int k2 = 64 + (lane & 15);
-    const typename F::W w2 = F::load(lane < 16 ? rowA : rowB, k2, grid);
+    if constexpr (!EARLY) r2 = F::raw(lane < 16 ? rowA : rowB, k2);
+    const typename F::W w2 = F::decode(r2, grid);
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
         if (c < n) {
@@ -312,17 +377,17 @@ __device__ __forceinline__ void pair(const uint8_t* blob, int row, int e0, int e
     for (int e = e0; e < e1;) {
         const int n = e1 - e;
         if (n == 1) {
-            rows2<TY, 1>(wr, rb, r, e, 1, ent_tok, xq, dst, n_ff, grid, lane);
+            rows2<TY, 1, kGu2Early>(wr, rb, r, e, 1, ent_tok, xq, dst, n_ff, grid, lane);
             e += 1;
         } else if (n == 2) {
-            rows2<TY, 2>(wr, rb, r, e, 2, ent_tok, xq, dst, n_ff, grid, lane);
+            rows2<TY, 2, kGu2Early>(wr, rb, r, e, 2, ent_tok, xq, dst, n_ff, grid, lane);
             e += 2;
         } else if (n == 3) {
-            rows2<TY, 3>(wr, rb, r, e, 3, ent_tok, xq, dst, n_ff, grid, lane);
+            rows2<TY, 3, kGu2Early>(wr, rb, r, e, 3, ent_tok, xq, dst, n_ff, grid, lane);
             e += 3;
         } else {
             const int m = min(n, 6);
-            rows2<TY, 6>(wr, rb, r, e, m, ent_tok, xq, dst, n_ff, grid, lane);
+            rows2<TY, 6, kGu2Early>(wr, rb, r, e, m, ent_tok, xq, dst, n_ff, grid, lane);
             e += m;
         }
     }
