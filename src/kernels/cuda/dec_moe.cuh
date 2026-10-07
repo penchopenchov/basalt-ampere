@@ -388,12 +388,14 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
     if (stats != nullptr) {
         stats[1] = dm_clock();
         dm_poll_tiers(plan, peer_done, host_flag, ring, stats);
+        pdl_wait();
         dm_stat_record(stats, plan, layer);
         return;
     }
     if (plan->counts[2] > 0) while (*peer_done < ring) spin_pause();
     if (plan->counts[3] > 0) while (*host_flag < ring) spin_pause();
     __threadfence_system();
+    pdl_wait();   // started during the down kernel: its rows are complete once this returns
 }
 
 // ---------------------------------------------------------------- DEC_GLUE & 1: the route inside gate/up
@@ -1585,7 +1587,8 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
 
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
                   uint32_t ring, void* stream, unsigned long long* stats, int layer, bool trigger) {
-    dm_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(plan, peer_done_m, host_flag_m, ring, stats, layer, trigger ? 1 : 0);
+    launch_pdl(dm_wait_kernel, dim3(1), dim3(1), 0, (cudaStream_t) stream, plan, peer_done_m, host_flag_m, ring, stats, layer,
+               trigger ? 1 : 0);
     check("dec_moe_wait");
 }
 

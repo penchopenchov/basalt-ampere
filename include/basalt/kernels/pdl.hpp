@@ -23,6 +23,13 @@ inline constexpr bool pdl2_requested() { return true; }
 /// trigger.
 inline constexpr int pdl2_mask() { return 64; }
 
+/// Boundary-level PDL parts under test (host side, set once at setup from `--exp ps_pdl`): 1 attention merge trigger,
+/// 2 attention chunk/merge as dependents, 4 block top-k as dependent, 8 query post trigger + block scores as dependent.
+inline int& pdls_bits() {
+    static int v = 0;
+    return v;
+}
+
 struct PdlState {
     bool on = false;
     int plain = 0;   // launches still to go the plain way
@@ -110,6 +117,23 @@ inline bool pdl_kernel_ok(const void* func) {
     return ok;
 }
 #endif
+
+/// For a launch made by hand (cudaLaunchKernelEx): true when the scope asks for the programmatic attribute here
+/// (consumes the scope's plain count as launch_pdl does).
+inline bool pdl_launch_wanted() {
+#if defined(PDL_LAUNCH)
+    PdlState& ps = pdl_state();
+    if (!ps.on) return false;
+    if (ps.plain > 0) {
+        --ps.plain;
+        return false;
+    }
+    ++pdl_count();
+    return true;
+#else
+    return false;
+#endif
+}
 
 /// `kernel<<<grid, block, smem, stream>>>(args...)`, or the same launch with programmatic stream serialization
 /// inside a PdlScope (see above).  The kernel must call pdl_wait() first.

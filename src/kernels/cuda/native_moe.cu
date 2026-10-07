@@ -129,7 +129,7 @@ template<int KM, bool DEP>
 __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                    const DmPlan* __restrict__ plan, const float* __restrict__ weights,
                                    const float* __restrict__ shared, const float* __restrict__ shared_gate,
-                                   float* __restrict__ output, int64_t n_embd, int k, int early) {
+                                   float* __restrict__ output, int64_t n_embd, int k, int early, int late) {
     __shared__ int s_kind[16];
     // early: the next kernel (the hc read) may start its blocks and stage weights while this one waits
     if (DEP && early) pdl_launch_dependents();
@@ -145,7 +145,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
         w[j] = weights[j];
-        if (s_kind[j] == 0) {
+        if (s_kind[j] == 0 && !late) {   // late: the wait kernel may start before the down kernel ends
             const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
             v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
         }
@@ -161,6 +161,10 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
         if (j >= k) break;
         const int kd = s_kind[j];
         if (kd != 0) v[j] = __ldcv(reinterpret_cast<const float4*>((kd == 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col));
+        else if (late) {
+            const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
+            v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
+        }
     }
     float sx = v[0].x * w[0], sy = v[0].y * w[0], sz = v[0].z * w[0], sw = v[0].w * w[0];
 #pragma unroll
@@ -195,12 +199,13 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         cfg.numAttrs = dep ? 1 : 0;
         const int ki = int(k);
         static const int x_early = (int) basalt::core::exp_flag("hc3_early", 1) & 1;
+        const int x_late = (basalt::kernels::pdls_bits() & 16) ? 1 : 0;
         if (dep)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki, x_early);
+                                      shared, shared_gate, output, n_embd, ki, x_early, x_late);
         else
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, shared_gate, output, n_embd, ki, x_early);
+                                      shared, shared_gate, output, n_embd, ki, x_early, x_late);
         const auto error = cudaGetLastError();
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
         return;

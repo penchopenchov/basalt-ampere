@@ -1744,6 +1744,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
             asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
         if constexpr (FUSE) dm_wait_hq(ng, blockIdx.y, gridDim.y, gridDim.x);
         else pdl_wait();
+        pdl_launch_dependents();   // the tail wait may start polling the tiers once every block is past its wait
     }
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);

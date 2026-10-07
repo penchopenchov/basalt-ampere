@@ -3,6 +3,7 @@
 // Built with --use_fast_math like native_qsa.cu, native_rope.cu and native_qsa_indexer.cu, whose expressions this
 // repeats; the INT8 append (kv_q8.cu, built without it) uses explicit IEEE instructions.
 #include "basalt/kernels/qsa_dec_fused.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/mrope.hpp"
@@ -199,6 +200,7 @@ __device__ __forceinline__ void q_post_dev(const QsaDecQPost& a, int n, int n_he
     __shared__ float row[HD];
     __shared__ float sums[32];
     const int d = threadIdx.x;
+    pdl_launch_dependents();
     if (b < n * n_head) {
         const float x = a.q_full[(size_t) b * 2 * HD + d];
         const float scale = norm_scale256(x, d, HD, a.eps, sums);

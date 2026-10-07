@@ -181,6 +181,8 @@ __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
                                                    const float* __restrict__ up,
                                                    Q81Block* __restrict__ y, int n_in) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
     const float gi = gate[i];
@@ -1093,7 +1095,7 @@ template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const int early = pdl2_mask() & 12;
+    const int early = (pdl2_mask() | ((pdls_bits() & 32) ? 12 : 0)) & 12;
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
@@ -1505,9 +1507,8 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
     validate_stream(stream);
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
-    native_swiglu_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
-                                         static_cast<cudaStream_t>(stream)>>>(
-        gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
+    launch_pdl(native_swiglu_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0, static_cast<cudaStream_t>(stream),
+               gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
 }
 

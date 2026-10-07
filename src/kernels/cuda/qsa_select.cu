@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "basalt/kernels/qsa_select.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
 
@@ -551,6 +552,8 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
                                                                               int skip_identity) {
     __shared__ __align__(16) float qs[MQ * IDX_HEADS * IDX_DIM];
     __shared__ int64_t s_nkv[MQ], s_nbid[MQ];
+    pdl_launch_dependents();
+    pdl_wait();
     if (skip_identity) {   // every selection the identity: the top-k reads no score
         bool all = true;
         for (int q = 0; q < nq; ++q) all = all && steps[q * kStepCount + kStepNKv] <= steps[q * kStepCount + kStepWidth];
@@ -684,6 +687,8 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
     const unsigned rank = cl_rank();
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     cl_arrive_relaxed();                                // phase 0: this CTA runs
+    pdl_launch_dependents();
+    pdl_wait();
     const int64_t qi = blockIdx.y;
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
@@ -823,9 +828,8 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
     if (nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
-        block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
-                                                                                     max_blocks, scores,
-                                                                                     skip_identity ? 1 : 0);
+        launch_pdl(block_scores_multi_kernel, dim3(256), dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, pooled, dead,
+                   q_idx, steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
@@ -936,7 +940,7 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
         opt[dev] = smem;
     }
     cudaLaunchConfig_t cfg{};
-    cudaLaunchAttribute at[1];
+    cudaLaunchAttribute at[2];
     at[0].id = cudaLaunchAttributeClusterDimension;
     at[0].val.clusterDim.x = CL_N;
     at[0].val.clusterDim.y = 1;
@@ -947,6 +951,11 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
     cfg.stream = (cudaStream_t) stream;
     cfg.attrs = at;
     cfg.numAttrs = 1;
+    if (pdl_launch_wanted()) {   // a dependent of the scores kernel
+        at[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        at[1].val.programmaticStreamSerializationAllowed = 1;
+        cfg.numAttrs = 2;
+    }
     const cudaError_t e = cudaLaunchKernelEx(&cfg, block_topk_cluster_kernel, scores, steps, max_blocks, cap, ids);
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk cluster: %s\n", cudaGetErrorString(e)); std::exit(1); }
     return true;

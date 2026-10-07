@@ -26,6 +26,7 @@
 #include "basalt/kernels/s2_gemv_q8.hpp"
 #include "basalt/kernels/s_gemv.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -161,6 +162,8 @@ __global__ void scale_rows_kernel(float* __restrict__ out, const float* __restri
 }
 
 __global__ void sigmoid_scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
+    pdl_launch_dependents();
+    pdl_wait();
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -197,8 +200,8 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         // the gate and its scale are the caller's
     } else if (native_bf16 && n_tok > 1) {   // one gemv for all rows (outputs identical), fused sigmoid+scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
-        sigmoid_scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok), THREADS, 0, cs>>>(
-            out, g, (int) n_embd);
+        launch_pdl(sigmoid_scale_rows_kernel, dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok),
+                   dim3(THREADS), 0, cs, out, g, (int) n_embd);
     } else if (native_bf16 && n_tok == 1) {
         bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, stream);
         sigmoid_scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), 1u), THREADS, 0, cs>>>(
