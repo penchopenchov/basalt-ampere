@@ -474,7 +474,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
         if (!draft_vocab_.empty() && draft_vocab_.exists()) {
             const long size = (long) draft_vocab_.size();
             if (size >= 4 && size % 4 == 0) {
-                const int64_t cx = (int64_t) exp_flag("dvocab_ctx", 0);
+                const int64_t cx = (int64_t) exp_flag("dvocab_ctx", 512);
                 const uint64_t xr = cx == 1 ? 2048 : (uint64_t) std::max<int64_t>(0, cx);
                 bytes += (uint64_t) (size / 4 + xr) * head_row_bytes + (uint64_t) size + xr * 8;
             }
@@ -584,7 +584,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             for (int64_t i = 1; i < n_raw; ++i)
                 if (ids[i] < ids[i - 1]) { n_base = i; break; }
             // context rows follow the base rows (gate dvocab_ctx: the value is the row count, 1 = 2048)
-            const int64_t cx = exp_flag("dvocab_ctx", 0);
+            const int64_t cx = exp_flag("dvocab_ctx", 512);
             if (cx != 0 && !coupled_draft_env() && head->type() == 13 && n_raw > 0) n_xcap_ = cx == 1 ? 2048 : cx;
             xbase_ = n_base;
             std::vector<int32_t> map((size_t) (n_raw + n_xcap_));
