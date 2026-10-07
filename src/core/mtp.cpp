@@ -1237,10 +1237,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     } else if (max_steps > 0) {
         decode_gaps().mark(6);
         const cudaGraphExec_t first = cond ? cond_exec_[tier_][cp ? 1 : 0][T] : (cp ? round_exec_c_[T] : round_exec_[tier_][T]);
+        decode_events().record(DecodeEvents::kDraftPre, cs_);
         if (cudaGraphLaunch(first, cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
+        decode_events().record(DecodeEvents::kDraftPost, cs_);
         (void) cudaStreamQuery(cs_);
         decode_gaps().mark(7);
         run_launch_hook();

@@ -1385,10 +1385,16 @@ int main(int argc, char** argv) {
         else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = next("--draft-log");
         else if (a == "--exp") {
-            const std::string kv = next("--exp");
-            const size_t eq = kv.find('=');
-            if (eq == std::string::npos || eq == 0) { std::fprintf(stderr, "basalt generate: --exp needs NAME=VALUE\n"); return 2; }
-            basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
+            const std::string list = next("--exp");   // NAME=VALUE[,NAME=VALUE...]
+            for (size_t at = 0; at < list.size();) {
+                size_t end = list.find(',', at);
+                if (end == std::string::npos) end = list.size();
+                const std::string kv = list.substr(at, end - at);
+                at = end + 1;
+                const size_t eq = kv.find('=');
+                if (eq == std::string::npos || eq == 0) { std::fprintf(stderr, "basalt generate: --exp needs NAME=VALUE\n"); return 2; }
+                basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
+            }
         }
         else if (a == "--ppl-base") ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") ppl_out = next("--ppl-out");
@@ -4946,8 +4952,15 @@ int main(int argc, char** argv) {
                 cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
         };
+        // host_late: the peer's swaps land a window after their copies are queued, so no window waits for a copy
+        const bool peer_late = basalt::core::exp_flag("host_late", 0) != 0;
+        bool peer_landing = false;
         auto apply_pending = [&](bool wait, bool exchanges = true) {
-            if (peer.valid()) peer.apply_pending(wait);
+            if (peer.valid()) {
+                if (!peer_late || !wait) peer.apply_pending(wait);
+                else if (peer_landing) { peer.apply_pending(true); peer_landing = false; }
+                else if (peer.has_pending()) { peer.issue_pending(true); peer_landing = true; }
+            }
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
@@ -5093,6 +5106,8 @@ int main(int argc, char** argv) {
         struct XSwap { int32_t layer, in, out, slot; uint64_t off; bool xchg, promo, p2p; };
         const bool peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
         std::vector<XSwap> xq;
+        const bool xq_pre = basalt::core::exp_flag("host_pre", 0) != 0;
+        const bool xq_post = xq_pre && basalt::core::exp_flag("host_post", 0) != 0;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
         auto xq_round = [&]() -> bool {
             const auto at0 = Clock::now();
@@ -5163,6 +5178,7 @@ int main(int argc, char** argv) {
         auto xq_advance = [&]() -> bool {
             if (xq_stage == 0) return true;
             const auto& lay = basalt::kernels::cpu::expert_layout();
+            if (xq_stage == 2) ver.flush_post_launch();
             cudaEventSynchronize(adapt_ev);
             if (xq_stage == 1) {
                 for (const XSwap& x : xq) {
@@ -5173,6 +5189,13 @@ int main(int argc, char** argv) {
                     }
                     host_res[(size_t) x.layer * g.n_expert + x.out] = basalt::core::kNotResident;
                 }
+                if (xq_pre) {   // the residency uploads go ahead of the incoming copies in the copy queue
+                    std::string perr;
+                    if (!ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                    res_upload();
+                    ver.dm_fence(adapt_stream);
+                }
+                bool deferred = false;
                 for (const XSwap& x : xq) {   // stream order keeps each behind its slot's eviction copy
                     std::string perr;
                     if (x.p2p) {
@@ -5182,6 +5205,7 @@ int main(int argc, char** argv) {
                         }
                         continue;
                     }
+                    if (xq_post) { deferred = true; continue; }
                     const uint8_t* b = srcp->blob(x.layer, x.in);
                     if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer),
                                                         cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
@@ -5190,8 +5214,23 @@ int main(int argc, char** argv) {
                         return false;
                     }
                 }
-                cudaEventRecord(adapt_ev, adapt_stream);
-                res_upload();
+                if (deferred) {   // the RAM copies are queued once the next window is launched, and run beside it
+                    ver.set_post_launch([&] {
+                        const auto& lay2 = basalt::kernels::cpu::expert_layout();
+                        for (const XSwap& x : xq) {
+                            if (x.p2p) continue;
+                            const uint8_t* b = srcp->blob(x.layer, x.in);
+                            if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
+                                                                cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
+                                std::fprintf(stderr, "basalt serve: adaptive swap copy failed (layer %d, slot %d): %s\n",
+                                             (int) x.layer, (int) x.slot, cudaGetErrorString(cudaGetLastError()));
+                        }
+                        cudaEventRecord(adapt_ev, adapt_stream);
+                    });
+                } else {
+                    cudaEventRecord(adapt_ev, adapt_stream);
+                }
+                if (!xq_pre) res_upload();
                 xq_stage = 2;
                 return true;
             }
@@ -6724,11 +6763,15 @@ int main(int argc, char** argv) {
                 // peer lands one window later
                 if (apply_thr.joinable()) apply_thr.join();
                 if (copy_live && copy_done) {   // the RAM copies are done: their bookkeeping, between windows
+                    basalt::core::decode_events().tag(1u << 3);
                     src.commit_exchanges();
                     copy_live = false;
                 }
                 ++adapt_age;
-                if (!chain || (adapt_age >= 2 && !(applied_early && adapt_age == 2))) apply_pending(true);
+                if (!chain || (adapt_age >= 2 && !(applied_early && adapt_age == 2))) {
+                    if (!pending.empty()) basalt::core::decode_events().tag(1u << 1);
+                    apply_pending(true);
+                }
                 basalt::core::decode_gaps().mark(18);
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the fed-back
@@ -6741,6 +6784,7 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 basalt::core::decode_gaps().mark(19);
+                basalt::core::decode_events().stamp(3);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -6770,11 +6814,16 @@ int main(int argc, char** argv) {
                     if (adapt_fast) {   // a round, or the next step of the one in flight, beside the draft
                         if (!do_adapt && xq_stage == 0) return;
                         if (do_adapt) adapt_age = 0;
+                        basalt::core::decode_events().tag(1u << 0);
+                        basalt::core::decode_events().tag(1u << (6 + xq_stage));
                         adapt_thr = std::thread([&] {
                             const auto ta = Clock::now();
+                            basalt::core::decode_events().stamp(8);
                             adapt_ok = xq_stage != 0 ? xq_advance() : xq_round();
+                            basalt::core::decode_events().stamp(6);
                             std::string perr;
                             if (adapt_ok && !ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                            basalt::core::decode_events().stamp(7);
                             basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                         });
                         return;
@@ -6825,6 +6874,7 @@ int main(int argc, char** argv) {
                             const bool boundary = applied_early;
                             copy_live = true;
                             copy_done = false;
+                            basalt::core::decode_events().tag(1u << 2);
                             apply_thr = std::thread([&, boundary] {
                                 if (boundary) {
                                     apply_pending(true, false);
@@ -6856,6 +6906,7 @@ int main(int argc, char** argv) {
                         mtp.set_launch_hook(nullptr);
                     }
                     if (!after_ran) after_launch();
+                    basalt::core::decode_events().stamp(0);
                     {
                         const Clock::time_point tw3 = Clock::now();
                         auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -6869,6 +6920,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (adapt_thr.joinable()) adapt_thr.join();
+                    basalt::core::decode_events().stamp(1);
                     basalt::core::decode_gaps().mark(16);
                     if (!commit_ok) {
                         std::printf("ERR %s\n", cerr.c_str());
@@ -6890,6 +6942,7 @@ int main(int argc, char** argv) {
                     if (stop_req.load()) { finish = "cancel"; break; }
                     x = outv[(size_t) a];
                     p += a + 1;
+                    basalt::core::decode_events().stamp(2);
                     continue;
                 }
                 spawn_adapt();
@@ -6980,6 +7033,8 @@ int main(int argc, char** argv) {
                              drive.d.peer == nullptr ? "" : (", peer GPU " + fmt2((d1.peer - ds0.peer) / (w * L)) +
                                                              " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
                                                              " ms/window for it)").c_str());
+                const std::string evr = basalt::core::decode_events().report();
+                if (!evr.empty()) std::fprintf(stderr, "%s\n", evr.c_str());
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "basalt decode GPU stages (ms/window):%s\n", pr.c_str());
             }

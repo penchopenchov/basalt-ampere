@@ -387,29 +387,32 @@ bool PeerExperts::copy_to(int64_t layer, int64_t expert, uint8_t* dst, cudaStrea
                                   stream), "copy to the primary", err);
 }
 
-void PeerExperts::apply_pending(bool wait) {
-    if (!evicting_.empty()) {
-        On on(device_);
-        if (wait) cudaEventSynchronize(evict_ev_);
-        else if (cudaEventQuery(evict_ev_) != cudaSuccess) return;
-        // the victims are in RAM now: they are computed from there while their slots take the incoming experts
-        const auto& lay = basalt::kernels::cpu::expert_layout();
-        for (const Evict& x : evicting_) {
-            const uint8_t* b = src_->blob(x.layer, x.in);
-            if (!fsrc_->spare_land(x.layer, x.out, x.off) || b == nullptr ||
-                cudaMemcpyAsync(cache_.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer), cudaMemcpyHostToDevice,
-                                refill_) != cudaSuccess) {
-                std::fprintf(stderr, "peer experts: an exclusive swap failed (layer %d, expert %d)\n", (int) x.layer,
-                             (int) x.in);
-                continue;
-            }
-            res_[(size_t) (x.layer * n_expert_ + x.out)] = kNotResident;
-            pending_.emplace_back((int32_t) (x.layer * n_expert_ + x.in), x.slot);
-            ++swaps_;
+bool PeerExperts::issue_pending(bool wait) {
+    if (evicting_.empty()) return true;
+    On on(device_);
+    if (wait) cudaEventSynchronize(evict_ev_);
+    else if (cudaEventQuery(evict_ev_) != cudaSuccess) return false;
+    // the victims are in RAM now: they are computed from there while their slots take the incoming experts
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    for (const Evict& x : evicting_) {
+        const uint8_t* b = src_->blob(x.layer, x.in);
+        if (!fsrc_->spare_land(x.layer, x.out, x.off) || b == nullptr ||
+            cudaMemcpyAsync(cache_.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer), cudaMemcpyHostToDevice,
+                            refill_) != cudaSuccess) {
+            std::fprintf(stderr, "peer experts: an exclusive swap failed (layer %d, expert %d)\n", (int) x.layer,
+                         (int) x.in);
+            continue;
         }
-        evicting_.clear();
-        if (!pending_.empty() && cudaEventRecord(refill_ev_, refill_) != cudaSuccess) return;
+        res_[(size_t) (x.layer * n_expert_ + x.out)] = kNotResident;
+        pending_.emplace_back((int32_t) (x.layer * n_expert_ + x.in), x.slot);
+        ++swaps_;
     }
+    evicting_.clear();
+    return pending_.empty() || cudaEventRecord(refill_ev_, refill_) == cudaSuccess;
+}
+
+void PeerExperts::apply_pending(bool wait) {
+    if (!issue_pending(wait)) return;
     if (pending_.empty()) return;
     {
         On on(device_);

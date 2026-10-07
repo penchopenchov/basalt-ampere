@@ -31,6 +31,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -76,6 +77,31 @@ struct DecodeGaps {
     }
 };
 DecodeGaps& decode_gaps();
+
+/// --exp host_ev=1: stream events at the decode loop's graph launches (verify, commit, draft), resolved into GPU-side
+/// spans and idle gaps per window at the end of a request.
+struct DecodeEvents {
+    enum Kind { kVerifyPre, kVerifyPost, kCommitPre, kCommitPost, kDraftPre, kDraftPost, kRunEntry, kKinds };
+    bool on = false;
+    std::vector<cudaEvent_t> ev;     // [window * kKinds + kind]
+    std::vector<char> set;
+    size_t window = 0;
+    cudaEvent_t cal = nullptr;       // clock alignment: the host time of GPU time zero (ms)
+    double cal_host = 0;
+    std::vector<unsigned> tags;      // per window: what the host did around it (bit per kind of work)
+    void tag(unsigned bits) { if (on && window < tags.size()) tags[window] |= bits; }
+    std::vector<std::array<double, 10>> hs;   // per window: host times (ms) of the loop's stations
+    void stamp(int i) {
+        if (!on || window >= hs.size()) return;
+        hs[window][(size_t) i] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void enable(size_t max_windows);
+    void next_window() { if (on) ++window; }
+    void record(Kind k, cudaStream_t s, size_t ahead = 0);
+    /// per-window medians and means (ms) of the spans and gaps; clears the trace
+    std::string report();
+};
+DecodeEvents& decode_events();
 
 class Verifier {
 public:
@@ -162,6 +188,13 @@ public:
     static bool chain_on();
     /// the residency tables uploaded now (between windows) rather than at the next run()
     bool dm_presync(std::string& err) { return dm_ == nullptr || dm_sync(err); }
+    /// Work queued on `s` after this call starts only once the window stream has run everything queued on it so far (the
+    /// residency uploads of dm_presync), so a large copy on `s` cannot hold the small uploads back in the copy queue.
+    bool dm_fence(cudaStream_t s);
+    /// `f` runs on the calling thread of the next `run`, right after the window's graph is launched.
+    void set_post_launch(std::function<void()> f) { post_launch_ = std::move(f); }
+    /// runs it now if no window has since (a request ending)
+    void flush_post_launch() { if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); } }
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -348,6 +381,8 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    std::function<void()> post_launch_;
+    cudaEvent_t fence_ev_ = nullptr;      // dm_fence
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)

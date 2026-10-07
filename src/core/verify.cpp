@@ -99,6 +99,12 @@ struct DecMoe {
     int pblocks = 0;
     bool pq2 = false;   // a layer's gate/up is Q2_0: the peer kernel's Q2_0 build
     bool peer_live = false;                  ///< a peer window was launched and not yet waited for
+    // pinned staging of the residency uploads (gate host_pin): the copies take their source from here, so the call does
+    // not wait for the stream; a ring of slots, each reused only after the window's stream sync
+    uint8_t* pin = nullptr;
+    size_t pin_stride = 0;
+    int pin_i = 0;
+    static constexpr int kPinSlots = 8;
 };
 
 namespace {
@@ -343,6 +349,13 @@ bool Verifier::dm_init(std::string& err) {
     if (!ok) { err = "verify: device-planned MoE buffers"; return false; }
     d->shadow0.assign((size_t) LE, INT32_MIN);
     d->shadow1.assign((size_t) LE, -1);
+    if (exp_flag("host_pin", 0) != 0) {   // [res0 | ptab0 | res1 | ptab1] per slot
+        d->pin_stride = (size_t) LE * 24;
+        if (cudaHostAlloc((void**) &d->pin, d->pin_stride * DecMoe::kPinSlots, cudaHostAllocPortable) != cudaSuccess) {
+            cudaGetLastError();
+            d->pin = nullptr;
+        }
+    }
     if (peer_ != nullptr && peer_->valid()) {
         const OnDevice on(peer_->device());
         d->pdev = peer_->device();
@@ -386,39 +399,71 @@ bool Verifier::dm_sync(std::string& err) {
         return a < b;
     };
     size_t a = 0, b = 0;
-    if (span(hits_.h_res, d->shadow0, a, b) &&
-        cudaMemcpyAsync(d->res0 + a, d->shadow0.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
-        err = "verify: device-planned MoE residency upload";
-        return false;
+    uint8_t* pin = nullptr;
+    if (d->pin != nullptr) {
+        pin = d->pin + (size_t) d->pin_i * d->pin_stride;
+        d->pin_i = (d->pin_i + 1) % DecMoe::kPinSlots;
+    }
+    int32_t* const pin_res0 = (int32_t*) pin;
+    unsigned long long* const pin_ptab0 = (unsigned long long*) (pin + (pin ? (size_t) LE * 4 : 0));
+    int32_t* const pin_res1 = (int32_t*) (pin + (pin ? (size_t) LE * 12 : 0));
+    unsigned long long* const pin_ptab1 = (unsigned long long*) (pin + (pin ? (size_t) LE * 16 : 0));
+    const bool up0 = span(hits_.h_res, d->shadow0, a, b);
+    if (up0) {
+        decode_events().tag(1u << 4);
+        const int32_t* src = d->shadow0.data() + a;
+        if (pin) { std::memcpy(pin_res0 + a, src, (b - a) * 4); src = pin_res0 + a; }
+        if (cudaMemcpyAsync(d->res0 + a, src, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+            err = "verify: device-planned MoE residency upload";
+            return false;
+        }
     }
     if (d->ptab0 != nullptr && a < b) {   // the same span as blob addresses (a < b only after an upload above)
-        std::vector<unsigned long long> p(b - a);
+        std::vector<unsigned long long> pv;
+        unsigned long long* p = pin_ptab0 + a;
+        if (!pin) { pv.resize(b - a); p = pv.data(); }
         for (size_t i = a; i < b; ++i) {
             const int32_t slot = d->shadow0[i];
             p[i - a] = slot >= 0 ? (unsigned long long) (hits_.cache_base + (hits_.slot_off ? (size_t) hits_.slot_off[slot]
                                                                                              : (size_t) slot * hits_.blob))
                                  : 0ull;
         }
-        if (cudaMemcpyAsync(d->ptab0 + a, p.data(), p.size() * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        if (cudaMemcpyAsync(d->ptab0 + a, p, (b - a) * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "verify: glue table upload";
             return false;
         }
     }
     if (d->pdev >= 0 && span(peer_->residency().data(), d->shadow1, a, b)) {
-        if (cudaMemcpyAsync(d->res1 + a, d->shadow1.data() + a, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        decode_events().tag(1u << 5);
+        const int32_t* src = d->shadow1.data() + a;
+        if (pin) { std::memcpy(pin_res1 + a, src, (b - a) * 4); src = pin_res1 + a; }
+        if (cudaMemcpyAsync(d->res1 + a, src, (b - a) * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "verify: device-planned MoE peer residency upload";
             return false;
         }
-        std::vector<unsigned long long> p(b - a);
+        std::vector<unsigned long long> pv;
+        unsigned long long* p = pin_ptab1 + a;
+        if (!pin) { pv.resize(b - a); p = pv.data(); }
         for (size_t i = a; i < b; ++i)
             p[i - a] = d->shadow1[i] >= 0 ? (unsigned long long) peer_->slot_address(d->shadow1[i]) : 0ull;
         const OnDevice on(d->pdev);
-        if (cudaMemcpyAsync(d->ptab + a, p.data(), p.size() * 8, cudaMemcpyHostToDevice, d->ps) != cudaSuccess) {
+        if (cudaMemcpyAsync(d->ptab + a, p, (b - a) * 8, cudaMemcpyHostToDevice, d->ps) != cudaSuccess) {
             err = "verify: device-planned MoE peer table upload";
             return false;
         }
     }
     return true;
+}
+
+bool Verifier::dm_fence(cudaStream_t s) {
+    if (dm_ == nullptr) return true;
+    const OnDevice on_device(device_);
+    if (fence_ev_ == nullptr && cudaEventCreateWithFlags(&fence_ev_, cudaEventDisableTiming) != cudaSuccess) {
+        cudaGetLastError();
+        fence_ev_ = nullptr;
+        return false;
+    }
+    return cudaEventRecord(fence_ev_, cs_) == cudaSuccess && cudaStreamWaitEvent(s, fence_ev_, 0) == cudaSuccess;
 }
 
 void Verifier::dm_free() {
@@ -434,6 +479,7 @@ void Verifier::dm_free() {
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0})
         if (p) cudaFree(p);
+    if (d->pin) cudaFreeHost(d->pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
         if (h) cudaFreeHost(h);
     delete d;
@@ -726,6 +772,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     cudaMemset(arena_, 0, count.used);
     prof_on_ = diagnostics().profile;
     if (prof_on_) decode_gaps().host_on = true;
+    if (next_ == nullptr && exp_flag("host_ev", 0) != 0) decode_events().enable(4000);
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 8;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
@@ -2030,6 +2077,175 @@ DecodeGaps& decode_gaps() {
     return g;
 }
 
+DecodeEvents& decode_events() {
+    static DecodeEvents e;
+    return e;
+}
+
+void DecodeEvents::enable(size_t max_windows) {
+    if (on) return;
+    ev.assign((max_windows + 2) * kKinds, nullptr);
+    set.assign(ev.size(), 0);
+    tags.assign(max_windows + 2, 0);
+    hs.assign(max_windows + 2, std::array<double, 10>{});
+    for (auto& e : ev)
+        if (cudaEventCreate(&e) != cudaSuccess) { cudaGetLastError(); e = nullptr; }
+    on = true;
+    // align the host clock to the event clock: poll an event's completion tightly, keep the smallest offset
+    auto host_ms = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    cudaEventCreate(&cal);
+    cudaEventRecord(cal, nullptr);
+    cudaEventSynchronize(cal);
+    cal_host = 1e30;
+    cudaEvent_t e;
+    cudaEventCreate(&e);
+    for (int i = 0; i < 200; ++i) {
+        cudaEventRecord(e, nullptr);
+        while (cudaEventQuery(e) == cudaErrorNotReady) {}
+        const double h = host_ms();
+        float t = 0;
+        cudaEventElapsedTime(&t, cal, e);
+        cal_host = std::min(cal_host, h - (double) t);
+    }
+    cudaEventDestroy(e);
+}
+
+void DecodeEvents::record(Kind k, cudaStream_t s, size_t ahead) {
+    if (!on) return;
+    const size_t i = (window + ahead) * kKinds + k;
+    if (i >= ev.size() || ev[i] == nullptr) return;
+    cudaEventRecord(ev[i], s);
+    set[i] = 1;
+}
+
+std::string DecodeEvents::report() {
+    if (!on) return {};
+    cudaDeviceSynchronize();
+    std::vector<double> v[8];
+    std::vector<std::pair<double, unsigned>> idle;
+    std::vector<size_t> idle_w;
+    auto at = [&](size_t w, int k) { return ev[w * kKinds + k]; };
+    auto ok = [&](size_t w, int k) { return w * kKinds + k < set.size() && set[w * kKinds + k]; };
+    auto el = [&](cudaEvent_t a, cudaEvent_t b) { float ms = 0; cudaEventElapsedTime(&ms, a, b); return (double) ms; };
+    for (size_t w = 1; w + 1 <= window; ++w) {
+        bool all = ok(w + 1, kVerifyPre) && ok(w + 1, kRunEntry);
+        for (int k = 0; k < kRunEntry; ++k) all = all && ok(w, k);
+        if (!all) continue;
+        v[0].push_back(el(at(w, kVerifyPre), at(w, kVerifyPost)));
+        v[1].push_back(el(at(w, kVerifyPost), at(w, kCommitPre)));
+        v[2].push_back(el(at(w, kCommitPre), at(w, kCommitPost)));
+        v[3].push_back(el(at(w, kVerifyPost), at(w, kDraftPre)));
+        v[4].push_back(el(at(w, kDraftPre), at(w, kDraftPost)));
+        const double c = el(at(w, kVerifyPre), at(w, kCommitPost)), d = el(at(w, kVerifyPre), at(w, kDraftPost));
+        v[5].push_back(el(at(w, kVerifyPre), at(w + 1, kVerifyPre)) - std::max(c, d));
+        idle.emplace_back(v[5].back(), tags[w]);
+        idle_w.push_back(w);
+        v[6].push_back(el(at(w, kVerifyPre), at(w + 1, kVerifyPre)));
+        v[7].push_back(el(at(w + 1, kRunEntry), at(w + 1, kVerifyPre)));
+    }
+    static const char* nm[8] = {"verify", "verify>commit", "commit", "verify>draft", "draft", "idle before next verify",
+                                "window", "run entry>launch"};
+    std::string out;
+    char b[400];
+    std::snprintf(b, sizeof b, "basalt decode events (GPU ms, %zu windows; median / mean):", v[0].size());
+    out = b;
+    for (int i = 0; i < 8; ++i) {
+        if (v[i].empty()) continue;
+        std::vector<double> x = v[i];
+        std::sort(x.begin(), x.end());
+        double sum = 0;
+        for (double y : x) sum += y;
+        std::snprintf(b, sizeof b, " %s %.3f/%.3f;", nm[i], x[x.size() / 2], sum / (double) x.size());
+        out += b;
+    }
+    // the idle gap's tail: the mean over the windows by tag, and how much of the total the gaps over 0.1 ms hold
+    double tot = 0, big = 0;
+    for (auto& g : idle) { tot += g.first; if (g.first > 0.1) big += g.first; }
+    std::snprintf(b, sizeof b, " | idle total %.3f ms/window, in gaps over 0.1 ms %.3f", idle.empty() ? 0.0 : tot / (double) idle.size(),
+                  idle.empty() ? 0.0 : big / (double) idle.size());
+    out += b;
+    std::vector<double> sorted;
+    for (auto& g : idle) sorted.push_back(g.first);
+    std::sort(sorted.begin(), sorted.end());
+    if (!sorted.empty()) {
+        std::snprintf(b, sizeof b, " p90 %.3f p99 %.3f max %.3f", sorted[sorted.size() * 9 / 10], sorted[sorted.size() * 99 / 100],
+                      sorted.back());
+        out += b;
+    }
+    for (unsigned m = 0; m < 12; ++m) {
+        double sum = 0;
+        long n = 0;
+        for (auto& g : idle) if (m == 0 ? g.second == 0 : (g.second & (1u << (m - 1)))) { sum += g.first; ++n; }
+        if (n == 0) continue;
+        std::snprintf(b, sizeof b, " | tag%u: n %ld mean idle %.3f", m, n, sum / (double) n);
+        out += b;
+    }
+    // the host's stations between a draft's return and the next launch: mean interval for gaps over 0.1 ms and the rest
+    for (int big_set = 1; big_set >= 0; --big_set) {
+        double sum[8] = {}, th[3] = {};
+        long n = 0, thn = 0;
+        for (size_t i = 0; i < idle.size(); ++i) {
+            if ((idle[i].first > 0.1) != (big_set == 1)) continue;
+            const auto& h = hs[idle_w[i]];
+            bool ok2 = true;
+            for (int k = 0; k < 6; ++k) ok2 = ok2 && h[(size_t) k] > 0;
+            if (!ok2) continue;
+            for (int k = 0; k < 5; ++k) sum[k] += h[(size_t) k + 1] - h[(size_t) k];
+            sum[5] += idle[i].first;
+            sum[6] += v[7][i];
+            if (h[8] > 0 && h[7] > 0 && h[6] > 0) { th[0] += h[8] - h[0]; th[1] += h[6] - h[8]; th[2] += h[7] - h[6]; ++thn; }
+            ++n;
+        }
+        if (n == 0) continue;
+        if (thn > 0) {
+            std::snprintf(b, sizeof b, " | adapt thread (windows with one, %s gaps): start after stamp0 %.3f, work %.3f, presync %.3f",
+                          big_set ? "big" : "small", th[0] / (double) thn, th[1] / (double) thn, th[2] / (double) thn);
+            out += b;
+        }
+        std::snprintf(b, sizeof b, " | host %s gaps (n %ld) ms: draft>adapt-join %.3f join>loop-end %.3f loop-end>top %.3f top>run-dm_sync %.3f dm_sync>launch %.3f (GPU idle %.3f, of it run-entry>launch %.3f)",
+                      big_set ? "big" : "small", n, sum[0] / (double) n, sum[1] / (double) n, sum[2] / (double) n,
+                      sum[3] / (double) n, sum[4] / (double) n, sum[5] / (double) n, sum[6] / (double) n);
+        out += b;
+    }
+    // the stamps on the GPU timeline: ms after the later of the commit's and the draft's end
+    for (int big_set = 1; big_set >= 0; --big_set) {
+        double sum[10] = {};
+        long n = 0;
+        for (size_t i = 0; i < idle.size(); ++i) {
+            if ((idle[i].first > 0.1) != (big_set == 1)) continue;
+            const size_t w = idle_w[i];
+            const auto& h = hs[w];
+            bool ok2 = true;
+            for (int k = 0; k < 6; ++k) ok2 = ok2 && h[(size_t) k] > 0;
+            if (!ok2) continue;
+            const double c = el(cal, at(w, kCommitPost)), d = el(cal, at(w, kDraftPost));
+            const double done = std::max(c, d) + cal_host;
+            for (int k = 0; k < 6; ++k) sum[k] += h[(size_t) k] - done;
+            sum[6] += el(cal, at(w + 1, kRunEntry)) + cal_host - done;
+            sum[7] += el(cal, at(w + 1, kVerifyPre)) + cal_host - done;
+            sum[8] += c - d;
+            ++n;
+        }
+        if (n == 0) continue;
+        std::snprintf(b, sizeof b, " | %s gaps, host stamps after the GPU's draft+commit end (ms):", big_set ? "big" : "small");
+        out += b;
+        static const char* sn[6] = {"draft returned", "adapt joined", "loop end", "loop top", "after dm_sync", "pre-launch"};
+        for (int k = 0; k < 6; ++k) {
+            const int kk = k == 5 ? 5 : k;
+            std::snprintf(b, sizeof b, " %s %.3f;", sn[k], sum[kk] / (double) n);
+            out += b;
+        }
+        std::snprintf(b, sizeof b, " run-entry event %.3f; verify-pre event %.3f; commit end - draft end %.3f", sum[6] / (double) n,
+                      sum[7] / (double) n, sum[8] / (double) n);
+        out += b;
+    }
+    std::fill(set.begin(), set.end(), 0);
+    std::fill(tags.begin(), tags.end(), 0);
+    for (auto& h : hs) h.fill(0.0);
+    window = 0;
+    return out;
+}
+
 void Verifier::collect_profile() {
     const ModelGeometry& g = *g_;
     cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
@@ -2090,6 +2306,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     DecodeGaps& gm = decode_gaps();
     gm.mark(11);
     const Clock::time_point t0 = Clock::now();
+    decode_events().record(DecodeEvents::kRunEntry, cs_, 1);
     if (!staged_) stage_inputs(T, tokens, pos0);
     staged_ = false;
     const bool do_ple = ss.ple.ready() && ple_stage();
@@ -2107,6 +2324,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     gm.mark(12);
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
         if (!dm_sync(err)) return false;
+        decode_events().stamp(4);
         gm.mark(13);
         *(volatile uint32_t*) (dm_->h_w + 0) = 0;
         *(volatile uint32_t*) (dm_->h_w + 16) = 0;
@@ -2132,7 +2350,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ms_host += ms_since(t0);
     if (prof_on_) decode_gaps().verify_end = 0;   // set again only by a collected window
     const Clock::time_point tl = Clock::now();
+    DecodeEvents& dev = decode_events();
+    dev.stamp(5);
+    if (next_ == nullptr && dev.on) { dev.next_window(); dev.record(DecodeEvents::kVerifyPre, cs_); }
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     // a sampled or penalized request's head sampling queued behind the window now, not after a sync
@@ -2144,6 +2366,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
     }
     (void) cudaStreamQuery(cs_);
+    if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); }
     gm.mark(15);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -2360,7 +2583,9 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         h_commit_[1] = n_keep - 1;
         for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
         std::atomic_thread_fence(std::memory_order_seq_cst);
+        decode_events().record(DecodeEvents::kCommitPre, cs_);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+        decode_events().record(DecodeEvents::kCommitPost, cs_);
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's

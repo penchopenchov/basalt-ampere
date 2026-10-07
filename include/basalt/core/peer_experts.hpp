@@ -81,6 +81,10 @@ public:
     /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
     void apply_pending(bool wait);
+    /// The first half of `apply_pending`: once the evictions' copies landed, queue the incoming experts' copies and
+    /// return without waiting for them (`apply_pending` then lands them).  False when `wait` is off and they are not done.
+    bool issue_pending(bool wait);
+    bool has_pending() const { return !pending_.empty() || !evicting_.empty(); }
     /// --peer-exclusive, once the RAM copy is built: the peer's experts have no RAM place.  Swaps then keep every
     /// expert somewhere: an evicted one goes to a free RAM place before its slot is reused, and a RAM place is freed
     /// once its expert is resident on the peer.  Nothing is read from the file for them.
