@@ -57,9 +57,11 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream);
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's
 /// layout (counts | start | dst | tok | pad | ptr | ptr2 | start2, `capx` entries) and order (distinct experts in
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.
+/// Without `skip` (the zero-doorbell graph) an entry whose expert is not in VRAM leaves the plan empty and sets
+/// *plan_err (mapped host memory) to 1, so the host sees it instead of a window on a stale plan.
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
