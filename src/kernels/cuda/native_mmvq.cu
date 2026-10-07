@@ -51,25 +51,6 @@ constexpr int WARPS = 4;
 constexpr int WARP = 32;
 constexpr int QUANT_THREADS = 256;
 
-// DEC_PDL2 (`early`): the block's weight rows into L2 and the next kernel let in before waiting for the
-// activations, so the rows stream during the previous kernel's tail
-__device__ __forceinline__ void mmvq_pre_wait(const void* w, int row0, int rows, int n_out, std::size_t row_bytes,
-                                              int early) {
-    if (early & 4) {
-        const int nr = min(rows, n_out - row0);
-        if (nr > 0) {
-            const char* p = static_cast<const char*>(w) + std::size_t(row0) * row_bytes;
-            const char* p0 = reinterpret_cast<const char*>(reinterpret_cast<std::uintptr_t>(p) & ~std::uintptr_t(127));
-            const std::size_t bytes = std::size_t(nr) * row_bytes + std::size_t(p - p0);
-            const int nt = int(blockDim.x * blockDim.y), tid = int(blockDim.x * threadIdx.y + threadIdx.x);
-            for (std::size_t o = std::size_t(tid) * 128; o < bytes; o += std::size_t(nt) * 128)
-                asm volatile("prefetch.global.L2 [%0];" ::"l"(p0 + o));
-        }
-    }
-    if (early & 8) pdl_launch_dependents();
-    pdl_wait();
-}
-
 struct Q5KBlock {
     half2 dm;
     uint8_t scales[12];
@@ -163,8 +144,7 @@ __device__ __forceinline__ float warp_max(float x) {
 
 __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
-                                           Q81Block* __restrict__ y, int n_in, int early) {
-    if (early) pdl_launch_dependents();
+                                           Q81Block* __restrict__ y, int n_in) {
     pdl_wait();
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
@@ -264,12 +244,12 @@ template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q5_k_mmvq_kernel(const Q5KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out, int early) {
+                                        float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
-    mmvq_pre_wait(w, row0, ROWS, n_out, std::size_t(n_in / 256) * sizeof(Q5KBlock), early);
+    pdl_wait();
     const int blocks_per_row = n_in / QK;
     float tmp[ROWS] = {};
     for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
@@ -502,12 +482,12 @@ template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_iq4_xs_mmvq_kernel(const IQ4XSBlock* __restrict__ w,
                                          const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out, int early) {
+                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 4 * WARPS * WARP / 32;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
-    mmvq_pre_wait(w, row0, ROWS, n_out, std::size_t(n_in / 256) * sizeof(IQ4XSBlock), early);
+    pdl_wait();
     const int blocks_per_row = n_in / 256;
     float tmp[ROWS] = {};
     for (int kbx = tid / 8; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
@@ -598,12 +578,12 @@ template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q4_k_mmvq_kernel(const Q4KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out, int early) {
+                                        float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
-    mmvq_pre_wait(w, row0, ROWS, n_out, std::size_t(n_in / 256) * sizeof(Q4KBlock), early);
+    pdl_wait();
     const int blocks_per_row = n_in / QK;
     float tmp[ROWS] = {};
     for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
@@ -674,12 +654,12 @@ template<bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
                                         const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out, int early) {
+                                        float* __restrict__ y, int n_in, int n_out) {
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
-    mmvq_pre_wait(w, row0, ROWS, n_out, std::size_t(n_in / 256) * sizeof(Q6KBlock), early);
+    pdl_wait();
     const int blocks_per_row = n_in / 256;
     float tmp[ROWS] = {};
     for (int kbx = tid / 32; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
@@ -1048,12 +1028,12 @@ template<typename F, int NCOLS, int NW, int ROWS>
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
                                          const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out, int early) {
+                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
     const int blocks_per_row = n_in / F::DIV;
-    mmvq_pre_wait(w, row0, ROWS, n_out, std::size_t(blocks_per_row) * sizeof(typename F::Block), early);
+    pdl_wait();
     const int x_stride = n_in / Q8K;                   // Q8_1 blocks per activation column
     float tmp[NCOLS][ROWS] = {};
     for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
@@ -1095,23 +1075,20 @@ template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const int early = pdl2_mask() & 12;
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
-        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2>, dim3(blocks), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out,
-                   early);
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2>, dim3(blocks), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out);
         return;
     }
     const dim3 threads(WARP, WARPS);
     if (n_in / F::DIV < F::BPI) {
         constexpr int ROWS = 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
-        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out,
-                   early);
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out);
     } else {
         launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in,
-                   n_out, early);
+                   n_out);
     }
 }
 
@@ -1494,7 +1471,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     launch_pdl(native_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0, static_cast<cudaStream_t>(stream), x,
-               static_cast<Q81Block*>(x_q8_1), n_total, pdl2_mask() & 16);
+               static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
 }
 
@@ -1531,15 +1508,9 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     const dim3 threads(WARP, WARPS);
     if (n_in / QK < VDR * WARPS * WARP / QI) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        if (const int e = pdl2_mask() & 12)
-            launch_pdl(native_q5_k_mmvq_kernel<true>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, e);
-        else
-            native_q5_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out, 0);
+        native_q5_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
-        if (const int e = pdl2_mask() & 12)
-            launch_pdl(native_q5_k_mmvq_kernel<false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, e);
-        else
-            native_q5_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out, 0);
+        native_q5_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
 }
@@ -1662,15 +1633,9 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < 4 * WARPS * WARP / 32) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        if (const int e = pdl2_mask() & 12)
-            launch_pdl(native_iq4_xs_mmvq_kernel<true>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, e);
-        else
-            native_iq4_xs_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out, 0);
+        native_iq4_xs_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
-        if (const int e = pdl2_mask() & 12)
-            launch_pdl(native_iq4_xs_mmvq_kernel<false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, e);
-        else
-            native_iq4_xs_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out, 0);
+        native_iq4_xs_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
 }
@@ -1707,15 +1672,9 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < WARPS * WARP / 16) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        if (const int e = pdl2_mask() & 12)
-            launch_pdl(native_q4_k_mmvq_kernel<true>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, e);
-        else
-            native_q4_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out, 0);
+        native_q4_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
-        if (const int e = pdl2_mask() & 12)
-            launch_pdl(native_q4_k_mmvq_kernel<false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, e);
-        else
-            native_q4_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out, 0);
+        native_q4_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
 }
@@ -1752,15 +1711,9 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < WARPS * WARP / 32) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        if (const int e = pdl2_mask() & 12)
-            launch_pdl(native_q6_k_mmvq_kernel<true>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, e);
-        else
-            native_q6_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out, 0);
+        native_q6_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
-        if (const int e = pdl2_mask() & 12)
-            launch_pdl(native_q6_k_mmvq_kernel<false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, e);
-        else
-            native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out, 0);
+        native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
 }
