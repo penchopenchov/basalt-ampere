@@ -78,6 +78,65 @@ __device__ __forceinline__ void dm_group(const int32_t* s_ids, const int32_t* s_
     __syncthreads();
 }
 
+// dm_group's plan with the per-entry counting unrolled and the prefix sums in one warp's scan: the same plan
+__device__ __forceinline__ void dm_group_fast(const int32_t* s_ids, const int32_t* s_kind, int n, int want, int tid,
+                                         int32_t* s_first, int32_t* s_cnt, int32_t* s_gstart, int32_t* s_gidx,
+                                         int32_t* s_pos, int32_t* start, int32_t* s_ng, int32_t* s_ne) {
+    static_assert(kDmCap == 128, "the scan takes four entries a lane");
+    int first = tid, rank = 0, cnt = 0;
+    const bool mine = tid < n && s_kind[tid] == want;
+    if (mine) {
+        const int32_t e = s_ids[tid];
+#pragma unroll 8
+        for (int j = 0; j < n; ++j) {
+            const bool m = s_ids[j] == e && s_kind[j] == want;
+            first = m && j < first ? j : first;
+            rank += m && j < tid;
+            cnt += m;
+        }
+    }
+    const bool is_first = mine && first == tid;
+    if (tid < kDmCap) {
+        s_first[tid] = is_first;
+        s_cnt[tid] = is_first ? cnt : 0;
+    }
+    __syncthreads();
+    if (tid < 32) {   // warp 0 scans the first flags and counts, four entries a lane: group indices and entry starts
+        int f[4], c[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            f[q] = s_first[4 * tid + q];
+            c[q] = s_cnt[4 * tid + q];
+        }
+        int fi = f[0] + f[1] + f[2] + f[3], ci = c[0] + c[1] + c[2] + c[3];
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int fu = __shfl_up_sync(0xffffffffu, fi, d), cu = __shfl_up_sync(0xffffffffu, ci, d);
+            if (tid >= d) { fi += fu; ci += cu; }
+        }
+        const int ng = __shfl_sync(0xffffffffu, fi, 31), ne = __shfl_sync(0xffffffffu, ci, 31);
+        int gi = fi - (f[0] + f[1] + f[2] + f[3]), es = ci - (c[0] + c[1] + c[2] + c[3]);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if (f[q]) {
+                s_gidx[4 * tid + q] = gi;
+                s_gstart[4 * tid + q] = es;
+                start[gi] = es;
+            }
+            gi += f[q];
+            es += c[q];
+        }
+        if (tid == 0) {
+            start[ng] = ne;
+            *s_ng = ng;
+            *s_ne = ne;
+        }
+    }
+    __syncthreads();
+    if (tid < kDmCap) s_pos[tid] = mine ? s_gstart[first] + rank : -1;
+    __syncthreads();
+}
+
 // Block 0 plans CUDA0's groups and publishes the ring's header; the other blocks quantize the FFN input (256 values
 // each) into the device q8_1 rows and, for the tiers that need them, into mapped memory.  The last block to finish
 // rings both doorbells.  Mode 1 keeps only the plan and the device rows, mode 2 only the ring (DmRouteArgs::mode).
@@ -369,7 +428,7 @@ __device__ void dm_glue_sw(int idx, int ng, const int32_t* s_start, int n_ff, un
 
 template<int TG>
 __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L, float* __restrict__ gate,
-                                                         float* __restrict__ up, block_q8_1* __restrict__ hq, int gy) {
+                                                         float* __restrict__ up, block_q8_1* __restrict__ hq, int gy, int fast_group) {
     __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap], s_start[kDmCap + 1], s_tok[kDmCap];
     __shared__ unsigned long long s_p[kDmCap], s_ptr[kDmCap];
@@ -404,7 +463,8 @@ __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExp
         s_kind[tid] = p != 0ull ? 0 : -1;
     }
     __syncthreads();
-    dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
+    if (fast_group) dm_group_fast(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
+    else dm_group(s_ids, s_kind, n, 0, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
     if (tid < n && s_kind[tid] == 0) {
         s_tok[s_pos[tid]] = tid / a.k;
         if (s_first[tid]) s_ptr[s_gidx[tid]] = s_p[tid];
@@ -1322,6 +1382,7 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
 
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scratch, float* out, int cap, void* stream) {
     static const bool x_fuse = core::exp_flag("moe_fuse", 0) != 0;
+    static const int x_grp = core::exp_flag("gu_grp", 0) != 0;
     DmGlueArgs a = a_in;
     a.fuse = a.fuse || x_fuse;
     if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap) {
@@ -1337,7 +1398,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * gy;
     auto go = [&](auto kernel, int resident) {
         const int nb = std::max(1, std::min(items, resident)) + (a.ring_on ? 1 : 0) + (a.fuse ? kDmSwBlocks : 0);
-        launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, hq, gy);
+        launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, hq, gy, x_grp);
     };
     switch (L.gu_type) {
         case 16: go(dm_glue_gu_kernel<16>, dm_glue_blocks<16>()); break;

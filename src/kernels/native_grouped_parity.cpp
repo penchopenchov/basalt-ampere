@@ -13,6 +13,8 @@
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
+#include "basalt/core/diag.hpp"
+#include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -366,15 +368,133 @@ void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
     cudaEventDestroy(e1);
 }
 
+// ------------------------------------------------------------------------------------------------ --glue
+// dec_moe_glue (the engine's gate/up + SwiGLU + down launches with the plan built inside) on synthetic experts: T tokens
+// route to top-10 experts drawn from a pool of `pool` (so about `pool` distinct experts a window), 48 layers each with its
+// own copies of the pool's blobs.  Checks every layer's rows bitwise against native_expert_grouped on the plan the glue
+// wrote, then times the 48 calls in a graph.
+void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T, int pool, int rounds) {
+    const int64_t H = 2560;
+    const int KK = 10, NEXP = 256, NL = 48;
+    Setup S(gu, dt, H, ff, T, KK, pool, rng, s);
+    std::vector<int32_t> ids((size_t) T * KK);
+    {
+        std::vector<int> ord(pool);
+        for (int t = 0; t < T; ++t) {
+            std::iota(ord.begin(), ord.end(), 0);
+            std::shuffle(ord.begin(), ord.end(), rng);
+            for (int j = 0; j < KK; ++j) ids[(size_t) t * KK + j] = ord[j % pool] * 3 + 1;   // expert id e = 3 * blob + 1
+        }
+    }
+    int32_t* d_ids = dalloc<int32_t>(ids.size());
+    ck(cudaMemcpy(d_ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
+    uint8_t* arena = dalloc<uint8_t>(S.slot * (size_t) NL * pool);
+    std::vector<unsigned long long*> ptab(NL);
+    for (int l = 0; l < NL; ++l) {
+        std::vector<unsigned long long> p(NEXP, 0ull);
+        for (int b = 0; b < pool; ++b) {
+            uint8_t* d = arena + S.slot * (size_t) (l * pool + b);
+            ck(cudaMemcpy(d, S.blobs + S.slot * (size_t) b, S.L.bytes, cudaMemcpyDeviceToDevice), "blob copy");
+            if (b % 5 != 4) p[b * 3 + 1] = (unsigned long long) d;   // every fifth expert is not resident (its entries are skipped)
+        }
+        ptab[l] = dalloc<unsigned long long>(NEXP);
+        ck(cudaMemcpy(ptab[l], p.data(), NEXP * 8, cudaMemcpyHostToDevice), "ptab");
+    }
+    k::DmPlan* plan = dalloc<k::DmPlan>(1);
+    const int n = T * KK;
+    float* out = dalloc<float>((size_t) k::kDmCap * H);
+    float* ref = dalloc<float>((size_t) k::kDmCap * H);
+    auto glue = [&](int l) {
+        k::DmGlueArgs a;
+        a.ids = d_ids; a.ptab = ptab[l]; a.n_tok = T; a.k = KK; a.n_expert = NEXP; a.plan = plan; a.xq = S.xq;
+        k::dec_moe_glue(S.L, a, S.scr, out, n, s);
+    };
+    std::vector<uint32_t> h_out((size_t) n * H), h_ref((size_t) n * H);
+    size_t bad = 0;
+    int ngroups = 0;
+    for (int l = 0; l < NL; l += 7) {
+        ck(cudaMemset(out, 0xFF, (size_t) n * H * 4), "memset");
+        ck(cudaMemset(ref, 0xFF, (size_t) n * H * 4), "memset");
+        glue(l);
+        ck(cudaStreamSynchronize(s), "glue");
+        k::DmPlan P;
+        ck(cudaMemcpy(&P, plan, sizeof P, cudaMemcpyDeviceToHost), "plan");
+        ngroups = P.counts[0];
+        {   // the plan against the plain grouping: groups in order of first appearance, entries in routing order
+            std::vector<int> gid;
+            std::vector<std::vector<int>> mem;
+            std::vector<unsigned long long> ptr_h(NEXP);
+            ck(cudaMemcpy(ptr_h.data(), ptab[l], NEXP * 8, cudaMemcpyDeviceToHost), "ptab");
+            int nvalid = 0;
+            for (int i = 0; i < n; ++i) {
+                if (ptr_h[ids[i]] == 0) continue;
+                ++nvalid;
+                size_t g = 0;
+                while (g < gid.size() && gid[g] != ids[i]) ++g;
+                if (g == gid.size()) { gid.push_back(ids[i]); mem.emplace_back(); }
+                mem[g].push_back(i);
+            }
+            size_t pbad = P.counts[0] != (int) gid.size() || P.counts[1] != nvalid;
+            int pos = 0;
+            for (size_t g = 0; g < gid.size() && !pbad; ++g) {
+                pbad += P.start[g] != pos || P.ptr[g] != ptr_h[gid[g]];
+                for (int i : mem[g]) { pbad += P.dst[pos] != i || P.tok[pos] != i / KK; ++pos; }
+            }
+            if (pbad) { std::printf("  plan differs from the plain grouping at layer %d  FAIL\n", l); ++g_fail; }
+        }
+        k::native_expert_grouped(S.L, plan->ptr, plan->start, (const int32_t*) plan, plan->dst, plan->tok, n, n, S.xq,
+                                 S.scr, ref, s);
+        ck(cudaStreamSynchronize(s), "ref");
+        ck(cudaMemcpy(h_out.data(), out, h_out.size() * 4, cudaMemcpyDeviceToHost), "out");
+        ck(cudaMemcpy(h_ref.data(), ref, h_ref.size() * 4, cudaMemcpyDeviceToHost), "ref");
+        for (int e = 0; e < P.counts[1]; ++e)
+            for (int64_t c = 0; c < H; ++c) bad += h_out[(size_t) P.dst[e] * H + c] != h_ref[(size_t) P.dst[e] * H + c];
+    }
+    std::printf("glue %s/%s T %d pool %d (%d groups): rows vs native_expert_grouped: %s (%zu differ)\n", name_of(gu),
+                name_of(dt), T, pool, ngroups, bad ? "FAIL" : "bitwise equal", bad);
+    g_fail += bad != 0;
+    cudaGraph_t g;
+    cudaGraphExec_t ge;
+    ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
+    for (int l = 0; l < NL; ++l) glue(l);
+    ck(cudaStreamEndCapture(s, &g), "capture");
+    ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "event");
+    ck(cudaEventCreate(&e1), "event");
+    std::vector<float> t;
+    for (int i = 0; i < 20 + rounds; ++i) {
+        const float us = launch_us(s, ge, e0, e1);
+        if (i >= 20) t.push_back(us);
+    }
+    const double bytes = (double) ngroups * S.L.bytes;
+    const float md = median(t);
+    std::printf("  glue bench: %.2f us per call (median of %d graphs of 48; %d groups, %.1f MB of experts, %.0f GB/s)\n", md,
+                rounds, ngroups, bytes / 1e6, bytes / md / 1e3);
+    cudaGraphExecDestroy(ge);
+    cudaGraphDestroy(g);
+    for (auto* p : ptab) cudaFree(p);
+    cudaFree(arena); cudaFree(d_ids); cudaFree(plan); cudaFree(out); cudaFree(ref);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool do_bench = false, gu2 = false;
+    bool do_bench = false, gu2 = false, do_glue = false;
+    int glue_t = 3, glue_pool = 22;
     BenchOptions bo;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto num = [&](int& dst) { if (i + 1 < argc) dst = std::atoi(argv[++i]); };
         if (a == "--bench") do_bench = true;
+        else if (a == "--glue") do_glue = true;
+        else if (a == "--glue-t") num(glue_t);
+        else if (a == "--glue-pool") num(glue_pool);
+        else if (a == "--exp" && i + 1 < argc) {   // --exp NAME=V
+            const std::string kv = argv[++i];
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos) basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
+        }
         else if (a == "--gu2") gu2 = true;   // also check the gate/up pair kernel (2560-value rows only)
         else if (a == "--bench-gu") num(bo.gu);
         else if (a == "--bench-down") num(bo.down);
@@ -393,6 +513,11 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
+    if (do_glue) {   // only the engine-shaped glue call: no format sweep
+        glue_bench(s, rng, bo.gu, bo.down, bo.ff, glue_t, glue_pool, 60);
+        std::printf("native_grouped_parity: %d failures\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 8})        // GU_FMTS
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
