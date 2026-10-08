@@ -282,13 +282,40 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     return _late_system_to_user(messages), tools, kwargs
 
 
+BILLING_HEADER = "x-anthropic-billing-header:"
+
+
+def pin_billing_stamp(system: str) -> str:
+    """Pin Claude Code's per-request billing stamp to f's. The header at the start of its system prompt carries a
+    `cch=` value that changes on every request and a `cc_version` 4th part that changes on every session; left alone
+    they change the prompt ahead of the cached prefix. Only a header at the very start of the system text is
+    touched, and only inside its first 160 characters."""
+    if not system.startswith(BILLING_HEADER):
+        return system
+    s = list(system)
+    cch = system.find("cch=", len(BILLING_HEADER))
+    if 0 <= cch <= 160:
+        v, end = cch + 4, system.find(";", cch + 4)
+        if end > v and end - v <= 16:
+            s[v:end] = "f" * (end - v)
+    cv = system.find("cc_version=")
+    if 0 <= cv <= 160:
+        v, end = cv + len("cc_version="), system.find(";", cv)
+        if v < end and end - v <= 64:
+            parts = system[v:end].split(".")
+            if len(parts) > 3:
+                tail = v + len(".".join(parts[:3])) + 1
+                s[tail:end] = "f" * (end - tail)
+    return "".join(s)
+
+
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, tools, kwargs). `think_unasked`: a request that asks nothing about
     thinking gets the template default; False renders it without thinking."""
     messages = []
     system = req.get("system")
     if system:
-        messages.append({"role": "system", "content": _text_of(system)})
+        messages.append({"role": "system", "content": pin_billing_stamp(_text_of(system))})
     for m in _object_list(req.get("messages"), "messages"):
         content = m.get("content")
         if isinstance(content, str):
