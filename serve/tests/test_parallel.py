@@ -71,7 +71,8 @@ def window():        # one batch window: every active slot one token
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
-            print(f"BDONE {b} {produced} {fin} 1.0", flush=True)
+            counts = f" {b + 3} {10 * (b + 1)}" if "--bdone-drafts" in args else ""   # accepted, offered
+            print(f"BDONE {b} {produced} {fin} 1.0{counts}", flush=True)
             del active[b]
         else:
             active[b] = [left, max_new, produced]
@@ -185,7 +186,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -194,6 +195,7 @@ class ParallelService(unittest.TestCase):
         extra = ["--batch", str(slots)] + (["--fit", str(fit)] if fit is not None else []) + ["--log", str(self.log)]
         extra += ["--slotcache"] if slot_cache else []
         extra += ["--fail-window"] if fail else []
+        extra += ["--bdone-drafts"] if drafts else []
         extra += ["--ready", str(ready)] if ready else []
         extra += ["--multi", str(multi)] if multi else []
         with mock.patch.object(subprocess, "Popen",
@@ -423,6 +425,29 @@ class ParallelService(unittest.TestCase):
 
     def test_a_window_gives_one_token_in_a_line(self):
         self.several(1)
+
+    def slot_drafts(self):
+        return {x["id"]: (x["drafts_accepted"], x["drafts_offered"]) for x in self.get("/slots")}
+
+    def test_batch_slot_drafts_come_from_its_bdone(self):
+        # BDONE <slot> <n> <fin> <ms> <accepted> <offered>: each slot keeps its own counts
+        self.start(2, drafts=True)
+        th = threading.Thread(target=lambda: self.chat("blocker LONGREPLY", max_tokens=200))
+        th.start()
+        time.sleep(0.05)
+        self.chat("second")
+        th.join(30)
+        got = self.slot_drafts()
+        self.assertEqual(got, {0: (3, 10), 1: (4, 20)})
+
+    def test_old_bdone_without_counts_keeps_drafts_unknown(self):
+        self.start(2)
+        th = threading.Thread(target=lambda: self.chat("blocker LONGREPLY", max_tokens=200))
+        th.start()
+        time.sleep(0.05)
+        self.chat("second")
+        th.join(30)
+        self.assertEqual(self.slot_drafts(), {0: (None, None), 1: (None, None)})
 
     def test_context_is_what_each_slot_holds(self):
         # the engine's context is the slots' own (the server divides --max-context): /slots, /props and /v1/models

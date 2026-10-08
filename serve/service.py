@@ -327,7 +327,10 @@ class Service:
         progress = getattr(self.engine, "progress", None)
         rows = []
         for i in range(total):
-            held = last.get(i, {})
+            held = dict(last.get(i, {}))
+            bd = (getattr(self.engine, "slot_drafts", None) or {}).get(i)
+            if bd and bd[2] >= held.get("at", 0):      # a batch slot's own counts, when newer than a solo request's
+                held.update(accepted=bd[0], offered=bd[1])
             row = {"id": i, "n_ctx": self.engine.max_context, "is_processing": i in by_slot, "state": "idle",
                    "api": None, "model": None, "tok_s": 0.0, "generated": 0, "prompt_tokens": 0, "prefill_done": 0,
                    "ctx_used": held.get("ctx", 0), "drafts_offered": held.get("offered"),
@@ -719,7 +722,7 @@ class Service:
                             self.requests_done += 1
                             if st.get("slot") is not None:
                                 self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
-                                                              "accepted": last.get("drafts_accepted")}
+                                                              "accepted": last.get("drafts_accepted"), "at": time.time()}
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path,
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,

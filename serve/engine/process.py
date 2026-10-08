@@ -85,6 +85,7 @@ class ProcessEngine:
     silence_s = ENGINE_SILENCE_S         # kept across restart()
     silent_note = None                   # why the server ended a silent engine
     last_err = None                      # an ERR that was the last stdout line
+    slot_drafts = {}                     # batch slot -> (accepted, offered, time) of its last BDONE, counts None when absent
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     stderr_sink = None                   # callable(line): engine stderr when there is no log file
 
@@ -116,6 +117,7 @@ class ProcessEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
+        self.slot_drafts = {}
         self.info = {}                   # INFO key=value facts
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens, from PP lines
@@ -550,12 +552,18 @@ class ProcessEngine:
                     except ValueError:
                         tail = []
                 if line.startswith("BDONE "):
+                    self._note_bdone(slot, line.split())
                     break
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
                 busy[slot] = False
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
+
+    def _note_bdone(self, slot: int, f: list[str]):
+        """Keep a slot's draft counts from its BDONE line (optional trailing accepted, offered; None when absent)."""
+        known = len(f) >= 7 and f[5].isdigit() and f[6].isdigit()
+        self.slot_drafts[slot] = (int(f[5]) if known else None, int(f[6]) if known else None, time.time())
 
     YIELDS_MAX = 2   # times one prompt read may give way to a shorter waiting one
 
@@ -782,8 +790,14 @@ class ProcessEngine:
                     elif line.startswith("BDONE "):
                         phase = "none"
                         f = line.split()
+                        self._note_bdone(slot, f)
                         if len(f) >= 5 and isinstance(self.last, dict):
-                            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
+                            # draft counts are this request's own (optional trailing accepted, offered);
+                            # without them they are unknown, never an earlier request's
+                            prev = {k: v for k, v in self.last.items() if k not in ("drafts_accepted", "drafts_offered")}
+                            counts = {"drafts_accepted": int(f[5]), "drafts_offered": int(f[6])} \
+                                if len(f) >= 7 and f[5].isdigit() and f[6].isdigit() else {}
+                            self.last = {**prev, **counts, "finish": f[3], "decode_ms": float(f[4]),
                                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
                         # the slot holds the prompt and every token fed (all but the last)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
