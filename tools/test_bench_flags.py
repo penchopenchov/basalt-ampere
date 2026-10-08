@@ -57,6 +57,12 @@ class BenchFlags(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--kv") + 1], "int8")
         self.assertEqual(cmd.count("--max-context"), 1)
 
+    def test_a_switch_does_not_take_the_next_option(self):
+        cmd = self.command("--peer-exclusive", "-p", "16384", "-t", "prose", "--seed", "-1")
+        self.assertIn("--peer-exclusive", cmd)
+        self.assertNotIn("-p", cmd)
+        self.assertEqual(cmd[cmd.index("--seed") + 1], "-1")
+
     def test_built_ins_are_minimal(self):
         cmd = self.command()
         self.assertEqual(cmd[cmd.index("--spec") + 1], "0")

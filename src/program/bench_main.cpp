@@ -4,6 +4,7 @@
 // requests), prefill runs on scaled, cache-busted prompts, and an optional quality session reports PPL / KLD.
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -595,9 +596,15 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             for (size_t k = 0; k < w.size(); k += 2) o.sets.emplace_back(w[k], w[k + 1]);
         } else if (a == "--print-command") o.print_command = true;
         else if (a.rfind("--", 0) == 0) {
-            // any other long flag is the engine's, with its value when one follows
+            // any other long flag is the engine's, with its value when one follows; a following option
+            // (anything starting with '-' that is not a negative number) means the flag is a switch
             o.passthrough.push_back(a);
-            if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) o.passthrough.push_back(argv[++i]);
+            if (i + 1 < argc) {
+                const std::string v = argv[i + 1];
+                const bool option = !v.empty() && v[0] == '-' &&
+                                    !(v.size() > 1 && (std::isdigit(static_cast<unsigned char>(v[1])) || v[1] == '.'));
+                if (!option) o.passthrough.push_back(argv[++i]);
+            }
         } else {
             err = "unknown argument " + a + " (see --help)";
         }
