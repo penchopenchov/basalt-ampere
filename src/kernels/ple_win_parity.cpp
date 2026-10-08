@@ -113,6 +113,44 @@ int main(int argc, char** argv) {
                     break;
                 }
     }
+    // independent rows (a batch window): row t over its own history equals the one-row window on that history
+    {
+        const auto h_hists = randv((size_t) MT * HS, 1.0f, 0.0f);
+        float* hists = dalloc<float>((size_t) MT * HS);
+        float* hsnap = dalloc<float>((size_t) MT * HS);
+        for (int T = 1; T <= MT; ++T) {
+            std::vector<float> out[2][3];
+            for (int v = 0; v < 2; ++v) {
+                ck(cudaDeviceSynchronize(), "sync");
+                up(R, h_R); up(hists, h_hists);
+                ck(cudaDeviceSynchronize(), "sync");
+                ck(cudaMemsetAsync(hsnap, 0, (size_t) MT * HS * 4, st), "memset");
+                ck(cudaStreamSynchronize(st), "sync");
+                if (v == 0) {
+                    for (int t = 0; t < T; ++t) {
+                        k::PleWindowArgs a;
+                        a.R = R + (size_t) t * D; a.block_out = bo + (size_t) t * N; a.inject = inj + (size_t) t * H;
+                        a.key = key + (size_t) t * D; a.value = val + (size_t) t * N; a.history = hists + (size_t) t * HS;
+                        a.hist_snap = hsnap + (size_t) t * HS; a.scratch = win; a.T = 1;
+                        k::native_ple_window(a, w, st);
+                    }
+                } else {
+                    k::PleWindowArgs a;
+                    a.R = R; a.block_out = bo; a.inject = inj; a.key = key; a.value = val; a.history = hists;
+                    a.hist_snap = hsnap; a.scratch = win; a.T = T; a.rows_independent = true;
+                    k::native_ple_window(a, w, st);
+                }
+                ck(cudaStreamSynchronize(st), "sync");
+                out[v][0] = down(R, (size_t) T * D);
+                out[v][1] = down(hists, (size_t) T * HS);
+                out[v][2] = down(hsnap, (size_t) T * HS);
+            }
+            const size_t d0 = ndiff(out[0][0], out[1][0]), d1 = ndiff(out[0][1], out[1][1]), d2 = ndiff(out[0][2], out[1][2]);
+            std::printf("rows T=%d  result %zu  history %zu  snapshots %zu  differing values%s\n", T, d0, d1, d2,
+                        d0 + d1 + d2 ? "  DIFF" : "");
+            fail += d0 + d1 + d2 != 0;
+        }
+    }
     // microbench: each form captured once per T, replayed
     for (int T = 1; T <= 4; ++T) {
         float ms[2];

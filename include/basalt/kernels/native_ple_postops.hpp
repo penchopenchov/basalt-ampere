@@ -43,8 +43,9 @@ struct PleWindowArgs {
     const float* inject = nullptr;      ///< [T][4] its inject
     const float* key = nullptr;         ///< [T][10240] projected keys
     const float* value = nullptr;       ///< [T][2560] projected values
-    float* history = nullptr;           ///< 9 rows per channel, advanced past the T rows
+    float* history = nullptr;           ///< 9 rows per channel, advanced past the T rows ([T][9 * 10240] if rows_independent)
     float* hist_snap = nullptr;         ///< [T][9 * 10240]: the history after each row
+    bool rows_independent = false;      ///< each row is its own sequence: its own history, advanced by that one row
     float* scratch = nullptr;           ///< 2 * T * 10240 floats
     int T = 0;
 };
