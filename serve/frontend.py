@@ -229,7 +229,8 @@ def _object_list(value, name: str) -> list[dict]:
 
 def _tool_list(value, wrapper: str | None) -> list[dict]:
     """A request's tools as named objects, in the OpenAI shape (`wrapper` "function") or Anthropic's (None);
-    anything else is a ValueError, no value is no tools."""
+    anything else is a ValueError, no value is no tools. A tool's schema ("parameters" / "input_schema") is an object
+    when it is there: a string or a list would otherwise fail on the model's first call of that tool."""
     if not value:
         return []
     shape = ('{"type": "function", "function": {"name": ..., "parameters": {...}}}' if wrapper else
@@ -238,10 +239,15 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
         tools = _object_list(value, "tools")
     except ValueError:
         raise ValueError(f"tools must be a list of tool objects, each {shape}") from None
+    key = "parameters" if wrapper else "input_schema"
     for i, t in enumerate(tools):
         fn = t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t
         if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
             raise ValueError(f"tools[{i}] has no name: each tool must be {shape}")
+        schema = fn.get(key)
+        if schema is not None and not isinstance(schema, dict):
+            raise ValueError(f'tools[{i}] ({fn["name"]}): "{key}" must be an object (the JSON schema of its '
+                             f"parameters), not {type(schema).__name__}")
     return tools
 
 

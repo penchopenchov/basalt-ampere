@@ -121,6 +121,15 @@ class Parsing(unittest.TestCase):
         self.assertEqual(skipped, ["web_search"])
         self.assertIsNone(request_tools({"tools": TOOLS, "tool_choice": "none"})[0])
 
+    def test_a_function_schema_that_is_not_an_object_is_refused(self):
+        for bad in ("x", ["a"], 5, True):
+            with self.assertRaises(ResponsesError) as e:
+                request_tools({"tools": [{"type": "function", "name": "f", "parameters": bad}]})
+            self.assertEqual(e.exception.param, "tools[0].parameters")
+        tools = request_tools({"tools": [{"type": "function", "name": "f"},
+                                         {"type": "function", "name": "g", "parameters": None}]})[0]
+        self.assertEqual([t["parameters"]["type"] for t in tools], ["object", "object"])
+
     def test_effort_and_text_format(self):
         self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}), {"enable_thinking": False})
         self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}), {"reasoning_effort": "xhigh"})

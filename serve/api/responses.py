@@ -236,7 +236,11 @@ def request_tools(req: dict):
         if ns_description:
             description = ns_description + ("\n\n" + description if description else "")
         if kind == "function":
-            params = tool.get("parameters") or {"type": "object", "properties": {}}
+            params = tool.get("parameters")
+            if params is not None and not isinstance(params, dict):
+                raise ResponsesError(f'tool "{name}": "parameters" must be an object (its JSON schema)',
+                                     param + ".parameters")
+            params = params or {"type": "object", "properties": {}}
         else:                                        # custom: free-form text, maybe in a grammar the model reads
             fmt = tool.get("format") or {}
             if isinstance(fmt, dict) and fmt.get("type") == "grammar" and fmt.get("definition"):

@@ -930,6 +930,28 @@ class ClientShapes(unittest.TestCase):
         status, b = self.post("/v1/chat/completions", {"model": "x", "max_tokens": 8, "messages": msgs})
         self.assertEqual(status, 200, b)                            # the server goes on
 
+    def test_a_tool_schema_that_is_not_an_object_is_a_400(self):
+        # a string, number or list as a tool's "parameters" / "input_schema" would raise on the model's first call of
+        # that tool, after the 200 and part of the reply; it is a 400 naming the tool and the field instead
+        msgs = [{"role": "user", "content": "hi"}]
+        bad = {"/v1/chat/completions": ([{"type": "function", "function": {"name": "f", "parameters": "x"}}],
+                                        [{"name": "f", "parameters": ["a"]}], [{"name": "f", "parameters": 5}]),
+               "/v1/messages": ([{"name": "f", "input_schema": "x"}], [{"name": "f", "input_schema": [1]}],
+                                [{"name": "f", "input_schema": True}])}
+        for path, shapes in bad.items():
+            for tools in shapes:
+                with self.subTest(path=path, tools=tools):
+                    status, b = self.post(path, {"model": "x", "max_tokens": 8, "messages": msgs, "tools": tools})
+                    self.assertEqual(status, 400, b)
+                    self.assertIn("tools[0] (f)", b["error"]["message"])
+                    self.assertIn("must be an object", b["error"]["message"])
+        for path, tools in (("/v1/chat/completions", [{"name": "f"}]),              # absent, null and {} go on
+                            ("/v1/chat/completions", [{"name": "f", "parameters": None}]),
+                            ("/v1/messages", [{"name": "f", "input_schema": {}}])):
+            with self.subTest(path=path, tools=tools):
+                status, b = self.post(path, {"model": "x", "max_tokens": 8, "messages": msgs, "tools": tools})
+                self.assertEqual(status, 200, b)
+
     def test_well_formed_tools_still_work(self):
         msgs = [{"role": "user", "content": "hi"}]
         fn = {"name": "get_weather", "description": "the weather", "parameters": {"type": "object", "properties": {}}}
