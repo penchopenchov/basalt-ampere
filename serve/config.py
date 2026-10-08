@@ -10,6 +10,7 @@ from pathlib import Path
 from serve import ROOT
 
 
+MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 # server options that are engine flags (the "engine" section of the config file)
 ENGINE_PASSTHROUGH = ("spec", "spec-min-p", "mtp-max-t", "peer-exclusive", "max-context")
@@ -135,6 +136,12 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
             if flag in cli_engine or flag in file_engine:
                 raise ValueError(f"parallel and engine {flag} both set: use parallel")
         (cli_engine if a_cli.parallel else file_engine)["--batch"] = a.parallel
+        if not a.slot_full_context:
+            # --max-context is shared by the slots, as in llama.cpp: each holds an equal part (the solo path, used while
+            # a request is alone, has the same length, so a request never outgrows its slot)
+            src = cli_engine if "--max-context" in cli_engine or "--max-context" not in file_engine else file_engine
+            ctx = int(src.get("--max-context", ENGINE_DEFAULT_CONTEXT))
+            src["--max-context"] = max(MIN_SLOT_CONTEXT, ctx // a.parallel)
     return a, file_argv + cli, file_engine, cli_engine
 
 
@@ -249,7 +256,12 @@ def build_parser() -> argparse.ArgumentParser:
                                                     "engine's)")
     ap.add_argument("--parallel", type=parallel_count, metavar="N",
                     help=f"requests served at once, 1..{PARALLEL_MAX} (default 1: one at a time); more requests wait "
-                         "their turn. Each slot holds a full context of KV cache, which the expert cache gives up")
+                         "their turn. --max-context is shared: each slot holds that divided by N (so 4 slots of 262144 "
+                         "need --max-context 1048576, or --slot-full-context). The slots' KV cache comes out of the "
+                         "expert cache")
+    ap.add_argument("--slot-full-context", action="store_true",
+                    help="with --parallel, give every slot the whole --max-context instead of an equal part: N slots "
+                         "cost N times the KV cache")
     ap.add_argument("--config", metavar="FILE",
                     help="a JSON object of engine flags, e.g. {\"max-context\": 32768, \"spec\": 7, "
                          "\"resident-experts\": true}; the server's own flags win over it")

@@ -147,6 +147,26 @@ class Precedence(unittest.TestCase):
                          "[server] engine: built-in defaults (no --config): spec 7, 4096 context; --spec 7 (cli)")
 
 
+class SlotContext(unittest.TestCase):
+    """--max-context is shared by the --parallel slots unless --slot-full-context."""
+
+    def flags(self, cli, cfg=None):
+        _, _, file_engine, cli_engine = parse(cli, cfg)
+        return {**file_engine, **cli_engine}
+
+    def test_each_slot_gets_an_equal_part(self):
+        self.assertEqual(self.flags(["--parallel", "4", "--max-context", "262144"])["--max-context"], 65536)
+        self.assertEqual(self.flags(["--parallel", "2", "--max-context", "262144"])["--max-context"], 131072)
+        self.assertEqual(self.flags(["--max-context", "262144"])["--max-context"], 262144)                  # solo: whole
+        self.assertEqual(self.flags(["--parallel", "4"], {"engine": {"max-context": 8192}})["--max-context"], 2048)
+
+    def test_slot_full_context_keeps_the_whole(self):
+        f = self.flags(["--parallel", "4", "--max-context", "262144", "--slot-full-context"])
+        self.assertEqual(f["--max-context"], 262144)
+        self.assertEqual(self.flags(["--parallel", "4", "--max-context", "262144"],
+                                    {"server": {"slot-full-context": True}})["--max-context"], 262144)
+
+
 class EveryOption(unittest.TestCase):
     def sample(self, act):
         if act.nargs == 0:

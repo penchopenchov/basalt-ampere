@@ -31,6 +31,7 @@ ENGINE_SILENCE_S = 300.0
 # While a prompt is read the allowance grows: before the first PP line by the chunk's tokens at PP_FLOOR_TOK_S,
 # afterwards a chunk may take PP_SLACK x the previous one's time.
 PP_CHUNK_MAX = 32768
+SLOT_MARGIN = 8       # tokens the engine keeps free in a slot's context beyond prompt and answer
 PP_FLOOR_TOK_S = 50.0
 PP_SLACK = 3.0
 # The read of the engine's READY line has a timeout: a blocking read that never returns would hold the request turn
@@ -264,7 +265,7 @@ class ProcessEngine:
                 except OSError:
                     pass
                 break                                   # publish EOF, never the trailing DONE
-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # a batch slot's own lines
+            if line.startswith(("BT ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
                 try:
                     slot_q[int(line.split()[1])].put(line)
                     continue
@@ -543,8 +544,8 @@ class ProcessEngine:
                     break
                 if line.startswith("BT "):
                     try:
-                        tail.append(int(line.split()[2]))
-                    except (IndexError, ValueError):
+                        tail.extend(int(x) for x in line.split()[2:])
+                    except ValueError:
                         tail = []
                 if line.startswith("BDONE "):
                     break
@@ -644,7 +645,7 @@ class ProcessEngine:
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
-                    def others():
+                    def others():       # a request waiting moves this one into a slot, if one can ever hold it
                         with self.slot_cv:
                             return self.waiting > 0
                     for x in self._control(cancel, pending.append, stop_when=others):
@@ -710,6 +711,7 @@ class ProcessEngine:
                         if not ok:
                             return
                         holding, born = True, self.gen
+                    left = max(1, min(left, self.max_context - len(prompt) - SLOT_MARGIN))   # the slot's room
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
@@ -758,16 +760,16 @@ class ProcessEngine:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                     if line.startswith("BT "):
-                        t = int(line.split()[2])
-                        out.append(t)
-                        if cancel.is_set():
-                            if not stop_sent:
-                                self._send(f"BSTOP {slot}")
-                                stop_sent = True
-                            continue
-                        yield t
-                        if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
-                                                                                  embeddings):
+                        for t in (int(x) for x in line.split()[2:]):    # a window's tokens for this slot, in order
+                            out.append(t)
+                            if cancel.is_set():
+                                if not stop_sent:
+                                    self._send(f"BSTOP {slot}")
+                                    stop_sent = True
+                                continue
+                            yield t
+                        if not going_solo and not stop_sent and not cancel.is_set() and \
+                                self._may_go_solo(int(max_new) - len(out), solo_again, embeddings):
                             self._send(f"BSTOP {slot}")         # alone now: continue solo
                             going_solo = True
                     elif line.startswith("BDONE "):
@@ -834,8 +836,8 @@ class ProcessEngine:
             return self.waiting + len(self.admission)
 
     def pick_slot(self, prompt: list[int]) -> int | None:
-        """A free slot for `prompt` (caller holds slot_cv): longest held prefix, else empty, else least recently used;
-        None when all are busy."""
+        """A free slot for `prompt` (caller holds slot_cv): longest held prefix, else an empty one, then the least
+        recently used; None when none is free."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None

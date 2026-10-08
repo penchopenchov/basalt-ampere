@@ -195,7 +195,9 @@ def main() -> int:
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''}", flush=True)
     if getattr(engine, "batch", 0):
-        print(f"[server] parallel: {engine.batch} requests at once, the rest wait in order", flush=True)
+        print(f"[server] parallel: {engine.batch} requests at once, the rest wait in order; each slot holds "
+              f"{engine.max_context} tokens" + (f" ({engine.batch} x {engine.max_context} of KV cache: --slot-full-context)"
+                                                if a.slot_full_context else ""), flush=True)
     print(f"[server] stats: http://{here}:{a.port}/ (Ctrl+C stops)", flush=True)
     if a.host not in LOOPBACK_NAMES:
         # reachable from other devices: print the addresses

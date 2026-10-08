@@ -21,12 +21,15 @@ from serve.util.text import ByteTokenizer
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
+# A window gives a slot up to MULTI tokens in ONE line, `BT <slot> <id> [<id> ..]`.
 # Every reply is the bytes of "ok, done." then <|im_end|> (ByteTokenizer: 257).
 FAKE_BATCH = r'''import queue, sys, threading, time
 args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
 fail = "--fail-window" in args        # the first window over two slots fails
+ready = int(args[args.index("--ready") + 1]) if "--ready" in args else 4096
+MULTI = int(args[args.index("--multi") + 1]) if "--multi" in args else 3
 STEP = 0.02
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
@@ -41,7 +44,7 @@ def reader():
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else ""), flush=True)
-print("READY 4096 stop", flush=True)
+print(f"READY {ready} stop", flush=True)
 LONG = list(b"LONGREPLY")
 def reply(ids):            # the rest of the reply after what the prompt already ends with (a request continued)
     ids = [int(x) for x in ids]
@@ -57,9 +60,14 @@ def window():        # one batch window: every active slot one token
         sys.exit(1)
     for b in sorted(active):
         left, max_new, produced = active[b]
-        t = left.pop(0) if left else 257
-        produced += 1
-        print(f"BT {b} {t}", flush=True)
+        got = []
+        while True:
+            t = left.pop(0) if left else 257
+            produced += 1
+            got.append(t)
+            if t == 257 or produced >= max_new or len(got) >= MULTI:
+                break
+        print(f"BT {b} " + " ".join(map(str, got)), flush=True)
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
@@ -177,7 +185,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -186,6 +194,8 @@ class ParallelService(unittest.TestCase):
         extra = ["--batch", str(slots)] + (["--fit", str(fit)] if fit is not None else []) + ["--log", str(self.log)]
         extra += ["--slotcache"] if slot_cache else []
         extra += ["--fail-window"] if fail else []
+        extra += ["--ready", str(ready)] if ready else []
+        extra += ["--multi", str(multi)] if multi else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -394,6 +404,37 @@ class ParallelService(unittest.TestCase):
             c = json.loads(r.read().decode())["choices"][0]
         self.assertEqual((c["message"]["content"], c["finish_reason"]), ("ok, ", "stop"))
         self.assertEqual(self.chat("again")["choices"][0]["message"]["content"], "ok, done.")
+
+    def several(self, multi):
+        self.start(2, multi=multi)
+        texts = ["first question LONGREPLY", "second question, longer"]
+        out = {}
+        threads = [threading.Thread(target=lambda t=t: out.setdefault(t, self.chat(t))) for t in texts]
+        for th in threads:
+            th.start()
+            time.sleep(0.05)
+        for th in threads:
+            th.join(30)
+        self.assertEqual(out[texts[0]]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+        self.assertEqual(out[texts[1]]["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_a_window_gives_several_tokens_in_one_line(self):
+        self.several(4)
+
+    def test_a_window_gives_one_token_in_a_line(self):
+        self.several(1)
+
+    def test_context_is_what_each_slot_holds(self):
+        # the engine's context is the slots' own (the server divides --max-context): /slots, /props and /v1/models
+        # say it, and the 400 for a prompt over it names it
+        self.start(3, ready=1024)
+        self.assertEqual([x["n_ctx"] for x in self.get("/slots")], [1024, 1024, 1024])
+        self.assertEqual(self.get("/props")["default_generation_settings"]["n_ctx"], 1024)
+        self.assertEqual(self.get("/v1/models")["data"][0]["meta"]["n_ctx"], 1024)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.chat("long " * 1100)
+        self.assertEqual(cm.exception.code, 400)
+        self.assertIn("(1024)", cm.exception.read().decode())
 
 
 if __name__ == "__main__":
