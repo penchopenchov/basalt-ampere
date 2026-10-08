@@ -34,9 +34,10 @@
 <div class="top" id="top">
 <section class="strip" aria-label="Key figures">
   <div class="m m-hero">
-    <div class="k"><span>Tokens/s</span><i id="limit"></i></div>
+    <div class="k"><span id="k-tok">Tokens/s</span><i id="limit"></i></div>
     <div class="v" id="v-tok">—</div>
     <div class="heat" aria-hidden="true"><i id="heat"></i></div>
+    <div class="sub" id="s-busy" hidden></div>
   </div>
   <div class="m"><div class="k"><span>Draft accept</span></div><div class="v" id="v-acc">—</div><div class="sub">Last request</div></div>
   <div class="m"><div class="k"><span>Context</span></div><div class="v" id="v-ctx">—</div><div class="sub" id="s-ctx"></div></div>
@@ -56,14 +57,14 @@
   <div class="view stats" id="view-stats" role="tabpanel" aria-labelledby="tab-stats">
     <aside class="col col-l">
       <section class="sec speed">
-        <div class="sh"><b>Speed</b><span class="grow"></span><span>Last 60 s</span></div>
+        <div class="sh"><b>Speed</b><span class="grow"></span><span id="speed-note">Last 60 s</span></div>
         <div class="cb">
           <div class="read"><span id="rd-decode-l">Decode</span><b id="rd-decode">—</b></div>
           <div class="chart" id="chart-decode">
             <div class="g" style="top:0"><span class="y0"></span></div>
             <div class="g" style="top:50%"><span class="y1"></span></div>
             <div class="g" style="top:100%"><span>0</span></div>
-            <svg viewBox="0 0 59 100" preserveAspectRatio="none" role="img" aria-label="Decode tokens per second, last 60 seconds. Hover for values."><polyline id="line-decode"/></svg>
+            <svg viewBox="0 0 59 100" preserveAspectRatio="none" role="img" aria-label="Decode tokens per second, last 60 seconds. Hover for values."><polyline id="line-per"/><polyline id="line-decode"/></svg>
             <div class="cur" hidden></div><div class="cdot" hidden></div><div class="tip" hidden></div>
           </div>
         </div>
@@ -90,33 +91,55 @@
           </div>
         </div>
       </section>
+
+      <section class="sec qsec" id="queue" hidden>
+        <div class="sh"><b>Queue</b><span id="q-count">0</span><span class="grow"></span><span>Waiting for a free slot</span></div>
+        <div class="tw">
+          <table>
+            <thead><tr><th>Waiting</th><th>API</th><th>Model</th><th class="n">Prompt</th></tr></thead>
+            <tbody id="t-queue"></tbody>
+          </table>
+          <div class="empty" id="q-empty">No request is waiting.</div>
+        </div>
+      </section>
     </aside>
 
     <div class="col col-r">
-      <section class="sec reqs" id="reqs">
-        <div class="sh"><b>Requests</b><span id="req-count">0</span><span class="grow"></span><button id="req-toggle" aria-expanded="true">Hide</button></div>
-        <div class="tw">
-          <table>
-            <thead><tr><th>Time</th><th>ID</th><th>Endpoint</th><th class="n">Output</th><th class="n">Tokens/s</th><th class="n">Duration</th></tr></thead>
-            <tbody id="t-req"></tbody>
-          </table>
-          <div class="empty" id="req-empty">No requests yet.</div>
-        </div>
+      <section class="sec slots" id="slots" hidden>
+        <div class="sh"><b>Slots</b><span id="slot-count">0</span><span class="grow"></span><span id="slot-note"></span></div>
+        <div class="lanes" id="lanes"></div>
       </section>
 
-      <section class="sec logsec">
-        <div class="sh"><b>Log</b><span id="log-count">0 lines</span></div>
-        <div class="tools">
-          <div class="seg" id="lvl" role="group" aria-label="Level">
-            <button data-l="all" aria-pressed="true">All</button><button data-l="warn" aria-pressed="false">Warnings</button><button data-l="err" aria-pressed="false">Errors</button>
-          </div>
-          <input id="q" type="search" placeholder="Filter  ( / )" aria-label="Filter log" autocomplete="off" spellcheck="false">
-          <span class="grow"></span>
-          <div class="seg"><button id="b-follow" aria-pressed="true">Follow</button></div>
+      <section class="sec reqs tabsec" id="reqs">
+        <div class="sh tabhead" role="tablist" aria-label="Requests and logs">
+          <button class="tab" role="tab" id="tab-req" data-pane="req" aria-selected="true" aria-controls="pane-req">Requests</button>
+          <button class="tab" role="tab" id="tab-log" data-pane="log" aria-selected="false" aria-controls="pane-log">Logs</button>
+          <span class="cnt" id="pane-count">0</span>
         </div>
-        <div class="logwrap">
-          <div class="log" id="log" role="log" aria-live="off" tabindex="0"></div>
-          <button class="jump" id="jump" hidden>Latest</button>
+        <div id="pane-req" role="tabpanel" aria-labelledby="tab-req">
+          <div class="sh phead"><b>Requests</b><span class="cnt" id="req-count">0</span></div>
+          <div class="tw">
+            <table>
+              <thead><tr><th>Time</th><th>ID</th><th>Endpoint</th><th class="n">Output</th><th class="n">Tokens/s</th><th class="n">Duration</th></tr></thead>
+              <tbody id="t-req"></tbody>
+            </table>
+            <div class="empty" id="req-empty">No requests yet.</div>
+          </div>
+        </div>
+        <div id="pane-log" role="tabpanel" aria-labelledby="tab-log" hidden>
+          <div class="sh phead"><b>Log</b><span class="cnt" id="log-count">0 lines</span></div>
+          <div class="tools">
+            <div class="seg" id="lvl" role="group" aria-label="Level">
+              <button data-l="all" aria-pressed="true">All</button><button data-l="warn" aria-pressed="false">Warnings</button><button data-l="err" aria-pressed="false">Errors</button>
+            </div>
+            <input id="q" type="search" placeholder="Filter  ( / )" aria-label="Filter log" autocomplete="off" spellcheck="false">
+            <span class="grow"></span>
+            <div class="seg"><button id="b-follow" aria-pressed="true">Follow</button></div>
+          </div>
+          <div class="logwrap">
+            <div class="log" id="log" role="log" aria-live="off" tabindex="0"></div>
+            <button class="jump" id="jump" hidden>Latest</button>
+          </div>
         </div>
       </section>
     </div>

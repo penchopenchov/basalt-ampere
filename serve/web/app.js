@@ -8,6 +8,7 @@ const p2 = n => String(n).padStart(2, "0");
 const clock = ms => { const d = new Date(ms); return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, "0")}`; };
 const gib = n => num(n) ? (n / 1024 ** 3).toFixed(1) : "—";
 const HIST = 60;
+let perStream = Array(HIST).fill(0);   // mean tok/s per decoding slot, one sample per poll
 
 let apiKey = sessionStorage.getItem("basalt.key") || "";
 let M = null;          // the last /metrics reading
@@ -24,15 +25,15 @@ function view(v) {
   $("#view-stats").hidden = v !== "stats";
   $("#view-hardware").hidden = v !== "hardware";
   $("#top").hidden = v !== "stats";
-  $$(".tab").forEach(t => t.setAttribute("aria-selected", String(t.dataset.view === v)));
+  $$(".tabs .tab").forEach(t => t.setAttribute("aria-selected", String(t.dataset.view === v)));
   if (location.hash.slice(1) !== v) history.replaceState(null, "", "#" + v);
   if (v === "stats") scrollLog();
 }
-$$(".tab").forEach(t => t.onclick = () => view(t.dataset.view));
+$$(".tabs .tab").forEach(t => t.onclick = () => view(t.dataset.view));
 
 /* ---- charts ---- */
 const CHARTS = [
-  { id: "decode", name: "Decode", steps: [100, 200, 400, 600, 800, 1000, 2000], hover: null, v: Array(HIST).fill(0), max: 400 },
+  { id: "decode", name: "Decode", steps: [50, 100, 200, 250, 300, 400, 500, 600, 700, 800, 1000, 1200, 1500, 2000], hover: null, v: Array(HIST).fill(0), max: 400 },
   { id: "prefill", name: "Prefill", steps: [2000, 4000, 8000, 16000, 32000], hover: null, v: Array(HIST).fill(0), max: 8000 }];
 const axis = n => n >= 1000 ? `${n / 1000}k` : String(n);
 const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : 0); while (v.length < HIST) v.unshift(0); return v; };
@@ -40,9 +41,13 @@ const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : 0); w
 function drawChart(c, now, last) {
   const el = $("#chart-" + c.id), [cur, dot, tip] = el.querySelectorAll(".cur, .cdot, .tip");
   const label = $("#rd-" + c.id + "-l"), read = $("#rd-" + c.id), unit = "<small>tok/s</small>";
-  const top = Math.max(...c.v, 0) * 1.05;
-  c.max = c.steps.find(s => s >= top) || c.steps[c.steps.length - 1];
-  $("#line-" + c.id).setAttribute("points", c.v.map((x, i) => `${i},${(100 - clamp(x, 0, c.max) / c.max * 100).toFixed(2)}`).join(" "));
+  // the axis follows every plotted line (aggregate and per stream), with headroom, so nothing clips
+  const per = c.id === "decode" ? perStream : [];
+  const top = Math.max(...c.v, ...per, 0) * 1.05;
+  c.max = c.steps.find(s => s >= top) || Math.ceil(top / 500) * 500;
+  const pts = a => a.map((x, i) => `${i},${(100 - clamp(x, 0, c.max) / c.max * 100).toFixed(2)}`).join(" ");
+  $("#line-" + c.id).setAttribute("points", pts(c.v));
+  if (c.id === "decode") $("#line-per").setAttribute("points", pts(per));
   el.querySelector(".y0").textContent = axis(c.max);
   el.querySelector(".y1").textContent = axis(c.max / 2);
   const h = c.hover;
@@ -89,6 +94,7 @@ function draw() {
   const gpus = hw.gpus || [], g0 = gpus[0] || {}, names = Object.fromEntries((st.gpus || []).map(g => [g.index, g.name]));
   const reqs = M.requests || [], r0 = reqs[0], busy = live.state === "reading" || live.state === "generating";
   const generating = live.state === "generating";
+  const sl = live.slots || {}, multi = sl.total > 1, slotRows = M.slots || [], dec = slotRows.filter(s => s.state === "decoding").length;
 
   const name = (live.state || "idle")[0].toUpperCase() + (live.state || "idle").slice(1);
   setState(live.state || "idle", live.queued > 0 ? `${name} · ${live.queued} queued` : name);
@@ -97,12 +103,19 @@ function draw() {
   const last = r0 && num(r0.decode_tok_s) ? r0.decode_tok_s : null, tok = generating && num(live.tok_s) ? live.tok_s : last;
   $("#v-tok").textContent = num(tok) ? tok.toFixed(1) : "—";
   $("#v-tok").classList.toggle("idle", !generating);
-  $("#heat").style.left = clamp((tok || 0) / 400, 0, 1) * 100 + "%";
+  $("#heat").style.left = clamp((tok || 0) / 800, 0, 1) * 100 + "%";
+  CHARTS[0].name = multi ? "Tok/s (aggregate)" : "Decode";
+  text("#k-tok", multi ? "Tok/s (aggregate)" : "Tokens/s");
+  text("#speed-note", multi ? "Last 60 s · dashed: per stream" : "Last 60 s");
+  $("#line-per").style.display = multi ? "" : "none";
+  $("#s-busy").hidden = !multi;
+  $("#s-busy").innerHTML = `<b>${sl.active || 0}</b> of ${sl.total} slots busy${dec && num(live.tok_s) ? ` · ${fmt(live.tok_s / dec)} per stream` : ""}`;
   text("#limit", num(g0.power_limit) ? `@ ${Math.round(g0.power_limit)} W` : "");
   $("#v-acc").innerHTML = r0 && r0.drafts_offered > 0 ? `${(r0.drafts_accepted / r0.drafts_offered * 100).toFixed(0)}<small>%</small>` : "—";
-  const ctx = busy ? (live.prompt_tokens || 0) + (live.generated || 0) : r0 ? (r0.prompt_tokens || 0) + (r0.output_tokens || 0) : null;
+  const ctx = multi ? slotRows.reduce((a, s) => a + (s.is_processing ? s.ctx_used : 0), 0)
+    : busy ? (live.prompt_tokens || 0) + (live.generated || 0) : r0 ? (r0.prompt_tokens || 0) + (r0.output_tokens || 0) : null;
   text("#v-ctx", num(ctx) ? fmt(ctx) : "—");
-  text("#s-ctx", num(eng.max_context) ? `of ${fmt(eng.max_context)} tokens` : "");
+  text("#s-ctx", num(eng.max_context) ? `of ${fmt(eng.max_context * (sl.total || 1))} tokens` : "");
 
   const h = M.history || {};
   CHARTS[0].v = tail(h.tok_s); CHARTS[1].v = tail(h.prefill_tok_s_mean);
@@ -124,14 +137,16 @@ function draw() {
     text("#tl-" + k, sh ? pct(sh[i]) : "—");
   });
 
-  drawRequests(live, reqs, busy);
+  drawRequests(live, reqs, busy, multi);
+  drawSlots(M, multi);
   drawHardware(eng, st, hw, gpus, names, sh);
 }
 
-function drawRequests(live, reqs, busy) {
+function drawRequests(live, reqs, busy, multi) {
   const rows = [];
-  if (busy) rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "—", out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
-  reqs.forEach(r => rows.push({ t: r.time, id: r.id, path: (r.path || "").replace("/v1/", ""), out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish }));
+  if (busy && !multi) rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "—", out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
+  reqs.forEach(r => rows.push({ t: r.time, id: r.id, path: (r.path || "").replace("/v1/", "").replace("chat/completions", "chat"), out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish }));
+  const total = rows.length; rows.length = Math.min(rows.length, 6);   // with slots, the lanes show what is running
   const tb = $("#t-req"); tb.replaceChildren();
   rows.forEach(r => {
     const tr = document.createElement("tr"); if (r.live) tr.className = "live";
@@ -145,7 +160,7 @@ function drawRequests(live, reqs, busy) {
     tb.append(tr);
   });
   $("#req-empty").hidden = rows.length > 0;
-  text("#req-count", String(rows.length));
+  PANE.req = String(total); text("#req-count", PANE.req); if (curPane() === "req") text("#pane-count", PANE.req);
 }
 
 function drawHardware(eng, st, hw, gpus, names, sh) {
@@ -185,17 +200,25 @@ function drawHardware(eng, st, hw, gpus, names, sh) {
   text("#h-build", eng.version || "—");
 }
 
-$("#req-toggle").onclick = () => {
-  const shut = $("#reqs").classList.toggle("shut");
-  $("#req-toggle").textContent = shut ? "Show" : "Hide";
-  $("#req-toggle").setAttribute("aria-expanded", String(!shut));
-};
+const PANE = { req: "0", log: "0 lines" };
+let paneOn = "req";
+// tabbed (several slots): one panel shows; split (one slot): both show, stacked
+function pane(p = paneOn) {
+  paneOn = p;
+  const split = $(".col-r").classList.contains("single");
+  $$("#reqs .tab").forEach(t => t.setAttribute("aria-selected", String(t.dataset.pane === p)));
+  $("#pane-req").hidden = !split && p !== "req"; $("#pane-log").hidden = !split && p !== "log";
+  text("#pane-count", PANE[p]);
+  scrollLog();
+}
+$$("#reqs .tab").forEach(t => t.onclick = () => pane(t.dataset.pane));
+const curPane = () => paneOn;
 
 /* ---- log ---- */
 const logs = [];
 const F = { lvl: "all", q: "", follow: true };
 const logEl = $("#log");
-const MAXDOM = 700;
+const MAXDOM = matchMedia("(min-width: 981px)").matches ? 12 : 14;   // a desktop log shows the last few lines
 const passes = e => (F.lvl === "all" || (F.lvl === "warn" && e.lvl !== "info") || (F.lvl === "err" && e.lvl === "err"))
   && (!F.q || e.msg.toLowerCase().includes(F.q.toLowerCase()));
 
@@ -223,7 +246,7 @@ function lineEl(e) {
   d.append(mk("t", clock(e.t * 1000)), mk("s", e.src), mk("lv", e.lvl === "info" ? "INF" : e.lvl === "warn" ? "WRN" : "ERR"), msg);
   return d;
 }
-const counts = () => text("#log-count", `${fmt(logs.length)} lines`);
+const counts = () => { PANE.log = `${fmt(logs.length)} lines`; text("#log-count", PANE.log); if (curPane() === "log") text("#pane-count", PANE.log); };
 function rebuild() {
   const out = [];
   for (let i = logs.length - 1; i >= 0 && out.length < MAXDOM; i--) if (passes(logs[i])) out.push(logs[i]);
@@ -256,15 +279,83 @@ $$("#lvl button").forEach(b => b.onclick = () => {
 $("#q").oninput = e => { F.q = e.target.value.trim(); rebuild(); };
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT") { if (e.key === "Escape") e.target.blur(); return; }
-  if (e.key === "/") { e.preventDefault(); view("stats"); $("#q").focus(); }
+  if (e.key === "/") { e.preventDefault(); view("stats"); pane("log"); $("#q").focus(); }
   else if (e.key === "f") setFollow(!F.follow);
 });
+
+/* ---- slots and queue (only with more than one slot) ---- */
+const API = { openai: "OpenAI", anthropic: "Anthropic" };
+const kfmt = n => n >= 10000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k" : fmt(n);
+const STATE = { idle: "Idle", prefill: "Prefill", decoding: "Decoding" };
+const cell = (cls, text) => { const e = document.createElement("span"); e.className = cls; if (text != null) e.textContent = text; return e; };
+
+function drawSlots(M, multi) {
+  $("#slots").hidden = $("#queue").hidden = !multi;
+  const col = $(".col-r"); if (col.classList.contains("single") === multi) { col.classList.toggle("single", !multi); pane(); }
+  if (!multi) return;
+  const sl = M.slots || [], host = $("#lanes"), live = M.live, queue = live.queue || [];
+  if (host.dataset.n !== String(sl.length)) {
+    host.dataset.n = String(sl.length);
+    const head = document.createElement("div"); head.className = "lane head";
+    ["Slot", "State", "Tokens/s", "Output", "Context", "Accept", "Request"].forEach(t => head.append(cell(t === "Accept" ? "n" : "", t)));
+    host.replaceChildren(head, ...sl.map(s => {
+      const d = document.createElement("div"); d.className = "lane"; d.dataset.s = "idle";
+      const ctxc = cell("l-ctx"), meter = cell("meter"); meter.append(document.createElement("i")); ctxc.append(meter, cell(""));
+      d.append(cell("l-id", `Slot ${s.id}`), cell("l-st"), cell("l-tps"), cell("l-tok"), ctxc, cell("l-acc"), cell("l-req"));
+      return d;
+    }));
+  }
+  const rows = host.querySelectorAll(".lane:not(.head)");
+  sl.forEach((s, i) => {
+    const el = rows[i]; if (!el) return;
+    const q = c => el.querySelector(c);
+    el.dataset.s = s.state;
+    text2(q(".l-st"), STATE[s.state] || s.state);
+    const tps = q(".l-tps"); tps.replaceChildren();
+    if (s.state === "decoding") tps.append(fmt(s.tok_s), Object.assign(document.createElement("small"), { textContent: "tok/s" }));
+    else if (s.state === "prefill") {
+      const small = document.createElement("small");
+      small.textContent = num(s.prefill_done) && s.prompt_tokens ? `% of ${kfmt(s.prompt_tokens)} prompt` : `reading ${kfmt(s.prompt_tokens || 0)} prompt`;
+      if (num(s.prefill_done) && s.prompt_tokens) tps.append(String(Math.round(s.prefill_done / s.prompt_tokens * 100)));
+      tps.append(small);
+    } else tps.append("—");
+    text2(q(".l-tok"), s.is_processing ? `${fmt(s.generated)} tokens` : "—");
+    const f = s.n_ctx ? s.ctx_used / s.n_ctx : 0, m = q(".meter");
+    m.firstChild.style.width = clamp(f, 0, 1) * 100 + "%"; m.classList.toggle("hot", f > .8);
+    text2(q(".l-ctx").lastChild, `${kfmt(s.ctx_used || 0)} / ${kfmt(s.n_ctx || 0)}`);
+    text2(q(".l-acc"), s.drafts_offered > 20 ? `${(s.drafts_accepted / s.drafts_offered * 100).toFixed(0)}%` : "—");
+    const rq = q(".l-req"); rq.replaceChildren();
+    if (s.is_processing) { const b = document.createElement("b"); b.textContent = API[s.api] || s.api || "—"; rq.append(b, ` · ${s.model || "—"}`); }
+    else rq.append("—");
+  });
+  text("#slot-count", `${(live.slots || {}).active || 0} of ${sl.length} busy`);
+  text("#slot-note", sl.length ? `${kfmt(sl[0].n_ctx)} context each` : "");
+
+  text("#q-count", String(live.queued || 0));
+  const tb = $("#t-queue"); tb.replaceChildren();
+  queue.slice(0, 3).forEach(r => {
+    const tr = document.createElement("tr");
+    [[`${(r.waited_s || 0).toFixed(1)} s`, "f"], [API[r.api] || r.api || "—", ""], [r.model || "—", ""], [num(r.prompt_tokens) ? fmt(r.prompt_tokens) : "—", "n"]].forEach(([t, c]) => {
+      const td = document.createElement("td"); td.textContent = t; if (c) td.className = c; tr.append(td);
+    });
+    tb.append(tr);
+  });
+  const more = (live.queued || 0) - Math.min(3, queue.length);
+  if (more > 0) { const tr = document.createElement("tr"), td = document.createElement("td"); td.colSpan = 4; td.textContent = `+${more} more`; tr.append(td); tb.append(tr); }
+  $("#q-empty").hidden = (live.queued || 0) > 0;
+  text2($("#q-empty"), "No request is waiting.");
+}
+const text2 = (e, v) => { if (e.textContent !== v) e.textContent = v; };
 
 /* ---- polling ---- */
 let lastLog = 0;
 async function pollMetrics() {
   try {
-    M = await get("metrics"); $("#auth").hidden = true; draw();
+    const m = await get("metrics");
+    m.slots = m.live && m.live.slots && m.live.slots.total > 1 ? await get("slots").catch(() => []) : [];
+    const dec = m.slots.filter(s => s.state === "decoding").length;
+    perStream = perStream.slice(1).concat(dec ? (m.live.tok_s || 0) / dec : 0);
+    M = m; $("#auth").hidden = true; draw();
   } catch (e) {
     $("#auth").hidden = !e.locked; M = null;
     setState("offline", e.locked ? "Locked" : "Offline");
