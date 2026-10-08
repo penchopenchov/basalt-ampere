@@ -220,7 +220,7 @@ class Engine {
 public:
     ~Engine() { stop(); }
 
-    bool start(const std::string& exe, const std::vector<std::string>& args, const std::string& log_path,
+    bool start(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
                std::string& err) {
         int in[2], out[2];
         if (pipe(in) != 0 || pipe(out) != 0) { err = "pipe failed"; return false; }
@@ -233,13 +233,13 @@ public:
             if (lf >= 0) dup2(lf, 2);
             close(in[0]); close(in[1]); close(out[0]); close(out[1]);
             std::vector<std::string> store;
-            store.push_back(exe);
+            store.push_back(engine_bin);
             store.push_back("--serve");
             for (const auto& a : args) store.push_back(a);
             std::vector<char*> av;
             for (auto& s : store) av.push_back(s.data());
             av.push_back(nullptr);
-            execv(exe.c_str(), av.data());
+            execv(engine_bin.c_str(), av.data());
             _exit(127);
         }
         close(in[0]);
@@ -848,16 +848,16 @@ int main(int argc, char** argv) {
     }
 
     // engine command from the model and the overrides
-    std::string exe = o.engine;
+    std::string engine_bin = o.engine;
     std::vector<std::string> args;
     if (!o.model.empty()) {
         args = {"--model", fs::absolute(o.model).string()};
         if (!has_arg(args, "--peer-device") && visible_gpus() > 1) set_arg(args, "--peer-device", "1");
     }
-    if (exe.empty()) exe = BASALT_BENCH_ENGINE;
-    if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) exe = BASALT_BENCH_ENGINE;
-    if (exe.empty() || !fs::exists(exe)) {
-        std::fprintf(stderr, "basalt-bench: the engine binary %s does not exist (--engine BIN)\n", exe.c_str());
+    if (engine_bin.empty()) engine_bin = BASALT_BENCH_ENGINE;
+    if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) engine_bin = BASALT_BENCH_ENGINE;
+    if (engine_bin.empty() || !fs::exists(engine_bin)) {
+        std::fprintf(stderr, "basalt-bench: the engine binary %s does not exist (--engine BIN)\n", engine_bin.c_str());
         return 2;
     }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
@@ -904,7 +904,7 @@ int main(int argc, char** argv) {
         set_arg(args, "--max-context", std::to_string(need));
     }
     if (o.print_command) {
-        std::printf("%s --serve", exe.c_str());
+        std::printf("%s --serve", engine_bin.c_str());
         for (const auto& a : args) std::printf(" %s", a.c_str());
         std::printf("\n");
         return 0;
@@ -955,8 +955,8 @@ int main(int argc, char** argv) {
         for (const auto& a : perf_args) engine_args_text += (engine_args_text.empty() ? "" : " ") + a;
         const std::string log_path = (fs::path(work) / "engine.log").string();
         Engine eng;
-        std::fprintf(stderr, "basalt-bench: starting %s\n", exe.c_str());
-        if (!eng.start(exe, perf_args, log_path, err)) {
+        std::fprintf(stderr, "basalt-bench: starting %s\n", engine_bin.c_str());
+        if (!eng.start(engine_bin, perf_args, log_path, err)) {
             std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
             return 1;
         }
@@ -1069,7 +1069,7 @@ int main(int argc, char** argv) {
             Engine eng;
             const auto t0 = Clock::now();
             std::fprintf(stderr, "basalt-bench: starting the engine for the quality gate\n");
-            if (!eng.start(exe, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
+            if (!eng.start(engine_bin, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
                 std::fprintf(stderr, "basalt-bench: %s\n", quality.err.c_str());
             } else {
                 quality.load_s = secs(t0, Clock::now());

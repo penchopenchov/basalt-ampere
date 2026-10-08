@@ -17,7 +17,7 @@
 // already established independently (1,223 / 1 tensors; 202 Q2_0 in shard 1). Agreement with those
 // numbers is the test.
 //
-// Build: scripts/build_artifact.bat        Run: gguf_reader.exe <file.gguf> [--check]
+// Target: basalt-gguf (CMake).  Run: basalt-gguf <file.gguf> [--check]
 
 #include <cstdint>
 #include <cstdio>

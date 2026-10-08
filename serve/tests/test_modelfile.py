@@ -27,9 +27,9 @@ class Tmp(unittest.TestCase):
         patch = mock.patch.dict(os.environ, {"BASALT_CACHE": str(self.dir / "cache")})
         patch.start()
         self.addCleanup(patch.stop)
-        self.exe = self.dir / "bin" / "basalt"
-        self.exe.parent.mkdir()
-        self.exe.write_text("")
+        self.engine_bin = self.dir / "bin" / "basalt"
+        self.engine_bin.parent.mkdir()
+        self.engine_bin.write_text("")
 
     def build(self, vision=False, meta=META):
         path = self.dir / "tiny.basalt"
@@ -47,8 +47,8 @@ class Tmp(unittest.TestCase):
 class Derivation(Tmp):
     def test_config(self):
         path = self.build()
-        cfg = modelfile.model_config(path, str(self.exe), gpus=1)
-        self.assertEqual(cfg["engine_bin"], str(self.exe))
+        cfg = modelfile.model_config(path, str(self.engine_bin), gpus=1)
+        self.assertEqual(cfg["engine_bin"], str(self.engine_bin))
         self.assertEqual(cfg["args"], ["--model", path])
         self.assertEqual(cfg["model_name"], "tiny-basalt")
         self.assertEqual(cfg["sampling"], META["sampling"])
@@ -59,17 +59,17 @@ class Derivation(Tmp):
     def test_cache_key_is_the_meta_hash(self):
         path = self.build()
         key = ModelFile(path).sections["meta"][2].hex()[:16]
-        tok = Path(modelfile.model_config(path, str(self.exe), gpus=1)["tokenizer"])
+        tok = Path(modelfile.model_config(path, str(self.engine_bin), gpus=1)["tokenizer"])
         self.assertEqual(tok, self.dir / "cache" / key / "tokenizer")
 
     def test_tokenizer_extracted_once_and_reused(self):
         path = self.build()
-        tok = Path(modelfile.model_config(path, str(self.exe), gpus=1)["tokenizer"])
+        tok = Path(modelfile.model_config(path, str(self.engine_bin), gpus=1)["tokenizer"])
         for n, b in TOKENIZER.items():
             self.assertEqual((tok / n).read_bytes(), b)
         self.assertEqual([p.name for p in tok.parent.iterdir()], ["tokenizer"])
         (tok / "vocab.json").write_bytes(b"{}")                # a present directory is not rewritten
-        modelfile.model_config(path, str(self.exe), gpus=1)
+        modelfile.model_config(path, str(self.engine_bin), gpus=1)
         self.assertEqual((tok / "vocab.json").read_bytes(), b"{}")
 
     def test_missing_tokenizer_and_bad_file(self):
@@ -77,47 +77,47 @@ class Derivation(Tmp):
         w.add_bytes("meta", b"{}")
         w.close()
         with self.assertRaises(ValueError):
-            modelfile.model_config(str(self.dir / "bare.basalt"), str(self.exe), gpus=1)
+            modelfile.model_config(str(self.dir / "bare.basalt"), str(self.engine_bin), gpus=1)
         (self.dir / "junk").write_bytes(b"x" * 5000)
         with self.assertRaises(ValueError):
-            modelfile.model_config(str(self.dir / "junk"), str(self.exe), gpus=1)
+            modelfile.model_config(str(self.dir / "junk"), str(self.engine_bin), gpus=1)
 
 
 class Peer(Tmp):
     def test_second_gpu_becomes_the_peer(self):
         path = self.build()
-        cfg = modelfile.model_config(path, str(self.exe), gpus=2)
+        cfg = modelfile.model_config(path, str(self.engine_bin), gpus=2)
         self.assertEqual(cfg["args"][-2:], ["--peer-device", "1"])
         self.assertEqual(gpus_in_play(cfg, cfg["args"]), [0, 1])
-        self.assertNotIn("--peer-device", modelfile.model_config(path, str(self.exe), gpus=1)["args"])
+        self.assertNotIn("--peer-device", modelfile.model_config(path, str(self.engine_bin), gpus=1)["args"])
 
     def test_vision_tells_the_engine(self):
         path = self.build(vision=True)
-        (self.exe.parent / "basalt-vision").write_text("")
-        cfg = modelfile.model_config(path, str(self.exe), gpus=1, vision=True)
+        (self.engine_bin.parent / "basalt-vision").write_text("")
+        cfg = modelfile.model_config(path, str(self.engine_bin), gpus=1, vision=True)
         self.assertIn("vision", cfg)
         self.assertIn("--vision", cfg["args"])
 
     def test_overrides_replace_or_add(self):
         path = self.build()
-        args = modelfile.model_config(path, str(self.exe), gpus=1,
+        args = modelfile.model_config(path, str(self.engine_bin), gpus=1,
                                       overrides={"--spec": 0, "--mtp-max-t": 4})["args"]
         self.assertEqual(args, ["--model", path, "--spec", "0", "--mtp-max-t", "4"])
-        args = modelfile.model_config(path, str(self.exe), gpus=1, overrides={"--spec": 3})["args"]
+        args = modelfile.model_config(path, str(self.engine_bin), gpus=1, overrides={"--spec": 3})["args"]
         self.assertEqual(args, ["--model", path, "--spec", "3"])
 
     def test_switch_override_is_added_once(self):
         path = self.build()
-        args = modelfile.model_config(path, str(self.exe), gpus=1, overrides={"--peer-exclusive": True})["args"]
+        args = modelfile.model_config(path, str(self.engine_bin), gpus=1, overrides={"--peer-exclusive": True})["args"]
         self.assertEqual(args, ["--model", path, "--peer-exclusive"])
 
     def test_plain_pack_gives_only_the_model(self):
         path = self.build()
-        self.assertEqual(modelfile.model_config(path, str(self.exe), gpus=1)["args"], ["--model", path])
+        self.assertEqual(modelfile.model_config(path, str(self.engine_bin), gpus=1)["args"], ["--model", path])
 
     def test_engine_args_in_an_old_pack_are_ignored(self):
         path = self.build(meta={**META, "engine_args": ["--spec", "7", "--peer-device", "-1"]})
-        cfg = modelfile.model_config(path, str(self.exe), gpus=2)
+        cfg = modelfile.model_config(path, str(self.engine_bin), gpus=2)
         self.assertEqual(cfg["args"], ["--model", path, "--peer-device", "1"])
         self.assertEqual(cfg["sampling"], META["sampling"])
 
@@ -133,17 +133,17 @@ class Peer(Tmp):
         with mock.patch.dict(os.environ, env, clear=True), mock.patch("subprocess.run", return_value=out):
             self.assertEqual(modelfile.gpu_count(), 2)
             path = self.build()
-            self.assertEqual(modelfile.model_config(path, str(self.exe))["args"][-2:], ["--peer-device", "1"])
+            self.assertEqual(modelfile.model_config(path, str(self.engine_bin))["args"][-2:], ["--peer-device", "1"])
         with mock.patch.dict(os.environ, env, clear=True), mock.patch("subprocess.run", side_effect=OSError):
             self.assertEqual(modelfile.gpu_count(), 0)
 
 
 class Vision(Tmp):
-    def test_sidecar_beside_the_exe_and_sections_unpacked(self):
+    def test_sidecar_beside_the_engine_bin_and_sections_unpacked(self):
         path = self.build(vision=True)
-        side = self.exe.parent / "basalt-vision"
+        side = self.engine_bin.parent / "basalt-vision"
         side.write_text("")
-        v = modelfile.model_config(path, str(self.exe), gpus=1, vision=True)["vision"]
+        v = modelfile.model_config(path, str(self.engine_bin), gpus=1, vision=True)["vision"]
         self.assertEqual(v["vision_bin"], str(side.resolve()))
         self.assertEqual(Path(v["mmproj"]).read_bytes(), b"MMPROJ" * 100)
         self.assertEqual(Path(v["model"]).read_bytes(), b"VOCAB")
@@ -151,27 +151,27 @@ class Vision(Tmp):
 
     def test_off_by_default(self):
         path = self.build(vision=True)
-        (self.exe.parent / "basalt-vision").write_text("")
-        cfg = modelfile.model_config(path, str(self.exe), gpus=1)
+        (self.engine_bin.parent / "basalt-vision").write_text("")
+        cfg = modelfile.model_config(path, str(self.engine_bin), gpus=1)
         self.assertNotIn("vision", cfg)
         self.assertNotIn("--vision", cfg["args"])
 
     def test_gpu_or_cpu_encoder(self):
         path = self.build(vision=True)
-        (self.exe.parent / "basalt-vision").write_text("")
-        self.assertTrue(modelfile.model_config(path, str(self.exe), gpus=1, vision=True)["vision"]["gpu"])
-        self.assertFalse(modelfile.model_config(path, str(self.exe), gpus=1, vision="cpu")["vision"]["gpu"])
+        (self.engine_bin.parent / "basalt-vision").write_text("")
+        self.assertTrue(modelfile.model_config(path, str(self.engine_bin), gpus=1, vision=True)["vision"]["gpu"])
+        self.assertFalse(modelfile.model_config(path, str(self.engine_bin), gpus=1, vision="cpu")["vision"]["gpu"])
 
     def test_error_when_the_sidecar_is_missing(self):
         path = self.build(vision=True)
         with self.assertRaisesRegex(ValueError, "basalt-vision"):
-            modelfile.model_config(path, str(self.exe), gpus=1, vision=True)
+            modelfile.model_config(path, str(self.engine_bin), gpus=1, vision=True)
 
     def test_error_when_the_model_has_no_projector(self):
         path = self.build(vision=False)
-        (self.exe.parent / "basalt-vision").write_text("")
+        (self.engine_bin.parent / "basalt-vision").write_text("")
         with self.assertRaisesRegex(ValueError, "projector"):
-            modelfile.model_config(path, str(self.exe), gpus=1, vision="cpu")
+            modelfile.model_config(path, str(self.engine_bin), gpus=1, vision="cpu")
 
 
 class Cli(Tmp):
@@ -192,13 +192,13 @@ class Cli(Tmp):
         self.assertIn("engine binary", err.getvalue())
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--model", path, "--engine-bin", str(self.exe), "--gpu", "x")
+            e = self.run_main("--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "x")
         self.assertEqual(getattr(e, "code", None), 2)
 
     def test_vision_flags_reach_model_config(self):
         from serve import server
         path = self.build(vision=True)
-        base = ["--model", path, "--engine-bin", str(self.exe), "--gpu", "0"]
+        base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
         for flags, want in (([], False), (["--vision"], True), (["--vision-cpu"], "cpu"), (["--vision", "--vision-cpu"], "cpu")):
             with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
                     mock.patch("sys.stderr", io.StringIO()):
@@ -209,7 +209,7 @@ class Cli(Tmp):
         path = self.build(vision=True)
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--model", path, "--engine-bin", str(self.exe), "--gpu", "0", "--vision")
+            e = self.run_main("--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0", "--vision")
         self.assertEqual(getattr(e, "code", None), 2)
         self.assertIn("basalt-vision", err.getvalue())
 

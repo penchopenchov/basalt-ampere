@@ -181,8 +181,8 @@ class EveryOption(unittest.TestCase):
         flags = engine_parser_flags()
         self.assertGreater(len(flags), 100)
         server = set(server_options(build_parser())) - set(ENGINE_PASSTHROUGH)
-        exe = write("\0".join(flags) + "\0", "fake-engine")
-        known = engine_flags_of(exe)
+        engine_bin = write("\0".join(flags) + "\0", "fake-engine")
+        known = engine_flags_of(engine_bin)
         self.assertEqual(known, set(flags))
         for flag, takes_value in flags.items():
             if flag == "--help":                           # the server answers its own help
@@ -204,10 +204,10 @@ class EveryOption(unittest.TestCase):
             self.assertIn(flag, args)
 
     def test_the_built_engine_accepts_every_flag(self):
-        exe = ROOT / "bin/basalt"
-        if not exe.exists():
+        engine_bin = ROOT / "bin/basalt"
+        if not engine_bin.exists():
             self.skipTest("no built bin/basalt")
-        missing = set(engine_parser_flags()) - (engine_flags_of(str(exe)) or set())
+        missing = set(engine_parser_flags()) - (engine_flags_of(str(engine_bin)) or set())
         self.assertEqual(missing, set())
 
 

@@ -44,10 +44,10 @@ def set_args(args: list[str], extra: list[str]) -> list[str]:
     return out
 
 
-def run(label: str, exe: str, args: list[str], prompts: list[str], tokens: int, logs: Path) -> list[list[int]] | None:
+def run(label: str, engine_bin: str, args: list[str], prompts: list[str], tokens: int, logs: Path) -> list[list[int]] | None:
     """One engine session over the prompts: the generated ids of each, or None when the engine failed."""
     err = open(logs / f"{label}.err", "w")
-    proc = subprocess.Popen([exe, "--serve", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+    proc = subprocess.Popen([engine_bin, "--serve", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
                             text=True, bufsize=1)
     out: list[list[int]] = []
     try:
@@ -109,8 +109,8 @@ def main() -> int:
 
     logs = Path(tempfile.mkdtemp(prefix="greedy-identity-"))
     results = {}
-    for label, exe in (("ref", a.ref), ("new", a.new)):
-        r = run(label, exe, args, prompts, a.tokens, logs)
+    for label, engine_bin in (("ref", a.ref), ("new", a.new)):
+        r = run(label, engine_bin, args, prompts, a.tokens, logs)
         if r is None:
             tail = (logs / f"{label}.err").read_text().strip().splitlines()[-5:]
             print(f"greedy_identity: the {label} engine failed (logs: {logs})", *tail, sep="\n  ", file=sys.stderr)

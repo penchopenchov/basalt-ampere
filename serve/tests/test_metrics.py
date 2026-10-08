@@ -235,15 +235,15 @@ class PerGpu(unittest.TestCase):
 class EngineStderr(unittest.TestCase):
     def test_without_a_log_file_the_engine_stderr_reaches_the_sink(self):
         with tempfile.TemporaryDirectory() as d:
-            exe = os.path.join(d, "engine")
-            with open(exe, "w") as f:
+            engine_bin = os.path.join(d, "engine")
+            with open(engine_bin, "w") as f:
                 f.write(f"#!{sys.executable}\nimport sys\nprint('engine: hello', file=sys.stderr, flush=True)\n"
                         "print('READY 4096 stop', flush=True)\nsys.stdin.readline()\n")
-            os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR)
+            os.chmod(engine_bin, os.stat(engine_bin).st_mode | stat.S_IXUSR)
             logs = LogBuffer()
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
             try:
-                engine = ProcessEngine(exe, [])
+                engine = ProcessEngine(engine_bin, [])
             finally:
                 ProcessEngine.stderr_sink = None
             try:
