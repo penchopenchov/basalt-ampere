@@ -27,7 +27,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================================
-ggml / llama.cpp (third_party/ggml, and kernels adapted in src/)
+ggml and llama.cpp (https://github.com/ggml-org/ggml, https://github.com/ggml-org/llama.cpp)
+Extracted from llama.cpp commit 3cf03257f219afbe7334045ff7c6a06ac68c627d into
+  include/basalt/ggml/, src/kernels/cpu/ggml/ and src/prefill/mmq/;
+kernels adapted from it elsewhere in src/ (src/kernels/cuda/, src/prefill/, src/kernels/cpu/)
+Both projects publish the same licence text, reproduced once below.
 ================================================================================
 
 MIT License
