@@ -244,6 +244,80 @@ void bench(cudaStream_t s) {
     }
 }
 
+// The segment commit against one gdn_commit_layers launch per segment: the whole window's GDN layers (36) over S
+// segments of one row each (the batch window), as CUDA graphs, in microseconds; bitwise equal states first.
+void bench_seg(cudaStream_t s) {
+    std::mt19937 rng(17);
+    constexpr int NL = 36;
+    Gdn g = make_gdn(rng, NL);
+    const size_t layer_floats = GDN_FLOATS;
+    for (int nseg : {1, 2, 5, 8}) {
+        // each segment owns a copy of the states; the window's rows are shared (row k for segment k)
+        std::vector<float*> st(nseg), st_ref(nseg);
+        std::vector<int32_t*> keep(nseg);
+        std::vector<SegRow> rows(nseg);
+        for (int k = 0; k < nseg; ++k) {
+            CK(cudaMalloc(&st[k], NL * layer_floats * 4)); CK(cudaMalloc(&st_ref[k], NL * layer_floats * 4));
+            CK(cudaMemcpy(st[k], g.state0, NL * layer_floats * 4, cudaMemcpyDeviceToDevice));
+            CK(cudaMemcpy(st_ref[k], g.state0, NL * layer_floats * 4, cudaMemcpyDeviceToDevice));
+            CK(cudaMalloc(&keep[k], 4));
+            const int one = 1;
+            CK(cudaMemcpy(keep[k], &one, 4, cudaMemcpyHostToDevice));
+            rows[k] = SegRow{st[k], k, 0, 1, 1, k, 100};
+        }
+        SegRow* d_rows = nullptr;
+        CK(cudaMalloc(&d_rows, nseg * sizeof(SegRow)));
+        CK(cudaMemcpy(d_rows, rows.data(), nseg * sizeof(SegRow), cudaMemcpyHostToDevice));
+        auto per_seg = [&] {
+            for (int k = 0; k < nseg; ++k) {
+                GdnCommitLayers a;
+                a.state = st_ref[k]; a.h = g.h + (size_t) k * C; a.qkv = g.qkv + (size_t) k * C;
+                a.gate = g.gate + (size_t) k * HV; a.beta = g.beta + (size_t) k * HV;
+                a.state_stride = GDN_FLOATS; a.h_stride = (size_t) MT * C; a.gb_stride = (size_t) MT * HV;
+                a.C = C; a.h_k = HK; a.h_v = HV; a.n_layers = NL; a.n_keep = keep[k];
+                gdn_commit_layers(a, s, 32);
+            }
+        };
+        auto seg = [&] {
+            GdnCommitSeg a;
+            a.rows = d_rows; a.state_stride = GDN_FLOATS; a.h_stride = (size_t) MT * C; a.gb_stride = (size_t) MT * HV;
+            a.h = g.h; a.qkv = g.qkv; a.gate = g.gate; a.beta = g.beta;
+            a.C = C; a.h_k = HK; a.h_v = HV; a.n_layers = NL; a.n_rows = nseg;
+            gdn_commit_layers_seg(a, s, 32);
+        };
+        per_seg(); seg();
+        CK(cudaStreamSynchronize(s));
+        bool same = true;
+        for (int k = 0; k < nseg; ++k) same = same && host(st[k], NL * layer_floats * 4) == host(st_ref[k], NL * layer_floats * 4);
+        float us[2];
+        for (int path = 0; path < 2; ++path) {
+            cudaGraph_t gr;
+            cudaGraphExec_t ge;
+            CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+            if (path == 0) per_seg(); else seg();
+            CK(cudaStreamEndCapture(s, &gr));
+            CK(cudaGraphInstantiate(&ge, gr, 0));
+            cudaEvent_t e0, e1;
+            CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+            for (int w = 0; w < 3; ++w) CK(cudaGraphLaunch(ge, s));
+            constexpr int REPS = 50;
+            CK(cudaEventRecord(e0, s));
+            for (int r = 0; r < REPS; ++r) CK(cudaGraphLaunch(ge, s));
+            CK(cudaEventRecord(e1, s));
+            CK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            us[path] = ms * 1000.0f / REPS;
+            CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(gr));
+        }
+        const double gb = 2.0 * nseg * NL * (double) S * HV * S * 4 / 1e9;
+        std::printf("bench seg S=%d x 1 row: per-segment launches %.1f us | one segment launch %.1f us (%.0f GB/s), states %s\n",
+                    nseg, us[0], us[1], gb / (us[1] * 1e-6), same ? "bitwise" : "DIFFER");
+        for (int k = 0; k < nseg; ++k) { CK(cudaFree(st[k])); CK(cudaFree(st_ref[k])); CK(cudaFree(keep[k])); }
+        CK(cudaFree(d_rows));
+    }
+}
+
 // A chain of small device copies on its own stream (a stand-in for the draft's short kernels), alone and with the
 // GDN commit launched beside it: how long the chain takes and when the commit ends, both from the common start.
 void contention(cudaStream_t s) {
@@ -288,6 +362,6 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     const bool ok = parity(s);
-    if (mode == "--bench") { bench(s); contention(s); }
+    if (mode == "--bench") { bench(s); bench_seg(s); contention(s); }
     return ok ? 0 : 1;
 }

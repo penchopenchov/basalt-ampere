@@ -12,6 +12,7 @@
 // dependency wait (the window never writes the state).
 #include "basalt/kernels/dec_gdn.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 
 #include <cooperative_groups.h>
@@ -311,6 +312,25 @@ __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T)
     rec_block<MAXT, true>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr);
 }
 
+// rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
+// segment's rows and state
+template<int MAXT>
+__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
+                                                                              size_t state_off) {
+    const SegRow r = rows[blockIdx.y];
+    if (r.j != 0) return;
+    __shared__ RecSmem sm;
+    cg::cluster_group cl = cg::this_cluster();
+    DecRecArgs a = a0;
+    const size_t vd = (size_t) S * a.h_v, r0 = (size_t) r.row0;
+    a.state = r.gdn + state_off;
+    a.qkv += r0 * a.C; a.x += r0 * a.n_embd; a.z += r0 * vd; a.h += r0 * a.C;
+    a.gate += r0 * a.h_v; a.beta += r0 * a.h_v;
+    if (a.y) a.y += r0 * vd;
+    a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
+    rec_block<MAXT, false>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+}
+
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
 __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T) {
     if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights
@@ -344,6 +364,21 @@ void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     else launch_pdl(rec_kernel<kDecMaxT>, grid, block, 0, s, a, n_tok);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
+void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream) {
+    if (n_rows < 1 || max_n < 1 || max_n > kDecMaxT || !rows || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 ||
+        a.h_v % a.h_k != 0) {
+        std::fprintf(stderr, "dec_gdn_rec_seg: invalid arguments\n");
+        std::exit(1);
+    }
+    const dim3 grid((unsigned) (a.h_v * 4), (unsigned) n_rows), block(S);
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (max_n <= 2) launch_pdl(rec_seg_kernel<2>, grid, block, 0, s, a, rows, state_off);
+    else if (max_n <= 4) launch_pdl(rec_seg_kernel<4>, grid, block, 0, s, a, rows, state_off);
+    else launch_pdl(rec_seg_kernel<kDecMaxT>, grid, block, 0, s, a, rows, state_off);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec_seg: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void dec_gdn_rec_split(const DecRecArgs& a, int n_tok, void* stream) {

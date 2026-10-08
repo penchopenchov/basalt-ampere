@@ -38,6 +38,38 @@ struct GdnCommitLayers {
 };
 /// From `blocks` persistent blocks (grid-stride); each loads its next item while the current one runs.
 void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 32);
+/// A window of several sequences ("segments"): each segment is n consecutive rows with its own GDN state.  The table
+/// has one entry per window row (a segment's rows all carry the segment's fields), uploaded to the device per window.
+/// A kernel launched over the entries lets only the segment's first row (j == 0) do the segment's work.
+struct SegRow {
+    float* gdn;        // the segment's GDN state of layer 0 (layer l's state at gdn + l * state floats)
+    int32_t row0;      // the segment's first window row
+    int32_t j;         // this row's index in its segment
+    int32_t n;         // the segment's rows
+    int32_t n_keep;    // rows of the segment to commit
+    int32_t slot;      // the sequence's slot
+    int32_t pos;       // this row's position
+};
+static_assert(sizeof(SegRow) == 32, "SegRow is copied as eight words");
+/// gdn_conv_l2_multi over a segmented window: every row's conv from its own segment's history (hist_off floats past
+/// `gdn`: the layer's conv history), all n_rows rows in one launch; bitwise the per-segment calls.
+void gdn_conv_l2_seg(const SegRow* rows, size_t hist_off, const float* qkv, const float* conv_w, float* h, int channels,
+                     int qk_heads, float eps, int n_rows, void* stream);
+/// gdn_step_norm_multi's verify form (state read, not written) over every segment of a window, one launch.
+/// state_off: floats from `gdn` to the layer's state.
+void gdn_step_norm_seg(const SegRow* rows, size_t state_off, const float* h, int conv_channels, const float* gate,
+                       const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                       int n_rows, void* stream);
+/// gdn_commit_layers over every segment of a window: segment s keeps rows[s.row0].n_keep rows of its own state.  The
+/// layers' rows (h, qkv, gate, beta) are laid out as in GdnCommitLayers with the window's rows in each; state of
+/// layer l at gdn + state_off + l * state_stride.
+struct GdnCommitSeg {
+    const SegRow* rows = nullptr;
+    size_t state_off = 0, state_stride = 0, h_stride = 0, gb_stride = 0;
+    const float *h = nullptr, *qkv = nullptr, *gate = nullptr, *beta = nullptr;
+    int C = 0, h_k = 0, h_v = 0, n_layers = 0, n_rows = 0;
+};
+void gdn_commit_layers_seg(const GdnCommitSeg& a, void* stream, int blocks = 32);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);

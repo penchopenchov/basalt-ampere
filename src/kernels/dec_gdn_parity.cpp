@@ -12,6 +12,10 @@
 // eight-token window; the state must be left untouched.  Weights are random bytes with normal fp16 scales
 // (mmvq_multi_parity's rule), activations and state random normal.
 //
+// Segmented windows (part of the default run): conv_l2, the verify recurrence, dec_gdn_rec and the commit over a
+// device table of segments (1, 2, 5 or 8 segments, mixed tokens per segment, windows past kDecMaxT rows) against the
+// current kernels called once per segment (bitwise) and a CPU reference (tolerance).
+//
 // --bench: the reference and the three modes timed as CUDA graphs over enough layers' distinct weights that the L2
 // holds none of them, per stage and whole, in microseconds per layer and GB/s over the bytes each must move.
 #include "basalt/kernels/dec_gdn.hpp"
@@ -302,6 +306,258 @@ bool parity_gdnf(cudaStream_t s) {
     return ok;
 }
 
+// ---- segmented windows
+// CPU reference of one segment: conv + L2 (h) and the recurrence from `st0` over n tokens (y)
+struct CpuSeg {
+    std::vector<float> h, y;
+};
+CpuSeg cpu_seg(const std::vector<float>& st0, const std::vector<float>& qkv, const std::vector<float>& z,
+               const std::vector<float>& cw, const std::vector<float>& gamma, const std::vector<float>& gate,
+               const std::vector<float>& beta, int n) {
+    CpuSeg r;
+    r.h.assign((size_t) n * C, 0.f);
+    r.y.assign((size_t) n * ZV, 0.f);
+    const float* hist = st0.data() + (size_t) S * HV * S;
+    for (int t = 0; t < n; ++t) {
+        for (int c = 0; c < C; ++c) {
+            double win[4];
+            for (int j = 0; j < 4; ++j) {
+                const int src = t + j;
+                win[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
+            }
+            double sum = 0;
+            for (int j = 0; j < 4; ++j) sum += win[j] * cw[(size_t) c * 4 + j];
+            r.h[(size_t) t * C + c] = (float) (sum / (1.0 + std::exp(-sum)));
+        }
+        for (int hd = 0; hd < 2 * HK; ++hd) {
+            double ss = 0;
+            for (int i = 0; i < S; ++i) ss += (double) r.h[(size_t) t * C + hd * S + i] * r.h[(size_t) t * C + hd * S + i];
+            const double sc = 1.0 / std::sqrt(ss + EPS);
+            for (int i = 0; i < S; ++i) r.h[(size_t) t * C + hd * S + i] = (float) (r.h[(size_t) t * C + hd * S + i] * sc);
+        }
+    }
+    std::vector<double> sd(st0.begin(), st0.begin() + (size_t) S * HV * S);
+    const int qk = S * HK;
+    for (int t = 0; t < n; ++t)
+        for (int hd = 0; hd < HV; ++hd) {
+            const int qh = hd % HK;
+            const float* ht = &r.h[(size_t) t * C];
+            const double g = std::exp((double) gate[(size_t) t * HV + hd]), b = beta[(size_t) t * HV + hd];
+            std::vector<double> oc(S);
+            for (int j = 0; j < S; ++j) {
+                double kv = 0;
+                for (int i = 0; i < S; ++i) kv += sd[((size_t) i * HV + hd) * S + j] * ht[qk + qh * S + i];
+                const double delta = (ht[2 * qk + hd * S + j] - g * kv) * b;
+                double o = 0;
+                for (int i = 0; i < S; ++i) {
+                    double& v = sd[((size_t) i * HV + hd) * S + j];
+                    v = g * v + ht[qk + qh * S + i] * delta;
+                    o += v * ht[qh * S + i];
+                }
+                oc[j] = o / std::sqrt((double) S);
+            }
+            double ss = 0;
+            for (int j = 0; j < S; ++j) ss += oc[j] * oc[j];
+            const double scale = 1.0 / std::sqrt(ss / S + EPS);
+            for (int j = 0; j < S; ++j) {
+                const double zz = z[(size_t) t * ZV + hd * S + j];
+                r.y[(size_t) t * ZV + hd * S + j] = (float) (oc[j] * scale * gamma[j] * (1.0 / (1.0 + std::exp(-zz))));
+            }
+        }
+    return r;
+}
+
+// the state after n_keep tokens of recorded inputs (h rows, gate, beta) and the conv history after n_keep rows of qkv
+std::vector<float> cpu_commit(const std::vector<float>& st0, const float* h, const float* qkv, const float* gate,
+                              const float* beta, int n_keep) {
+    std::vector<float> r = st0;
+    std::vector<double> sd(st0.begin(), st0.begin() + (size_t) S * HV * S);
+    const int qk = S * HK;
+    for (int t = 0; t < n_keep; ++t)
+        for (int hd = 0; hd < HV; ++hd) {
+            const int qh = hd % HK;
+            const float* ht = h + (size_t) t * C;
+            const double g = std::exp((double) gate[(size_t) t * HV + hd]), b = beta[(size_t) t * HV + hd];
+            for (int j = 0; j < S; ++j) {
+                double kv = 0;
+                for (int i = 0; i < S; ++i) kv += sd[((size_t) i * HV + hd) * S + j] * ht[qk + qh * S + i];
+                const double delta = (ht[2 * qk + hd * S + j] - g * kv) * b;
+                for (int i = 0; i < S; ++i) {
+                    double& v = sd[((size_t) i * HV + hd) * S + j];
+                    v = g * v + ht[qk + qh * S + i] * delta;
+                }
+            }
+        }
+    if (n_keep > 0) {
+        for (size_t i = 0; i < sd.size(); ++i) r[i] = (float) sd[i];
+        const float* hist = st0.data() + (size_t) S * HV * S;
+        for (int c = 0; c < C; ++c)
+            for (int j = 0; j < 3; ++j) {
+                const int src = n_keep + j;
+                r[(size_t) S * HV * S + c * 3 + j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
+            }
+    }
+    return r;
+}
+
+double max_err(const float* a, const float* b, size_t n) {
+    double m = 0;
+    for (size_t i = 0; i < n; ++i) m = std::max(m, std::fabs((double) a[i] - b[i]) / (1.0 + std::fabs((double) b[i])));
+    return m;
+}
+
+bool parity_seg(cudaStream_t s) {
+    std::mt19937 rng(97);
+    bool ok = true;
+    const size_t SF = (size_t) S * HV * S + (size_t) C * 3;
+    Layer L = make_layer(14, 23, 14, rng);
+    const std::vector<float> cw = down(L.conv_w, (size_t) C * 4), gam = down(L.gamma, S);
+    constexpr int NL = 2;   // layers per state: the table points at layer 0, the kernels at layer 1
+    const int layer = 1;
+    const int counts[4] = {1, 2, 5, 8};
+    for (int trial = 0; trial < 3; ++trial)
+        for (int nseg : counts) {
+            std::vector<int> T(nseg), keep(nseg), row0(nseg);
+            int R = 0, tmax = 1;
+            for (int k = 0; k < nseg; ++k) {
+                T[k] = trial == 0 ? 1 : 1 + (int) (rng() % kDecMaxT);
+                if (trial == 2 && k % 2) T[k] = kDecMaxT;
+                keep[k] = trial == 0 ? 1 : (int) (rng() % (T[k] + 1));
+                row0[k] = R;
+                R += T[k];
+                tmax = std::max(tmax, T[k]);
+            }
+            // per-segment states (NL layers each), random
+            std::vector<float*> sbase(nseg);
+            std::vector<std::vector<float>> st0(nseg);
+            for (int k = 0; k < nseg; ++k) {
+                st0[k] = randn(NL * SF, 0.1f, rng);
+                sbase[k] = upload(st0[k]);
+            }
+            const std::vector<float> qkv = randn((size_t) R * C, 1.f, rng), z = randn((size_t) R * ZV, 1.f, rng),
+                                     x = randn((size_t) R * N, 1.f, rng);
+            float *d_qkv = upload(qkv), *d_z = upload(z), *d_x = upload(x);
+            std::vector<SegRow> rows(R);
+            for (int k = 0; k < nseg; ++k)
+                for (int j = 0; j < T[k]; ++j)
+                    rows[row0[k] + j] = SegRow{sbase[k], row0[k], j, T[k], keep[k], k, 100 + j};
+            SegRow* d_rows = upload(rows);
+            auto fbuf = [&](size_t n) { float* p; CK(cudaMalloc(&p, n * 4 + 64)); CK(cudaMemset(p, 0xff, n * 4)); return p; };
+            // the current kernels, one call per segment
+            float *h_r = fbuf((size_t) R * C), *g_r = fbuf((size_t) R * HV), *b_r = fbuf((size_t) R * HV),
+                  *y_r = fbuf((size_t) R * ZV);
+            float *h_f1 = fbuf((size_t) R * C), *g_f1 = fbuf((size_t) R * HV), *b_f1 = fbuf((size_t) R * HV),
+                  *y_f1 = fbuf((size_t) R * ZV);
+            void *yq_r, *yq_f;
+            CK(cudaMalloc(&yq_r, (size_t) R * (ZV / 32) * 36 + 64)); CK(cudaMemset(yq_r, 0xff, (size_t) R * (ZV / 32) * 36));
+            CK(cudaMalloc(&yq_f, (size_t) R * (ZV / 32) * 36 + 64)); CK(cudaMemset(yq_f, 0xff, (size_t) R * (ZV / 32) * 36));
+            for (int k = 0; k < nseg; ++k) {
+                const size_t r0 = row0[k];
+                float* st = sbase[k] + layer * SF;
+                gdn_conv_l2_multi(st + (size_t) S * HV * S, d_qkv + r0 * C, L.conv_w, h_r + r0 * C, C, 2 * HK, EPS, T[k], s, 0);
+                gdn_ab_multi(d_x + r0 * N, L.wa, L.wb, L.dt, L.ssm_a, g_r + r0 * HV, b_r + r0 * HV, N, HV, T[k], s);
+                gdn_step_norm_multi(st, h_r + r0 * C, C, g_r + r0 * HV, b_r + r0 * HV, d_z + r0 * ZV, L.gamma, EPS,
+                                    y_r + r0 * ZV, HK, HV, T[k], nullptr, s, 0);
+                DecRecArgs a;
+                a.state = st; a.qkv = d_qkv + r0 * C; a.conv_w = L.conv_w; a.x = d_x + r0 * N; a.w_alpha = L.wa;
+                a.w_beta = L.wb; a.dt = L.dt; a.ssm_a = L.ssm_a; a.z = d_z + r0 * ZV; a.gamma = L.gamma;
+                a.h = h_f1 + r0 * C; a.gate = g_f1 + r0 * HV; a.beta = b_f1 + r0 * HV; a.y = y_f1 + r0 * ZV;
+                a.yq = (char*) yq_r + r0 * (ZV / 32) * 36; a.C = C; a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = EPS;
+                dec_gdn_rec(a, T[k], s);
+            }
+            // the segment kernels
+            float *h_s = fbuf((size_t) R * C), *y_s = fbuf((size_t) R * ZV);
+            float *h_f = fbuf((size_t) R * C), *g_f = fbuf((size_t) R * HV), *b_f = fbuf((size_t) R * HV),
+                  *y_f = fbuf((size_t) R * ZV);
+            gdn_conv_l2_seg(d_rows, layer * SF + (size_t) S * HV * S, d_qkv, L.conv_w, h_s, C, 2 * HK, EPS, R, s);
+            gdn_step_norm_seg(d_rows, layer * SF, h_r, C, g_r, b_r, d_z, L.gamma, EPS, y_s, HK, HV, R, s);
+            {
+                DecRecArgs a;
+                a.qkv = d_qkv; a.conv_w = L.conv_w; a.x = d_x; a.w_alpha = L.wa; a.w_beta = L.wb; a.dt = L.dt;
+                a.ssm_a = L.ssm_a; a.z = d_z; a.gamma = L.gamma; a.h = h_f; a.gate = g_f; a.beta = b_f; a.y = y_f;
+                a.yq = yq_f; a.C = C; a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = EPS;
+                dec_gdn_rec_seg(a, d_rows, layer * SF, R, tmax, s);
+            }
+            CK(cudaStreamSynchronize(s));
+            long long d = 0;
+            double ma = 0;
+            d += cmp_f("conv seg", h_r, h_s, (size_t) R * C, ma);
+            d += cmp_f("step_norm seg", y_r, y_s, (size_t) R * ZV, ma);
+            d += cmp_f("rec seg h", h_f1, h_f, (size_t) R * C, ma);
+            d += cmp_f("rec seg gate", g_f1, g_f, (size_t) R * HV, ma);
+            d += cmp_f("rec seg beta", b_f1, b_f, (size_t) R * HV, ma);
+            d += cmp_f("rec seg y", y_f1, y_f, (size_t) R * ZV, ma);
+            d += cmp_b("rec seg yq", yq_r, yq_f, (size_t) R * (ZV / 32) * 36);
+            // the CPU reference, per segment
+            double ec = 0, ey = 0;
+            for (int k = 0; k < nseg; ++k) {
+                const size_t r0 = row0[k];
+                const std::vector<float> sl(st0[k].begin() + layer * SF, st0[k].begin() + (layer + 1) * SF);
+                const CpuSeg c = cpu_seg(sl, std::vector<float>(qkv.begin() + r0 * C, qkv.begin() + (r0 + T[k]) * C),
+                                         std::vector<float>(z.begin() + r0 * ZV, z.begin() + (r0 + T[k]) * ZV), cw, gam,
+                                         down(g_r + r0 * HV, (size_t) T[k] * HV), down(b_r + r0 * HV, (size_t) T[k] * HV),
+                                         T[k]);
+                const std::vector<float> hs = down(h_s + r0 * C, (size_t) T[k] * C), ys = down(y_s + r0 * ZV, (size_t) T[k] * ZV);
+                ec = std::max(ec, max_err(hs.data(), c.h.data(), c.h.size()));
+                ey = std::max(ey, max_err(ys.data(), c.y.data(), c.y.size()));
+            }
+            // the commit: the current kernel per segment on a copy of the states against the segment kernel
+            const int CNL = 2;
+            const std::vector<float> hL = randn((size_t) CNL * R * C, 0.1f, rng), qL = randn((size_t) CNL * R * C, 1.f, rng),
+                                     gL = randn((size_t) CNL * R * HV, 0.3f, rng), bL = randn((size_t) CNL * R * HV, 0.3f, rng);
+            float *d_hL = upload(hL), *d_qL = upload(qL), *d_gL = upload(gL), *d_bL = upload(bL);
+            std::vector<float*> sref(nseg);
+            for (int k = 0; k < nseg; ++k) sref[k] = upload(st0[k]);
+            // fresh states for the new kernel
+            for (int k = 0; k < nseg; ++k) CK(cudaMemcpy(sbase[k], st0[k].data(), NL * SF * 4, cudaMemcpyHostToDevice));
+            for (int k = 0; k < nseg; ++k) {
+                int32_t* nk;
+                CK(cudaMalloc(&nk, 4));
+                CK(cudaMemcpy(nk, &keep[k], 4, cudaMemcpyHostToDevice));
+                GdnCommitLayers a;
+                a.state = sref[k]; a.h = d_hL + (size_t) row0[k] * C; a.qkv = d_qL + (size_t) row0[k] * C;
+                a.gate = d_gL + (size_t) row0[k] * HV; a.beta = d_bL + (size_t) row0[k] * HV;
+                a.state_stride = SF; a.h_stride = (size_t) R * C; a.gb_stride = (size_t) R * HV;
+                a.C = C; a.h_k = HK; a.h_v = HV; a.n_layers = CNL; a.n_keep = nk;
+                gdn_commit_layers(a, s, 32);
+            }
+            {
+                GdnCommitSeg a;
+                a.rows = d_rows; a.state_off = 0; a.state_stride = SF; a.h_stride = (size_t) R * C;
+                a.gb_stride = (size_t) R * HV; a.h = d_hL; a.qkv = d_qL; a.gate = d_gL; a.beta = d_bL;
+                a.C = C; a.h_k = HK; a.h_v = HV; a.n_layers = CNL; a.n_rows = R;
+                gdn_commit_layers_seg(a, s, 32);
+            }
+            CK(cudaStreamSynchronize(s));
+            double es = 0;
+            for (int k = 0; k < nseg; ++k) {
+                d += cmp_f("commit seg", sref[k], sbase[k], NL * SF, ma);
+                for (int l = 0; l < CNL; ++l) {
+                    const std::vector<float> sl(st0[k].begin() + l * SF, st0[k].begin() + (l + 1) * SF);
+                    const size_t r0 = row0[k], lr = (size_t) l * R;   // layer l's rows of the recorded inputs
+                    const std::vector<float> c = cpu_commit(sl, hL.data() + (lr + r0) * C, qL.data() + (lr + r0) * C,
+                                                            gL.data() + (lr + r0) * HV, bL.data() + (lr + r0) * HV, keep[k]);
+                    const std::vector<float> got = down(sbase[k] + l * SF, SF);
+                    es = std::max(es, max_err(got.data(), c.data(), SF));
+                }
+            }
+            std::printf("seg S=%d R=%2d T={", nseg, R);
+            for (int k = 0; k < nseg; ++k) std::printf("%d%s", T[k], k + 1 < nseg ? "," : "");
+            std::printf("} keep={");
+            for (int k = 0; k < nseg; ++k) std::printf("%d%s", keep[k], k + 1 < nseg ? "," : "");
+            std::printf("}: vs current kernels %s; CPU max rel err conv %.2g recurrence %.2g commit %.2g\n",
+                        d == 0 ? "bitwise" : "DIFF", ec, ey, es);
+            ok = ok && d == 0 && ec < 1e-4 && ey < 1e-3 && es < 1e-3;
+            for (int k = 0; k < nseg; ++k) { CK(cudaFree(sbase[k])); CK(cudaFree(sref[k])); }
+            for (void* p : {(void*) d_qkv, (void*) d_z, (void*) d_x, (void*) d_rows, (void*) h_r, (void*) g_r, (void*) b_r,
+                            (void*) y_r, (void*) h_f1, (void*) g_f1, (void*) b_f1, (void*) y_f1, yq_r, yq_f, (void*) h_s,
+                            (void*) y_s, (void*) h_f, (void*) g_f, (void*) b_f, (void*) y_f, (void*) d_hL, (void*) d_qL,
+                            (void*) d_gL, (void*) d_bL})
+                CK(cudaFree(p));
+        }
+    return ok;
+}
+
 void bench(cudaStream_t s) {
     std::mt19937 rng(7);
     constexpr int NL = 12;   // distinct layers per graph: far more weight than the L2 holds
@@ -360,6 +616,85 @@ void bench(cudaStream_t s) {
     }
 }
 
+// Segmented windows of one-row segments (the batch window) over 12 layers' states: the per-segment calls the batch window
+// made (conv, gates, recurrence per row) and dec_gdn_rec per row, against the segment kernels, as graphs; us per layer.
+void bench_seg(cudaStream_t s) {
+    std::mt19937 rng(21);
+    constexpr int NL = 12;
+    Layer L = make_layer(14, 23, 14, rng);
+    const size_t SF = (size_t) S * HV * S + (size_t) C * 3;
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    for (int nseg : {1, 2, 5, 8}) {
+        const int R = nseg;
+        float* st = upload(randn(NL * nseg * SF, 0.1f, rng));
+        float *d_qkv = upload(randn((size_t) R * C, 1.f, rng)), *d_z = upload(randn((size_t) R * ZV, 1.f, rng)),
+              *d_x = upload(randn((size_t) R * N, 1.f, rng));
+        std::vector<SegRow> rows(R);
+        for (int k = 0; k < R; ++k) rows[k] = SegRow{st + (size_t) k * NL * SF, k, 0, 1, 1, k, 100};
+        SegRow* d_rows = upload(rows);
+        float *h, *g, *b, *y;
+        void* yq;
+        CK(cudaMalloc(&h, (size_t) R * C * 4)); CK(cudaMalloc(&g, (size_t) R * HV * 4)); CK(cudaMalloc(&b, (size_t) R * HV * 4));
+        CK(cudaMalloc(&y, (size_t) R * ZV * 4)); CK(cudaMalloc(&yq, (size_t) R * (ZV / 32) * 36));
+        auto stages = [&](int path, int l) {
+            if (path == 0) {   // per row, as the batch window ran
+                for (int k = 0; k < R; ++k) {
+                    float* sl = st + ((size_t) k * NL + l) * SF;
+                    gdn_conv_l2_multi(sl + (size_t) S * HV * S, d_qkv + (size_t) k * C, L.conv_w, h + (size_t) k * C, C, 2 * HK,
+                                      EPS, 1, s, 0);
+                }
+                gdn_ab_multi(d_x, L.wa, L.wb, L.dt, L.ssm_a, g, b, N, HV, R, s);
+                for (int k = 0; k < R; ++k)
+                    gdn_step_norm_multi(st + ((size_t) k * NL + l) * SF, h + (size_t) k * C, C, g + (size_t) k * HV,
+                                        b + (size_t) k * HV, d_z + (size_t) k * ZV, L.gamma, EPS, y + (size_t) k * ZV, HK, HV, 1,
+                                        nullptr, s, 0);
+            } else if (path == 1) {   // the segment kernels
+                gdn_conv_l2_seg(d_rows, (size_t) l * SF + (size_t) S * HV * S, d_qkv, L.conv_w, h, C, 2 * HK, EPS, R, s);
+                gdn_ab_multi(d_x, L.wa, L.wb, L.dt, L.ssm_a, g, b, N, HV, R, s);
+                gdn_step_norm_seg(d_rows, (size_t) l * SF, h, C, g, b, d_z, L.gamma, EPS, y, HK, HV, R, s);
+            } else {   // dec_gdn_rec per row, or once over the segments
+                DecRecArgs a;
+                a.qkv = d_qkv; a.conv_w = L.conv_w; a.x = d_x; a.w_alpha = L.wa; a.w_beta = L.wb; a.dt = L.dt;
+                a.ssm_a = L.ssm_a; a.z = d_z; a.gamma = L.gamma; a.h = h; a.gate = g; a.beta = b; a.yq = yq; a.C = C;
+                a.n_embd = N; a.h_k = HK; a.h_v = HV; a.eps = EPS; a.early_trigger = false;
+                if (path == 3) { dec_gdn_rec_seg(a, d_rows, (size_t) l * SF, R, 1, s); return; }
+                for (int k = 0; k < R; ++k) {
+                    DecRecArgs r = a;
+                    r.state = st + ((size_t) k * NL + l) * SF; r.qkv += (size_t) k * C; r.x += (size_t) k * N;
+                    r.z += (size_t) k * ZV; r.h += (size_t) k * C; r.gate += (size_t) k * HV; r.beta += (size_t) k * HV;
+                    r.yq = (char*) yq + (size_t) k * (ZV / 32) * 36;
+                    dec_gdn_rec(r, 1, s);
+                }
+            }
+        };
+        double us[4];
+        for (int path = 0; path < 4; ++path) {
+            // per-row calls read state slice k*NL+l, the segment kernels (state_off l * SF) the table's: point the table at layer 0
+            cudaGraph_t gr;
+            cudaGraphExec_t ge;
+            CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+            for (int l = 0; l < NL; ++l) stages(path, l);
+            CK(cudaStreamEndCapture(s, &gr));
+            CK(cudaGraphInstantiate(&ge, gr, 0));
+            for (int w = 0; w < 3; ++w) CK(cudaGraphLaunch(ge, s));
+            constexpr int REPS = 50;
+            CK(cudaEventRecord(e0, s));
+            for (int r = 0; r < REPS; ++r) CK(cudaGraphLaunch(ge, s));
+            CK(cudaEventRecord(e1, s));
+            CK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            us[path] = ms * 1000.0 / REPS / NL;
+            CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(gr));
+        }
+        std::printf("bench seg S=%d x 1 row (us per layer, graph of %d layers): conv+ab+rec per row %.1f | segment kernels %.1f"
+                    " || dec_gdn_rec per row %.1f | dec_gdn_rec_seg %.1f\n",
+                    nseg, NL, us[0], us[1], us[2], us[3]);
+        CK(cudaFree(st));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -375,8 +710,8 @@ int main(int argc, char** argv) {
     CK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&g_join, cudaEventDisableTiming));
-    const bool ok = mode == "--bench-only" || parity_gdnf(s);
+    const bool ok = mode == "--bench-only" || (parity_gdnf(s) && parity_seg(s));
     if (mode != "--bench-only") std::printf("dec_gdn_parity: %s\n", ok ? "PASS (bitwise, columns independent of T)" : "FAIL");
-    if (ok && (mode == "--bench" || mode == "--bench-only")) bench(s);
+    if (ok && (mode == "--bench" || mode == "--bench-only")) { bench_seg(s); bench(s); }
     return ok ? 0 : 1;
 }

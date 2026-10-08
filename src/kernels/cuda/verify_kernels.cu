@@ -55,10 +55,39 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __res
     h[(size_t) t * C + c] = y;
 }
 
-__device__ __forceinline__ void gdn_conv_commit_one(float* __restrict__ hist, const float* __restrict__ qkv, int C,
-                                                    const int32_t* __restrict__ n_keep, int c) {
+// gdn_conv_l2_multi_kernel over a segmented window: row t = blockIdx.y reads its own segment's history and rows
+__global__ void __launch_bounds__(S) gdn_conv_l2_seg_kernel(const SegRow* __restrict__ rows, size_t hist_off,
+                                                            const float* __restrict__ qkv, const float* __restrict__ w,
+                                                            float* __restrict__ h, int C, int qk_heads, float eps) {
+    pdl_wait();
+    __shared__ float part[S / 32];
+    const int t = blockIdx.y;
+    const SegRow r = rows[t];
+    const float* hist = r.gdn + hist_off;
+    const int c = blockIdx.x * S + threadIdx.x;
+    float win[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int src = r.j + j;
+        win[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (r.row0 + src - 3) * C + c];
+    }
+    const float v0 = win[0], v1 = win[1], v2 = win[2], x = qkv[(size_t) t * C + c];
+    float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
+    float y = sum / (1.0f + __expf(-sum));
+    if ((int) blockIdx.x < qk_heads) {
+        float sq = y * y;
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
+        __syncthreads();
+        const float ss = part[0] + part[1] + part[2] + part[3];
+        y *= rsqrtf(ss + eps);
+    }
+    h[(size_t) t * C + c] = y;
+}
+
+__device__ __forceinline__ void gdn_conv_commit_n(float* __restrict__ hist, const float* __restrict__ qkv, int C, int n,
+                                                  int c) {
     if (c >= C) return;
-    const int n = *n_keep;
     if (n <= 0) return;
     float seq[3];
 #pragma unroll
@@ -69,6 +98,11 @@ __device__ __forceinline__ void gdn_conv_commit_one(float* __restrict__ hist, co
     hist[c * 3] = seq[0];
     hist[c * 3 + 1] = seq[1];
     hist[c * 3 + 2] = seq[2];
+}
+
+__device__ __forceinline__ void gdn_conv_commit_one(float* __restrict__ hist, const float* __restrict__ qkv, int C,
+                                                    const int32_t* __restrict__ n_keep, int c) {
+    gdn_conv_commit_n(hist, qkv, C, *n_keep, c);
 }
 
 __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
@@ -297,10 +331,8 @@ __device__ __forceinline__ void commit_pre_run(const GdnCommitLayers& a, int per
 }
 
 // The grid-stride items with the next state item's loads issued before the current item runs.
-__global__ void __launch_bounds__(32 * RG) gdn_commit_layers_pipe_kernel(GdnCommitLayers a, int conv_blocks) {
+__device__ __forceinline__ void commit_layers_body(const GdnCommitLayers& a, int n, int conv_blocks) {
     const int per_state = a.h_v * (S / 32), per_layer = per_state + conv_blocks, total = per_layer * a.n_layers;
-    const int n = min(*a.n_keep, kVerifyMaxT);
-    if (n <= 0) return;
     const int step = gridDim.x;
     CommitPre cur, nxt;
     bool cur_state = (int) blockIdx.x < total && (int) blockIdx.x % per_layer < per_state;
@@ -313,24 +345,41 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_layers_pipe_kernel(GdnComm
             commit_pre_run(a, per_layer, n, i, cur);
         } else {
             const int l = i / per_layer, j = i - l * per_layer;
-            gdn_conv_commit_one(a.state + (size_t) l * a.state_stride + (size_t) S * a.h_v * S,
-                                a.qkv + (size_t) l * a.h_stride, a.C, a.n_keep,
-                                (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
+            gdn_conv_commit_n(a.state + (size_t) l * a.state_stride + (size_t) S * a.h_v * S,
+                              a.qkv + (size_t) l * a.h_stride, a.C, n,
+                              (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
         }
         cur_state = next_state;
         if (next_state) cur = nxt;
     }
 }
 
-__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
-                                                                     const float* __restrict__ hbuf, int C,
-                                                                     const float* __restrict__ gate,
-                                                                     const float* __restrict__ beta,
-                                                                     const float* __restrict__ z,
-                                                                     const float* __restrict__ gamma, float eps,
-                                                                     float* __restrict__ y, int h_k, int h_v, int T,
-                                                                     const int32_t* __restrict__ n_keep, int t_out_begin) {
-    pdl_wait();
+__global__ void __launch_bounds__(32 * RG) gdn_commit_layers_pipe_kernel(GdnCommitLayers a, int conv_blocks) {
+    const int n = min(*a.n_keep, kVerifyMaxT);
+    if (n <= 0) return;
+    commit_layers_body(a, n, conv_blocks);
+}
+
+// the same over a segmented window: blockIdx.y = the window row whose segment it commits (only a segment's first row)
+__global__ void __launch_bounds__(32 * RG) gdn_commit_layers_seg_kernel(GdnCommitSeg s, int conv_blocks) {
+    const SegRow r = s.rows[blockIdx.y];
+    const int n = min(r.n_keep, kVerifyMaxT);
+    if (r.j != 0 || n <= 0) return;
+    GdnCommitLayers a;
+    a.state = r.gdn + s.state_off;
+    a.h = s.h + (size_t) r.row0 * s.C; a.qkv = s.qkv + (size_t) r.row0 * s.C;
+    a.gate = s.gate + (size_t) r.row0 * s.h_v; a.beta = s.beta + (size_t) r.row0 * s.h_v;
+    a.state_stride = s.state_stride; a.h_stride = s.h_stride; a.gb_stride = s.gb_stride;
+    a.C = s.C; a.h_k = s.h_k; a.h_v = s.h_v; a.n_layers = s.n_layers;
+    commit_layers_body(a, n, conv_blocks);
+}
+
+// n tokens from `state` (written back when `write`)
+__device__ __forceinline__ void gdn_step_norm_body(float* __restrict__ state, const float* __restrict__ hbuf, int C,
+                                                   const float* __restrict__ gate, const float* __restrict__ beta,
+                                                   const float* __restrict__ z, const float* __restrict__ gamma,
+                                                   float eps, float* __restrict__ y, int h_k, int h_v, int n,
+                                                   bool write, int t_out_begin) {
     __shared__ float sk[S], sq[S];
     __shared__ float red[RG][S];
     __shared__ float wsum[S * RG / 32];
@@ -341,7 +390,6 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     const int qh = head % h_k;
     const int qk = S * h_k;             // q at [0, qk), k at [qk, 2qk), v at [2qk, ...)
     const int value_dim = S * h_v;
-    const int n = n_keep ? *n_keep : T;
     float s[RPG];
     float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
@@ -393,10 +441,39 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
         }
     }
-    if (n_keep != nullptr && n > 0) {
+    if (write && n > 0) {
 #pragma unroll
         for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
     }
+}
+
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
+                                                                     const float* __restrict__ hbuf, int C,
+                                                                     const float* __restrict__ gate,
+                                                                     const float* __restrict__ beta,
+                                                                     const float* __restrict__ z,
+                                                                     const float* __restrict__ gamma, float eps,
+                                                                     float* __restrict__ y, int h_k, int h_v, int T,
+                                                                     const int32_t* __restrict__ n_keep, int t_out_begin) {
+    pdl_wait();
+    gdn_step_norm_body(state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_keep ? *n_keep : T, n_keep != nullptr,
+                       t_out_begin);
+}
+
+// the verify form over a segmented window: block row y is a segment's first row; the state is only read
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_seg_kernel(const SegRow* __restrict__ rows, size_t state_off,
+                                                                   const float* __restrict__ hbuf, int C,
+                                                                   const float* __restrict__ gate,
+                                                                   const float* __restrict__ beta,
+                                                                   const float* __restrict__ z,
+                                                                   const float* __restrict__ gamma, float eps,
+                                                                   float* __restrict__ y, int h_k, int h_v) {
+    pdl_wait();
+    const SegRow r = rows[blockIdx.y];
+    if (r.j != 0) return;
+    const size_t vd = (size_t) S * h_v;
+    gdn_step_norm_body(r.gdn + state_off, hbuf + (size_t) r.row0 * C, C, gate + (size_t) r.row0 * h_v,
+                       beta + (size_t) r.row0 * h_v, z + r.row0 * vd, gamma, eps, y + r.row0 * vd, h_k, h_v, r.n, false, 0);
 }
 
 __global__ void embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
@@ -726,6 +803,37 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
     launch_pdl(gdn_conv_l2_multi_kernel, dim3((unsigned) (channels / S), (unsigned) n_tok), dim3(S), 0,
                (cudaStream_t) stream, history, qkv, conv_w, h, channels, qk_heads, eps, t_begin);
     check("gdn_conv_l2_multi");
+}
+
+void gdn_conv_l2_seg(const SegRow* rows, size_t hist_off, const float* qkv, const float* conv_w, float* h, int channels,
+                     int qk_heads, float eps, int n_rows, void* stream) {
+    if (!rows || !qkv || !conv_w || !h || channels % S != 0 || n_rows < 1) {
+        std::fprintf(stderr, "gdn_conv_l2_seg: invalid arguments\n");
+        std::exit(1);
+    }
+    launch_pdl(gdn_conv_l2_seg_kernel, dim3((unsigned) (channels / S), (unsigned) n_rows), dim3(S), 0,
+               (cudaStream_t) stream, rows, hist_off, qkv, conv_w, h, channels, qk_heads, eps);
+    check("gdn_conv_l2_seg");
+}
+
+void gdn_step_norm_seg(const SegRow* rows, size_t state_off, const float* h, int conv_channels, const float* gate,
+                       const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                       int n_rows, void* stream) {
+    if (!rows || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_rows < 1) {
+        std::fprintf(stderr, "gdn_step_norm_seg: invalid arguments\n");
+        std::exit(1);
+    }
+    launch_pdl(gdn_step_norm_seg_kernel, dim3((unsigned) h_v, (unsigned) n_rows), dim3(S, RG), 0, (cudaStream_t) stream,
+               rows, state_off, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v);
+    check("gdn_step_norm_seg");
+}
+
+void gdn_commit_layers_seg(const GdnCommitSeg& a, void* stream, int blocks) {
+    if (a.n_layers <= 0 || a.n_rows <= 0) return;
+    const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
+    gdn_commit_layers_seg_kernel<<<dim3((unsigned) (blocks > 0 ? blocks : 1), (unsigned) a.n_rows), dim3(32, RG), 0,
+                                   (cudaStream_t) stream>>>(a, conv_blocks);
+    check("gdn_commit_layers_seg");
 }
 
 void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks) {

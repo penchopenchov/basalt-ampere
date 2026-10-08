@@ -8,6 +8,7 @@
 // depend on T or its column.  Needs thread-block clusters.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace basalt::kernels {
@@ -39,6 +40,12 @@ struct DecRecArgs {
 
 /// The recurrence of tokens [0, n_tok) from the untouched state; one cluster of four blocks per value head.
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream);
+
+/// dec_gdn_rec over a segmented window (verify_kernels.hpp SegRow): each segment's tokens from its own state (the
+/// layer's at rows[].gdn + state_off), one launch for all n_rows window rows; a.state is unused.  max_n: the most rows
+/// a segment holds (at most kDecMaxT).  Every output is the segment's own dec_gdn_rec's, bitwise.
+struct SegRow;
+void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, int n_rows, int max_n, void* stream);
 
 /// dec_gdn_rec in two launches: the split kernel (conv, gates, recurrence; never reads z) writes the raw output to
 /// a.o, dec_gdn_rec_norm applies the gated RMS norm and writes a.yq (and a.y); the same bits as dec_gdn_rec.  The z
