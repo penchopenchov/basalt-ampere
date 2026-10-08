@@ -1,32 +1,51 @@
-# tools/vision - basalt-vision, the image encoder for the multimodal path (optional; built when the vision encoder
-# is wanted).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
+# tools/vision - basalt-vision, the image encoder for the multimodal path, on Basalt's own kernels (no ggml or
+# llama.cpp).  Built with the root project, or on its own:
 #
-#   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
-#         [-DVISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native]
+#   cmake -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build-vision --target basalt-vision
-cmake_minimum_required(VERSION 3.21)
-project(basalt_vision C CXX)
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 120)
+  endif()
+  project(basalt_vision CXX CUDA)
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD 20)
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+  endif()
+  option(BUILD_TESTING "Build the parity programs" OFF)
+endif()
+find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
-set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
-option(VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
+set(VISION_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
 
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
-set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
-set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
-set(GGML_NATIVE ON CACHE BOOL "" FORCE)
-set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA ${VISION_CUDA} CACHE BOOL "" FORCE)
+# host side: preprocessing, projector file, CPU encoder
+add_library(vision_core STATIC
+  ${VISION_ROOT}/src/vision/preprocess.cpp
+  ${VISION_ROOT}/src/vision/mmproj.cpp
+  ${VISION_ROOT}/src/vision/encoder_cpu.cpp
+  ${VISION_ROOT}/src/vision/gemm_cpu.cpp)
+target_include_directories(vision_core PUBLIC ${VISION_ROOT}/include PRIVATE ${VISION_ROOT}/src/vision)
+set_source_files_properties(${VISION_ROOT}/src/vision/gemm_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+target_link_libraries(vision_core PUBLIC Threads::Threads)
 
-add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
+# device side
+add_library(vision_cuda STATIC
+  ${VISION_ROOT}/src/vision/encoder_cuda.cu
+  ${VISION_ROOT}/src/vision/vision_kernels.cu)
+target_include_directories(vision_cuda PUBLIC ${VISION_ROOT}/include ${VISION_ROOT}/src/vision)
+target_link_libraries(vision_cuda PUBLIC vision_core CUDA::cudart CUDA::cublas)
 
 add_executable(basalt-vision vision.cpp)
-target_link_libraries(basalt-vision PRIVATE mtmd llama)
-target_compile_features(basalt-vision PRIVATE cxx_std_17)
-set_target_properties(basalt-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../../bin)
+target_compile_definitions(basalt-vision PRIVATE BASALT_VISION_CUDA)
+target_link_libraries(basalt-vision PRIVATE vision_cuda)
+set_target_properties(basalt-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${VISION_ROOT}/bin)
+
+if(BUILD_TESTING)
+  add_executable(vision_cpu_parity ${VISION_ROOT}/src/vision/cpu_parity.cpp)
+  target_link_libraries(vision_cpu_parity PRIVATE vision_core)
+  add_executable(vision_cuda_parity ${VISION_ROOT}/src/vision/cuda_parity.cu)
+  target_link_libraries(vision_cuda_parity PRIVATE vision_cuda)
+endif()
