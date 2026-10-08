@@ -3,6 +3,7 @@
 // Built with --use_fast_math like native_qsa.cu, native_rope.cu and native_qsa_indexer.cu, whose expressions this
 // repeats; the INT8 append (kv_q8.cu, built without it) uses explicit IEEE instructions.
 #include "basalt/kernels/qsa_dec_fused.hpp"
+#include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/kv_q8.hpp"
@@ -224,6 +225,34 @@ template <bool TAB>
 __global__ void __launch_bounds__(THREADS) kv_post_kernel(QsaDecKvPost a, int n, int n_kv, int page_size, RopeArgs ra) {
     kv_post_dev<TAB>(a, n, n_kv, page_size, ra, blockIdx.x + (a.part == 2 ? n * n_kv : 0));
 }
+// the per-sequence fields of a post call, from a slot
+__device__ __forceinline__ void take_slot(QsaDecKvPost& a, const QsaSegSlot& sl) {
+    a.k_q = sl.k_q; a.v_q = sl.v_q; a.k_scale = sl.k_scale; a.v_scale = sl.v_scale; a.page_table = sl.page_table;
+    a.host = sl.host; a.tail = sl.tail; a.dead = sl.dead; a.pooled = sl.pooled; a.block_pos = sl.block_pos;
+    a.max_cells = sl.max_cells;
+}
+
+// kv_post_kernel with each row's slot from the table: blocks [0, n * n_kv) the rows' K/V, then one block per segment
+// for its indexer appends (the segment's rows, in order, on its slot's tail)
+template <bool TAB>
+__global__ void __launch_bounds__(THREADS) kv_post_seg_kernel(QsaDecKvPost a, QsaSegTable t, int n, int n_kv,
+                                                              int page_size, RopeArgs ra) {
+    const int b = blockIdx.x + (a.part == 2 ? n * n_kv : 0);
+    if (b < n * n_kv) {
+        take_slot(a, t.slots[t.rows[b / n_kv].slot]);
+        a.tail_snap = nullptr;
+        kv_post_dev<TAB>(a, n, n_kv, page_size, ra, b);
+        return;
+    }
+    const QsaSeg sg = t.segs[b - n * n_kv];
+    const QsaSegSlot& sl = t.slots[sg.slot];
+    take_slot(a, sl);
+    a.tail_snap = a.tail_snap != nullptr ? sl.tail_snap : nullptr;
+    a.idx_raw += (size_t) sg.first * ID;
+    a.steps += (size_t) sg.first * kStepCount;
+    kv_post_dev<TAB>(a, sg.len, n_kv, page_size, ra, sg.len * n_kv);
+}
+
 template <bool TAB>
 __global__ void __launch_bounds__(THREADS) q_post_kernel(QsaDecQPost a, int n, int n_head, int idx_heads, RopeArgs ra) {
     q_post_dev<TAB>(a, n, n_head, idx_heads, ra, blockIdx.x);
@@ -269,6 +298,24 @@ void qsa_dec_kv_post(const QsaDecKvPost& a, int n, const QsaShapes& s, const Rop
     else
         kv_post_kernel<false><<<blocks, THREADS, 0, (cudaStream_t) stream>>>(a, n, (int) s.n_head_kv, (int) s.page_size, ra);
     check("qsa_dec_kv_post");
+}
+
+void qsa_dec_kv_post_seg(const QsaDecKvPost& a, const QsaSegTable& t, int n, const QsaShapes& s,
+                         const RopeScaling& scaling, void* stream) {
+    if (n <= 0) return;
+    if (!qsa_dec_fused_supported(s) || rope_scaling_invalid(scaling) != nullptr || t.n_seg <= 0 || t.n_seg > n) {
+        std::fprintf(stderr, "qsa_dec_kv_post_seg: unsupported geometry, scaling or table\n");
+        std::exit(1);
+    }
+    const RopeArgs ra = rope_args(scaling);
+    const unsigned kv_blocks = a.part == 2 ? 0u : (unsigned) (n * s.n_head_kv);
+    const unsigned blocks = kv_blocks + (a.idx_raw != nullptr && a.part != 1 ? (unsigned) t.n_seg : 0u);
+    if (blocks == 0) return;
+    if (ra.rt.cos != nullptr)
+        kv_post_seg_kernel<true><<<blocks, THREADS, 0, (cudaStream_t) stream>>>(a, t, n, (int) s.n_head_kv, (int) s.page_size, ra);
+    else
+        kv_post_seg_kernel<false><<<blocks, THREADS, 0, (cudaStream_t) stream>>>(a, t, n, (int) s.n_head_kv, (int) s.page_size, ra);
+    check("qsa_dec_kv_post_seg");
 }
 
 void qsa_dec_q_post(const QsaDecQPost& a, int n, const QsaShapes& s, const RopeScaling& scaling, void* stream) {
