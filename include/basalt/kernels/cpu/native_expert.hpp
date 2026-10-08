@@ -2,8 +2,8 @@
 //
 // The IQ2_XS / IQ3_XXS model files keep their experts in i-quant formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
 // IQ3_S gate/up; Q2_0 or IQ4_NL down) whose values cannot be re-expressed in the Q2_0 pack form.  A native expert
-// blob is the three GGUF slices back to back, [gate rows | up rows | down rows], and the arithmetic is ggml-cpu's
-// own (`ggml_get_type_traits_cpu`): the activation is quantized with the weight type's `vec_dot_type` and each row
+// blob is the three GGUF slices back to back, [gate rows | up rows | down rows], and the arithmetic is ggml's
+// own (`ggml_get_type_traits_cpu`, extracted in src/kernels/cpu/ggml): the activation is quantized with the weight type's `vec_dot_type` and each row
 // is one `vec_dot`, exactly what llama.cpp's CPU backend computes for the same tensor.
 #pragma once
 
@@ -29,9 +29,9 @@ struct NativeFmt {
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
 };
 
-/// Whether this build has the ggml-cpu path.
+/// Whether this build has the ggml dot-product path.
 bool native_experts_available() noexcept;
-/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
+/// Fills `f` for a layer; false (with a reason) when there is no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).

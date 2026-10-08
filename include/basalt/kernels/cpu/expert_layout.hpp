@@ -38,19 +38,15 @@ bool cpu_avx512_ok();
 /// Whether this CPU runs AVX-512F + AVX-512BW + AVX-512VL + AVX-512DQ (e.g. Skylake-X i9-9920X) for iq_avx512.cpp.
 bool cpu_avx512bw_ok();
 /// Whether this CPU (and its OS) runs the AVX2 kernels (AVX, AVX2, FMA, F16C): the floor of every expert kernel
-/// (q2_avx2.cpp, iq_avx2.cpp, and ggml-cpu in the portable build).
+/// (q2_avx2.cpp, iq_avx2.cpp, and the ggml dot products).
 bool cpu_avx2_ok();
-/// Whether this CPU (and its OS) runs AVX (Sandy Bridge and newer): the AVX1 router dot (kq_avx1.cpp) and ggml-cpu in
-/// a ISA_FLOOR=avx build.  The other expert rows then run on ggml-cpu (experimental, slow).
+/// Whether this CPU (and its OS) runs AVX (Sandy Bridge and newer): the AVX1 router dot (kq_avx1.cpp).
 bool cpu_avx1_ok();
-/// SSE4.2 + POPCNT: ggml-cpu in a ISA_FLOOR=none build.
+/// SSE4.2 + POPCNT.
 bool cpu_sse42_ok();
-/// The cap on the probes above (3 = no cap, 2 = AVX2, 1 = AVX, 0 = SSE4.2); always 3.  ggml-cpu keeps what it was
-/// compiled for.
+/// The cap on the probes above (3 = no cap, 2 = AVX2, 1 = AVX, 0 = SSE4.2); always 3.
 int cpu_isa_cap();
-/// Whether a layer of this ggml type runs on the engine's own Q2_0 kernels (AVX2 / AVX-512).  On a
-/// CPU without AVX2 (a native, non-portable build: ggml-cpu compiled for this CPU's SSE) a Q2_0 layer takes
-/// ggml-cpu's own Q2_0 vec_dot like every other native type: slower, but it runs.
+/// Whether a layer of this ggml type runs on the engine's own Q2_0 kernels (AVX2 / AVX-512).
 inline bool q2_native_kernels(int type) { return type == 42 && cpu_avx2_ok(); }
 /// The CPU's brand string (CPUID 0x80000002..4), for messages; "unknown" when it has none.
 std::string cpu_name();

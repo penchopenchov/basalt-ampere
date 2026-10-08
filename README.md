@@ -37,6 +37,10 @@ cmake --build build -j        # bin/basalt, bin/basalt-bench
 ctest --test-dir build        # the parity tests need a GPU
 ```
 
+The build needs nothing outside this repository and fetches nothing. The parts of ggml and llama.cpp that Basalt uses
+(quantization formats, CPU dot products, the prompt path's MMQ kernels) are extracted into `src/` and `include/basalt/ggml/`,
+with their MIT licence in `THIRD_PARTY_LICENSES`.
+
 Image input needs the vision sidecar, `basalt-vision`, a separate build on llama.cpp's mtmd library. The server looks
 for it next to `bin/basalt`:
 

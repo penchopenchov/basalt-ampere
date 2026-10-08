@@ -3,7 +3,7 @@
 // UD-Q4_K_XL (gate/up Q4_K or Q5_K, down Q5_1 or Q8_0, a Q8_0 embedding).
 //
 // The block layouts, codebook grids and dot products are llama.cpp's (ggml-common.h, ggml-cuda/vecdotq.cuh,
-// ggml-cuda/dequantize.cuh; MIT, see third_party/ggml/LICENSE and VERSION.txt), so a weight means exactly what it
+// ggml-cuda/dequantize.cuh; MIT, llama.cpp commit 3cf03257f219afbe7334045ff7c6a06ac68c627d, see THIRD_PARTY_LICENSES), so a weight means exactly what it
 // means in llama.cpp.  Activations are q8_1 (32 values, fp16 scale and fp16 sum), the llama.cpp CUDA contract.
 #pragma once
 
