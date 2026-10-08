@@ -126,6 +126,7 @@ public:
         cv_.notify_one();
     }
     bool joinable() const { return busy_; }
+    bool finished() const { return !busy_ || done_.load(std::memory_order_acquire); }
     void join() {
         if (!busy_) return;
         // the caller has nothing else to do: poll rather than sleep, so the job's end is seen at once
@@ -5745,6 +5746,8 @@ int main(int argc, char** argv) {
         const bool batch_adapt = adapt_fast && !drive.d.usage.empty();
         int64_t ba_win = 0, ba_swaps = 0, ba_rounds = 0, ba_swaps_l = 0, ba_rounds_l = 0, ba_h_l = 0, ba_m_l = 0;
         double ba_ms = 0;
+        JobRunner ba_thr;       // queues the adaptive copies beside the windows
+        bool ba_job = false;
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -5975,23 +5978,30 @@ int main(int argc, char** argv) {
             drive.d.failed = false;
             apply_pending(false);
             if (batch_adapt) {
-                // the tier follows what all the slots' rows route: a round every --adapt-every windows, its steps
-                // taken once their copies are done, so no window waits for one
+                // the tier follows what all the slots' rows route: a round every --adapt-every windows.  Its steps
+                // are taken once their copies are done; the copies out of the RAM tier (which may read the experts
+                // file) are queued from a worker thread beside the windows, so no window waits for one.
                 const Clock::time_point ta = Clock::now();
                 bool ok = true, acted = false;
                 ++ba_win;
-                if (xq_stage != 0) {
-                    if (cudaEventQuery(adapt_ev) == cudaSuccess) {
-                        const int was = xq_stage;
-                        ok = xq_advance();
-                        if (ok && was == 1 && xq_stage == 2) ver.flush_post_launch();
+                if (ba_job && ba_thr.finished()) { ba_thr.join(); ba_job = false; }
+                if (!ba_job) {
+                    if (xq_stage != 0) {
+                        if (cudaEventQuery(adapt_ev) == cudaSuccess) {
+                            const int was = xq_stage;
+                            ok = xq_advance();
+                            if (ok && was == 1 && xq_stage == 2) {
+                                ba_thr.run([&] { ver.flush_post_launch(); });
+                                ba_job = true;
+                            }
+                            acted = true;
+                        }
+                    } else if (ba_win % o.adapt_every == 0) {
+                        ok = xq_round();
+                        ba_swaps += (int64_t) xq.size();
+                        ++ba_rounds;
                         acted = true;
                     }
-                } else if (ba_win % o.adapt_every == 0) {
-                    ok = xq_round();
-                    ba_swaps += (int64_t) xq.size();
-                    ++ba_rounds;
-                    acted = true;
                 }
                 std::string perr;
                 if (ok && acted && !ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
@@ -6166,7 +6176,7 @@ int main(int argc, char** argv) {
                                          "time, peer swaps total %lld\n", (long long) ba_rounds, (long long) ba_swaps,
                                  ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0, ba_ms / w,
                                  (long long) (peer.valid() ? peer.swaps() : 0));
-                    ba_swaps = ba_rounds = 0;
+                    ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = 0;
                     ba_ms = 0;
                 }
                 if (bt_slotwin > 0)
@@ -6370,6 +6380,7 @@ int main(int argc, char** argv) {
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
+            if (ba_job) { ba_thr.join(); ba_job = false; }   // (a request runs the same copy steps itself)
             if (line == "QUIT") break;
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
