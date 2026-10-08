@@ -76,8 +76,9 @@ class Http(unittest.TestCase):
         self.assertEqual(set(m), {"engine", "live", "requests", "hardware", "hardware_static", "history"})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
-        self.assertEqual(set(m["live"]), {"state", "queued", "slots", "prompt_tokens", "generated", "elapsed_s", "tok_s",
-                                          "prefill_tok_s_mean"})
+        self.assertEqual(set(m["live"]), {"state", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
+                                          "tok_s", "prefill_tok_s_mean"})
+        self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
         self.assertEqual(m["requests"], [])
         self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})

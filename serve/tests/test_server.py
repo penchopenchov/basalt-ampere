@@ -1952,7 +1952,11 @@ class WebApp(unittest.TestCase):
                     self.svc.status["busy"] = busy
                 code, _, body = self.get("/slots")
                 self.assertEqual(code, 200)
-                self.assertEqual(json.loads(body), [{"id": 0, "n_ctx": CTX, "is_processing": busy}])
+                rows = json.loads(body)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual({k: rows[0][k] for k in ("id", "n_ctx", "is_processing")},
+                                 {"id": 0, "n_ctx": CTX, "is_processing": busy})
+                self.assertEqual(rows[0]["state"], "prefill" if busy else "idle")
         finally:
             with self.svc.status_lock:
                 self.svc.status["busy"] = False

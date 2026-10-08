@@ -21,11 +21,12 @@ TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
 class Slots(unittest.TestCase):
     """A server over MockEngine(batch=N); each script is chosen by the first word of the user's message."""
     N = 2
+    Engine = MockEngine
 
     def start(self, scripts, n=None, delay=0.02, **kw):
         tok = ByteTokenizer()
         words = list(scripts)
-        self.engine = MockEngine(tok, ["t</think>\n\n" + scripts[w] for w in words], batch=n or self.N, delay_s=delay,
+        self.engine = self.Engine(tok, ["t</think>\n\n" + scripts[w] for w in words], batch=n or self.N, delay_s=delay,
                                  route=lambda ids: next((i for i, w in enumerate(words)
                                                          if w.encode() in bytes(x & 255 for x in ids)), 0), **kw)
         self.svc = Service(self.engine, tok, ChatTemplate(TEMPLATE))
@@ -120,6 +121,99 @@ class Concurrent(Slots):
             t.join(10)
         self.assertEqual(res[0].strip(), "keep going")
         self.assertIn("and more text", res[1])
+
+
+class Drafting(MockEngine):
+    """The mock engine with a DONE line's draft counts, as ProcessEngine keeps them."""
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        try:
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+        finally:
+            self.last = {"generated": 3, "prompt_tokens": len(ids), "decode_ms": 30.0, "drafts_offered": 40,
+                         "drafts_accepted": 30}
+
+
+class SlotRows(Slots):
+    """/slots and /metrics live.queue: the request on each slot and the ones waiting."""
+    N = 3
+
+    def busy_rows(self, count, what):
+        self.wait_for(lambda: sum(r["is_processing"] for r in self.get("/slots")) == count, what)
+        return [r for r in self.get("/slots") if r["is_processing"]]
+
+    def test_each_slot_names_its_request(self):
+        self.start({"go": "word " * 80}, delay=0.03)
+        ts, _ = self.run_all([lambda: self.chat("go a", model="alias-one"),
+                              lambda: self.post("/v1/messages", {"model": "alias-two", "max_tokens": 200,
+                                                                 "messages": [{"role": "user", "content": "go b"}]})])
+        self.wait_for(lambda: sum(r["state"] == "decoding" and r["generated"] > 0 for r in self.get("/slots")) == 2,
+                      "both decoding")
+        rows = self.get("/slots")
+        busy = [r for r in rows if r["is_processing"]]
+        self.assertEqual(sorted(r["id"] for r in busy), sorted(set(r["id"] for r in busy)))
+        self.assertEqual(sorted((r["api"], r["model"]) for r in busy), [("anthropic", "alias-two"), ("openai", "alias-one")])
+        for r in busy:
+            self.assertEqual(r["state"], "decoding")
+            self.assertGreater(r["prompt_tokens"], 0)
+            self.assertEqual(r["prefill_done"], r["prompt_tokens"])
+            self.assertGreaterEqual(r["tok_s"], 0.0)
+            self.assertGreaterEqual(r["ctx_used"], r["prompt_tokens"] + 1)
+            self.assertEqual(r["n_ctx"], self.engine.max_context)
+        idle = next(r for r in rows if not r["is_processing"])
+        self.assertEqual((idle["state"], idle["api"], idle["model"], idle["tok_s"], idle["generated"], idle["prompt_tokens"]),
+                         ("idle", None, None, 0.0, 0, 0))
+        for t in ts:
+            t.join(10)
+        self.assertTrue(all(r["state"] == "idle" for r in self.get("/slots")))
+
+    def test_a_slot_reads_before_it_decodes(self):
+        self.start({"go": "word " * 5}, delay=0.4)
+        ts, _ = self.run_all([lambda: self.chat("go slowly")])
+        reading = self.busy_rows(1, "one slot busy")[0]
+        self.assertEqual((reading["state"], reading["generated"]), ("prefill", 0))
+        self.assertGreater(reading["prompt_tokens"], 0)
+        self.assertEqual(reading["ctx_used"], reading["prompt_tokens"])
+        self.wait_for(lambda: self.get("/slots")[reading["id"]]["state"] == "decoding", "first token")
+        for t in ts:
+            t.join(10)
+
+    def test_an_idle_slot_keeps_the_last_requests_context_and_drafts(self):
+        self.Engine = Drafting
+        self.start({"go": "word " * 20}, delay=0.03)
+        ts, res = self.run_all([lambda: self.chat("go a")])
+        slot = self.busy_rows(1, "one slot busy")[0]["id"]
+        ts[0].join(10)
+        kept = self.get("/slots")[slot]
+        self.assertEqual((kept["state"], kept["drafts_offered"], kept["drafts_accepted"]), ("idle", 40, 30))
+        self.assertGreater(kept["ctx_used"], 20)
+        self.assertEqual(self.get("/slots")[(slot + 1) % 3]["drafts_offered"], None)
+
+    def test_waiting_requests_are_listed_oldest_first(self):
+        self.start({"go": "word " * 60}, n=2, delay=0.05)
+        ts = []
+        for i, kind in enumerate(("openai", "anthropic", "openai", "anthropic")):
+            job = (lambda i=i: self.chat(f"go {i}", model=f"m{i}")) if kind == "openai" else \
+                  (lambda i=i: self.post("/v1/messages", {"model": f"m{i}", "max_tokens": 200,
+                                                          "messages": [{"role": "user", "content": f"go {i}"}]}))
+            t, _ = self.run_all([job])
+            ts += t
+            self.wait_for(lambda i=i: len(self.engine.requests) + len(self.engine.admission) > i, "arrival")
+            time.sleep(0.05)
+        self.wait_for(lambda: len(self.get("/metrics")["live"]["queue"]) == 2, "two wait")
+        live = self.get("/metrics")["live"]
+        self.assertEqual(live["queued"], 2)
+        q = live["queue"]
+        self.assertEqual([(w["api"], w["model"]) for w in q], [("openai", "m2"), ("anthropic", "m3")])
+        for w in q:
+            self.assertEqual(set(w), {"api", "model", "prompt_tokens", "waited_s"})
+            self.assertGreater(w["prompt_tokens"], 0)
+            self.assertGreaterEqual(w["waited_s"], 0.0)
+        self.assertGreaterEqual(q[0]["waited_s"], q[1]["waited_s"])
+        self.assertEqual(len([r for r in self.get("/slots") if r["is_processing"]]), 2)
+        for t in ts:
+            t.join(15)
+        self.assertEqual(self.get("/metrics")["live"]["queue"], [])
 
 
 class Leaving(Slots):

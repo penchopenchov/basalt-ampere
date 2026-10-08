@@ -70,7 +70,8 @@ class Service:
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples
         # parallel mode: each running request's own status and rate window; self.status shows the newest
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
-        self.request_ctx = threading.local()            # .path: the API path serving this request
+        self.request_ctx = threading.local()            # .path, .model: the API path and model name of this request
+        self.slot_last: dict[int, dict] = {}            # per slot: context held and draft counts of its last request
         self.history = collections.deque(maxlen=500)    # finished requests, newest last
         self.requests_done = 0                           # finished requests since start
         self.last_timings = None                         # last request's timings
@@ -298,6 +299,50 @@ class Service:
         return {"total": max(1, total), "active": max(0, min(max(1, total), running - waiting)),
                 "queue_depth": queued + waiting}
 
+    def slot_table(self) -> tuple[list[dict], list[dict]]:
+        """Per-slot rows and the waiting requests. The oldest running requests take the slots, each keeping its
+        slot until it ends; the rest of the live requests wait for admission."""
+        base = self.slot_stats()
+        total, active = base["total"], base["active"]
+        now = time.time()
+        with self.status_lock:
+            if self.live_reqs:
+                live = [st for st, _ in self.live_reqs.values()]
+                rates = {id(st): list(rt) for st, rt in self.live_reqs.values()}
+            else:
+                live = [self.status] if self.status.get("busy") else []
+                rates = {id(self.status): list(self.rate)}
+            live.sort(key=lambda st: st.get("started") or 0)
+            running, waiting = live[:active], live[active:]
+            taken = {st["slot"] for st in running if st.get("slot") is not None and st["slot"] < total}
+            for st in running:
+                if st.get("slot") is None or st["slot"] >= total:
+                    st["slot"] = next((i for i in range(total) if i not in taken), None)
+                    taken.add(st["slot"])
+            by_slot = {st["slot"]: (dict(st), rates.get(id(st), [])) for st in running}
+            queue = [{"api": st.get("api"), "model": st.get("model"), "prompt_tokens": st.get("prompt_tokens"),
+                      "waited_s": round(now - (st.get("started") or now), 1)} for st in waiting]
+            last = {k: dict(v) for k, v in self.slot_last.items()}
+        reading = [i for i, (st, _) in by_slot.items() if st.get("first_token") is None]
+        progress = getattr(self.engine, "progress", None)
+        rows = []
+        for i in range(total):
+            held = last.get(i, {})
+            row = {"id": i, "n_ctx": self.engine.max_context, "is_processing": i in by_slot, "state": "idle",
+                   "api": None, "model": None, "tok_s": 0.0, "generated": 0, "prompt_tokens": 0, "prefill_done": 0,
+                   "ctx_used": held.get("ctx", 0), "drafts_offered": held.get("offered"),
+                   "drafts_accepted": held.get("accepted")}       # draft counts are the slot's last finished request's
+            if i in by_slot:
+                st, rate = by_slot[i]
+                prompt, gen = int(st.get("prompt_tokens") or 0), int(st.get("generated") or 0)
+                decoding = st.get("first_token") is not None
+                done = prompt if decoding else (min(progress[0], prompt) if progress and reading == [i] else None)
+                row.update(state="decoding" if decoding else "prefill", api=st.get("api"), model=st.get("model"),
+                           tok_s=round(self._rate_of(st, rate), 1), generated=gen, prompt_tokens=prompt,
+                           prefill_done=done, ctx_used=prompt + gen)
+            rows.append(row)
+        return rows, queue
+
     def metrics(self) -> dict:
         """GET /metrics: engine facts, live state, recent requests, hardware and speed history."""
         with self.status_lock:
@@ -315,7 +360,7 @@ class Service:
         else:
             state = "idle"
         slots = self.slot_stats()
-        live = {"state": state, "queued": slots["queue_depth"], "slots": slots,
+        live = {"state": state, "queued": slots["queue_depth"], "slots": slots, "queue": self.slot_table()[1],
                 "prompt_tokens": s.get("prompt_tokens") if busy else None,
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
@@ -545,7 +590,9 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new)
+                                  max_tokens=max_new, slot=None,
+                                  api="anthropic" if path == "/v1/messages" else "openai",
+                                  model=getattr(self.request_ctx, "model", None) or self.model)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
@@ -670,6 +717,9 @@ class Service:
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # less than len(ids) when cancelled mid-read
                             self.requests_done += 1
+                            if st.get("slot") is not None:
+                                self.slot_last[st["slot"]] = {"ctx": seen + n, "offered": last.get("drafts_offered"),
+                                                              "accepted": last.get("drafts_accepted")}
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path,
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,

@@ -288,9 +288,7 @@ def make_handler(svc: Service):
             elif path == "/slots":
                 if self._authorized():
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
-                    st = svc.slot_stats()
-                    self._json(200, [{"id": i, "n_ctx": svc.engine.max_context, "is_processing": i < st["active"]}
-                                     for i in range(st["total"])] if loaded else [])
+                    self._json(200, svc.slot_table()[0] if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
@@ -367,6 +365,7 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 svc.request_ctx.path = path
+                svc.request_ctx.model = req.get("model") if isinstance(req.get("model"), str) else None
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/chat/completions":
