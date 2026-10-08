@@ -1068,6 +1068,8 @@ int main(int argc, char** argv) {
             set_arg(qa, "--spec-min-p", "0.7");
             set_arg(qa, "--adapt-swaps", "0");
             set_arg(qa, "--peer-adapt-swaps", "0");
+            // the gate must run on every pack: without this a pack larger than free RAM is refused
+            if (!has_arg(qa, "--resident-experts") && !has_arg(qa, "--mmap-experts")) qa.push_back("--resident-experts");
             const std::string rows = (fs::path(work) / "rows.tsv").string();
             std::remove(rows.c_str());
             set_arg(qa, "--ppl-base", o.kld_base);
