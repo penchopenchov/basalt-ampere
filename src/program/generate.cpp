@@ -7086,8 +7086,11 @@ int main(int argc, char** argv) {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                // while slots are decoding the prompt goes in chunks of a fixed small size, so a long prompt holds the
+                // slots' windows back for one short chunk at a time
+                constexpr int64_t live_chunk = 1024;
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    const int64_t r = std::min(b0, q + (batch_on() ? std::min(C, live_chunk) : C));
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     q = r;
