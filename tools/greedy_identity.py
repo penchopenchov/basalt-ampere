@@ -1,9 +1,9 @@
 """tools/greedy_identity.py - do two engine builds produce the same greedy tokens?
 
-    python3 tools/greedy_identity.py REF_EXE NEW_EXE --model FILE.basalt [--fixtures DIR] [--tokens N] [-- ENGINE ARGS...]
+    python3 tools/greedy_identity.py REF_BIN NEW_BIN --model FILE.basalt [--fixtures DIR] [--tokens N] [-- ENGINE ARGS...]
 
-Each binary runs as `--serve` with the model file's own engine arguments, plus whatever follows `--` (a flag given
-there replaces the file's value).  The bench fixtures' prompts (conv, struct, prose: one line of comma-separated token
+Each binary runs as `--serve` with a minimal set (BASE below: speculation 7, context 8192), plus whatever follows `--` (a flag given
+there replaces the built-in value; any engine flag works there).  The bench fixtures' prompts (conv, struct, prose: one line of comma-separated token
 ids each) are sent at temperature 0 and every generated token is compared.  Adaptive expert swaps and the PCIe share
 are switched off so placement cannot drift between the runs; pin the tiers too (e.g. `-- --peer-slots N
 --expert-cache N`) when the builds' VRAM use differs, since auto-sized tiers change where experts are computed and so
@@ -21,9 +21,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from model_file import ModelFile  # noqa: E402
 
 PROMPTS = ("conv", "struct", "prose")
+# What the comparison needs on any machine: the verify path over the fixtures.  Flags after `--` replace these.
+BASE = ["--spec", "7", "--spec-min-p", "0.5", "--max-context", "8192"]
 PINNED = ["--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--pcie-frac", "0"]
 
 
@@ -106,7 +107,7 @@ def main() -> int:
             print(f"greedy_identity: {path} is missing", file=sys.stderr)
             return 2
         prompts.append(path.read_text().strip())
-    args = set_args(["--model", a.model], PINNED + extra)
+    args = set_args(["--model", a.model, *BASE], PINNED + extra)
 
     logs = Path(tempfile.mkdtemp(prefix="greedy-identity-"))
     results = {}
