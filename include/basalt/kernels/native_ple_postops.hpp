@@ -3,6 +3,8 @@
 
 namespace basalt::kernels {
 
+struct SegRow;
+
 // Fixed qwen4exp single-token geometry: embd=2560, streams=4, history=9,
 // convolution kernel=4/dilation=3. All buffers are caller-owned and capture-safe.
 struct NativePlePostopsBuffers {
@@ -43,9 +45,11 @@ struct PleWindowArgs {
     const float* inject = nullptr;      ///< [T][4] its inject
     const float* key = nullptr;         ///< [T][10240] projected keys
     const float* value = nullptr;       ///< [T][2560] projected values
-    float* history = nullptr;           ///< 9 rows per channel, advanced past the T rows ([T][9 * 10240] if rows_independent)
+    float* history = nullptr;           ///< 9 rows per channel, advanced past the T rows ([T][9 * 10240] if segs)
     float* hist_snap = nullptr;         ///< [T][9 * 10240]: the history after each row
-    bool rows_independent = false;      ///< each row is its own sequence: its own history, advanced by that one row
+    /// The rows are segments of different sequences (device table, one entry per row): a segment's first row holds its
+    /// history, which its rows advance in order, as a window of that segment alone would.
+    const SegRow* segs = nullptr;
     float* scratch = nullptr;           ///< 2 * T * 10240 floats
     int T = 0;
 };

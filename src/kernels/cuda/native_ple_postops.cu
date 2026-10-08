@@ -20,6 +20,7 @@
 
 #include "basalt/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/native_gr_norm.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -301,12 +302,16 @@ __global__ void __launch_bounds__(128) ple_win_conv_kernel(float* R, const float
     ple_win_conv_dev(R, gated, normalized, weights, history, snap, T, blockIdx.x * blockDim.x + threadIdx.x);
 }
 
-// the rows are independent sequences: row t's conv reads and advances its own history, a one-row window each
-__global__ void __launch_bounds__(128) ple_win_conv_rows_kernel(float* R, const float* gated, const float* normalized,
-                                                               const uint16_t* weights, float* history, float* snap) {
-    const size_t t = blockIdx.y;
+// the rows are segments of different sequences: a segment's first row runs its rows' conv in order over the history
+// held at that row, the others are idle
+__global__ void __launch_bounds__(128) ple_win_conv_seg_kernel(float* R, const float* gated, const float* normalized,
+                                                              const uint16_t* weights, float* history, float* snap,
+                                                              const SegRow* __restrict__ rows) {
+    const SegRow r = rows[blockIdx.y];
+    if (r.j != 0) return;
+    const size_t t = r.row0;
     ple_win_conv_dev(R + t * D, gated + t * D, normalized + t * D, weights, history + t * HISTORY * D,
-                     snap + t * HISTORY * D, 1, blockIdx.x * blockDim.x + threadIdx.x);
+                     snap + t * HISTORY * D, r.n, blockIdx.x * blockDim.x + threadIdx.x);
 }
 
 struct Span { const void* p; size_t bytes; size_t alignment; };
@@ -366,9 +371,9 @@ void native_ple_window(const PleWindowArgs& a, const PleWeights& w, void* stream
     r.gated = a.scratch; r.normalized = a.scratch + size_t(a.T) * D;
     r.n_cols = N; r.epsilon = NG_RMS_EPS; r.inv_hc = 1.0f / float(H); r.gate_scale = 1.0f / std::sqrt(float(N));
     ple_win_rows_kernel<<<dim3(H, unsigned(a.T)), 1024, 0, st>>>(r);
-    if (a.rows_independent)
-        ple_win_conv_rows_kernel<<<dim3(D / 128, unsigned(a.T)), 128, 0, st>>>(a.R, r.gated, r.normalized, w.conv1d_f16,
-                                                                               a.history, a.hist_snap);
+    if (a.segs)
+        ple_win_conv_seg_kernel<<<dim3(D / 128, unsigned(a.T)), 128, 0, st>>>(a.R, r.gated, r.normalized, w.conv1d_f16,
+                                                                              a.history, a.hist_snap, a.segs);
     else
         ple_win_conv_kernel<<<D / 128, 128, 0, st>>>(a.R, r.gated, r.normalized, w.conv1d_f16, a.history, a.hist_snap, a.T);
     launch_check();

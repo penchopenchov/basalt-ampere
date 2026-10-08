@@ -200,15 +200,17 @@ public:
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
-    // A batch window holds S INDEPENDENT sequences, one token each: row s is slot s, at slot s's own position,
-    // reading and writing slot s's own state (GDN recurrence and conv history, QSA K/V and indexer, PLE history),
-    // which lives in `slots[s]` - a session carved like this verifier's own (same layer range, same max_cells).
-    // Everything that is per row already (hyper-connections, dense projections, router, shared expert, the
-    // routed experts on the GPU and the CPU, the head) runs once over the S rows, so the weights are read once
-    // per window for all the sequences.  Row s's arithmetic is the single-token window's, so a slot's greedy
-    // tokens are its solo greedy tokens (modulo the multi-token CPU kernel choice).
+    // A batch window holds the SEGMENTS of several INDEPENDENT sequences: segment s is `lens[s]` consecutive tokens
+    // of slot s at the slot's own positions, reading and writing slot s's own state (GDN recurrence and conv
+    // history, QSA K/V and indexer, PLE history), which lives in `slots[s]` - a session carved like this
+    // verifier's own (same layer range, same max_cells).  Everything that is per row (hyper-connections, dense
+    // projections, router, shared expert, the routed experts on the GPU and the CPU, the head) runs once over the
+    // window's rows, so the weights are read once per window for all the sequences.  A segment's rows are a solo
+    // window of that slot, so a slot's greedy tokens are its solo greedy tokens (modulo the multi-token CPU kernel
+    // choice).  The window graph is keyed by the row count alone; the split into segments is data.  Each segment
+    // then keeps its own number of rows (commit_slots), as a solo commit does.
     //
-    // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
+    // No drafting here: the caller supplies the tokens of every segment.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
@@ -219,8 +221,15 @@ public:
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
                        int32_t* out, std::string& err);
-    /// Keep every row of the last batch window: each slot's state advances by its one token.
+    /// A window of S segments: segment s feeds lens[s] tokens (concatenated in `tokens`, at most max_t in all) of
+    /// slot slots[s] from position pos0[s]; out[r] = the greedy pick after row r.
+    bool run_slot_segs(const int* slots, const int* lens, int S, const int32_t* tokens, const int64_t* pos0,
+                       PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// Keep every row of the last batch window: each slot's state advances by its tokens.
     bool commit_slots(std::string& err);
+    /// Keep the first n_keep[s] (1..lens[s]) rows of segment s: its slot's state advances by those tokens only and
+    /// is exactly what a solo commit of that many leaves.
+    bool commit_slots(const int* n_keep, std::string& err);
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -295,7 +304,8 @@ private:
     /// slots the rows are is data (the staged segment tables), so a membership change re-records nothing.
     std::map<uint64_t, cudaGraphExec_t> exec_bm_;
     std::map<int, cudaGraphExec_t> commit_bm_;
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int last_rows_[8] = {};                ///< the slot of each row of the last batch window
+    int last_nseg_ = 0, last_seg_slot_[8] = {}, last_seg_len_[8] = {};   ///< its segments
     uint64_t bkey(int S, int hbase) const {
         return batch_key(S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
     }
@@ -330,10 +340,12 @@ private:
     bool batch_gdnf_ = false;              ///< a batch window runs the fused GDN recurrence (a gate)
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
-    bool capture_batch(int S, int hbase, std::string& err);
+    bool capture_batch(int R, int hbase, std::string& err);
     void collect_profile();   // --profile: add the last window's stamps to prof_sum_
-    bool capture_commit_batch(int S, std::string& err);
-    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
+    bool capture_commit_batch(int R, std::string& err);
+    bool stage_batch(const int* slots, const int* lens, int S, int hbase, const int32_t* tokens, const int64_t* pos0,
+                     std::string& err);
+    bool batch_seg_ple_ = true;            ///< the window's PLE runs the window kernels (segments of several rows)
     basalt::kernels::SamplerParams sampling_ = [] {
         basalt::kernels::SamplerParams s;
         s.greedy = true;

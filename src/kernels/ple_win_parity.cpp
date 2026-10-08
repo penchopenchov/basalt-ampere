@@ -6,6 +6,7 @@
 #include "basalt/kernels/native_ple_postops.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/ple.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -43,7 +44,7 @@ size_t ndiff(const std::vector<float>& a, const std::vector<float>& b) {
 
 int main(int argc, char** argv) {
     const int iters = argc > 1 ? std::atoi(argv[1]) : 500;
-    constexpr int N = k::NG_N_EMBD, H = k::NG_HC, D = k::NG_HC_DIM, HS = k::NG_HIST * k::NG_HC_DIM, MT = 7;
+    constexpr int N = k::NG_N_EMBD, H = k::NG_HC, D = k::NG_HC_DIM, HS = k::NG_HIST * k::NG_HC_DIM, MT = 8;
     std::mt19937 rng(23);
     std::normal_distribution<float> nd(0.f, 1.f);
     auto randv = [&](size_t n, float sc, float off) { std::vector<float> v(n); for (auto& x : v) x = off + sc * nd(rng); return v; };
@@ -113,42 +114,66 @@ int main(int argc, char** argv) {
                     break;
                 }
     }
-    // independent rows (a batch window): row t over its own history equals the one-row window on that history
+    // segments of different sequences (a batch window): each segment over its own history equals the window of that
+    // segment alone; every split of T rows, one-row segments included
     {
         const auto h_hists = randv((size_t) MT * HS, 1.0f, 0.0f);
         float* hists = dalloc<float>((size_t) MT * HS);
         float* hsnap = dalloc<float>((size_t) MT * HS);
+        k::SegRow* dseg = dalloc<k::SegRow>(MT);
         for (int T = 1; T <= MT; ++T) {
-            std::vector<float> out[2][3];
-            for (int v = 0; v < 2; ++v) {
-                ck(cudaDeviceSynchronize(), "sync");
-                up(R, h_R); up(hists, h_hists);
-                ck(cudaDeviceSynchronize(), "sync");
-                ck(cudaMemsetAsync(hsnap, 0, (size_t) MT * HS * 4, st), "memset");
-                ck(cudaStreamSynchronize(st), "sync");
-                if (v == 0) {
-                    for (int t = 0; t < T; ++t) {
+            for (int trial = 0; trial < 12; ++trial) {
+                std::vector<int> lens;
+                for (int left = T; left > 0;) {
+                    const int n = trial == 0 ? 1 : 1 + (int) (rng() % (unsigned) left);
+                    lens.push_back(n);
+                    left -= n;
+                }
+                std::vector<k::SegRow> tab((size_t) T);
+                for (size_t s2 = 0, r0 = 0; s2 < lens.size(); r0 += (size_t) lens[s2], ++s2)
+                    for (int j = 0; j < lens[s2]; ++j) {
+                        k::SegRow& e = tab[r0 + (size_t) j];
+                        std::memset(&e, 0, sizeof e);
+                        e.row0 = (int32_t) r0; e.j = j; e.n = lens[s2]; e.n_keep = lens[s2];
+                    }
+                std::vector<float> out[2][3];
+                for (int v = 0; v < 2; ++v) {
+                    ck(cudaDeviceSynchronize(), "sync");
+                    up(R, h_R); up(hists, h_hists); up(dseg, tab);
+                    ck(cudaMemsetAsync(hsnap, 0, (size_t) MT * HS * 4, st), "memset");
+                    ck(cudaStreamSynchronize(st), "sync");
+                    if (v == 0) {
+                        for (size_t s2 = 0, r0 = 0; s2 < lens.size(); r0 += (size_t) lens[s2], ++s2) {
+                            k::PleWindowArgs a;
+                            a.R = R + r0 * D; a.block_out = bo + r0 * N; a.inject = inj + r0 * H;
+                            a.key = key + r0 * D; a.value = val + r0 * N; a.history = hists + r0 * HS;
+                            a.hist_snap = hsnap + r0 * HS; a.scratch = win; a.T = lens[s2];
+                            k::native_ple_window(a, w, st);
+                        }
+                    } else {
                         k::PleWindowArgs a;
-                        a.R = R + (size_t) t * D; a.block_out = bo + (size_t) t * N; a.inject = inj + (size_t) t * H;
-                        a.key = key + (size_t) t * D; a.value = val + (size_t) t * N; a.history = hists + (size_t) t * HS;
-                        a.hist_snap = hsnap + (size_t) t * HS; a.scratch = win; a.T = 1;
+                        a.R = R; a.block_out = bo; a.inject = inj; a.key = key; a.value = val; a.history = hists;
+                        a.hist_snap = hsnap; a.scratch = win; a.T = T; a.segs = dseg;
                         k::native_ple_window(a, w, st);
                     }
-                } else {
-                    k::PleWindowArgs a;
-                    a.R = R; a.block_out = bo; a.inject = inj; a.key = key; a.value = val; a.history = hists;
-                    a.hist_snap = hsnap; a.scratch = win; a.T = T; a.rows_independent = true;
-                    k::native_ple_window(a, w, st);
+                    ck(cudaStreamSynchronize(st), "sync");
+                    out[v][0] = down(R, (size_t) T * D);
+                    // the histories held at each segment's first row
+                    std::vector<float> hh = down(hists, (size_t) T * HS), sn = down(hsnap, (size_t) T * HS), keep;
+                    for (size_t s2 = 0, r0 = 0; s2 < lens.size(); r0 += (size_t) lens[s2], ++s2)
+                        keep.insert(keep.end(), hh.begin() + (long) (r0 * HS), hh.begin() + (long) ((r0 + 1) * HS));
+                    out[v][1] = keep;
+                    out[v][2] = sn;
                 }
-                ck(cudaStreamSynchronize(st), "sync");
-                out[v][0] = down(R, (size_t) T * D);
-                out[v][1] = down(hists, (size_t) T * HS);
-                out[v][2] = down(hsnap, (size_t) T * HS);
+                const size_t d0 = ndiff(out[0][0], out[1][0]), d1 = ndiff(out[0][1], out[1][1]), d2 = ndiff(out[0][2], out[1][2]);
+                if (d0 + d1 + d2 != 0 || trial == 0 || trial == 11) {
+                    std::printf("segments T=%d [", T);
+                    for (int n : lens) std::printf(" %d", n);
+                    std::printf(" ]  result %zu  history %zu  snapshots %zu  differing values%s\n", d0, d1, d2,
+                                d0 + d1 + d2 ? "  DIFF" : "");
+                }
+                fail += d0 + d1 + d2 != 0;
             }
-            const size_t d0 = ndiff(out[0][0], out[1][0]), d1 = ndiff(out[0][1], out[1][1]), d2 = ndiff(out[0][2], out[1][2]);
-            std::printf("rows T=%d  result %zu  history %zu  snapshots %zu  differing values%s\n", T, d0, d1, d2,
-                        d0 + d1 + d2 ? "  DIFF" : "");
-            fail += d0 + d1 + d2 != 0;
         }
     }
     // microbench: each form captured once per T, replayed
@@ -173,6 +198,54 @@ int main(int argc, char** argv) {
             cudaGraphExecDestroy(ge); cudaGraphDestroy(g);
         }
         std::printf("bench: T=%d  per-row chain %.2f us  window %.2f us\n", T, 1000.0f * ms[0] / iters, 1000.0f * ms[1] / iters);
+    }
+    // microbench: an 8-row window split into segments, one segment-table call vs one call per segment
+    for (const std::vector<int>& lens : std::vector<std::vector<int>>{{1, 1, 1, 1, 1, 1, 1, 1}, {2, 2, 2, 2}, {4, 4}, {8}}) {
+        const int T = 8;
+        std::vector<k::SegRow> tab((size_t) T);
+        for (size_t s2 = 0, r0 = 0; s2 < lens.size(); r0 += (size_t) lens[s2], ++s2)
+            for (int j = 0; j < lens[s2]; ++j) {
+                k::SegRow& e = tab[r0 + (size_t) j];
+                std::memset(&e, 0, sizeof e);
+                e.row0 = (int32_t) r0; e.j = j; e.n = lens[s2]; e.n_keep = lens[s2];
+            }
+        k::SegRow* dseg = dalloc<k::SegRow>(T);
+        up(dseg, tab);
+        float* hists = dalloc<float>((size_t) T * HS);
+        float* hsnap = dalloc<float>((size_t) T * HS);
+        float ms[2];
+        for (int v = 0; v < 2; ++v) {
+            cudaGraph_t g;
+            cudaGraphExec_t ge;
+            ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "capture");
+            if (v == 0) {
+                for (size_t s2 = 0, r0 = 0; s2 < lens.size(); r0 += (size_t) lens[s2], ++s2) {
+                    k::PleWindowArgs a;
+                    a.R = R + r0 * D; a.block_out = bo + r0 * N; a.inject = inj + r0 * H; a.key = key + r0 * D;
+                    a.value = val + r0 * N; a.history = hists + r0 * HS; a.hist_snap = hsnap + r0 * HS; a.scratch = win;
+                    a.T = lens[s2];
+                    k::native_ple_window(a, w, st);
+                }
+            } else {
+                k::PleWindowArgs a;
+                a.R = R; a.block_out = bo; a.inject = inj; a.key = key; a.value = val; a.history = hists;
+                a.hist_snap = hsnap; a.scratch = win; a.T = T; a.segs = dseg;
+                k::native_ple_window(a, w, st);
+            }
+            ck(cudaStreamEndCapture(st, &g), "end capture");
+            ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+            for (int i = 0; i < 20; ++i) cudaGraphLaunch(ge, st);
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0); cudaEventCreate(&e1);
+            cudaEventRecord(e0, st);
+            for (int i = 0; i < iters; ++i) cudaGraphLaunch(ge, st);
+            cudaEventRecord(e1, st);
+            ck(cudaEventSynchronize(e1), "bench");
+            cudaEventElapsedTime(&ms[v], e0, e1);
+            cudaGraphExecDestroy(ge); cudaGraphDestroy(g);
+        }
+        std::printf("bench: 8 rows in %zu segments  per-segment calls %.2f us  one segment-table call %.2f us\n",
+                    lens.size(), 1000.0f * ms[0] / iters, 1000.0f * ms[1] / iters);
     }
     std::printf("%s\n", fail ? "PLE WINDOW PARITY FAILED" : "PLE WINDOW PARITY OK (bitwise)");
     return fail ? 1 : 0;
