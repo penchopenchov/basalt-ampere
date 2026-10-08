@@ -117,129 +117,6 @@ private:
     bool key_ = false;
 };
 
-// ---------------------------------------------------------------------------------------------- minimal JSON reader
-// Enough for the server's run config: objects, arrays, strings, numbers, booleans, null.
-
-struct JVal {
-    enum Kind { Null, Bool, Num, Str, Arr, Obj } kind = Null;
-    std::string s;
-    double n = 0;
-    bool b = false;
-    std::vector<JVal> a;
-    std::vector<std::pair<std::string, JVal>> o;
-    const JVal* find(const std::string& k) const {
-        for (const auto& kv : o)
-            if (kv.first == k) return &kv.second;
-        return nullptr;
-    }
-};
-
-class JParser {
-public:
-    explicit JParser(const std::string& t) : t_(t) {}
-    bool parse(JVal& v, std::string& err) {
-        try {
-            value(v);
-            ws();
-            if (p_ != t_.size()) fail("trailing text");
-            return true;
-        } catch (const std::string& e) {
-            err = e + " at offset " + std::to_string(p_);
-            return false;
-        }
-    }
-
-private:
-    [[noreturn]] void fail(const std::string& m) { throw m; }
-    void ws() {
-        while (p_ < t_.size() && (t_[p_] == ' ' || t_[p_] == '\n' || t_[p_] == '\t' || t_[p_] == '\r')) ++p_;
-    }
-    void expect(char c) {
-        ws();
-        if (p_ >= t_.size() || t_[p_] != c) fail(std::string("expected '") + c + "'");
-        ++p_;
-    }
-    std::string string_lit() {
-        expect('"');
-        std::string r;
-        while (p_ < t_.size() && t_[p_] != '"') {
-            char c = t_[p_++];
-            if (c != '\\') { r += c; continue; }
-            if (p_ >= t_.size()) fail("bad escape");
-            const char e = t_[p_++];
-            switch (e) {
-                case 'n': r += '\n'; break;
-                case 't': r += '\t'; break;
-                case 'r': r += '\r'; break;
-                case 'b': r += '\b'; break;
-                case 'f': r += '\f'; break;
-                case 'u': {
-                    if (p_ + 4 > t_.size()) fail("bad \\u escape");
-                    const unsigned cp = (unsigned) std::strtoul(t_.substr(p_, 4).c_str(), nullptr, 16);
-                    p_ += 4;
-                    if (cp < 0x80) r += (char) cp;
-                    else if (cp < 0x800) { r += (char) (0xC0 | (cp >> 6)); r += (char) (0x80 | (cp & 0x3F)); }
-                    else { r += (char) (0xE0 | (cp >> 12)); r += (char) (0x80 | ((cp >> 6) & 0x3F)); r += (char) (0x80 | (cp & 0x3F)); }
-                    break;
-                }
-                default: r += e;
-            }
-        }
-        if (p_ >= t_.size()) fail("unterminated string");
-        ++p_;
-        return r;
-    }
-    void value(JVal& v) {
-        ws();
-        if (p_ >= t_.size()) fail("unexpected end");
-        const char c = t_[p_];
-        if (c == '{') {
-            v.kind = JVal::Obj;
-            ++p_;
-            ws();
-            if (p_ < t_.size() && t_[p_] == '}') { ++p_; return; }
-            for (;;) {
-                ws();
-                std::string k = string_lit();
-                expect(':');
-                JVal x;
-                value(x);
-                v.o.emplace_back(std::move(k), std::move(x));
-                ws();
-                if (p_ < t_.size() && t_[p_] == ',') { ++p_; continue; }
-                expect('}');
-                return;
-            }
-        }
-        if (c == '[') {
-            v.kind = JVal::Arr;
-            ++p_;
-            ws();
-            if (p_ < t_.size() && t_[p_] == ']') { ++p_; return; }
-            for (;;) {
-                JVal x;
-                value(x);
-                v.a.push_back(std::move(x));
-                ws();
-                if (p_ < t_.size() && t_[p_] == ',') { ++p_; continue; }
-                expect(']');
-                return;
-            }
-        }
-        if (c == '"') { v.kind = JVal::Str; v.s = string_lit(); return; }
-        if (t_.compare(p_, 4, "true") == 0) { v.kind = JVal::Bool; v.b = true; p_ += 4; return; }
-        if (t_.compare(p_, 5, "false") == 0) { v.kind = JVal::Bool; v.b = false; p_ += 5; return; }
-        if (t_.compare(p_, 4, "null") == 0) { v.kind = JVal::Null; p_ += 4; return; }
-        char* end = nullptr;
-        v.n = std::strtod(t_.c_str() + p_, &end);
-        if (end == t_.c_str() + p_) fail("unexpected character");
-        v.kind = JVal::Num;
-        p_ = (size_t) (end - t_.c_str());
-    }
-    const std::string& t_;
-    size_t p_ = 0;
-};
-
 // ---------------------------------------------------------------------------------------------- NVML (dlopen)
 
 class Nvml {
@@ -343,8 +220,7 @@ class Engine {
 public:
     ~Engine() { stop(); }
 
-    bool start(const std::string& exe, const std::vector<std::string>& args, const std::string& cwd,
-               const std::vector<std::pair<std::string, std::string>>& env, const std::string& log_path,
+    bool start(const std::string& exe, const std::vector<std::string>& args, const std::string& log_path,
                std::string& err) {
         int in[2], out[2];
         if (pipe(in) != 0 || pipe(out) != 0) { err = "pipe failed"; return false; }
@@ -356,8 +232,6 @@ public:
             const int lf = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (lf >= 0) dup2(lf, 2);
             close(in[0]); close(in[1]); close(out[0]); close(out[1]);
-            if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
-            for (const auto& kv : env) setenv(kv.first.c_str(), kv.second.c_str(), 1);
             std::vector<std::string> store;
             store.push_back(exe);
             store.push_back("--serve");
@@ -504,7 +378,7 @@ private:
 // ---------------------------------------------------------------------------------------------- options
 
 struct Options {
-    std::string engine, config, model, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, power_label;
+    std::string engine, model, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, power_label;
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec, spec_min_p;        // --spec N, --spec-min-p P: engine arguments of the same names
@@ -521,7 +395,6 @@ void usage(const std::string& engine) {
         "basalt-bench - the standard benchmark: decode fixtures, prefill depths, optional quality gate\n"
         "\n"
         "usage: basalt-bench --model FILE.basalt [options] [-- ENGINE ARGS...]\n"
-        "       basalt-bench --config CFG.json [options] [-- ENGINE ARGS...]\n"
         "\n"
         "what to run (default: -p 16384 -t conv,struct,prose; giving one of -p / -t runs only what is given)\n"
         "  -t LIST            decode fixtures, any of conv,struct,prose; they always run in that order, because\n"
@@ -539,16 +412,13 @@ void usage(const std::string& engine) {
         "  --model FILE       a .basalt model file; --peer-device 1 is added when a second GPU is visible. Every\n"
         "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
-        "  --config FILE      server run config (JSON): \"exe\", \"args\", \"cwd\", \"env\", \"lib_dirs\" are used;\n"
-        "                     the vision sidecar is not started\n"
-        "  --engine EXE       engine binary (default: the one built with this program, else the config's)\n"
+        "  --engine BIN       engine binary (default: the one built with this program)\n"
         "  --set \"F V ...\"    FLAG VALUE pairs that replace or add engine arguments (repeatable)\n"
-        "  --spec N           speculation window for the engine (--spec N); without it, and without --spec in the\n"
-        "                     config or after --, the run has no speculation (--spec 0): a clean baseline\n"
+        "  --spec N           speculation window for the engine (--spec N); without it, and without --spec after --,\n"
+        "                     the run has no speculation (--spec 0): a clean baseline\n"
         "  --spec-min-p P     the draft cutoff (--spec-min-p P); with N >= 2 and no cutoff given, 0.5\n"
         "                     MTP: --spec 7 --spec-min-p 0.5 (or -- --spec 7 --spec-min-p 0.5)\n"
-        "  -- ARGS...         the same engine arguments, after --: appended last to --config's, or replacing\n"
-        "                     and adding flags with --model\n"
+        "  -- ARGS...         the same engine arguments, after --: replacing and adding flags\n"
         "  built in (only what the measurement needs, each replaced by giving the flag): --spec 0, --max-context sized\n"
         "  to the fixtures, --spec-min-p 0.5 when --spec is 2 or more\n"
         "\n"
@@ -694,8 +564,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
                 if (std::string(argv[k]) == "--engine") engine = argv[k + 1];
             usage(engine);
             std::exit(0);
-        } else if (a == "--config") o.config = next("--config");
-        else if (a == "--model") o.model = next("--model");
+        } else if (a == "--model") o.model = next("--model");
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--spec-min-p") o.spec_min_p = next("--spec-min-p");
@@ -742,9 +611,8 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             err = "-t: unknown fixture " + s + " (conv, struct, prose)";
             return false;
         }
-    if (!o.model.empty() && !o.config.empty()) { err = "give --model or --config, not both"; return false; }
-    if (o.config.empty() && o.model.empty() && o.passthrough.empty()) {
-        err = "give --model FILE, --config FILE or engine arguments after --";
+    if (o.model.empty() && o.passthrough.empty()) {
+        err = "give --model FILE or engine arguments after --";
         return false;
     }
     return true;
@@ -979,41 +847,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // engine command from the config and the overrides
-    std::string exe = o.engine, cwd;
+    // engine command from the model and the overrides
+    std::string exe = o.engine;
     std::vector<std::string> args;
-    std::vector<std::pair<std::string, std::string>> env;
-    if (!o.config.empty()) {
-        std::ifstream f(o.config);
-        if (!f) { std::fprintf(stderr, "basalt-bench: cannot read %s\n", o.config.c_str()); return 2; }
-        std::stringstream ss;
-        ss << f.rdbuf();
-        const std::string text = ss.str();
-        JVal cfg;
-        JParser jp(text);
-        if (!jp.parse(cfg, err) || cfg.kind != JVal::Obj) {
-            std::fprintf(stderr, "basalt-bench: %s: %s\n", o.config.c_str(), err.empty() ? "not a JSON object" : err.c_str());
-            return 2;
-        }
-        if (const JVal* v = cfg.find("cwd"); v && v->kind == JVal::Str) cwd = v->s;
-        if (exe.empty()) {
-            if (const JVal* v = cfg.find("exe"); v && v->kind == JVal::Str) exe = v->s;
-            if (!exe.empty() && exe[0] != '/' && !cwd.empty()) exe = (fs::path(cwd) / exe).string();
-        }
-        if (const JVal* v = cfg.find("args"); v && v->kind == JVal::Arr)
-            for (const JVal& x : v->a) args.push_back(x.kind == JVal::Num ? fmt("%.17g", x.n) : x.s);
-        if (const JVal* v = cfg.find("env"); v && v->kind == JVal::Obj)
-            for (const auto& kv : v->o) env.emplace_back(kv.first, kv.second.s);
-        if (const JVal* v = cfg.find("lib_dirs"); v && v->kind == JVal::Arr) {
-            std::string ld;
-            for (const JVal& x : v->a)
-                if (fs::is_directory(x.s)) ld += x.s + ":";
-            if (!ld.empty()) {
-                const char* old = std::getenv("LD_LIBRARY_PATH");
-                env.emplace_back("LD_LIBRARY_PATH", ld + (old != nullptr ? old : ""));
-            }
-        }
-    }
     if (!o.model.empty()) {
         args = {"--model", fs::absolute(o.model).string()};
         if (!has_arg(args, "--peer-device") && visible_gpus() > 1) set_arg(args, "--peer-device", "1");
@@ -1021,7 +857,7 @@ int main(int argc, char** argv) {
     if (exe.empty()) exe = BASALT_BENCH_ENGINE;
     if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) exe = BASALT_BENCH_ENGINE;
     if (exe.empty() || !fs::exists(exe)) {
-        std::fprintf(stderr, "basalt-bench: the engine binary %s does not exist (--engine EXE)\n", exe.c_str());
+        std::fprintf(stderr, "basalt-bench: the engine binary %s does not exist (--engine BIN)\n", exe.c_str());
         return 2;
     }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
@@ -1120,7 +956,7 @@ int main(int argc, char** argv) {
         const std::string log_path = (fs::path(work) / "engine.log").string();
         Engine eng;
         std::fprintf(stderr, "basalt-bench: starting %s\n", exe.c_str());
-        if (!eng.start(exe, perf_args, cwd, env, log_path, err)) {
+        if (!eng.start(exe, perf_args, log_path, err)) {
             std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
             return 1;
         }
@@ -1233,7 +1069,7 @@ int main(int argc, char** argv) {
             Engine eng;
             const auto t0 = Clock::now();
             std::fprintf(stderr, "basalt-bench: starting the engine for the quality gate\n");
-            if (!eng.start(exe, qa, cwd, env, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
+            if (!eng.start(exe, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
                 std::fprintf(stderr, "basalt-bench: %s\n", quality.err.c_str());
             } else {
                 quality.load_s = secs(t0, Clock::now());
