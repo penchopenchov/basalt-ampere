@@ -3150,7 +3150,7 @@ int main(int argc, char** argv) {
             if (!profile.empty()) without = std::min<int64_t>(without, (int64_t) profile.size());
             const bool swaps = !profile.empty() && o.expert_cache < (int64_t) profile.size() && without >= (int64_t) profile.size();
             if (without > 0 && (swaps || o.expert_cache * 2 < without))
-                std::fprintf(stderr, "basalt warning: the %d batch slot sessions take %.1f GiB of CUDA0, leaving an "
+                std::fprintf(stderr, "basalt warning: the %d batch slots' sessions (the first is the solo one) take %.1f GiB of CUDA0 beyond it, leaving an "
                                      "expert cache of %d slots (%.1f GiB) where %lld would fit without them%s. Lower "
                                      "--max-context or drop --slot-full-context (or use fewer --parallel slots)\n",
                              o.batch, (double) slot_kv_cuda0 / 1073741824.0, o.expert_cache,
