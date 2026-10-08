@@ -1303,8 +1303,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
                 // multi-row GEMV is the one-row one)
                 const bool qsaf_wide = fused_pre && (qb || n == 1) && qs_[0] != nullptr;
-                // the indexer appends on a branch of their own and the K/V appends joined before the selection's
-                // consumers, so the query post runs beside them
+                // the indexer appends gate the scores, the K/V appends the attention chunks: each on its own branch,
+                // joined after the query post, which runs beside them
                 if (qsaf_wide) {
                     {
                         PdlScope ps(pdl);   // after the hc read
@@ -1323,11 +1323,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID,
                                                   n, qs_[2]);
                     }
+                    {
+                        QsaDecKvPost ia = kv_post_args();
+                        ia.part = 2;
+                        qsa_dec_kv_post(ia, n, s, rope_scaling(), qs_[2]);
+                    }
                     cudaEventRecord(qev_[2], qs_[2]);
                     {
                         PdlScope pz(pdl, true);
                         bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
-                                                  IQ * ID, N, IQ * ID, n, qs_[2]);
+                                                  IQ * ID, N, IQ * ID, n, qs_[1]);
                     }
                     {
                         PdlScope pz(pdl, true);
@@ -1335,19 +1340,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                    n, qs_[0]);
                     }
                     cudaStreamWaitEvent(qs_[0], qev_[1], 0);
-                    cudaStreamWaitEvent(qs_[0], qev_[2], 0);
-                    qsa_dec_kv_post(kv_post_args(), n, s, rope_scaling(), qs_[0]);
+                    {
+                        QsaDecKvPost ka = kv_post_args();
+                        ka.part = 1;
+                        qsa_dec_kv_post(ka, n, s, rope_scaling(), qs_[0]);
+                    }
                     cudaEventRecord(qev_[3], qs_[0]);
-                    cudaEventRecord(qev_[1], qs_[2]);
+                    cudaEventRecord(qev_[4], qs_[1]);
                     {
                         PdlScope pq(pdl);   // after the q8_1 kernel
                         dense_proj(8, wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                    (int) (NH * 2 * HD), n, cs);
                     }
-                    cudaStreamWaitEvent(cs, qev_[3], 0);
-                    cudaStreamWaitEvent(cs, qev_[1], 0);
+                    cudaStreamWaitEvent(cs, qev_[4], 0);
                     for (int i = 7; i <= 9; ++i) stamp(l, i, grp);
                     qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
+                    cudaStreamWaitEvent(cs, qev_[3], 0);
+                    cudaStreamWaitEvent(cs, qev_[2], 0);
                 } else {
                 {
                     PdlScope ps(pdl);   // after the hc read, up to the K/V norms
