@@ -76,7 +76,7 @@ class ConfigFile(unittest.TestCase):
         for obj, msg in (({"spec": 7}, "not the key"),
                          ({"server": {"nope": 1}}, "not a server option"),
                          ({"server": {"spec": 7}}, "under \"engine\""),
-                         ({"server": {"exe": "/x/basalt"}}, "exe is set by basalt serve"),
+                         ({"server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
                          ({"server": {"vision": "yes"}}, "true or false"),
                          ({"server": {"port": [1]}}, "one value"),
                          ({"server": {"config": "x"}}, "not a server option"),
@@ -167,7 +167,7 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            if name in ENGINE_PASSTHROUGH or name in ("api-key", "exe"):
+            if name in ENGINE_PASSTHROUGH or name in ("api-key", "engine-bin"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):

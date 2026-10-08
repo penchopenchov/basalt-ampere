@@ -1,7 +1,7 @@
 """serve/server.py - plan v0.3 P8: OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
 
     basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
-    python -m serve.server --model FILE.basalt --exe bin/basalt ...   (what basalt serve runs)
+    python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...   (what basalt serve runs)
     python -m serve.server --config config.json                      (every setting from a file)
     python -m serve.server --mock-engine --port 8095                 (a scripted engine, for clients and tests)
 
@@ -1624,7 +1624,7 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
     """(argv, engine) from a --config JSON file: {"server": {...}, "engine": {...}}.  `server` holds the server's
     options (name with or without the dashes -> a string or number, true/false for a switch, a list for the
     repeatable ones); it comes back as the command-line words they stand for, so every command-line check applies
-    to it.  `engine` holds engine flags ({"--flag": value}, true for a switch, false to leave it off).  model, exe
+    to it.  `engine` holds engine flags ({"--flag": value}, true for a switch, false to leave it off).  model, engine-bin
     and tokenizer paths are relative to the file.  ValueError for anything else."""
     try:
         with open(path, encoding="utf-8") as f:
@@ -1649,8 +1649,8 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
     for key, value in sections["server"].items():
         name = str(key).strip().lower().replace("_", "-").removeprefix("--")
         act = known.get(name)
-        if name == "exe":
-            raise ValueError("server.exe: exe is set by basalt serve")
+        if name == "engine-bin":
+            raise ValueError("server.engine-bin: engine-bin is set by basalt serve")
         if name in ENGINE_PASSTHROUGH:
             raise ValueError(f'server.{key}: an engine flag, set it under "engine"')
         if act is None:
@@ -3732,7 +3732,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mock-engine", action="store_true",
                     help="run a scripted engine instead of the model, for clients and tests (no --model needed)")
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
-    ap.add_argument("--exe", help=argparse.SUPPRESS)      # set by `basalt serve`; given by hand for development
+    ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`; given by hand for development
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
     ap.add_argument("--spec", type=int, help="tokens per verify window, the drafter's cap (default: the model file's; "
                                              "0 = no speculation, the drafter is not loaded)")
@@ -3801,17 +3801,17 @@ def main() -> int:
             gpu_list(cfg)
     except ValueError:
         fail(f"--gpu {a.gpu}: expected numbers like 0 or 0,1")
-    if not a.mock_engine and not (a.model and a.exe):
+    if not a.mock_engine and not (a.model and a.engine_bin):
         fail("the server needs --model and the engine binary: run it as basalt serve --config FILE (or --mock-engine)")
     if (file_engine or cli_engine) and not a.model:
         fail("engine flags need --model")
     if a.model:
-        if not a.exe:
-            fail("--model needs --exe BINARY")
+        if not a.engine_bin:
+            fail("--model needs --engine-bin BINARY")
         from serve import modelfile
         listed = gpu_list(cfg)
         try:
-            known = engine_flags_of(a.exe)
+            known = engine_flags_of(a.engine_bin)
             check_engine_flags(file_engine, known, f"--config {a.config}")
             check_engine_flags(cli_engine, known, "command line")
         except ValueError as e:
@@ -3819,7 +3819,7 @@ def main() -> int:
         flags, sources = engine_settings(file_engine, cli_engine)
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
-                a.model, a.exe, gpus=len(listed) if listed else None, vision=("cpu" if a.vision_cpu else True) if not a.mock_engine and (a.vision or a.vision_cpu) else False,
+                a.model, a.engine_bin, gpus=len(listed) if listed else None, vision=("cpu" if a.vision_cpu else True) if not a.mock_engine and (a.vision or a.vision_cpu) else False,
                 overrides={f: v for f, v in flags.items() if v is not False}).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
