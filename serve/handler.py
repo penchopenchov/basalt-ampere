@@ -12,18 +12,18 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from serve import responses as responses_api
-from serve.responses import error_body as responses_error_body
+from serve.api import responses as responses_api
+from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
-from serve.anthropic_api import anthropic_collect, anthropic_events
+from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.engine import EngineDied, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.frontend import anthropic_to_messages, openai_to_messages
-from serve.openai_api import openai_chunks, openai_collect, structured_chunks
-from serve.responses import ResponsesError
+from serve.api.openai import openai_chunks, openai_collect, structured_chunks
+from serve.api.responses import ResponsesError
 from serve.security import host_allowed, host_names_for, origin_allowed
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
-from serve.structured import StructuredOutputError, prepare_format, validated_json
-from serve.text import stop_strings
+from serve.api.structured import StructuredOutputError, prepare_format, validated_json
+from serve.util.text import stop_strings
 
 
 def make_handler(svc: Service):
@@ -468,7 +468,7 @@ def make_handler(svc: Service):
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _responses(self, req):
-            """POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
+            """POST /v1/responses - OpenAI's Responses API, stateless (serve/api/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)

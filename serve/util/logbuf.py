@@ -1,4 +1,4 @@
-"""serve/logbuf.py - the last lines the server and the engine printed, for GET /api/logs.
+"""serve/util/logbuf.py - the last lines the server and the engine printed, for GET /api/logs.
 
 `LogBuffer` is a ring of lines with rising ids; `TeeStream` feeds it what this process prints (without changing what
 reaches the real stream); `tail_file` feeds it the engine's log file as it grows.

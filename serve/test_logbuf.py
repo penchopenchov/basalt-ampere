@@ -1,4 +1,4 @@
-"""serve/logbuf.py: the line buffer behind GET /api/logs, the stream tee and the file tail."""
+"""serve/util/logbuf.py: the line buffer behind GET /api/logs, the stream tee and the file tail."""
 import io
 import tempfile
 import threading
@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from serve.logbuf import CAPACITY, MAX_LINE, LogBuffer, TeeStream, level, tail_file
+from serve.util.logbuf import CAPACITY, MAX_LINE, LogBuffer, TeeStream, level, tail_file
 
 
 class Levels(unittest.TestCase):

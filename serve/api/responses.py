@@ -1,4 +1,4 @@
-"""serve/responses.py - OpenAI's Responses API (POST /v1/responses), stateless, on the chat path.
+"""serve/api/responses.py - OpenAI's Responses API (POST /v1/responses), stateless, on the chat path.
 
 A Responses request becomes the same template messages, tools and kwargs a Chat Completions request does, runs through
 the same Service.run, and its events (reasoning, text, tool calls) come back as Responses output items and typed SSE

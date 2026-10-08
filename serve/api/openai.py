@@ -7,7 +7,7 @@ import uuid
 
 from serve.frontend import Event
 from serve.service import Service
-from serve.structured import validated_json
+from serve.api.structured import validated_json
 
 
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):

@@ -21,7 +21,7 @@ from serve.engine import MockEngine  # noqa: E402
 from serve.handler import serve  # noqa: E402
 from serve.security import allowed_hosts_of, host_allowed, host_name, host_names_for, origin_allowed  # noqa: E402
 from serve.service import Service  # noqa: E402
-from serve.text import ByteTokenizer  # noqa: E402
+from serve.util.text import ByteTokenizer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = {"localhost", "127.0.0.1", "::1"}

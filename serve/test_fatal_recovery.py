@@ -12,7 +12,7 @@ from serve.frontend import ChatTemplate
 from serve.engine import EngineDied, ProcessEngine
 from serve.handler import serve
 from serve.service import Service
-from serve.text import ByteTokenizer
+from serve.util.text import ByteTokenizer
 
 FAKE=r'''
 import sys

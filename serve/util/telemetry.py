@@ -1,4 +1,4 @@
-"""serve/telemetry.py - hardware readings for the stats page (GET /metrics).
+"""serve/util/telemetry.py - hardware readings for the stats page (GET /metrics).
 
 A background thread samples once a second; the page gets the latest reading and the last 60 values of the server's
 two speed series:

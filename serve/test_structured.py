@@ -7,11 +7,11 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve import structured
+from serve.api import structured
 from serve.engine import MockEngine
 from serve.handler import serve
 from serve.service import Service
-from serve.text import ByteTokenizer
+from serve.util.text import ByteTokenizer
 
 try:
     import jsonschema  # noqa: F401

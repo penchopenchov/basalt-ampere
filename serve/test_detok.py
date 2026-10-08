@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
-from serve.text import Detokenizer  # noqa: E402
+from serve.util.text import Detokenizer  # noqa: E402
 
 
 def find_tokenizer():

@@ -26,7 +26,7 @@ from serve import service as service_module  # noqa: E402
 from serve.engine import EngineDied, EngineStartError, GpuBusy, MockEngine, ProcessEngine, start_failure_hint  # noqa: E402
 from serve.handler import serve  # noqa: E402
 from serve.service import CTX_SLACK, Service, prompt_tokens_seen, request_timings  # noqa: E402
-from serve.text import ByteTokenizer, control_literals  # noqa: E402
+from serve.util.text import ByteTokenizer, control_literals  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -578,7 +578,7 @@ class StopStrings(unittest.TestCase):
                 self.assertEqual(code, 400)
 
     def test_matcher_holds_back_only_a_possible_prefix(self):
-        from serve.text import StopMatcher
+        from serve.util.text import StopMatcher
         m = StopMatcher(["</s>"])
         self.assertEqual(m.push("a <"), "a ")              # "<" may start "</s>"
         self.assertEqual(m.push("b"), "<b")                # it did not
@@ -811,7 +811,7 @@ class UnfinishedToolCall(unittest.TestCase):
         self.assertEqual((a["openai", True][0], a["anthropic", True][0]), ("length", "max_tokens"))
 
     def test_collect_keeps_calls_whose_arguments_parse(self):
-        from serve.openai_api import openai_collect
+        from serve.api.openai import openai_collect
 
         def chunk(delta, finish=None):
             return {"id": "c", "created": 1, "model": "m", "usage": {},

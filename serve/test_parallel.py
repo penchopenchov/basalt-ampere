@@ -20,7 +20,7 @@ from serve.frontend import ChatTemplate
 from serve.engine import ProcessEngine
 from serve.handler import serve
 from serve.service import Service
-from serve.text import ByteTokenizer
+from serve.util.text import ByteTokenizer
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.

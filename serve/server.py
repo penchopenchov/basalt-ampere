@@ -40,10 +40,10 @@ from serve.config import (build_parser, check_engine_flags, engine_flags_of, eng
 from serve.engine import EngineStartError, MockEngine, ProcessEngine  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
-from serve.logbuf import LogBuffer, TeeStream, tail_file  # noqa: E402
+from serve.util.logbuf import LogBuffer, TeeStream, tail_file  # noqa: E402
 from serve.security import allowed_hosts_of, exposed_without_key, lan_addresses, origins_of  # noqa: E402
 from serve.service import Service  # noqa: E402
-from serve.text import ByteTokenizer  # noqa: E402
+from serve.util.text import ByteTokenizer  # noqa: E402
 from serve.vision import (Vision, child_env, engine_args, gpu_list, gpus_in_play, vision_env,  # noqa: E402
                           vision_line)
 

@@ -13,7 +13,7 @@ from serve.frontend import ChatTemplate
 from serve.engine import EngineDied, EngineStuck, MockEngine, ProcessEngine
 from serve.handler import serve
 from serve.service import Service
-from serve.text import ByteTokenizer
+from serve.util.text import ByteTokenizer
 
 
 class ResidentEngine(ProcessEngine):

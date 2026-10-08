@@ -13,9 +13,9 @@ from typing import Iterator
 
 from serve.engine import Engine, EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
-from serve.logbuf import LogBuffer
+from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
-from serve.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
+from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
 from serve.vision import Vision
 
 
@@ -145,7 +145,7 @@ class Service:
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML; None when it can't be read (then nothing is refused)."""
         try:
-            from serve.telemetry import _Nvml
+            from serve.util.telemetry import _Nvml
             nv = _Nvml(int(getattr(self, "gpu_index", 0) or 0))
             if not nv.ok():
                 return None
@@ -287,9 +287,9 @@ class Service:
         threading.Thread(target=loop, daemon=True).start()
 
     def start_telemetry(self):
-        """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's speeds too."""
+        """The hardware sampler behind GET /metrics (serve/util/telemetry.py), recording this server's speeds too."""
         if getattr(self, "telemetry", None) is None:
-            from serve.telemetry import Telemetry
+            from serve.util.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(),
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_indices=getattr(self, "gpu_indices", None) or [0])

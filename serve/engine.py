@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Iterator, Protocol
 
-from serve.text import IM_END
+from serve.util.text import IM_END
 
 
 # a running request whose engine prints nothing (no T, PP or any other line) for this long has lost step with the
