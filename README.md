@@ -41,18 +41,10 @@ The build needs nothing outside this repository and fetches nothing. The parts o
 (quantization formats, CPU dot products, the prompt path's MMQ kernels) are extracted into `src/` and `include/basalt/ggml/`,
 with their MIT licence in `THIRD_PARTY_LICENSES`.
 
-Image input needs the vision sidecar, `basalt-vision`, a separate build on llama.cpp's mtmd library. The server looks
-for it next to `bin/basalt`:
-
-```sh
-cmake -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp \
-      -DVISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native     # leave out VISION_CUDA for a CPU-only encoder
-cmake --build build-vision -j --target basalt-vision
-cp build-vision/bin/basalt-vision bin/
-```
-
-Then start the server with `--vision` (encoder on the GPU; with two cards in `--gpu` it uses the second) or
-`--vision-cpu` (no VRAM, slower), or `"vision": true` in the config file's `server` section. Vision is off by default.
+Image input uses the vision sidecar, `bin/basalt-vision`, which the main build also produces (its encoder runs on Basalt's
+own kernels; `tools/vision` also builds on its own). The server looks for it next to `bin/basalt`. Start the server with
+`--vision` (encoder on the GPU; with two cards in `--gpu` it uses the second), or `"vision": true` in the config file's
+`server` section. `--vision-cpu` runs the encoder on the CPU as a fallback (no VRAM, slower). Vision is off by default.
 
 ## Run
 

@@ -297,6 +297,8 @@ execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 add_executable(basalt-bench src/program/bench_main.cpp)
 set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+# the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
+add_subdirectory(tools/vision)
 add_dependencies(basalt-bench basalt git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE warnings ${CMAKE_DL_LIBS})
