@@ -75,7 +75,7 @@ class Lifecycle(unittest.TestCase):
         proc.kill.assert_called_once()
 
     def test_close_terminates_before_it_kills(self):
-        # an engine that does not end on QUIT is terminated first (as the unload always did); kill is the last resort
+        # an engine that ignores QUIT is terminated first; kill is the last resort
         engine = ProcessEngine("missing-executable", [], lazy=True)
         proc = mock.Mock()
         proc.stdin, proc.stdout = io.StringIO(), io.StringIO()

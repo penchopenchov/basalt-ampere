@@ -1,8 +1,4 @@
-"""The streaming detokenizer (perf-review F-1): the incremental one emits exactly what the old re-decode did, token
-by token, and its cost per token does not grow with the reply.
-
-    python -m unittest serve.tests.test_detok      (needs a pack's tokenizer; skipped without one)
-"""
+"""The streaming detokenizer matches a whole re-decode (needs a pack's tokenizer; skipped without one)."""
 import random
 import sys
 import time
@@ -54,9 +50,7 @@ class Detok(unittest.TestCase):
                                json.loads((t / "token_type.json").read_text()))
 
     def same_stream(self, ids):
-        """The same text as the old re-decode, never behind it (the old one held complete characters too while
-        the tail was an incomplete one; the new one holds only the incomplete bytes), and never ahead of what the
-        ids so far decode to."""
+        """The same text as a whole re-decode, never behind it and never ahead of what the ids decode to."""
         a, b = OldDetokenizer(self.tok), Detokenizer(self.tok)
         self.assertIsNotNone(b.inc)
         old = new = ""
@@ -123,8 +117,7 @@ def real_tokenizer():
 
 
 def random_text(rng, n_pieces=40):
-    """Strings shaped to make one pre-token piece long or awkward: CJK and Hangul runs (syllables and conjoining
-    jamo), letters under stacks of combining marks, URLs, minified code, digits, emoji, whitespace, specials."""
+    """Strings that make a pre-token piece long or awkward (CJK, combining marks, URLs, emoji, specials)."""
     def run(lo, hi, k):
         return "".join(chr(rng.randint(lo, hi)) for _ in range(k))
 
@@ -158,8 +151,7 @@ def encode_with(tok, text, parse_special, heap_min):
 
 
 def synthetic_tokenizer(seed=268, n_merges=1500):
-    """A small byte-level BPE vocabulary with merges learned (randomly) from random_text, and a few specials of
-    both kinds - so the parity test runs without a pack."""
+    """A small byte-level BPE vocabulary learned from random_text, so the parity test runs without a pack."""
     import tokenizer as ST
     rng = random.Random(seed)
     tokens = sorted(set(ST.BYTE_TO_UNICODE.values()))

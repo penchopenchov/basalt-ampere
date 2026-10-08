@@ -1,7 +1,4 @@
-"""serve/tests/test_responses.py - the Responses API (POST /v1/responses) against the mock engine (no GPU, no pack).
-
-    python -m unittest serve.tests.test_responses -v
-"""
+"""The Responses API (POST /v1/responses) against the mock engine (no GPU, no pack)."""
 from __future__ import annotations
 
 import base64
@@ -127,7 +124,7 @@ class Parsing(unittest.TestCase):
     def test_effort_and_text_format(self):
         self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}), {"enable_thinking": False})
         self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}), {"reasoning_effort": "xhigh"})
-        self.assertEqual(template_kwargs({"reasoning": {"summary": "auto"}}), {})      # Codex: the default
+        self.assertEqual(template_kwargs({"reasoning": {"summary": "auto"}}), {})      # the default
         with self.assertRaises(ResponsesError):
             template_kwargs({"reasoning": {"effort": "huge"}})
         self.assertEqual(text_format({"text": {"format": {"type": "json_schema", "name": "n", "schema": {}}}}),
@@ -331,7 +328,7 @@ class ToolRoundTrip(Server):
         added = next(e for e in events if e["type"] == "response.output_item.added"
                      and e["item"]["type"] == "function_call")
         self.assertEqual((added["item"]["call_id"], added["item"]["arguments"]), (fc["call_id"], ""))
-        # Codex sends everything back, plus the result: the prompt continues exactly where the model stopped
+        # the client sends everything back plus the result: the prompt continues where the model stopped
         code, r = self.post({"model": "m", "instructions": "You are a coding agent.", "tools": TOOLS, "store": False,
                              "input": [user, *output, {"type": "function_call_output", "call_id": fc["call_id"],
                                                        "output": "before"}]})

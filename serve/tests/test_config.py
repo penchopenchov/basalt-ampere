@@ -1,8 +1,4 @@
-"""serve/tests/test_config.py - the --config file ({"server": {...}, "engine": {...}}): parsing, precedence, every server
-option and every engine flag by both paths, switches, the API key sources.
-
-    python -m unittest serve.tests.test_config -v
-"""
+"""The --config file: parsing, precedence, server options and engine flags, switches, API key sources."""
 from __future__ import annotations
 
 import argparse

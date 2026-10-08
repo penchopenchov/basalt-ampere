@@ -1,5 +1,4 @@
-"""#879: a Stop that arrives while the engine reads the prompt (PP lines, no tokens yet) is sent at once, not after the
-first token."""
+"""A Stop that arrives while the engine reads the prompt is sent at once, not after the first token."""
 import os
 import queue
 import sys

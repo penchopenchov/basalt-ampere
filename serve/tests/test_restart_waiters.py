@@ -1,13 +1,5 @@
-"""#1012 (the old #792): requests waiting for the engine's control lines when the engine is restarted.
-
-restart() runs ProcessEngine.__init__ again; it used to make a new condition variable, lock, wait counter and wait
-list while the waiters still held the old ones: they hung for good, or failed with `list.remove(x): x not in
-list`.  The admission state is now kept across a restart.  A waiter either goes on with the new engine or ends
-with a clean 503; never a hang, never a ValueError.  The fake engine of test_parallel runs behind the real
-ProcessEngine and Service.
-
-    python -m unittest serve.tests.test_restart_waiters -v
-"""
+"""Requests waiting for the engine's control lines while it restarts: they go on with the new engine or end with a
+503, never hang. The fake engine of test_parallel runs behind the real ProcessEngine and Service."""
 import json
 import subprocess
 import sys
@@ -141,9 +133,7 @@ class RestartWaiters(unittest.TestCase):
         self.clean()
 
     def killed_mid_read(self, slots, others):
-        """A long prompt is being read (alone, or with `others` short requests arriving meanwhile: it gives way and is
-        admitted into a slot) when the engine dies: every request ends at once with a 503.  It used to wait out the
-        300 s drain for an end line that had been read already."""
+        """The engine dies during a long prompt read (alone or giving way): every request ends at once with a 503."""
         self.start(slots)
         out, threads = {}, []
         threads.append(threading.Thread(target=self.post, args=("LONGREPLY " + "word " * 740, out, "long")))
@@ -171,8 +161,7 @@ class RestartWaiters(unittest.TestCase):
         self.killed_mid_read(2, 2)
 
     def test_an_old_request_meets_a_restart_in_progress(self):
-        """A request that learns its engine died while restart() has already taken the process (self.proc is None):
-        its death note and its sends answer with EngineDied, not AttributeError (the client got no reply at all)."""
+        """A request whose engine died while restart() holds the process gets EngineDied, not AttributeError."""
         from serve.engine.errors import EngineDied
         self.start(2)
         self.kill()

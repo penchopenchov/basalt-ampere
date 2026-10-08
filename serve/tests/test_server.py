@@ -1,7 +1,4 @@
-"""serve/tests/test_server.py - the max tokens budget over both APIs, against the mock engine (no GPU, no pack).
-
-    python -m unittest serve.tests.test_server -v
-"""
+"""Tests for the max tokens budget, APIs, caching and lifecycle against the mock engine (no GPU, no pack)."""
 from __future__ import annotations
 
 import contextlib
@@ -34,8 +31,7 @@ from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 CTX = 4096
-ANSWER = "xy" * 1000                             # longer than the old 1024 fallback: one token per byte (not
-#                                                one token repeated, which the server ends at 256)
+ANSWER = "xy" * 1000                             # alternating bytes: not one repeated token (ended at 256)
 
 
 class RecordingEngine(MockEngine):
@@ -126,7 +122,7 @@ class MaxTokens(unittest.TestCase):
                     s, b, pt, ct = self.call(api, **budget)
                     self.assertEqual(s, 200, b)
                     self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
-                    self.assertGreater(ct, 1024)          # the whole answer, not cut at the old 1024 fallback
+                    self.assertGreater(ct, 1024)          # the whole answer, not cut
 
     def test_explicit_budget_is_honoured(self):
         for api, budget in [("openai", {"max_tokens": 50}), ("openai", {"max_completion_tokens": 50}),
@@ -250,8 +246,7 @@ class ImageMarkers(unittest.TestCase):
             svc.embeddings.path.unlink(missing_ok=True)
 
     def test_the_whole_marker_in_text_before_images(self):
-        # Text quoting the template's marker (an agent reading chat_template.jinja) took the first picture's rows, the
-        # later pictures moved up one and the last real marker became text - every count still matched.
+        # text quoting the template's marker must not take a picture's rows
         tok = ByteTokenizer()
         start, pad, end = (tok.encode(s, parse_special=True)[0]
                            for s in ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"))
@@ -306,15 +301,13 @@ class ImageMarkers(unittest.TestCase):
 
 
 class ThinkTokenizer(ByteTokenizer):
-    """The byte tokenizer with the model's reasoning markers as specials that are matched even without parse_special,
-    as the real tokenizer does (GGUF token type 4)."""
+    """The byte tokenizer with the reasoning markers as specials matched even without parse_special."""
     SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
     ALWAYS = ("<think>", "</think>")
 
 
 class LiteralThinkTags(unittest.TestCase):
-    """A <think> / </think> written inside a message is text, not the model's reasoning markers: a quoted
-    "</think>" no longer ends the model's reasoning before it starts.  The template's own markers stay special."""
+    """A <think> or </think> inside a message is text; the template's own markers stay special."""
 
     @classmethod
     def setUpClass(cls):
@@ -384,9 +377,7 @@ class LiteralThinkTags(unittest.TestCase):
 
 
 class LiteralControlTokens(unittest.TestCase):
-    """A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) written inside a message is text: a
-    file an agent reads, or a pasted chat template, does not open or end a turn.  The template's own control tokens
-    stay special."""
+    """Control-token text inside a message is plain text; the template's own tokens stay special."""
 
     @classmethod
     def setUpClass(cls):
@@ -474,9 +465,7 @@ class CountingEngine(MockEngine):
 
 
 class StopStrings(unittest.TestCase):
-    """OpenAI `stop` and Anthropic `stop_sequences`: the answer ends before the first stop string, which is not sent,
-    and the engine stops there.  The byte tokenizer gives one token per byte, so every stop string here is split
-    across tokens (and across streamed chunks)."""
+    """OpenAI `stop` and Anthropic `stop_sequences` end the answer before the first stop string and stop the engine."""
     ANSWER = "alpha END beta STOP gamma"
 
     @classmethod
@@ -592,10 +581,7 @@ class StopStrings(unittest.TestCase):
 
 
 class EffortAtTheEnd(unittest.TestCase):
-    """A non-default effort goes in a system turn right before the answer, so
-    a request that changes only the effort keeps the cached conversation.  The engine's checkpoint rule is simulated
-    on the token ids (src/program/generate.cpp: the last <|im_start|>, and with --tail-role-token the one in front
-    of a trailing system turn); the default prompt does not change."""
+    """A non-default effort goes in a system turn before the answer so the cached conversation is kept."""
 
     TURN = 256                                       # the byte tokenizer's <|im_start|>
     ROLE = ord("s")                                  # "system"'s first byte stands for its token
@@ -638,7 +624,7 @@ class EffortAtTheEnd(unittest.TestCase):
             self.assertEqual(self.ids(self.CHAT, True, **kw),
                              self.tok.encode(self.svc.template.render(self.CHAT, **kw), parse_special=True))
         for kw in ({"reasoning_effort": "low"}, {"reasoning_effort": "medium"}, {"enable_thinking": False}):
-            self.assertEqual(self.ids(self.CHAT, False, **kw),        # off: every effort renders as before
+            self.assertEqual(self.ids(self.CHAT, False, **kw),        # off: every effort renders alike
                              self.tok.encode(self.svc.template.render(self.CHAT, **kw), parse_special=True))
 
     def test_the_trailing_turn(self):
@@ -730,8 +716,7 @@ class ToolCallTerminators(unittest.TestCase):
 
 
 class UnfinishedToolCall(unittest.TestCase):
-    """A call the output ends inside is not reported as a whole one - its streamed JSON is not closed and the
-    finish reason is not "tool_calls" / "tool_use" - so a client can tell it from a call to run."""
+    """A call the output ends inside is not reported as whole: no closed JSON, no tool_calls/tool_use finish."""
     CALL = ("</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\nnotes.txt\n</parameter>\n"
             "<parameter=content>\n")
     CUT = CALL + "first half of the fi"                            # the model's turn ends here
@@ -807,8 +792,7 @@ class UnfinishedToolCall(unittest.TestCase):
             ("anthropic", True): ("end_turn", cut)})
 
     def test_a_call_cut_at_the_token_limit(self):
-        """The same cut by max_tokens: "length" / "max_tokens", and the whole (non-streamed) answers leave the call
-        out in both APIs."""
+        """The same cut by max_tokens: "length" / "max_tokens"; whole answers leave the call out in both APIs."""
         a = self.answers(self.CUT + "rest of the file, never reached" * 40, max_tokens=len(self.CUT))
         self.assertEqual((a["openai", False], a["anthropic", False]), (("length", []), ("max_tokens", [])))
         self.assertEqual((a["openai", True][0], a["anthropic", True][0]), ("length", "max_tokens"))
@@ -839,8 +823,7 @@ class UnfinishedToolCall(unittest.TestCase):
 
 
 class ClientShapes(unittest.TestCase):
-    """What real clients send: Claude Code posts /v1/messages?beta=true and puts hook context into the
-    conversation as a mid-conversation system message; some OpenAI clients send a late developer message."""
+    """Client shapes: mid-conversation system messages, late developer messages and ?beta=true paths."""
 
     @classmethod
     def setUpClass(cls):
@@ -1001,7 +984,7 @@ class ClientShapes(unittest.TestCase):
         anth = [{"role": "user", "content": "u"}]
         self.assertEqual(anthropic_to_messages({"messages": json.dumps(anth)})[0],
                          anthropic_to_messages({"messages": anth})[0])
-        self.assertEqual(openai_to_messages({})[0], [])                     # no field: nothing, as before
+        self.assertEqual(openai_to_messages({})[0], [])                     # no field: nothing
         self.assertEqual(openai_to_messages({"messages": None})[0], [])
         for bad in ("not json", "\"a string\"", json.dumps({"role": "user"}), ["hi"], [{"role": "user"}, 3], 5,
                     {"role": "user", "content": "u"}):
@@ -1015,8 +998,7 @@ class ClientShapes(unittest.TestCase):
 
 
 class SamplingKeys(unittest.TestCase):
-    """The GEN line's sampling keys: top_k 0 ("off") or wider than the engine's 64 get the widest list, 64 (they used
-    to fall back to the engine default 20); a penalty always carries its window."""
+    """The GEN line's sampling keys: top_k 0 or above 64 becomes 64; a penalty always carries its window."""
 
     def keys(self, **sampling):
         return ProcessEngine.sampling_keys(sampling).split()
@@ -1043,7 +1025,7 @@ class GpuChoice(unittest.TestCase):
         env = child_env({"gpu": 1})
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
         self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
-        plain = child_env({})                     # no choice: the environment as it was (existing installs)
+        plain = child_env({})                     # no choice: the environment unchanged
         self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
@@ -1066,7 +1048,7 @@ class GpuChoice(unittest.TestCase):
                          "[server] vision: ready on GPU 0 in 5.0 s")
 
     def test_vision_device(self):
-        # with two cards listed the image encoder takes the second; the engine's environment stays as it was
+        # with two cards listed the encoder takes the second
         from serve.engine.vision import child_env, vision_env
         cfg = {"gpu": "0,1"}
         env = child_env(cfg)
@@ -1121,8 +1103,7 @@ class SlowPromptEngine(MockEngine):
 
 
 class ClientHangUp(unittest.TestCase):
-    """A client that hangs up during a long prompt read cancels the request within about a second -
-    non-streamed (which writes nothing until the end) and streamed (one keep-alive per prompt chunk) alike."""
+    """A client hanging up during a long prompt read cancels the request within about a second."""
 
     @classmethod
     def setUpClass(cls):
@@ -1194,8 +1175,7 @@ class EngineDeath(unittest.TestCase):
             httpd.server_close()
 
     def test_engine_err_mid_stream(self):
-        """The engine's ERR line after the stream started reaches the client as an error event, not a
-        400 written into the open stream (which clients read as an empty answer)."""
+        """The engine's ERR after the stream started reaches the client as an error event, not a 400."""
         class ErrEngine(MockEngine):
             def generate(self, ids, max_new, sampling, cancel, embeddings=None):
                 yield None                                  # a prompt-progress heartbeat: the stream has started
@@ -1237,8 +1217,7 @@ class DoneLineEngine(MockEngine):
 
 
 class DraftCounts(unittest.TestCase):
-    """GET /metrics gives each request's speculative draft counts (offered / accepted, from the engine's DONE
-    line; None when the line has no such fields)."""
+    """GET /metrics gives each request's draft counts (None when the DONE line has none)."""
 
     def test_drafts_in_history(self):
         tok = ByteTokenizer()
@@ -1266,8 +1245,7 @@ class DraftCounts(unittest.TestCase):
 
 
 class PcieShare(unittest.TestCase):
-    """The hit rate stays the VRAM share of the lookups; the routed experts the GPU read over PCIe (the DONE
-    line's 16th field, newer engines) are given as their own share of all routed experts."""
+    """The hit rate stays the VRAM share of lookups; PCIe-read experts get their own share."""
 
     def test_history(self):
         tok = ByteTokenizer()
@@ -1612,8 +1590,7 @@ class LoadProgress(unittest.TestCase):
 
 
 class CancelledRead(unittest.TestCase):
-    """A request cancelled while its prompt was read is recorded with the tokens the engine read (the DONE
-    line's 15th field), not the whole prompt; an older engine's line (no such field) keeps the whole prompt."""
+    """A request cancelled mid-read is recorded with the tokens the engine read, not the whole prompt."""
 
     def test_parse_done_read_field(self):
         e = SimpleNamespace()
@@ -1658,11 +1635,7 @@ class CancelledRead(unittest.TestCase):
 
 
 class LiveRate(unittest.TestCase):
-    """live.tok_s is a rate, and a request that never got a DONE keeps no counters.
-
-    A mean since the first token has 1/elapsed as its first sample: against a paced engine it reads huge numbers for
-    the first instant of every answer and undershoots for the first second after that.  The readout is the rate over
-    the last RATE_WINDOW_S."""
+    """live.tok_s is a windowed rate, and a request without a DONE keeps no counters."""
 
     PACE_S = 0.02                    # 50 tokens/s: a 30-token answer takes about 0.6 s
     TOKENS = 30
@@ -1989,8 +1962,7 @@ class WebApp(unittest.TestCase):
 
 
 class ClockedEngine(MockEngine):
-    """The mock engine with ProcessEngine's clock: `last` as the engine's DONE line gives it, the conversation cache
-    holding the first REUSED tokens of every prompt."""
+    """The mock engine with ProcessEngine's clock and a conversation cache holding the first REUSED tokens."""
     REUSED = 5
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -2005,8 +1977,7 @@ class ClockedEngine(MockEngine):
 
 
 class UsageAndStatus(unittest.TestCase):
-    """What clients read besides the text: the part of the prompt the conversation cache held (OpenAI's
-    prompt_tokens_details.cached_tokens, Anthropic's cache_read_input_tokens), llama.cpp's timings, GET /v1/status."""
+    """Cached-token usage fields, llama.cpp timings and GET /v1/status."""
 
     @classmethod
     def setUpClass(cls):
@@ -2293,8 +2264,7 @@ class SharingTheGpu(unittest.TestCase):
 
 
 class ThinkingEngine(MockEngine):
-    """Thinks THOUGHT, then answers; a prompt that already ends its thinking (the budget's wrap-up) gets the answer
-    at once, the way the model continues after </think>.  Records every prompt it is given."""
+    """Thinks THOUGHT, then answers; a prompt already ending its thinking gets the answer at once. Records prompts."""
     THOUGHT = "Let me think step by step about two plus two. " * 4          # 184 reasoning tokens (one per byte)
     ANSWER = "The answer is 4."
     end_in_thought = False      # the turn ends inside the thinking (the end token right after THOUGHT)
@@ -2314,8 +2284,7 @@ class ThinkingEngine(MockEngine):
 
 
 class ThinkingBudget(unittest.TestCase):
-    """Reasoning_budget_tokens (opt-in): at the budget the thinking is wrapped up and the model answers,
-    continuing from the prompt plus what it generated plus the wrap-up (a prefix the engine already holds)."""
+    """reasoning_budget_tokens: at the budget the thinking is wrapped up and the model answers."""
 
     def setUp(self):
         self.tok = ByteTokenizer()
@@ -2448,11 +2417,8 @@ class ThinkingBudget(unittest.TestCase):
 
 
 class StatusHandover(unittest.TestCase):
-    """A stream aborted mid-way and the next request, which was waiting for the fifo.  The aborted request's
-    status/history block ran after the fifo was released, so the waiting request could start in that gap: the old
-    request then recorded the NEW request's status as its own, set busy=False and popped `tail`, and the new request
-    crashed in _note (KeyError 'tail').  The fifo below lets the waiting request run to its first token as soon as
-    it is released, before the releasing thread goes on - the worst case of that gap, every time."""
+    """An aborted stream must not record the status of the request waiting on the fifo; the fifo here releases
+    that waiter as early as possible."""
 
     def test_abort_then_the_next_request(self):
         tok = ByteTokenizer()
@@ -2547,8 +2513,7 @@ if fail.exists():                            # this start fails before READY (as
 
 
 class RestartWindow(unittest.TestCase):
-    """While the engine restarts it is not alive (a request waits for the restart instead of reading
-    max_context 0), and a request that still meets max_context 0 gets a 503 "starting", not a 400 about its prompt."""
+    """While the engine restarts it is not alive, and a request meeting max_context 0 gets a 503, not a 400."""
 
     def test_not_alive_until_ready(self):
         from unittest import mock
@@ -2585,8 +2550,7 @@ class RestartWindow(unittest.TestCase):
                     self.assertFalse(t.is_alive())
                     self.assertTrue(eng.alive())
                     self.assertEqual(eng.max_context, 4096)
-                    # restart() of a running engine kills it first: that engine's output thread ends after the new
-                    # one is up, and must not mark it dead (it did: every request after restarted it again)
+                    # restart() kills the running engine first; its output thread ending later must not mark the new one dead
                     eng.restart()
                     time.sleep(0.5)
                     self.assertTrue(eng.alive())
@@ -2596,8 +2560,7 @@ class RestartWindow(unittest.TestCase):
                     eng.unload()
 
     def test_restart_retries_a_start_that_fails(self):
-        """A dead engine's VRAM is freed only when its process is gone, so a new engine started at once can exit
-        before READY; restart() tries again (3 times) instead of leaving the server with max_context 0."""
+        """restart() retries a start that exits before READY (VRAM of a dead engine may not be free yet)."""
         from unittest import mock
         with tempfile.TemporaryDirectory() as d:
             script, gate, fail = Path(d) / "fake_engine.py", Path(d) / "ready", Path(d) / "fail_once"
@@ -2624,8 +2587,7 @@ class RestartWindow(unittest.TestCase):
                     eng.unload()
 
     def test_failed_restart_keeps_the_known_context(self):
-        """After a restart that failed, max_context is 0 but the engine is not starting: a request is checked against
-        the last known context and reaches run() (which starts the engine again), not a 400 about context 0."""
+        """After a failed restart max_context is 0 but known_ctx applies, so the request reaches run()."""
         tok = ByteTokenizer()
         eng = MockEngine(tok, "</think>\n\nok", max_context=0)
         eng.known_ctx, eng.starting = 4096, False
@@ -2668,8 +2630,7 @@ class RestartWindow(unittest.TestCase):
 
 
 class SilentEngine(unittest.TestCase):
-    """An engine that prints nothing for engine_silence_s during a request (or never acknowledges a STOP) has
-    lost step with the server: it is ended and the request fails with EngineDied, instead of waiting forever."""
+    """An engine silent for engine_silence_s (or ignoring STOP) is ended and the request fails with EngineDied."""
 
     def bare(self, silence, can_stop=False):
         import io
@@ -2760,8 +2721,7 @@ for line in sys.stdin:
 
 
 class LostStep(unittest.TestCase):
-    """Over HTTP, with a real process: the request with the silent engine ends with an error, and the next one
-    starts the engine again and is answered (the server used to wait forever, holding the request FIFO)."""
+    """With a real process: a silent engine ends the request with an error and the next request restarts it."""
 
     def run_mode(self, mode, stream):
         with tempfile.TemporaryDirectory() as d:

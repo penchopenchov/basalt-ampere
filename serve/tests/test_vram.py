@@ -1,5 +1,4 @@
-"""POST /v1/vram (opt-in hot VRAM resize) - the engine command, the route, the config key, a reserve kept for
-an unloaded engine and applied when it loads again."""
+"""POST /v1/vram: the engine command, the route, the config key, and a reserve kept for an unloaded engine."""
 import io
 import json
 import queue
@@ -20,8 +19,7 @@ from serve.tests.test_lifecycle import ResidentEngine
 
 
 class VramEngine(ResidentEngine):
-    """The resident test engine with an elastic cache: VRAM n frees what the reserve asks for, None takes the
-    start's (700 MiB)."""
+    """A test engine with an elastic cache: a reserve frees VRAM, None restores the start."""
     def __init__(self, tok, elastic=True):
         super().__init__(tok)
         self.elastic, self.calls = elastic, []

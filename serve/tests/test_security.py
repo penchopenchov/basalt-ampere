@@ -1,8 +1,4 @@
-"""serve/tests/test_security.py - the Host check (DNS rebinding) and the Origin check for requests without an API key,
-against the mock engine (no GPU, no pack).
-
-    python -m unittest serve.tests.test_security -v
-"""
+"""The Host check (DNS rebinding) and Origin check for requests without an API key, against the mock engine."""
 from __future__ import annotations
 
 import contextlib
@@ -180,7 +176,7 @@ class OverHttp(unittest.TestCase):
         self.assertIn("--api-key", message)
 
     def test_with_a_key_the_host_check_is_off(self):
-        # a rebinding page cannot authenticate; tunnels and proxies that pass their own name on keep working
+        # a rebinding page cannot authenticate, so the check is skipped with a key
         self.start(api_key="s3cret")
         tunnel = "random-words.trycloudflare.com"
         self.assertEqual(self.req("GET", "/status", host=tunnel)[0], 401)

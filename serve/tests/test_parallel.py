@@ -1,9 +1,6 @@
-"""The config's "parallel": N - several requests decode together in the engine's batch slots (--batch N).
+"""Config "parallel": N, requests decoding together in the engine's batch slots (--batch N).
 
-A fake engine (a Python script speaking the engine's GEN / BGEN / BT / BDONE / BADM / BSTOP lines) runs behind the
-real ProcessEngine and Service, so the server's side is tested without a GPU: requests up to N run at once, more
-wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
-goes back to the slot that holds it."""
+A fake engine script speaking GEN / BGEN / BT / BDONE / BADM / BSTOP runs behind the real ProcessEngine and Service."""
 import json
 import subprocess
 import sys
@@ -283,8 +280,7 @@ class ParallelService(unittest.TestCase):
         return res
 
     def test_a_long_prompt_gives_way_to_a_short_one(self):
-        """A long solo prompt read gives way at a chunk boundary; the short request is answered first, then the
-        long one goes on (in the slot its part waited in) and is answered too."""
+        """A long solo prompt read gives way at a chunk boundary to a short request, then continues and is answered."""
         self.start(2)
         long_q, short_q = "long " * 600, "short"
         res = self.race(long_q, short_q)
@@ -321,8 +317,7 @@ class ParallelService(unittest.TestCase):
         self.assertFalse(any(x.startswith("YIELD ") for x in self.log.read_text().splitlines()))
 
     def test_left_alone_it_goes_back_to_the_solo_path(self):
-        """A request decoding in a slot whose neighbour finished goes back to the solo path (MTP drafts), continued
-        from its slot - only with an engine that keeps the slots' conversations (INFO slot_cache=1)."""
+        """A request left alone in a slot returns to the solo path (needs INFO slot_cache=1)."""
         self.start(2, slot_cache=True)
         res = {}
         long = threading.Thread(target=lambda: res.setdefault("long", self.chat("LONGREPLY please", max_tokens=200)))
