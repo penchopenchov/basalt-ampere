@@ -36,6 +36,9 @@ public:
     /// Maps `path`, parses the header and checks it is the expected projector.  False with `err` otherwise.
     bool open(const std::string& path, std::string& err);
 
+    /// Unmaps the file: tensor pointers are invalid afterwards, hp() stays.  For callers that copied the weights.
+    void release();
+
     const Hparams& hp() const { return hp_; }
     /// A tensor by name; null when absent.
     const TensorRef* find(const std::string& name) const;

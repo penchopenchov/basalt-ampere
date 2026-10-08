@@ -89,6 +89,7 @@ int main(int argc, char** argv) {
         // Sized and warmed at the largest picture before READY: the engine is started after this process and sizes
         // its expert cache from the memory that is left, so nothing may be allocated later.
         if (!cuda.init(mp, geo.max_tokens, err)) { std::printf("ERR cannot load the vision encoder: %s\n", err.c_str()); std::fflush(stdout); return 1; }
+        mp.release();   // the weights are on the device: give the mapped file back
 #else
         std::printf("ERR this build has no GPU encoder\n");
         std::fflush(stdout);

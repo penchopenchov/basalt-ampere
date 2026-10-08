@@ -83,9 +83,13 @@ Value read_value(Cursor& c, uint32_t t) {
 
 }  // namespace
 
-Mmproj::~Mmproj() {
+void Mmproj::release() {
     if (map_) munmap(map_, size_);
+    map_ = nullptr;
+    tensors_.clear();
 }
+
+Mmproj::~Mmproj() { release(); }
 
 bool Mmproj::open(const std::string& path, std::string& err) {
     const int fd = ::open(path.c_str(), O_RDONLY);
