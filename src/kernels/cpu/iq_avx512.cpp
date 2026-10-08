@@ -12,7 +12,7 @@
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
-#include "ggml-common.h"
+#include "basalt/ggml/ggml_common.h"
 
 #include <immintrin.h>
 

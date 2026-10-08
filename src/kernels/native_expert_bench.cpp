@@ -10,7 +10,7 @@
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 
-#include "ggml.h"
+#include "basalt/ggml/ggml.h"
 
 #include <cuda_runtime.h>
 

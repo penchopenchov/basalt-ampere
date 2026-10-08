@@ -12,7 +12,7 @@
 #include "basalt/prefill/moe_fused.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
-#include "ggml.h"
+#include "basalt/ggml/ggml.h"
 
 #include <cuda_runtime.h>
 

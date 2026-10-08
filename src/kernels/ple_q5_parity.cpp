@@ -2,7 +2,7 @@
 #define NOMINMAX
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/ngram.hpp"
-#include "ggml.h"
+#include "basalt/ggml/ggml.h"
 
 #include <algorithm>
 #include <cmath>

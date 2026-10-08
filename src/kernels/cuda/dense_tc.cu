@@ -19,7 +19,7 @@
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
-#include "ggml-common.h"
+#include "basalt/ggml/ggml_common.h"
 
 #include <algorithm>
 #include <cstdint>

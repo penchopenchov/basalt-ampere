@@ -37,9 +37,8 @@ set(_gpu_runtime_target CUDA::cudart)
 set(_gpu_blas_target CUDA::cublas)
 set(_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
-# Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
-# globally they would also hit FetchContent'd Catch2, whose -W4 warnings are not this project's to fix and
-# whose /WX failures would be indistinguishable from our own.
+# Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied
+# globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
 # The flags are guarded by COMPILE_LANGUAGE:CXX so nvcc never receives them as inputs.
 add_library(warnings INTERFACE)
 target_compile_options(warnings INTERFACE
@@ -179,8 +178,6 @@ if(BUILD_TESTING)
   add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
   set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
 endif()
-# llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
-target_include_directories(kernels PRIVATE third_party/ggml)
 # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
 set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
     src/kernels/cuda/native_gr_norm.cu
@@ -358,14 +355,14 @@ if(NOT _iq_python STREQUAL "")
   add_test(NAME iq_parity_fixtures
            COMMAND ${_iq_python} ${CMAKE_CURRENT_SOURCE_DIR}/tools/iq_fixture.py
                    --out ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
-  # exit 3: numpy or the vendored gguf-py is missing (a trimmed third_party) - a skip, not a failure
+  # exit 3: numpy or the vendored gguf-py is missing (a trimmed checkout) - a skip, not a failure
   set_tests_properties(iq_parity_fixtures PROPERTIES FIXTURES_SETUP iq_fixture_data SKIP_RETURN_CODE 3)
   add_test(NAME iq_parity COMMAND iq_parity ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
   set_tests_properties(iq_parity PROPERTIES FIXTURES_REQUIRED iq_fixture_data SKIP_RETURN_CODE 3)
 else()
   message(STATUS "basalt tests: no python3 with numpy was found (the configured interpreter and .venv "
                  "were probed) - the iq_parity fixtures and its test are not registered; the fixtures "
-                 "need python3 with numpy and the repository's vendored gguf-py")
+                 "need python3 with numpy and gguf-py")
 endif()
 # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
 # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)
@@ -657,84 +654,67 @@ set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIO
 find_package(Threads REQUIRED)
 target_link_libraries(kernels_cpu PUBLIC Threads::Threads)
 
-# ---- the i-quant models' CPU experts ----
+# ---- ggml, extracted ----
 #
-# The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
-# weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
-# with -DGGML_SOURCE_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
-set(GGML_SOURCE_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(GGML_STATIC ON CACHE BOOL "" FORCE)
-set(GGML_CUDA OFF CACHE BOOL "" FORCE)
-set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
-set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
-set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GGML_NATIVE ON CACHE BOOL "" FORCE)
-if(GGML_SOURCE_DIR)
-  add_subdirectory(${GGML_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
-else()
-  include(FetchContent)
-  FetchContent_Declare(llamacpp
-    GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-    GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
-    GIT_SHALLOW FALSE)
-  FetchContent_GetProperties(llamacpp)
-  if(NOT llamacpp_POPULATED)
-    FetchContent_Populate(llamacpp)
-  endif()
-  add_subdirectory(${llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
-endif()
+# The parts of ggml (MIT, llama.cpp commit 3cf03257f219afbe7334045ff7c6a06ac68c627d) the engine uses, in
+# src/kernels/cpu/ggml and src/prefill/mmq: the reference quantizers and the format table, the CPU row dot
+# products, and the prompt path's MMQ kernels.  Nothing is fetched at build time.
+add_library(ggml_quants STATIC src/kernels/cpu/ggml/ggml_quants.c)
+target_include_directories(ggml_quants PUBLIC include PRIVATE src/kernels/cpu/ggml)
+set_target_properties(ggml_quants PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
+# The CPU dot products are built for AVX2 and for AVX-512, each with its own name for the table lookup;
+# ggml_cpu_dispatch.cpp picks one at run time (cpu_avx512_ok / cpu_avx2_ok).
+set(_ggml_dots_avx2_flags -mavx2 -mfma -mf16c)
+set(_ggml_dots_avx512_flags -mavx2 -mfma -mf16c -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi)
+foreach(_isa avx2 avx512)
+  add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
+  target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
+  target_compile_options(ggml_dots_${_isa} PRIVATE ${_ggml_dots_${_isa}_flags})
+  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa})
+  set_target_properties(ggml_dots_${_isa} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
+endforeach()
 # part of kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
 # one-pass static linking has no cycle to resolve)
 target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                          src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
-                                         src/kernels/cpu/kq_avx1.cpp)
-target_include_directories(kernels_cpu PRIVATE third_party/ggml)
+                                         src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
+                                         $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
 set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
-target_link_libraries(kernels_cpu PUBLIC ggml-cpu ggml-base)
+target_link_libraries(kernels_cpu PUBLIC ggml_quants)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
 add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)
 target_link_libraries(router_dot_parity PRIVATE kernels_cpu)
 if(BUILD_TESTING)
   add_test(NAME router_dot_parity COMMAND router_dot_parity)
 endif()
+# MMQ (ggml-cuda) for the prompt path's experts: the kernel, one instance per format the packs use, and the
+# activation quantizer; mmq_host.cu holds its few host symbols
 set(_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
-# llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
-# from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
-# the few host symbols of ggml-cuda.cu they use in src/prefill/ggml_cuda_host.cu
-if(GGML_SOURCE_DIR)
-  set(_ggml_src ${GGML_SOURCE_DIR}/ggml)
-else()
-  set(_ggml_src ${llamacpp_SOURCE_DIR}/ggml)
-endif()
-set(_mmq_src ${_ggml_src}/src/ggml-cuda)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
 add_library(mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
-            src/prefill/ggml_cuda_host.cu ${_mmq_src}/quantize.cu)
+            src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
 # q8_0: the drafter's matrices
 foreach(_t IN LISTS _mmq_types)
-  target_sources(mmq PRIVATE ${_mmq_src}/template-instances/mmq-instance-${_t}.cu)
+  target_sources(mmq PRIVATE src/prefill/mmq/instances/mmq_${_t}.cu)
 endforeach()
-target_include_directories(mmq PRIVATE ${_ggml_src}/include ${_ggml_src}/src ${_mmq_src}
-                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(mmq PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
-target_link_libraries(mmq PUBLIC ggml-base ${_gpu_runtime_target})
+target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC mmq)
 if(BUILD_TESTING)
   # the fused int8 experts against a double-precision reference and the MMQ path (exit 77 without int8 tensor cores)
   add_executable(prefill_fused_moe_test tests/cuda/prefill_fused_moe_test.cpp)
-  target_link_libraries(prefill_fused_moe_test PRIVATE mmq ggml-base ${_gpu_runtime_target})
+  target_link_libraries(prefill_fused_moe_test PRIVATE mmq ${_gpu_runtime_target})
   add_test(NAME prefill_fused_moe_test COMMAND prefill_fused_moe_test)
   set_tests_properties(prefill_fused_moe_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the same for the native packs' formats (IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS, down Q2_0 IQ4_NL)
   add_executable(prefill_fused_iq_test tests/cuda/prefill_fused_iq_test.cpp)
-  target_link_libraries(prefill_fused_iq_test PRIVATE mmq ggml-base ${_gpu_runtime_target})
+  target_link_libraries(prefill_fused_iq_test PRIVATE mmq ${_gpu_runtime_target})
   add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
   set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
@@ -768,10 +748,10 @@ endif()
 # real-weight checks: test programs, not part of a release
 if(BUILD_TESTING)
   add_executable(ple_q5_parity src/kernels/ple_q5_parity.cpp)
-  target_link_libraries(ple_q5_parity PRIVATE kernels artifact ggml-base ${_gpu_runtime_target})
+  target_link_libraries(ple_q5_parity PRIVATE kernels artifact ggml_quants ${_gpu_runtime_target})
   add_executable(q5_projection_parity src/kernels/q5_projection_parity.cpp)
   target_include_directories(q5_projection_parity PRIVATE ${_gpu_include_directories})
-  target_link_libraries(q5_projection_parity PRIVATE kernels artifact ggml-base ${_gpu_runtime_target})
+  target_link_libraries(q5_projection_parity PRIVATE kernels artifact ggml_quants ${_gpu_runtime_target})
 endif()
 
 if(BUILD_TESTING)

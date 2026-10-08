@@ -9,7 +9,6 @@ __pycache__/
 .pytest_cache/
 *.pyc
 /.venv/
-/third_party/llama.cpp
 /models/
 /packs/
 /mtp/

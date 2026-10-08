@@ -3,7 +3,7 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/kernels/cpu/native_expert.hpp"
-#include "ggml.h"
+#include "basalt/ggml/ggml.h"
 
 #include <algorithm>
 #include <chrono>

@@ -2,7 +2,7 @@
 #define NOMINMAX
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/dequant_bf16.hpp"
-#include "ggml.h"
+#include "basalt/ggml/ggml.h"
 
 #include <cuda_runtime.h>
 #include <algorithm>

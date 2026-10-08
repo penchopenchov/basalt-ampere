@@ -1,11 +1,9 @@
-// src/prefill/moe_mmq.cu - see include/basalt/prefill/moe_mmq.hpp.  llama.cpp's MMQ (ggml-cuda, MIT) is compiled
-// from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
-// few host symbols of ggml-cuda.cu it references.
+// src/prefill/moe_mmq.cu - see include/basalt/prefill/moe_mmq.hpp.  llama.cpp's MMQ (ggml-cuda, MIT) lives in
+// src/prefill/mmq/; mmq_host.cu supplies the host symbols it references.
 #include "basalt/prefill/moe_mmq.hpp"
 
-#include "common.cuh"
-#include "mmq.cuh"
-#include "quantize.cuh"
+#include "mmq/mmq.cuh"
+#include "mmq/quantize.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -124,20 +122,19 @@ bool fits(int t, int64_t w_rows) {
     const bool fallback = w_rows % 128 != 0;
     const ggml_cuda_device_info& info = ggml_cuda_info();
     for (int id = 0; id < info.device_count; ++id) {
-        const int cc = info.devices[id].cc;
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false;
         for (int J = 8; J <= 128 && !any; J += 8) {
-            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc);
-            any = c.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(c, cc) <= smpbo;
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback);
+            any = c.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(c) <= smpbo;
         }
         if (!any) {
             static bool said[GGML_TYPE_COUNT] = {};
             if (t >= 0 && t < GGML_TYPE_COUNT && !said[t]) {
                 said[t] = true;
                 std::fprintf(stderr, "basalt: prompt kernels: llama.cpp's MMQ has no tile for %s (%lld rows) on GPU %d "
-                                     "(cc %d, %zu bytes of shared memory per block): that product takes the non-MMQ path "
-                                     "\n", ggml_type_name((ggml_type) t), (long long) w_rows, id, cc, smpbo);
+                                     "(%zu bytes of shared memory per block): that product takes the non-MMQ path "
+                                     "\n", ggml_type_name((ggml_type) t), (long long) w_rows, id, smpbo);
             }
             return false;
         }
@@ -154,8 +151,9 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 }
 
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+    (void) t;   // every format quantizes its activations the same way
     if (rows <= 0) return;
-    quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
+    quantize_mmq_q8_1_cuda(x, ids, xq, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
 }
@@ -173,7 +171,7 @@ void Context::run(const Product& p, void* stream) {
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
     // the grid always covers max_rows; opt_rows only picks the tile width
     const int64_t opt = p.opt_rows > 0 && p.opt_rows < p.max_rows ? p.opt_rows : p.max_rows;
-    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
+    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,

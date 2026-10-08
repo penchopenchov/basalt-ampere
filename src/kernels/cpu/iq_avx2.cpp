@@ -13,7 +13,7 @@
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
-#include "ggml-common.h"
+#include "basalt/ggml/ggml_common.h"
 
 #include <immintrin.h>
 
@@ -58,7 +58,7 @@ inline __m256i sc32(int s) { return _mm256_set1_epi16(s); }
 //
 // Computed at COMPILE time (constexpr), so this file has no static constructor at all.  This TU is compiled
 // for AVX2, and a runtime constructor here runs before main() on every CPU: a compiler may turn its variable shift
-// into BMI2 `shlx` or vectorise the loop into AVX2 (`vpbroadcastb`), which faults on CPUs without them.  ksigns_iq2xs[i] is i's 7 bits plus an even-parity bit 7 (ggml-common.h); a const
+// into BMI2 `shlx` or vectorise the loop into AVX2 (`vpbroadcastb`), which faults on CPUs without them.  ksigns_iq2xs[i] is i's 7 bits plus an even-parity bit 7 (ggml_common.h); a const
 // array is not usable in a constant expression, so the byte is derived the same way here, and
 // native_expert_parity checks these kernels against ggml-cpu's.
 struct EvenSigns {

@@ -1,6 +1,6 @@
-// src/kernels/cpu/native_expert.cpp - native (GGUF-form) experts on the CPU through ggml-cpu.
-// See the header.  Nothing here is the engine's own arithmetic: the activation quantizers and the row dot products are
-// ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
+// src/kernels/cpu/native_expert.cpp - native (GGUF-form) experts on the CPU through the extracted ggml dot products.
+// See the header.  The activation quantizers and the row dot products here are ggml's (src/kernels/cpu/ggml), so an
+// IQ expert computes what llama.cpp's CPU backend computes for it.
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
@@ -8,39 +8,31 @@
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
-#include "ggml.h"
-#include "ggml-cpu.h"
+#include "basalt/ggml/ggml.h"
 
 #include <cmath>
 #include <cstdlib>
-#include <mutex>
 
 namespace basalt::kernels::cpu {
 namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
-void init_once() {
-    static std::once_flag once;
-    std::call_once(once, [] { ggml_cpu_init(); });
-}
-
 }  // namespace
 
 bool native_experts_available() noexcept { return true; }
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
-    init_once();
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* td = traits(d_type);
     if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr) {
-        err = "native experts: ggml-cpu has no dot product for type " + std::to_string(tg && tg->vec_dot ? d_type : gu_type);
+        err = "native experts: no CPU dot product for type " + std::to_string(tg && tg->vec_dot ? d_type : gu_type);
         return false;
     }
     const ggml_type_traits_cpu* ag = traits(tg->vec_dot_type);
     const ggml_type_traits_cpu* ad = traits(td->vec_dot_type);
     if (ag == nullptr || ag->from_float == nullptr || ad == nullptr || ad->from_float == nullptr) {
-        err = "native experts: ggml-cpu cannot quantize an activation for this layer";
+        err = "native experts: cannot quantize an activation for this layer";
         return false;
     }
     if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_ff % ggml_blck_size((ggml_type) d_type) ||
@@ -78,24 +70,13 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
-    // the multi-token kernels decode the weights once for all tokens: faster than ggml-cpu at several tokens, no faster
-    // at one (all are bound by the codebook lookups), as native_expert_parity measures.  AVX-512
-    // first, then the AVX-2 one.  ggml-cpu's single-token vec_dot is reached only on a CPU with neither.
+    // The multi-token kernels decode the weights once for all tokens; the single-token ggml dot below serves the
+    // formats without one.  A token's rows round the same alone as in a group, so greedy output does not depend on
+    // the number of drafts in a window.  A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs
+    // only: an AVX-512 CPU keeps the ggml dot for it.
     static const bool avx512 = cpu_avx512_ok();
-    // cpu_avx2_ok() is required for the AVX-2 kernel: iq_avx2.cpp and kq_avx2.cpp
-    // are compiled /arch:AVX2 and use AVX2 and FMA3, so calling them on a CPU without either is an
-    // illegal instruction, not a slow path.  The gate sat next to `avx512` above, which does test
-    // cpu_avx512_ok(), and that asymmetry is what let a pre-Haswell CPU reach iq256_gu_rows.
-    // Without it this falls through to ggml-cpu's vec_dot below, which is compiled for whatever
-    // baseline the build selected (AVX1 here) and covers the same types - IQ2_XXS and IQ2_S among
-    // them.  That path loops over tokens itself, so it is correct for any `nt`, not just one.
     static const bool avx2 = cpu_avx2_ok();
-    // The multi-token kernels run for every group size, so a token's expert rows round the same alone as in a
-    // group and greedy output does not depend on how many drafts a verify window held.
-    // A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
-    // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
-    // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
-    static const bool cpu512 = cpu_avx512_ok();
+    static const bool cpu512 = avx512;
     if ((iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -123,10 +104,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
-    // block instead of once per token; ggml-cpu's dot is single-token.
-    // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
-    // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
-    // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
+    // block instead of once per token; the ggml dot is single-token.
     if (cpu_avx2_ok() && f.d_type == 20) {   // the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

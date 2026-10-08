@@ -1,9 +1,9 @@
 // src/kernels/cuda/iq_kernels.cu - see include/basalt/kernels/iq_kernels.hpp.
 //
 // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
-// (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
-// MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
-// included unchanged.
+// (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at llama.cpp commit
+// 3cf03257f219afbe7334045ff7c6a06ac68c627d; MIT, Copyright (c) 2023-2026 The ggml authors, see
+// THIRD_PARTY_LICENSES).  The block structs and codebook grids are basalt/ggml/ggml_common.h.
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
@@ -15,7 +15,7 @@
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
-#include "ggml-common.h"
+#include "basalt/ggml/ggml_common.h"
 
 #include <algorithm>
 #include <atomic>

@@ -15,7 +15,7 @@
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
-#include "ggml-common.h"
+#include "basalt/ggml/ggml_common.h"
 
 #include <immintrin.h>
 
@@ -32,7 +32,7 @@ inline float h2f(ggml_half h) {
     std::memcpy(&u, &h, 2);
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) u)));
 }
-// the fp16 pair {d, dmin} / {d, m} / {d, s} a block starts with (a union in ggml-common.h's C++ declarations)
+// the fp16 pair {d, dmin} / {d, m} / {d, s} a block starts with (a union in ggml_common.h's C++ declarations)
 inline float half_at(const void* block, int i) {
     ggml_half h;
     std::memcpy(&h, (const uint8_t*) block + 2 * i, 2);

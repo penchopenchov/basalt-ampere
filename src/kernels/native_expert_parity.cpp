@@ -16,10 +16,9 @@
 #include "basalt/kernels/cpu/iq_avx2.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
-#include "ggml-cpu.h"
 #include "basalt/kernels/iq_kernels.hpp"
 
-#include "ggml.h"
+#include "basalt/ggml/ggml.h"
 
 #include <cuda_runtime.h>
 
@@ -396,9 +395,7 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
             const float scale = 0.02f * (0.5f + (float) (r % 7) / 7.0f);
             for (int64_t c = 0; c < cols; ++c) w[(size_t) (r * cols + c)] = scale * nd(rng);
         }
-        const std::vector<float> imatrix((size_t) cols, 1.0f);
-        ggml_quantize_chunk((ggml_type) type, w.data(), dst, 0, rows, cols,
-                            ggml_quantize_requires_imatrix((ggml_type) type) ? imatrix.data() : nullptr);
+        ggml_quantize_chunk((ggml_type) type, w.data(), dst, 0, rows, cols);
     };
     quant(f.gu_type, FF, H, blob.data());
     quant(f.gu_type, FF, H, blob.data() + f.up_off);
@@ -412,7 +409,6 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
 // from the ds.y variant.  Weights with large mins make the difference visible.
 int check_q5_1_min(cudaStream_t s) {
     constexpr int n = 640, rows = 64;
-    ggml_cpu_init();   // the fp16 tables vec_dot uses (the other modes get this through native_fmt)
     std::mt19937 rng(5);
     std::uniform_int_distribution<int> qd(-100, 100);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -422,7 +418,7 @@ int check_q5_1_min(cudaStream_t s) {
     for (auto& v : x) v = d * ((float) qd(rng) + 0.45f);
     const size_t row_bytes = ggml_row_size(GGML_TYPE_Q5_1, n);
     std::vector<uint8_t> wq((size_t) rows * row_bytes);
-    ggml_quantize_chunk(GGML_TYPE_Q5_1, w.data(), wq.data(), 0, rows, n, nullptr);
+    ggml_quantize_chunk(GGML_TYPE_Q5_1, w.data(), wq.data(), 0, rows, n);
     // the GPU: its own q8_1 quantizer, then iq_mmvq on Q5_1
     void *dw, *dx, *dxq;
     float* dy;
