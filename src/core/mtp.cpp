@@ -39,6 +39,7 @@
 #include "basalt/kernels/dense_tc.hpp"
 #include "basalt/kernels/pdl.hpp"
 
+#include <memory>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -665,6 +666,15 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     const bool kv_fused = st_.kv_int8 && !st_.kv_q4 && !st_.kv_rot && native_rope_enabled() &&
                           qsa_dec_fused_supported(s);
     const bool kv_par = par_ && full && !reuse_row && kv_fused;
+    // chain-step kernels that start while the one before them still runs (the paths below all use the fused kernels)
+    const bool pdl_ok = kv_par && !st_.kv_rot && native_rope_enabled() && qsa_dec_fused_supported(s) &&
+                        qsa_dec_attn_supported(qsa_attn_pools(st_), s) && par_ && dec_draft_hcf() && have_pre_;
+    std::unique_ptr<PdlScope> psc;
+    auto pscope = [&](bool first_plain) {
+        psc.reset();
+        if (pdl_ok) psc.reset(new PdlScope(true, first_plain));
+    };
+    auto pscope_off = [&] { psc.reset(); };
     try {
         auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
@@ -685,6 +695,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (par_) fork(cs);
             const cudaStream_t ce = par_ ? cs2_ : cs;
             uint8_t* const xqe = par_ ? xq2_ : xq_;
+            pscope(true);   // the embedding branch follows the fork
             if (const NativeEmbed* ne = native_embed()) {   // the GGUF-form table
                 ne->gather_dev(tok_, T, emb_, ce);
             } else {
@@ -697,9 +708,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, ce);
             native_quantize_q8_1(en_, xqe, (int) N, T, ce);
             native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xqe, e2_, (int) N, (int) N, T, ce);
+            pscope_off();
             if (!(have_pre_ && full)) record_hidden(Rin_, T, xq_, cs);
             if (par_) join(cs);
             pf_fork(cs);
+            pscope(false);
             add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
             // ---- the attention hyper-connection
             bool q8_done = false;
@@ -717,6 +730,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 if (par_ && dec_draft_hcf()) {
                     HcFusedArgs h = hcf_args(fa, T, xn_);
                     if (hc_fused_q8_rows_ok()) { h.xq = xq_; q8_done = true; }   // mixed's q8_1 rows from the read
+                    h.next_early = pdl_ok && q8_done;   // the query projection's blocks start with the read
                     hc_fused_read(h, cs);
                 } else if (T == 1)   // one row: the per-row read (its own rounding)
                     gr_read(R_, fa[0].w_norm, fa[0].w_down, fa[0].w_up, fa[0].w_inject, EPS, gs, ss.block.gr, mixed_, inj_,
@@ -728,6 +742,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (!q8_done) native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
             if (kv_par) fork(cs);   // K/V on the second stream, beside Q
             const cudaStream_t ckv = kv_par ? cs2_ : cs;
+            pscope(true);   // the K/V branch follows the fork
             native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, ckv);
             native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, ckv);
             if (kv_fused) {   // the rows' K norm + RoPE and appends in one launch
@@ -757,6 +772,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             }
         }
         if (!full) return true;
+        pscope(false);   // the query follows the hc read (or its quantize)
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         if (!st_.kv_rot && native_rope_enabled() && qsa_dec_fused_supported(s)) {
             QsaDecQPost qp;   // the query split, norm and RoPE in one launch
@@ -776,6 +792,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
         if (kv_par) join(cs);
+        pscope(true);   // the attention follows the join
         bool aq_done = false;
         if (!st_.kv_rot && qsa_dec_attn_supported(pools, s)) {   // the gate in the merge writes the q8_1 rows
             aq_done = true;
@@ -817,6 +834,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 fused_gr_read_multi(fa, T, xn_, cs);
             }
         }
+        pscope_off();
         // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write
         // par_: the shared expert on the second stream, beside the router and the routed experts
         const bool sh_par = par_;
@@ -876,6 +894,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         // ---- the final mixer and the main model's head
         bool mixer_q8 = false;
         if (par_ && dec_draft_hcf()) {
+            pscope(false);   // after the combine
             FusedGrArgs fa[1];
             fa[0].R = R_; fa[0].R_out = R_; fa[0].apply = true; fa[0].bo_prev = y_; fa[0].inj_prev = inj2_;
             fa[0].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
@@ -885,7 +904,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (T != 1) { err = "mtp: the one-kernel mixer read runs one row"; return false; }
             HcFusedArgs h = hcf_args(fa, 1, xn_);
             if (hc_fused_q8_rows_ok()) { h.xq = xq_; mixer_q8 = true; }
+            h.next_early = pdl_ok;   // the head's blocks start with the read
             hc_fused_read(h, cs);
+            pscope_off();
         } else {
             for (int t = 0; t < T; ++t)
                 gr_read(R_ + (size_t) t * HC * N, f32("hyper_connection_mixer.hc_norm.weight"),
@@ -894,6 +915,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                         sample_ + t * N, dummy_inj_, cs);
         }
         if (fold_write) fork_next_hidden();
+        if (mixer_q8) pscope(false);   // the head follows the read
         if (!mixer_q8) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         // the argmax drafts over the base rows only on tier 0 (the coupled sampler keeps the whole subset)

@@ -19,7 +19,8 @@ void q5k_head_mask_unmapped(float* y, const int32_t* map, int n, void* stream);
 /// One column (n_in 2560): the logits as above, and in the same launch the first row of the largest logit (through
 /// `map` when non-null; rows with a negative id are skipped) and its softmax probability over the n_out rows.  The probability's sum runs in a different
 /// order than row_top_prob's (last bits differ).  `scratch`: q5k_head_top1_scratch_bytes(), zeroed once before first
-/// use.  False: the shape is not supported.
+/// use.  False: the shape is not supported.  Each warp prefetches its first rows into L2 before the kernel waits on
+/// its predecessor (a PdlScope applies).
 size_t q5k_head_top1_scratch_bytes();
 bool q5k_head_top1(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, const int32_t* map,
                    int* out_id, float* out_prob, void* scratch, void* stream);

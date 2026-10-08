@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 
 namespace basalt::kernels {
@@ -800,6 +801,84 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
     }
 }
 
+
+// The Q8_0 one-column kernel: the same per-row arithmetic as native_small_mmvq_kernel, with the first weight blocks
+// loaded before pdl_wait (weights are constant) and the dependents let in at the start, so the launch overlaps the
+// previous kernel's tail. Plain launches run it unchanged.
+template<bool SmallK>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_small_q80_kernel(const Q80Block* __restrict__ w,
+                                        const Q81Block* __restrict__ x,
+                                        float* __restrict__ y, int n_in, int n_out) {
+    constexpr int Qi = 8;
+    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
+    constexpr int NPRE = 3;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / 32;
+    const int kbx0 = tid / (Qi / 2);
+    const int kqs = 2 * (tid % (Qi / 2));
+    float d0[ROWS][NPRE];
+    int v0[ROWS][NPRE], v1[ROWS][NPRE];
+#pragma unroll
+    for (int p = 0; p < NPRE; ++p) {
+        const int kbx = kbx0 + p * BLOCKS_PER_ITER;
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (kbx < blocks_per_row && row0 + i < n_out) {
+                const Q80Block* b = w + std::size_t(row0 + i) * blocks_per_row + kbx;
+                v0[i][p] = load_int_b2(b->qs, kqs);
+                v1[i][p] = load_int_b2(b->qs, kqs + 1);
+                d0[i][p] = b->d;
+            }
+        }
+    }
+    pdl_launch_dependents();
+    pdl_wait();
+    float tmp[ROWS] = {};
+#pragma unroll
+    for (int p = 0; p < NPRE; ++p) {
+        const int kbx = kbx0 + p * BLOCKS_PER_ITER;
+        if (kbx < blocks_per_row) {
+            const int* u = reinterpret_cast<const int*>(x[kbx].qs);
+            const float d1 = __low2float(x[kbx].ds);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    int sumi = 0;
+                    sumi = DP4A(v0[i][p], u[kqs], sumi);
+                    sumi = DP4A(v1[i][p], u[kqs + 1], sumi);
+                    tmp[i] += d0[i][p] * d1 * float(sumi);
+                }
+            }
+        }
+    }
+    for (int kbx = kbx0 + NPRE * BLOCKS_PER_ITER; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += small_q8_dot(w + block, x + kbx, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
 // ============================ ncols = 2..8 (speculative verify, small batches) ============================
 //
 // One generic kernel for every format, parameterized by the format's iteration traits below, which are
@@ -1425,9 +1504,15 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     const dim3 threads(WARP, WARPS);
     if (n_in / 32 < 2 * WARPS * WARP / Qi) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        native_small_mmvq_kernel<Weight, Qi, true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+        if constexpr (std::is_same_v<Weight, Q80Block>)
+            launch_pdl(native_small_q80_kernel<true>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out);
+        else
+            native_small_mmvq_kernel<Weight, Qi, true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
     } else {
-        native_small_mmvq_kernel<Weight, Qi, false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
+        if constexpr (std::is_same_v<Weight, Q80Block>)
+            launch_pdl(native_small_q80_kernel<false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out);
+        else
+            native_small_mmvq_kernel<Weight, Qi, false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
 }

@@ -43,6 +43,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -385,6 +386,127 @@ void bench(cudaStream_t s) {
     k::native_mmvq_set_mma(env);
 }
 
+
+// ---- the one-column Q8_0 kernel at the draft chain's projection shapes, and short rows (the small-K layout):
+// bitwise equal to column 0 of a two-column call, and within float rounding of a float64 reference on the same bytes
+struct Q80Geom {
+    int n_in, n_out;
+};
+const Q80Geom Q80_GEOMS[] = {{2560, 12288}, {6144, 2560}, {2560, 512}, {2560, 2048}, {512, 640}, {1024, 130}, {2560, 1}};
+
+double half_to_double(uint16_t h) {
+    const int e = (h >> 10) & 31, m = h & 1023;
+    const double v = e == 0 ? std::ldexp((double) m, -24) : std::ldexp((double) (m + 1024), e - 25);
+    return (h >> 15) ? -v : v;
+}
+
+bool compare_q80(const Q80Geom& g, cudaStream_t s) {
+    namespace k = basalt::kernels;
+    constexpr int Q8_0 = 8, BYTES = 34;
+    const std::size_t wbytes = k::native_mmvq_weight_bytes(Q8_0, g.n_in, g.n_out);
+    const std::size_t qcol = k::native_q8_1_bytes(g.n_in, 1);
+    std::mt19937 rng(4242u + (unsigned) g.n_in + (unsigned) g.n_out);
+    std::vector<uint8_t> w(wbytes);
+    for (auto& v : w) v = (uint8_t) (rng() & 0xff);
+    for (std::size_t b = 0; b < wbytes / BYTES; ++b) {
+        const uint16_t h = sane_half(rng);
+        std::memcpy(&w[b * BYTES], &h, 2);
+    }
+    std::vector<float> x((std::size_t) 2 * g.n_in);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (int i = 0; i < g.n_in; ++i) x[i] = x[g.n_in + i] = nd(rng);
+    uint8_t *dw = nullptr, *dq = nullptr;
+    float *dx = nullptr, *y1 = nullptr, *y2 = nullptr;
+    if (!ck(cudaMalloc(&dw, wbytes), "malloc") || !ck(cudaMalloc(&dq, 2 * qcol), "malloc") ||
+        !ck(cudaMalloc(&dx, x.size() * 4), "malloc") || !ck(cudaMalloc(&y1, (std::size_t) g.n_out * 4), "malloc") ||
+        !ck(cudaMalloc(&y2, (std::size_t) 2 * g.n_out * 4), "malloc"))
+        return false;
+    cudaMemcpy(dw, w.data(), wbytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemset(y1, 0xff, (std::size_t) g.n_out * 4);
+    cudaMemset(y2, 0xfe, (std::size_t) 2 * g.n_out * 4);
+    k::quantize_q8_1_rows(dx, 2, g.n_in, dq, s);
+    k::native_mmvq(Q8_0, dw, dq, y1, g.n_in, g.n_out, 1, s);
+    k::native_mmvq(Q8_0, dw, dq, y2, g.n_in, g.n_out, 2, s);
+    std::vector<uint8_t> xq(2 * qcol);
+    std::vector<float> a(g.n_out), b(2 * (std::size_t) g.n_out);
+    const bool ok_copy = ck(cudaStreamSynchronize(s), "mmvq") &&
+                         ck(cudaMemcpy(xq.data(), dq, 2 * qcol, cudaMemcpyDeviceToHost), "read") &&
+                         ck(cudaMemcpy(a.data(), y1, a.size() * 4, cudaMemcpyDeviceToHost), "read") &&
+                         ck(cudaMemcpy(b.data(), y2, b.size() * 4, cudaMemcpyDeviceToHost), "read");
+    cudaFree(dw); cudaFree(dq); cudaFree(dx); cudaFree(y1); cudaFree(y2);
+    if (!ok_copy) return false;
+    long long diff = 0;
+    double worst = 0.0, scale = 0.0;
+    const int nb = g.n_in / 32;
+    for (int r = 0; r < g.n_out; ++r) {
+        double ref = 0.0;
+        for (int blk = 0; blk < nb; ++blk) {
+            const uint8_t* wb = &w[((std::size_t) r * nb + blk) * BYTES];
+            const uint8_t* xb = &xq[(std::size_t) blk * 36];
+            uint16_t hw, hx;
+            std::memcpy(&hw, wb, 2);
+            std::memcpy(&hx, xb, 2);
+            long long dot = 0;
+            for (int i = 0; i < 32; ++i) dot += (long long) (int8_t) wb[2 + i] * (int8_t) xb[4 + i];
+            ref += half_to_double(hw) * half_to_double(hx) * (double) dot;
+        }
+        uint32_t ua, ub;
+        std::memcpy(&ua, &a[r], 4);
+        std::memcpy(&ub, &b[r], 4);
+        diff += ua != ub;
+        worst = std::max(worst, std::fabs((double) a[r] - ref));
+        scale = std::max(scale, std::fabs(ref));
+    }
+    const bool ok = diff == 0 && worst <= 1e-4 * (scale + 1e-30);
+    std::printf("Q8_0 T=1 %5d x %5d: %lld differ from the two-column call, max abs err %.3e of %.3e  %s\n", g.n_in,
+                g.n_out, diff, worst, scale, ok ? "ok" : "FAIL");
+    return ok;
+}
+
+int q80_section(cudaStream_t s) {
+    std::printf("\n=== Q8_0 one column ===\n");
+    int bad = 0;
+    for (const Q80Geom& g : Q80_GEOMS) bad += !compare_q80(g, s);
+    return bad;
+}
+
+// The one-column Q8_0 kernel's time per call and its weight bytes' rate, at the shapes above (warm L2 excluded by
+// cycling through enough distinct weights).
+void bench_q80(cudaStream_t s) {
+    namespace k = basalt::kernels;
+    std::printf("\n=== --bench: Q8_0 one column, us per call (weights cycled past L2) ===\n");
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    for (const Q80Geom& g : Q80_GEOMS) {
+        const std::size_t wbytes = k::native_mmvq_weight_bytes(8, g.n_in, g.n_out);
+        const int copies = std::max<int>(2, (int) ((256u << 20) / wbytes));
+        uint8_t* dw = nullptr;
+        uint8_t* dq = nullptr;
+        float *dx = nullptr, *dy = nullptr;
+        if (!ck(cudaMalloc(&dw, wbytes * copies), "malloc") || !ck(cudaMalloc(&dq, k::native_q8_1_bytes(g.n_in, 1)), "malloc") ||
+            !ck(cudaMalloc(&dx, (std::size_t) g.n_in * 4), "malloc") || !ck(cudaMalloc(&dy, (std::size_t) g.n_out * 4), "malloc"))
+            return;
+        cudaMemset(dw, 0x11, wbytes * copies);
+        cudaMemset(dx, 0, (std::size_t) g.n_in * 4);
+        k::quantize_q8_1_rows(dx, 1, g.n_in, dq, s);
+        for (int r = 0; r < copies; ++r) k::native_mmvq(8, dw + wbytes * r, dq, dy, g.n_in, g.n_out, 1, s);
+        const int N = copies * 4;
+        cudaEventRecord(e0, s);
+        for (int r = 0; r < N; ++r) k::native_mmvq(8, dw + wbytes * (r % copies), dq, dy, g.n_in, g.n_out, 1, s);
+        cudaEventRecord(e1, s);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        const double us = 1000.0 * ms / N;
+        std::printf("%5d -> %5d: %7.2f us  %6.0f GB/s (%.1f MB)\n", g.n_in, g.n_out, us, wbytes / us / 1e3, wbytes / 1e6);
+        cudaFree(dw); cudaFree(dq); cudaFree(dx); cudaFree(dy);
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -398,7 +520,8 @@ int main(int argc, char** argv) {
     const int bad_off = sweep(false, s, off);
     basalt::kernels::native_mmvq_set_multi_exact(true);   // back to the default
     const int bad_mma = mma_section(s);
-    if (do_bench) bench(s);
+    const int bad_q80 = q80_section(s);
+    if (do_bench) { bench(s); bench_q80(s); }
 
     std::printf("\nmulti_exact on:   %lld outputs compared, %lld differ bitwise, %lld non-finite\n",
                 on.checked, on.diff, on.nonfinite);
@@ -408,6 +531,11 @@ int main(int argc, char** argv) {
     if (on.nonfinite != 0 || off.nonfinite != 0) {
         std::printf("\nmmvq_multi_parity: FAILED. %lld non-finite outputs from finite scales and activations: the "
                     "bit comparison is only meaningful on finite outputs.\n", on.nonfinite + off.nonfinite);
+        return 1;
+    }
+    if (bad_q80 != 0) {
+        std::printf("\nmmvq_multi_parity: FAILED. %d one-column Q8_0 case(s) differ from the two-column call or the "
+                    "float64 reference.\n", bad_q80);
         return 1;
     }
     if (bad_mma != 0) {

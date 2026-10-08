@@ -3,6 +3,7 @@
 // Built with --use_fast_math like native_mmvq.cu, whose Q5_K x q8_1 dot this repeats.
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -249,6 +250,8 @@ __global__ void __launch_bounds__(WPB * WARP) q5k_head_kernel(const Q5KBlock* __
     }
 }
 
+constexpr int kPfRows = 6;   // rows per warp prefetched to L2 before the wait
+
 // One column, n_in 2560: the logits, and the argmax (first on ties) with its softmax probability over all rows,
 // by block partials and the last block's merge; `map` turns the row into a token id.
 __global__ void __launch_bounds__(WPB * WARP) q5k_head_top1_kernel(const Q5KBlock* __restrict__ w,
@@ -260,6 +263,18 @@ __global__ void __launch_bounds__(WPB * WARP) q5k_head_top1_kernel(const Q5KBloc
     __shared__ __align__(16) int4 xe[80 * XS];
     __shared__ Top wt[WPB];
     __shared__ bool last;
+    {   // the weights are constant: the warp's first rows go to L2 before the wait
+        const int lane0 = threadIdx.x & 31;
+        const int r0 = blockIdx.x * WPB + (threadIdx.x >> 5), st = gridDim.x * WPB;
+        for (int k = 0; k < kPfRows; ++k) {
+            const int row = r0 + k * st;
+            if (row >= n_out) break;
+            const char* base = reinterpret_cast<const char*>(w + (size_t) row * 10);
+            if (lane0 < 14) asm volatile("prefetch.global.L2 [%0];" ::"l"(base + 128 * lane0));
+            else if (lane0 == 14) asm volatile("prefetch.global.L2 [%0];" ::"l"(base + 1759));
+        }
+    }
+    pdl_wait();
     for (int i = threadIdx.x; i < 80 * 4; i += blockDim.x) {
         const int b = i / 4, pos = i % 4;
         const Q81Block* blk = x + b;
@@ -370,9 +385,8 @@ bool q5k_head_top1(const void* weights, const void* x_q8_1, float* y, int n_in, 
     const unsigned grid = (unsigned) (want < grid_max[dev] ? want : grid_max[dev]);
     float* part = (float*) scratch;
     unsigned* count = (unsigned*) ((char*) scratch + 4096 * 3 * sizeof(float));
-    q5k_head_top1_kernel<<<grid, WPB * WARP, 0, (cudaStream_t) stream>>>((const Q5KBlock*) weights,
-                                                                         (const Q81Block*) x_q8_1, y, n_out, map, out_id,
-                                                                         out_prob, part, count);
+    launch_pdl(q5k_head_top1_kernel, dim3(grid), dim3(WPB * WARP), 0, (cudaStream_t) stream, (const Q5KBlock*) weights,
+               (const Q81Block*) x_q8_1, y, n_out, map, out_id, out_prob, part, count);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "q5k_head_top1: %s\n", cudaGetErrorString(e));
