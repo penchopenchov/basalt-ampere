@@ -288,16 +288,18 @@ private:
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    std::map<uint64_t, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< key: batch_key(rows, S, hand-off base)
+    /// One window graph and one commit graph per (hand-off base, row count): which slots the rows are is rebound in
+    /// place (see bind_batch), never a new graph.
+    std::map<uint64_t, cudaGraphExec_t> exec_bm_, commit_bm_;
+    std::map<uint64_t, std::array<int, 8>> exec_bound_, commit_bound_;   ///< the slots each graph is bound to
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
-    uint64_t bkey(const int* rows, int S, int hbase) const {   // the doorbell variant has its own graphs
-        return batch_key(rows, S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
+    uint64_t bkey(int S, int hbase) const {   // the doorbell variant has its own graphs
+        return batch_key(S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
     }
-    static uint64_t batch_key(const int* rows, int S, int hbase) {
-        uint64_t k = (uint64_t) hbase << 40 | (uint64_t) S << 32;
-        for (int t = 0; t < S; ++t) k |= (uint64_t) (rows[t] & 15) << (4 * t);
-        return k;
-    }
+    static uint64_t batch_key(int S, int hbase) { return (uint64_t) hbase << 40 | (uint64_t) S << 32; }
+    /// Finishes a capture of a batch graph: instantiates it for a new key, else updates the existing executable in
+    /// place (same topology, new slot pointers).
+    bool bind_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err);
     // batch_launch / batch_poll
     bool b_running_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;

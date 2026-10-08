@@ -2715,8 +2715,11 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 }
 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
-    cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
-    if (ex != nullptr) return true;
+    const uint64_t key = bkey(S, hbase);
+    cudaGraphExec_t& ex = exec_bm_[key];
+    std::array<int, 8> want{};
+    for (int t = 0; t < S; ++t) want[(size_t) t] = rows[t];
+    if (ex != nullptr && exec_bound_[key] == want) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
         return false;
@@ -2735,20 +2738,39 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    const bool fresh = ex == nullptr;
+    if (!bind_batch(ex, graph, err)) return false;
+    exec_bound_[key] = want;
+    if (fresh) std::fprintf(stderr, "basalt verify: captured the batch window for %d rows\n", S);
+    return true;
+}
+
+bool Verifier::bind_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err) {
+    if (ex != nullptr) {
+        cudaGraphExecUpdateResultInfo info{};
+        const cudaError_t ue = cudaGraphExecUpdate(ex, graph, &info);
+        if (ue == cudaSuccess) {
+            cudaGraphDestroy(graph);
+            return true;
+        }
+        (void) cudaGetLastError();
+        cudaGraphExecDestroy(ex);   // the topology moved: the one executable for this key is rebuilt
+        ex = nullptr;
+    }
     const cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
     cudaGraphDestroy(graph);
-    if (ie != cudaSuccess) { err = std::string("verify: batch instantiate: ") + cudaGetErrorString(ie); return false; }
+    if (ie != cudaSuccess) { ex = nullptr; err = std::string("verify: batch instantiate: ") + cudaGetErrorString(ie); return false; }
     cudaGraphUpload(ex, cs_);
     cudaStreamSynchronize(cs_);
-    std::string list;
-    for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
-    std::fprintf(stderr, "basalt verify: captured the batch window over slots %s\n", list.c_str());
     return true;
 }
 
 bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
-    cudaGraphExec_t& cex = commit_bm_[batch_key(rows, S, hbase)];
-    if (cex != nullptr) return true;
+    const uint64_t key = batch_key(S, hbase);
+    cudaGraphExec_t& cex = commit_bm_[key];
+    std::array<int, 8> want{};
+    for (int t = 0; t < S; ++t) want[(size_t) t] = rows[t];
+    if (cex != nullptr && commit_bound_[key] == want) return true;
     using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
@@ -2813,12 +2835,13 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&cex, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: batch commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    cudaGraphDestroy(graph);
+    if (!bind_batch(cex, graph, err)) return false;
+    commit_bound_[key] = want;
     return true;
 }
 
@@ -2899,7 +2922,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
-    const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
+    const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
@@ -2971,7 +2994,7 @@ bool Verifier::commit_slots(std::string& err) {
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_bm_[batch_key(last_rows_, S, row_base_)], cs_);
+    const cudaError_t le = cudaGraphLaunch(commit_bm_[batch_key(S, row_base_)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
@@ -3006,8 +3029,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
-    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
-    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[batch_key(rows, S, base)], cs_);   // right behind it: every row is kept
+    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
+    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[batch_key(S, base)], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
