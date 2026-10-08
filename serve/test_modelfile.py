@@ -183,22 +183,22 @@ class Cli(Tmp):
                 server.main()
         return cm.exception
 
-    def test_model_needs_exe_and_a_valid_gpu(self):
+    def test_model_needs_an_engine_binary_and_a_valid_gpu(self):
         path = self.build()
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--engine", "engine", "--model", path)
+            e = self.run_main("--model", path)
         self.assertEqual(getattr(e, "code", None), 2)
-        self.assertIn("--exe", err.getvalue())
+        self.assertIn("engine binary", err.getvalue())
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--engine", "engine", "--model", path, "--exe", str(self.exe), "--gpu", "x")
+            e = self.run_main("--model", path, "--exe", str(self.exe), "--gpu", "x")
         self.assertEqual(getattr(e, "code", None), 2)
 
     def test_vision_flags_reach_model_config(self):
         from serve import server
         path = self.build(vision=True)
-        base = ["--engine", "engine", "--model", path, "--exe", str(self.exe), "--gpu", "0"]
+        base = ["--model", path, "--exe", str(self.exe), "--gpu", "0"]
         for flags, want in (([], False), (["--vision"], True), (["--vision-cpu"], "cpu"), (["--vision", "--vision-cpu"], "cpu")):
             with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
                     mock.patch("sys.stderr", io.StringIO()):
@@ -209,7 +209,7 @@ class Cli(Tmp):
         path = self.build(vision=True)
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--engine", "engine", "--model", path, "--exe", str(self.exe), "--gpu", "0", "--vision")
+            e = self.run_main("--model", path, "--exe", str(self.exe), "--gpu", "0", "--vision")
         self.assertEqual(getattr(e, "code", None), 2)
         self.assertIn("basalt-vision", err.getvalue())
 

@@ -558,27 +558,36 @@ bool for_each_index_name(const basalt::core::FileRange& index, const std::functi
     return true;
 }
 
-/// `basalt serve MODEL.basalt [--host H] [--port P] [--python PY] [server args...]`: runs the Python server over this
-/// binary and the model.  Only returns on failure.
+/// `basalt serve --config FILE` or `basalt serve MODEL.basalt [--python PY] [server args...]`: runs the Python server
+/// over this binary.  The server gets `--engine-bin` and what was typed; a MODEL.basalt argument stands for `--model MODEL.basalt`.
+/// Only returns on failure.
 int serve_subcommand(int argc, char** argv) {
-    std::string model, host = "127.0.0.1", port = "8080", python, alias;
+    std::string python;
     std::vector<std::string> extra;
+    bool have_model = false;
+    // the working directory changes below: the paths the server reads must not depend on it
+    auto absolute = [](const std::string& path) {
+        char real[4096];
+        if (::realpath(path.c_str(), real) == nullptr) {
+            std::fprintf(stderr, "basalt serve: cannot open %s\n", path.c_str());
+            std::exit(1);
+        }
+        return std::string(real);
+    };
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
-        auto value = [&](std::string& dst) {
+        auto value = [&]() -> std::string {
             if (i + 1 >= argc) { std::fprintf(stderr, "basalt serve: %s needs a value\n", a.c_str()); std::exit(2); }
-            dst = argv[++i];
+            return argv[++i];
         };
-        if (a == "--host") value(host);
-        else if (a == "--port") value(port);
-        else if (a == "--python") value(python);
-        else if (a == "--model") value(model);
-        else if (a == "--alias") value(alias);
-        else if (model.empty() && !a.empty() && a[0] != '-') model = a;
+        if (a == "--python") python = value();
+        else if (a == "--model") { extra.insert(extra.end(), {a, absolute(value())}); have_model = true; }
+        else if (a == "--config") extra.insert(extra.end(), {a, absolute(value())});
+        else if (!have_model && !a.empty() && a[0] != '-') { extra.insert(extra.end(), {"--model", absolute(a)}); have_model = true; }
         else extra.push_back(a);
     }
-    if (model.empty()) {
-        std::fprintf(stderr, "usage: basalt serve [--model] MODEL.basalt [--alias NAME] [--host H] [--port P] [--python PY] [server args...]\n");
+    if (extra.empty()) {
+        std::fprintf(stderr, "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [server args...]\n");
         return 2;
     }
     char exe[4096];
@@ -590,19 +599,11 @@ int serve_subcommand(int argc, char** argv) {
         const std::string venv = src_dir + "/.venv/bin/python";
         python = ::access(venv.c_str(), X_OK) == 0 ? venv : "python3";
     }
-    // the working directory changes below: the model's path must not depend on it
-    char real[4096];
-    if (::realpath(model.c_str(), real) == nullptr) {
-        std::fprintf(stderr, "basalt serve: cannot open %s\n", model.c_str());
-        return 1;
-    }
     if (::chdir(src_dir.c_str()) != 0) {
         std::fprintf(stderr, "basalt serve: cannot enter the source tree %s\n", src_dir.c_str());
         return 1;
     }
-    std::vector<std::string> args = {python, "-m", "serve.server", "--engine", "engine", "--model", real,
-                                     "--exe", exe, "--host", host, "--port", port};
-    if (!alias.empty()) args.insert(args.end(), {"--alias", alias});
+    std::vector<std::string> args = {python, "-m", "serve.server", "--engine-bin", exe};
     args.insert(args.end(), extra.begin(), extra.end());
     std::vector<char*> cargs;
     for (std::string& s : args) cargs.push_back(s.data());
@@ -614,11 +615,12 @@ int serve_subcommand(int argc, char** argv) {
 
 void usage() {
     std::fprintf(stderr,
-                 "basalt serve [--model] MODEL.basalt [--alias NAME] [--host H] [--port P] [--python PY] [server args...]\n"
-                 "    runs the Python server (serve/) over this binary and the model: host 127.0.0.1, port 8080;\n"
-                 "    --alias sets the model name the API reports (default: the name stored in the file);\n"
-                 "    --python defaults to .venv/bin/python in the source tree, else python3; the other arguments\n"
-                 "    go to the server.  It runs in the source tree, so give paths to it as absolute ones.\n"
+                 "basalt serve --config FILE [--python PY] [server args...]\n"
+                 "basalt serve MODEL.basalt [--python PY] [server args...]\n"
+                 "    runs the Python server (serve/) over this binary: the server reads its options and the engine flags\n"
+                 "    from the config file and the command line (the model is the config's or MODEL.basalt, which stands\n"
+                 "    for --model); --python defaults to .venv/bin/python in the source tree, else python3; the other\n"
+                 "    arguments go to the server.  It runs in the source tree; --model and --config paths are made absolute.\n"
                  "basalt generate --model FILE.basalt --tokens \"1,2,3\" [options]\n"
                  "\n"
                  "  --model FILE         the .basalt model file (required): the dense weights, experts, source tensors\n"
