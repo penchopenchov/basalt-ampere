@@ -110,11 +110,12 @@ class Tokenizer:
         """Merge `word` (already byte-mapped) by lowest rank first, not left to right; long words go to _bpe_heap."""
         if len(word) > self.HEAP_MIN:
             return self._bpe_heap(word)
+        ranks_get = self.ranks.get      # read once: the scan below works on a local, not on `self` per symbol pair
         parts = list(word)
         while len(parts) > 1:
             best, best_rank = None, None
             for i in range(len(parts) - 1):
-                r = self.ranks.get((parts[i], parts[i + 1]))
+                r = ranks_get((parts[i], parts[i + 1]))
                 if r is not None and (best_rank is None or r < best_rank):
                     best, best_rank = i, r
             if best is None:

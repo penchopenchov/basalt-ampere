@@ -180,6 +180,34 @@ def synthetic_tokenizer(seed=268, n_merges=1500):
     return ST.Tokenizer(tokens, merges, types)
 
 
+class ThreadedEncode(unittest.TestCase):
+    """Many threads sharing one Tokenizer, as the server does, get exactly the single-threaded ids."""
+
+    def test_threads_match_serial(self):
+        import threading
+        tok = synthetic_tokenizer()
+        rng = random.Random(1385)
+        texts = [random_text(rng, 6) for _ in range(40)]
+        want = [tok.encode(t) for t in texts]
+        errors = []
+
+        def work():
+            try:
+                for _ in range(15):
+                    for t, w in zip(texts, want):
+                        if tok.encode(t) != w:
+                            errors.append("mismatch")
+            except Exception as e:                  # noqa: BLE001
+                errors.append(repr(e))
+
+        ts = [threading.Thread(target=work) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(errors, [])
+
+
 class HeapBpe(unittest.TestCase):
     """Words longer than HEAP_MIN symbols merge with a heap; the ids must be exactly the scan's."""
 
