@@ -1,13 +1,15 @@
 """Build the single .basalt model file from the source GGUF shards.
 
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
-        [--mtp-source DIR] [--profile FILE | --profile-from TRACE ...] [--draft-vocab FILE] [--hc8 FILE] \\
+        [--mtp-source DIR] [--mtp-dense FILE] [--profile FILE | --profile-from TRACE ...] [--draft-vocab FILE] [--hc8 FILE] \\
         [--name NAME] [--compat-bf16] [--no-vision] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
+  --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
+                     with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp
   --draft-vocab FILE the token subset the draft head may propose (int32 ids; needs --mtp-source)
   --profile FILE     an expert profile stored as is (`--expert-profile-save`'s file)
   --profile-from TRACE ...  `--dump-routing` traces: routed experts first, most frequent first, then the rest;
@@ -161,7 +163,7 @@ def convert(a) -> None:
     if out.exists() and not a.force:
         die(f"{out} exists (use --force to overwrite)")
     mmproj = Path(a.mmproj) if a.mmproj else None
-    side = [Path(x) for x in (a.hc8, a.draft_vocab, a.profile) if x] + [Path(t) for t in (a.profile_from or [])]
+    side = [Path(x) for x in (a.hc8, a.draft_vocab, a.profile, a.mtp_dense) if x] + [Path(t) for t in (a.profile_from or [])]
     if not a.no_vision:
         side.append(mmproj if mmproj else Path("<--mmproj>"))
     for p in side:
@@ -169,6 +171,8 @@ def convert(a) -> None:
             die(f"missing input: {p}")
     if a.draft_vocab and not a.mtp_source:
         die("--draft-vocab needs --mtp-source")
+    if a.mtp_dense and not a.mtp_source:
+        die("--mtp-dense needs --mtp-source")
     if a.profile and a.profile_from:
         die("give --profile or --profile-from, not both")
 
@@ -178,7 +182,7 @@ def convert(a) -> None:
         kv, tensors = source_tensors(model)
         dense = S.Dense(model, a.compat_bf16)
         experts = S.Experts(model)
-        mtp = S.Mtp(a.mtp_source) if a.mtp_source else None
+        mtp = S.Mtp(a.mtp_source, a.mtp_dense) if a.mtp_source else None
         n_vocab = len(kv.get("tokenizer.ggml.tokens") or []) or None
         draft_vocab = S.draft_vocab_bytes(a.draft_vocab, n_vocab) if a.draft_vocab else None
         if a.profile:
@@ -261,7 +265,9 @@ def convert(a) -> None:
                 "profile": prof,
                 "hc8": {"bytes": Path(a.hc8).stat().st_size} if a.hc8 else None,
                 "mtp": None if mtp is None else {"source_sha256": mtp.source_sha256(),
-                                                  "expert_format": "q2_0", "draft_vocab": draft_vocab is not None},
+                                                  "expert_format": "q2_0", "draft_vocab": draft_vocab is not None,
+                                                  "dense": ({"tuning": "self_distilled", "sha256": mtp.tuned_sha256}
+                                                            if mtp.tuned else {"tuning": None})},
                 "vision": None if a.no_vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
             }
@@ -289,6 +295,7 @@ def main():
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
     ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/convert/mtp_fetch.py fetch")
+    ap.add_argument("--mtp-dense", metavar="FILE", help="a tuned (self-distilled) mtp/dense section to embed (needs --mtp-source)")
     ap.add_argument("--draft-vocab", metavar="FILE", help="int32 token ids the draft head may propose (needs --mtp-source)")
     ap.add_argument("--profile", metavar="FILE", help="an expert profile to store as it is (--expert-profile-save's file)")
     ap.add_argument("--profile-from", nargs="+", metavar="TRACE",

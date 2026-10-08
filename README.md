@@ -137,7 +137,7 @@ Build one from the source GGUF shards (give shard 1; the others are found beside
 
 ```sh
 python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \
-    [--mtp-source DIR] [--draft-vocab FILE] [--profile FILE] [--hc8 FILE] [--compat-bf16] [--name NAME]
+    [--mtp-source DIR [--mtp-dense FILE]] [--draft-vocab FILE] [--profile FILE] [--hc8 FILE] [--compat-bf16] [--name NAME]
 ```
 
 `python3 tools/convert/convert.py --help` describes every input.
@@ -160,7 +160,8 @@ path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer
 
 The IQ3_S, IQ3_XXS and Q2_0 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
 raises draft acceptance. Output is unchanged, because verify decides every token. Q4_K_XL and Q8_0 keep the original
-MTP layer.
+MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's raw bytes, checked against the
+source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`.
 
 The model files are derived from Qwen3.8-Flash-Next and are distributed under the
 [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT

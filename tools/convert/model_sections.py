@@ -399,8 +399,18 @@ def mtp_blob(gu: np.ndarray, dn: np.ndarray) -> bytes:
 class Mtp:
     """The draft layer's sections, from a directory written by `mtp_fetch.py fetch`."""
 
-    def __init__(self, src):
+    def __init__(self, src, tuned_dense=None):
         self.src = pathlib.Path(src)
+        self.tuned = pathlib.Path(tuned_dense) if tuned_dense else None
+        self.tuned_sha256 = None
+        if self.tuned is not None:
+            if not self.tuned.is_file():
+                raise ConvertError(f"missing input: {self.tuned}")
+            h = hashlib.sha256()
+            with open(self.tuned, "rb") as f:
+                for b in iter(lambda: f.read(1 << 24), b""):
+                    h.update(b)
+            self.tuned_sha256 = h.hexdigest()
         mf = self.src / "mtp-manifest.json"
         if not mf.is_file():
             raise ConvertError(f"{mf} not found (run tools/convert/mtp_fetch.py fetch --out {self.src})")
@@ -416,6 +426,20 @@ class Mtp:
                                          sort_keys=True).encode()).hexdigest()
 
     def dense_chunks(self):
+        """The dense section: the tuned file when given (its size must match the source layout), else the source."""
+        if self.tuned is None:
+            yield from self._source_dense_chunks()
+            return
+        for _ in self._source_dense_chunks():     # fills the index and the expected size
+            pass
+        size = self.tuned.stat().st_size
+        if size != self.dense_bytes:
+            raise ConvertError(f"{self.tuned}: {size} bytes, the source layout is {self.dense_bytes}")
+        with open(self.tuned, "rb") as f:
+            for b in iter(lambda: f.read(1 << 24), b""):
+                yield b
+
+    def _source_dense_chunks(self):
         """Every tensor but the experts, by name, each starting at a multiple of 256; fills `dense_lines`."""
         off = 0
         for name in sorted(self.manifest):

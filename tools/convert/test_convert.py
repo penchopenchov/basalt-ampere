@@ -84,7 +84,7 @@ class ConvertTest(unittest.TestCase):
 
     def args(self, **kw):
         t = self.t
-        d = dict(gguf=[str(self.gguf)], mmproj=str(t / "mmproj.gguf"), out=str(t / "out.basalt"), mtp_source=None,
+        d = dict(gguf=[str(self.gguf)], mmproj=str(t / "mmproj.gguf"), out=str(t / "out.basalt"), mtp_source=None, mtp_dense=None,
                  draft_vocab=None, profile=None, profile_from=None, hc8=str(t / "hc8.bin"), name="Tiny",
                  compat_bf16=False, no_vision=False, force=False)
         d.update(kw)
@@ -261,7 +261,7 @@ class ConvertTest(unittest.TestCase):
     def test_help(self):
         r = subprocess.run([sys.executable, str(Path(convert.__file__)), "--help"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0)
-        for flag in ("--gguf", "--mtp-source", "--mmproj", "--profile-from", "--profile ", "--hc8", "--draft-vocab"):
+        for flag in ("--gguf", "--mtp-source", "--mtp-dense", "--mmproj", "--profile-from", "--profile ", "--hc8", "--draft-vocab"):
             self.assertIn(flag, r.stdout)
 
 
@@ -357,6 +357,29 @@ class DrafterTest(unittest.TestCase):
             (t.t / "dv.bin").write_bytes(np.array([0, 6], dtype="<i4").tobytes())      # 6 is outside the 6 tokens
             with self.assertRaises(SystemExit):
                 convert.convert(t.args(mtp_source=str(self.src), draft_vocab=str(t.t / "dv.bin"), force=True))
+        finally:
+            t.tearDown()
+
+    def test_tuned_dense(self):
+        t = ConvertTest("test_sections")
+        t.setUp()
+        try:
+            mtp = S.Mtp(self.src)
+            plain = b"".join(mtp.dense_chunks())
+            tuned = bytes(b ^ 0x5A for b in plain)
+            f = t.t / "tuned.bin"
+            f.write_bytes(tuned)
+            convert.convert(t.args(mtp_source=str(self.src), mtp_dense=str(f)))
+            m = t.model()
+            self.assertEqual(m.read("mtp/dense"), tuned)
+            self.assertEqual(m.read("mtp/dense.index"), mtp.dense_index())
+            meta = json.loads(m.read("meta"))
+            self.assertEqual(meta["mtp"]["dense"], {"tuning": "self_distilled", "sha256": hashlib.sha256(tuned).hexdigest()})
+            f.write_bytes(tuned[:-1])
+            with self.assertRaises(SystemExit):
+                convert.convert(t.args(mtp_source=str(self.src), mtp_dense=str(f), force=True))
+            with self.assertRaises(SystemExit):
+                convert.convert(t.args(mtp_dense=str(f), force=True))
         finally:
             t.tearDown()
 
