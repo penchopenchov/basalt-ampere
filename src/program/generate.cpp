@@ -585,7 +585,8 @@ int serve_subcommand(int argc, char** argv) {
         if (a == "--python") python = value();
         else if (a == "--model") { extra.insert(extra.end(), {a, absolute(value())}); have_model = true; }
         else if (a == "--config") extra.insert(extra.end(), {a, absolute(value())});
-        else if (!have_model && !a.empty() && a[0] != '-') { extra.insert(extra.end(), {"--model", absolute(a)}); have_model = true; }
+        // only the first argument can be MODEL.basalt; a later bare word is the value of the option before it
+        else if (i == 2 && !have_model && !a.empty() && a[0] != '-') { extra.insert(extra.end(), {"--model", absolute(a)}); have_model = true; }
         else extra.push_back(a);
     }
     if (extra.empty()) {
