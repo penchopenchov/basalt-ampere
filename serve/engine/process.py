@@ -201,6 +201,7 @@ class ProcessEngine:
             self.ctl = threading.Lock()                 # one admission or solo request at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is
         self._yielded = None                            # (slot, tokens read) of a read that gave way
+        self._ctl_erred = False                         # the control lines ended on an ERR
         self.wlock = threading.Lock()                   # serializes stdin writes
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -444,6 +445,7 @@ class ProcessEngine:
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
+                self._ctl_erred = True                   # the engine refused it and is idle: no DONE follows
                 raise ValueError(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
@@ -592,6 +594,7 @@ class ProcessEngine:
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                    self._ctl_erred = False
                     def others():
                         with self.slot_cv:
                             return self.waiting > 0
@@ -659,6 +662,7 @@ class ProcessEngine:
                     self.slot_held[slot] = []               # admission overwrites the slot
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                    self._ctl_erred = False
                     asked = False
                     for x in self._control(cancel, pending.append):
                         while pending:
@@ -736,6 +740,8 @@ class ProcessEngine:
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
                     phase = "none"                      # engine gone: nothing to drain
+                if phase in ("solo", "admit") and self._ctl_erred:
+                    phase = "none"                      # it ended on the engine's ERR: no DONE to wait for
                 if phase == "solo":
                     self._send("STOP")
                     self._drain_control("DONE", born=born)
