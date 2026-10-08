@@ -90,6 +90,15 @@ bin/basalt serve --config basalt_config.json                     # everything fr
 bin/basalt serve --config basalt_config.json --max-context 32768  # the command line wins
 ```
 
+### Concurrent requests: `--parallel N`
+
+`--parallel N` (1..8, also `"parallel"` in the config's `server` section) serves N requests at once in the
+engine's batch slots; the default 1 is the single-stream path. Further requests wait in arrival order (a later one
+may go first only to resume a slot that holds its conversation, a few times at most). A slot is freed when its
+request finishes, is cancelled or its client leaves. `/metrics` reports `live.slots` (`total`, `active`,
+`queue_depth`). Every slot holds a full `--max-context` of KV cache, taken from the expert cache; a per-slot
+context is not an engine option yet, so lower `--max-context` when raising N.
+
 - `server` holds the server's options (`python -m serve.server --help`), named as the flags without the dashes:
   strings or numbers, `true`/`false` for a switch (`vision`, `lazy`, ...), a list for the repeatable ones
   (`allowed-host`, `cors-origin`). `model` and `tokenizer` paths are relative to the file.

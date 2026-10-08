@@ -14,6 +14,7 @@ from serve.security import exposed_without_key
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 # server options that are engine flags (the "engine" section of the config file)
 ENGINE_PASSTHROUGH = ("spec", "spec-min-p", "mtp-max-t", "peer-exclusive", "max-context")
+PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer")       # relative to the config file
 
 
@@ -130,6 +131,11 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
                         ("--max-context", a.max_context), ("--peer-exclusive", a.peer_exclusive or None)):
         if value is not None:
             cli_engine[flag] = value
+    if a.parallel and a.parallel > 1:
+        for flag in ("--batch", "--slots"):
+            if flag in cli_engine or flag in file_engine:
+                raise ValueError(f"parallel and engine {flag} both set: use parallel")
+        (cli_engine if a_cli.parallel else file_engine)["--batch"] = a.parallel
     host_on_cli = any(w == "--host" or w.startswith("--host=") for w in cli)
     if "--host" in file_argv and not host_on_cli and exposed_without_key(a.host, a.api_key):
         raise ValueError(f"host {a.host} is open to the network and comes from the config file: "
@@ -220,6 +226,17 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+def parallel_count(text: str) -> int:
+    """argparse type: a whole number of request slots, 1..PARALLEL_MAX."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number 1..{PARALLEL_MAX}, not {text!r}") from None
+    if not 1 <= n <= PARALLEL_MAX:
+        raise argparse.ArgumentTypeError(f"expected 1..{PARALLEL_MAX}, not {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
@@ -235,6 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mtp-max-t", type=int, help="the drafter's own window cap (default 0 = --spec)")
     ap.add_argument("--max-context", type=int, help="the longest context the engine allows, in tokens (default: the "
                                                     "engine's)")
+    ap.add_argument("--parallel", type=parallel_count, metavar="N",
+                    help=f"requests served at once, 1..{PARALLEL_MAX} (default 1: one at a time); more requests wait "
+                         "their turn. Each slot holds a full context of KV cache, which the expert cache gives up")
     ap.add_argument("--config", metavar="FILE",
                     help="a JSON object of engine flags, e.g. {\"max-context\": 32768, \"spec\": 7, "
                          "\"resident-experts\": true}; the server's own flags win over it")

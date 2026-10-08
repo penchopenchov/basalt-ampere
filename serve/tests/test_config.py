@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.engine.modelfile import with_arg  # noqa: E402
-from serve.config import ENGINE_PASSTHROUGH, build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings, load_config_file, parse_settings, server_options, split_engine_extras  # noqa: E402
+from serve.config import ENGINE_PASSTHROUGH, build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings, load_config_file, parallel_count, parse_settings, server_options, split_engine_extras  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -153,7 +153,7 @@ class EveryOption(unittest.TestCase):
             return True
         if act.choices:
             return [c for c in act.choices][-1]
-        if act.type is int:
+        if act.type is int or act.type is parallel_count:
             return 7
         if act.type is float:
             return 0.25

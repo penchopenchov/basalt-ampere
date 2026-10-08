@@ -155,7 +155,7 @@ def main() -> int:
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
-            "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+            "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, {}
     # the model's exported template, else the bundled one
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
@@ -194,6 +194,8 @@ def main() -> int:
     print(f"[server] ready: http://{here}:{a.port}/v1 (OpenAI /v1/chat/completions, Anthropic /v1/messages), "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''}", flush=True)
+    if getattr(engine, "batch", 0):
+        print(f"[server] parallel: {engine.batch} requests at once, the rest wait in order", flush=True)
     print(f"[server] stats: http://{here}:{a.port}/ (Ctrl+C stops)", flush=True)
     if a.host not in LOOPBACK_NAMES:
         # reachable from other devices: print the addresses
