@@ -1,4 +1,4 @@
-"""What the engine log says while it starts: load progress bars, warnings and errors, and start-failure hints."""
+"""Engine start narration from its log: load bars, warnings, errors and start-failure hints."""
 from __future__ import annotations
 
 import sys
@@ -11,9 +11,7 @@ DRAFT_HEAD_HINT = "free VRAM, or run without the drafter (--spec 0)"
 
 
 def start_failure_hint(log: str | None, offset: int) -> str:
-    """What to change when the engine stopped at the start because the MTP draft head did not fit the VRAM
-    left: the engine's own `basalt mtp:` lines after that failure (what it needs, what is free, the smaller
-    subsets), else the same advice in words for an older engine.  "" for any other failure: the log says why."""
+    """Advice when the start failed because the MTP draft head did not fit the free VRAM; "" for other failures."""
     if not log:
         return ""
     try:
@@ -30,14 +28,13 @@ def start_failure_hint(log: str | None, offset: int) -> str:
 
 
 def start_last_line(log: str | None, offset: int) -> str:
-    """The last meaningful line this start wrote to the engine log (without its `basalt generate:` prefix), for the
-    error when the engine ended before READY without an error line of its own.  "" when there is none."""
+    """The last meaningful log line of this start, without its prefix; "" when none."""
     if not log:
         return ""
     try:
         with open(log, "rb") as f:
             f.seek(0, 2)
-            start = max(offset, f.tell() - 64 * 1024)   # never an earlier start's lines
+            start = max(offset, f.tell() - 64 * 1024)   # skip earlier starts' lines
             f.seek(start)
             text = f.read().decode("utf-8", "replace")
     except (OSError, ValueError):
@@ -51,24 +48,22 @@ def start_last_line(log: str | None, offset: int) -> str:
 
 
 class LoadBars:
-    """The engine's `basalt load:` lines, shown as one bar per target, each against that target's own planned size
-    (`plan`).  A target appears when it starts loading, below the ones that started before it; one without a plan
-    yet shows a byte counter.  A `copy` target (experts another tier already holds, written to a second card) is counted apart
-    and never goes into the total.  At the end (finish) the bars become one line with the size, time and split
-    across targets; off a terminal only that line is printed."""
+    """One progress bar per `basalt load:` target against its planned size (a byte counter before the plan).
+    `copy` targets are counted apart from the total. finish() collapses the bars into one result line; off a
+    terminal only that line is printed."""
 
     WIDTH = 24
 
     def __init__(self, out=None, gpus=None):
         self.out = out or sys.stdout
-        self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number, when --gpu picked cards
+        self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number
         self.tty = self.out.isatty()
-        self.total = 0                                 # the announced bytes of the whole start (0: not announced)
+        self.total = 0                                 # announced total bytes (0: none)
         self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, last, seen, start}
-        self.started = 0                               # targets that have begun loading
+        self.started = 0                               # targets begun
         self.t0 = None
         self.drawn = 0                                 # lines of bars on screen
-        self.kv: list[tuple[str, int, int]] = []       # (target, bytes, tokens): allocated, not loaded
+        self.kv: list[tuple[str, int, int]] = []       # (target, bytes, tokens): allocated only
 
     def name(self, target: str) -> str:
         if target == "ram":
@@ -132,7 +127,7 @@ class LoadBars:
         self.kv.append((target, nbytes, tokens))
 
     def set_total(self, total: int) -> None:
-        """The bytes the whole start places (the engine may lower it when part is left on the file)."""
+        """The bytes the whole start places."""
         self.total = total
 
     def set_plan(self, target: str, plan: int, copy: bool = False) -> None:
@@ -150,7 +145,7 @@ class LoadBars:
             t["start"] = self.started
             self.started += 1
         done = min(done, total)
-        if t["seen"] != total or done < t["last"]:     # a new phase of this target: the last one is complete
+        if t["seen"] != total or done < t["last"]:     # new phase: the last is complete
             t["done"] += t["last"] if t["seen"] else 0
             t["last"] = 0
             t["seen"] = total
@@ -159,11 +154,11 @@ class LoadBars:
         self._draw()
 
     def finish(self) -> None:
-        """The engine is up: the bars become the result line."""
+        """The engine is up: replace the bars with the result line."""
         self._erase()
         done = self.done()
         want = self.total or sum(t["plan"] for (_, c), t in self.targets.items() if not c)
-        if done > 0 and done >= want:                  # a start that failed mid-load says so elsewhere
+        if done > 0 and done >= want:                  # a failed start is reported elsewhere
             def part(copy):
                 return {tg: t["done"] + t["last"] for (tg, c), t in self.targets.items()
                         if c == copy and t["done"] + t["last"]}
@@ -252,8 +247,7 @@ def start_errors(log: str | None, offset: int) -> list[str]:
 
 
 def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=20.0, out=None, gpus=None) -> None:
-    """Show the engine's load progress from its log (LoadBars) and its warnings, and a heartbeat while nothing
-    moves."""
+    """Show load progress and warnings from the engine log, with a heartbeat while idle."""
     bars = LoadBars(out, gpus)
     t0 = last = time.time()
     pos = offset

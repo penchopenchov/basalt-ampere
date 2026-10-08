@@ -1,4 +1,14 @@
-"""ProcessEngine: one resident basalt --serve child process, spoken to over stdin and stdout."""
+"""ProcessEngine: one resident `basalt --serve` child process, driven over stdin and stdout.
+
+Protocol (one line each):
+  * start: stdout `INFO k=v ...` lines, then `READY <ctx> [stop]` (stop: STOP is honoured mid-request).
+  * solo: `GEN <max_new> [k=v ...] <ids>` (GENI with embeddings) -> `T <id>`, `PP <read> <total> ...`,
+    `RESUME <n>`, then `DONE ...`; `STOP` ends it early. `ERR ...` is a failure.
+  * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`;
+    `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
+  * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
+  * Requests share one pipe, serialized by the service FIFO (batch: by the `ctl` lock).
+"""
 from __future__ import annotations
 
 import json
@@ -14,32 +24,24 @@ from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, Engi
 from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
 
 
-# a running request whose engine prints nothing (no T, PP or any other line) for this long has lost step with the
-# server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
-# the next request starts it again.  ProcessEngine.silence_s sets it (0: wait forever).
+# A running request whose engine prints nothing for this long is out of step: the engine is ended and the request
+# fails. ProcessEngine.silence_s overrides it (0: wait forever).
 ENGINE_SILENCE_S = 300.0
-# ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto)
-# and a slow PC can take minutes over a first chunk before the first line.  Until the first
-# PP the wait adds the chunk's tokens at PP_FLOOR_TOK_S; after one, a chunk may take PP_SLACK x the last one's time.
+# While a prompt is read the allowance grows: before the first PP line by the chunk's tokens at PP_FLOOR_TOK_S,
+# afterwards a chunk may take PP_SLACK x the previous one's time.
 PP_CHUNK_MAX = 32768
 PP_FLOOR_TOK_S = 50.0
 PP_SLACK = 3.0
 ENGINE_REQUEST = re.compile(
-    # "+ 12288 of 98179 read": a request cancelled while its prompt was read
+    # "+ 12288 of 98179 read": a request cancelled during its prompt read
     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
     r"\((?P<pp>[\d.]+) tok/s\), "
     r"(?P<gen>\d+) generated in (?P<gen_ms>[\d.]+) ms \((?P<tg>[\d.]+) tok/s\)")
-_echoing: set[str] = set()      # the logs echo_requests already follows (restart() runs ProcessEngine.__init__ again)
+_echoing: set[str] = set()      # logs already followed (restart() re-runs __init__)
 
 
 def echo_requests(log_path: str, offset: int) -> None:
-    """--request-lines: one stdout line per finished request, from the engine's own summary in its log.
-
-    The engine's stderr goes to the log file (the start narrator reads it), so a supervisor that only sees this
-    process's output - a tray, llama-swap - has no per-request numbers. This re-states the engine's line with the
-    total the two times make: `request prompt P cached C output O prompt_read R ms total S ms prefill X tok/s decode Y
-    tok/s` (prompt_read: the time the engine spent reading the prompt's new tokens, not a time to first token).
-    """
+    """--request-lines: print one stdout line per finished request, parsed from the engine's log summary."""
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
         f.seek(offset)
         while True:
@@ -56,7 +58,7 @@ def echo_requests(log_path: str, offset: int) -> None:
 
 
 def pump_lines(stream, sink) -> None:
-    """Hands each line of a child's pipe to `sink` until the pipe closes."""
+    """Pass each line of a child's pipe to `sink` until it closes."""
     try:
         for line in stream:
             sink(line)
@@ -66,28 +68,21 @@ def pump_lines(stream, sink) -> None:
 
 REQUEST_LINES = False    # --request-lines: echo the engine's per-request summary on stdout
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
-# The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
-# finished): the process may stay alive and even print DONE, but it must not take another request.
+# Engine lines for an unrecoverable verifier: the process may stay alive and print DONE, but must take no more requests.
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
 
 
 class ProcessEngine:
-    """The resident engine: `basalt --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
-    `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
-
-    Per-request sampling rides the same line as engine-side keys between max_new and the ids
-    (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
-    engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
-    """
-    silence_s = ENGINE_SILENCE_S         # an attribute of its own: restart() keeps it
-    silent_note = None                   # why the server ended a silent engine (death_note says it)
-    last_err = None                      # an ERR that was its last stdout line (death_note says it)
+    """The resident engine process. Per-request sampling goes as `k=v` keys between max_new and the ids;
+    an absent or zero temperature is greedy and not forwarded."""
+    silence_s = ENGINE_SILENCE_S         # kept across restart()
+    silent_note = None                   # why the server ended a silent engine
+    last_err = None                      # an ERR that was the last stdout line
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
-    stderr_sink = None                   # callable(line): the engine's stderr when there is no log file (main() sets it)
+    stderr_sink = None                   # callable(line): engine stderr when there is no log file
 
-    # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
-    # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
+    # `last`: figures of the last DONE line; per thread with batch slots, since requests run concurrently.
     @property
     def last(self):
         if self.batch:
@@ -106,30 +101,30 @@ class ProcessEngine:
 
     def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
-        self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again after it died
+        self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
-        self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_stop = False            # READY <ctx> stop
         self.last = {}
-        self.info = {}                   # INFO key=value facts: kv, expert slots, ...
+        self.info = {}                   # INFO key=value facts
         self.prefill_tok_s_mean = None
-        self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
+        self.progress = None             # (read, total) prompt tokens, from PP lines
         self.silent_note = None
         self.last_err = None
-        try:                            # a ready-made engine's BUILD.json says its version
+        try:                            # a release's BUILD.json gives its version
             self.info["version"] = json.loads((Path(engine_bin).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
         if lazy:
             return
-        self.unloaded = False            # `ended` stays True until READY (below): not alive while starting
+        self.unloaded = False            # `ended` stays True until READY
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
-        loading = threading.Event()                     # set once READY: the narrator below stops
-        log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
+        loading = threading.Event()                     # set once READY: stops the narrator
+        log_start = os.path.getsize(log) if log else 0  # where this start's log lines begin
         self.log_start = log_start
         if log:
             visible = (env or os.environ).get("CUDA_VISIBLE_DEVICES", "")
@@ -137,7 +132,7 @@ class ProcessEngine:
             narrator = threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), loading),
                                         kwargs={"gpus": gpus}, daemon=True)
             narrator.start()
-            # once per log: the follower keeps reading the same (appended) log across restarts and reloads
+            # one follower per log, across restarts
             if REQUEST_LINES and os.path.abspath(log) not in _echoing:
                 _echoing.add(os.path.abspath(log))
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
@@ -160,9 +155,9 @@ class ProcessEngine:
                 break
         loading.set()
         if log:
-            narrator.join(2)                            # its result lines come before what follows READY
+            narrator.join(2)                            # its lines precede what follows READY
         if self.max_context <= 0:
-            try:                                        # its pipes and our handle on its log (the log stays)
+            try:                                        # close its pipes and our log handle
                 self.proc.wait(timeout=5)
                 self.proc.stdin.close()
                 self.proc.stdout.close()
@@ -170,21 +165,19 @@ class ProcessEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            if errors := start_errors(log, log_start):   # its own reason, short
+            if errors := start_errors(log, log_start):   # the engine's own reason
                 reason = "; ".join(dict.fromkeys(errors))
             else:
                 reason = start_last_line(log, log_start) or "the engine exited before it was ready"
             raise EngineStartError(reason + start_failure_hint(log, log_start), log)
-        self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
-        # a locally built engine can sit next to another release's BUILD.json: engines that
-        # report their own version (INFO engine=) win, the manifest stays the fallback for the others
+        self.known_ctx = self.max_context   # survives a failed restart
+        # an engine's own version (INFO engine=) beats the BUILD.json fallback
         if self.info.get("engine"):
             self.info["version"] = str(self.info["engine"])
-        self.ended = False                              # READY: alive from here (restart() set it True)
-        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
+        self.ended = False                              # READY: alive from here
+        # stdout is pumped on a thread so requests can wait with a timeout
         self.lines: queue.Queue = queue.Queue()
-        # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
-        # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
+        # the engine reports the slots it actually runs (INFO batch_slots=N), possibly fewer than asked
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
@@ -192,34 +185,32 @@ class ProcessEngine:
         groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
-        # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
+        # slot order that spreads requests over the groups first: 0, gs, 2gs, .., 1, gs+1, ..
         self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
-        # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
-        # the slot that has its start (the engine checks it again); when the slot was last used
+        # tokens each slot holds (for prefix reuse by a conversation's next turn) and when it was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
-        # the admission state belongs to the server, not to one engine process: restart() runs this again while
-        # requests still wait on these objects, so they are made once and kept
+        # admission state outlives engine processes: restart() re-runs this while requests wait on it
         if "slot_cv" not in self.__dict__:
             self.slot_cv = threading.Condition()
-            self.waiting = 0                            # requests waiting for the control lines (ctl)
-            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
-            self.ctl_epoch = 0                          # how often the control lines were taken
-            self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
-        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
-        self._yielded = None                            # (slot, tokens read): the last request on them gave way
-        self.wlock = threading.Lock()                   # stdin writes from several request threads
+            self.waiting = 0                            # requests waiting for ctl
+            self.wait_lens: list[list[int]] = []        # their prompt lengths
+            self.ctl_epoch = 0                          # times ctl was taken
+            self.ctl = threading.Lock()                 # one admission or solo request at a time
+        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is
+        self._yielded = None                            # (slot, tokens read) of a read that gave way
+        self.wlock = threading.Lock()                   # serializes stdin writes
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
     def _pump(self):
-        proc, lines = self.proc, self.lines             # this process's: a restart replaces both
+        proc, lines = self.proc, self.lines             # a restart replaces both
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
-            if line.startswith(FATAL_PREFIXES):         # checked before batch routing: a fatal line is never a slot's
+            if line.startswith(FATAL_PREFIXES):         # before batch routing
                 if self.proc is proc:
                     self.silent_note = "unrecoverable verification failure: " + line[4:].strip()
                     self.ended = True
@@ -228,24 +219,24 @@ class ProcessEngine:
                 except OSError:
                     pass
                 break                                   # publish EOF, never the trailing DONE
-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
+            if line.startswith(("BT ", "BDONE ")) and slot_q:   # a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
                     continue
                 except (IndexError, ValueError):
                     pass
             lines.put(line)
-        if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
-            self.ended = True                           # its output closed: it is gone, even before the OS says so
-            if line and line.startswith("ERR"):         # why it exited, though no request may read it (a failed
-                self.last_err = line[4:].strip()        # batch window: every request reads its own slot)
+        if self.proc is proc:                           # a killed engine's pump must not mark its successor
+            self.ended = True                           # output closed: it is gone
+            if line and line.startswith("ERR"):         # why it exited, when no request read it
+                self.last_err = line[4:].strip()
         lines.put(None)
         for q in slot_q:
             q.put(None)
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog, else RAM."""
-        if getattr(self, "silent_note", None):          # the server ended it, not the OS or the engine itself
+        if getattr(self, "silent_note", None):          # the server ended it
             return self.silent_note
         tail = ""
         try:
@@ -258,17 +249,17 @@ class ProcessEngine:
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return "the engine's watchdog stopped it: " + line.strip()
-        proc = self.proc                                 # None while a restart has not started the next one yet
+        proc = self.proc                                 # None between restart's close and start
         rc = proc.poll() if proc is not None else None
-        if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
+        if rc is not None and rc >= 0 and self.last_err:  # its last stdout words
             return f"the engine exited (code {rc}) after it reported: {self.last_err}"
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("basalt", "ERR"))), "")
-        if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why
+        if rc is not None and rc >= 0 and last:          # it ended by itself
             return f"the engine exited (code {rc}), last log line: {last}"
         return "probably out of RAM (sudo dmesg | grep -i 'out of memory')"
 
     def alive(self) -> bool:
-        proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
+        proc = self.proc                                 # read once: restart()/close() may clear it
         return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
     def exit_code(self):
@@ -284,21 +275,16 @@ class ProcessEngine:
         self.close()
         self.unloaded = True
 
-    RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
+    RESTART_RETRY_S = 15.0   # between restart() tries, for VRAM to be released
 
     def restart(self, tries: int = 3):
-        """Start the engine again (the same command) after it died; the new process has its own line queue.
-        close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
-        exits before READY - a dead engine's VRAM can take a while to come back - is retried.
-"""
+        """Start the engine again after it died; a start that exits before READY is retried."""
         info = dict(self.info)
-        self.starting = True                     # prepare() answers 503 "starting" meanwhile
+        self.starting = True                     # prepare() answers 503 meanwhile
         try:
             self.close()
             for i in range(tries):
-                # not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
-                # READY, and a request that saw alive() in that window skipped load() and failed with "context
-                # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
+                # not alive until READY, so no request sees a half-started engine; __init__ clears `ended`
                 self.ended = True
                 try:
                     self.__init__(*self.spawn)
@@ -315,28 +301,26 @@ class ProcessEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
-            with self.slot_cv:                   # wake the requests that waited through it: they go on with the new
-                self.slot_cv.notify_all()        # engine, or (it did not start) end with a clean EngineDied
+            with self.slot_cv:                   # wake the requests that waited through the restart
+                self.slot_cv.notify_all()
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
-        if len(f) >= 9:                                   # the conversation cache's fields
+        if len(f) >= 9:                                   # conversation cache fields
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
-        if len(f) >= 11:                                  # decode hit rate fields
+        if len(f) >= 11:                                  # decode hit rate
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
-        if len(f) >= 15:                                  # the prompt tokens actually read
+        if len(f) >= 15:                                  # prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
-        if len(f) >= 16:                                  # routed experts read over PCIe
+        if len(f) >= 16:                                  # experts read over PCIe
             self.last.update(offloaded=int(f[15]))
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
-        """`VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
-        expert cache until that much VRAM is free, or grows it back when more is free; None: back to the reserve it
-        started with.  -> the engine's figures (expert_slots, expert_cache_mib, vram_free_mib, ...); raises ValueError
-        with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
+        """Resize the expert cache to leave `reserve_mib` free (None: the starting reserve); returns the engine's
+        figures. Caller holds the service FIFO. ValueError carries the engine's refusal."""
         if not self.alive():
             raise EngineDied("the engine is not running")
         self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
@@ -374,7 +358,7 @@ class ProcessEngine:
             keys += f" top_p={float(tp)!r}"
         tk = sampling.get("top_k")
         if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
-            # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
+            # the sampler keeps at most 64 candidates
             keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
@@ -392,7 +376,7 @@ class ProcessEngine:
         if pp_on:
             keys += f" penalty_present={float(pp)!r}"
         if rp_on or pf_on or pp_on:
-            # a penalty without a window counts over nothing: the engine's default is the last 64 tokens
+            # a penalty needs a window; default to the last 64 tokens
             pln = sampling.get("penalty_last_n")
             if isinstance(pln, int) and not isinstance(pln, bool) and pln > 0:
                 keys += f" penalty_last_n={pln}"
@@ -405,8 +389,7 @@ class ProcessEngine:
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
-        """`cvec=0|1`: the experimental-speed-projection control vector for this request, when the engine was
-        started with one (--control-vector-scaled; an engine without one ignores the key).  Absent = on."""
+        """`cvec=0|1` key for the speed-projection control vector (ignored by engines without one)."""
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
@@ -415,13 +398,12 @@ class ProcessEngine:
             with self.wlock:
                 self.proc.stdin.write(text + "\n")
                 self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process)
+        except (OSError, AttributeError):                # the pipe is gone
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
     def _control(self, cancel, on_token, stop_when=None):
-        """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
-        for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
-        true sends STOP once (the request is then read to its DONE)."""
+        """Read the control lines of a GEN/BGEN, yielding None as heartbeat and False per token (on_token gets the id).
+        Ends at DONE (solo) or BADM; `stop_when()` true sends STOP once."""
         stopped = False
         while True:
             try:
@@ -439,14 +421,14 @@ class ProcessEngine:
                 if not stopped and (cancel.is_set() or (stop_when is not None and stop_when())):
                     self._send("STOP")
                     stopped = True
-                yield False                              # a token is pending (not a heartbeat)
+                yield False                              # a token (not a heartbeat)
             elif line.startswith("PP "):
                 f = line.split()
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                     self.progress = (int(f[1]), int(f[2]))
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                 if not stopped and cancel.is_set():
-                    # a Stop during the prompt read goes out at once, not after the first token
+                    # stop during the prompt read, not after the first token
                     self._send("STOP")
                     stopped = True
                 yield None
@@ -457,7 +439,7 @@ class ProcessEngine:
                 f = line.split()
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
                 return
-            elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
+            elif line.startswith("YIELDED "):            # <slot> <tokens read> after BYIELD
                 f = line.split()
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
                     self._yielded = (int(f[1]), int(f[2]))
@@ -468,10 +450,8 @@ class ProcessEngine:
                 return
 
     def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
-        """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
-        request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
-        `born`: the engine process (self.gen) the request started on; once that one is gone there is nothing to
-        drain, and the lines now are its successor's."""
+        """Read control lines up to `until` (DONE or BADM) so the next request sees no leftovers; None if the engine
+        ended or `born` (the starting engine generation) is gone."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             if born is not None and (self.gen != born or not self.alive()):
@@ -489,16 +469,15 @@ class ProcessEngine:
         return None
 
     def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
-        """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
-        says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
-        come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
-        if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+        """BSTOP a slot whose consumer left and free it at BDONE in the background; `stream` (prompt + tokens so far)
+        becomes what the slot holds."""
+        if slot >= len(self.slot_q):                    # the engine restarted with fewer slots
             return
         try:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
+        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # restart() replaces them
 
         def wait():
             end = time.monotonic() + 600.0
@@ -524,11 +503,11 @@ class ProcessEngine:
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
-    YIELDS_MAX = 2   # how often one request's prompt read gives way to a shorter waiting one
+    YIELDS_MAX = 2   # times one prompt read may give way to a shorter waiting one
 
     def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
-        """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
+        """Wait for the control lines, yielding None heartbeats; False when cancelled. `after_epoch`: let requests
+        already waiting go first."""
         entry = [plen]
         with self.slot_cv:
             self.waiting += 1
@@ -537,22 +516,21 @@ class ProcessEngine:
         try:
             while True:
                 if not self.alive() and not getattr(self, "starting", False):
-                    # the engine is gone and nobody is starting it again: this request was not sent, so it ends now
-                    # instead of waiting for control lines nothing will answer on (during a restart it keeps waiting)
+                    # engine gone and not restarting: end now rather than wait for lines nobody will answer
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
                 if turn and self.ctl.acquire(timeout=0.5):
                     if self.alive():
                         break
-                    self.ctl.release()                  # it died (or is being restarted) while this one was getting
-                    turn = False                        # the lines: not the engine this request was meant for
+                    self.ctl.release()                  # died or restarting while acquiring: not this request's engine
+                    turn = False
                 if not turn:
                     with self.slot_cv:
                         self.slot_cv.wait(timeout=0.5)
                 if cancel.is_set():
                     return False
-                if time.monotonic() - beat >= 10.0:     # a heartbeat every 10 s, as the engine's own wait
+                if time.monotonic() - beat >= 10.0:     # heartbeat every 10 s
                     beat = time.monotonic()
                     yield None
         finally:
@@ -565,13 +543,11 @@ class ProcessEngine:
             self.slot_cv.notify_all()
         return True
 
-    SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
-    SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
+    SOLO_AGAIN_MAX = 2      # times a request alone in a slot returns to the solo path
+    SOLO_AGAIN_MIN_LEFT = 32  # ... and only with this many tokens still allowed
 
     def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
-        """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
-        path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
-        slot_cache=1)."""
+        """Whether a request alone in a slot should go back to the solo path (needs INFO slot_cache=1)."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
                 not (self.info or {}).get("slot_cache")):
             return False
@@ -579,19 +555,14 @@ class ProcessEngine:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
     def _shorter_waiting(self, plen: int) -> bool:
-        """Someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+        """A waiting prompt under half this length is worth giving way to."""
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
-        """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
-        - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
-        its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
-        slot's own BT lines until BDONE.  Several requests run at once; the control lines (prompt reading, admission)
-        are taken one request at a time - and a long prompt read gives way at a chunk boundary to a waiting request
-        with a much shorter prompt (`BYIELD <slot>`; the part read waits in a slot and the read goes on after).
-        A consumer that stops early leaves the engine in step: the solo request is STOPped and read to its DONE, an
-        admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
+        """--batch: run solo (GEN) while alone, move to a batch slot (BGEN) when others arrive, and return to solo
+        when left alone. Prompt reads and admissions take the control lines one at a time; a long read may give way
+        to a much shorter waiting one (BYIELD). An early-leaving consumer is STOPped/BSTOPped and drained."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
@@ -602,13 +573,13 @@ class ProcessEngine:
         ok = yield from self._take_control(cancel, len(prompt))
         if not ok:
             return
-        holding, born = True, self.gen                  # (born: the engine process it has the control lines of)
+        holding, born = True, self.gen                  # born: engine generation holding the control lines
         slot, gen0, reserved = None, None, None
-        phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
+        phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
         yields, solo_again = 0, 0
         try:
-            while True:   # a request in a slot that is left alone goes back to the solo path
+            while True:   # loops when a request alone in a slot returns to solo
                 if not holding:
                     ok = yield from self._take_control(cancel, len(prompt))
                     if not ok:
@@ -629,24 +600,24 @@ class ProcessEngine:
                             t = pending.pop(0)
                             out.append(t)
                             yield t
-                        if x is None:                       # a heartbeat (False: a token, flushed above)
+                        if x is None:                       # heartbeat
                             if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                     self._shorter_waiting(len(prompt))):
-                                with self.slot_cv:          # the slot the part read will wait in
+                                with self.slot_cv:          # slot the partial read will wait in
                                     reserved = self.pick_slot(prompt)
                                     if reserved is not None:
                                         self.slot_busy[reserved] = True
                                 if reserved is not None:
                                     self._send(f"BYIELD {reserved}")
                             yield None
-                    phase = "none"                          # its DONE is read
+                    phase = "none"                          # DONE was read
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
-                        slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
-                    elif reserved is not None:              # it did not give way: the slot is free again
+                        slot, reserved = reserved, None     # gave way: the read continues in that slot
+                    elif reserved is not None:              # did not give way: release the slot
                         with self.slot_cv:
                             self.slot_busy[reserved] = False
                             self.slot_cv.notify_all()
@@ -656,11 +627,10 @@ class ProcessEngine:
                         left = int(max_new) - len(out)
                         if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
                             return
-                        prompt = list(ids) + out            # promoted: it continues in a batch slot from here
+                        prompt = list(ids) + out            # continues in a batch slot
                 while True:
                     if slot is None:
-                        # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
-                        # the start of this prompt (its conversation's last turn), else the one used longest ago
+                        # prefer the slot holding this prompt's start, else the longest unused
                         with self.slot_cv:
                             while True:
                                 slot = self.pick_slot(prompt)
@@ -670,7 +640,7 @@ class ProcessEngine:
                                 self.slot_cv.wait(timeout=10.0)
                                 if cancel.is_set():
                                     return
-                    if self._yielded is not None:           # it gave way: the others waiting then go first
+                    if self._yielded is not None:           # gave way: waiting requests go first
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
                         yields += 1
@@ -686,7 +656,7 @@ class ProcessEngine:
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
-                    self.slot_held[slot] = []               # the admission overwrites what the slot held
+                    self.slot_held[slot] = []               # admission overwrites the slot
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     asked = False
@@ -708,13 +678,13 @@ class ProcessEngine:
                         out.append(t)
                         yield t
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
-                        continue                            # gave way: again once the shorter request is in
+                        continue                            # gave way: retry after the shorter request
                     break
                 self.ctl.release()
                 holding = False
                 if not cont:
                     return
-                gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
+                gen0 = len(out) - 1                         # the admission's token; the slot feeds it first
                 going_solo = False
                 while True:
                     try:
@@ -739,7 +709,7 @@ class ProcessEngine:
                         yield t
                         if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
-                            self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                            self._send(f"BSTOP {slot}")         # alone now: continue solo
                             going_solo = True
                     elif line.startswith("BDONE "):
                         phase = "none"
@@ -747,12 +717,11 @@ class ProcessEngine:
                         if len(f) >= 5 and isinstance(self.last, dict):
                             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
-                        # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
+                        # the slot holds the prompt and every token fed (all but the last)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
-                            # the solo path continues it: the engine copies the slot's sessions back (all but the
-                            # last token are in them) and decodes with MTP drafts again
+                            # continue on the solo path
                             self.slot_used[slot] = time.time()
                             with self.slot_cv:
                                 self.slot_busy[slot] = False
@@ -763,10 +732,10 @@ class ProcessEngine:
                             break
                         return
         finally:
-            # a consumer that left early (or an error): keep the engine and this server in step
+            # consumer left early or errored: keep engine and server in step
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
-                    phase = "none"                      # its engine is gone: nothing to stop or drain
+                    phase = "none"                      # engine gone: nothing to drain
                 if phase == "solo":
                     self._send("STOP")
                     self._drain_control("DONE", born=born)
@@ -787,16 +756,15 @@ class ProcessEngine:
                 if phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
+                    self._release_slot_when_done(slot, stream)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_cv.notify_all()
 
     def pick_slot(self, prompt: list[int]) -> int | None:
-        """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
-        prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
-        conversations other slots hold stay for their next turns.  None: every slot is busy."""
+        """A free slot for `prompt` (caller holds slot_cv): longest held prefix, else empty, else least recently used;
+        None when all are busy."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
@@ -809,9 +777,8 @@ class ProcessEngine:
         return min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
-        the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
-        has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        """Yield token ids, and None as a 10 s heartbeat while the engine is quiet. An early-leaving consumer or
+        `cancel` makes the engine STOP."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         if getattr(self, "batch", 0):
@@ -819,17 +786,15 @@ class ProcessEngine:
             return
         self.progress = None
         self.prefill_tok_s_mean = None
-        # an image request takes the same sampling keys as text (greedy only when none is asked for)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
-        except OSError:                                  # the pipe is gone: the engine died (not the client)
+        except OSError:                                  # the pipe is gone: the engine died
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
-        # how long the engine may stay silent from here.  Until the first line: the request's first prompt
-        # chunk at the slowest prompt reading on top of silence_s; a PP line resets it to its own chunk's time.
+        # silence allowance: silence_s plus the first chunk's read time; each PP line resets it to its chunk's time
         silence = float(self.silence_s or 0)
         allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
         heard, read_to = time.monotonic(), 0
@@ -839,7 +804,7 @@ class ProcessEngine:
                 if allow > 0:
                     wait = min(wait, allow - (time.monotonic() - heard))
                     if wait <= 0:
-                        done = True                       # no STOP and no drain: nothing is listening
+                        done = True                       # nothing is listening: no STOP, no drain
                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
                                            "the request")
                 try:
@@ -848,12 +813,12 @@ class ProcessEngine:
                     if cancel.is_set():
                         return
                     if wait >= 10.0:
-                        yield None                        # the 10 s heartbeat (the deadline's short waits are not)
+                        yield None                        # 10 s heartbeat (not the deadline's short waits)
                     continue
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
+                heard = time.monotonic()                  # any line counts as output
                 if line.startswith("T "):
                     allow = silence
                     if cancel.is_set():
@@ -862,16 +827,16 @@ class ProcessEngine:
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        self.progress = (int(f[1]), int(f[2]))
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
                         if silence > 0 and rate > 0 and chunk > 0:   # the next chunk, as long as this one
                             allow = max(silence, PP_SLACK * chunk / rate)
-                    if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
-                        return                            # would send no keep-alives at all)
-                    yield None
-                elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
+                    if cancel.is_set():
+                        return
+                    yield None                            # PP lines reset the 10 s wait, so heartbeat here
+                elif line.startswith("RESUME "):          # reused tokens: the first chunk starts after them
                     try:
                         read_to = int(line.split()[1])
                     except (IndexError, ValueError):
@@ -884,16 +849,15 @@ class ProcessEngine:
                     done = True
                     raise ValueError(line[4:].strip())
         finally:
-            if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
+            if not done:                                  # consumer left early: STOP and drain to DONE
                 if self.can_stop:
                     try:
                         self.proc.stdin.write("STOP\n")
                         self.proc.stdin.flush()
                     except OSError:
                         pass
-                # never an untimed wait here - it holds the request FIFO, and an engine that lost step never
-                # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
-                # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
+                # never wait untimed: this holds the request FIFO. With STOP the whole drain gets the current
+                # allowance; without it the engine runs to max_new, so each line only has to come in time.
                 heard = time.monotonic()
                 while True:
                     left = allow - (time.monotonic() - heard) if allow > 0 else None
@@ -913,21 +877,19 @@ class ProcessEngine:
                         heard = time.monotonic()
 
     def _silent(self, what: str) -> EngineSilent:
-        """End an engine that lost step with the server (its main thread waits for a command the server never
-        sends), so the next request starts it again: killed now, its GPU and RAM go back with the process."""
+        """Kill an engine that lost step with the server so the next request restarts it."""
         self.silent_note = "the engine and the server lost step (engine_silence_s, 0 = wait forever)"
-        self.ended = True                               # not alive from now: the next request restarts it
+        self.ended = True                               # the next request restarts it
         proc = self.proc
         try:
             proc.kill()
-            proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
+            proc.wait(timeout=20)                       # restart()/close() handles one still exiting
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
     def close(self):
-        """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        """End the engine: QUIT, then terminate, then kill, 20 s each; EngineStuck if it still runs."""
         if self.proc is None:
             return
         try:
@@ -935,7 +897,7 @@ class ProcessEngine:
                 try:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
-                    self.proc.stdin.close()  # the engine's stdin reader must see EOF before shutdown
+                    self.proc.stdin.close()  # the engine must see EOF before shutdown
                     self.proc.wait(timeout=20)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
@@ -953,7 +915,7 @@ class ProcessEngine:
                 if self.pump is not None:
                     self.pump.join(timeout=2)
                 try:
-                    self.proc.stdin.close()             # buffered data may flush again after the engine has exited
+                    self.proc.stdin.close()             # buffered data may flush after exit
                 except OSError:
                     pass
                 self.proc.stdout.close()

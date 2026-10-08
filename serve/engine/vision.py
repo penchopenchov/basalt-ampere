@@ -13,16 +13,14 @@ from pathlib import Path
 
 
 class Vision:
-    """The resident image encoder: `basalt-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
-    lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
-    sends the same picture again (every turn, with most clients) encodes it once."""
+    """The resident `basalt-vision` encoder: `ENC <image> <out>` lines in, embeddings out, cached by image hash."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
         args = [cfg["vision_bin"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
-        self.spawn = (args, log, env)                   # to start it again after an unload
+        self.spawn = (args, log, env)                   # to start again
         self.stopped = False
-        self.ready_s = 0.0                              # how long the last start took to reach READY
+        self.ready_s = 0.0                              # last start's time to READY
         self._start()
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
@@ -42,12 +40,12 @@ class Vision:
         return not self.stopped and self.proc.poll() is None
 
     def unload(self):
-        """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
+        """Stop the encoder; encoded images stay cached on disk."""
         self.close()
         self.stopped = True
 
     def restart(self):
-        """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
+        """Start the encoder again, keeping the cache."""
         try:
             self.proc.kill()
         except OSError:
@@ -69,7 +67,7 @@ class Vision:
 
     @staticmethod
     def normalize(data: bytes) -> bytes:
-        """The formats basalt-vision's decoder (stb_image) reads pass through; anything else is converted to PNG."""
+        """Formats the decoder reads pass through; others are converted to PNG."""
         if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
             return data
@@ -86,7 +84,7 @@ class Vision:
             raise ValueError(f"the image could not be read ({e})") from None
         if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
             im = im.convert("RGBA")
-            bg = Image.new("RGB", im.size, (255, 255, 255))   # transparent areas become white, not black
+            bg = Image.new("RGB", im.size, (255, 255, 255))   # transparency becomes white
             bg.paste(im, mask=im.split()[-1])
             im = bg
         elif im.mode != "RGB":
@@ -96,7 +94,7 @@ class Vision:
         return out.getvalue()
 
     def encode(self, source: str) -> tuple[Path, int]:
-        """-> (embeddings file, number of image tokens)."""
+        """Return (embeddings file, image token count)."""
         data = self.normalize(self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
@@ -108,7 +106,7 @@ class Vision:
                 self.proc.stdin.write(f"ENC {img} {out}\n")
                 self.proc.stdin.flush()
                 line = self.proc.stdout.readline().strip()
-            finally:                                                   # also when the encoder's pipe is gone
+            finally:                                                   # also when the pipe is gone
                 img.unlink(missing_ok=True)
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
@@ -129,8 +127,7 @@ class Vision:
 
 
 def gpu_list(cfg: dict) -> list[int]:
-    """The cards --gpu lists ("0,1"), numbered as nvidia-smi numbers them: the first runs the model, the second is the
-    peer expert tier; [] when it names none."""
+    """The nvidia-smi numbers of the cards --gpu lists (first: model, second: peer tier); [] when none."""
     g = cfg.get("gpu")
     if g is None or g == "":
         return []
@@ -139,8 +136,7 @@ def gpu_list(cfg: dict) -> list[int]:
 
 
 def gpus_in_play(cfg: dict, args: list[str]) -> list[int]:
-    """The physical GPUs the engine uses, numbered as nvidia-smi numbers them, first the engine's own card: the first
-    one --gpu lists, plus the peer card of --peer-device (a CUDA ordinal: the Nth listed card).  [0] when none is named."""
+    """The nvidia-smi numbers of the GPUs the engine uses, its own card first, then the --peer-device card; [0] if none."""
     visible = gpu_list(cfg)
     out = visible[:1] or [0]
     peer = next((a.split("=", 1)[1] for a in args if a.startswith("--peer-device=")),
@@ -152,22 +148,21 @@ def gpus_in_play(cfg: dict, args: list[str]) -> list[int]:
 
 
 def engine_args(cfg: dict) -> list[str]:
-    """The engine's arguments: the ones the model file carries."""
+    """The engine arguments the model file carries."""
     return list(cfg["args"])
 
 
 def child_env(cfg: dict) -> dict:
-    """The engine's environment: --gpu's cards, as the only ones it sees."""
+    """The engine environment: only the --gpu cards are visible."""
     env = dict(os.environ)
-    if gpu_list(cfg):                              # numbered as nvidia-smi does; CUDA's own default order
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # (fastest first) can number the cards otherwise
+    if gpu_list(cfg):                              # number cards as nvidia-smi does
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # CUDA's default order differs
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     return env
 
 
 def vision_env(cfg: dict, env: dict) -> dict:
-    """The image encoder's environment: the engine's, or with two cards listed the second card alone, so the encoder
-    stays off the card that holds the model."""
+    """The encoder environment: the engine's, or the second listed card alone to stay off the model's card."""
     gpus = gpu_list(cfg)
     if len(gpus) < 2:
         return env
@@ -178,7 +173,7 @@ def vision_env(cfg: dict, env: dict) -> dict:
 
 
 def gpu_card_name(index: int) -> str | None:
-    """The marketing name of one card, from a single nvidia-smi query at startup; None when it cannot be had."""
+    """A card's name from one nvidia-smi query; None if unavailable."""
     try:
         out = subprocess.run(["nvidia-smi", "-i", str(index), "--query-gpu=name", "--format=csv,noheader"],
                              capture_output=True, text=True, timeout=5)
@@ -189,9 +184,7 @@ def gpu_card_name(index: int) -> str | None:
 
 
 def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_card_name) -> str:
-    """The startup line about the image encoder: off, or where it runs and how long it took to be ready.  The
-    card is numbered as nvidia-smi numbers it: the second listed card when two are listed (see vision_env), else
-    the engine's."""
+    """The startup line about the encoder: off, or where it runs and its ready time."""
     if not vision:
         return "[server] vision: off (--vision or --vision-cpu to enable)"
     took = f" in {ready_s:.1f} s"

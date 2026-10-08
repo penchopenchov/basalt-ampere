@@ -1,5 +1,4 @@
-"""Run the server from a .basalt model file: the engine settings the file implies, its tokenizer and the vision
-sidecar's inputs, unpacked once into the cache directory."""
+"""Engine settings, tokenizer and vision inputs for a .basalt model file, unpacked once into the cache directory."""
 from __future__ import annotations
 
 import json
@@ -22,12 +21,12 @@ def cache_root() -> Path:
 
 
 def cache_dir(mf: ModelFile) -> Path:
-    """One directory per model: the first 16 hex digits of the meta section's sha256."""
+    """One cache directory per model, named by the meta section's sha256 prefix."""
     return cache_root() / mf.sections["meta"][2].hex()[:16]
 
 
 def write_section(mf: ModelFile, name: str, dest: Path) -> None:
-    """Copy a section to `dest` through a temporary name, so a partial file is never taken for a whole one."""
+    """Copy a section to `dest` via a temporary name so a partial file is never used."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     off, size = mf.section(name)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=dest.name + ".")
@@ -49,8 +48,7 @@ def write_section(mf: ModelFile, name: str, dest: Path) -> None:
 
 
 def extract_tokenizer(mf: ModelFile) -> Path:
-    """The `tokenizer/*` sections as a directory (what tools/tokenizer.py and the chat template read); reused
-    when already there."""
+    """The `tokenizer/*` sections as a directory, reused when present."""
     out = cache_dir(mf) / "tokenizer"
     if (out / "vocab.json").exists():
         return out
@@ -85,8 +83,7 @@ def gpu_count(visible_env: str | None = None) -> int:
 
 
 def vision_config(mf: ModelFile, engine_bin: str) -> dict:
-    """The vision sidecar's config (`basalt-vision` beside the engine binary, the projector and a vocab-only text
-    model unpacked from the file).  ValueError says what is missing: vision was asked for, so no silent text-only."""
+    """The vision sidecar's config; ValueError names what is missing."""
     side = Path(engine_bin).resolve().parent / VISION_EXE
     if "vision/mmproj" not in mf.sections:
         raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision / --vision-cpu")
@@ -116,13 +113,12 @@ def with_arg(args: list[str], flag: str, value) -> list[str]:
 
 def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bool | str = False,
                  overrides: dict | None = None) -> dict:
-    """The engine settings the model file implies, with `overrides` ({flag: value}) replacing the file's
-    engine arguments.  `vision` (False, True or "cpu"; True runs the encoder on the GPU) adds the vision sidecar and
-    raises ValueError when it cannot be set up.  A second visible GPU becomes the engine's peer expert tier unless they already say."""
+    """The engine settings the file implies; `overrides` ({flag: value}) replace its arguments, `vision` (True or
+    "cpu") adds the sidecar (ValueError if it cannot be set up). A second visible GPU becomes the peer tier."""
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
-    args = ["--model", path]   # engine settings come from the engine defaults and the server, not the file
+    args = ["--model", path]   # settings come from the engine defaults and the server
     for flag, value in (overrides or {}).items():
         args = with_arg(args, flag, value)
     if "--peer-device" not in args and (gpu_count() if gpus is None else gpus) > 1:
@@ -136,6 +132,6 @@ def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bo
     if v:
         v["gpu"] = vision != "cpu"
         cfg["vision"] = v
-        if "--vision" not in args:   # the engine takes image embeddings only when told
+        if "--vision" not in args:   # image embeddings need --vision
             args.append("--vision")
     return cfg

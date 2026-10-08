@@ -14,8 +14,7 @@ class Engine(Protocol):
 
 
 class MockEngine:
-    """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token.  Given a list of
-    scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it)."""
+    """Replays scripted completions as token ids plus the end-of-turn token; a list gives one script per request, the last repeating."""
 
     def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
