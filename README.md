@@ -44,8 +44,50 @@ bin/basalt serve --model /path/to/model.basalt --host 127.0.0.1 --port 8080 [--a
 
 The server listens on 127.0.0.1 by default; do not expose it beyond that without `--api-key`.
 
-Diagnostics are engine command-line flags (`--profile`, `--wait-stats`, `--decode-timing`, `--draft-log FILE`); no
-environment variables control the engine.
+### Settings: `--config`
+
+The engine's built-in defaults are untuned (4096 context, fp16 KV, no speculation, no expert cache), and the model
+file carries no engine flags. Put every setting in one `basalt_config.json` and pass `--config`:
+
+```json
+{
+  "server": {
+    "model": "model.basalt",
+    "alias": "Qwen 3.8 FN",
+    "gpu": "0,1",
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+  "engine": {
+    "expert-cache": "auto",
+    "prefill": "auto",
+    "spec": 7,
+    "spec-min-p": 0.5,
+    "max-context": 262144,
+    "kv": "int8",
+    "resident-experts": true,
+    "vram-reserve-mib": 700
+  }
+}
+```
+
+```sh
+bin/basalt serve --config basalt_config.json                     # everything from the file
+bin/basalt serve --config basalt_config.json --max-context 32768  # the command line wins
+```
+
+- `server` holds the server's options (`python -m serve.server --help`), named as the flags without the dashes:
+  strings or numbers, `true`/`false` for a switch (`vision`, `lazy`, ...), a list for the repeatable ones
+  (`allowed-host`, `cors-origin`). `model` and `tokenizer` paths are relative to the file.
+- `engine` holds engine flags (`bin/basalt --help`), the same way: a string or number, `true` for a switch, `false`
+  to leave it off. Any flag the engine accepts works, on the command line as well (`--kv int8`, `--resident-experts`).
+  A name the engine does not accept stops the server at startup, as does one in the wrong section.
+- Precedence: command line > config file > built-in defaults. `spec`, `spec-min-p`, `mtp-max-t`, `peer-exclusive` and
+  `max-context` are engine flags; they are also server flags on the command line.
+- The API key is command line only (`--api-key`); a config file that sets it is refused. A non-loopback `host` from
+  the file also needs `--api-key` on the command line, or the server refuses to start.
+- The startup line `[server] engine: ...` lists the settings that came from the file or the command line; without
+  `--config` it says the built-in defaults apply.
 
 ## The `.basalt` model file
 
