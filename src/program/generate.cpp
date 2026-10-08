@@ -89,6 +89,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -5688,8 +5689,14 @@ int main(int argc, char** argv) {
             // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same
             // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0)
             bool partial = false, partial_from0 = false;
+            // BSCRIPT (a test drive of the multi-token segments): the tokens this slot's request is known to produce
+            // (script[0] is its first token); the windows draft from it, some drafts wrong, and keep what matches
+            std::vector<int32_t> script;
+            std::mt19937_64 rng;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript((size_t) std::max(o.batch, 0));
+        const bool bdigest = basalt::core::exp_flag("concur5_digest", 0) != 0;
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -5764,21 +5771,86 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // hashes of everything slot b's sessions hold for its first `upto` tokens, per part (GDN state, PLE history,
+        // indexer tails, dead rows, block positions, K, V, scales, pooled rows), for comparing a slot's state window by
+        // window against another run of the same request
+        auto slot_digest = [&](int b, int64_t upto, uint64_t* part) -> bool {
+            for (int i = 0; i < 10; ++i) part[i] = 1469598103934665603ull;
+            auto mix = [&](int i, const uint8_t* p, size_t n) {
+                uint64_t h = part[i];
+                size_t k = 0;
+                for (; k + 8 <= n; k += 8) {
+                    uint64_t w;
+                    std::memcpy(&w, p + k, 8);
+                    h = (h ^ w) * 1099511628211ull;
+                    h ^= h >> 29;
+                }
+                for (; k < n; ++k) h = (h ^ p[k]) * 1099511628211ull;
+                part[i] = h;
+            };
+            std::string e;
+            const basalt::core::SessionState& from = *bslot_ss[0][(size_t) b];
+            if (cudaDeviceSynchronize() != cudaSuccess) return false;
+            basalt::core::ConversationCheckpoint ck;
+            ck.ids.assign((size_t) upto, 0);
+            if (!basalt::core::conversation_checkpoint_save(ck, from, g, e)) return false;
+            const std::vector<uint8_t>* cv[5] = {&ck.gdn, &ck.ple, &ck.tails, &ck.dead, &ck.block_pos};
+            for (int i = 0; i < 5; ++i) mix(i, cv[i]->data(), cv[i]->size());
+            for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                basalt::core::ConversationKv img;
+                if (!basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto & ~int64_t(3), true, e)) return false;   // whole pages: the cells past `upto` may hold rejected rows
+                if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                const basalt::core::ConversationBuffer* kb[5] = {&img.k, &img.v, &img.k_scale, &img.v_scale, &img.pooled};
+                for (int i = 0; i < 5; ++i) {   // (the pooled rows past the completed blocks are not state)
+                    const size_t cnt = i == 4 ? std::min(kb[i]->size(), (size_t) (upto >> 2) * (size_t) img.idx_dim * 4) : kb[i]->size();
+                    kb[i]->visit(0, cnt, [&](const uint8_t* p, size_t n, size_t) { mix(5 + i, p, n); return true; });
+                }
+            }
+            return true;
+        };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
-            int S = 0;
-            int rows[basalt::kernels::kVerifyMaxT] = {};
-            int32_t tok[basalt::kernels::kVerifyMaxT] = {}, outb[basalt::kernels::kVerifyMaxT] = {};
-            int64_t pos[basalt::kernels::kVerifyMaxT] = {};
-            for (int b = 0; b < (int) bs.size() && S < basalt::kernels::kVerifyMaxT; ++b)
+            constexpr int MR = basalt::kernels::kVerifyMaxT;
+            int S = 0, R = 0;
+            int rows[MR] = {}, lens[MR] = {}, n_keep[MR] = {}, r0s[MR] = {};
+            int32_t tok[MR] = {}, outb[MR] = {};
+            int64_t pos[MR] = {};
+            std::vector<int32_t> drafts[MR];
+            for (int b = 0; b < (int) bs.size() && S < MR; ++b)
                 if (bs[(size_t) b].active) {
                     rows[S] = b;
-                    tok[S] = bs[(size_t) b].x;
                     pos[S] = bs[(size_t) b].p;
+                    lens[S] = 1;
                     ++S;
                 }
             if (S == 0) return true;
+            {   // the rows beyond one per slot go to the scripted slots, as many drafts as the script and the context allow
+                int extra = MR - S;
+                const int first = (int) (bs[(size_t) rows[0]].rng() % (uint64_t) S);
+                for (int i = 0; i < S && extra > 0; ++i) {
+                    const int sg = (first + i) % S;
+                    BSlot& sl = bs[(size_t) rows[sg]];
+                    if (sl.script.empty()) continue;
+                    const int64_t avail = (int64_t) sl.script.size() - sl.produced;
+                    const int64_t room = o.max_context - sl.p - 2;
+                    const int want = (int) std::min<int64_t>({(int64_t) (sl.rng() % (uint64_t) (extra + 1)), avail, room});
+                    if (want <= 0) continue;
+                    drafts[sg].assign(sl.script.begin() + sl.produced, sl.script.begin() + sl.produced + want);
+                    if (sl.rng() % 2 == 0) {   // a wrong draft at a random place
+                        const size_t c = (size_t) (sl.rng() % (uint64_t) want);
+                        drafts[sg][c] = (int32_t) ((drafts[sg][c] + 1 + sl.rng() % 100) % n_vocab);
+                    }
+                    lens[sg] += want;
+                    extra -= want;
+                }
+            }
+            for (int sg = 0; sg < S; ++sg) {
+                r0s[sg] = R;
+                tok[R] = bs[(size_t) rows[sg]].x;
+                for (size_t j = 0; j < drafts[sg].size(); ++j) tok[R + 1 + (int) j] = drafts[sg][j];
+                R += lens[sg];
+            }
             const bool was_busy = basalt::core::progress().busy.load();
             basalt::core::progress().busy.store(true);
             drive.d.layers = 0;
@@ -5791,12 +5863,27 @@ int main(int argc, char** argv) {
                 bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
             }
             const Clock::time_point w0 = Clock::now();
-            if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
+            if (!ver.run_slot_segs(rows, lens, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
             const Clock::time_point w1 = Clock::now();
-            if (!ver.commit_slots(err)) {
+            // per segment: the drafts the picks confirm, then how far the request goes (stop token, limits) within them
+            const char* fin_of[MR] = {};
+            for (int sg = 0; sg < S; ++sg) {
+                const BSlot& sl = bs[(size_t) rows[sg]];
+                int k = 1;
+                while (k < lens[sg] && outb[r0s[sg] + k - 1] == drafts[sg][(size_t) k - 1]) ++k;
+                for (int e = 0; e < k; ++e) {
+                    const int32_t y = outb[r0s[sg] + e];
+                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    fin_of[sg] = eos ? "stop" : sl.stop ? "cancel" : sl.produced + e + 1 >= sl.max_new ? "length"
+                               : sl.p + e + 2 > o.max_context ? "length" : nullptr;
+                    if (fin_of[sg] != nullptr) { k = e + 1; break; }
+                }
+                n_keep[sg] = k;
+            }
+            if (!ver.commit_slots(n_keep, err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
             }
@@ -5805,25 +5892,31 @@ int main(int argc, char** argv) {
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
             ++bt_windows;
-            bt_rows += S;
-            for (int t = 0; t < S; ++t) {
-                const int b = rows[t];
+            bt_rows += R;
+            for (int sg = 0; sg < S; ++sg) {
+                const int b = rows[sg];
                 BSlot& sl = bs[(size_t) b];
-                const int32_t y = outb[t];
-                sl.ids.push_back(sl.x);    // the window fed it: the slot's sessions hold it now
-                std::printf("BT %d %d\n", b, (int) y);
-                ++sl.produced;
-                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-                const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                                : sl.p + 2 > o.max_context ? "length" : nullptr;
-                if (fin != nullptr) {
+                const int k = n_keep[sg];
+                for (int e = 0; e < k; ++e) {
+                    sl.ids.push_back(tok[r0s[sg] + e]);    // the window fed it: the slot's sessions hold it now
+                    std::printf("BT %d %d\n", b, (int) outb[r0s[sg] + e]);
+                }
+                sl.produced += k;
+                if (bdigest) {
+                    uint64_t part[10] = {};
+                    slot_digest(b, sl.p + k, part);
+                    std::printf("BDIG %d %lld", b, (long long) (sl.p + k));
+                    for (int i = 0; i < 10; ++i) std::printf("%c%llx", i == 0 ? ' ' : ',', (unsigned long long) part[i]);
+                    std::printf("\n");
+                }
+                if (fin_of[sg] != nullptr) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                    std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                    std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin_of[sg], ms);
                     sl.active = false;
                     sl.cached = o.prompt_cache > 0 && !sl.img;   // its sessions hold sl.ids for the next turn
                 } else {
-                    sl.x = y;
-                    sl.p += 1;
+                    sl.x = outb[r0s[sg] + k - 1];
+                    sl.p += k;
                 }
             }
             std::fflush(stdout);
@@ -5988,6 +6081,22 @@ int main(int argc, char** argv) {
             if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);
                 if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                continue;
+            }
+            if (line.rfind("BSCRIPT ", 0) == 0) {   // BSCRIPT <slot> <seed> <id,id,...>: before the slot's BGEN
+                char* e1 = nullptr;
+                const long b = std::strtol(line.c_str() + 8, &e1, 10);
+                char* e2 = nullptr;
+                const unsigned long long seed = std::strtoull(e1, &e2, 10);
+                std::vector<int64_t> sids;
+                std::string se;
+                if (b < 0 || b >= (long) bs.size() || e2 == e1 || !parse_i64_list(e2, sids, se)) {
+                    std::printf("ERR BSCRIPT: bad slot or list\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                bscript[(size_t) b].first.assign(sids.begin(), sids.end());
+                bscript[(size_t) b].second = seed;
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
@@ -7244,6 +7353,9 @@ int main(int argc, char** argv) {
                     BSlot& sl = bs[(size_t) admit_slot];
                     sl = BSlot{};
                     sl.active = true;
+                    sl.script = std::move(bscript[(size_t) admit_slot].first);
+                    sl.rng.seed(bscript[(size_t) admit_slot].second);
+                    bscript[(size_t) admit_slot].first.clear();
                     sl.x = x;
                     sl.p = p;
                     sl.produced = 1;
