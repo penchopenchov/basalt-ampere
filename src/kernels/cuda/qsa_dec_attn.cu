@@ -75,7 +75,6 @@ __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.com
 // shared memory of one chunk block; KV_MODE 0: fp16 rows, 1: int8 rows + fp16 scales
 template <int KV_MODE> struct ChunkSmem {
     static constexpr int ROW = KV_MODE == 0 ? HD * 2 : HD;   // bytes of one cell's K (or V) row
-    float q[G][HD];
     alignas(16) unsigned char k[CHUNK][ROW];
     alignas(16) unsigned char v[CHUNK][ROW];
     alignas(16) uint16_t ks[CHUNK][NSC];
@@ -141,19 +140,26 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
     float* part_acc = a.scratch + (size_t) qi * (size_t) a.stride;
     float* part_m = part_acc + (size_t) a.n_chunks * a.n_kv_heads * G * HD;
     float* part_l = part_m + (size_t) a.n_chunks * a.n_kv_heads * G;
-    const int n_ids = __ldg(step + kStepWidth);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int c0 = chunk * CHUNK;
+    // this block's cell ids are requested before the width is known (ids past the width are read in bounds and
+    // unused), then the query heads' registers (8 of the 256 dimensions per lane)
+    const int cell = (t < CHUNK && c0 + t < a.cap) ? ids[c0 + t] : 0;
+    const int n_ids = __ldg(step + kStepWidth);
+    float qr[G][8];
+#pragma unroll
+    for (int h = 0; h < G; ++h) {
+        const float4 qa = __ldg(reinterpret_cast<const float4*>(q + (size_t) (kvh * G + h) * HD + lane * 8));
+        const float4 qb = __ldg(reinterpret_cast<const float4*>(q + (size_t) (kvh * G + h) * HD + lane * 8 + 4));
+        qr[h][0] = qa.x; qr[h][1] = qa.y; qr[h][2] = qa.z; qr[h][3] = qa.w;
+        qr[h][4] = qb.x; qr[h][5] = qb.y; qr[h][6] = qb.z; qr[h][7] = qb.w;
+    }
     const int n_here = min(CHUNK, n_ids - c0);
     if (n_here <= 0) return;   // the merge reads only the chunks the width reaches
     const int slot = kvh * a.n_chunks + chunk;
-    // the query heads of this KV head (768 float4), then each cell's rows as soon as its pool row is known
-    for (int i = t; i < G * HD / 4; i += THREADS)
-        cp_async16(&sm.q[0][0] + 4 * i, q + (size_t) (kvh * G) * HD + 4 * i);
     if (t < CHUNK) {
         long long r = -1;
         if (t < n_here) {
-            const int cell = ids[c0 + t];
             const long long page = (long long) a.p.page_table[cell / a.page_size];
             if (page >= 0) r = (page * a.n_kv_heads + kvh) * a.page_size + (cell % a.page_size);
         }
@@ -166,7 +172,10 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
         for (int i = t; i < CHUNK * PER; i += THREADS) {
             const int c = i / PER, j = i % PER;
             const long long r = sm.row[c];
-            if (r < 0) continue;
+            if (r < 0) {   // a masked or missing cell's values are zero, so the value loop needs no branch
+                *reinterpret_cast<uint4*>(&sm.v[c][j * 16]) = make_uint4(0, 0, 0, 0);
+                continue;
+            }
             cp_async16(&sm.k[c][j * 16], kb + r * ROW + j * 16);
             cp_async16(&sm.v[c][j * 16], vb + r * ROW + j * 16);
         }
@@ -177,22 +186,15 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
                 if (r >= 0) {
                     if (t < CHUNK) cp_async8(&sm.ks[c][0], a.p.k_scale + r * NSC);
                     else cp_async8(&sm.vs[c][0], a.p.v_scale + r * NSC);
+                } else if (t >= CHUNK) {
+                    *reinterpret_cast<uint2*>(&sm.vs[c][0]) = make_uint2(0, 0);
                 }
             }
         }
     }
     cp_async_wait_all();
     __syncthreads();
-    // scores: warp w takes cells w, w+8, ...; two cells per pass; each lane holds 8 of the 256 dimensions of the
-    // 12 query heads in registers
-    float qr[G][8];
-#pragma unroll
-    for (int h = 0; h < G; ++h) {
-        const float4 qa = *reinterpret_cast<const float4*>(&sm.q[h][lane * 8]);
-        const float4 qb = *reinterpret_cast<const float4*>(&sm.q[h][lane * 8 + 4]);
-        qr[h][0] = qa.x; qr[h][1] = qa.y; qr[h][2] = qa.z; qr[h][3] = qa.w;
-        qr[h][4] = qb.x; qr[h][5] = qb.y; qr[h][6] = qb.z; qr[h][7] = qb.w;
-    }
+    // scores: warp w takes cells w, w+8, ...; two cells per pass
     const int hd = head_of_lane(lane);
     constexpr int NC = 2;
 #pragma unroll 1
@@ -235,54 +237,61 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
     }
     __syncthreads();
     // per-head chunk max and exp-sum: warp w handles heads w and w+8
-    for (int h = warp; h < G; h += WARPS) {
-        const float x0 = sm.sp[h][lane], x1 = sm.sp[h][lane + 32];
+    {
+        const bool ok0 = lane < n_here && sm.row[lane] >= 0, ok1 = lane + 32 < n_here && sm.row[lane + 32] >= 0;
+        const int h0 = warp, h1 = warp + WARPS;   // heads w and w+8 (the second exists for w < 4)
+        const bool two = h1 < G;
+        const float x0 = sm.sp[h0][lane], x1 = sm.sp[h0][lane + 32];
+        const float y0 = two ? sm.sp[h1][lane] : 0.0f, y1 = two ? sm.sp[h1][lane + 32] : 0.0f;
         const float m = warp_max(fmaxf(x0, x1));
-        const float e0 = (lane < n_here && sm.row[lane] >= 0) ? __expf(x0 - m) : 0.0f;
-        const float e1 = (lane + 32 < n_here && sm.row[lane + 32] >= 0) ? __expf(x1 - m) : 0.0f;
-        sm.spt[lane][h] = e0;
-        sm.spt[lane + 32][h] = e1;
+        const float n = warp_max(fmaxf(y0, y1));
+        const float e0 = ok0 ? __expf(x0 - m) : 0.0f, e1 = ok1 ? __expf(x1 - m) : 0.0f;
+        const float f0 = ok0 ? __expf(y0 - n) : 0.0f, f1 = ok1 ? __expf(y1 - n) : 0.0f;
+        sm.spt[lane][h0] = e0;
+        sm.spt[lane + 32][h0] = e1;
+        if (two) {
+            sm.spt[lane][h1] = f0;
+            sm.spt[lane + 32][h1] = f1;
+        }
         const float l = warp_sum(e0 + e1);
-        if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+        const float l2 = warp_sum(f0 + f1);
+        if (lane == 0) {
+            part_m[slot * G + h0] = m; part_l[slot * G + h0] = l;
+            if (two) { part_m[slot * G + h1] = n; part_l[slot * G + h1] = l2; }
+        }
     }
     __syncthreads();
-    // values: thread t < 192 owns dimensions 4*(t%64).. +3 of heads 4*(t/64).. +3; cells folded in ascending order.
-    // A masked or missing cell folds weight 0 times value 0, which leaves every accumulator unchanged (none is ever
-    // -0), so the loop has no branch.
-    if (t >= 192) return;
-    const int dg = t & 63, hg = t >> 6;
-    float acc[4][4];
+    // values: thread t < 128 owns dimensions 2t, 2t+1 of all 12 heads; cells folded in ascending order.  A masked or
+    // missing cell has weight 0 and value 0, which leaves every accumulator unchanged (none is ever -0).
+    if (t >= HD / 2) return;
+    float acc[G][2];
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
-#pragma unroll
-        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int i = 0; i < G; ++i) acc[i][0] = acc[i][1] = 0.0f;
 #pragma unroll 8
     for (int c = 0; c < CHUNK; ++c) {
-        const bool ok = c < n_here && sm.row[c] >= 0;
-        float v[4];
+        float v0, v1;
         if constexpr (KV_MODE == 0) {
-            const uint2 raw = *reinterpret_cast<const uint2*>(&sm.v[c][dg * 8]);
-            const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
-            const float2 f0 = __half22float2(h2[0]), f1 = __half22float2(h2[1]);
-            v[0] = f0.x; v[1] = f0.y; v[2] = f1.x; v[3] = f1.y;
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&sm.v[c][t * 4]));
+            v0 = f.x; v1 = f.y;
         } else {
-            const float sc = __half2float(__ushort_as_half(sm.vs[c][dg / (KV_Q8_GROUP / 4)]));
-            const char4 cv = *reinterpret_cast<const char4*>(&sm.v[c][dg * 4]);
-            v[0] = (float) cv.x * sc; v[1] = (float) cv.y * sc; v[2] = (float) cv.z * sc; v[3] = (float) cv.w * sc;
+            const float sc = __half2float(__ushort_as_half(sm.vs[c][t / (KV_Q8_GROUP / 2)]));
+            const ushort raw = *reinterpret_cast<const ushort*>(&sm.v[c][t * 2]);
+            v0 = (float) (int8_t) (raw & 0xff) * sc;
+            v1 = (float) (int8_t) (raw >> 8) * sc;
         }
+        const float4 w0 = *reinterpret_cast<const float4*>(&sm.spt[c][0]);
+        const float4 w1 = *reinterpret_cast<const float4*>(&sm.spt[c][4]);
+        const float4 w2 = *reinterpret_cast<const float4*>(&sm.spt[c][8]);
+        const float w[G] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w, w2.x, w2.y, w2.z, w2.w};
 #pragma unroll
-        for (int j = 0; j < 4; ++j) v[j] = ok ? v[j] : 0.0f;
-        const float4 w = *reinterpret_cast<const float4*>(&sm.spt[c][hg * 4]);
-        const float wv[4] = {w.x, w.y, w.z, w.w};
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-#pragma unroll
-            for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(wv[i], v[j], acc[i][j]);
+        for (int i = 0; i < G; ++i) {
+            acc[i][0] = fmaf(w[i], v0, acc[i][0]);
+            acc[i][1] = fmaf(w[i], v1, acc[i][1]);
+        }
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
-        *reinterpret_cast<float4*>(&part_acc[((size_t) slot * G + hg * 4 + i) * HD + dg * 4]) =
-            make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+    for (int i = 0; i < G; ++i)
+        *reinterpret_cast<float2*>(&part_acc[((size_t) slot * G + i) * HD + 2 * t]) = make_float2(acc[i][0], acc[i][1]);
 }
 
 // sigmoid gate with the fast-math sequence native_qsa_gate_apply compiles to
@@ -341,6 +350,13 @@ __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi,
         s_l[c] = part_l[slot * G + hl];
         mx = fmaxf(mx, m);
     }
+    // the chunks' partial sums are requested before the maxima are known
+    constexpr int PRE = 32;
+    const float* pa = part_acc + ((size_t) (kvh * a.n_chunks) * G + hl) * HD + d;
+    const size_t cs = (size_t) G * HD;
+    float xp[PRE];
+#pragma unroll
+    for (int j = 0; j < PRE; ++j) xp[j] = j < nc ? pa[(size_t) j * cs] : 0.0f;
     mx = warp_max(mx);
     if ((d & 31) == 0) s_red[d >> 5] = mx;
     __syncthreads();
@@ -353,9 +369,16 @@ __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi,
     }
     __syncthreads();
     float L = 0.0f, acc = 0.0f;
-    const float* pa = part_acc + ((size_t) (kvh * a.n_chunks) * G + hl) * HD + d;
-    const size_t cs = (size_t) G * HD;
     int c = 0;
+#pragma unroll
+    for (int j = 0; j < PRE; ++j) {
+        if (j >= nc) break;
+        const float w = s_w[j];
+        if (w < 0.0f) continue;
+        L = fmaf(s_l[j], w, L);
+        acc = fmaf(xp[j], w, acc);
+    }
+    c = min(nc, PRE);
     for (; c + 8 <= nc; c += 8) {
         float x[8];
 #pragma unroll
