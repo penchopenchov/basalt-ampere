@@ -46,6 +46,11 @@ own kernels; `tools/vision` also builds on its own). The server looks for it nex
 `--vision` (encoder on the GPU; with two cards in `--gpu` it uses the second), or `"vision": true` in the config file's
 `server` section. `--vision-cpu` runs the encoder on the CPU as a fallback (no VRAM, slower). Vision is off by default.
 
+The image encoder is Basalt's own, written for this model's vision tower (no llama.cpp or ggml): bf16 tensor-core
+products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on the CPU. It replaces llama.cpp's
+mtmd encoder as a drop-in, is faster than it at every image size, and stays closer to an fp32 reference: mtmd's fp16
+attention drifts on large images, ours does not.
+
 ## Run
 
 ```sh
@@ -111,12 +116,12 @@ context is not an engine option yet, so lower `--max-context` when raising N.
 
 A model is one file. It holds everything the engine, the server and the vision sidecar load: the weights, the
 tokenizer and chat template, the MTP drafter, the expert profile, the 8-bit hyper-connection copies, the vision
-projector, and the default engine arguments and sampling. `basalt serve --model FILE` needs nothing else.
+projector, and the default sampling. It carries no engine flags: those come from `--config` or the command line.
 
 - **Layout:** a 64 KiB header (magic `BASALTMF`, version, a table of up to 511 named sections, each with its offset,
   size and SHA-256), then the sections, each aligned to 2 MiB so it can be memory-mapped or read with `O_DIRECT`.
-- **Sections:** `meta` (JSON: geometry, the source GGUF metadata, every tensor's type, shape and offset, engine
-  arguments, sampling, provenance and license), `tokenizer/*`, `dense`, `experts` and `experts.layout` (the routed
+- **Sections:** `meta` (JSON: geometry, the source GGUF metadata, every tensor's type, shape and offset,
+  sampling, provenance and license), `tokenizer/*`, `dense`, `experts` and `experts.layout` (the routed
   experts, laid out per layer), `gguf` (every non-expert source tensor), `mtp/*` (the drafter), `profile`, `hc8` and
   `vision/*`. The authoritative description is [include/basalt/core/model_format.hpp](include/basalt/core/model_format.hpp).
 - **No requantization:** tensors are copied byte for byte from the source GGUF. The only exception is
