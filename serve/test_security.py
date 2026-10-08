@@ -17,7 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.engine import MockEngine  # noqa: E402
+from serve.engine.mock import MockEngine  # noqa: E402
 from serve.handler import serve  # noqa: E402
 from serve.security import allowed_hosts_of, host_allowed, host_name, host_names_for, origin_allowed  # noqa: E402
 from serve.service import Service  # noqa: E402

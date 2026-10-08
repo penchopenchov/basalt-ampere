@@ -34,18 +34,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # run as a script as well as a module
-from serve import ROOT, engine as engine_process, service  # noqa: E402
+from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings,  # noqa: E402
                           parse_settings, sampling_defaults_from_config)
-from serve.engine import EngineStartError, MockEngine, ProcessEngine  # noqa: E402
+from serve.engine import process as engine_process  # noqa: E402
+from serve.engine.errors import EngineStartError  # noqa: E402
+from serve.engine.mock import MockEngine  # noqa: E402
+from serve.engine.process import ProcessEngine  # noqa: E402
+from serve.engine.vision import (Vision, child_env, engine_args, gpu_list, gpus_in_play, vision_env,  # noqa: E402
+                                 vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
-from serve.util.logbuf import LogBuffer, TeeStream, tail_file  # noqa: E402
 from serve.security import allowed_hosts_of, exposed_without_key, lan_addresses, origins_of  # noqa: E402
 from serve.service import Service  # noqa: E402
+from serve.util.logbuf import LogBuffer, TeeStream, tail_file  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
-from serve.vision import (Vision, child_env, engine_args, gpu_list, gpus_in_play, vision_env,  # noqa: E402
-                          vision_line)
 
 
 def fail(msg: str) -> None:

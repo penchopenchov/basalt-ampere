@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.engine import ProcessEngine
+from serve.engine.process import ProcessEngine
 from serve.handler import serve
 from serve.service import Service
 from serve.util.text import ByteTokenizer

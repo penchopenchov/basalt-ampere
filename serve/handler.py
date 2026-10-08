@@ -16,7 +16,7 @@ from serve.api import responses as responses_api
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
-from serve.engine import EngineDied, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import EngineDied, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.frontend import anthropic_to_messages, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect, structured_chunks
 from serve.api.responses import ResponsesError

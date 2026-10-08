@@ -23,7 +23,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve import service as service_module  # noqa: E402
-from serve.engine import EngineDied, EngineStartError, GpuBusy, MockEngine, ProcessEngine, start_failure_hint  # noqa: E402
+from serve.engine.errors import EngineDied, EngineStartError, GpuBusy  # noqa: E402
+from serve.engine.mock import MockEngine  # noqa: E402
+from serve.engine.process import ProcessEngine  # noqa: E402
+from serve.engine.progress import start_failure_hint  # noqa: E402
 from serve.handler import serve  # noqa: E402
 from serve.service import CTX_SLACK, Service, prompt_tokens_seen, request_timings  # noqa: E402
 from serve.util.text import ByteTokenizer, control_literals  # noqa: E402
@@ -101,7 +104,7 @@ class MaxTokens(unittest.TestCase):
     def test_request_line_parses_the_engine_summary(self):
         line = ("basalt serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
-        from serve.engine import ENGINE_REQUEST
+        from serve.engine.process import ENGINE_REQUEST
         m = ENGINE_REQUEST.search(line)
         self.assertIsNotNone(m)
         self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
@@ -961,7 +964,7 @@ class ClientShapes(unittest.TestCase):
 
     def test_vision_temp_image_removed_when_the_pipe_fails(self):
         # the temporary image goes even when the encoder's pipe raises
-        from serve.vision import Vision
+        from serve.engine.vision import Vision
 
         class Gone:
             def write(self, _):
@@ -1036,7 +1039,7 @@ class GpuChoice(unittest.TestCase):
     """--gpu reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
     def test_env(self):
-        from serve.vision import child_env
+        from serve.engine.vision import child_env
         env = child_env({"gpu": 1})
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
         self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
@@ -1045,7 +1048,7 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
     def test_vision_sidecar_args(self):
-        from serve.vision import Vision
+        from serve.engine.vision import Vision
         for gpu, want in ((True, ["--gpu"]), (False, [])):
             with mock.patch.object(Vision, "_start"):
                 v = Vision({"exe": "x", "mmproj": "m", "model": "t", "gpu": gpu})
@@ -1053,7 +1056,7 @@ class GpuChoice(unittest.TestCase):
             shutil.rmtree(v.dir, ignore_errors=True)
 
     def test_vision_startup_line(self):
-        from serve.vision import vision_line
+        from serve.engine.vision import vision_line
         self.assertEqual(vision_line(None, {}), "[server] vision: off (--vision or --vision-cpu to enable)")
         cpu = vision_line({"gpu": False}, {}, 2.34)
         self.assertRegex(cpu, r"^\[server\] vision: ready on the CPU \(\d+ threads\) in 2\.3 s$")
@@ -1064,7 +1067,7 @@ class GpuChoice(unittest.TestCase):
 
     def test_vision_device(self):
         # with two cards listed the image encoder takes the second; the engine's environment stays as it was
-        from serve.vision import child_env, vision_env
+        from serve.engine.vision import child_env, vision_env
         cfg = {"gpu": "0,1"}
         env = child_env(cfg)
         venv = vision_env(cfg, env)
@@ -1348,7 +1351,7 @@ class StartFailureLog(unittest.TestCase):
     """Whatever stopped the engine before READY, the error carries this start's last log lines."""
 
     def test_the_last_line_of_this_start(self):
-        from serve.engine import start_last_line
+        from serve.engine.progress import start_last_line
         d = tempfile.mkdtemp()
         p = Path(d) / "engine.log"
         before = "basalt serve: an earlier start's line\n"
@@ -1368,7 +1371,7 @@ class StartFailureLog(unittest.TestCase):
             real = subprocess.Popen
             with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
-                    mock.patch("serve.engine.narrate_start", lambda *a, **k: None):
+                    mock.patch("serve.engine.process.narrate_start", lambda *a, **k: None):
                 with self.assertRaises(EngineStartError) as cm:
                     ProcessEngine("basalt", [], log=str(log))
             self.assertEqual(str(cm.exception), "cannot open the pack packs/x")
@@ -1381,7 +1384,7 @@ class StartFailureLog(unittest.TestCase):
             real = subprocess.Popen
             with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
-                    mock.patch("serve.engine.narrate_start", lambda *a, **k: None):
+                    mock.patch("serve.engine.process.narrate_start", lambda *a, **k: None):
                 with self.assertRaises(EngineStartError) as cm:
                     ProcessEngine("basalt", [], log=str(log))
             self.assertIn("exited before it was ready", str(cm.exception))
@@ -1414,14 +1417,14 @@ class StartFailureLog(unittest.TestCase):
             real = subprocess.Popen
             with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
-                    mock.patch("serve.engine.narrate_start", lambda *a, **k: None):
+                    mock.patch("serve.engine.process.narrate_start", lambda *a, **k: None):
                 with self.assertRaises(EngineStartError) as cm:
                     ProcessEngine("basalt", [], log=str(log))
             self.assertEqual(str(cm.exception), "the experts need 40.0 GiB of RAM, 27.1 GiB is available; use "
                                                 "--resident-experts or --mmap-experts")
 
     def test_error_lines(self):
-        from serve.engine import engine_error
+        from serve.engine.progress import engine_error
         self.assertEqual(engine_error("basalt error: x y"), "x y")
         self.assertIsNone(engine_error("basalt error: "))
         self.assertIsNone(engine_error("basalt warning: x"))
@@ -1436,13 +1439,13 @@ class LoadProgress(unittest.TestCase):
     """The engine's `basalt load:` lines: one bar for the whole start, one line when it is done."""
 
     def test_parse(self):
-        from serve.engine import engine_warning, load_progress, load_total
+        from serve.engine.progress import engine_warning, load_progress, load_total
         self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100, False))
         self.assertEqual(load_progress("basalt load: copy cuda1 10 100"), ("cuda1", 10, 100, True))
         self.assertIsNone(load_progress("basalt load: total 100"))
         self.assertIsNone(load_progress("basalt load: cuda0 ten 100"))
         self.assertIsNone(load_progress("basalt generate: loaded 3 GiB"))
-        from serve.engine import load_plan
+        from serve.engine.progress import load_plan
         self.assertEqual(load_plan("basalt load: plan cuda0 100"), ("cuda0", 100, False))
         self.assertEqual(load_plan("basalt load: plan copy cuda1 100"), ("cuda1", 100, True))
         self.assertIsNone(load_plan("basalt load: plan cuda0 x"))
@@ -1456,7 +1459,7 @@ class LoadProgress(unittest.TestCase):
         self.assertIsNone(engine_warning("basalt generate: WARNING: x"))
 
     def test_log_output_prints_only_the_result(self):
-        from serve.engine import LoadBars
+        from serve.engine.progress import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(100 << 30)
@@ -1471,7 +1474,7 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(lines[0].endswith("(system ram 100.0 GiB)"))
 
     def test_phases_add_up_to_one_result(self):
-        from serve.engine import LoadBars
+        from serve.engine.progress import LoadBars
         out = io.StringIO()
         bars = LoadBars(out, gpus=[2, 3])
         bars.set_total(5 << 30)
@@ -1486,7 +1489,7 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(line.endswith("(cuda2 5.0 GiB; cuda3 copy 2.0 GiB)"))
 
     def test_unfinished_start_is_not_reported(self):
-        from serve.engine import LoadBars
+        from serve.engine.progress import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(4 << 30)
@@ -1495,7 +1498,7 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
     def test_one_bar_per_target_against_its_own_plan(self):
-        from serve.engine import LoadBars
+        from serve.engine.progress import LoadBars
         out = Tty()
         bars = LoadBars(out, gpus=[2, 3])
         bars.update("cuda0", 1 << 30, 1 << 30)                          # no plan yet: a count
@@ -1517,7 +1520,7 @@ class LoadProgress(unittest.TestCase):
         self.assertIn("\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
 
     def test_bars_follow_the_order_targets_start_loading(self):
-        from serve.engine import LoadBars
+        from serve.engine.progress import LoadBars
         out = Tty()
         bars = LoadBars(out, gpus=[2, 3])
         bars.set_plan("cuda0", 1 << 30)
@@ -1530,7 +1533,7 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2", "cuda3", "ram"])
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
-        from serve.engine import LoadBars, load_kv, load_progress
+        from serve.engine.progress import LoadBars, load_kv, load_progress
         self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144))
         self.assertIsNone(load_kv("basalt load: kv cuda0 x 1"))
         self.assertIsNone(load_progress("basalt load: kv cuda0 100 5"))
@@ -1545,7 +1548,7 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(second, "[server] kv cache: 4.0 GiB on cuda2, 262144 tokens")
 
     def test_a_target_planned_empty_shows_nothing(self):
-        from serve.engine import LoadBars
+        from serve.engine.progress import LoadBars
         out = Tty()
         bars = LoadBars(out)
         bars.set_plan("cuda0", 1 << 30)
@@ -1555,7 +1558,7 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(len(bars.lines()), 1)
 
     def test_a_lowered_total_ends_at_full(self):
-        from serve.engine import LoadBars
+        from serve.engine.progress import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(6 << 30)
@@ -1566,13 +1569,13 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(out.getvalue().startswith("[server] loaded 4.0 GiB in "))
 
     def test_names_follow_the_picked_cards(self):
-        from serve.engine import LoadBars
+        from serve.engine.progress import LoadBars
         self.assertEqual(LoadBars(gpus=[2, 3]).name("cuda1"), "cuda3")
         self.assertEqual(LoadBars().name("cuda1"), "cuda1")
         self.assertEqual(LoadBars().name("ram"), "system ram")
 
     def test_narrator_shows_warnings_and_the_result(self):
-        from serve.engine import narrate_start
+        from serve.engine.progress import narrate_start
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
         log.write_text("basalt load: total 200\nbasalt load: plan cuda0 100\nbasalt load: plan ram 100\nbasalt load: plan copy cuda1 100\nbasalt warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow\n"
@@ -1593,7 +1596,7 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(lines[1].endswith("(cuda0 0.0 GiB, system ram 0.0 GiB; cuda1 copy 0.0 GiB)"))
 
     def test_an_older_engine_without_a_total_counts_bytes(self):
-        from serve.engine import narrate_start
+        from serve.engine.progress import narrate_start
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
         log.write_text("basalt load: cuda0 0 100\nbasalt load: cuda0 100 100\n", encoding="utf-8")
@@ -2763,7 +2766,7 @@ class SilentEngine(unittest.TestCase):
         threading.Thread(target=put, daemon=True).start()
 
     def test_silence_mid_answer_ends_the_engine(self):
-        from serve.engine import EngineSilent
+        from serve.engine.errors import EngineSilent
         engine = self.bare(0.3)
         engine.lines.put("T 5")
         gen = engine.generate([1], 10, {}, threading.Event())
@@ -2795,7 +2798,7 @@ class SilentEngine(unittest.TestCase):
         engine.proc.kill.assert_not_called()
 
     def test_a_stop_never_acknowledged(self):
-        from serve.engine import EngineSilent
+        from serve.engine.errors import EngineSilent
         engine = self.bare(0.3, can_stop=True)
         engine.lines.put("T 5")
         gen = engine.generate([1], 10, {}, threading.Event())

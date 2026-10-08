@@ -8,7 +8,7 @@ from unittest import mock
 
 from serve.frontend import ChatTemplate
 from serve.api import structured
-from serve.engine import MockEngine
+from serve.engine.mock import MockEngine
 from serve.handler import serve
 from serve.service import Service
 from serve.util.text import ByteTokenizer

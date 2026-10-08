@@ -9,7 +9,8 @@ import unittest
 import json
 import urllib.request
 from serve.frontend import ChatTemplate
-from serve.engine import EngineDied, ProcessEngine
+from serve.engine.errors import EngineDied
+from serve.engine.process import ProcessEngine
 from serve.handler import serve
 from serve.service import Service
 from serve.util.text import ByteTokenizer

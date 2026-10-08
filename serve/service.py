@@ -11,12 +11,13 @@ import uuid
 from pathlib import Path
 from typing import Iterator
 
-from serve.engine import Engine, EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
+from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
-from serve.vision import Vision
+from serve.engine.vision import Vision
 
 
 IMAGE_PAD = "<|image_pad|>"

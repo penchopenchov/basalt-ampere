@@ -10,11 +10,12 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.engine import EngineDied, ProcessEngine
+from serve.engine.errors import EngineDied
+from serve.engine.process import ProcessEngine
 from serve.handler import serve
 from serve.service import Service
 from serve.util.text import ByteTokenizer
-from serve.vision import engine_args
+from serve.engine.vision import engine_args
 from serve.test_lifecycle import ResidentEngine
 
 
