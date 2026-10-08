@@ -279,6 +279,8 @@ private:
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
+    bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
+    bool dm_end(std::string& err);         ///< the peer window's end
     void dm_free();
     std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)
     bool capture(int T, std::string& err);
@@ -299,7 +301,7 @@ private:
     }
     static uint64_t batch_key(int S, int hbase) { return (uint64_t) hbase << 40 | (uint64_t) S << 32; }
     /// Instantiates a finished batch capture as the executable of a new key.
-    bool instantiate_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err);
+    bool instantiate_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err, bool priority = false);
     // batch_launch / batch_poll
     bool b_running_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;
@@ -322,6 +324,9 @@ private:
     std::vector<basalt::kernels::QsaSegSlot*> d_qslots_;   ///< per QSA layer ordinal: [slot] (null outside the stage)
     float** d_ple_slots_ = nullptr;        ///< each slot's PLE history
     float* ple_work_ = nullptr;            ///< each row's PLE history while the window runs
+    bool batch_plew_ = false;              ///< a batch window runs the PLE window kernels
+    bool batch_pdl_ = false;               ///< a batch window's dense chain uses programmatic dependent launch
+    bool batch_dm_ = false;                ///< a batch window runs the device-planned tail
     bool batch_gdnf_ = false;              ///< a batch window runs the fused GDN recurrence (a gate)
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};

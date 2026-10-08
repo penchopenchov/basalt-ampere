@@ -896,14 +896,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    const bool dm = dm_ != nullptr && !batch_rec_;   // the device-planned tail (one group)
+    const bool dm = dm_ != nullptr && (!batch_rec_ || batch_dm_);   // the device-planned tail (one group)
     const int G = (split_ && T >= 2 && !batch_rec_ && !dm) ? 2 : 1;   // a batch window is one group
     // each hyper-connection read (and the FFN read's router) as one kernel; the next read's w_norm is prefetched into
     // L2 at its end
     const bool dec_hc = hc_fused_supported();
     // the dense chain's kernels (pdl.hpp) may start during the previous kernel's tail.  Only where that previous kernel
     // is one of them or another plain kernel; never with the profile's stamps.
-    const bool pdl = pdl_rec_ && !prof_on_ && !batch_rec_;
+    const bool pdl = pdl_rec_ && !prof_on_ && (!batch_rec_ || batch_pdl_);
     // the chain's kernels let their dependents in early (pdl.hpp), which stage their weights
     const bool pdl2 = pdl && pdl2_requested();
     auto stamp = [&](int64_t l, int i, int grp) {
@@ -996,7 +996,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // the rows' write, post-ops, history advance and snapshots in two launches, the value
             // projection on the side stream beside the key's
             // (one row too: there the multi-row GEMVs are ple_block's own)
-            const bool ple_win = !batch_rec_ && gr_native_mmvf_enabled() &&
+            const bool ple_win = (!batch_rec_ || batch_plew_) && gr_native_mmvf_enabled() &&
                                  (ple_batch_kv || (n == 1 && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr &&
                                                    ple_native_bf16_enabled() && ple_native_postops_enabled()));
             cudaStream_t pside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
@@ -1023,7 +1023,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (ple_win) {
                 PleWindowArgs pa;
                 pa.R = Rt(tb); pa.block_out = bo_ + (size_t) tb * N; pa.inject = inj2_ + (size_t) tb * HC;
-                pa.key = xn_ + (size_t) tb * HC * N; pa.value = z_ + (size_t) tb * N; pa.history = ss.ple.hist;
+                pa.key = xn_ + (size_t) tb * HC * N; pa.value = z_ + (size_t) tb * N;
+                pa.history = batch_rec_ ? ple_work_ : ss.ple.hist; pa.rows_independent = batch_rec_;
                 pa.hist_snap = hist_snap_ + (size_t) tb * HS; pa.scratch = ple_win_; pa.T = n;
                 try {
                     native_ple_window(pa, ss.ple.w, cs);
@@ -1089,10 +1090,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (read_q8) h.xq = xq_;
                 // the GDN qkv+z pair kernel follows (dense_tc_pair_mask & 16): its blocks start on the SMs the read leaves
                 h.next_early = read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
-                               !is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT &&
+                               !is_qsa_layer(g, l) && (!batch_rec_ || batch_pdl_) && tb == 0 && N == 2560 && n <= kDecMaxT &&
                                dec_gdnf_mode() != 0;
                 // a QSA layer's query projection follows (qsaf_wide path): its blocks start with the read
-                if (read_q8 && is_qsa_layer(g, l) && !batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT) {
+                if (read_q8 && is_qsa_layer(g, l) && (!batch_rec_ || batch_pdl_) && tb == 0 && N == 2560 && n <= kDecMaxT) {
                     const QsaState& st0 = ss.qsa_states[qsa_idx[(size_t) l]];
                     h.next_early = st0.kv_int8 && !st0.kv_rot && !st0.kv_hybrid && !st0.kv_q4 && native_qsa_enabled() &&
                                    native_rope_enabled() && qsa_dec_fused_supported(s) &&
@@ -2327,6 +2328,52 @@ void Verifier::collect_profile() {
     ++prof_windows_;
 }
 
+// The device-planned tail's window start: residency tables, the flag words, and the peer card's persistent window.
+bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
+    if (!dm_sync(err)) return false;
+    decode_events().stamp(4);
+    if (gm) gm->mark(13);
+    *(volatile uint32_t*) (dm_->h_w + 0) = 0;
+    *(volatile uint32_t*) (dm_->h_w + 16) = 0;
+    *(volatile uint32_t*) (dm_->h_w + 32) = 0;
+    if (dm_->tag && dm_->tag_dirty) {   // a released window left rows written: back to unwritten
+        for (size_t i = 0; i < dm_->rows_words; ++i)
+            ((volatile uint32_t*) dm_->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        dm_->tag_dirty = false;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (dm_->pdev >= 0) {
+        const OnDevice on(dm_->pdev);
+        basalt::kernels::DmPeerArgs pa;
+        pa.rings_m = dm_->h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
+        pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
+        pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
+        pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
+        pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
+        if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
+            !basalt::kernels::dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
+            err = "verify: the peer window did not launch";
+            return false;
+        }
+        dm_->peer_live = true;
+    }
+    if (gm) gm->mark(14);
+    return true;
+}
+
+// The peer window ends with CUDA0's last ring.
+bool Verifier::dm_end(std::string& err) {
+    if (dm_ == nullptr || !dm_->peer_live) return true;
+    const OnDevice on(dm_->pdev);
+    dm_->peer_live = false;
+    const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
+    if (pe != cudaSuccess) { err = std::string("verify: the peer window: ") + cudaGetErrorString(pe); return false; }
+    const std::string ab = basalt::kernels::dec_moe_peer_diag(dm_->h_w + 32);
+    if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
+    return true;
+}
+
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     using namespace basalt::kernels;
@@ -2359,35 +2406,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     gm.mark(12);
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
-        if (!dm_sync(err)) return false;
-        decode_events().stamp(4);
-        gm.mark(13);
-        *(volatile uint32_t*) (dm_->h_w + 0) = 0;
-        *(volatile uint32_t*) (dm_->h_w + 16) = 0;
-        *(volatile uint32_t*) (dm_->h_w + 32) = 0;
-        if (dm_->tag && dm_->tag_dirty) {   // a released window left rows written: back to unwritten
-            for (size_t i = 0; i < dm_->rows_words; ++i)
-                ((volatile uint32_t*) dm_->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            dm_->tag_dirty = false;
-        }
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (dm_->pdev >= 0) {
-            const OnDevice on(dm_->pdev);
-            DmPeerArgs pa;
-            pa.rings_m = dm_->h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
-            pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
-            pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
-            pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
-            pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
-            if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
-                !dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
-                err = "verify: the peer window did not launch";
-                return false;
-            }
-            dm_->peer_live = true;
-        }
-        gm.mark(14);
+        if (!dm_begin(err, &gm)) return false;
     }
     ms_host += ms_since(t0);
     if (prof_on_) decode_gaps().verify_end = 0;   // set again only by a collected window
@@ -2509,14 +2528,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // with cudaStreamQuery here would cost decode time (a core calling the driver beside the expert workers).
     const cudaError_t se = cudaStreamSynchronize(cs_);
     gm.mark(-1);
-    if (dm_ != nullptr && dm_->peer_live) {   // the peer window ends with CUDA0's last ring
-        const OnDevice on(dm_->pdev);
-        dm_->peer_live = false;
-        const cudaError_t pe = cudaStreamSynchronize(dm_->ps);
-        if (pe != cudaSuccess) { err = std::string("verify: the peer window: ") + cudaGetErrorString(pe); return false; }
-        const std::string ab = basalt::kernels::dec_moe_peer_diag(dm_->h_w + 32);
-        if (!ab.empty()) { err = "verify: the peer window " + ab; return false; }
-    }
+    if (!dm_end(err)) return false;
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // the table changed under the window
         *(volatile uint32_t*) h_plan_err_ = 0;
@@ -2766,6 +2778,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     }
     slots_ = slots;
     batch_gdnf_ = exp_flag("concur2_gdnf", 1) != 0;
+    batch_dm_ = dm_ != nullptr && exp_flag("concur4_dm", 1) != 0;
+    batch_plew_ = exp_flag("concur4_plew", 1) != 0;
+    batch_pdl_ = exp_flag("concur4_pdl", 1) != 0;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     std::fprintf(stderr, "basalt verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
@@ -2776,30 +2791,47 @@ bool Verifier::capture_batch(int S, int hbase, std::string& err) {
     const uint64_t key = bkey(S, hbase);
     cudaGraphExec_t& ex = exec_bm_[key];
     if (ex != nullptr) return true;
+    const bool pdl_try = batch_pdl_ && basalt::kernels::pdl_requested() && !pdl_off_;
+    // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
+    auto retry_plain = [&](const std::string& why) {
+        std::fprintf(stderr, "basalt verify: the %d-row batch window failed with programmatic dependent launch (%s): "
+                             "capturing it without\n", S, why.c_str());
+        (void) cudaGetLastError();
+        pdl_off_ = true;
+        ex = nullptr;
+        return capture_batch(S, hbase, err);
+    };
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
         return false;
     }
     batch_rec_ = true;
+    pdl_rec_ = pdl_try;
     row_base_ = hbase;
     std::string rerr;
     const bool ok = record_window(S, cs_, rerr);
     batch_rec_ = false;
+    pdl_rec_ = false;
     row_base_ = 0;
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok || ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
+        if (pdl_try) return retry_plain(!ok ? rerr : cudaGetErrorString(ce));
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    if (!instantiate_batch(ex, graph, err)) return false;
+    if (!instantiate_batch(ex, graph, err, batch_pdl_)) {
+        if (pdl_try) return retry_plain(err);
+        return false;
+    }
     std::fprintf(stderr, "basalt verify: captured the batch window for %d rows\n", S);
     return true;
 }
 
-bool Verifier::instantiate_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err) {
-    const cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
+bool Verifier::instantiate_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err, bool priority) {
+    const cudaError_t ie = priority ? cudaGraphInstantiateWithFlags(&ex, graph, cudaGraphInstantiateFlagUseNodePriority)
+                                    : cudaGraphInstantiate(&ex, graph, 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) { ex = nullptr; err = std::string("verify: batch instantiate: ") + cudaGetErrorString(ie); return false; }
     cudaGraphUpload(ex, cs_);
@@ -2964,6 +2996,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    const bool dm = dm_ != nullptr && batch_dm_;
+    if (dm && !dm_begin(err, nullptr)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -2999,7 +3033,12 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cur_layer_ = want - 1;
         set_plan_slot(0);
         progress_at("verify batch: the CPU experts of layer", l);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        if (dm) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
+            const basalt::kernels::DmRing& R = dm_->h_ring[k];
+            sink_.ext_kind = R.kind;
+            if (pool != nullptr) pool(user, dm_->h_x + (size_t) k * dm_->x_stride, R.ids, S, ss_->k, h_ymiss_, l);
+            sink_.ext_kind = nullptr;
+        } else if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -3018,6 +3057,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         ms_pool += ms_since(b);
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (dm && !dm_end(err)) return false;
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
     cudaStreamSynchronize(copy_);
     if (prof_on_) collect_profile();
