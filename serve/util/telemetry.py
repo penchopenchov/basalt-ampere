@@ -1,13 +1,7 @@
-"""serve/util/telemetry.py - hardware readings for the stats page (GET /metrics).
+"""Hardware readings for GET /metrics, sampled once a second on a background thread.
 
-A background thread samples once a second; the page gets the latest reading and the last 60 values of the server's
-two speed series:
-- GPU: NVIDIA's own NVML library (libnvidia-ml.so.1, installed with every driver) through ctypes, so no pip package
-  is needed: per card load, VRAM, temperature, power and its limit, PCIe link and throughput; the driver and CUDA
-  versions; each card's name.
-- CPU, RAM, disk: `psutil` when it is installed; without it the CPU and RAM readings come from /proc and the disk
-  rate is absent.
-Anything that cannot be read is None; nothing here can stop the server.
+GPU readings come from NVML through ctypes; CPU, RAM and disk from psutil, falling back to /proc (no disk rate).
+Unreadable values are None and never stop the server.
 """
 from __future__ import annotations
 
@@ -84,7 +78,7 @@ class _Nvml:
         return None
 
     def cuda_version(self):
-        """The newest CUDA the driver supports, as "13.3" (NVML says 13030)."""
+        """The newest CUDA the driver supports, as "13.3"."""
         v = ctypes.c_int()
         for fn in ("nvmlSystemGetCudaDriverVersion_v2", "nvmlSystemGetCudaDriverVersion"):
             try:
@@ -113,7 +107,7 @@ class _Nvml:
         out["power"] = mw / 1000.0 if mw is not None else None
         lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
         out["power_limit"] = lim / 1000.0 if lim is not None else None
-        out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
+        out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle
         out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
         out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
         rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
@@ -171,15 +165,14 @@ class _CpuRamFallback:
 # ------------------------------------------------------------------------------------------------ the sampler
 GPU_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
             "pcie_rx_mb", "pcie_tx_mb")
-SERIES = ("tok_s", "prefill_tok_s_mean")      # the values kept as history
+SERIES = ("tok_s", "prefill_tok_s_mean")      # series kept as history
 
 
 class Telemetry:
     def __init__(self, extra=None, gpu_indices=None, gpu_factory=gpu_reader):
-        """`extra()` -> dict with the server's own speeds, recorded each second.  `gpu_indices`: every card the engine
-        uses (its own and its peer), numbered as nvidia-smi and NVML number them (by PCI bus); "gpus" has one entry
-        per card that can be read, with that card's own figures.  `gpu_factory(index)` -> a reader with ok(), read(),
-        name() (and optionally driver_version(), cuda_version())."""
+        """`extra()` returns the server's own speeds, recorded each second. `gpu_indices`: the engine's cards
+        (NVML numbering); `gpu_factory(index)` returns a reader with ok(), read(), name() and optionally
+        driver_version(), cuda_version()."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None, "disk_read_mb": None}
@@ -204,7 +197,7 @@ class Telemetry:
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _disk(self):
-        """Disk read rate in MB/s since the last call; None without psutil or on the first call."""
+        """Disk read MB/s since the last call; None without psutil or on the first call."""
         if not self.ps:
             return None
         try:

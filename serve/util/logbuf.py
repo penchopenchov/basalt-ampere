@@ -1,8 +1,4 @@
-"""serve/util/logbuf.py - the last lines the server and the engine printed, for GET /api/logs.
-
-`LogBuffer` is a ring of lines with rising ids; `TeeStream` feeds it what this process prints (without changing what
-reaches the real stream); `tail_file` feeds it the engine's log file as it grows.
-"""
+"""Recent server and engine output for GET /api/logs: LogBuffer, TeeStream and tail_file."""
 from __future__ import annotations
 
 import collections
@@ -27,7 +23,7 @@ def level(text: str) -> str:
 
 
 class LogBuffer:
-    """A thread-safe ring of the last CAPACITY lines.  Ids start at 1 and only rise."""
+    """A thread-safe ring of the last CAPACITY lines with rising ids."""
 
     def __init__(self, capacity: int = CAPACITY):
         self.lock = threading.Lock()
@@ -35,7 +31,7 @@ class LogBuffer:
         self.last = 0
 
     def add(self, src: str, text: str) -> None:
-        """Adds each non-empty line of `text` (ANSI codes removed, long lines cut) from source `src`."""
+        """Add each non-empty line of `text` (ANSI codes removed, long lines cut) from source `src`."""
         now = round(time.time(), 3)
         for raw in ANSI.sub("", text or "").splitlines():
             msg = raw.rstrip()[:MAX_LINE]
@@ -46,7 +42,7 @@ class LogBuffer:
                 self.lines.append({"id": self.last, "t": now, "src": src, "lvl": level(msg), "msg": msg})
 
     def since(self, after_id: int = 0, limit: int = 500) -> tuple[list[dict], int]:
-        """-> (the newest `limit` lines with an id above `after_id`, oldest first; the newest id in the buffer)."""
+        """Return (the newest `limit` lines above `after_id`, oldest first; the newest id)."""
         with self.lock:
             fresh = [dict(x) for x in self.lines if x["id"] > after_id]
             last = self.last
@@ -54,8 +50,7 @@ class LogBuffer:
 
 
 class TeeStream:
-    """Wraps sys.stdout / sys.stderr: everything still goes to the original stream, and each complete line is also
-    added to the buffer as `src`, without a leading "[server] "."""
+    """Wraps sys.stdout/stderr: passes everything through and adds each complete line to the buffer as `src`."""
 
     def __init__(self, stream, buffer: LogBuffer, src: str):
         self._stream, self._buffer, self._src = stream, buffer, src
@@ -77,9 +72,8 @@ class TeeStream:
 
 
 def tail_file(buffer: LogBuffer, path: str, src: str = "eng", poll_s: float = 0.25) -> None:
-    """Follows a text file from its current end, adding each complete line to the buffer.  A file that is not there
-    yet is waited for; one that shrinks (emptied or replaced) is read again from its start.  Runs until the process
-    ends."""
+    """Follow a file from its end, adding complete lines to the buffer; waits for a missing file and rereads a
+    shrunk one from the start."""
     try:
         pos = os.path.getsize(path)
     except OSError:

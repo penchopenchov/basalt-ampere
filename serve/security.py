@@ -8,15 +8,15 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 
 
 def exposed_without_key(host: str, api_key: str) -> bool:
-    """True when the server listens beyond this PC and no API key is set."""
+    """True when the server listens beyond this PC without an API key."""
     return host not in LOOPBACK_NAMES and not api_key
 
 
 def lan_addresses() -> list[str]:
-    """This PC's IPv4 addresses on its networks (what another device types in), without loopback/link-local."""
+    """This PC's non-loopback, non-link-local IPv4 addresses."""
     import socket
     first, ips = None, set()
-    try:                                                # the address of the default route; sends nothing (UDP)
+    try:                                                # default-route address; UDP connect sends nothing
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("10.255.255.255", 1))
             first = s.getsockname()[0]
@@ -32,8 +32,7 @@ def lan_addresses() -> list[str]:
 
 
 def host_name(value) -> str:
-    """The name in a Host header (or an origin's host[:port]): "Example.com:8080" -> "example.com",
-    "[::1]:8095" -> "::1"; "" when it is malformed."""
+    """The lowercase name of a Host header or origin host[:port] ("[::1]:8095" -> "::1"); "" when malformed."""
     v = (value or "").strip().lower()
     if v.startswith("["):
         name, sep, rest = v[1:].partition("]")
@@ -42,7 +41,7 @@ def host_name(value) -> str:
         v, port = v.split(":")
         if not port.isdigit():
             return ""
-    elif ":" in v:                                       # a bare IPv6 address (an --allowed-host entry)
+    elif ":" in v:                                       # a bare IPv6 address
         return v
     v = v.rstrip(".")
     return v if v and all(c.isalnum() or c in "-._" for c in v) else ""
@@ -63,9 +62,8 @@ def _name_in(name: str, names) -> bool:
 
 
 def allowed_hosts_of(value) -> list[str]:
-    """The --allowed-host names (a name or a list): host names, "*" or
-    ".example.com" (it and every name below it).  A scheme, port or path is dropped ("https://a.example.com:8443/"
-    -> "a.example.com"); a wrong entry stops the start (ValueError)."""
+    """The --allowed-host names: host names, "*" or ".example.com" (it and below). Scheme, port and path are
+    dropped; a bad entry raises ValueError."""
     items = [] if value in (None, "") else [value] if isinstance(value, str) else value
     if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
         raise ValueError("allowed_hosts: expected a host name or a list of them")
@@ -85,9 +83,8 @@ def allowed_hosts_of(value) -> list[str]:
 
 
 def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[str]:
-    """Every name this server answers to besides an IP address: localhost, the address it listens on, the --allowed-host
-    allowed_hosts and trusted_origins' hosts, and - listening beyond this PC (0.0.0.0 or a LAN address) - this PC's
-    name and LAN addresses (the LAN addresses matter for the Origin check, which takes no IP on trust)."""
+    """Every non-IP name this server answers to: localhost, the bind address, allowed hosts, trusted origins' hosts
+    and, when listening beyond this PC, its name and LAN addresses (the Origin check trusts no IP)."""
     names = set(LOOPBACK_NAMES)
     bind = host_name(bind_host)
     if bind and bind not in ("0.0.0.0", "::"):
@@ -105,11 +102,8 @@ def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[
 
 
 def host_allowed(host, names, any_host=False) -> bool:
-    """DNS rebinding: a web page of another site whose name its DNS points at 127.0.0.1 reaches this server as the
-    same origin, so the browser lets it read every answer.  Its requests carry that site's name in Host, so only
-    the names this server answers to pass.  An IP address passes (a page served from an IP is that IP's own page;
-    rebinding needs a name), as does "*.localhost" (browsers never ask DNS for it) and a request without a Host
-    header (HTTP/1.0 clients; browsers always send one)."""
+    """DNS-rebinding check: only known names pass, since a rebinding page carries its own site's name in Host.
+    IPs, "*.localhost" and a missing Host (browsers always send one) pass too."""
     if any_host or not (host or "").strip():
         return True
     name = host_name(host)
@@ -118,13 +112,11 @@ def host_allowed(host, names, any_host=False) -> bool:
 
 
 def origin_allowed(origin: str, host, names, origins=()) -> bool:
-    """A browser page's Origin that may use the model without an API key: this server's own page (the Origin is the
-    request's own Host), a page on one of the names this server answers to (any port), or an origin --cors-origin lists
-    (trusted_origins, cors_origins).  Unlike the Host check no IP passes on trust: a page served from any other IP is
-    another site.  "null" (a sandboxed frame, a file:// page) does not pass: any site can send it.  An origin of another
-    scheme (chrome-extension://, moz-extension://, an Electron app's app://) does: no web site can send one."""
+    """Whether an Origin may use the model without an API key: this server's own page, a known name on any port,
+    or a listed origin. Unlike the Host check no IP passes on trust, and "null" fails (any site can send it);
+    non-http(s) schemes pass since no web site can send them."""
     origin = (origin or "").strip().rstrip("/")
-    if origin in origins or "*" in origins:             # --cors-origin "*": every page may use it
+    if origin in origins or "*" in origins:             # "*": every page
         return True
     scheme, sep, rest = origin.lower().partition("://")
     if not sep or not scheme:
@@ -138,8 +130,7 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 
 
 def origins_of(value, key: str, wildcard: bool) -> list[str]:
-    """An origin list ("https://chat.example.com" or a list of them) - scheme://host[:port], no path;
-    "*" only where `wildcard` allows it.  A wrong entry stops the start rather than opening less or more than meant."""
+    """An origin or list of origins (scheme://host[:port], no path); "*" only when `wildcard`; a bad entry raises."""
     if value is None or value == "" or value == []:
         return []
     items = [value] if isinstance(value, str) else value

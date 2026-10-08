@@ -1,26 +1,13 @@
-"""serve/server.py - OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
+"""OpenAI, Anthropic and Responses endpoints over an engine that maps token ids to tokens.
 
     basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
-    python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...   (what basalt serve runs)
-    python -m serve.server --config config.json                      (every setting from a file)
-    python -m serve.server --mock-engine --port 8095                 (a scripted engine, for clients and tests)
+    python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...
+    python -m serve.server --config config.json
+    python -m serve.server --mock-engine --port 8095
 
---gpu lists the GPUs as nvidia-smi numbers them: the first runs the model, a second is the peer expert tier
-(default: every visible GPU).  See --help for the other flags.
-
-Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /metrics and GET /api/logs (the stats page's feeds). One sequence at a time behind a
-FIFO (plan: one resident sequence).
-Images (off by default; --vision encodes on the GPU, --vision-cpu on the CPU; needs a model file with a vision encoder): OpenAI image_url parts and Anthropic image blocks (base64
-data, http(s) URLs or local file paths) go through `basalt-vision` (the model's mmproj file) and reach the engine as
-embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
-converted to PNG first with Pillow.
-Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
-An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
-
-The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
-`ProcessEngine` keeps one `basalt --serve` process resident (weights, expert arena and VRAM tier load once) and
-talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes every API path testable without a GPU.
+The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel)` -> token ids. ProcessEngine keeps
+one `basalt --serve` process resident; MockEngine is a scripted stand-in for tests. Prompts that do not fit the
+context are rejected with a 400, never truncated.
 """
 from __future__ import annotations
 
@@ -33,7 +20,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # run as a script as well as a module
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings,  # noqa: E402
                           parse_settings, sampling_defaults_from_config)
@@ -52,15 +39,13 @@ from serve.util.text import ByteTokenizer  # noqa: E402
 
 
 def fail(msg: str) -> None:
-    """Prints a startup error as a console line and exits with status 2."""
+    """Print a startup error and exit with status 2."""
     print(f"[server] error: {msg}", file=sys.stderr)
     raise SystemExit(2)
 
 
 def warn_tight_ram(arena_mib) -> None:
-    """The model's experts live in RAM (INFO arena_mib).  With less than ~6 GB left beside them for the
-    system, the engine and this server, Linux ends the engine mid-answer when memory runs out; say so at
-    start instead of after a lost answer."""
+    """Warn at start when less than ~6 GB of RAM is left beside the expert arena (INFO arena_mib)."""
     if not isinstance(arena_mib, int) or arena_mib <= 0:
         return
     try:
@@ -80,9 +65,9 @@ def main() -> int:
     except ValueError as e:
         fail(f"--config: {e}")
     service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
-    logs = LogBuffer()                                  # GET /api/logs: this process's output, and the engine's
+    logs = LogBuffer()                                  # this process's and the engine's output
     sys.stdout, sys.stderr = TeeStream(sys.stdout, logs, "srv"), TeeStream(sys.stderr, logs, "srv")
-    cfg = {}                                            # what the model file implies (serve/engine/modelfile.py)
+    cfg = {}                                            # what the model file implies
     try:
         if a.gpu is not None:
             cfg["gpu"] = a.gpu
@@ -119,7 +104,7 @@ def main() -> int:
             print(engine_line(flags, sources, bool(a.config)), flush=True)
     if a.alias:
         cfg["model_name"] = a.alias
-    try:                                                # before the minutes of loading: is the port free?
+    try:                                                # fail fast if the port is taken
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
         fail(f"port {a.port} is in use (--port N)")
@@ -155,7 +140,7 @@ def main() -> int:
         print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
         if lazy:
             print("[server] model unloaded, the first request loads it", flush=True)
-        if cfg.get("log"):                              # the engine's stderr goes to its log file: follow it
+        if cfg.get("log"):                              # follow the engine's log file
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
@@ -170,7 +155,7 @@ def main() -> int:
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
+    # the model's exported template, else the bundled one
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
@@ -178,7 +163,7 @@ def main() -> int:
     svc.logs = logs
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
-        # an empty key would switch authentication off without a word
+        # an empty key would silently disable authentication
         print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
         return 2
     svc.api_key = a.api_key
@@ -206,7 +191,7 @@ def main() -> int:
           f"{', API key required' if svc.api_key else ''}", flush=True)
     print(f"[server] stats: http://{here}:{a.port}/ (Ctrl+C stops)", flush=True)
     if a.host not in LOOPBACK_NAMES:
-        # reachable from other devices - say at which address, and what can still block it
+        # reachable from other devices: print the addresses
         ips = lan_addresses()
         for ip in ips:
             print(f"[server] network: http://{ip}:{a.port}/v1", flush=True)
@@ -217,9 +202,7 @@ def main() -> int:
     if a.open:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
-    # docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
-    # the grace period with the engine still running. SIGTERM takes Ctrl+C's path below (QUIT to the engine).
-    # SIGINT keeps Python's own handler, so Ctrl+C and a second Ctrl+C work as before.
+    # SIGTERM takes Ctrl+C's path (QUIT to the engine) so a container stop does not orphan it
     def on_sigterm(signum, frame):
         raise KeyboardInterrupt
     try:
@@ -235,7 +218,7 @@ def main() -> int:
         for close in filter(None, closers):
             try:
                 close()
-            except KeyboardInterrupt:                   # a second Ctrl+C: don't wait for the engine to free its memory
+            except KeyboardInterrupt:                   # second Ctrl+C: do not wait for the engine
                 if getattr(engine, "proc", None):
                     engine.proc.kill()
         print("[server] stopped", flush=True)

@@ -11,7 +11,7 @@ class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
 
-    ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
+    ALWAYS = ()                                     # specials matched without parse_special
 
     @property
     def control_tokens(self):
@@ -48,11 +48,8 @@ def control_literals(tok) -> list[str]:
 
 
 class Detokenizer:
-    """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
-    characters and holds a multi-byte character split across tokens until it is complete (invalid bytes become
-    U+FFFD, as a whole decode with errors="replace" makes them).  Constant time per token - the old re-decode of
-    every generated id cost 2 ms per token after 8K tokens and 4 ms after 16K (perf-review F-1).  A tokenizer
-    without `token_bytes` (the tests' byte tokenizer) keeps the re-decode."""
+    """Constant-time incremental decode: token bytes go through an incremental UTF-8 decoder that holds a split
+    multi-byte character. A tokenizer without `token_bytes` re-decodes instead."""
 
     def __init__(self, tok):
         self.tok, self.ids, self.sent = tok, [], 0
@@ -75,12 +72,11 @@ class Detokenizer:
         return delta
 
 
-OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
+OPENAI_MAX_STOP = 4                                  # OpenAI's `stop` limit
 
 
 def stop_strings(req: dict) -> list[str]:
-    """The request's stop strings: OpenAI's `stop` (a string or a list of up to 4) or Anthropic's `stop_sequences`
-    (a list).  Empty strings are left out.  A bad value is a ValueError, so a 400 before anything is generated."""
+    """The request's stop strings (OpenAI `stop` or Anthropic `stop_sequences`), empties dropped; ValueError if bad."""
     req = req or {}
     if req.get("stop") is not None:
         stop = req["stop"]
@@ -99,14 +95,13 @@ def stop_strings(req: dict) -> list[str]:
 
 
 class StopMatcher:
-    """Cuts the answer's text at the first stop string.  Text that could still be the start of a stop string is held
-    back (only that tail, never more), so a stop string split across tokens or chunks is still found and never sent."""
+    """Cuts text at the first stop string, holding back only a tail that could start one."""
 
     def __init__(self, stops: list[str]):
         self.stops, self.held, self.hit = stops, "", None
 
     def push(self, text: str) -> str:
-        """-> the text that is safe to send now; after a match, self.hit is the stop string and nothing more comes."""
+        """Return the text safe to send; after a match self.hit is the stop string and nothing more comes."""
         if self.hit is not None:
             return ""
         buf = self.held + text
@@ -118,7 +113,7 @@ class StopMatcher:
         if first is not None:
             self.held, self.hit = "", first[1]
             return buf[:first[0]]
-        keep = 0                                      # the longest end of buf that a stop string starts with
+        keep = 0                                      # longest end of buf that starts a stop string
         for s in self.stops:
             for k in range(min(len(s) - 1, len(buf)), keep, -1):
                 if buf.endswith(s[:k]):

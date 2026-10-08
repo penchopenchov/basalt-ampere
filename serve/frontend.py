@@ -1,17 +1,9 @@
-"""serve/frontend.py - the request/response layer between API clients and the engine.
+"""Text-only layer between API clients and the engine (no model, no GPU).
 
-Everything here is text: no model, no GPU. The engine consumes token ids and produces text deltas; this module
-
-  * normalizes OpenAI Chat Completions and Anthropic Messages requests into the chat template's message form,
-  * renders the model's own Jinja chat template (pack `tokenizer/chat_template.jinja`) exactly as Hugging Face
-    does,
-  * parses the streamed output incrementally into reasoning (`<think>...</think>`), content and tool calls in
-    the template's XML form (`<tool_call><function=NAME><parameter=P>VALUE</parameter>...</function></tool_call>`),
-    never emitting a partial tag to the client.
-
-Design note: plan v0.3 describes a single C++ process. The frontend is Python first because the template is Jinja
-and the formats change often; the engine boundary is token ids in, text deltas out, which keeps a later C++ port
-(or a pybind wrapper) a local change.
+  * Normalizes OpenAI and Anthropic requests into the chat template's message form.
+  * Renders the model's Jinja chat template as Hugging Face does.
+  * Parses streamed output into reasoning, content and `<tool_call><function=NAME><parameter=P>...` tool calls,
+    never emitting a partial tag.
 """
 from __future__ import annotations
 
@@ -27,12 +19,11 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 # ------------------------------------------------------------------------------------------------ template
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
-    """The template refused the request's messages (e.g. "No user query found in messages."): a ValueError, so the
-    client gets a 400 with the template's message instead of a dropped connection."""
+    """The template refused the messages; a ValueError so the client gets a 400 with its message."""
 
 
 class ChatTemplate:
-    """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
+    """The model's chat template, rendered with the Jinja settings of transformers' apply_chat_template."""
 
     def __init__(self, path: str | Path):
         def raise_exception(message):
@@ -65,14 +56,13 @@ def _text_of(content) -> str:
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
 
-# Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
-# enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
+# client spellings of a thinking level -> the template's low, medium, xhigh (default) or none
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
 def effort_kwargs(value) -> dict:
-    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
+    """A client's reasoning effort as template kwargs; unknown values are a 400."""
     if value is None or value == "":
         return {}
     if value is False:
@@ -98,10 +88,7 @@ def _has_image(content) -> bool:
 
 
 def _image_source(part: dict) -> str:
-    """An image part's source as one string: a data: URL, an http(s) URL or a local file path.
-    OpenAI: {"type": "image_url", "image_url": {"url": ...}} (or "image_url": "..."), Responses-style
-    {"type": "input_image", "image_url": ...}; Anthropic: {"type": "image", "source": {"type": "base64",
-    "media_type": ..., "data": ...}} or {"source": {"type": "url", "url": ...}}."""
+    """An image part's source as a data: URL, http(s) URL or local path (OpenAI, Responses and Anthropic shapes)."""
     if part.get("type") == "image":
         src = part.get("source") or {}
         if src.get("type") == "base64":
@@ -114,8 +101,7 @@ def _image_source(part: dict) -> str:
 
 
 def _parts_of(content):
-    """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
-    template's list form - text items and image items, in order - whose image items carry their source."""
+    """Message content for the template: a string without images, else its list of text and image items."""
     if not _has_image(content):
         return _text_of(content)
     items = []
@@ -130,31 +116,24 @@ def _parts_of(content):
 
 
 def images_of(messages: list[dict]) -> list[str]:
-    """The image sources of the rendered conversation, in prompt order (the template renders one
-    <|vision_start|><|image_pad|><|vision_end|> per image item, message by message)."""
+    """The image sources of the conversation in prompt order."""
     return [item["source"] for m in messages if isinstance(m.get("content"), list)
             for item in m["content"] if item.get("type") == "image"]
 
 
-# a literal <think> / </think> inside a message's text is plain text, not the model's reasoning markers.  The
-# tokenizer matches those two strings as their special tokens everywhere (GGUF token type 4, as llama.cpp does), so
-# a user quoting "</think>" would hand the model a real end-of-reasoning token.  Before the template is rendered
-# they are swapped for these private-use characters, and the server encodes the spans they mark as ordinary text.
+# Literal think and vision tags in message text must stay plain text, but the tokenizer would turn them into
+# special tokens. Before rendering they are swapped for these private-use marks and encoded as ordinary text.
 THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
-# The vision markers the same way: they are special tokens only where the template writes them for an image item;
-# the same strings in a message's text must not take a picture's place.
+# vision markers are special only where the template writes them for an image item
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
 LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
-CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
+CONTROL_MARK0 = 0xF0E10      # control-token marks start here
 
 
 def literal_tags(controls) -> dict[str, str]:
-    """LITERAL_TAGS plus a mark for each control token's text (`controls`: the tokenizer's control literals,
-    <|im_start|>, <|im_end|>, <|endoftext|>, ...).  The rendered prompt is encoded with those literals parsed, so one
-    written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.  Longest
-    first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
+    """LITERAL_TAGS plus a mark for each control token's text in `controls`, longest first like the tokenizer."""
     tags = {**LITERAL_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(c for c in controls
                                                                                 if c not in LITERAL_TAGS)}}
     return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
@@ -187,11 +166,8 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
 
 
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
-    """(messages, tools) with every literal <think> / </think> or vision marker in their text swapped for
-    LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
-    whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
-    An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
-    inline) keeps that one block as the model's markers, as before."""
+    """(messages, tools, changed) with literal tags in their text swapped for `tags`' marks; unchanged objects come
+    back when there are none. An assistant message opening with a whole <think>...</think> block keeps it."""
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
@@ -214,8 +190,7 @@ _THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
 
 
 def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
-    """The rendered prompt with the marks turned back into the tags' text, and the (start, end) spans of those
-    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
+    """The prompt with marks restored to tag text, and those tags' (start, end) spans to encode as plain text."""
     marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
     mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
     out, spans, pos, n = [], [], 0, 0
@@ -232,18 +207,14 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
 
 
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
-    """The chat template takes a system message only at the start ("System message must be at the beginning").
-    Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
-    turn, some OpenAI clients a late "developer" message - so those become user messages, in place:
-    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
+    """Turn system messages after the first into user messages in place; the template allows system only first,
+    and merging would change the prompt start and lose the cache."""
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
 
 
 def _object_list(value, name: str) -> list[dict]:
-    """A request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
-    double-encoded, as a JSON string, which used to be iterated character by character and crashed on m.get: such a
-    string is decoded.  Anything that is still not a list of objects is a ValueError, which the server answers with
-    a 400 naming the field.  None (or no field) is an empty list, as a missing field always was."""
+    """A list of objects from `value` (a double-encoded JSON string is decoded); None is empty, anything else a
+    ValueError naming `name`."""
     if value is None:
         return []
     if isinstance(value, str):
@@ -257,11 +228,8 @@ def _object_list(value, name: str) -> list[dict]:
 
 
 def _tool_list(value, wrapper: str | None) -> list[dict]:
-    """A request's "tools" as a list of tool objects, each with a name - in the OpenAI shape
-    {"type": "function", "function": {"name": ...}} (`wrapper` "function"; a bare {"name": ...} is still taken), or
-    in the Anthropic shape {"name": ...} (`wrapper` None).  A value that is not (a string such as "auto", a list of
-    names, an object without a name) is a ValueError - a 400 naming the field - where it used to take the request
-    thread down with no reply at all.  No value (or an empty one) is no tools, as always."""
+    """A request's tools as named objects, in the OpenAI shape (`wrapper` "function") or Anthropic's (None);
+    anything else is a ValueError, no value is no tools."""
     if not value:
         return []
     shape = ('{"type": "function", "function": {"name": ..., "parameters": {...}}}' if wrapper else
@@ -294,7 +262,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
                 args = fn.get("arguments")
-                if isinstance(args, str):               # the template requires a mapping, not a JSON string
+                if isinstance(args, str):               # the template needs a mapping
                     args = json.loads(args) if args.strip() else {}
                 calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
             out["tool_calls"] = calls
@@ -302,10 +270,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
     kwargs = {}
-    # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
+    # "reasoning_effort", or Responses-style "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
     kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
-    # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
+    # chat_template_kwargs: enable_thinking / reasoning_effort
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
@@ -315,9 +283,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
 
 
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
-    """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
-    without "thinking", an effort or a budget gets the template's default (it thinks); False
-    renders it without thinking."""
+    """Anthropic Messages -> (template messages, tools, kwargs). `think_unasked`: a request that asks nothing about
+    thinking gets the template default; False renders it without thinking."""
     messages = []
     system = req.get("system")
     if system:
@@ -352,8 +319,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
-    # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
-    # "output_config": {"effort": "low" | "medium" | "high"}
+    # "thinking": {"type": "disabled" | "enabled", "budget_tokens"} and "output_config": {"effort"}
     thinking = req.get("thinking")
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
@@ -363,11 +329,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
-        # Opt-in (the default thinks, since a
-        # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
-        # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
-        # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
-        # A request that gives its own reasoning_budget_tokens asks for thinking, so it thinks as before.
+        # opt-in thinking: short helper calls that ask for none would otherwise spend their tokens thinking
         kwargs["enable_thinking"] = False
     return _late_system_to_user(messages), tools, kwargs
 
@@ -397,9 +359,8 @@ FUNC_END = "</function>"
 
 
 def param_end(text: str, final: bool = False) -> int:
-    """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
-    `<parameter=` or `</function>` - the same text inside a value (a file that documents the call format) is
-    part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
+    """Where a parameter value ends: the first `</parameter>` followed by `<parameter=` or `</function>`, so the
+    same text inside a value is kept. -1: none yet; -2: candidate awaiting its follower (`final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
@@ -412,9 +373,8 @@ def param_end(text: str, final: bool = False) -> int:
 
 
 def call_end(text: str) -> int:
-    """Where a tool call's body ends: the `</tool_call>` after the call's own `</function>`, found by walking
-    its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
-    the call format ends at the first `</tool_call>`, as before."""
+    """Where a call body ends: the `</tool_call>` after its own `</function>` (found via param_end); -1: incomplete.
+    A body not in the call format ends at the first `</tool_call>`."""
     s = text.lstrip()
     pos = len(text) - len(s)
     if not s.startswith("<function="):
@@ -448,9 +408,8 @@ def call_end(text: str) -> int:
 
 
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
-    """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
-    when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
-    objects/arrays/numbers/booleans)."""
+    """`<function=NAME>...</function>` -> ToolCall. Values are JSON-decoded when the schema says non-string
+    (without a schema: when they parse as JSON objects, arrays, numbers or booleans)."""
     body = body.strip()
     if not body.startswith("<function=") or ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
@@ -481,31 +440,27 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
 
 
 class OutputParser:
-    """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
-    until it is complete, so clients never see `<tool_` or `</thi`."""
+    """Incremental parser of model text: feed deltas, get events; a split tag is held until complete."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
-        # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
-        # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
-        # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
-        # nothing until the call is complete, which for a large file write can be many minutes.
+        # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
         self.stream_tools = stream_tools
         self._reset_scan()
 
     def _reset_scan(self):
-        self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
+        self.sp = 0                  # consumed part of self.buf (the call body)
         self.ss = "name"             # name -> between -> str|raw -> ... -> done
-        self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
+        self.scall = None            # the ToolCall being streamed
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
 
     def _scan(self) -> list[Event]:
-        """Advance the streaming view of the call body in self.buf (see stream_tools)."""
+        """Advance the streaming view of the call body."""
         out = []
 
         def args(s):
@@ -547,12 +502,12 @@ class OutputParser:
                     self.sp += len("</function>")
                     self.ss = "done"
                 else:
-                    return out          # a tag still arriving (or trailing text): wait
+                    return out          # a tag still arriving: wait
             elif self.ss == "str":
                 if not self.sval_started:
                     if not rest:
                         return out
-                    if rest[0] == "\n":          # the value's leading newline is not part of it
+                    if rest[0] == "\n":          # the leading newline is not part of the value
                         self.sp += 1
                         rest = rest[1:]
                     self.sval_started = True
@@ -565,9 +520,9 @@ class OutputParser:
                     self.sp += end + len(PARAM_END)
                     self.ss = "between"
                     continue
-                # an undecided </parameter> (-2) is held from its start, like a tag still arriving
+                # an undecided </parameter> is held from its start
                 safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END,))
-                if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
+                if safe > 0 and rest[safe - 1] == "\n":   # maybe the newline before </parameter>
                     safe -= 1
                 if safe > 0:
                     args(json.dumps(rest[:safe])[1:-1])
@@ -593,7 +548,7 @@ class OutputParser:
                 return out
 
     def _close_scan(self) -> list[Event]:
-        """A streamed call that ended without a clean </function>: close its JSON so clients can still parse it."""
+        """Close the JSON of a streamed call that ended without a clean </function>."""
         out = []
         if self.scall is None or self.ss == "done":
             return out
@@ -633,7 +588,7 @@ class OutputParser:
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
             elif self.state == "content":
-                if self.lead:                                   # newlines right after </think> or a call
+                if self.lead:                                   # newlines after </think> or a call
                     stripped = self.buf.lstrip("\n")
                     if not stripped:
                         self.buf = ""
@@ -641,8 +596,7 @@ class OutputParser:
                     self.buf, self.lead = stripped, False
                 i = self.buf.find(CALL_START)
                 if i < 0:
-                    # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
-                    # so emitting them early would make streamed and whole outputs differ.
+                    # hold a partial tag and the newlines before it: a following tool call drops them
                     j = len(self.buf) - self._hold(self.buf, (CALL_START,))
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
@@ -677,12 +631,12 @@ class OutputParser:
                 self.state, self.lead = "content", True
 
     def finish(self) -> list[Event]:
-        """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
-        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it)."""
+        """End of generation: flush what is held (an unterminated call becomes content; an announced one is left
+        unfinished with no "tool_call")."""
         out = []
         if self.state == "call" and self.stream_tools and self.scall is not None:
-            out += self._scan()                 # the output ended inside a call that was already announced
-            if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
+            out += self._scan()                 # ended inside an announced call
+            if self.ss == "done":               # only </tool_call> is missing
                 out.append(Event("tool_call", call=self.scall))
             self.buf = ""
             self._reset_scan()

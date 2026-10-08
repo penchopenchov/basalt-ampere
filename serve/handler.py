@@ -36,9 +36,7 @@ def make_handler(svc: Service):
             pass
 
         def parse_request(self):
-            """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
-            (host_allowed).  With a key a rebinding page cannot authenticate, so the check is skipped: tunnels and
-            proxies that pass their own name on keep working."""
+            """Without an API key, check the Host header (DNS-rebinding protection); a key makes the check moot."""
             if not super().parse_request():
                 return False
             host = self.headers.get("Host")
@@ -54,9 +52,8 @@ def make_handler(svc: Service):
             return False
 
         def _foreign_page(self) -> bool:
-            """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
-            there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
-            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
+            """Without an API key, refuse a /v1 POST from another site's page: its Origin must be allowed (no Origin
+            is fine) and, with one, the body must be JSON."""
             origin = self.headers.get("Origin")
             if svc.api_key or not origin:
                 return False
@@ -74,11 +71,8 @@ def make_handler(svc: Service):
             return False
 
         def _watch_client(self, cancel: threading.Event) -> None:
-            """Cancel the request as soon as its client hangs up.  A non-streamed request writes nothing
-            until it ends, and a streamed one only a keep-alive per prompt chunk (and the first write after a hang-up
-            usually still succeeds), so a dropped request kept the engine busy until its answer or the whole prompt
-            was done.  Every 0.5 s: the socket readable with nothing to read (EOF) means the client closed it.  A
-            request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
+            """Cancel the request when its client hangs up, polling every 0.5 s: a readable socket with nothing to
+            read is EOF (the request is fully read, so data is not a hang-up)."""
             done = self.watch_done = threading.Event()
             sock = self.connection
 
@@ -89,7 +83,7 @@ def make_handler(svc: Service):
                         gone = bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
                     except (ConnectionError, TimeoutError):
                         gone = True
-                    except (OSError, ValueError):            # the socket was closed here: the request has ended
+                    except (OSError, ValueError):            # socket closed: the request has ended
                         return
                     if gone:
                         cancel.set()
@@ -98,8 +92,7 @@ def make_handler(svc: Service):
             threading.Thread(target=watch, daemon=True, name="client-watch").start()
 
         def _cors(self):
-            """CORS headers for an API path (/v1/*) and an origin --cors-origin lists - nothing
-            otherwise, so a browser keeps every other page away from the API and the model controls."""
+            """CORS headers, only for /v1/* and a listed origin."""
             if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
                 return
             origin = (self.headers.get("Origin") or "").rstrip("/")
@@ -112,14 +105,14 @@ def make_handler(svc: Service):
                 return
             self.send_header("Access-Control-Allow-Origin", allow)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            # the headers the preflight asks for (SDKs add their own; "*" does not cover Authorization)
+            # echo the requested headers: "*" does not cover Authorization
             asked = self.headers.get("Access-Control-Request-Headers")
             self.send_header("Access-Control-Allow-Headers",
                              asked or "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta")
             self.send_header("Access-Control-Max-Age", "600")
 
         def do_OPTIONS(self):
-            # a CORS preflight: no credentials come with it, so no API key; the headers only for cors_origins
+            # preflights carry no credentials, so no API key check
             self.send_response(204)
             self._cors()
             self.send_header("Content-Length", "0")
@@ -147,7 +140,6 @@ def make_handler(svc: Service):
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
-                # the page's fonts (OFL: serve/web/fonts); it falls back to the system font
                 name = path[len("/fonts/"):]
                 f = ROOT / "serve" / "web" / "fonts" / name
                 if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():
@@ -162,7 +154,6 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
                 return
             if path.startswith("/web/"):
-                # the page's own files (serve/web): styles, script, icon - same origin, no CDN
                 name = path[len("/web/"):]
                 types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                          ".svg": "image/svg+xml"}
@@ -197,7 +188,7 @@ def make_handler(svc: Service):
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": svc.loaded(), "service": "basalt"})
             elif path == "/status":
-                if not self._authorized():                  # it shows the end of the last answer
+                if not self._authorized():                  # it shows the last answer's tail
                     return
                 with svc.status_lock:
                     s = dict(svc.status)
@@ -218,7 +209,7 @@ def make_handler(svc: Service):
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
+                        model["status"] = {"value": "unloaded"}   # listed, loads on use
                         loaded = True
                     self._json(200, {"object": "list", "data": [model] if loaded else []})
             elif path == "/props":
@@ -240,15 +231,15 @@ def make_handler(svc: Service):
         def do_POST(self):
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # Claude Code posts /v1/messages?beta=true
+            path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path in ("/unload", "/load") and not self._control_body():
                 return
-            # JSON from the server's own page only: else a plain form POST from any site unloads the model
+            # own page and JSON only: a form POST from any site must not control the model
             if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
                 return
-            if path == "/unload":                            # give the GPU back now (between requests)
+            if path == "/unload":                            # unload between requests
                 try:
                     r = svc.unload()
                 except EngineStuck as e:
@@ -256,7 +247,7 @@ def make_handler(svc: Service):
                     return
                 self._json(409 if r == "busy" else 200, {"status": r})
                 return
-            if path == "/load":                              # load now, e.g. ahead of a request
+            if path == "/load":                              # load ahead of a request
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
@@ -267,7 +258,7 @@ def make_handler(svc: Service):
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
-                if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
+                if path.startswith("/v1/responses/"):        # nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
                     return
@@ -295,7 +286,7 @@ def make_handler(svc: Service):
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
-                if path == "/v1/vram":                       # give VRAM back to other programs, or take it
+                if path == "/v1/vram":                       # resize the VRAM reserve
                     if not self._own_page("the VRAM reserve can be changed"):
                         return
                     r = req.get("reserve_mib")
@@ -329,9 +320,9 @@ def make_handler(svc: Service):
                                           "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
-            except EngineDied as e:                          # before the answer started (not streamed)
+            except EngineDied as e:                          # before the answer started
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
-            except EngineStuck as e:                         # an unload or restart that could not end the engine
+            except EngineStuck as e:                         # the engine could not be ended
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
             finally:
@@ -363,7 +354,7 @@ def make_handler(svc: Service):
             self._json(200, props)
 
         def _control_body(self) -> bool:
-            """Consume the unused control body before replying/closing (otherwise the client can see a TCP reset)."""
+            """Read the unused body before replying so the client sees no TCP reset."""
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -385,14 +376,11 @@ def make_handler(svc: Service):
             return complete
 
         def _own_page(self, what) -> bool:
-            """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
-            server never grants) and no foreign Origin: a web page elsewhere must not control the model."""
+            """Require a JSON body and no foreign Origin, so another site's page cannot control the model."""
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return False
-            # The Origin must be this server's own address (host and port), or a trusted origin
-            # (trusted_origins: the page behind a reverse proxy or tunnel).  Headers a proxy adds (X-Forwarded-*,
-            # CF-Ray, CF-Connecting-IP) prove nothing about the page that sent the request, so they open nothing.
+            # Origin must be this server's address or a trusted origin; proxy-added headers prove nothing
             origin = (self.headers.get("Origin") or "").rstrip("/")
             if origin and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
                     origin not in svc.trusted_origins:
@@ -401,8 +389,7 @@ def make_handler(svc: Service):
             return True
 
         def _logs(self):
-            """GET /api/logs?after=<id>&limit=<n>: the newest lines after that id (without `after`: the newest
-            LOG_FIRST_LINES) and the newest id in the buffer."""
+            """GET /api/logs?after=<id>&limit=<n>: the newest lines after that id, and the newest id."""
             query = parse_qs(urlsplit(self.path).query)
 
             def number(name, default):
@@ -420,7 +407,7 @@ def make_handler(svc: Service):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
+            self.send_header("X-Accel-Buffering", "no")   # proxies pass each event at once
             self._cors()
             self.end_headers()
 
@@ -430,13 +417,13 @@ def make_handler(svc: Service):
             if validator is not None and tools:
                 raise ValueError("structured response_format with tools is not supported")
             svc.load()
-            max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
-            svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+            max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
+            svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
+            stop_strings(req)                                 # likewise a bad stop
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # 1
+            self._watch_client(cancel)
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
@@ -446,27 +433,26 @@ def make_handler(svc: Service):
             try:
                 for c in chunks:
                     if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        self.wfile.write(b": keep-alive\n\n")      # SSE comment
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
             except OSError:
-                cancel.set()                                 # client went away: stop the engine
+                cancel.set()                                 # client left: stop the engine
                 chunks.close()
-            except EngineDied as e:                          # mid-stream: say so, then end the stream properly
+            except EngineDied as e:                          # mid-stream
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
-            except ValueError as e:                          # the engine's ERR after the stream started: the
-                err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
+            except ValueError as e:                          # engine ERR after the stream started: no 400 now
+                err = {"error": {"type": "server_error", "message": str(e)}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _responses(self, req):
-            """POST /v1/responses - OpenAI's Responses API, stateless (serve/api/responses.py), on the chat path.
-            Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
+            """POST /v1/responses (serve/api/responses.py); after the stream starts, errors are response.failed."""
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
             except ResponsesError as e:
@@ -476,7 +462,7 @@ def make_handler(svc: Service):
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # 1
+            self._watch_client(cancel)
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -516,8 +502,7 @@ def make_handler(svc: Service):
             try:
                 for e in items:
                     if e is None:
-                        # Codex's idle timeout (5 minutes by default) counts events, not SSE comments: while a long
-                        # prompt is read, a response.in_progress every 15 s tells it the server is still working
+                        # clients' idle timers count events, not SSE comments: send in_progress every 15 s
                         if time.monotonic() - last >= 15:
                             send(asm.in_progress())
                             last = time.monotonic()
@@ -528,13 +513,13 @@ def make_handler(svc: Service):
                         last = time.monotonic()
                     self.wfile.flush()
             except OSError:
-                cancel.set()                                 # client went away: stop the engine
+                cancel.set()                                 # client left: stop the engine
                 items.close()
-            except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
+            except EngineDied as e:                          # mid-stream: response.failed
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
-            except ValueError as e:                          # the engine's ERR after the stream started
+            except ValueError as e:                          # engine ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
@@ -557,12 +542,12 @@ def make_handler(svc: Service):
             if validator is not None and tools:
                 raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
                                      "unsupported_parameter")
-            noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
+            noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
             if set(skipped) - noted:
                 print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)
                 noted.update(skipped)
             try:
-                svc.reasoning_budget(req)                    # a bad value is a 400 before anything is sent
+                svc.reasoning_budget(req)                    # a bad value is a 400 before streaming
             except ValueError as e:
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
             try:
@@ -574,33 +559,31 @@ def make_handler(svc: Service):
                 ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0)
             except ResponsesError:
                 raise
-            except ValueError as e:                          # too long for the context, an image without vision
+            except ValueError as e:                          # too long for the context, or an image without vision
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
-            # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
 
         def _count_tokens(self, req):
-            """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
-            read for the same request, rendered and tokenized - the model does not run."""
+            """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            stop_strings(req)                                 # the same 400 as the request itself would get
+            stop_strings(req)                                 # same 400 as the request itself
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+            svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
+            stop_strings(req)                                 # likewise a bad stop
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            self._watch_client(cancel)                       # 1
+            self._watch_client(cancel)
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -617,10 +600,10 @@ def make_handler(svc: Service):
             except OSError:
                 cancel.set()
                 events.close()
-            except EngineDied as e:                          # mid-stream: Anthropic's error event
+            except EngineDied as e:                          # mid-stream: an Anthropic error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
-            except ValueError as e:                          # the engine's ERR after the stream started
+            except ValueError as e:                          # engine ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
 
@@ -631,7 +614,7 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def handle_error(self, request, client_address):
-        if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
+        if not isinstance(sys.exc_info()[1], ConnectionError):   # a hang-up needs no stack trace
             super().handle_error(request, client_address)
 
 

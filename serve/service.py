@@ -1,4 +1,4 @@
-"""Service: the engine behind a lock with its conversation cache, request bookkeeping and the metrics the stats page reads."""
+"""Service: the engine behind a lock, with request bookkeeping and the metrics the stats page reads."""
 from __future__ import annotations
 
 import collections
@@ -21,32 +21,28 @@ from serve.engine.vision import Vision
 
 
 IMAGE_PAD = "<|image_pad|>"
-# the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
-# template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
+# trailing effort turn (effort_end): sentences for the non-default efforts
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
 EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
                       "conclusion without unnecessary elaboration.",
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
                          "elaboration."}
 VISION_START = "<|vision_start|>"
-# a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
-# broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The Service's
-# repeat_stop_tokens sets it; 0 turns it off.
+# a reply repeating one token this many times in a row is ended ("length"); Service.repeat_stop_tokens, 0: off
 REPEAT_STOP_TOKENS = 256
-# what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
+# closes the thinking at reasoning_budget_tokens
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
-# what closes the thinking when the model ends its turn inside it, so it still answers
+# closes the thinking when the model ends its turn inside it
 REASONING_CLOSE = "\n</think>\n\n"
-CTX_SLACK = 8               # `basalt --serve` rejects prompt + max_new + 8 > context: keep the same margin here
-# The live tok/s is a rate over a window, not a mean since the first token: a mean divides by a span near zero at
-# the first token (a huge number) and then undershoots for the first second of every answer.
+CTX_SLACK = 8               # the engine rejects prompt + max_new + 8 > context
+# live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
 RATE_WINDOW_S = 2.0
-LOG_FIRST_LINES = 300        # the lines GET /api/logs returns when the client has none yet
-LOG_MAX_LINES = 500          # ... and the most it returns in one answer
-REQUESTS_SHOWN = 12        # the finished requests GET /metrics lists, newest first
-RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
-# Diagnostics, off unless the matching server flag is given (main sets them).
-DEBUG = False            # --debug: one line per request, the raw model text after it
+LOG_FIRST_LINES = 300        # lines /api/logs returns to a client with none
+LOG_MAX_LINES = 500          # ... and its maximum per answer
+REQUESTS_SHOWN = 12        # finished requests /metrics lists
+RATE_MIN_SPAN_S = 0.25      # below this span there is no rate yet: use the mean with the span floored
+# diagnostics, off unless the server flag sets them
+DEBUG = False            # --debug: one line per request plus the raw model text
 
 
 class Service:
@@ -54,47 +50,40 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        self.literals = literal_tags(control_literals(tokenizer))   # texts that stay text inside a message
-        self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
-        self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling block
+        self.literals = literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
+        self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
+        self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
-        self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
-        self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
-        # a non-default reasoning effort goes in a short system
-        # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
+        self.embeddings = threading.local()           # this request's image embeddings file
+        self.api_key = ""                              # when set, /v1/* requires it
+        # put a non-default reasoning effort in a system turn before the answer so the cached prefix survives
         self.effort_end = False
-        self.logs = LogBuffer()                         # GET /api/logs: the server's and the engine's output
-        # browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
-        # matters); empty = no CORS headers at all, as before
+        self.logs = LogBuffer()                         # server and engine output
+        # origins allowed to call /v1/* (CORS; "*" = any); empty: no CORS headers
         self.cors_origins: list[str] = []
-        # origins that count as the server's own page for the load/unload/VRAM controls, e.g. reached through a
-        # reverse proxy or tunnel whose Host differs ("https://host.example.com"); never a wildcard
+        # origins treated as the server's own page for the load/unload/VRAM controls (no wildcard)
         self.trusted_origins: list[str] = []
-        # DNS rebinding: extra Host names this server answers to (--allowed-host;
-        # "*" = any), and every name it answers to, which serve() works out from the address it listens on
+        # DNS-rebinding guard: extra Host names ("*" = any) and all names answered, set by serve()
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
-        self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
-        self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
-        # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
-        # then says busy while any runs and shows the newest one
+        self.status = {"busy": False, "queued": 0}      # what the model is doing now
+        self.rate = collections.deque(maxlen=32)        # (time, generated) samples
+        # parallel mode: each running request's own status and rate window; self.status shows the newest
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
-        self.request_ctx = threading.local()            # the handler thread's request: .path (the API path serving it)
-        self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
-        self.requests_done = 0                           # finished requests since the start (their ids, /v1/status)
-        self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
-        self.last_request_at = None                      # when a request last started or finished
+        self.request_ctx = threading.local()            # .path: the API path serving this request
+        self.history = collections.deque(maxlen=500)    # finished requests, newest last
+        self.requests_done = 0                           # finished requests since start
+        self.last_timings = None                         # last request's timings
+        self.last_request_at = None                      # last request start or finish
         self.started_at = time.time()
         self.status_lock = threading.Lock()
-        # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
-        # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
-        # server's model); the next request after an unload starts the engine again
+        # GPU sharing, all off by default: idle unload seconds, min free VRAM to load, a command run before loading
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
         self.before_load = None
-        self.vram_reserve = None                         # the last POST /v1/vram reserve (None: the start's)
-        self.reasoning_budget_tokens = 0                 # a default thinking budget (0: none)
-        self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # one token this many times in a row ends a reply (0: off)
+        self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
+        self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
+        self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # see REPEAT_STOP_TOKENS
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -103,9 +92,7 @@ class Service:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
     def reasoning_budget(self, req) -> int | None:
-        """The most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else
-        none.  0 (or less) means no budget.  ValueError (a 400) for
-        anything that is not a whole number."""
+        """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer."""
         value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
         if value is None:
             value = self.reasoning_budget_tokens
@@ -119,7 +106,7 @@ class Service:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
     def free_vram_mib(self) -> int | None:
-        """Free VRAM on the engine's (first) GPU, from NVML; None when it can't be read (then nothing is refused)."""
+        """Free VRAM on the first GPU from NVML; None when unreadable (nothing is then refused)."""
         try:
             from serve.util.telemetry import _Nvml
             nv = _Nvml(int(getattr(self, "gpu_index", 0) or 0))
@@ -133,8 +120,7 @@ class Service:
             return None
 
     def ensure_loaded(self):
-        """Start the engine if it is not running (unloaded, or it died -), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
+        """Start the engine if it is not running, after the before_load hook and VRAM check. Caller holds fifo."""
         if self.loaded() and not self._vision_down():
             return
         if self.before_load:
@@ -146,15 +132,15 @@ class Service:
                 print(f"[server] warning: before_load command failed ({e}), loading anyway", flush=True)
         if self.min_free_vram_mib:
             free = self.free_vram_mib()
-            deadline = time.time() + 15                 # memory another process just gave back can take a moment
+            deadline = time.time() + 15                 # memory just released elsewhere may take a moment
             while free is not None and free < self.min_free_vram_mib and time.time() < deadline:
                 time.sleep(0.5)
                 free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib:
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
-        if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
-            print("[server] restarting the vision encoder", flush=True)   # the engine sizes its cache
+        if self._vision_down():                         # first: a GPU encoder takes its VRAM before the engine sizes its cache
+            print("[server] restarting the vision encoder", flush=True)
             self.vision.restart()
         if self.loaded():
             return
@@ -165,31 +151,28 @@ class Service:
             print(f"[server] warning: the engine stopped (exit code {code}), restarting it", flush=True)
         try:
             self.engine.restart()
-        except EngineStartError as e:                   # a line, not a traceback: the next request tries again
+        except EngineStartError as e:                   # a line, not a traceback
             print(f"[server] error: {e}", flush=True)
             if e.log:
                 print(f"[server] engine log: {e.log}", flush=True)
             raise
         print("[server] engine running again", flush=True)
-        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # the reserve asked for last
+        if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # reapply the last reserve
             try:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
                 print(f"[server] warning: VRAM reserve of {self.vram_reserve} MiB not applied ({e})", flush=True)
 
-    vram_wait_s = 300.0                                  # how long POST /v1/vram waits for a running request
+    vram_wait_s = 300.0                                  # POST /v1/vram wait for a running request
 
     def vram(self, reserve_mib: int | None) -> dict:
-        """, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
-        started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
-        engine started with --vram-elastic  can do it; it never resizes on its own.
-        An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
+        """POST /v1/vram: keep `reserve_mib` of VRAM free (None: the starting reserve), applied between requests.
+        Needs --vram-elastic; an unloaded engine applies it on load."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
-        # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
-        # and the engine refuses a resize while a slot decodes
+        # parallel requests do not hold the fifo, so take the control lines too: no resize while a slot decodes
         ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
         if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
             self.fifo.release()
@@ -210,15 +193,15 @@ class Service:
             self.fifo.release()
 
     def _say_died(self, e: Exception) -> None:
-        """The server window's line for an engine that died (or was ended) in the middle of a request."""
+        """Print the server-window line for an engine that ended mid-request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
         why = f"{e}: {note}" if note else str(e)
         print(f"[server] warning: {why} (the next request restarts it{', log ' + log if log else ''})", flush=True)
 
     def load(self):
-        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
-        # a request is on its way: the idle thread must not unload between this and the request's own start
+        """Start the engine if unloaded (POST /load and every generation request); may raise GpuBusy."""
+        # keeps the idle thread from unloading before this request starts
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
             return
@@ -226,8 +209,7 @@ class Service:
             self.ensure_loaded()
 
     def unload(self, idle_for: float | None = None) -> str:
-        """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
-        with idle_for: one ran more recently than that) or "unsupported"."""
+        """Stop the engine between requests: "unloaded", "not loaded", "busy" or "unsupported"."""
         if not hasattr(self.engine, "unload"):
             return "unsupported"
         if not self.fifo.acquire(blocking=False):
@@ -258,12 +240,12 @@ class Service:
                 time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
                 try:
                     self.unload(idle_for=self.idle_unload_s)
-                except EngineStuck as e:                # tried again at the next turn; the thread keeps running
+                except EngineStuck as e:                # retried next turn
                     print(f"[server] warning: idle unload failed ({e})", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def start_telemetry(self):
-        """The hardware sampler behind GET /metrics (serve/util/telemetry.py), recording this server's speeds too."""
+        """Start the hardware sampler behind GET /metrics, including this server's speeds."""
         if getattr(self, "telemetry", None) is None:
             from serve.util.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(),
@@ -271,8 +253,7 @@ class Service:
                                        gpu_indices=getattr(self, "gpu_indices", None) or [0])
 
     def _tok_s(self):
-        """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
-        the sum of theirs."""
+        """tok/s over the last RATE_WINDOW_S (summed over parallel requests); 0.0 when idle."""
         with self.status_lock:
             many = [(dict(st), list(rt)) for st, rt in self.live_reqs.values()]
         if many:
@@ -294,7 +275,7 @@ class Service:
         return s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
 
     def _tok_s_mean(self):
-        """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
+        """Mean tok/s since the first token."""
         with self.status_lock:
             many = [dict(st) for st, _ in self.live_reqs.values()] or [dict(self.status)]
         return sum(s["generated"] / max(1e-6, time.time() - s["first_token"]) for s in many
@@ -307,11 +288,10 @@ class Service:
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
     def metrics(self) -> dict:
-        """GET /metrics: what the stats page shows - the engine's facts, what it is doing, the last requests, the
-        hardware and a minute of history for the two speed series."""
+        """GET /metrics: engine facts, live state, recent requests, hardware and speed history."""
         with self.status_lock:
             s = dict(self.status)
-            if self.live_reqs:                          # parallel requests: the newest one's status
+            if self.live_reqs:                          # parallel: the newest request
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             hist = list(self.history)
         busy = bool(s.get("busy"))
@@ -337,9 +317,7 @@ class Service:
                 "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
 
     def v1_status(self) -> dict:
-        """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
-        that polls its OpenAI-compatible server's status, collabosm's for one): the model and its window, images,
-        the APIs, what is running, and the last request's timings in llama.cpp's names.  /metrics has the rest."""
+        """GET /v1/status: model, context, APIs, activity and last timings, for clients that poll status."""
         with self.status_lock:
             s = dict(self.status)
             last_t, last_at = (dict(self.last_timings) if self.last_timings else None), self.last_request_at
@@ -362,7 +340,6 @@ class Service:
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
-            # one request at a time (more wait their turn), or "parallel": N batch slots
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
@@ -381,10 +358,8 @@ class Service:
                         "total_gib": scaled(ram.get("ram_total"), 2 ** 30, 1)} if ram.get("ram_total") else None}}
 
     def render_prompt(self, messages, tools, kwargs) -> str:
-        """The template rendered.  With `effort_end`, a request with a non-default effort (low, medium or no
-        thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
-        keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
-        empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        """Render the template. With `effort_end`, a non-default effort is rendered as the default up to the answer
+        (same prefix, cache kept) and follows as a short system turn right before it."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -393,16 +368,14 @@ class Service:
         history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
         full = self.template.render(messages, tools=tools, add_generation_prompt=True, **kwargs)
         mine = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
-        if not full.startswith(mine):                  # a template this cannot take apart: rendered as asked
+        if not full.startswith(mine):                  # a template that cannot be split: render as asked
             return full
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
     def encode_prompt(self, messages, tools, kwargs) -> list[int]:
-        """The request's prompt: the template rendered and tokenized.  A <think> / </think> written inside a
-        message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
-        A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
-        the control tokens the template writes are control tokens."""
+        """The rendered, tokenized prompt. Think tags and control-token text inside messages stay plain text; only
+        the template's own are special."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
@@ -411,8 +384,7 @@ class Service:
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
     def prepare(self, messages, tools, kwargs, max_new=None):
-        """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-        the rest of the context."""
+        """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context."""
         ids = self.encode_prompt(messages, tools, kwargs)
         self.embeddings.path = None
         images = images_of(messages)
@@ -422,20 +394,15 @@ class Service:
                                  "so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
-            # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
-            # run on the GPU at the same time - an encode during a running request left that request stuck at
-            # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
-            # same FIFO as the requests.
+            # encode under the fifo: the encoder and a running engine must not use the GPU together
             with self.fifo:
                 encoded = [self.vision.encode(src) for src in images]
-            # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
-            # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
-            # say) is kept as plain text: it must not take an image's place, or the counts would not match.
+            # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
-                    # more pairs than images: text parts that cut both markers apart (whole ones are kept as text)
+                    # more markers than images
                     if k == len(encoded):
                         raise ValueError("the prompt and its images do not match")
                     out += [pad] * encoded[k][1]
@@ -454,10 +421,9 @@ class Service:
             self.embeddings.path = combined
         ctx = self.engine.max_context
         if ctx <= 0:
-            if getattr(self.engine, "starting", False):   # (re)starting, not a prompt that is too long
+            if getattr(self.engine, "starting", False):   # starting, not an oversized prompt
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-            # a failed restart leaves max_context 0: check against the last known context, so the request reaches
-            # run() - which starts the engine again - instead of failing with "exceeds the context (0)" forever
+            # a failed restart leaves max_context 0: use the last known context so run() can restart the engine
             ctx = getattr(self.engine, "known_ctx", 0)
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
@@ -473,7 +439,7 @@ class Service:
                                  f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
                                  "model's <model>.json to shorten it to the room left")
-            max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+            max_new = max(1, room)          # fit_max_tokens: shorten rather than 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     def _note(self, n, evs, st=None, rate=None):
@@ -482,7 +448,7 @@ class Service:
             s["generated"] = n
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
-            (self.rate if rate is None else rate).append((time.time(), n))   # the live rate's window (RATE_WINDOW_S)
+            (self.rate if rate is None else rate).append((time.time(), n))   # live rate window
             for ev in evs:
                 if ev.kind == "reasoning":
                     s["phase"] = "thinking"
@@ -495,7 +461,7 @@ class Service:
                 s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-600:]
 
     def _progress(self, last_print, every=1.0, st=None):
-        """A progress line in the server window every `every` seconds while a request runs."""
+        """Print a progress line at most every `every` seconds while a request runs."""
         now = time.time()
         if now - last_print < every:
             return last_print
@@ -503,7 +469,7 @@ class Service:
             s = dict(self.status if st is None else st)
         el = now - s.get("started", now)
         if s.get("first_token") is None:
-            pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
+            pr = getattr(self.engine, "progress", None)   # (position, prompt tokens); a reused prefix counts as read
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read
             print(f"[server] reading the prompt: {done} tokens, {el:.0f} s", flush=True)
         else:
@@ -513,58 +479,55 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
-        budget = self.reasoning_budget(sampling) if thinking else None   # opt-in, off by default
-        if self.sampling_defaults:     # the request's own fields win (explicit 0 stays greedy)
+        """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...})."""
+        budget = self.reasoning_budget(sampling) if thinking else None   # opt-in
+        if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
-        run_tok, run_len, repeated = None, 0, False     # the current run of one repeated token
-        thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
+        run_tok, run_len, repeated = None, 0, False     # current run of one repeated token
+        thinking_n = 0                                  # tokens written while thinking
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
         def cut(evs):
-            """The events with the answer's text cut at a stop string (OpenAI stop, Anthropic stop_sequences)."""
+            """The events with the answer text cut at a stop string."""
             if stops is None:
                 return evs
             out = []
             for ev in evs:
                 if stops.hit is not None:
-                    break                               # nothing after the stop string is sent
+                    break                               # nothing after the stop string
                 if ev.kind == "content":
                     text = stops.push(ev.text or "")
                     if text:
                         out.append(Event("content", text))
                     continue
-                held = stops.flush()                    # a stop string does not run across a tool call or thinking
+                held = stops.flush()                    # a stop string does not span a tool call or thinking
                 if held:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
         timings, before = None, None                    # this request's timings; the engine's `last` before it
-        raw_ids = []                                    # every generated id (--debug: dump raw model text)
+        raw_ids = []                                    # every generated id (--debug)
         emb = getattr(self.embeddings, "path", None)
-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
+        # identity token: only a DONE line replaces engine.last, so a request without one records no stale figures
         engine_last0 = getattr(self.engine, "last", None)
-        path = getattr(self.request_ctx, "path", None)   # the API path serving this request (GET /metrics)
-        # with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
-        # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
+        path = getattr(self.request_ctx, "path", None)   # the API path serving this request
+        # parallel requests keep their own status and rate window; otherwise self.status / self.rate
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
         try:
-            # --batch: the engine runs several requests at once (ProcessEngine.generate_batched orders them)
+            # batch slots run requests concurrently, so no fifo
             with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
                 try:
                     with self.status_lock:
                         self.status["queued"] -= 1
-                    # it died in an earlier request (or was unloaded) - start it again instead of failing
-                    # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
+                    # restart a dead or unloaded engine; parallel requests serialize this start on the fifo
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
                     with self.status_lock:
@@ -575,19 +538,19 @@ class Service:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
                         self.last_request_at = time.time()
-                        rate.clear()                    # the previous request's samples must not leak into this one
+                        rate.clear()                    # drop the previous request's samples
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
-                    prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
-                    closed_early = False                # the thinking was closed once after the turn ended in it
+                    prompt, thought = ids, 0            # reasoning tokens so far
+                    closed_early = False                # the thinking was already closed once
                     while True:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
-                        seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
-                        ended_thinking = False          # the turn ended inside the thinking: close it and answer
+                        seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
+                        ended_thinking = False          # the turn ended inside the thinking
                         try:
                             for t in gen:
-                                if t is None:               # heartbeat while the engine is quiet
+                                if t is None:               # heartbeat
                                     last_print = self._progress(last_print, st=st)
                                     yield "ping", None
                                     continue
@@ -595,7 +558,7 @@ class Service:
                                 if t in self.stop_ids:
                                     if (parser.state == "reasoning" and not closed_early and not parser.buf
                                             and not detok.pending()):
-                                        n -= 1              # the end token is dropped, not part of the reply
+                                        n -= 1              # the end token is not part of the reply
                                         ended_thinking = True
                                         break
                                     finish = "stop"
@@ -607,7 +570,7 @@ class Service:
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
-                                    repeated = True     # a degenerate output, not an answer: end it here
+                                    repeated = True     # degenerate output
                                     break
                                 evs = cut(parser.feed(detok.push(t)))
                                 self._note(n, evs, st, rate)
@@ -615,11 +578,11 @@ class Service:
                                 for ev in evs:
                                     yield "event", ev
                                 if stops is not None and stops.hit is not None:
-                                    finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
+                                    finish = "stop"         # gen.close() below STOPs the engine
                                     break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
-                                    # at a clean point: no tag held back, no character split across tokens
+                                    # only at a clean point: no held tag or split character
                                     if thought >= budget and not parser.buf and not detok.pending():
                                         wrap = True
                                         break
@@ -627,29 +590,25 @@ class Service:
                             finish = "error"
                             self._say_died(e)
                             raise
-                        except ValueError as e:             # the engine's ERR line (it may have ended after it)
+                        except ValueError as e:             # the engine's ERR line
                             finish = "error"
                             print(f"[server] error: engine reported {e}", flush=True)
                             raise
-                        except GeneratorExit:               # the client went away: an engine that never acknowledges
-                            leaving = True                  # the STOP below is ended, but no error replaces this
+                        except GeneratorExit:               # the client went away
+                            leaving = True                  # an unacknowledged STOP below must not replace this
                             raise
                         finally:
                             try:
-                                gen.close()             # STOP+drain to THIS request's DONE while still holding the
-                                #                         fifo, so a stop-token break can't leave the shared engine
-                                #                         queue mid-drain for the next request to read as its own DONE
-                            except EngineSilent as e:   # the STOP was never acknowledged: the engine is ended
+                                gen.close()             # STOP and drain to this request's DONE under the fifo
+                            except EngineSilent as e:   # the STOP was never acknowledged
                                 finish = "error"
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
                         if not (wrap or ended_thinking) or cancel.is_set():
                             break
-                        # the thinking reached reasoning_budget_tokens, or the model ended its turn inside it.  Close
-                        # it the way the model would (for the budget, a short wrap-up first) and let it answer: the
-                        # next pass's prompt is this one plus what was generated plus the close, so the engine
-                        # continues from the prefix it already holds.
+                        # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
+                        # one, so the engine keeps its prefix
                         if ended_thinking:
                             closed_early = True
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
@@ -661,7 +620,7 @@ class Service:
                             budget = None
                             extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
                             if max_new - n - len(extra) < 1:
-                                break                   # no room left to answer: "length", as without a budget
+                                break                   # no room to answer: "length"
                             print(f"[server] thinking budget reached ({thought} tokens), wrapping up",
                                   flush=True)
                         for t in extra:
@@ -681,26 +640,23 @@ class Service:
                     elif repeated:
                         print(f"[server] warning: the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times, stopped as length (repeat_stop_tokens, 0 = off)", flush=True)
-                except GeneratorExit:                   # the client disconnected mid-stream
+                except GeneratorExit:                   # client disconnected
                     finish = "disconnect"
                     raise
                 finally:
-                    # settle this request's status and history while still holding the fifo: once
-                    # it is released the next request sets its own status, which this must not record or clear
+                    # settle status and history under the fifo, before the next request sets its own
                     with self.status_lock:
                         if st.get("busy"):
-                            # only this request's DONE counts: same object means no DONE arrived (death, error,
-                            # disconnect)
+                            # same object as before: no DONE arrived
                             last = dict(getattr(self.engine, "last", {}) or {}) \
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
                             started = st.get("started", time.time())
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                            # the share the GPU read over PCIe (--pcie-frac) or another GPU computed - not in
-                            # the hit rate's lookups, which is the VRAM share of the rest (None: an older engine)
+                            # experts read over PCIe or computed elsewhere are not in the hit rate's lookups
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
-                            seen = prompt_tokens_seen(len(ids), last)   # < len(ids) when cancelled mid-read
+                            seen = prompt_tokens_seen(len(ids), last)   # less than len(ids) when cancelled mid-read
                             self.requests_done += 1
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path,
@@ -710,11 +666,10 @@ class Service:
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share,
-                                # the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
                             fresh = getattr(self.engine, "last", None)
-                            if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                            if fresh is not None and fresh is not before:      # a DONE line arrived for this request
                                 timings = request_timings(seen, n, last)
                                 self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
@@ -727,13 +682,13 @@ class Service:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             print(f"[server] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                            if finish == "length" and parser.state == "reasoning":   # 0
+                            if finish == "length" and parser.state == "reasoning":
                                 print("[server] warning: max tokens reached while thinking, no answer "
                                       "(set reasoning_budget_tokens)", flush=True)
                             if DEBUG and raw_ids:
                                 print(f"[server] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
-                        st.pop("tail", None)                     # the answer's end is not kept once it is done
+                        st.pop("tail", None)                     # drop the tail once done
                         st.pop("tool", None)
                         if par:
                             self.live_reqs.pop(id(st), None)
@@ -749,7 +704,7 @@ class Service:
         for ev in cut(parser.finish()):
             yield "event", ev
         if stops is not None and stops.hit is None and stops.held:
-            yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
+            yield "event", Event("content", stops.flush())     # the held tail was not a stop string
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n}
         if stops is not None and stops.hit is not None:
@@ -758,10 +713,7 @@ class Service:
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
-    """The prompt tokens a request got through - all of them, unless the engine's DONE line says a cancel stopped
-    its prompt read part-way (then the reused ones plus those read).  /metrics' history counts these, so a
-    cancelled read is neither recorded as the whole prompt nor given a rate from tokens it never read.  An engine
-    that does not say (no `prompt_read`): the whole prompt, as before."""
+    """Prompt tokens a request got through: all, unless the DONE line shows a cancel mid-read (reused + read)."""
     read = last.get("prompt_read")
     if read is None or last.get("finish") != "cancel":
         return prompt_tokens
@@ -769,27 +721,25 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
-    """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
-    (ProcessEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
-    engine keeps no clock (MockEngine)."""
+    """A request's `timings` in llama.cpp's names from the engine's DONE figures; None without an engine clock."""
     if last.get("prompt_ms") is None:
         return None
     cache_n = int(last.get("reused") or 0)
     prompt_n, prompt_ms, decode_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
-    decoded = int(last.get("generated") or generated)          # the engine's count gives its rate, as /metrics does
+    decoded = int(last.get("generated") or generated)          # the engine's count gives the rate
     return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
             "prompt_per_token_ms": round(prompt_ms / prompt_n, 3) if prompt_n else None,
             "prompt_per_second": round(prompt_n / (prompt_ms / 1000), 1) if prompt_n and prompt_ms > 0 else None,
             "predicted_n": generated, "predicted_ms": round(decode_ms, 1),
             "predicted_per_token_ms": round(decode_ms / decoded, 3) if decoded else None,
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
-            # the speculative drafts, as llama.cpp names them: only when the engine reported them
+            # draft counts only when reported
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
-    """One compact line per request while diagnosing blank/empty turns. Enabled by --debug."""
+    """--debug: one compact line per request."""
     if not DEBUG:
         return
     last = messages[-1] if messages else {}

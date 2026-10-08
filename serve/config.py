@@ -1,4 +1,4 @@
-"""Server settings: the command-line parser, the --config file, engine flag checks and the startup lines about them."""
+"""Server settings: the command-line parser, the --config file and engine flag checks."""
 from __future__ import annotations
 
 import argparse
@@ -12,13 +12,13 @@ from serve.security import exposed_without_key
 
 
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
-# server options that are really engine flags: their home in the config file is "engine"
+# server options that are engine flags (the "engine" section of the config file)
 ENGINE_PASSTHROUGH = ("spec", "spec-min-p", "mtp-max-t", "peer-exclusive", "max-context")
-CONFIG_PATHS = ("model", "tokenizer")       # resolved against the config file's directory
+CONFIG_PATHS = ("model", "tokenizer")       # relative to the config file
 
 
 def engine_flags_of(engine_bin: str) -> set[str] | None:
-    """The long flags the engine binary accepts (the option strings stored in it); None when it cannot be read."""
+    """The long flags the engine binary accepts; None when it cannot be read."""
     try:
         with open(engine_bin, "rb") as f:
             data = f.read()
@@ -34,9 +34,8 @@ def server_options(ap: argparse.ArgumentParser) -> dict:
 
 
 def split_engine_extras(extras: list[str]) -> dict:
-    """The engine flags among the command-line words the server does not know: `--flag VALUE`, `--flag=VALUE` or a
-    bare `--flag` (a switch).  A word after a flag that does not start with `--` is its value.  ValueError for a
-    stray word."""
+    """Engine flags among the unknown command-line words: `--flag VALUE`, `--flag=VALUE` or a bare switch;
+    ValueError for a stray word."""
     out, i = {}, 0
     while i < len(extras):
         word = extras[i]
@@ -55,11 +54,9 @@ def split_engine_extras(extras: list[str]) -> dict:
 
 
 def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str], dict]:
-    """(argv, engine) from a --config JSON file: {"server": {...}, "engine": {...}}.  `server` holds the server's
-    options (name with or without the dashes -> a string or number, true/false for a switch, a list for the
-    repeatable ones); it comes back as the command-line words they stand for, so every command-line check applies
-    to it.  `engine` holds engine flags ({"--flag": value}, true for a switch, false to leave it off).  model, engine-bin
-    and tokenizer paths are relative to the file.  ValueError for anything else."""
+    """(argv, engine) from a --config JSON file {"server": {...}, "engine": {...}}. `server` options become
+    command-line words so every command-line check applies; `engine` maps flags to values (true: switch, false:
+    off). Paths are relative to the file; ValueError for anything else."""
     try:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
@@ -118,16 +115,15 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
 
 
 def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
-    """(args, argv, file_engine, cli_engine): the parsed server options and the words they came from (the config
-    file's, then the command line's); the engine flags the config file and the command line set.  Command line >
-    config file > defaults.  SystemExit(2) from argparse for a bad value; ValueError for a bad config or extra word."""
+    """(args, argv, file_engine, cli_engine): parsed options, their source words and the engine flags from each.
+    Command line > config file > defaults; SystemExit(2) for a bad value, ValueError for a bad config or stray word."""
     a_cli, extras = ap.parse_known_args(cli)
     cli_engine = split_engine_extras(extras)
     file_argv, file_engine = [], {}
     if a_cli.config:
         file_argv, file_engine = load_config_file(a_cli.config, ap)
     a = ap.parse_known_args(file_argv + cli)[0]
-    for act in ap._actions:                                # a repeatable option on the command line replaces the file's
+    for act in ap._actions:                                # a repeatable command-line option replaces the file's
         if isinstance(act, argparse._AppendAction) and getattr(a_cli, act.dest) != act.default:
             setattr(a, act.dest, getattr(a_cli, act.dest))
     for flag, value in (("--spec", a.spec), ("--spec-min-p", a.spec_min_p), ("--mtp-max-t", a.mtp_max_t),
@@ -142,14 +138,14 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
 
 
 def check_engine_flags(flags: dict, known: set[str] | None, where: str) -> None:
-    """ValueError naming the first flag the engine does not accept (unchecked when the binary cannot be read)."""
+    """ValueError naming the first flag the engine rejects (unchecked when the binary is unreadable)."""
     for flag in flags:
         if known is not None and flag not in known:
             raise ValueError(f"{where}: {flag} is not an engine flag")
 
 
 def engine_settings(file_flags: dict, cli_flags: dict) -> tuple[dict, dict]:
-    """(flags, sources): the config file's flags overridden by the command line's, and where each came from."""
+    """(flags, sources): the config file's flags overridden by the command line's, with each one's origin."""
     flags, sources = {}, {}
     for src, items in (("config", file_flags), ("cli", cli_flags)):
         for flag, value in items.items():
@@ -158,8 +154,8 @@ def engine_settings(file_flags: dict, cli_flags: dict) -> tuple[dict, dict]:
 
 
 def engine_line(flags: dict, sources: dict, config: bool = True) -> str:
-    """The startup line listing the engine settings that came from --config or the command line.  Without a
-    config file it warns that the engine's untuned built-in defaults apply."""
+    """The startup line listing engine settings from --config or the command line; without a config file it says
+    the built-in defaults apply."""
     shown = ", ".join(f"no {f} ({sources[f]})" if v is False else f"{f}{'' if v is True else f' {v}'} ({sources[f]})"
                       for f, v in flags.items())
     if config:
@@ -170,12 +166,9 @@ def engine_line(flags: dict, sources: dict, config: bool = True) -> str:
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
-    """The model file's optional `sampling` block: defaults for the sampling fields a request leaves out, so
-    a plain client gets the model's sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
-    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
-    always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
-    A bad value refuses to start the server (a typo'd value should not quietly change sampling); unknown keys
-    are named at startup and ignored."""
+    """The model file's `sampling` block: defaults for fields a request omits (temperature, top_p, top_k, min_p,
+    presence/repetition/frequency penalties, penalty_last_n, seed). Request fields win; a bad value refuses to
+    start; unknown keys are named and ignored."""
     out = {}
     for key, value in (cfg.get("sampling") or {}).items():
         if value is None:
@@ -233,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mock-engine", action="store_true",
                     help="run a scripted engine instead of the model, for clients and tests (no --model needed)")
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
-    ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`; given by hand for development
+    ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
     ap.add_argument("--spec", type=int, help="tokens per verify window, the drafter's cap (default: the model file's; "
                                              "0 = no speculation, the drafter is not loaded)")
