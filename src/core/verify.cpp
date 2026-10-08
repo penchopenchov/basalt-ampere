@@ -3091,9 +3091,13 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
 bool Verifier::commit_slots(std::string& err) { return commit_slots(nullptr, err); }
 
 bool Verifier::commit_slots(const int* n_keep, std::string& err) {
+    return commit_slots_begin(n_keep, err) && commit_slots_end(err);
+}
+
+bool Verifier::commit_slots_begin(const int* n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
-    const Clock::time_point t0 = Clock::now();
+    commit_t0_ = Clock::now();
     const int64_t CB = 2 + max_t_;
     if (n_keep != nullptr) {
         for (int sg = 0; sg < last_nseg_; ++sg)
@@ -3110,8 +3114,7 @@ bool Verifier::commit_slots(const int* n_keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_bm_[last_t_], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+    // (the PLE history the commit leaves is known from the tokens: it advances now, the graph runs beside the caller)
     if (ple_stage())
         for (int sg = 0, r0 = 0; sg < last_nseg_; r0 += last_seg_len_[sg], ++sg) {
             SessionState& sx = *slots_[(size_t) last_seg_slot_[sg]];
@@ -3121,8 +3124,16 @@ bool Verifier::commit_slots(const int* n_keep, std::string& err) {
                 sx.ple_prev[1] = last_tokens_[r0 + j];
             }
         }
-    ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit_slots(n_keep, err);
+    commit_next_keep_.assign(n_keep != nullptr ? n_keep : nullptr, n_keep != nullptr ? n_keep + last_nseg_ : nullptr);
+    return true;
+}
+
+bool Verifier::commit_slots_end(std::string& err) {
+    const OnDevice on_device(device_);
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+    ms_commit += ms_since(commit_t0_);
+    return next_ == nullptr || next_->commit_slots(commit_next_keep_.empty() ? nullptr : commit_next_keep_.data(), err);
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {

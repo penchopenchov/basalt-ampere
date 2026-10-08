@@ -230,6 +230,10 @@ public:
     /// Keep the first n_keep[s] (1..lens[s]) rows of segment s: its slot's state advances by those tokens only and
     /// is exactly what a solo commit of that many leaves.
     bool commit_slots(const int* n_keep, std::string& err);
+    /// The same in two halves: `begin` stages the counts and launches the commit graph, `end` waits for it.  What
+    /// does not read the committed state (the draft layer from the window's rows) can run between them.
+    bool commit_slots_begin(const int* n_keep, std::string& err);
+    bool commit_slots_end(std::string& err);
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -306,6 +310,8 @@ private:
     std::map<int, cudaGraphExec_t> commit_bm_;
     int last_rows_[8] = {};                ///< the slot of each row of the last batch window
     int last_nseg_ = 0, last_seg_slot_[8] = {}, last_seg_len_[8] = {};   ///< its segments
+    std::chrono::steady_clock::time_point commit_t0_;   ///< commit_slots_begin
+    std::vector<int> commit_next_keep_;                 ///< its counts, for the next stage
     uint64_t bkey(int S, int hbase) const {
         return batch_key(S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
     }
