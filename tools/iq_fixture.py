@@ -7,12 +7,12 @@ dequantized by the same library the comparison treats as ground truth):
     python tools/iq_fixture.py --out build/iq_fixture
     python tools/iq_fixture.py --out build/iq_fixture --seed 7 --rows 32 --cols 256
 
-Deterministic: a seed and fixed dimensions drive every random choice. gguf-py only dequantizes i-quants, so
+Deterministic: a seed and fixed dimensions drive every random choice. The i-quants are only dequantized (tools/ggufq.py), so
 each block pairs a sane fp16 scale (at the layout's scale offsets) with seeded index and sub-scale bytes.
 
-Needs numpy and the vendored gguf-py (third_party/llama.cpp/gguf-py). Q2_0 (GGML type 42, absent from gguf-py) is
+Needs numpy. Q2_0 (GGML type 42, not in ggufq) is
 encoded by tools/gguf_writer.py. The kernel ids in the .bin headers match the repo's i-quant dispatch table and the
-vendored gguf-py enum ids.
+ggufq enum ids.
 """
 from __future__ import annotations
 
@@ -24,23 +24,21 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "third_party" / "llama.cpp" / "gguf-py"))
 sys.path.insert(0, str(ROOT / "tools"))
 
 try:
-    import gguf
-    from gguf.quants import dequantize as gguf_dequantize
+    import ggufq
+    from ggufq import dequantize as gguf_dequantize
     from gguf_writer import dequantize_q2_0, quantize_q2_0
 except ImportError as e:  # say so plainly instead of a traceback
     sys.stderr.write(f"iq_fixture: missing dependency: {e}\n"
-                     "numpy and the repository's vendored gguf-py (third_party/llama.cpp/gguf-py) are "
-                     "required: put a llama.cpp checkout's gguf-py there.\n")
+                     "numpy is required.\n")
     sys.exit(3)
 
-QT = gguf.GGMLQuantizationType
-# name -> (block values, block bytes), mirroring gguf-py's dequantize_blocks; scales sit at fixed offsets
+QT = ggufq.GGMLQuantizationType
+# name -> (block values, block bytes), mirroring ggufq's dequantize_blocks; scales sit at fixed offsets
 # and the rest of a block is seeded random indices and sub-scales
-LAYOUT = {   # equals the vendored GGML_QUANT_SIZES and the kernels' sizes
+LAYOUT = {   # equals ggufq's GGML_QUANT_SIZES and the kernels' sizes
     "IQ2_XXS": (256,  66),
     "IQ2_XS":  (256,  74),
     "IQ2_S":   (256,  82),
@@ -67,7 +65,7 @@ def repair_scales(name: str, raw: np.ndarray) -> None:
             raw[:, byte] |= np.uint8(nib)
         return
     raw[:, 0:2] = np.frombuffer(HALF_ONE, dtype=np.uint8)
-# name -> kernel type id for the .bin header (equal to the gguf-py enum id)
+# name -> kernel type id for the .bin header (equal to the ggufq enum id)
 KERNEL_IDS = {"IQ2_XXS": 16, "IQ2_XS": 17, "IQ2_S": 22, "IQ3_XXS": 18, "IQ3_S": 21,
               "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11}
 
@@ -77,7 +75,7 @@ def build(name: str, rows: int, cols: int, seed: int):
     kernel_type = KERNEL_IDS[name]
     n = rows * cols
     rng = np.random.RandomState((seed, hash(name) & 0xFFFF) if False else (seed, KERNEL_IDS[name]))
-    if name == "Q2_0":                                 # gguf-py has no type 42
+    if name == "Q2_0":                                 # ggufq has no type 42
         w = rng.standard_normal(n).astype(np.float32)
         raw = np.frombuffer(quantize_q2_0(w), dtype=np.uint8)
         ref = dequantize_q2_0(raw.tobytes()).astype(np.float32)
@@ -91,7 +89,7 @@ def build(name: str, rows: int, cols: int, seed: int):
         ref = np.asarray(gguf_dequantize(flat, getattr(QT, name)), dtype=np.float32)
     if not np.isfinite(ref).all() or float(np.abs(ref).max()) > 1e4:
         raise RuntimeError(f"{name}: the dequantized reference is not finite/tame - the layout table "
-                           f"(block bytes, scale offsets) does not match gguf-py's dequantizer")
+                           f"(block bytes, scale offsets) does not match ggufq's dequantizer")
     header = struct.pack("<3i", kernel_type, rows, cols)
     return header + flat.tobytes(), ref
 

@@ -5,7 +5,7 @@
   mtp/dense, mtp/dense.index, mtp/experts  the draft layer from the BF16 `mtp.*` tensors (tools/convert/mtp_fetch.py)
   profile                   the expert ranking from routing traces or an existing profile
 
-Sections are produced as byte-chunk iterators for ModelWriter.add_chunks. Needs numpy; gguf-py only for --compat-bf16.
+Sections are produced as byte-chunk iterators for ModelWriter.add_chunks. Needs numpy.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import numpy as np
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+import ggufq  # noqa: E402
 from gguf_reader import GGUFFile  # noqa: E402
 
 
@@ -141,28 +142,22 @@ def is_expert(name: str) -> bool:
 
 # ------------------------------------------------------------------ dense
 def _dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
-    """The tensor's values as float32 (floats exactly, quantized types through gguf-py's dequantizer)."""
+    """The tensor's values as float32 (floats exactly, quantized types through tools/ggufq.py)."""
     if type_name == "F32":
         return raw.view(np.float32)
     if type_name == "F16":
         return raw.view(np.float16).astype(np.float32)
     if type_name == "BF16":
         return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
-    return quants.dequantize(raw, Q[type_name]).astype(np.float32).reshape(-1)
+    return ggufq.dequantize(raw, ggufq.GGMLQuantizationType[type_name]).astype(np.float32).reshape(-1)
 
 
 def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
     """Round-to-nearest-even BF16 of the tensor's values (ggml's conversion, halfway cases included)."""
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
-    values = quants.dequantize(raw, Q[type_name])
+    values = ggufq.dequantize(raw, ggufq.GGMLQuantizationType[type_name])
     if not np.isfinite(values).all():
         raise ValueError("cannot convert non-finite weights to BF16")
-    return quants.quantize(values, Q.BF16).tobytes()
+    return ggufq.quantize(values, ggufq.GGMLQuantizationType.BF16).tobytes()
 
 
 def f16_values(values: np.ndarray, name: str) -> np.ndarray:

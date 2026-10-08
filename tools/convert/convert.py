@@ -17,7 +17,7 @@ Inputs
 Options
   --name NAME        the model's name, reported by the server
   --compat-bf16      convert small projections stored in another form to BF16 (round-to-nearest-even, recorded in
-                     meta.conversions); needs llama.cpp's gguf-py in third_party/llama.cpp
+                     meta.conversions)
   --no-vision        leave out the vision projector
   --force            overwrite --out
 
@@ -296,7 +296,7 @@ def main():
     ap.add_argument("--hc8", metavar="FILE", help="file written by `basalt generate --model ... --dump-hc8`")
     ap.add_argument("--name", default="Qwen3.8-Flash-Next IQ3_XXS")
     ap.add_argument("--compat-bf16", action="store_true",
-                    help="convert small projections stored in another form to BF16 (rounds; needs gguf-py)")
+                    help="convert small projections stored in another form to BF16 (rounds)")
     ap.add_argument("--no-vision", action="store_true")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     a = ap.parse_args()
