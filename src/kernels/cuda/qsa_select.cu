@@ -559,7 +559,6 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
         for (int q = 0; q < nq; ++q) all = all && steps[q * kStepCount + kStepNKv] <= steps[q * kStepCount + kStepWidth];
         if (all) return;
     }
-    for (int i = threadIdx.x; i < nq * IDX_HEADS * IDX_DIM; i += blockDim.x) qs[i] = q_idx[i];
     if (threadIdx.x < nq) {
         s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
         s_nbid[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNBid];
@@ -567,6 +566,12 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
     __syncthreads();
     int64_t top = 0;
     for (int q = 0; q < nq; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
+    // A CTA whose first block is past the batch's largest n_bid has no work: the grid is fixed and a decode window
+    // reaches only a few of its CTAs, so the rest return before staging the queries. top and blockIdx are CTA-uniform,
+    // so every thread takes the same branch and the barrier below is safe.
+    if ((int64_t) blockIdx.x * SCORE_WARPS > top) return;
+    for (int i = threadIdx.x; i < nq * IDX_HEADS * IDX_DIM; i += blockDim.x) qs[i] = q_idx[i];
+    __syncthreads();
     const int lane = threadIdx.x & 31;
     const int64_t wstride = (int64_t) gridDim.x * SCORE_WARPS;
     for (int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5); b <= top && b < max_blocks; b += wstride) {
