@@ -138,6 +138,9 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
+    for (auto& st : stores_)
+        for (void* a : st) if (a) cudaFree(a);
+    if (rstage_) cudaFree(rstage_);
     for (auto& row : round_exec_)
         for (auto& e : row) if (e) cudaGraphExecDestroy(e);
     for (auto& row : step_exec_)
@@ -352,6 +355,25 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
+    cur_ = n_stores_;
+    if (n_stores_ > 0) {   // one K/V per slot beside the working one (batch windows)
+        KvArr lay[4];
+        const int na = kv_layout(lay);
+        if (st_.kv_mode != 0 || na == 0) {
+            std::fprintf(stderr, "basalt mtp: batch windows need the draft layer's K/V fully resident; no drafts there\n");
+            n_stores_ = cur_ = 0;
+        } else {
+            stores_.assign((size_t) n_stores_ + 1, std::array<void*, 4>{});
+            store_hi_.assign((size_t) n_stores_ + 1, 0);
+            for (auto& st : stores_)
+                for (int i = 0; i < na; ++i) {
+                    const uint64_t bytes = (uint64_t) st_.n_pages * lay[i].page_bytes;
+                    if (cudaMalloc(&st[(size_t) i], bytes) != cudaSuccess) { err = "mtp: the slots' K/V do not fit"; return false; }
+                    cudaMemset(st[(size_t) i], 0, bytes);
+                    vram_ += bytes;
+                }
+        }
+    }
 
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;
@@ -404,6 +426,10 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     real.base = (uint8_t*) arena_;
     carve(real);
     vram_ += count.used;
+    if (n_stores_ > 0) {
+        if (cudaMalloc((void**) &rstage_, T * HC * N * sizeof(float)) != cudaSuccess) { err = "mtp: row staging"; return false; }
+        vram_ += T * HC * N * sizeof(float);
+    }
     {
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
@@ -1238,7 +1264,13 @@ void MtpDrafter::kv_restore(int64_t upto) {
 }
 
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+    if (!use_main(err)) return false;
+    return prefill_cur(R_rows, next_tokens, n, cell0, err);
+}
+
+bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     const OnDevice on_device(device_);
+    note_cells(cell0, cell0 + n);
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
     // cells the window can never reach again need no K/V
@@ -1341,6 +1373,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    note_cells(p, p + T + max_t_ + 1);
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (n_xcap_ > 0) {   // the window's committed picks (rows 0..a) may hold names the subset lacks
         for (int t = 0; t <= a; ++t) ctx_note(tokens[t]);
@@ -1504,6 +1537,107 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
+}
+
+int MtpDrafter::kv_layout(KvArr* out) const {
+    const basalt::kernels::QsaShapes s = shapes_of(*g_);
+    const uint64_t rows = (uint64_t) s.n_head_kv * (uint64_t) s.page_size;
+    const uint64_t hd = (uint64_t) s.head_dim;
+    if (st_.kv_hybrid) return 0;
+    if (st_.kv_q4) {
+        const uint64_t q4 = rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+        out[0] = {st_.k_q4, q4};
+        out[1] = {st_.v_q4, q4};
+        return 2;
+    }
+    if (st_.kv_int8) {
+        const uint64_t sc = rows * (hd / basalt::kernels::KV_Q8_GROUP) * 2;
+        out[0] = {st_.k_q, rows * hd};
+        out[1] = {st_.v_q, rows * hd};
+        out[2] = {st_.k_scale, sc};
+        out[3] = {st_.v_scale, sc};
+        return 4;
+    }
+    out[0] = {st_.k_pool, rows * hd * 2};
+    out[1] = {st_.v_pool, rows * hd * 2};
+    return 2;
+}
+
+void MtpDrafter::note_cells(int64_t lo, int64_t hi) {
+    hi = std::min(hi, st_.max_cells);
+    if (hi <= lo) return;
+    if (dirty_hi_ <= dirty_lo_) { dirty_lo_ = lo; dirty_hi_ = hi; }
+    else { dirty_lo_ = std::min(dirty_lo_, lo); dirty_hi_ = std::max(dirty_hi_, hi); }
+    if (!store_hi_.empty()) store_hi_[(size_t) cur_] = std::max(store_hi_[(size_t) cur_], hi);
+}
+
+bool MtpDrafter::use_store(int id, std::string& err) {
+    if (id == cur_) return true;
+    if (id < 0 || id > n_stores_) { err = "mtp: no such K/V store"; return false; }
+    const OnDevice on_device(device_);
+    KvArr lay[4];
+    const int na = kv_layout(lay);
+    const int64_t ps = shapes_of(*g_).page_size;
+    if (dirty_hi_ > dirty_lo_) {   // the written pages go back to the sequence that held them
+        const int64_t pg0 = dirty_lo_ / ps, pg1 = std::min<int64_t>(st_.n_pages, (dirty_hi_ + ps - 1) / ps);
+        for (int i = 0; i < na; ++i)
+            cudaMemcpyAsync((uint8_t*) stores_[(size_t) cur_][(size_t) i] + pg0 * lay[i].page_bytes,
+                            (const uint8_t*) lay[i].p + pg0 * lay[i].page_bytes, (size_t) ((pg1 - pg0) * lay[i].page_bytes),
+                            cudaMemcpyDeviceToDevice, cs_);
+    }
+    const int64_t n1 = std::min<int64_t>(st_.n_pages, (store_hi_[(size_t) id] + ps - 1) / ps);
+    for (int i = 0; i < na && n1 > 0; ++i)
+        cudaMemcpyAsync(lay[i].p, stores_[(size_t) id][(size_t) i], (size_t) ((uint64_t) n1 * lay[i].page_bytes),
+                        cudaMemcpyDeviceToDevice, cs_);
+    cur_ = id;
+    dirty_lo_ = dirty_hi_ = 0;
+    if (cudaGetLastError() != cudaSuccess) { err = "mtp: swapping the K/V failed"; return false; }
+    return true;
+}
+
+bool MtpDrafter::copy_store(int from, int to, int64_t cells, std::string& err) {
+    if (n_stores_ == 0 || from == to) return true;
+    if (from < 0 || from > n_stores_ || to < 0 || to > n_stores_) { err = "mtp: no such K/V store"; return false; }
+    const OnDevice on_device(device_);
+    KvArr lay[4];
+    const int na = kv_layout(lay);
+    const int64_t ps = shapes_of(*g_).page_size;
+    const int64_t n1 = std::min<int64_t>(st_.n_pages, (cells + ps - 1) / ps);
+    for (int i = 0; i < na && n1 > 0; ++i)
+        cudaMemcpyAsync(store_ptr(to, i, lay), store_ptr(from, i, lay), (size_t) ((uint64_t) n1 * lay[i].page_bytes),
+                        cudaMemcpyDeviceToDevice, cs_);
+    if (to == cur_) note_cells(0, cells);
+    store_hi_[(size_t) to] = std::min<int64_t>(cells, st_.max_cells);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: copying the K/V failed"; return false; }
+    return true;
+}
+
+QsaState& MtpDrafter::kv_state_rw() {
+    std::string e;
+    if (!use_main(e)) std::fprintf(stderr, "basalt mtp: %s\n", e.c_str());
+    note_cells(0, prompt_len_ > 0 ? prompt_len_ : st_.max_cells);
+    return st_;
+}
+
+bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts,
+                           std::string& err, float* probs, float min_p, int* n_drafts) {
+    if (!use_store(id, err)) return false;
+    const OnDevice on_device(device_);
+    const size_t bytes = (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float);
+    if (R_rows != window_R_) {   // through a copy: the rows may overlap the ones the graphs read
+        if (rstage_ == nullptr) { err = "mtp: no row staging"; return false; }
+        if (cudaMemcpyAsync(rstage_, R_rows, bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+            cudaMemcpyAsync((void*) window_R_, rstage_, bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+            err = "mtp: staging the window rows failed";
+            return false;
+        }
+    }
+    return draft(T, tokens, p, a, drafts, err, probs, min_p, n_drafts);
+}
+
+bool MtpDrafter::catch_up(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+    if (!use_store(id, err)) return false;
+    return prefill_cur(R_rows, next_tokens, n, cell0, err);
 }
 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,

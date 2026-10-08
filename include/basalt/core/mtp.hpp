@@ -25,6 +25,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -108,6 +109,22 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
+
+    /// BATCH WINDOWS: one draft K/V per sequence.  `n` stores for the slots (set before `load`); the working state
+    /// `st_` the graphs address holds one sequence at a time, `use_store` swaps another in (the old one's written
+    /// cells go to its store).  Store `n` is the main sequence (the prompt path and solo requests), so `use_main`
+    /// must precede anything that reads or writes it.  Needs the K/V fully resident.
+    void set_stores(int n) { n_stores_ = n; }
+    int main_store() const { return n_stores_; }
+    bool use_store(int id, std::string& err);
+    bool use_main(std::string& err) { return use_store(n_stores_, err); }
+    /// Cells [0, cells) of sequence `from` into sequence `to`.
+    bool copy_store(int from, int to, int64_t cells, std::string& err);
+    /// `draft` for sequence `id` from the window rows `R_rows` (device, row 0 of the sequence's segment).
+    bool draft_seq(int id, const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts,
+                   std::string& err, float* probs, float min_p, int* n_drafts);
+    /// The K/V cells [cell0, cell0 + n) of sequence `id` from window rows, no draft (`prefill` on that sequence).
+    bool catch_up(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
     bool coupled() const { return coupled_active_; }
     /// Diagnostic (gate spec_log): the top-k tokens and softmax probabilities of the last draft's step j, from the
     /// draft head's logits kept per step.  Returns the count written (0 when the diagnostic is off).
@@ -123,7 +140,7 @@ public:
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
-    QsaState& kv_state_rw() { return st_; }
+    QsaState& kv_state_rw();
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
     bool idle(std::string& err) {
@@ -219,6 +236,18 @@ private:
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;
+    // per-sequence K/V (set_stores): the stores' pool arrays, the sequence st_ holds, the cells each sequence has
+    // written, and the range of st_ not yet saved to its store
+    struct KvArr { void* p = nullptr; uint64_t page_bytes = 0; };
+    int kv_layout(KvArr* out) const;
+    void* store_ptr(int id, int i, const KvArr* lay) const { return id == cur_ ? lay[i].p : stores_[(size_t) id][(size_t) i]; }
+    std::vector<std::array<void*, 4>> stores_;
+    int n_stores_ = 0, cur_ = 0;
+    std::vector<int64_t> store_hi_;
+    int64_t dirty_lo_ = 0, dirty_hi_ = 0;   // empty when hi <= lo
+    float* rstage_ = nullptr;   ///< draft_seq's copy of the rows
+    void note_cells(int64_t lo, int64_t hi);
+    bool prefill_cur(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
 
     // mapped staging: tokens, step records (2*max_t rows), positions per head (2*max_t rows), the selected row,
     // the drafts out
