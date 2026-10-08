@@ -26,6 +26,22 @@ from serve.api.structured import StructuredOutputError, prepare_format, validate
 from serve.util.text import stop_strings
 
 
+BODY_MAX = 256 << 20                        # the most a JSON request body may hold (read into memory)
+CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
+
+
+class BadBody(Exception):
+    """A request body that cannot be read (malformed or oversized): the status and the sentence."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def _size_text(n: int) -> str:
+    return f"{n >> 20} MiB" if n >= 1 << 20 else f"{n >> 10} KiB"
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -50,6 +66,61 @@ def make_handler(svc: Service):
                              f"name on purpose? Start the server with --allowed-host NAME, "
                              f"or with --api-key KEY, which turns this check off"}})
             return False
+
+        def _chunked(self) -> bool:
+            """The body is sent as Transfer-Encoding: chunked (it wins over a Content-Length, RFC 9112)."""
+            te = self.headers.get("Transfer-Encoding", "") or ""
+            return te.split(",")[-1].strip().lower() == "chunked"
+
+        def _read_chunked(self, limit: int, keep: bool = True) -> bytes:
+            """Decode a chunked body: at most `limit` bytes (413 beyond it; the size is checked before a chunk is
+            read, so a huge announced chunk is never allocated), 400 for a malformed one. keep=False drops it."""
+            parts, total = [], 0
+            while True:
+                line = self.rfile.readline(1025)
+                if not line.endswith(b"\n"):
+                    raise BadBody(400, "malformed chunked request body")
+                try:
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    raise BadBody(400, "malformed chunk size in the request body") from None
+                if size < 0:
+                    raise BadBody(400, "malformed chunk size in the request body")
+                if size == 0:
+                    for _ in range(64):                       # the trailers, up to the blank line
+                        if self.rfile.readline(8193).strip() == b"":
+                            break
+                    return b"".join(parts)
+                total += size
+                if total > limit:
+                    self.close_connection = True
+                    raise BadBody(413, f"the request body is larger than {_size_text(limit)}")
+                left = size
+                while left > 0:
+                    piece = self.rfile.read(min(left, 1 << 20))
+                    if not piece:
+                        raise BadBody(400, "the chunked request body ended early")
+                    left -= len(piece)
+                    if keep:
+                        parts.append(piece)
+                if self.rfile.read(2) != b"\r\n":
+                    raise BadBody(400, "malformed chunked request body")
+
+        def _body(self) -> bytes:
+            """The request body, chunked or by Content-Length, at most BODY_MAX bytes."""
+            limit = BODY_MAX
+            if self._chunked():
+                return self._read_chunked(limit)
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                raise BadBody(400, "invalid Content-Length") from None
+            if length < 0:
+                raise BadBody(400, "invalid Content-Length")
+            if length > limit:
+                self.close_connection = True
+                raise BadBody(413, f"the request body is larger than {_size_text(limit)}")
+            return self.rfile.read(length)
 
         def _foreign_page(self) -> bool:
             """Without an API key, refuse a /v1 POST from another site's page: its Origin must be allowed (no Origin
@@ -255,7 +326,7 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
-                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 if path.startswith("/v1/responses/"):        # nothing is stored
@@ -308,6 +379,11 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except BadBody as e:
+                if path == "/v1/responses":
+                    self._json(e.status, responses_error_body(str(e)))
+                else:
+                    self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ValueError as e:
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
@@ -355,18 +431,28 @@ def make_handler(svc: Service):
 
         def _control_body(self) -> bool:
             """Read the unused body before replying so the client sees no TCP reset."""
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                self._json(400, {"error": {"message": "invalid Content-Length"}})
-                return False
-            if not 0 <= length <= 65536:
-                self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
-                return False
+            chunked = self._chunked()
+            length = 0
+            if not chunked:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._json(400, {"error": {"message": "invalid Content-Length"}})
+                    return False
+                if not 0 <= length <= CONTROL_BODY_MAX:
+                    self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
+                    return False
             timeout = self.connection.gettimeout()
             try:
                 self.connection.settimeout(2.0)
-                complete = len(self.rfile.read(length)) == length
+                if chunked:
+                    self._read_chunked(CONTROL_BODY_MAX, keep=False)
+                    complete = True
+                else:
+                    complete = len(self.rfile.read(length)) == length
+            except BadBody as e:
+                self._json(e.status, {"error": {"message": f"control request: {e}"}})
+                return False
             except OSError:
                 complete = False
             finally:
