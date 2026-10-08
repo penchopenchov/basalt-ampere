@@ -35,6 +35,7 @@
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_dec_fused.hpp"
 #include "basalt/kernels/q5k_head.hpp"
+#include "basalt/kernels/q6k_head.hpp"
 #include "basalt/kernels/qsa_select.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/rope.hpp"
@@ -1869,6 +1870,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                 if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits, one wave
                     q5k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                else if (head_->type() == 14 && q6k_head_supported((int) N, T))
+                    q6k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
                 else
                     native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
             } catch (const std::exception& e) {

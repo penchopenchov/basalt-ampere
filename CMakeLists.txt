@@ -150,6 +150,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/qsa_dec_attn.cu
                         src/kernels/cuda/qsa_dec_fused.cu
                         src/kernels/cuda/q5k_head.cu
+                        src/kernels/cuda/q6k_head.cu
                         src/kernels/cuda/qsa_prompt_attn.cu
                         src/kernels/cuda/fused_gdn.cu
                         src/kernels/cuda/dequant_bf16.cu
@@ -196,6 +197,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/kernels/cuda/native_qsa_score.cu
     src/kernels/cuda/qsa_dec_fused.cu
     src/kernels/cuda/q5k_head.cu
+    src/kernels/cuda/q6k_head.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
 # ---- engine -----------------------------------------------------
@@ -544,6 +546,10 @@ add_executable(q5k_head_parity src/kernels/q5k_head_parity.cpp)
 target_include_directories(q5k_head_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(q5k_head_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME q5k_head_parity COMMAND q5k_head_parity 20000 5)
+add_executable(q6k_head_parity src/kernels/q6k_head_parity.cpp)
+target_include_directories(q6k_head_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q6k_head_parity PRIVATE kernels ${_gpu_runtime_target})
+add_test(NAME q6k_head_parity COMMAND q6k_head_parity 20000 5)
 
 # KV streaming: streamed vs resident attention, bitwise (GPU, synthetic, no model).
 add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
