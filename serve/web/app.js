@@ -38,7 +38,7 @@ const CHARTS = [
 const axis = n => n >= 1000 ? `${n / 1000}k` : String(n);
 const tail = a => { const v = (a || []).slice(-HIST).map(x => num(x) ? x : 0); while (v.length < HIST) v.unshift(0); return v; };
 
-function drawChart(c, now, last) {
+function drawChart(c, now, last, lastNote) {
   const el = $("#chart-" + c.id), [cur, dot, tip] = el.querySelectorAll(".cur, .cdot, .tip");
   const label = $("#rd-" + c.id + "-l"), read = $("#rd-" + c.id), unit = "<small>tok/s</small>";
   // the axis follows every plotted line (aggregate and per stream), with headroom, so nothing clips
@@ -54,7 +54,7 @@ function drawChart(c, now, last) {
   [cur, dot, tip].forEach(e => e.hidden = h == null);
   if (h == null) {
     const live = num(now) && now > 0, shown = live ? now : last;
-    label.textContent = `${c.name}, ${live ? "now" : "last request"}`;
+    label.textContent = `${c.name}, ${live ? "now" : `last request${lastNote ? ` · ${lastNote}` : ""}`}`;
     read.innerHTML = num(shown) ? `${fmt(shown, c.id === "decode" ? 1 : 0)}${unit}` : "—";
     return;
   }
@@ -115,13 +115,14 @@ function draw() {
   const ctx = multi ? slotRows.reduce((a, s) => a + (s.is_processing ? s.ctx_used : 0), 0)
     : busy ? (live.prompt_tokens || 0) + (live.generated || 0) : r0 ? (r0.prompt_tokens || 0) + (r0.output_tokens || 0) : null;
   text("#v-ctx", num(ctx) ? fmt(ctx) : "—");
-  text("#s-ctx", num(eng.max_context) ? `of ${fmt(eng.max_context * (sl.total || 1))} tokens` : "");
+  text("#s-ctx", num(eng.max_context) ? `of ${fmt(slotRows.length > 1 && num(slotRows[0].n_ctx) ? slotRows[0].n_ctx : eng.max_context)} tokens${slotRows.length > 1 ? " (per slot)" : ""}` : "");
 
   const h = M.history || {};
   CHARTS[0].v = tail(h.tok_s); CHARTS[1].v = tail(h.prefill_tok_s_mean);
   const lastPrefill = r0 && r0.prompt_ms > 0 && r0.prompt_tokens > (r0.reused || 0) ? (r0.prompt_tokens - (r0.reused || 0)) / (r0.prompt_ms / 1000) : null;
   drawChart(CHARTS[0], generating ? live.tok_s : null, last);
-  drawChart(CHARTS[1], live.state === "reading" ? live.prefill_tok_s_mean : null, lastPrefill);
+  const lastRead = r0 ? (r0.prompt_tokens || 0) - (r0.reused || 0) : 0;   // short prompts are dominated by fixed cost, so show the size
+  drawChart(CHARTS[1], live.state === "reading" ? live.prefill_tok_s_mean : null, lastPrefill, lastPrefill != null ? `${fmt(lastRead)} tokens` : "");
 
   text("#s-load", num(g0.util) ? `${Math.round(g0.util)}%` : "—");
   text("#s-vram", num(g0.mem_used) ? `${gib(g0.mem_used)} / ${gib(g0.mem_total)} GiB` : "—");
