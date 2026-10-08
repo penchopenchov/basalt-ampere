@@ -80,7 +80,7 @@ void gdn_ref(const Gdn& g, const int32_t* n_keep, cudaStream_t s) {
                             g.beta + (size_t) l * MT * HV, g.z, g.gamma, EPS, g.y, HK, HV, MT, n_keep, s, MT);
     }
 }
-void gdn_new(const Gdn& g, const int32_t* n_keep, cudaStream_t s, int blocks = 0) {
+void gdn_new(const Gdn& g, const int32_t* n_keep, cudaStream_t s, int blocks = 32) {
     GdnCommitLayers a;
     a.state = g.state; a.h = g.h; a.qkv = g.qkv; a.gate = g.gate; a.beta = g.beta;
     a.state_stride = GDN_FLOATS; a.h_stride = (size_t) MT * C; a.gb_stride = (size_t) MT * HV;
@@ -168,7 +168,7 @@ bool parity(cudaStream_t s) {
             gdn_ref(g, commit, s);
             CK(cudaStreamSynchronize(s));
             const auto ra = host(g.state, g.nl * GDN_FLOATS * 4);
-            for (int blocks : {0, 1, 7, 24, 170}) {   // the full grid, then the grid-stride form
+            for (int blocks : {1, 7, 24, 32, 170}) {
                 CK(cudaMemcpy(g.state, g.state0, g.nl * GDN_FLOATS * 4, cudaMemcpyDeviceToDevice));
                 CK(cudaDeviceSynchronize());
                 gdn_new(g, commit, s, blocks);
@@ -226,7 +226,7 @@ void bench(cudaStream_t s) {
         const double gb = 2.0 * 36 * (double) S * HV * S * 4 / 1e9;   // the states read and written
         std::printf("bench n_keep=%d: per-layer calls %.1f us | two launches %.1f us (GDN states %.0f MB: %.0f GB/s)\n",
                     n_keep, us[0], us[1], gb * 1e3, gb / (us[1] * 1e-6));
-        for (int blocks : {8, 16, 24, 34, 48, 85, 170, 340}) {   // the GDN part alone from persistent blocks
+        for (int blocks : {8, 16, 24, 32, 48, 85, 170, 340}) {   // the GDN part alone from persistent blocks
             cudaEvent_t e0, e1;
             CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
             for (int w = 0; w < 3; ++w) gdn_new(g, commit, s, blocks);
@@ -238,7 +238,7 @@ void bench(cudaStream_t s) {
             float ms = 0;
             CK(cudaEventElapsedTime(&ms, e0, e1));
             const double u = ms * 1000.0 / REPS;
-            std::printf("  GDN grid-stride blocks=%3d: %7.1f us (%.0f GB/s)\n", blocks, u, gb / (u * 1e-6));
+            std::printf("  GDN blocks=%3d: %7.1f us (%.0f GB/s)\n", blocks, u, gb / (u * 1e-6));
             CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
         }
     }
@@ -260,7 +260,7 @@ void contention(cudaStream_t s) {
     CK(cudaMalloc(&src, CH * N)); CK(cudaMalloc(&dst, CH * N));
     cudaEvent_t e0, ev, ec;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&ev)); CK(cudaEventCreate(&ec));
-    for (int blocks : {-1, 0, 8, 16, 24, 34, 48, 85}) {   // -1: the chain alone
+    for (int blocks : {-1, 8, 16, 24, 32, 48, 85}) {   // -1: the chain alone
         double sv = 0, sc = 0;
         constexpr int REPS = 20;
         for (int r = 0; r < REPS + 2; ++r) {

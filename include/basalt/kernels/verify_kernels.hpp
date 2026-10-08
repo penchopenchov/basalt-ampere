@@ -36,8 +36,8 @@ struct GdnCommitLayers {
     int C = 0, h_k = 0, h_v = 0, n_layers = 0;
     const int32_t* n_keep = nullptr;
 };
-/// `blocks` > 0: the same work from that many persistent blocks (grid-stride), bitwise the same.
-void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 0);
+/// From `blocks` persistent blocks (grid-stride); each loads its next item while the current one runs.
+void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 32);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);
