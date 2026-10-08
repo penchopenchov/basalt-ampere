@@ -287,6 +287,17 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
+    def slot_stats(self) -> dict:
+        """Request slots: how many exist, how many requests run in them, and how many wait for one."""
+        total = int(getattr(self.engine, "batch", 0) or 0)
+        with self.status_lock:
+            running = len(self.live_reqs) if total else int(bool(self.status.get("busy")))
+            queued = int(self.status.get("queued") or 0)
+        depth = getattr(self.engine, "queue_depth", None)
+        waiting = depth() if total and depth else 0
+        return {"total": max(1, total), "active": max(0, min(max(1, total), running - waiting)),
+                "queue_depth": queued + waiting}
+
     def metrics(self) -> dict:
         """GET /metrics: engine facts, live state, recent requests, hardware and speed history."""
         with self.status_lock:
@@ -303,7 +314,8 @@ class Service:
             state = "unloaded"
         else:
             state = "idle"
-        live = {"state": state, "queued": s.get("queued", 0),
+        slots = self.slot_stats()
+        live = {"state": state, "queued": slots["queue_depth"], "slots": slots,
                 "prompt_tokens": s.get("prompt_tokens") if busy else None,
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
