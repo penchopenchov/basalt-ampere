@@ -512,11 +512,11 @@ struct Options {
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
     int reps = 1;
-    bool quality = false, no_windows = false;
+    bool quality = false, no_windows = false, print_command = false;
     int quality_chunks = 20, quality_t = 3;
 };
 
-void usage() {
+void usage(const std::string& engine) {
     std::printf(
         "basalt-bench - the standard benchmark: decode fixtures, prefill depths, optional quality gate\n"
         "\n"
@@ -536,9 +536,9 @@ void usage() {
         "  --quality-t T      tokens per verify window in the quality gate (default 3)\n"
         "\n"
         "engine\n"
-        "  --model FILE       a .basalt model file: its own engine arguments (the ones `basalt serve` uses), plus\n"
-        "                     --peer-device 1 when a second GPU is visible; the file's --spec is dropped (see --spec).\n"
-        "                     A flag given after -- replaces the file's value, or is added\n"
+        "  --model FILE       a .basalt model file; --peer-device 1 is added when a second GPU is visible. Every\n"
+        "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
+        "                     rejects a bad one at startup); --print-command shows the command and exits\n"
         "  --config FILE      server run config (JSON): \"exe\", \"args\", \"cwd\", \"env\", \"lib_dirs\" are used;\n"
         "                     the vision sidecar is not started\n"
         "  --engine EXE       engine binary (default: the one built with this program, else the config's)\n"
@@ -547,8 +547,10 @@ void usage() {
         "                     config or after --, the run has no speculation (--spec 0): a clean baseline\n"
         "  --spec-min-p P     the draft cutoff (--spec-min-p P); with N >= 2 and no cutoff given, 0.5\n"
         "                     MTP: --spec 7 --spec-min-p 0.5 (or -- --spec 7 --spec-min-p 0.5)\n"
-        "  -- ARGS...         engine arguments: appended last to --config's; with --model they replace or add flags;\n"
-        "                     alone they are the whole command (the engine's default expert mode needs the RAM)\n"
+        "  -- ARGS...         the same engine arguments, after --: appended last to --config's, or replacing\n"
+        "                     and adding flags with --model\n"
+        "  built in (only what the measurement needs, each replaced by giving the flag): --spec 0, --max-context sized\n"
+        "  to the fixtures, --spec-min-p 0.5 when --spec is 2 or more\n"
         "\n"
         "output\n"
         "  -o md|json         a markdown table (default), or the full detail as JSON on stdout: per-repetition\n"
@@ -578,6 +580,17 @@ void usage() {
         "      print(','.join(map(str, r(PROMPT))))\"\n"
         "  (for prefill, render with a marker in place of the body and split the ids around it)\n",
         BASALT_BENCH_FIXTURES);
+    // the engine's flags are defined once, in the engine: print its own help
+    std::string bin = engine.empty() ? std::string(BASALT_BENCH_ENGINE) : engine;
+    if (!bin.empty() && fs::exists(bin)) {
+        std::printf("\nEngine flags (passed to basalt):\n");
+        std::fflush(stdout);
+        if (FILE* pf = popen(("'" + bin + "' --help 2>&1").c_str(), "r")) {
+            char buf[4096];
+            while (std::fgets(buf, sizeof buf, pf) != nullptr) std::fputs(buf, stdout);
+            pclose(pf);
+        }
+    }
 }
 
 std::vector<std::string> split(const std::string& s, char sep) {
@@ -676,7 +689,10 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         if (a == "--") {
             for (++i; i < argc; ++i) o.passthrough.push_back(argv[i]);
         } else if (a == "--help" || a == "-h") {
-            usage();
+            std::string engine;
+            for (int k = 1; k + 1 < argc; ++k)
+                if (std::string(argv[k]) == "--engine") engine = argv[k + 1];
+            usage(engine);
             std::exit(0);
         } else if (a == "--config") o.config = next("--config");
         else if (a == "--model") o.model = next("--model");
@@ -708,6 +724,11 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             const std::vector<std::string> w = split(next("--set"), ' ');
             if (w.size() % 2 != 0) { err = "--set takes FLAG VALUE pairs"; return false; }
             for (size_t k = 0; k < w.size(); k += 2) o.sets.emplace_back(w[k], w[k + 1]);
+        } else if (a == "--print-command") o.print_command = true;
+        else if (a.rfind("--", 0) == 0) {
+            // any other long flag is the engine's, with its value when one follows
+            o.passthrough.push_back(a);
+            if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) o.passthrough.push_back(argv[++i]);
         } else {
             err = "unknown argument " + a + " (see --help)";
         }
@@ -1031,6 +1052,26 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt-bench: %s\n", err.empty() ? "prefill.ids needs three lines (before, body, after)" : err.c_str());
             return 2;
         }
+    }
+
+    // the context the fixtures need, unless the command line gives one
+    if (!has_arg(args, "--max-context")) {
+        long long need = 4096;
+        for (size_t i = 0; i < 3; ++i)
+            if (!decode_ids[i].empty()) need = std::max(need, (long long) decode_ids[i].size() + kDecode[i].max_new + 16);
+        if (do_prefill)
+            for (long long depth : o.depths) {
+                const double scale = (double) depth / (double) kPrefillBase;
+                need = std::max(need, (long long) ((double) prefill_parts[1].size() * scale) + (long long) prefill_parts[0].size() +
+                                          (long long) prefill_parts[2].size() + kPrefillBaseDecode + 16);
+            }
+        set_arg(args, "--max-context", std::to_string(need));
+    }
+    if (o.print_command) {
+        std::printf("%s --serve", exe.c_str());
+        for (const auto& a : args) std::printf(" %s", a.c_str());
+        std::printf("\n");
+        return 0;
     }
 
     // scratch files
