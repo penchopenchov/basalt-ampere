@@ -37,6 +37,19 @@ cmake --build build -j        # bin/basalt, bin/basalt-bench
 ctest --test-dir build        # the parity tests need a GPU
 ```
 
+Image input needs the vision sidecar, `basalt-vision`, a separate build on llama.cpp's mtmd library. The server looks
+for it next to `bin/basalt`:
+
+```sh
+cmake -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp \
+      -DVISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native     # leave out VISION_CUDA for a CPU-only encoder
+cmake --build build-vision -j --target basalt-vision
+cp build-vision/bin/basalt-vision bin/
+```
+
+Then start the server with `--vision` (encoder on the GPU; with two cards in `--gpu` it uses the second) or
+`--vision-cpu` (no VRAM, slower), or `"vision": true` in the config file's `server` section. Vision is off by default.
+
 ## Run
 
 ```sh
