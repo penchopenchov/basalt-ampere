@@ -8,7 +8,6 @@ import re
 from pathlib import Path
 
 from serve import ROOT
-from serve.security import exposed_without_key
 
 
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
@@ -136,10 +135,6 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
             if flag in cli_engine or flag in file_engine:
                 raise ValueError(f"parallel and engine {flag} both set: use parallel")
         (cli_engine if a_cli.parallel else file_engine)["--batch"] = a.parallel
-    host_on_cli = any(w == "--host" or w.startswith("--host=") for w in cli)
-    if "--host" in file_argv and not host_on_cli and exposed_without_key(a.host, a.api_key):
-        raise ValueError(f"host {a.host} is open to the network and comes from the config file: "
-                         "pass --api-key on the command line")
     return a, file_argv + cli, file_engine, cli_engine
 
 

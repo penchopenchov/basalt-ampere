@@ -107,8 +107,7 @@ context is not an engine option yet, so lower `--max-context` when raising N.
   A name the engine does not accept stops the server at startup, as does one in the wrong section.
 - Precedence: command line > config file > built-in defaults. `spec`, `spec-min-p`, `mtp-max-t`, `peer-exclusive` and
   `max-context` are engine flags; they are also server flags on the command line.
-- The API key is command line only (`--api-key`); a config file that sets it is refused. A non-loopback `host` from
-  the file also needs `--api-key` on the command line, or the server refuses to start.
+- The API key is command line only (`--api-key`); a config file that sets it is refused.
 - The startup line `[server] engine: ...` lists the settings that came from the file or the command line; without
   `--config` it says the built-in defaults apply.
 

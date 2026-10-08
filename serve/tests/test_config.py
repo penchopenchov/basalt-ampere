@@ -218,10 +218,9 @@ class ApiKey(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "api-key can't be set in a config file"):
                 load_config_file(conf(obj), build_parser())
 
-    def test_a_network_host_from_the_config_needs_a_key_on_the_command_line(self):
+    def test_a_network_host_from_the_config_starts_without_a_key(self):
         cfg = {"server": {"host": "0.0.0.0"}}
-        with self.assertRaisesRegex(ValueError, "pass --api-key on the command line"):
-            parse([], cfg)
+        self.assertEqual(parse([], cfg)[0].host, "0.0.0.0")
         a = parse(["--api-key", "k"], cfg)[0]
         self.assertEqual((a.host, a.api_key), ("0.0.0.0", "k"))
         self.assertEqual(parse([], {"server": {"host": "127.0.0.1"}})[0].host, "127.0.0.1")
@@ -256,9 +255,6 @@ class Startup(unittest.TestCase):
         code, err = self.run_server({"server": {"api-key": "k"}})
         self.assertEqual(code, 2)
         self.assertIn("api-key can't be set in a config file", err)
-        code, err = self.run_server({"server": {"host": "0.0.0.0"}})
-        self.assertEqual(code, 2)
-        self.assertIn("pass --api-key on the command line", err)
         code, err = self.run_server({"server": {"nope": 1}})
         self.assertIn("not a server option", err)
         code, err = self.run_server({"server": {"port": "abc"}})
