@@ -12,6 +12,7 @@ import dataclasses
 import pathlib
 import struct
 import sys
+import tempfile
 
 import numpy as np
 
@@ -179,10 +180,10 @@ def _selfcheck() -> int:
 
     A = rng.standard_normal((16, 64)).astype(np.float32)
     B = rng.standard_normal((4, 8)).astype(np.float32)
-    w.add_q2_0("blk.0.ffn_gate_exps.weight", A, 64)
+    w.add_q2_0("blk.0.ffn_gate_exps.weight", A, [64, 16])
     w.add_f32("blk.0.ssm_a", B)
 
-    p = pathlib.Path(__file__).resolve().parent.parent / "bench" / "tiny-selftest.gguf"
+    p = pathlib.Path(tempfile.mkdtemp(prefix="gguf-selfcheck-")) / "tiny-selftest.gguf"
     w.write(p)
     print(f"wrote {p.name}  ({p.stat().st_size} B)")
 
