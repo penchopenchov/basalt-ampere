@@ -33,7 +33,7 @@ It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped dow
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j        # bin/basalt, bin/basalt-bench
+cmake --build build -j        # bin/basalt, bin/basalt-bench, bin/basalt-vision
 ctest --test-dir build        # the parity tests need a GPU
 ```
 
