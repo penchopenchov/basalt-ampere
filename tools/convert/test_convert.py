@@ -1,7 +1,6 @@
-"""Tests for tools/convert/convert.py and tools/convert/model_sections.py on a tiny synthetic model, drafter and side files.
+"""Tests for convert.py and model_sections.py on a tiny synthetic model, drafter and side files.
 
-    python3 -m unittest discover -s tools/convert -p 'test_convert.py'
-"""
+    python3 -m unittest discover -s tools/convert -p 'test_convert.py'"""
 import hashlib
 import json
 import struct
@@ -198,7 +197,7 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(info["slots"], 8)
         pairs = struct.unpack_from("<16H", blob, 20)
         self.assertEqual(pairs[:4], (0, 0, 1, 0))                    # expert-major fill: (0,0) (1,0) (0,1) ...
-        # a trace of three records (each routes its expert and expert 0): (1,3) and (1,0) twice, (0,2) and (0,0) once
+        # three records, each routing its expert and expert 0
         trace = b"".join(struct.pack("<ii2i2f", l, 2, e, 0, 1.0, 1.0) for l, e in ((1, 3), (0, 2), (1, 3)))
         (self.t / "trace.bin").write_bytes(trace)
         convert.convert(self.args(profile_from=[str(self.t / "trace.bin")], force=True))

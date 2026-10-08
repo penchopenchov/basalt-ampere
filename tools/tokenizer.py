@@ -1,17 +1,8 @@
-"""tools/tokenizer.py - the tokenizer, as the reference implementation of record.
+"""The reference byte-level BPE tokenizer, read back from the model's `tokenizer/` directory.
 
-WHY THIS EXISTS AND WHERE IT SITS.  The GGUF carries the whole tokenizer in metadata: `tokenizer.ggml.model`
-= `gpt2`, 248,320 `tokens`, 247,587 `merges`, `token_type`, `pre` = `qwen35`, and a Jinja `chat_template`.
-None of that needs the 35 GB of weights, so it is extracted into the pack's `tokenizer/` directory
-(the pack format) and this module is what reads it back.  A C++ port follows and is tested against
-this one.
-
-THE DECISIVE PROPERTY IS THE ROUND TRIP.  Byte-level BPE maps each BYTE to a printable unicode character so
-that any UTF-8 input is representable with no UNK token.  Every failure mode of that mapping - the wrong
-offset for a byte, a merge applied in the wrong order, a pre-tokenizer split that drops a character - still
-produces plausible token ids.  `decode(encode(s)) == s` is the check that sees them, and it is exact because
-the byte layer is lossless.  It is asserted over a corpus chosen to hit the boundaries: multi-byte UTF-8,
-emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
+The GGUF metadata carries the whole tokenizer (gpt2 model, tokens, merges, token types, `qwen35` pre-tokenizer,
+chat template), so no weights are needed. Any byte maps to a printable character, so there is no UNK token, and
+`decode(encode(s)) == s` is the check that catches byte-offset, merge-order and pre-tokenizer mistakes.
 """
 from __future__ import annotations
 
@@ -23,12 +14,8 @@ import regex
 
 # ------------------------------------------------------------------ byte <-> unicode (GPT-2 byte-level BPE)
 def bytes_to_unicode() -> dict[int, str]:
-    """The GPT-2 byte encoder: 256 bytes -> 256 printable characters, reversibly.
-
-    Bytes 33..126, 161..172 and 174..255 map to themselves; the remaining 68 (space, newline, the C0
-    controls and the high range that would be invisible) are shifted into 256+n so that no byte is
-    unprintable.  The shift is the whole trick and getting its ORDER wrong is invisible in the output ids.
-    """
+    """The GPT-2 byte encoder: bytes 33..126, 161..172, 174..255 map to themselves, the other 68 are shifted to
+    256+n in order; a wrong order is invisible in the ids."""
     bs = (list(range(0x21, 0x7F)) + list(range(0xA1, 0xAD)) + list(range(0xAE, 0x100)))
     cs = bs[:]
     n = 0
@@ -43,16 +30,9 @@ def bytes_to_unicode() -> dict[int, str]:
 BYTE_TO_UNICODE = bytes_to_unicode()
 UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
 
-# The `qwen35` pre-tokenizer, transcribed from the ORACLE rather than from the family resemblance:
-# llama.cpp's `src/llama-vocab.cpp`, `case LLAMA_VOCAB_PRE_TYPE_QWEN35`.  The commented-out line
-# above it is the `tokenizer.json` original, and llama.cpp's active version differs from it - it spells the
-# contraction classes out instead of using `(?i:...)`, which is behaviourally the same.
-#
-# THE `\p{M}` IS THE WHOLE POINT OF THIS BEING TRANSCRIBED.  The QWEN3 pattern two cases earlier is
-# the same shape with `\p{L}` where this has `[\p{L}\p{M}]` and without `\p{M}` in the punctuation negation.
-# Writing the QWEN3 pattern for `qwen35` looks right, round-trips perfectly, and is wrong: a combining mark
-# is `\p{M}`, so without it the mark gets swallowed into the following punctuation run and a token like `_j`
-# never forms.  Only an oracle check can see it.
+# The `qwen35` pre-tokenizer, transcribed from llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35. Unlike the QWEN3 pattern it
+# keeps `\p{M}` in the letter class and out of the punctuation class; without that a combining mark is swallowed into
+# the next punctuation run. Round trips cannot see the difference; only an oracle comparison can.
 QWEN35_PATTERN = (
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
     r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
@@ -75,9 +55,7 @@ class Tokenizer:
         if len(self.ids) != len(tokens):
             raise ValueError("vocabulary has duplicate tokens: %d entries, %d unique"
                              % (len(tokens), len(self.ids)))
-        # Merge rules as (left, right) -> rank.  A merge list that is not a total order over its pairs, or one
-        # naming a token that is not in the vocabulary, would make BPE silently produce different ids than the
-        # model was trained with, so both are checked here rather than discovered as a bad answer later.
+        # merges as (left, right) -> rank; a non-total order or an unknown token would silently change ids, so check
         self.ranks: dict[tuple[str, str], int] = {}
         for i, m in enumerate(merges):
             parts = m.split(" ")
@@ -88,25 +66,17 @@ class Tokenizer:
             self.ranks[(parts[0], parts[1])] = i
         self._re = regex.compile(QWEN35_PATTERN)
 
-        # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
-        # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
-        #
-        #   * type 4 (USER_DEFINED: `<think>`, `<tool_call>`, `<tool_response>`, ...) is matched ALWAYS,
-        #     with or without parse_special.
-        #   * type 3 (CONTROL: `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`, ...) is matched ONLY when
-        #     parse_special is set.
-        #
-        # With parse_special=False the oracle still emits `<tool_response>` as one token, so the type-4
-        # cases must match always.  Treating both classes alike silently changes a chat prompt, because
-        # `<|im_end|>` decomposed into ordinary pieces is not the token the model expects.
+        # Literals matched directly instead of through BPE (GGUF token types):
+        #   * type 4 (USER_DEFINED: `<think>`, `<tool_call>`, ...) always matches, with or without parse_special;
+        #   * type 3 (CONTROL: `<|im_start|>`, `<|im_end|>`, ...) matches only when parse_special is set.
+        # This mirrors llama.cpp; treating them alike changes chat prompts.
         self.special_tokens: dict[str, int] = {}
         if token_types:
             for i, ty in enumerate(token_types):
                 if ty in (3, 4):
                     self.special_tokens[tokens[i]] = i
         always = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 4]
-        # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `regex.escape` so a
-        # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
+        # longest literal first so `<|im_end|>` cannot match a shorter prefix; regex.escape for metacharacters
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
 
@@ -137,15 +107,7 @@ class Tokenizer:
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
-        """Merge `word` (already byte-mapped) by LOWEST RANK first, repeatedly - not left to right.
-
-        Applying merges in list order rather than rank order is the classic BPE bug: it produces a different
-        segmentation and a plausible token count.
-
-        A word longer than HEAP_MIN symbols (a long CJK run, a minified blob: one pre-token piece of thousands of
-        bytes) goes to _bpe_heap, which applies the same merges in the same order without rescanning every pair
-        after each merge (that rescan is O(n^2), slow on long CJK runs).
-        """
+        """Merge `word` (already byte-mapped) by lowest rank first, not left to right; long words go to _bpe_heap."""
         if len(word) > self.HEAP_MIN:
             return self._bpe_heap(word)
         parts = list(word)
@@ -160,14 +122,11 @@ class Tokenizer:
             parts[best:best + 2] = [parts[best] + parts[best + 1]]
         return parts
 
-    HEAP_MIN = 64       # words up to this many symbols keep the scan above, unchanged
+    HEAP_MIN = 64       # longer words use the heap
 
     def _bpe_heap(self, word: str) -> list[str]:
-        """_bpe's result in O(n log n): the symbols as a linked list, every adjacent pair with a rank in a heap
-        keyed (rank, position).  Popping the lowest rank and then the lowest position is exactly the order the
-        scan picks (its strict `<` keeps the leftmost of equal ranks), and a symbol's position is where it starts
-        in the word, which only its left neighbour's merge can change - so a popped pair whose two symbols are
-        no longer the ones it was pushed with is stale and skipped."""
+        """_bpe's result in O(n log n): a linked list of symbols and a heap of ranked pairs keyed (rank, position);
+        stale pairs are skipped."""
         import heapq
         parts = list(word)
         n = len(parts)
@@ -184,9 +143,9 @@ class Tokenizer:
             r, i, left, right = heapq.heappop(heap)
             j = nxt[i]
             if parts[i] != left or j < 0 or parts[j] != right:
-                continue                                # stale: one of its symbols has merged since
+                continue                                # stale: a symbol has merged since
             parts[i] = left + right
-            parts[j] = None                             # j is gone: i takes its place in the list
+            parts[j] = None                             # j merged into i
             k = nxt[j]
             nxt[i] = k
             if k >= 0:
@@ -213,13 +172,8 @@ class Tokenizer:
         return out
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
-        """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
-
-        The split happens on the RAW text, before the byte mapping, because a special token's string is a
-        literal to match rather than bytes to decompose.  Everything between the matches is tokenized
-        normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.  A match that starts
-        inside one of the `plain` (start, end) spans is left to the text around it.
-        """
+        """Encode `text`, emitting literal `pat` matches as single tokens and BPE-ing the rest. The split is on raw
+        text; matches inside `plain` spans are left to the text around them."""
         if pat is None:
             return self._encode_plain(text)
         out: list[int] = []
@@ -236,13 +190,8 @@ class Tokenizer:
         return out
 
     def encode(self, text: str, parse_special: bool = False, plain=()) -> list[int]:
-        """Tokenize `text`.
-
-        `parse_special` controls only the type-3 CONTROL literals such as `<|im_end|>`; the type-4
-        USER_DEFINED ones such as `<think>` are matched either way.  See the note in `__init__`.
-        `plain`: (start, end) spans of `text` that are ordinary text even where they spell a literal - a
-        `</think>` quoted in a message - and are tokenized with the text around them.
-        """
+        """Tokenize `text`. `parse_special` governs only type-3 CONTROL literals; type-4 USER_DEFINED ones always match.
+        `plain`: (start, end) spans that stay ordinary text even where they spell a literal."""
         return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
 
     def token_bytes(self, i: int) -> bytes:
@@ -278,8 +227,7 @@ def extract(gguf_path, out_dir) -> dict:
         "n_merges": len(tk.ranks),
         "special_ids": tk.special_ids,
         "add_bos_token": False,
-        # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
-        # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
+        # shipped rather than re-derived by readers, so a port cannot lose the `\p{M}` classes
         "pre_pattern": QWEN35_PATTERN,
         "pre_pattern_source": "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
@@ -288,7 +236,7 @@ def extract(gguf_path, out_dir) -> dict:
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
+    # fine-tunes change the chat template, so the model's own is shipped
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from gguf_reader import GGUFFile
     tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")

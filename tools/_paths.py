@@ -1,7 +1,4 @@
-"""tools/_paths.py - where the tools find llama.cpp's gguf-py (for the MTP packer and the fixtures).
-
-It lives in a llama.cpp checkout at <repo>/third_party/llama.cpp.
-"""
+"""Where the tools find llama.cpp's gguf-py: <repo>/third_party/llama.cpp."""
 from __future__ import annotations
 
 import sys

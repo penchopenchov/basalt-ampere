@@ -1,20 +1,17 @@
-"""tools/convert/mtp_fetch.py - the MTP block from the BF16 checkpoint, without the checkpoint.
+"""Fetch the MTP tensors from the BF16 checkpoint without downloading it.
 
-The GSQ-RCO GGUF ships no MTP head. The BF16 checkpoint (Qwen/Qwen3.8-Flash-Next, 360 GB in 131 shards) does:
-31 `mtp.*` tensors scattered over 28 shards. Safetensors puts a JSON header (name -> dtype, shape, byte range)
-at the start of each shard, so HTTP range requests can read the headers and then only the MTP tensors.
+The source GGUF has no MTP head; the BF16 checkpoint has 31 `mtp.*` tensors across 28 shards. Safetensors headers
+list each tensor's byte range, so HTTP range requests read only the headers and those tensors.
 
-    python tools/convert/mtp_fetch.py inventory --out DIR          # headers only (a few KB per shard)
-    python tools/convert/mtp_fetch.py fetch --out DIR [--only SUBSTR]  # the MTP tensors themselves, resumable
-    python tools/convert/mtp_fetch.py verify --out DIR             # the fetched tensors against SHA256 (exit 3: bad ones)
+    python tools/convert/mtp_fetch.py inventory --out DIR          # headers only
+    python tools/convert/mtp_fetch.py fetch --out DIR [--only SUBSTR]  # the tensors, resumable
+    python tools/convert/mtp_fetch.py verify --out DIR             # against SHA256 (exit 3: bad ones)
 
-`fetch` writes one raw file per tensor plus `mtp-manifest.json` (dtype, shape, source shard, byte range,
-sha256). It never downloads anything but the ranges named in the headers. Nothing here runs a model.
+`fetch` writes one raw file per tensor plus `mtp-manifest.json` (dtype, shape, source shard, byte range, sha256).
 
-a mirror or proxy that ignores the Range header answers 200 with the whole shard - its JSON header and
-unrelated tensors - and a proxy may cut that to the requested length, so neither the size nor a hash of what was
-downloaded catches it (the drafter then accepts nothing, silently).  A range read therefore needs a 206 whose
-Content-Range is the range asked for, and every tensor of the pinned revision is checked against SHA256 below.
+A mirror that ignores Range answers 200 with the whole shard (possibly cut to length), which size and hash of the
+download alone would not catch. A range read therefore needs a 206 with the asked Content-Range, and every tensor
+of the pinned revision is checked against SHA256.
 """
 import argparse
 import hashlib
@@ -26,21 +23,18 @@ import time
 import urllib.error
 import urllib.request
 
-# A fixed commit of the checkpoint (its `sha` from https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next), so every
-# install reads the same tensors; --revision overrides it (e.g. main).  When the repository no longer has it, the
-# current files are read instead, with a message (resolve_repo).
+# fixed checkpoint commit so every install reads the same tensors; --revision overrides it, and resolve_repo falls
+# back to the current files with a message when the commit is gone
 PINNED_REVISION = "de4b8e4d43b917e7706784d8bb445c9af86a3540"
 REVISION = PINNED_REVISION
-# HF_ENDPOINT (a mirror, e.g. https://hf-mirror.com) serves the same revision; the SHA256 checks below still apply
+# HF_ENDPOINT may name a mirror; the SHA256 checks still apply
 HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
 REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
-PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # SHA256's revision
+PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # the revision SHA256 covers
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 BAD = 3                                             # `verify`'s exit code: a tensor is missing or corrupt
 
-# sha256 of every MTP tensor's bytes at PINNED_REVISION (two independent fetches agree, and 29 of them were read
-# again from that revision; the two expert tensors' first and last 16 MiB), so a mirror that ignored the
-# Range header (it sent the shard's start: its JSON header) is caught, and an install it corrupted is fetched again.
+# sha256 of every MTP tensor at PINNED_REVISION: catches a mirror that ignored Range and corrupted installs
 SHA256 = {
     "mtp.fc_embedding.weight":
         "241d6e87ded317a61b1aeb3ca4e28c53f1caba09ad5be66092e91fe5e3e14751",
@@ -120,7 +114,7 @@ def get(url, start=None, end=None, retries=4):
             if start is not None and len(data) != end - start + 1:
                 raise IOError("short range read: %d of %d" % (len(data), end - start + 1))
             return data
-        except Exception as e:  # network errors are retried, then surfaced
+        except Exception as e:  # retried, then surfaced
             if attempt == retries - 1:
                 raise
             time.sleep(2 ** attempt)
@@ -163,7 +157,7 @@ def resolve_repo():
                   file=sys.stderr)
             REPO = REPO.replace("/resolve/%s/" % REVISION, "/resolve/main/")
     except OSError:
-        pass                                        # no answer: get() retries and reports it
+        pass                                        # get() retries and reports it
     return REPO
 
 
@@ -214,8 +208,7 @@ def fetch(out, only):
                 inv = json.load(f)
         except ValueError:
             inv = None
-    # The byte ranges belong to one revision: an inventory read from another repository or revision is read again,
-    # and a tensor fetched from there is not resumed - it is kept only when it is the pinned revision's (sha256).
+    # byte ranges belong to one revision: an inventory from another repository or revision is read again
     same = isinstance(inv, dict) and inv.get("repo") == REPO
     rows = inv["tensors"] if same else inventory(out)
     os.makedirs(tdir, exist_ok=True)
@@ -246,7 +239,7 @@ def fetch(out, only):
             digest = sha256_of(path)
             if want is None or digest == want:
                 break
-            os.remove(path)                         # wrong bytes: the whole tensor again, once
+            os.remove(path)                         # wrong bytes: fetch the tensor again, once
             if attempt:
                 sys.exit("%s: sha256 %s is not the checkpoint's %s - the download source sends wrong data (a mirror "
                          "that ignores Range requests?)" % (r["name"], digest, want))
@@ -257,9 +250,8 @@ def fetch(out, only):
 
 
 def verify(out):
-    """The fetched tensors against SHA256 -> the names that are missing or wrong.  [] when they are right, or
-    when there is nothing to check (no tensors/, or --revision names another one).  A tensor's verdict
-    is kept in tensors/verified.json by size and mtime, so a later run hashes only what changed."""
+    """Names of fetched tensors that are missing or wrong against SHA256 ([] if right or nothing to check).
+    Verdicts are cached in tensors/verified.json by size and mtime."""
     tdir = os.path.join(out, "tensors")
     if not pinned() or not os.path.isdir(tdir):
         return []
@@ -301,7 +293,7 @@ def main():
         global REVISION, REPO
         REVISION = a.revision
         REPO = REPO.replace("/resolve/%s/" % PINNED_REVISION, "/resolve/%s/" % a.revision)
-    if a.cmd == "verify":                           # offline: the hashes are the pinned revision's
+    if a.cmd == "verify":                           # offline
         bad = verify(a.out)
         for name in bad:
             print("MTP tensor missing or corrupt: %s" % name, file=sys.stderr)

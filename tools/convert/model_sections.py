@@ -1,17 +1,11 @@
-"""The sections of a .basalt model file that are built from the source weights (used by tools/convert/convert.py).
+"""Sections of a .basalt file built from the source weights, for tools/convert/convert.py.
 
-  dense / dense.index    the float tensors the engine reads from its weight pool, in the form it reads them, and the
-                         table of every non-expert tensor (quantized ones are only listed: the engine serves them from
-                         the `gguf` section)
-  experts / experts.layout  per layer, n_expert blobs of [gate rows | up rows | down rows], the raw GGUF slices, and
-                         the text that says where each layer starts and what its formats are
-  mtp/dense, mtp/dense.index, mtp/experts   the draft layer, from the BF16 `mtp.*` tensors fetched by
-                         tools/convert/mtp_fetch.py: Q8_0 projections, BF16 hyper-connection and router weights, F32 norms,
-                         and Q2_0 experts in the engine's blob layout
-  profile                the expert ranking, from routing traces (--dump-routing) or an existing profile
+  dense / dense.index       float tensors in the form the engine reads, and the table of every non-expert tensor
+  experts / experts.layout  per layer, n_expert blobs of [gate | up | down] rows, and where each layer starts
+  mtp/dense, mtp/dense.index, mtp/experts  the draft layer from the BF16 `mtp.*` tensors (tools/convert/mtp_fetch.py)
+  profile                   the expert ranking from routing traces or an existing profile
 
-Everything is streamed: a section is produced as an iterator of byte chunks that ModelWriter.add_chunks writes.
-Needs numpy; llama.cpp's gguf-py (third_party/llama.cpp) only for --compat-bf16's dequantization.
+Sections are produced as byte-chunk iterators for ModelWriter.add_chunks. Needs numpy; gguf-py only for --compat-bf16.
 """
 from __future__ import annotations
 
@@ -38,17 +32,16 @@ FLOAT = {"BF16", "F32", "F16"}
 ROLES = ("gate", "up", "down")
 ALIGN = 64                      # between the tensors of `dense`
 EXPERT_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.weight$")
-# the PLE table is read by the engine from the `gguf` section, never from the dense pool
+# the PLE table comes from the `gguf` section, never the dense pool
 NOT_IN_DENSE = {"per_layer_token_embd.weight"}
 
-# The float form the engine reads each dense tensor in (name without `blk.N.`).  The residual, router, GDN, QSA and
-# PLE kernels read these small projections as BF16, the norms as F32 and the PLE conv as F16.  A tensor stored
-# otherwise is converted, and every conversion is recorded in meta.conversions:
-#   F32 -> BF16 whose values are exactly BF16 (low 16 bits zero)    exact, by default
-#   F32 with other values, F16 or a quantized type -> BF16          rounds (nearest-even): only with --compat-bf16
-#   F32 -> F16 (ple_conv1d)                                         index kind 3, narrowed by the loader
-#   F16 / BF16 -> F32                                               exact widening
-# Tensors not named here are written as stored (floats) or served from the `gguf` section (quantized).
+# float form the engine reads each dense tensor in (name without `blk.N.`); other forms are converted and recorded
+# in meta.conversions:
+#   F32 -> BF16 when exactly BF16 (low 16 bits zero)              exact, by default
+#   other F32, F16 or quantized -> BF16                           rounds (nearest-even): only with --compat-bf16
+#   F32 -> F16 (ple_conv1d)                                       index kind 3, narrowed by the loader
+#   F16 / BF16 -> F32                                             exact widening
+# tensors not listed are written as stored (floats) or served from the `gguf` section (quantized)
 FORM = {
     "ffn_gate_inp.weight": "BF16", "ffn_gate_inp_shexp.weight": "BF16",
     "hc_attn_down.weight": "BF16", "hc_attn_up.weight": "BF16", "hc_attn_inject.weight": "BF16",
@@ -63,8 +56,7 @@ FORM = {
     "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
     "ssm_norm.weight": "F32",
 }
-# PLE key encodings left in the source tensors for the engine's native PLE key; other quantized keys take the BF16
-# path (--compat-bf16).
+# PLE key encodings the engine reads natively; other quantized keys need --compat-bf16
 NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 
@@ -88,8 +80,7 @@ def expand_shards(first: pathlib.Path) -> list[pathlib.Path]:
 
 
 def check_split(files) -> None:
-    """The split keys, as the engine checks them: shard 1 carries the metadata, and every shard declares
-    split.count / split.no (and split.tensors.count) consistently."""
+    """The split keys as the engine checks them: shard 1 carries the metadata and every shard declares split.count / split.no consistently."""
     n = len(files)
     meta0 = files[0].metadata
     if n == 1:
@@ -186,8 +177,8 @@ def f16_values(values: np.ndarray, name: str) -> np.ndarray:
 
 
 def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
-    """The dense form of one tensor: (index kind, stored bytes, destination bytes, record or None), or an error
-    string.  `record` describes a conversion for meta.conversions."""
+    """The dense form of one tensor: (index kind, stored bytes, destination bytes, record or None), or an error string.
+        `record` describes a conversion for meta.conversions."""
     form = form_of(name)
     if form is None or form == type_name:
         return KIND[type_name], raw.tobytes(), raw.nbytes, None
@@ -198,7 +189,7 @@ def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool
         if u is not None and not np.count_nonzero(u & 0xFFFF):
             if not np.isfinite(values).all():
                 return f"{name} is F32 with non-finite values; refused rather than converted"
-            data = (u >> 16).astype("<u2").tobytes()       # the exact BF16 values
+            data = (u >> 16).astype("<u2").tobytes()       # exact BF16 values
             rec.update(method="f32->bf16: the values are BF16's (low 16 bits zero)", exact=True, max_abs_err=0.0)
             return "4", data, len(data), rec
         if not compat_bf16:
@@ -218,8 +209,7 @@ def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool
         err = float(np.max(np.abs(h.astype(np.float64) - values))) if values.size else 0.0
         rec.update(exact=bool(np.array_equal(h.astype(np.float32), values)), max_abs_err=err)
         if type_name == "F32":
-            # the F32 bytes are stored as index kind 3 and the loader narrows them to F16 (nearest-even): 4 B/elem in,
-            # 2 B/elem out
+            # stored as F32 (index kind 3); the loader narrows to F16
             rec.update(method="f32->f16 by the loader (index kind 3, round-to-nearest-even)")
             return "3", raw.tobytes(), raw.nbytes // 2, rec
         rec.update(method="%s->f16 round-to-nearest-even (--compat-bf16)" % type_name.lower())
@@ -234,8 +224,8 @@ def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool
 
 
 class Dense:
-    """The `dense` section: `plan` checks every tensor first (nothing is written for a model that cannot be
-    converted), `chunks` streams the pool and fills `rows` and `records`, `index_text` is the `dense.index`."""
+    """The `dense` section: `plan` validates every tensor first, `chunks` streams the pool and fills `rows` and `records`,
+        `index_text` is the `dense.index`."""
 
     def __init__(self, model: SourceModel, compat_bf16: bool = False):
         self.model = model
@@ -251,8 +241,7 @@ class Dense:
             if len(t.shape) > 2:
                 raise ConvertError(f"tensor {name} has {len(t.shape)} dimensions; the index holds two")
             form = form_of(name)
-            # a quantized tensor is served from the source tensors unless the engine reads it from the pool, which
-            # takes --compat-bf16 to dequantize - except the native PLE key encodings
+            # quantized tensors are served from the source unless the pool needs them dequantized (--compat-bf16)
             native = t.type_name not in FLOAT and (
                 form is None or (name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
             if t.type_name not in FLOAT and not native and not compat_bf16:
@@ -302,8 +291,7 @@ class Dense:
 
 # ------------------------------------------------------------------ experts
 class Experts:
-    """The `experts` section and its `experts.layout`.  Each role of a layer is resolved by name in whichever
-    shard holds it."""
+    """The `experts` section and its `experts.layout`; each role is resolved by name in the shard that holds it."""
 
     def __init__(self, model: SourceModel):
         T = {n: w[1] for n, w in model.where.items()}
@@ -312,7 +300,7 @@ class Experts:
             raise ConvertError("the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)")
         self.model = model
         self.n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
-        # router rows = experts kept (a pruned model ships fewer than the full set)
+        # router rows = experts kept (a pruned model has fewer)
         self.n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])
         if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != self.n_expert for l in range(self.n_layers)):
             raise ConvertError("the routers disagree on the expert count; a per-layer pruned model cannot be converted")
@@ -357,14 +345,13 @@ MTP_Q8 = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", 
 
 
 def q2_0(x: np.ndarray) -> np.ndarray:
-    """Float32 values in blocks of 64 -> bytes of Q2_0 blocks (fp16 d, 16 bytes of 2-bit codes, code = q + 1, four
-    per byte).  The scale of a block minimizes the squared error over the grid {-1, 0, 1, 2} x d (the ggml reference
-    sets d = max|w| and never uses the +2 level)."""
+    """Float32 values in blocks of 64 -> Q2_0 blocks (fp16 d, 16 bytes of 2-bit codes, code = q + 1, four per byte).
+        The block scale minimizes squared error over {-1, 0, 1, 2} x d (the ggml reference uses d = max|w| and never the +2 level)."""
     x = x.reshape(-1, 64).astype(np.float32)
     amax = np.abs(x).max(axis=1, keepdims=True)
     best_err = np.full((x.shape[0], 1), np.inf, dtype=np.float32)
     best_d = np.zeros_like(amax)
-    for f in np.linspace(0.5, 1.0, 17, dtype=np.float32):      # amax/2 (the +2 level reaches the max) .. amax
+    for f in np.linspace(0.5, 1.0, 17, dtype=np.float32):      # scale search range: amax/2 .. amax
         d = amax * f
         inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
         q = np.clip(np.rint(x * inv), -1, 2)
@@ -373,7 +360,7 @@ def q2_0(x: np.ndarray) -> np.ndarray:
         best_err = np.where(better, err, best_err)
         best_d = np.where(better, d, best_d)
     d16 = best_d.astype(np.float16)
-    d = d16.astype(np.float32)                                   # quantize against the STORED scale
+    d = d16.astype(np.float32)                                   # quantize against the stored (fp16) scale
     inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
     codes = (np.clip(np.rint(x * inv), -1, 2) + 1).astype(np.uint8)
     c = codes.reshape(-1, 16, 4)
@@ -402,9 +389,9 @@ def _bf16_to_f32(u16: np.ndarray) -> np.ndarray:
 
 
 def mtp_blob(gu: np.ndarray, dn: np.ndarray) -> bytes:
-    """One expert in the engine's blob layout: gu is its (1280, 40, 18) Q2_0 rows (gate rows 0..639, up rows
-    640..1279), dn its (2560, 10, 18); gate/up rows are interleaved (2r = gate r, 2r+1 = up r), then the down rows;
-    the codes of all rows in one plane and the fp16 scales in another."""
+    """One expert in the engine's blob layout: gu is its (1280, 40, 18) Q2_0 rows (gate 0..639, up 640..1279), dn its
+        (2560, 10, 18). Gate/up rows interleave (2r = gate r, 2r+1 = up r), then the down rows; codes of all rows in one
+        plane, fp16 scales in another."""
     inter = np.empty_like(gu)
     inter[0::2] = gu[:MTP_FF]
     inter[1::2] = gu[MTP_FF:]
@@ -415,8 +402,7 @@ def mtp_blob(gu: np.ndarray, dn: np.ndarray) -> bytes:
 
 
 class Mtp:
-    """The draft layer's sections, from a directory written by `tools/convert/mtp_fetch.py fetch` (mtp-manifest.json and
-    one raw BF16 file per tensor)."""
+    """The draft layer's sections, from a directory written by `mtp_fetch.py fetch`."""
 
     def __init__(self, src):
         self.src = pathlib.Path(src)
@@ -447,7 +433,7 @@ class Mtp:
             raw16 = np.fromfile(self.src / t["file"], dtype="<u2")
             if raw16.size != int(np.prod(shape)):
                 raise ConvertError(f"{t['file']}: {raw16.size} values, expected shape {shape}")
-            if len(shape) == 1:      # norm weights: the "+1" of the Gemma RMSNorm is applied here
+            if len(shape) == 1:      # norm weights: apply the Gemma RMSNorm "+1"
                 arr = _bf16_to_f32(raw16) + 1.0
                 raw, kind, rows, cols = arr.astype(np.float32).tobytes(), "f32", 1, arr.size
             else:
@@ -498,8 +484,7 @@ PROFILE_HEADER = struct.Struct("<5I")
 
 
 def read_trace(path, n_layers: int, n_expert: int) -> dict:
-    """(layer, expert) -> count over the records `--dump-routing` writes: int32 layer, int32 k, k int32 ids,
-    k float32 weights."""
+    """(layer, expert) -> count over `--dump-routing` records (int32 layer, int32 k, k int32 ids, k float32 weights)."""
     blob = pathlib.Path(path).read_bytes()
     off, freq = 0, defaultdict(int)
     while off + 8 <= len(blob):
@@ -515,8 +500,7 @@ def read_trace(path, n_layers: int, n_expert: int) -> dict:
 
 
 def rank_pairs(freq: dict, n_layers: int, n_expert: int) -> list:
-    """The pairs the traces routed, most frequent first, then every pair not yet ranked, interleaved across the
-    layers (expert-major)."""
+    """Routed pairs, most frequent first, then every other pair interleaved across layers (expert-major)."""
     ranked, seen = [], set()
     for p, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0])):
         seen.add(p)
@@ -530,7 +514,7 @@ def rank_pairs(freq: dict, n_layers: int, n_expert: int) -> list:
 
 def build_profile(ranked: list, n_layers: int, n_expert: int) -> bytes:
     """The profile section: version, n_layers, n_expert, slots, n_ranked (uint32), the pairs (uint16 layer, uint16
-    expert), then the n_layers x n_expert int32 table of each pair's rank (-1: not ranked)."""
+        expert), then the n_layers x n_expert int32 rank table (-1: not ranked)."""
     table = [[-1] * n_expert for _ in range(n_layers)]
     for slot, (layer, e) in enumerate(ranked):
         table[layer][e] = slot

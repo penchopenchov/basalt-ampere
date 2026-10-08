@@ -1,11 +1,7 @@
-"""Minimal GGUF v3 header reader - no ggml, no gguf-py.
+"""Minimal GGUF v3 header reader with no ggml or gguf-py dependency.
 
-Written because the `gguf` PyPI package cannot open this artifact: its `GGMLQuantizationType`
-enum has no member for type 42 (`Q2_0`), which is newer than the library. That is itself a
-finding - the format this engine is specialized for is ahead of the standard tooling.
-
-This is the reference implementation for `src/artifact/` (a GGUF v3 reader with mmap and
-no ggml dependency). It parses the header only; tensor data is never read.
+gguf-py cannot open these files: its quantization enum has no type 42 (`Q2_0`). This is the reference for
+`src/artifact/`. It parses the header only; tensor data is never read.
 """
 from __future__ import annotations
 
@@ -16,7 +12,7 @@ from typing import Any
 
 GGUF_MAGIC = 0x46554747  # "GGUF" little-endian
 
-# ggml_type values. 42 = Q2_0, the GSQ-RCO routed-expert encoding, absent from gguf-py as of 0.19.
+# ggml_type values; 42 = Q2_0, the routed-expert encoding, absent from gguf-py
 GGML_TYPES: dict[int, str] = {
     0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 4: "Q4_2", 5: "Q4_3", 6: "Q5_0", 7: "Q5_1",
     8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K",
@@ -34,8 +30,7 @@ GGUF_META = {
     10: ("u64", 8), 11: ("i64", 8), 12: ("f64", 8),
 }
 
-# ggml block geometry for the encodings this model uses: (block elements, bytes per block)
-# This is what makes a per-tensor byte count checkable, and it is the contract the kernels share.
+# ggml block geometry per encoding: (block elements, bytes per block); makes tensor byte counts checkable
 BLOCK_GEOMETRY: dict[str, tuple[int, int]] = {
     "F32": (1, 4), "F16": (1, 2), "BF16": (1, 2), "F64": (1, 8),
     "Q4_0": (32, 18), "Q4_1": (32, 20), "Q5_0": (32, 22), "Q5_1": (32, 24),

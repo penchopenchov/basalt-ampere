@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""tools/ppl_gate.py - perplexity and KL divergence through the decode path, against a llama.cpp base.
+"""Perplexity and KL divergence through the decode path, against a llama.cpp base.
 
-The base is the file `llama-perplexity --kl-divergence-base` writes (wikitext-2, n_ctx 512 chunks, the second half
-of each chunk scored).  The engine is started the way serve/server.py starts it from a config (the vision encoder
-first, so the expert tiers are sized as in daily use), with --ppl-base and --ppl-out added to its arguments.  Per chunk it reads the first half as a prompt and teacher-forces the rest
-through verify windows of T tokens (every token committed); see the engine's ppl_gate.hpp.
+The base is `llama-perplexity --kl-divergence-base`'s file (wikitext-2, 512-token chunks, second half scored). The
+engine starts as serve/server.py starts it (encoder first, so tiers are sized as in use) plus --ppl-base and
+--ppl-out; per chunk it reads the first half as a prompt and teacher-forces the rest through verify windows of T
+tokens (see the engine's ppl_gate.hpp).
 
   python3 tools/ppl_gate.py --exe build/basalt --config cfg.json --base base.kld --out DIR [--chunks 20] [--t 3]
                             [--set="--spec 5 --spec-min-p 0.7"]
-  python3 tools/ppl_gate.py --report DIR/rows.tsv          # the summary of a finished run again
+  python3 tools/ppl_gate.py --report DIR/rows.tsv          # summary of a finished run
   python3 tools/ppl_gate.py --diff A/rows.tsv B/rows.tsv   # row by row: identical rows, largest NLL/KLD change
 """
 from __future__ import annotations
@@ -98,7 +98,7 @@ def start_vision(cfg: dict, env: dict, log):
     if v.get("max_tokens"):
         args += ["--max-tokens", str(v["max_tokens"])]
     venv = dict(env)
-    if v.get("cuda_device") is not None:   # serve/engine/vision.py vision_env
+    if v.get("cuda_device") is not None:   # as serve/engine/vision.py vision_env
         venv["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         venv["CUDA_VISIBLE_DEVICES"] = str(v["cuda_device"])
     p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, env=venv)
@@ -113,7 +113,7 @@ def run(a) -> int:
     first = n_ctx // 2
     cfg = json.load(open(a.config))
     args = list(cfg["args"])
-    for k in range(0, len(a.set), 2):   # --set FLAG VALUE ...: replace or add engine arguments
+    for k in range(0, len(a.set), 2):   # --set FLAG VALUE ...: replace or add
         if a.set[k] in args:
             args[args.index(a.set[k]) + 1] = a.set[k + 1]
         else:

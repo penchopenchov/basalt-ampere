@@ -1,40 +1,27 @@
-"""tools/convert/convert.py - build the single .basalt model file from the source GGUF shards.
+"""Build the single .basalt model file from the source GGUF shards.
 
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
         [--mtp-source DIR] [--profile FILE | --profile-from TRACE ...] [--draft-vocab FILE] [--hc8 FILE] \\
         [--name NAME] [--compat-bf16] [--no-vision] [--force]
 
 Inputs
-  --gguf FILE        the model's GGUF.  Give shard 1 of a split model (<name>-00001-of-0000N.gguf) and the other
-                     shards are found beside it (a missing one is an error), or repeat --gguf once per shard.
-                     Every section but the drafter, the profile's ranking, the hc8 table and the vision projector is
-                     built from these.
+  --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
-  --mtp-source DIR   the draft layer's BF16 tensors, as `tools/convert/mtp_fetch.py fetch --out DIR` writes them
-                     (mtp-manifest.json and one raw file per tensor).  The converter quantizes them: Q8_0
-                     projections, BF16 hyper-connection and router weights, F32 norms, Q2_0 experts.  Without it the
-                     file has no drafter and the engine runs without speculation.
-  --draft-vocab FILE the token subset the draft head may propose (int32 ids; needs --mtp-source).  Without it the
-                     draft head covers the whole vocabulary.
-  --profile FILE     an expert profile to store as it is: what `--expert-profile-save` writes (header, ranked pairs,
-                     rank table; see include/basalt/core/expert_cache.hpp).
-  --profile-from TRACE ...  routing traces written by `basalt generate --dump-routing FILE` on a prompt typical of
-                     your use: the experts they routed come first, most frequent first, then every other pair.
-                     With neither --profile nor --profile-from, no routing is known and the ranking is the plain fill
-                     order, which the engine's adaptive tier then improves on.
-  --hc8 FILE         the 8-bit hyper-connection copies, as `basalt generate --model ... --dump-hc8 FILE` writes
-                     them (from a file made without one).  Without it the engine quantizes them at every start.
+  --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
+  --draft-vocab FILE the token subset the draft head may propose (int32 ids; needs --mtp-source)
+  --profile FILE     an expert profile stored as is (`--expert-profile-save`'s file)
+  --profile-from TRACE ...  `--dump-routing` traces: routed experts first, most frequent first, then the rest;
+                     with neither option the ranking is the plain fill order
+  --hc8 FILE         8-bit hyper-connection copies from `--dump-hc8`; without them the engine quantizes at every start
 
 Options
   --name NAME        the model's name, reported by the server
-  --compat-bf16      for GGUFs that store the small projections the engine reads as BF16 in another form: convert
-                     them (round-to-nearest-even, recorded in meta.conversions); experts and the PLE table are not
-                     touched.  Needs llama.cpp's gguf-py in third_party/llama.cpp.
+  --compat-bf16      convert small projections stored in another form to BF16 (round-to-nearest-even, recorded in
+                     meta.conversions); needs llama.cpp's gguf-py in third_party/llama.cpp
   --no-vision        leave out the vision projector
   --force            overwrite --out
 
-The sections written are listed in include/basalt/core/model_format.hpp.  Everything is streamed: nothing large is
-held in memory, and the tensors of the shards are copied by offset.
+Sections are listed in include/basalt/core/model_format.hpp. Everything is streamed.
 """
 from __future__ import annotations
 
@@ -52,7 +39,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent))   # model_file, gguf_reader, tokenizer
+sys.path.insert(0, str(HERE.parent))   # for model_file, gguf_reader, tokenizer
 import model_sections as S  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelWriter  # noqa: E402
 
@@ -128,7 +115,7 @@ def source_tensors(model: S.SourceModel):
         a, n = g.data_start + t.offset, t.expected_bytes()
         tensors.append((name, p, a, n, t))
     order = {p: i for i, p in enumerate(model.paths)}
-    tensors.sort(key=lambda x: (order[x[1]], x[2]))      # sequential reads within each shard
+    tensors.sort(key=lambda x: (order[x[1]], x[2]))      # sequential reads per shard
     return kv, tensors
 
 

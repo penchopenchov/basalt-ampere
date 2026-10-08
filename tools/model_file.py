@@ -2,8 +2,8 @@
 
     w = ModelWriter(path)
     w.add_bytes("meta", json_bytes)
-    w.add_file("experts", "/path/experts.bin")        # streamed, hashed while copied
-    w.add_chunks("dense", chunk_iterator)             # streamed from a generator
+    w.add_file("experts", "/path/experts.bin")        # streamed and hashed while copied
+    w.add_chunks("dense", chunk_iterator)             # streamed
     w.close()
 
     m = ModelFile(path)
@@ -19,7 +19,7 @@ MAGIC = b"BASALTMF"
 VERSION = 1
 SECTION_ALIGN = 2 << 20
 HEADER_BYTES = 64 << 10
-TENSOR_ALIGN = 4096                            # within the `gguf` section
+TENSOR_ALIGN = 4096                            # inside the `gguf` section
 HEADER = struct.Struct("<8sIIQ40s")           # 64 bytes
 ENTRY = struct.Struct("<64sQQ32s16s")         # 128 bytes
 MAX_SECTIONS = (HEADER_BYTES - HEADER.size) // ENTRY.size
@@ -86,9 +86,8 @@ class ModelWriter:
         return n
 
     def add_parts(self, name: str, parts, align: int = TENSOR_ALIGN) -> list[int]:
-        """One section of several parts, each starting at a multiple of `align` within it (zero padding between).
-        A part is bytes or (src_path, offset, size).  Returns each part's offset in the section; the hash covers
-        the whole section."""
+        """One section of several parts, each at a multiple of `align` (zero padded). A part is bytes or
+        (src_path, offset, size); returns each part's offset. The hash covers the whole section."""
         off = self._start(name)
         h = hashlib.sha256()
         pos, offsets = 0, []

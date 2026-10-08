@@ -1,13 +1,11 @@
-"""tools/greedy_identity.py - do two engine builds produce the same greedy tokens?
+"""Do two engine builds produce the same greedy tokens?
 
     python3 tools/greedy_identity.py REF_BIN NEW_BIN --model FILE.basalt [--fixtures DIR] [--tokens N] [-- ENGINE ARGS...]
 
-Each binary runs as `--serve` with a minimal set (BASE below: speculation 7, context 8192), plus whatever follows `--` (a flag given
-there replaces the built-in value; any engine flag works there).  The bench fixtures' prompts (conv, struct, prose: one line of comma-separated token
-ids each) are sent at temperature 0 and every generated token is compared.  Adaptive expert swaps and the PCIe share
-are switched off so placement cannot drift between the runs; pin the tiers too (e.g. `-- --peer-slots N
---expert-cache N`) when the builds' VRAM use differs, since auto-sized tiers change where experts are computed and so
-the rounding.
+Each binary runs as `--serve` with BASE plus any flags after `--` (which replace BASE values). The bench fixtures'
+prompts (conv, struct, prose: comma-separated token ids per line) run at temperature 0 and every token is compared.
+Adaptive swaps and the PCIe share are off so placement cannot drift; pin the tiers too (`-- --peer-slots N
+--expert-cache N`) when the builds' VRAM use differs, since auto-sized tiers change rounding.
 
 Prints "GREEDY IDENTICAL" (exit 0) or "GREEDY DIFFERS" with the first difference (exit 1); exit 2 when an engine fails.
 """
@@ -23,7 +21,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 PROMPTS = ("conv", "struct", "prose")
-# What the comparison needs on any machine: the verify path over the fixtures.  Flags after `--` replace these.
+# flags after `--` replace these
 BASE = ["--spec", "7", "--spec-min-p", "0.5", "--max-context", "8192"]
 PINNED = ["--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--pcie-frac", "0"]
 

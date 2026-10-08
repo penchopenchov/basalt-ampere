@@ -1,21 +1,10 @@
-"""A minimal GGUF v3 WRITER, including `Q2_0`.
+"""A minimal GGUF v3 writer including `Q2_0`, which gguf-py cannot write (no type 42).
 
-Why this exists
----------------
-A tiny synthetic model "written as a real GGUF via `gguf-py`" with `Q2_0` does not work: `gguf-py` has no
-`GGMLQuantizationType` member for type 42, so `GGMLQuantizationType(42)` raises `ValueError`.
-
-`src/artifact/` needs a writer regardless - its reader has no ggml dependency, and the writer is its
-companion - so this is that writer in Python, where it can be validated immediately against
-`tools/gguf_reader.py` and against llama.cpp.
-
-Scope: enough to build the tiny synthetic model. It is NOT a general-purpose quantizer; the only
-quantizer implemented is `Q2_0`, and its contract is the Q2_0 contract:
+Enough to build the tiny synthetic model; the only quantizer is Q2_0:
     block = 64 elements, fp16 scale, 16 bytes of 2-bit codes, LSB-first, 4 codes per byte
     d = amax, code = clamp(round(w/d) + 1, 0, 3), symbol = code - 1  ->  {-1, 0, +1, +2}
 
-Self-checking: `python tools/gguf_writer.py` writes a synthetic v3 file, reads it back with
-`gguf_reader.py`, and asserts the tensors and metadata survived byte-exactly.
+`python tools/gguf_writer.py` writes a synthetic file, reads it back with `gguf_reader.py` and checks it byte-exactly.
 """
 from __future__ import annotations
 
@@ -29,7 +18,7 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf_reader import GGUF_MAGIC, GGUFFile  # noqa: E402
 
-# ggml_type ids we can write. Values match GGML_TYPES in gguf_reader.py.
+# writable ggml_type ids, matching GGML_TYPES in gguf_reader.py
 TYPE_IDS = {"F32": 0, "F16": 1, "Q2_0": 42}
 DEFAULT_ALIGNMENT = 32
 
@@ -48,11 +37,11 @@ def quantize_q2_0(w: np.ndarray) -> bytes:
     for b in blocks:
         amax = float(np.max(np.abs(b)))
         d = amax
-        # d = amax (NOT amax/2) - the grid is asymmetric, symbols land in {-1,0,+1,+2}.
+        # d = amax (not amax/2): the grid is asymmetric, symbols are {-1,0,+1,+2}
         code = np.zeros(64, dtype=np.uint8) if d == 0 else \
             np.clip(np.rint(b / d).astype(np.int32) + 1, 0, 3).astype(np.uint8)
         packed = np.zeros(16, dtype=np.uint8)
-        # j -> byte j//4, bit (j%4)*2 ;  four codes per byte, least significant first.
+        # code j -> byte j//4, bit (j%4)*2
         for j in range(64):
             packed[j // 4] |= np.uint8(code[j] << ((j % 4) * 2))
         out += struct.pack("<e", d)      # fp16 scale
@@ -108,10 +97,8 @@ class GGUFWriter:
         self.tensors.append(_Tensor(name, list(a.shape), "F32", a.tobytes()))
 
     def add_q2_0(self, name: str, arr: np.ndarray, shape: list[int]) -> None:
-        """`arr` is (rows, in_features) row-major with every row `shape[0]` long; `shape` is the FULL
-        GGUF shape. The shape must be passed explicitly, not inferred as [in, rows]: a fused expert
-        tensor is [in, out, experts], and inferring 2-D produced `[64, 4096]` where llama.cpp expects
-        `[64, 256, 16]`. Q2_0 blocks run along dim 0 only, so the extra axes are just a layout.
+        """`arr` is (rows, in_features) row-major; `shape` is the full GGUF shape, passed explicitly because a
+        fused expert tensor is [in, out, experts] and cannot be inferred. Blocks run along dim 0 only.
         """
         a = np.asarray(arr, dtype=np.float32)
         in_features = shape[0]
@@ -157,7 +144,7 @@ class GGUFWriter:
         for k, (t, v) in self.metadata.items():
             body += self._kv_bytes(k, t, v)
 
-        # Tensor directory: offsets are relative to the start of the data section.
+        # tensor directory: offsets are relative to the data section
         offset = 0
         infos = bytearray()
         for t in self.tensors:
@@ -219,7 +206,7 @@ def _selfcheck() -> int:
         rel = float(np.abs(back - A.reshape(-1)).mean() / np.abs(A).mean())
         print(f"  Q2_0 round trip: max abs {err:.4f}  mean rel {rel*100:.2f}%  "
               f"(quantization error, not a write bug)")
-        # The real check: re-quantizing the DEQUANTIZED values must be a fixed point.
+        # re-quantizing the dequantized values must be a fixed point
         again = dequantize_q2_0(quantize_q2_0(back))
         if not np.array_equal(again, back):
             print("  FAIL Q2_0 is not a fixed point under requantization"); ok = False

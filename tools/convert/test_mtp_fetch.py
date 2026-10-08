@@ -1,10 +1,7 @@
-"""Tests for tools/convert/mtp_fetch.py: a range read needs a 206 with the asked Content-Range, the pinned revision's
-tensors are checked against their sha256 (a wrong one is fetched again; a corrupt install is found by `verify` and
-a rerun fetches it again), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
-urlopen - nothing is downloaded.
+"""Tests for mtp_fetch.py against a fake checkpoint behind a mocked urlopen: range checks, sha256 verification and refetch,
+inventory revisions.
 
-    python -m unittest discover -s tools/convert -p test_mtp_fetch.py
-"""
+    python -m unittest discover -s tools/convert -p test_mtp_fetch.py"""
 from __future__ import annotations
 
 import contextlib
@@ -55,8 +52,8 @@ class Response(io.BytesIO):
 
 
 class Mirror:
-    """urlopen for the fake checkpoint.  `ignore_range`: 200 and the whole file (`cut`: cut to the asked length, as
-    such a proxy does); `wrong`: the bytes of these tensors' ranges are flipped (a source that sends bad data)."""
+    """urlopen for the fake checkpoint. `ignore_range`: answer 200 with the whole file (`cut`: cut to length);
+    `wrong`: flip these tensors' bytes."""
 
     def __init__(self, ignore_range=False, cut=False, wrong=()):
         self.ignore_range, self.cut, self.wrong, self.ranges = ignore_range, cut, set(wrong), []

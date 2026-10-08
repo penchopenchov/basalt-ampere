@@ -1,13 +1,10 @@
-"""The sections the vision sidecar reads from a .basalt file, for the converter to add.
+"""The sections the vision sidecar reads from a .basalt file:
 
-    vision/mmproj       the projector GGUF, whole (the encoder and projector weights)
-    vision/text_vocab   a vocab-only GGUF of the text model: the source GGUF's metadata (architecture, hparams,
-                        tokenizer) without tensors and without the split keys.  The sidecar opens it as its text
-                        model (the tokenizer for the image marker) and never needs the weights.
+    vision/mmproj       the projector GGUF, whole
+    vision/text_vocab   a vocab-only GGUF of the text model (metadata without tensors or split keys), used for the
+                        image-marker tokenizer
 
-vision_sections(mmproj_path, native_paths) -> [(section_name, bytes_or_None, src_path_or_None, offset, size)]
-A section is either the bytes or a byte range of a source file.
-"""
+vision_sections(mmproj_path, native_paths) -> [(section_name, bytes_or_None, src_path_or_None, offset, size)]"""
 from __future__ import annotations
 
 import os
@@ -15,7 +12,7 @@ import struct
 
 GGUF_MAGIC = b"GGUF"
 ALIGNMENT = 32
-# value type id -> fixed size; strings (8) and arrays (9) are walked
+# value type id -> fixed size; strings and arrays are walked
 _FIXED = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
 
