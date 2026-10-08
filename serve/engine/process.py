@@ -488,7 +488,9 @@ class ProcessEngine:
                 self._last_done = line
             elif line.startswith("BADM "):
                 f = line.split()
-                self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
+                # BADM <slot> 1: continues, the admission's token already sent; 2: continues, no token yet (the slot's
+                # first window makes it); 0: done
+                self._ctl_result = ("badm", len(f) >= 3 and f[2] in ("1", "2"), len(f) >= 3 and f[2] == "2")
                 return
             elif line.startswith("YIELDED "):            # <slot> <tokens read> after BYIELD
                 f = line.split()
@@ -749,7 +751,8 @@ class ProcessEngine:
                 holding = False
                 if not cont:
                     return
-                gen0 = len(out) - 1                         # the admission's token; the slot feeds it first
+                notok = bool(self._ctl_result and len(self._ctl_result) > 2 and self._ctl_result[2])
+                gen0 = len(out) if notok else len(out) - 1  # the admission's token, if any; the slot feeds it first
                 going_solo = False
                 while True:
                     try:
@@ -808,7 +811,7 @@ class ProcessEngine:
                     self._drain_control("DONE", born=born)
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
-                    if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
+                    if line and line.startswith("BADM ") and line.split()[2:3] in (["1"], ["2"]):
                         phase = "slot"
             except EngineDied:
                 pass

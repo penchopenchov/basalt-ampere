@@ -4840,6 +4840,10 @@ int main(int argc, char** argv) {
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // the session the request path reads, parks and restores: the solo one, or (a --batch request for a slot other
+        // than 0) a view of it carrying that slot's state, so the prompt is read in the slot itself
+        basalt::core::SessionState rview;
+        basalt::core::SessionState* rsp = &ss;
         basalt::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
@@ -4898,14 +4902,14 @@ int main(int argc, char** argv) {
                 stage_estimate += b;
             }
             size_t estimate = 0;
-            if (!basalt::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, err)) {
+            if (!basalt::core::conversation_snapshot_bytes(view, *rsp, g, draft0, estimate, err)) {
                 std::fprintf(stderr, "basalt serve: conversation cache: skip parking (%s)\n", err.c_str());
                 err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
                 return true;
             }
             const size_t fresh_estimate = estimate;
             if (!reuse.kv.empty() && !basalt::core::conversation_snapshot_capture_bytes(
-                    reuse, view, ss, g, draft0, estimate, err)) {
+                    reuse, view, *rsp, g, draft0, estimate, err)) {
                 reuse = {};
                 estimate = fresh_estimate;
                 err.clear();
@@ -4935,7 +4939,7 @@ int main(int argc, char** argv) {
                 }
                 basalt::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!basalt::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                if (!basalt::core::conversation_snapshot_save(image, view, *rsp, g, draft0, err,
                         std::move(reuse), &reused_bytes)) return false;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
@@ -5011,7 +5015,7 @@ int main(int argc, char** argv) {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                if (!gpu_sync_ok() || !checkpoint_save(c, *rsp, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const basalt::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
@@ -5814,9 +5818,9 @@ int main(int argc, char** argv) {
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                basalt::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
+                basalt::core::SessionState& from = k == 0 ? *rsp : stages[k - 1]->ss;
                 basalt::core::SessionState& to = *bslot_ss[k][(size_t) b];
-                if (&from == &to) continue;   // slot 0 is the solo session: already in place
+                if (from.gdn_state == to.gdn_state) continue;   // the same state (slot 0, or the request's own slot)
                 const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                 basalt::core::ConversationCheckpoint ck;
@@ -5845,8 +5849,8 @@ int main(int argc, char** argv) {
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 basalt::core::SessionState& from = *bslot_ss[k][(size_t) b];
-                basalt::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
-                if (&from == &to) continue;   // slot 0 is the solo session: already in place
+                basalt::core::SessionState& to = k == 0 ? *rsp : stages[k - 1]->ss;
+                if (from.gdn_state == to.gdn_state) continue;   // the same state (slot 0, or the request's own slot)
                 const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                 if (at != nullptr) {
@@ -6194,7 +6198,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                mtp.set_ple_session(&ss);
+                mtp.set_ple_session(rsp);
                 if (!mtp.idle(err)) { std::printf("ERR %s\n", err.c_str()); return false; }   // (the kept rows are copied)
                 bt_draft += msd(w3, Clock::now());
                 bt_draft_last = msd(w3, Clock::now());
@@ -6656,6 +6660,52 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            // A request for a slot other than 0 reads its prompt in that slot: the request path works on a view of the
+            // solo session that carries the slot's state, with the slot's own conversation bookkeeping swapped in
+            // for the request (the solo one is put back after it)
+            const int slot_b = admit_slot;
+            const bool in_slot = slot0_is_solo && slot_b > 0;
+            struct SoloBook {
+                std::vector<int32_t> live;
+                std::vector<ImgKey> live_imgs;
+                bool live_ok = false, cvec = true;
+                std::vector<ConvCheckpoint> checks;
+            } solo_book;
+            if (in_slot) {
+                solo_book = {std::move(live), std::move(live_imgs), live_ok, cvec_cached, std::move(checks)};
+                BSlot& sb = bs[(size_t) slot_b];
+                live.clear();
+                live_imgs.clear();
+                checks.clear();
+                live_ok = false;
+                cvec_cached = sb.cvec;
+                if (sb.cached && !sb.img) {
+                    live = sb.ids;
+                    live_ok = o.prompt_cache > 0;
+                    checks = std::move(sb.checks);
+                    if (batch_spec && !mtp.copy_store(slot_b, mtp.main_store(), (int64_t) live.size(), err)) {
+                        err.clear();
+                        live_ok = false;
+                    }
+                }
+                sb.cached = false;
+                sb.partial = false;
+                sb.checks.clear();
+                const basalt::core::SessionState& t = *bslot_ss[0][(size_t) slot_b];
+                rview = ss;
+                rview.gdn_state = t.gdn_state;
+                rview.qsa_states = t.qsa_states;
+                rview.ple_hist = t.ple_hist;
+                rview.ple.hist = t.ple_hist;
+                rview.ple_prev[0] = t.ple_prev[0];
+                rview.ple_prev[1] = t.ple_prev[1];
+                rview.ple_token = t.ple_token;
+                rview.ple.token = &rview.ple_token;
+                rview.ple.prev = rview.ple_prev;
+                rsp = &rview;
+                sp.set_session(rview);
+                if (mtp_on) mtp.set_ple_session(&rview);
+            }
             // slot 0 is the solo session: what an idle slot 0 holds is the live conversation, in place
             if (slot0_is_solo && !bs.empty() && bs[0].cached && !bs[0].active) {
                 BSlot& s0 = bs[0];
@@ -6666,6 +6716,10 @@ int main(int argc, char** argv) {
                 for (ConvCheckpoint& c : s0.checks) checks.push_back(std::move(c));
                 s0.checks.clear();
                 s0.cached = false;
+                if (batch_spec && !mtp.copy_store(0, mtp.main_store(), (int64_t) live.size(), err)) {   // the draft K/V with it
+                    err.clear();
+                    live_ok = false;
+                }
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -6683,7 +6737,7 @@ int main(int argc, char** argv) {
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && req_imgs.empty())
+            if (o.prompt_cache > 0 && req_imgs.empty() && !in_slot)
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
@@ -6720,7 +6774,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
-            if (incoming && !basalt::core::conversation_snapshot_validate(*incoming, ss, g,
+            if (incoming && !basalt::core::conversation_snapshot_validate(*incoming, *rsp, g,
                     stages.empty() ? mtp_kv : nullptr, err)) {
                 std::fprintf(stderr, "basalt serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
@@ -6771,7 +6825,7 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (basalt::core::conversation_snapshot_restore(*incoming, ss, g,
+                if (basalt::core::conversation_snapshot_restore(*incoming, *rsp, g,
                         stages.empty() ? mtp_kv : nullptr, err) !=
                     basalt::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
@@ -6825,7 +6879,7 @@ int main(int argc, char** argv) {
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
             if (resume == 0) {
-                basalt::core::session_zero(ss, g, nullptr, main_cs);
+                basalt::core::session_zero(*rsp, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
                 for (auto& st : stages) {
                     const basalt::core::OnDevice on(st->dev);
@@ -6837,7 +6891,7 @@ int main(int argc, char** argv) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
-                if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+                if (c == nullptr || !checkpoint_restore(*c, *rsp, g) || c->stage_parts.size() != stages.size() ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {
                                    const basalt::core::OnDevice on(stages[i]->dev);
@@ -6878,7 +6932,7 @@ int main(int argc, char** argv) {
             // the misses on the CPU.  Each part below is decided on its own, so a long first message is read batched
             // and its header still goes through the windows.  Picture rows need the batched path.
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (b - a > o.short_read) return false;
+                if (in_slot || b - a > o.short_read) return false;   // (the solo verifier is bound to slot 0's state)
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -7059,7 +7113,7 @@ int main(int argc, char** argv) {
                         // read left), text only, and into a slot that is not decoding
                         const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
                                          n + (admit_slot >= 0 ? admit_max_new : (long long) max_new) + 8 <= slot_cap[(size_t) ys] &&
-                                         (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
+                                         (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 && !in_slot &&
                                          b0 - q > std::max<int64_t>(C, o.short_read);
                         std::string ye;
                         const auto ty = Clock::now();
@@ -7267,7 +7321,7 @@ int main(int argc, char** argv) {
             TkStep tk_prev[16];
             bool tk_valid = false;
             if (tk_log != nullptr) { std::fprintf(tk_log, "R temp=%g S=%d\n", (double) req_temperature, S_mtp); std::fflush(tk_log); }
-            while (!cancelled && produced_n < max_new) {
+            while (!cancelled && produced_n < max_new && !in_slot) {   // (a slot's first token comes from the batch window)
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
                     T = 1;
@@ -7667,15 +7721,25 @@ int main(int argc, char** argv) {
                         (long long) req_offload);
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
-                bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
-                            (int64_t) live.size() == p;
+                bool cont = in_slot ? !cancelled && (int64_t) live.size() == p
+                                    : !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
+                                      (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
                 // the draft layer's cell for the prompt's last token (it pairs with the first generated one), then its K/V
-                if (cont && batch_spec && !mtp.prefill(ver.final_R_all(), &x, 1, p - 1, err)) {
+                if (cont && !in_slot && batch_spec && !mtp.prefill(ver.final_R_all(), &x, 1, p - 1, err)) {
                     std::fprintf(stderr, "basalt serve: batch admission failed: %s\n", err.c_str());
                     cont = false;
                 }
-                if (cont && !copy_to_slot(admit_slot, live, err)) {
+                if (cont && in_slot) {   // the slot holds the prompt already; only its draft K/V is staged
+                    basalt::core::SessionState& t = *bslot_ss[0][(size_t) admit_slot];
+                    t.ple_prev[0] = rview.ple_prev[0];
+                    t.ple_prev[1] = rview.ple_prev[1];
+                    t.ple_token = rview.ple_token;
+                    if (batch_spec && !mtp.copy_store(mtp.main_store(), admit_slot, (int64_t) live.size(), err)) {
+                        std::fprintf(stderr, "basalt serve: batch admission failed: %s\n", err.c_str());
+                        cont = false;
+                    }
+                } else if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "basalt serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
@@ -7698,7 +7762,7 @@ int main(int argc, char** argv) {
                     }
                     sl.x = x;
                     sl.p = p;
-                    sl.produced = 1;
+                    sl.produced = in_slot ? 0 : 1;
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
@@ -7713,9 +7777,19 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "basalt batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
-                std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+                std::printf("BADM %d %d\n", admit_slot, cont ? (in_slot ? 2 : 1) : 0);   // 2: no token yet
                 std::fflush(stdout);
                 admit_slot = -1;
+            }
+            if (in_slot) {   // the solo session and its bookkeeping again
+                rsp = &ss;
+                sp.set_session(ss);
+                if (mtp_on) mtp.set_ple_session(&ss);
+                live = std::move(solo_book.live);
+                live_imgs = std::move(solo_book.live_imgs);
+                live_ok = solo_book.live_ok;
+                cvec_cached = solo_book.cvec;
+                checks = std::move(solo_book.checks);
             }
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read, the rate from what was read

@@ -540,6 +540,8 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
 }
 }
 
+void Prefill::set_session(core::SessionState& ss) { impl_->ss = &ss; }
+
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {

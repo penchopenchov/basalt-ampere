@@ -71,6 +71,9 @@ public:
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
+    /// Points the prompt path at another session's state (a view of `ss` with a batch slot's state fields) for the
+    /// next runs; the buffers and the layer range stay.
+    void set_session(core::SessionState& ss);
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all); sizes the prompt path's
     /// lend cap.
