@@ -627,38 +627,6 @@ std::string arg_value(const std::vector<std::string>& args, const std::string& f
     return "";
 }
 
-// The engine arguments a .basalt file carries (its meta section's "engine_args"), as `basalt serve` reads them.
-bool model_file_args(const std::string& path, std::vector<std::string>& out, std::string& err) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) { err = "cannot read " + path; return false; }
-    std::string head(64 * 1024, '\0');
-    f.read(head.data(), (std::streamsize) head.size());
-    if (f.gcount() < 64 || head.compare(0, 8, "BASALTMF") != 0) { err = path + " is not a .basalt model file"; return false; }
-    uint32_t n = 0;
-    std::memcpy(&n, head.data() + 12, 4);
-    for (uint32_t i = 0; i < n && 64 + (size_t) (i + 1) * 128 <= (size_t) f.gcount(); ++i) {
-        const char* e = head.data() + 64 + (size_t) i * 128;
-        if (std::strncmp(e, "meta", 64) != 0) continue;
-        uint64_t off = 0, bytes = 0;
-        std::memcpy(&off, e + 64, 8);
-        std::memcpy(&bytes, e + 72, 8);
-        if (bytes == 0 || bytes > (64u << 20)) { err = path + ": the meta section is unreadable"; return false; }
-        std::string meta(bytes, '\0');
-        f.clear();
-        f.seekg((std::streamoff) off);
-        f.read(meta.data(), (std::streamsize) bytes);
-        if ((uint64_t) f.gcount() != bytes) { err = path + ": the meta section is cut short"; return false; }
-        JVal v;
-        JParser jp(meta);
-        if (!jp.parse(v, err) || v.kind != JVal::Obj) { err = path + ": the meta section is not JSON"; return false; }
-        if (const JVal* a = v.find("engine_args"); a && a->kind == JVal::Arr)
-            for (const JVal& x : a->a) out.push_back(x.kind == JVal::Num ? fmt("%.17g", x.n) : x.s);
-        return true;
-    }
-    err = path + " has no meta section";
-    return false;
-}
-
 // The GPUs this process can see: CUDA_VISIBLE_DEVICES when set, else what NVML lists.
 size_t visible_gpus() {
     if (const char* v = std::getenv("CUDA_VISIBLE_DEVICES")) {
@@ -1026,18 +994,7 @@ int main(int argc, char** argv) {
         }
     }
     if (!o.model.empty()) {
-        std::vector<std::string> file_args;
-        if (!model_file_args(o.model, file_args, err)) {
-            std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
-            return 2;
-        }
-        // the bench runs without speculation unless asked (--spec, or after --), so the file's are dropped
         args = {"--model", fs::absolute(o.model).string()};
-        for (size_t i = 0; i < file_args.size(); ++i) {
-            if (file_args[i] == "--serve") continue;   // the bench starts the engine as a server itself
-            if ((file_args[i] == "--spec" || file_args[i] == "--spec-min-p") && i + 1 < file_args.size()) { ++i; continue; }
-            args.push_back(file_args[i]);
-        }
         if (!has_arg(args, "--peer-device") && visible_gpus() > 1) set_arg(args, "--peer-device", "1");
     }
     if (exe.empty()) exe = BASALT_BENCH_ENGINE;

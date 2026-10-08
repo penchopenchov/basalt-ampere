@@ -100,8 +100,6 @@ public:
     /// Parses the `meta` section (once).
     bool load_meta(std::string& err);
     const Json& meta() const { return meta_; }
-    /// `meta.engine_args` as strings.
-    std::vector<std::string> engine_args() const;
 
     /// After load_meta: makes `GgufFile(path())` serve meta.gguf_kv and the tensors of the `gguf` section.
     bool register_gguf_view(std::string& err) const;

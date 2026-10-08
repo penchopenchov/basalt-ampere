@@ -71,7 +71,7 @@ int main() {
         R"("qwen4exp.rope.freq_base":10000000.0,"tok":["a","b","c"],"neg":-3,"name":"hé"},)"
         R"("tensors":{"a.weight":{"type":"F32","type_id":0,"shape":[25],"bytes":100,"offset":0},)"
         R"("b.weight":{"type":"F32","type_id":0,"shape":[5,2],"bytes":40,"offset":4096}},)"
-        R"("engine_args":["--spec","7"]})";
+        R"("sampling":{"temperature":1.0}})";
     basalt::core::Hc8Copy c;
     c.name = "blk.0.hc_attn_down.weight";
     c.rows = 3; c.cols = 64; c.srow = 8;
@@ -109,7 +109,6 @@ int main() {
 
     std::printf("2. meta and the GGUF view\n");
     check(m.load_meta(err), "load_meta: " + err);
-    check(m.engine_args() == std::vector<std::string>({"--spec", "7"}), "engine_args");
     check(m.register_gguf_view(err), "register_gguf_view: " + err);
     {
         const basalt::GgufModel g(std::vector<std::string>{path});

@@ -14,7 +14,6 @@ Prints "GREEDY IDENTICAL" (exit 0) or "GREEDY DIFFERS" with the first difference
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 import tempfile
@@ -107,8 +106,7 @@ def main() -> int:
             print(f"greedy_identity: {path} is missing", file=sys.stderr)
             return 2
         prompts.append(path.read_text().strip())
-    file_args = [x for x in json.loads(ModelFile(a.model).read("meta"))["engine_args"] if x != "--serve"]
-    args = set_args(["--model", a.model, *file_args], PINNED + extra)
+    args = set_args(["--model", a.model], PINNED + extra)
 
     logs = Path(tempfile.mkdtemp(prefix="greedy-identity-"))
     results = {}

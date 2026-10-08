@@ -173,7 +173,7 @@ class ConvertTest(unittest.TestCase):
         self.assertEqual(meta["vision"]["mmproj"], "vision/mmproj")
         self.assertEqual(meta["sources"][0]["size"], self.gguf.stat().st_size)
         self.assertEqual(meta["profile"]["n_pairs"], N_LAYERS * N_EXPERT)
-        self.assertIn("engine_args", meta)
+        self.assertNotIn("engine_args", meta)
         self.assertEqual(meta["sampling"]["top_k"], 20)
         self.assertIsNone(meta["mtp"])
         lic = meta["license"]

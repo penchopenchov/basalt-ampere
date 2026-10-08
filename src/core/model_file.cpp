@@ -341,14 +341,6 @@ bool ModelFile::load_meta(std::string& err) {
     return true;
 }
 
-std::vector<std::string> ModelFile::engine_args() const {
-    std::vector<std::string> out;
-    if (const Json* a = meta_.get("engine_args"))
-        for (const Json& x : a->items)
-            if (x.is_string()) out.push_back(x.s);
-    return out;
-}
-
 namespace {
 
 MetaValue meta_value(const Json& j) {

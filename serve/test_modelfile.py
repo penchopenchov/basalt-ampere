@@ -13,7 +13,7 @@ from serve import modelfile
 from serve.server import engine_args, gpus_in_play
 from model_file import ModelFile, ModelWriter  # noqa: E402
 
-META = {"name": "tiny-basalt", "engine_args": ["--serve", "--context", "4096"],
+META = {"name": "tiny-basalt",
         "sampling": {"temperature": 0.7, "top_p": 0.9}}
 TOKENIZER = {"vocab.json": b'{"a": 0}', "merges.txt": b"a a", "token_type.json": b"[1]",
              "chat_template.jinja": b"{{ messages }}"}
@@ -49,7 +49,7 @@ class Derivation(Tmp):
         path = self.build()
         cfg = modelfile.model_config(path, str(self.exe), gpus=1)
         self.assertEqual(cfg["exe"], str(self.exe))
-        self.assertEqual(cfg["args"], ["--model", path, "--serve", "--context", "4096"])
+        self.assertEqual(cfg["args"], ["--model", path])
         self.assertEqual(cfg["model_name"], "tiny-basalt")
         self.assertEqual(cfg["sampling"], META["sampling"])
         self.assertTrue(cfg["log"].startswith(str(self.dir / "cache")))
@@ -99,23 +99,27 @@ class Peer(Tmp):
         self.assertIn("--vision", cfg["args"])
 
     def test_overrides_replace_or_add(self):
-        path = self.build(meta={**META, "engine_args": ["--spec", "7", "--spec-min-p", "0.5"]})
+        path = self.build()
         args = modelfile.model_config(path, str(self.exe), gpus=1,
                                       overrides={"--spec": 0, "--mtp-max-t": 4})["args"]
-        self.assertEqual(args, ["--model", path, "--spec", "0", "--spec-min-p", "0.5", "--mtp-max-t", "4"])
+        self.assertEqual(args, ["--model", path, "--spec", "0", "--mtp-max-t", "4"])
+        args = modelfile.model_config(path, str(self.exe), gpus=1, overrides={"--spec": 3})["args"]
+        self.assertEqual(args, ["--model", path, "--spec", "3"])
 
     def test_switch_override_is_added_once(self):
-        path = self.build(meta={**META, "engine_args": ["--spec", "7"]})
+        path = self.build()
         args = modelfile.model_config(path, str(self.exe), gpus=1, overrides={"--peer-exclusive": True})["args"]
-        self.assertEqual(args, ["--model", path, "--spec", "7", "--peer-exclusive"])
-        path = self.build(meta={**META, "engine_args": ["--peer-exclusive"]})
-        args = modelfile.model_config(path, str(self.exe), gpus=1, overrides={"--peer-exclusive": True})["args"]
-        self.assertEqual(args.count("--peer-exclusive"), 1)
+        self.assertEqual(args, ["--model", path, "--peer-exclusive"])
 
-    def test_file_args_win(self):
-        path = self.build(meta={**META, "engine_args": ["--peer-device", "-1"]})
-        args = modelfile.model_config(path, str(self.exe), gpus=2)["args"]
-        self.assertEqual(args.count("--peer-device"), 1)
+    def test_plain_pack_gives_only_the_model(self):
+        path = self.build()
+        self.assertEqual(modelfile.model_config(path, str(self.exe), gpus=1)["args"], ["--model", path])
+
+    def test_engine_args_in_an_old_pack_are_ignored(self):
+        path = self.build(meta={**META, "engine_args": ["--spec", "7", "--peer-device", "-1"]})
+        cfg = modelfile.model_config(path, str(self.exe), gpus=2)
+        self.assertEqual(cfg["args"], ["--model", path, "--peer-device", "1"])
+        self.assertEqual(cfg["sampling"], META["sampling"])
 
     def test_count_respects_visible_devices_and_nvidia_smi(self):
         with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}):

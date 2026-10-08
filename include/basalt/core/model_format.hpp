@@ -12,7 +12,7 @@
 // Sections (v1):
 //   meta                     JSON: format/version, model name, geometry, the source GGUF metadata the engine reads
 //                            (`gguf_kv`), the type, shape, size and offset in `gguf` of every source tensor (`tensors`), the engine's
-//                            default arguments (`engine_args`), default sampling (`sampling`), provenance (source
+//                            default sampling (`sampling`), provenance (source
 //                            files, sizes, sha256, converter version) and the license / attribution text
 //   tokenizer/<file>         the tokenizer directory's files (tokenizer.json, vocab.json, merges.txt,
 //                            token_type.json, chat_template.jinja)

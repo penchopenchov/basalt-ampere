@@ -122,7 +122,7 @@ def model_config(path: str, exe: str, gpus: int | None = None, vision: bool | st
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
-    args = ["--model", path] + [str(a) for a in meta.get("engine_args") or []]
+    args = ["--model", path]   # engine settings come from the engine defaults and the server, not the file
     for flag, value in (overrides or {}).items():
         args = with_arg(args, flag, value)
     if "--peer-device" not in args and (gpu_count() if gpus is None else gpus) > 1:

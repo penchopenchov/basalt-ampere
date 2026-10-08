@@ -58,8 +58,6 @@ from model_file import TENSOR_ALIGN, ModelWriter  # noqa: E402
 
 FINGERPRINT_BYTES = 64 << 20
 
-ENGINE_ARGS = ["--expert-cache", "auto", "--prefill", "auto", "--spec", "7", "--spec-min-p", "0.5",
-               "--max-context", "262144", "--kv", "int8", "--resident-experts", "--vram-reserve-mib", "700"]
 SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0}
 LICENSE_TEXT = (HERE / "qwen-community-license-1.0.txt").read_text(encoding="utf-8")
 
@@ -277,7 +275,7 @@ def convert(a) -> None:
                                 "bytes": nb, "offset": tensor_offsets[n]}
                             for n, _, _, nb, t in tensors},
                 "conversions": {"compat_bf16": a.compat_bf16, "tensors": dense.records},
-                "engine_args": ENGINE_ARGS, "sampling": SAMPLING, "license": model_license(kv),
+                "sampling": SAMPLING, "license": model_license(kv),
                 "profile": prof,
                 "hc8": {"bytes": Path(a.hc8).stat().st_size} if a.hc8 else None,
                 "mtp": None if mtp is None else {"source_sha256": mtp.source_sha256(),
