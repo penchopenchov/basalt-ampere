@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
+from serve.engine.slots import AdmissionQueue
 from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
 
 
@@ -225,6 +226,7 @@ class ProcessEngine:
             self.wait_lens: list[list[int]] = []        # their prompt lengths
             self.ctl_epoch = 0                          # times ctl was taken
             self.ctl = threading.Lock()                 # one admission or solo request at a time
+            self.admission = AdmissionQueue()           # requests waiting for a free slot
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is
         self._yielded = None                            # (slot, tokens read) of a read that gave way
         self._ctl_erred = False                         # the control lines ended on an ERR
@@ -682,14 +684,20 @@ class ProcessEngine:
                     if slot is None:
                         # prefer the slot holding this prompt's start, else the longest unused
                         with self.slot_cv:
-                            while True:
-                                slot = self.pick_slot(prompt)
-                                if slot is not None:
-                                    self.slot_busy[slot] = True
-                                    break
-                                self.slot_cv.wait(timeout=10.0)
-                                if cancel.is_set():
-                                    return
+                            ticket = self.admission.join()
+                            try:
+                                while True:
+                                    slot = self.pick_slot(prompt)
+                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, prompt)):
+                                        self.slot_busy[slot] = True
+                                        break
+                                    slot = None
+                                    self.slot_cv.wait(timeout=10.0)
+                                    if cancel.is_set():
+                                        return
+                            finally:
+                                self.admission.leave(ticket)
+                                self.slot_cv.notify_all()
                     if self._yielded is not None:           # gave way: waiting requests go first
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
@@ -814,6 +822,16 @@ class ProcessEngine:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_cv.notify_all()
+
+    def _resumes(self, slot: int, prompt: list[int]) -> bool:
+        """Whether `slot` holds the start of `prompt`."""
+        h = self.slot_held[slot]
+        return bool(h) and len(h) < len(prompt) and prompt[:len(h)] == h
+
+    def queue_depth(self) -> int:
+        """Requests waiting for the engine or a free slot."""
+        with self.slot_cv:
+            return self.waiting + len(self.admission)
 
     def pick_slot(self, prompt: list[int]) -> int | None:
         """A free slot for `prompt` (caller holds slot_cv): longest held prefix, else empty, else least recently used;
