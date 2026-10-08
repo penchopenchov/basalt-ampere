@@ -456,7 +456,7 @@ struct Options {
     int spec = 0;
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
-    /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
+    /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).
     int batch = 0;
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
@@ -2877,6 +2877,7 @@ int main(int argc, char** argv) {
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
     // engine still starts and serves one request at a time.
     std::vector<std::vector<std::unique_ptr<basalt::core::SessionState>>> bslot_ss;
+    std::vector<int64_t> slot_cap;   // each batch slot's context (cells)
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -2897,51 +2898,58 @@ int main(int argc, char** argv) {
     }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
+        slot_cap.assign((size_t) o.batch, o.max_context);
         int fit = o.batch;   // the slots every stage could carve
-        uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const basalt::core::OnDevice on_k(dev);
-            const uint64_t bytes = basalt::core::session_bytes(g, o.max_context, K, lo, hi);
-            if (k == 0) bytes0 = bytes;
+            uint64_t total = 0;
             for (int b = 0; b < fit; ++b) {
+                const uint64_t bytes = basalt::core::session_bytes(g, slot_cap[(size_t) b], K, lo, hi);
                 auto u = std::make_unique<basalt::core::SessionState>();
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || basalt::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                if (cudaMalloc(&buf, bytes) != cudaSuccess || basalt::core::session_init(g, slot_cap[(size_t) b], K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
                     std::fprintf(stderr, "basalt generate: WARNING: --batch %d: slot %d's session does not fit on CUDA%d "
-                                         "(%.2f GiB each, %.2f GiB free); %d slot%s\n", o.batch, b, dev,
+                                         "(%.2f GiB, %.2f GiB free); %d slot%s\n", o.batch, b, dev,
                                  (double) bytes / 1073741824.0, (double) fb / 1073741824.0, b, b == 1 ? "" : "s");
                     fit = b;
                     break;
                 }
                 basalt::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
+                total += bytes;
+                std::fprintf(stderr, "basalt generate: --batch: slot %d on CUDA%d holds %lld tokens (%.2f GiB)\n", b, dev,
+                             (long long) slot_cap[(size_t) b], (double) bytes / 1073741824.0);
             }
             cudaDeviceSynchronize();
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            std::fprintf(stderr, "basalt generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
-                         (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
+            std::fprintf(stderr, "basalt generate: --batch: %d slot sessions on CUDA%d (%.2f GiB in all); %.2f GiB free\n",
+                         (int) bslot_ss[k].size(), dev, (double) total / 1073741824.0, (double) fb / 1073741824.0);
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
         if (fit < 2) {
             std::fprintf(stderr, "basalt generate: WARNING: --batch is off: not two slot sessions fit (a smaller "
-                                 "--max-context or KV streaming, --kv-resident, makes them smaller)\n");
+                                 "--max-context, or KV streaming, --kv-resident, makes them smaller)\n");
             bslot_ss.clear();
+            slot_cap.clear();
             o.batch = 0;
         } else {
             o.batch = fit;
+            slot_cap.resize((size_t) fit);
             if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
-            // the sessions' VRAM is the expert cache's: say what it costs
+            // the sessions' VRAM is the expert cache's: say what it costs (the slots carved on CUDA0 may be fewer than
+            // were first carved when a later stage ran out)
+            uint64_t kept = 0;
+            for (int b = 0; b < o.batch; ++b) kept += basalt::core::session_bytes(g, slot_cap[(size_t) b], K, 0, multi_gpu ? split_at[0] : -1);
             std::fprintf(stderr, "basalt generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
-                                 "expert cache would otherwise hold\n", o.batch,
-                         (double) bytes0 * o.batch / 1073741824.0);
+                                 "expert cache would otherwise hold\n", o.batch, (double) kept / 1073741824.0);
         }
     }
 
@@ -2951,7 +2959,7 @@ int main(int argc, char** argv) {
     if (!o.mtp.empty()) {
         if (o.spec < 2) o.mtp.clear();
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        if (o.batch > 0 && basalt::core::exp_flag("concur6_spec", 1) != 0) mtp.set_stores(o.batch);   // a draft K/V per batch slot
+        if (o.batch > 0 && basalt::core::exp_flag("concur6_spec", 1) != 0) mtp.set_stores(o.batch, slot_cap);   // a draft K/V per batch slot
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const basalt::core::ModelGeometry draft_geometry{};
@@ -5714,7 +5722,6 @@ int main(int argc, char** argv) {
         // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
         const bool batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
         const bool batch_catchup = basalt::core::exp_flag("concur6_catchup", 1) != 0;
-        const bool batch_overlap = basalt::core::exp_flag("concur6_overlap", 1) != 0;
         const int S_all = S;
         basalt::spec::DraftPolicy bpolicy(S);   // the lookup-or-MTP choice, costs per row
         basalt::kernels::SamplerParams greedy_sp;
@@ -5880,7 +5887,7 @@ int main(int argc, char** argv) {
                             if (pk.lookup) { T = pk.t; sl.from_sfx = true; }
                         }
                     }
-                    const int64_t room = o.max_context - sl.p - 1;
+                    const int64_t room = slot_cap[(size_t) rows[sg]] - sl.p - 1;
                     T = (int) std::max<int64_t>(1, std::min<int64_t>(T, room));
                     Tw[sg] = T;
                     float c = 1.0f;
@@ -5892,6 +5899,21 @@ int main(int argc, char** argv) {
                 }
                 int sum = 0;
                 for (int sg = 0; sg < S; ++sg) sum += Tw[sg];
+                if (sum > MR) {
+                    // every slot keeps one row, and none takes more than an equal share of the window unless the others
+                    // want less: the slots wanting least are served in full, the rest split what is left
+                    int ord[MR];
+                    for (int sg = 0; sg < S; ++sg) ord[sg] = sg;
+                    std::sort(ord, ord + S, [&](int x1, int x2) { return Tw[x1] < Tw[x2]; });
+                    int left_rows = MR;
+                    for (int i = 0; i < S; ++i) {
+                        const int share = std::max(1, (left_rows + (S - i) - 1) / (S - i));
+                        Tw[ord[i]] = std::min(Tw[ord[i]], share);
+                        left_rows -= Tw[ord[i]];
+                    }
+                    sum = 0;
+                    for (int sg = 0; sg < S; ++sg) sum += Tw[sg];
+                }
                 while (sum > MR) {
                     int pick = -1;
                     for (int sg = 0; sg < S; ++sg)
@@ -5913,7 +5935,7 @@ int main(int argc, char** argv) {
                     BSlot& sl = bs[(size_t) rows[sg]];
                     if (sl.script.empty()) continue;
                     const int64_t avail = (int64_t) sl.script.size() - sl.produced;
-                    const int64_t room = o.max_context - sl.p - 2;
+                    const int64_t room = slot_cap[(size_t) rows[sg]] - sl.p - 2;
                     const int want = (int) std::min<int64_t>({(int64_t) (sl.rng() % (uint64_t) (extra + 1)), avail, room});
                     if (want <= 0) continue;
                     drafts[sg].assign(sl.script.begin() + sl.produced, sl.script.begin() + sl.produced + want);
@@ -5958,13 +5980,13 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[r0s[sg] + e];
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     fin_of[sg] = eos ? "stop" : sl.stop ? "cancel" : sl.produced + e + 1 >= sl.max_new ? "length"
-                               : sl.p + e + 2 > o.max_context ? "length" : nullptr;
+                               : sl.p + e + 2 > slot_cap[(size_t) rows[sg]] ? "length" : nullptr;
                     if (fin_of[sg] != nullptr) { k = e + 1; break; }
                 }
                 n_keep[sg] = k;
             }
             // the commit runs beside the drafts when nothing reads the committed state meanwhile
-            const bool overlap = real && batch_overlap && !bdigest;
+            const bool overlap = real && !bdigest;
             if (!(overlap ? ver.commit_slots_begin(n_keep, err) : ver.commit_slots(n_keep, err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
@@ -5979,10 +6001,12 @@ int main(int argc, char** argv) {
                 const int b = rows[sg];
                 BSlot& sl = bs[(size_t) b];
                 const int k = n_keep[sg];
+                std::printf("BT %d", b);   // one line per slot and window: every token it kept
                 for (int e = 0; e < k; ++e) {
                     sl.ids.push_back(tok[r0s[sg] + e]);    // the window fed it: the slot's sessions hold it now
-                    std::printf("BT %d %d\n", b, (int) outb[r0s[sg] + e]);
+                    std::printf(" %d", (int) outb[r0s[sg] + e]);
                 }
+                std::printf("\n");
                 sl.produced += k;
                 if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
                     const int a = k - 1, Tw = lens[sg];
@@ -6030,7 +6054,8 @@ int main(int argc, char** argv) {
                     return s1.acc + 0.05 * (double) s1.since_draft > s2.acc + 0.05 * (double) s2.since_draft;
                 });
                 mtp.set_draft_sampling(greedy_sp);   // (the drafts are the draft layer's own picks)
-                const float* Rw = ver.final_R_all();
+                const float* Rw = mtp.keep_rows(ver.final_R_all(), R, err);
+                if (Rw == nullptr) { std::printf("ERR %s\n", err.c_str()); return false; }
                 const int64_t HCN = (int64_t) g.hc * g.n_embd;
                 for (int ci = 0; ci < nc; ++ci) {
                     const int sg = cont[ci];
@@ -6148,7 +6173,7 @@ int main(int argc, char** argv) {
                     ++bt_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                                    : sl.p + 2 > o.max_context ? "length" : nullptr;
+                                    : sl.p + 2 > slot_cap[(size_t) (gi * GS + t)] ? "length" : nullptr;
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
@@ -6460,10 +6485,20 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
+            {
+                const int64_t ctx = admit_slot >= 0 ? slot_cap[(size_t) admit_slot] : o.max_context;
+                const long long want = admit_slot >= 0 ? admit_max_new : (long long) max_new;   // a slot's request: its own max_new
+                if (n + want + 8 > ctx) {
+                    if (admit_slot >= 0)
+                        std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds slot %d's context (%lld)\n", (long long) n,
+                                    want, admit_slot, (long long) ctx);
+                    else
+                        std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                                    want, (long long) ctx);
+                    std::fflush(stdout);
+                    admit_slot = -1;
+                    continue;
+                }
             }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
@@ -6893,6 +6928,7 @@ int main(int argc, char** argv) {
                         // only where the rest is read the same way after it (more than a chunk and more than a short
                         // read left), text only, and into a slot that is not decoding
                         const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                                         n + (admit_slot >= 0 ? admit_max_new : (long long) max_new) + 8 <= slot_cap[(size_t) ys] &&
                                          (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                          b0 - q > std::max<int64_t>(C, o.short_read);
                         std::string ye;
