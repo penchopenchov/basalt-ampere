@@ -28,6 +28,7 @@
 #include "basalt/core/layer.hpp"
 #include "basalt/core/session.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -287,20 +288,18 @@ private:
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    /// One window graph and one commit graph per (hand-off base, row count): which slots the rows are is rebound in
-    /// place (see bind_batch), never a new graph.
-    std::map<uint64_t, cudaGraphExec_t> exec_bm_, commit_bm_;
-    std::map<uint64_t, std::array<int, 8>> exec_bound_, commit_bound_;   ///< the slots each graph is bound to
+    /// One window graph per (hand-off base, row count, doorbell variant) and one commit graph per row count.  Which
+    /// slots the rows are is data (the staged segment tables), so a membership change re-records nothing.
+    std::map<uint64_t, cudaGraphExec_t> exec_bm_;
+    std::map<int, cudaGraphExec_t> commit_bm_;
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
-    uint64_t bkey(int S, int hbase) const {   // the doorbell variant has its own graphs
+    uint64_t bkey(int S, int hbase) const {
         return batch_key(S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
     }
     static uint64_t batch_key(int S, int hbase) { return (uint64_t) hbase << 40 | (uint64_t) S << 32; }
-    /// Finishes a capture of a batch graph: instantiates it for a new key, else updates the existing executable in
-    /// place (same topology, new slot pointers).
-    bool bind_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err);
+    /// Instantiates a finished batch capture as the executable of a new key.
+    bool instantiate_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err);
     // batch_launch / batch_poll
     bool b_running_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;
@@ -315,12 +314,20 @@ private:
     /// the commit, so the GDN kernels take slot identity as data.
     basalt::kernels::SegRow* h_segb_ = nullptr; basalt::kernels::SegRow* m_segb_ = nullptr;
     basalt::kernels::SegRow* segb_ = nullptr;
+    /// The QSA chain's segment tables (qsa_seg.hpp): one entry per row and per segment, staged with the segment table;
+    /// the per-layer, per-slot pointers are uploaded once.
+    basalt::kernels::QsaSeg* h_qseg_ = nullptr; basalt::kernels::QsaSeg* m_qseg_ = nullptr;
+    basalt::kernels::QsaSeg* d_qrows_ = nullptr;   ///< kQsaSegMaxRows row entries, then the segment entries
+    basalt::kernels::QsaSeg* d_qsegs_ = nullptr;
+    std::vector<basalt::kernels::QsaSegSlot*> d_qslots_;   ///< per QSA layer ordinal: [slot] (null outside the stage)
+    float** d_ple_slots_ = nullptr;        ///< each slot's PLE history
+    float* ple_work_ = nullptr;            ///< each row's PLE history while the window runs
     bool batch_gdnf_ = false;              ///< a batch window runs the fused GDN recurrence (a gate)
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
-    bool capture_batch(const int* rows, int S, int hbase, std::string& err);
+    bool capture_batch(int S, int hbase, std::string& err);
     void collect_profile();   // --profile: add the last window's stamps to prof_sum_
-    bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
+    bool capture_commit_batch(int S, std::string& err);
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     basalt::kernels::SamplerParams sampling_ = [] {
         basalt::kernels::SamplerParams s;
