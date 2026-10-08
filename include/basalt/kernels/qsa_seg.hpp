@@ -61,7 +61,8 @@ struct QsaSeg {
     int32_t pad = 0;
 };
 
-/// Device pointers. `rows[r]` for every row r, `segs[j]` for every segment j (distinct slots).
+/// Device pointers. `rows[r]` for every row r, `segs[j]` for every segment j (distinct slots).  `n_seg` is the number
+/// of entries the kernels visit; an entry with a negative slot is skipped, so one launch covers any split of the rows.
 struct QsaSegTable {
     const QsaSegSlot* slots = nullptr;
     const QsaSeg* rows = nullptr;

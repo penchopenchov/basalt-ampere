@@ -245,6 +245,7 @@ __global__ void __launch_bounds__(THREADS) kv_post_seg_kernel(QsaDecKvPost a, Qs
         return;
     }
     const QsaSeg sg = t.segs[b - n * n_kv];
+    if (sg.slot < 0) return;   // an unused entry of the table
     const QsaSegSlot& sl = t.slots[sg.slot];
     take_slot(a, sl);
     a.tail_snap = a.tail_snap != nullptr ? sl.tail_snap : nullptr;

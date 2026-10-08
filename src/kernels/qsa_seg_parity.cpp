@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
     auto stage = [&](const Window& w, const std::vector<int>& pos0, bool commit_keep) {
         std::vector<int32_t> hs((size_t) MAXROWS * k::kStepCount), hq((size_t) MAXROWS * NH), hk((size_t) MAXROWS * NKV),
             hi((size_t) MAXROWS * IQ), hc((size_t) NSLOT * CB, -1);
-        std::vector<k::QsaSeg> rows(MAXROWS), segs(NSLOT);
+        std::vector<k::QsaSeg> rows(MAXROWS), segs(NSLOT, k::QsaSeg{-1, 0, 0, 0});   // unused entries: negative slot
         for (int j = 0; j < w.S; ++j) {
             segs[j] = {w.slot[j], w.first[j], w.len[j], 0};
             const int keep = commit_keep ? (int) (rng() % (w.len[j] + 1)) : w.len[j];
@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
     };
     auto seg_table = [&](const Window& w, int l) {
         k::QsaSegTable t;
-        t.slots = d_slots[l]; t.rows = d_rows; t.segs = d_segs; t.n_rows = w.R; t.n_seg = w.S;
+        t.slots = d_slots[l]; t.rows = d_rows; t.segs = d_segs; t.n_rows = w.R; t.n_seg = std::min(w.R, NSLOT);   // as many entries as rows, the unused ones skipped
         return t;
     };
     auto seg_kv = [&](const Window& w, int l, bool int8) {
@@ -295,7 +295,7 @@ int main(int argc, char** argv) {
     auto commit_seg = [&](const Window& w) {
         k::QsaSegCommit c;
         for (int l = 0; l < NL; ++l) { c.layer[l].slots = d_slots[l]; c.layer[l].raw = raw; c.layer[l].gamma = iknorm; }
-        c.segs = d_segs; c.pos = cpos; c.pos_stride = CB; c.epsilon = 1e-6f; c.n_layers = NL; c.n_seg = w.S;
+        c.segs = d_segs; c.pos = cpos; c.pos_stride = CB; c.epsilon = 1e-6f; c.n_layers = NL; c.n_seg = std::min(w.R, NSLOT);
         k::native_qsa_indexer_commit_seg(c, S_, sc, cs);
     };
     auto cmp = [&](const char* what, size_t d, size_t& tot) {

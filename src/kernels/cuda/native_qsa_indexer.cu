@@ -139,6 +139,7 @@ __global__ void __launch_bounds__(THREADS) commit_seg(QsaSegCommit a, float thet
                                                       const int32_t* __restrict__ mtab, RopeTab rt) {
     const QsaSegCommitLayer& L = a.layer[blockIdx.x];
     const QsaSeg sg = a.segs[blockIdx.y];
+    if (sg.slot < 0) return;   // an unused entry of the table
     const QsaSegSlot& sl = L.slots[sg.slot];
     for (int i = threadIdx.x; i < (R - 1) * D; i += THREADS) sl.tail[i] = ((const volatile float*) sl.tail_snap)[i];
     __syncthreads();
