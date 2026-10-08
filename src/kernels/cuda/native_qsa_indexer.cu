@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include "basalt/kernels/native_qsa_indexer.hpp"
+#include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/mrope.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -127,6 +128,24 @@ __global__ void __launch_bounds__(THREADS) commit_layers(QsaCommitLayers a, floa
         append_one<TAB>(L.raw + (size_t) t * D, a.pos + t, 0, L.gamma, a.epsilon, L.tail, L.dead, L.pooled,
                         L.block_pos, L.max_cells, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
                         mtab, rt);
+        __syncthreads();
+    }
+}
+// commit_layers per (layer, segment): block (l, j) restores its slot's tail from the slot's snapshot, then appends
+// the segment's rows in order at pos[slot * pos_stride + t]
+template <bool TAB>
+__global__ void __launch_bounds__(THREADS) commit_seg(QsaSegCommit a, float theta_scale, float freq_scale,
+                                                      float corr_low, float corr_high, float ext_factor, float mscale,
+                                                      const int32_t* __restrict__ mtab, RopeTab rt) {
+    const QsaSegCommitLayer& L = a.layer[blockIdx.x];
+    const QsaSeg sg = a.segs[blockIdx.y];
+    const QsaSegSlot& sl = L.slots[sg.slot];
+    for (int i = threadIdx.x; i < (R - 1) * D; i += THREADS) sl.tail[i] = ((const volatile float*) sl.tail_snap)[i];
+    __syncthreads();
+    for (int t = 0; t < sg.len; ++t) {
+        append_one<TAB>(L.raw + (size_t) (sg.first + t) * D, a.pos + (size_t) sg.slot * a.pos_stride + t, 0, L.gamma,
+                        a.epsilon, sl.tail, sl.dead, sl.pooled, sl.block_pos, sl.max_cells, theta_scale, freq_scale,
+                        corr_low, corr_high, ext_factor, mscale, mtab, rt);
         __syncthreads();
     }
 }
@@ -294,6 +313,25 @@ void native_qsa_indexer_commit_layers(const QsaCommitLayers& a, const QsaShapes&
     else
         commit_layers<false><<<(unsigned) a.n_layers, THREADS, 0, st>>>(a, theta_scale, k.freq_scale, k.corr_low,
             k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_qsa_indexer_commit_seg(const QsaSegCommit& a, const QsaShapes& s, const RopeScaling& scaling, void* stream) {
+    if (a.n_layers <= 0 || a.n_seg <= 0) return;
+    if (!stream || a.n_layers > kQsaCommitMaxLayers || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        !std::isfinite(a.epsilon) || a.epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer segment commit: bad geometry, layer count or parameters");
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);
+    const RopeTab rt = rope_table_for(scaling);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    const dim3 grid((unsigned) a.n_layers, (unsigned) a.n_seg);
+    if (rt.cos != nullptr)
+        commit_seg<true><<<grid, THREADS, 0, st>>>(a, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+                                                   k.attn_factor, mrope_table(), rt);
+    else
+        commit_seg<false><<<grid, THREADS, 0, st>>>(a, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+                                                    k.attn_factor, mrope_table(), rt);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
