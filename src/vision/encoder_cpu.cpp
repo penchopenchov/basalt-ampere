@@ -106,7 +106,7 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
     const int n = gx * gy;
     if (n % 4 != 0 || (int) patches.size() != n * 768) return false;
     std::vector<float> x((size_t) n * E), h((size_t) n * E), qkv((size_t) n * 3 * E), att((size_t) n * E),
-        tmp((size_t) n * E), ffn((size_t) n * F);
+        tmp((size_t) n * E), ffn((size_t) n * F), attk((size_t) H * n * D), attv((size_t) H * D * n);
     const int T = threads_;
 
     // patch embedding + bilinear position embedding, rows in merge order
@@ -183,31 +183,39 @@ bool CpuEncoder::encode(const std::vector<float>& patches, Size canvas, std::vec
                     }
             }
         });
-        // attention: every token over every token, one head at a time
-        parallel_for(T, n * H, [&](int a0, int a1) {
-            std::vector<float> sc(n);
-            for (int a = a0; a < a1; ++a) {
-                const int t = a / H, hd = a % H;
-                const float* q = &qkv[(size_t) t * 3 * E + hd * D];
-                float mx = -INFINITY;
-                for (int u = 0; u < n; ++u) {
-                    const float* k = &qkv[(size_t) u * 3 * E + E + hd * D];
-                    float s = 0;
-                    for (int i = 0; i < D; ++i) s += q[i] * k[i];
-                    sc[u] = s * kq;
-                    mx = std::max(mx, sc[u]);
+        // attention: every token over every token; per head, blocks of 64 queries against all keys as two products
+        {
+            const int QB = 64, nqb = (n + QB - 1) / QB;
+            std::vector<float>& kh = attk;
+            std::vector<float>& vt = attv;
+            parallel_for(T, H, [&](int h0, int h1) {
+                for (int hd = h0; hd < h1; ++hd)
+                    for (int t = 0; t < n; ++t) {
+                        const float* r = &qkv[(size_t) t * 3 * E + hd * D];
+                        std::memcpy(&kh[((size_t) hd * n + t) * D], r + E, D * sizeof(float));
+                        for (int i = 0; i < D; ++i) vt[((size_t) hd * D + i) * n + t] = r[2 * E + i];
+                    }
+            });
+            parallel_for(T, H * nqb, [&](int a0, int a1) {
+                std::vector<float> qc((size_t) QB * D), sc((size_t) QB * n), oc((size_t) QB * D);
+                for (int a = a0; a < a1; ++a) {
+                    const int hd = a / nqb, q0 = (a % nqb) * QB, rows = std::min(QB, n - q0);
+                    for (int r = 0; r < rows; ++r) std::memcpy(&qc[(size_t) r * D], &qkv[(size_t) (q0 + r) * 3 * E + hd * D], D * sizeof(float));
+                    gemm_f32w(qc.data(), &kh[(size_t) hd * n * D], sc.data(), rows, n, D, 1);
+                    for (int r = 0; r < rows; ++r) {
+                        float* s = &sc[(size_t) r * n];
+                        float mx = -INFINITY;
+                        for (int u = 0; u < n; ++u) { s[u] *= kq; mx = std::max(mx, s[u]); }
+                        float sum = 0;
+                        for (int u = 0; u < n; ++u) { s[u] = expf(s[u] - mx); sum += s[u]; }
+                        const float inv = 1.0f / sum;
+                        for (int u = 0; u < n; ++u) s[u] *= inv;
+                    }
+                    gemm_f32w(sc.data(), &vt[(size_t) hd * D * n], oc.data(), rows, D, n, 1);
+                    for (int r = 0; r < rows; ++r) std::memcpy(&att[(size_t) (q0 + r) * E + hd * D], &oc[(size_t) r * D], D * sizeof(float));
                 }
-                float sum = 0;
-                for (int u = 0; u < n; ++u) { sc[u] = expf(sc[u] - mx); sum += sc[u]; }
-                float* o = &att[(size_t) t * E + hd * D];
-                for (int i = 0; i < D; ++i) o[i] = 0;
-                for (int u = 0; u < n; ++u) {
-                    const float* v = &qkv[(size_t) u * 3 * E + 2 * E + hd * D];
-                    const float w = sc[u] / sum;
-                    for (int i = 0; i < D; ++i) o[i] += w * v[i];
-                }
-            }
-        });
+            });
+        }
         gemm_bf16w(att.data(), L.wo, tmp.data(), n, E, E, T, round_);
         parallel_for(T, n, [&](int t0, int t1) {
             for (int t = t0; t < t1; ++t)

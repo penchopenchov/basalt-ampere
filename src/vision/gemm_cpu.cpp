@@ -74,6 +74,8 @@ void run(const float* X, float* Y, int M, int N, int K, int threads, LoadRow loa
 }  // namespace
 
 void gemm_bf16w(const float* X, const uint16_t* W, float* Y, int M, int N, int K, int threads, bool round_x) {
+    static const bool has_bf16 = cpu_has_bf16();
+    if (round_x && has_bf16) { gemm_bf16_avx512(X, W, Y, M, N, K, threads); return; }
     std::vector<float> xr;
     if (round_x) {
         xr.resize((size_t) M * K);
