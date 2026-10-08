@@ -517,6 +517,7 @@ Verifier::~Verifier() {
         if (kv.second) cudaGraphExecDestroy(kv.second);
     if (arena_b_) cudaFree(arena_b_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
+    if (h_segb_) cudaFreeHost(h_segb_);
     if (cs_) cudaStreamDestroy(cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
@@ -917,6 +918,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     if (prof_on_ && !batch_rec_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 2), cs);
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
+    if (batch_rec_) copy_i32_from_mapped((int32_t*) segb_, (const int32_t*) m_segb_, (int64_t) T * 8, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
@@ -1125,7 +1127,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // conv, gates, recurrence, gated norm and the output's q8_1 in dec_gdn_rec's one or two launches; at
                 // 2/3 the z projection runs on the side stream beside the recurrence (dec_gdn.hpp)
                 {
-                const int gdnf = (!batch_rec_ && tb == 0 && N == 2560 && n <= kDecMaxT) ? dec_gdnf_mode() : 0;
+                // a batch window may take the fused recurrence where the qkv and z projections are one pair launch
+                const bool pair_ok = kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
+                                     ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0;
+                const int gdnf = ((!batch_rec_ || (pair_ok && batch_gdnf_)) && tb == 0 && N == 2560 && n <= kDecMaxT) ? dec_gdnf_mode() : 0;
+                auto rec = [&](const DecRecArgs& ra) {
+                    if (batch_rec_) dec_gdn_rec_seg(ra, segb_, (size_t) gi * gdn_floats, n, n, cs);
+                    else dec_gdn_rec(ra, n, cs);
+                };
                 const bool gdnf_fork = gdnf >= 2 && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
                 auto gdnf_z_side = [&] {
                     cudaEventRecord(ev_fork_, cs);
@@ -1137,8 +1146,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!read_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // qkv and z in one dense_tc_pair launch for every window width, then the
                 // one-launch recurrence with the gated norm
-                const bool pair_ok = kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
-                                     ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0;
                 if (gdnf && !pair_ok)
                     note_fallback("GDN qkv + z without dense_tc_pair", wqkv->native_type,
                                   wg->native_type);
@@ -1158,7 +1165,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     ra.early_trigger = pdl;   // PDL2: the out projection stages its weights
                     {
                         PdlScope pr(pdl);
-                        dec_gdn_rec(ra, n, cs);
+                        rec(ra);
                     }
                     stamp(l, 6, grp);
                     dense_proj(4, wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
@@ -1222,14 +1229,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     goto gdn_done;
                 }
                 }
-                if (batch_rec_) {   // each row from its own slot's conv history, one row each
-                    for (int t = tb; t < te; ++t) {
-                        SessionState& sx = slot_ss(t);
-                        const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
-                                          (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                        gdn_conv_l2_multi(cx, qkv + (size_t) t * C, (const float*) wc->data, hb + (size_t) t * C, (int) C,
-                                          (int) (2 * HK), EPS, 1, cs, 0);
-                    }
+                if (batch_rec_) {   // each row from its segment's conv history, the slots read from the table
+                    gdn_conv_l2_seg(segb_, (size_t) gi * gdn_floats + (size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size,
+                                    qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs);
                 } else
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
                 stamp(l, 3, grp);
@@ -1240,14 +1242,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 dense_proj(2, wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                if (batch_rec_) {   // each row's recurrence from its own slot's state, one token
-                    for (int t = tb; t < te; ++t) {
-                        SessionState& sx = slot_ss(t);
-                        float* stx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
-                        gdn_step_norm_multi(stx, hb + (size_t) t * C, (int) C, gate + (size_t) t * HV, beta + (size_t) t * HV,
-                                            z_ + (size_t) t * ZV, (const float*) wnm->data, EPS, y_ + (size_t) t * ZV,
-                                            (int) HK, (int) HV, 1, nullptr, cs, 0);
-                    }
+                if (batch_rec_) {   // each segment's recurrence from its own slot's state
+                    gdn_step_norm_seg(segb_, (size_t) gi * gdn_floats, hb, (int) C, gate, beta, z_, (const float*) wnm->data,
+                                      EPS, y_, (int) HK, (int) HV, n, cs);
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, nullptr, cs, tb);
@@ -2699,15 +2696,22 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         err = "verify: the batch commit staging failed";
         return false;
     }
+    if (!mapped((size_t) max_t_ * sizeof(basalt::kernels::SegRow), (void**) &h_segb_, (void**) &m_segb_)) {
+        err = "verify: the batch segment staging failed";
+        return false;
+    }
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
-    if (cudaMalloc(&d, a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4) != cudaSuccess) {
+    const uint64_t b = (a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4 + 255) & ~255ull;
+    if (cudaMalloc(&d, b + (uint64_t) max_t_ * sizeof(basalt::kernels::SegRow)) != cudaSuccess) {
         err = "verify: the batch buffers do not fit";
         return false;
     }
     arena_b_ = d;
     commitb_ = (int32_t*) d;
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
+    segb_ = (basalt::kernels::SegRow*) ((uint8_t*) d + b);
     slots_ = slots;
+    batch_gdnf_ = exp_flag("concur2_gdnf", 0) != 0;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     std::fprintf(stderr, "basalt verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
@@ -2790,23 +2794,20 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
             copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        {   // every segment's GDN layers in one launch (the keep counts come from the table)
+            copy_i32_from_mapped((int32_t*) segb_, (const int32_t*) m_segb_, (int64_t) S * 8, cs_);
+            GdnCommitSeg ga;
+            ga.rows = segb_; ga.state_off = (size_t) gdn_index * gdn_floats; ga.state_stride = gdn_floats;
+            ga.h = h_L_ + (size_t) gdn_index * MT * C; ga.qkv = qkv_L_ + (size_t) gdn_index * MT * C;
+            ga.gate = gate_L_ + (size_t) gdn_index * MT * HV; ga.beta = beta_L_ + (size_t) gdn_index * MT * HV;
+            ga.h_stride = (size_t) MT * C; ga.gb_stride = (size_t) MT * HV;
+            ga.C = (int) C; ga.h_k = (int) g.ssm_k_heads; ga.h_v = (int) HV; ga.n_rows = S;
+            for (int64_t l = lb_; l < le_; ++l) ga.n_layers += is_qsa_layer(g, l) ? 0 : 1;
+            gdn_commit_layers_seg(ga, cs_, kCommitBlocks);
+        }
         for (int64_t l = lb_; l < le_ && ok; ++l) {
             const LayerView v(*wt_, l);
             if (!is_qsa_layer(g, l)) {
-                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
-                if (!wnm) { ok = false; break; }
-                for (int t = 0; t < S; ++t) {
-                    SessionState& sx = *slots_[(size_t) rows[t]];
-                    const int32_t* keep = commitb_ + (size_t) rows[t] * CB;
-                    float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
-                    float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) t * C, (int) C, keep, cs_);
-                    gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) t * C, (int) C,
-                                        gate_L_ + (size_t) gdn_index * MT * HV + (size_t) t * HV,
-                                        beta_L_ + (size_t) gdn_index * MT * HV + (size_t) t * HV, z_ + (size_t) t * ZV,
-                                        (const float*) wnm->data, EPS, y_dummy_ + (size_t) t * ZV, (int) g.ssm_k_heads,
-                                        (int) HV, 1, keep, cs_);
-                }
                 ++gdn_index;
             } else {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
@@ -2894,6 +2895,15 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         c[1] = 0;
         c[2] = (int32_t) pos[t];
         for (int64_t j = 3; j < CB; ++j) c[j] = -1;
+    }
+    // the segment table: each row its own one-row segment, the state of layer 0 of its slot's session
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    for (int t = 0; t < S; ++t) {
+        const SessionState& sx = *slots_[(size_t) rows[t]];
+        SegRow& e = h_segb_[t];
+        e.gdn = (float*) ((uintptr_t) sx.gdn_state - (uintptr_t) sx.gdn_ord0 * gdn_floats * sizeof(float));
+        e.row0 = t; e.j = 0; e.n = 1; e.n_keep = 1; e.slot = rows[t]; e.pos = (int32_t) pos[t];
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;

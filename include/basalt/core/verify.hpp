@@ -28,6 +28,7 @@
 #include "basalt/core/layer.hpp"
 #include "basalt/core/session.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -310,6 +311,11 @@ private:
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
+    /// The window's segment table, one entry per row: staged from the host (mapped) at the start of the window and of
+    /// the commit, so the GDN kernels take slot identity as data.
+    basalt::kernels::SegRow* h_segb_ = nullptr; basalt::kernels::SegRow* m_segb_ = nullptr;
+    basalt::kernels::SegRow* segb_ = nullptr;
+    bool batch_gdnf_ = false;              ///< a batch window runs the fused GDN recurrence (a gate)
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
