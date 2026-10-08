@@ -9,7 +9,14 @@ import tempfile
 import threading
 import time
 import urllib.request
+import queue
 from pathlib import Path
+
+# Reads of the encoder's pipe have a timeout: a read that never returns would hold the request turn for good.
+# Generous: a cold model load or a slow encode is not a hang. A silent encoder is killed and the next request
+# starts a fresh one.
+VISION_READY_S = 300.0
+VISION_ENCODE_S = 300.0
 
 
 class Vision:
@@ -30,11 +37,37 @@ class Vision:
         t0 = time.time()
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
                                      text=True, encoding="utf-8", bufsize=1, env=env)
-        line = self.proc.stdout.readline()
+        try:
+            line = self._readline(VISION_READY_S, "the vision encoder did not start")
+        except RuntimeError:                            # silent: it was ended, and is not left half-started
+            self.stopped = True
+            raise
         if not line.startswith("READY"):
             raise RuntimeError("the vision encoder did not start: " + line.strip())
         self.ready_s = time.time() - t0
         self.stopped = False
+
+    def _readline(self, timeout: float, what: str) -> str:
+        """One line from the encoder, waiting at most `timeout` s. On a timeout the encoder is killed, so the next
+        request starts a fresh one, and the read raises RuntimeError instead of holding the request turn."""
+        proc = self.proc
+        got: queue.Queue = queue.Queue()
+
+        def read():
+            try:
+                got.put(proc.stdout.readline())
+            except (OSError, ValueError):               # killed under the read
+                got.put("")
+
+        threading.Thread(target=read, daemon=True).start()
+        try:
+            return got.get(timeout=timeout)
+        except queue.Empty:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
     def alive(self) -> bool:
         return not self.stopped and self.proc.poll() is None
@@ -105,7 +138,11 @@ class Vision:
             try:
                 self.proc.stdin.write(f"ENC {img} {out}\n")
                 self.proc.stdin.flush()
-                line = self.proc.stdout.readline().strip()
+                try:
+                    line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
+                except RuntimeError as e:               # silent: the encoder was ended
+                    self.stopped = True                 # alive() is False, so the next request starts it again
+                    raise ValueError(str(e)) from None
             finally:                                                   # also when the pipe is gone
                 img.unlink(missing_ok=True)
             if not line.startswith("OK"):

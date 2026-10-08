@@ -32,6 +32,10 @@ ENGINE_SILENCE_S = 300.0
 PP_CHUNK_MAX = 32768
 PP_FLOOR_TOK_S = 50.0
 PP_SLACK = 3.0
+# The read of the engine's READY line has a timeout: a blocking read that never returns would hold the request turn
+# for good (the engine sits idle, so no watchdog fires). Generous: a cold model load is not a hang. A process that
+# says nothing for this long is ended, and the next request starts it again.
+ENGINE_READY_S = 900.0
 ENGINE_REQUEST = re.compile(
     # "+ 12288 of 98179 read": a request cancelled during its prompt read
     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
@@ -143,7 +147,22 @@ class ProcessEngine:
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
         self.max_context = 0
-        for line in self.proc.stdout:
+        # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
+        ready_q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
+        ready_deadline = time.monotonic() + ENGINE_READY_S
+        timed_out = False
+        while True:
+            left = ready_deadline - time.monotonic()
+            if left <= 0:
+                timed_out = True
+                break
+            try:
+                line = ready_q.get(timeout=left)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
@@ -157,6 +176,11 @@ class ProcessEngine:
         if log:
             narrator.join(2)                            # its lines precede what follows READY
         if self.max_context <= 0:
+            if timed_out:                               # still loading, or hung: end it so the turn is not held
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
             try:                                        # close its pipes and our log handle
                 self.proc.wait(timeout=5)
                 self.proc.stdin.close()
@@ -165,7 +189,9 @@ class ProcessEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            if errors := start_errors(log, log_start):   # the engine's own reason
+            if timed_out:
+                reason = f"the engine did not report READY within {ENGINE_READY_S:.0f} s"
+            elif errors := start_errors(log, log_start):   # the engine's own reason
                 reason = "; ".join(dict.fromkeys(errors))
             else:
                 reason = start_last_line(log, log_start) or "the engine exited before it was ready"
@@ -205,6 +231,22 @@ class ProcessEngine:
         self.wlock = threading.Lock()                   # serializes stdin writes
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+
+    @staticmethod
+    def _ready_pump(proc, out: queue.Queue) -> None:
+        """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
+        done = False
+        try:
+            for line in proc.stdout:
+                out.put(line)
+                if line.startswith("READY"):
+                    done = True
+                    return
+        except (OSError, ValueError):                   # the pipe closed under us (the engine was killed)
+            pass
+        finally:
+            if not done:
+                out.put(None)
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # a restart replaces both
