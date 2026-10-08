@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from serve import modelfile
+from serve.engine import modelfile
 from serve.server import engine_args, gpus_in_play
 from model_file import ModelFile, ModelWriter  # noqa: E402
 
@@ -48,7 +48,7 @@ class Derivation(Tmp):
     def test_config(self):
         path = self.build()
         cfg = modelfile.model_config(path, str(self.exe), gpus=1)
-        self.assertEqual(cfg["exe"], str(self.exe))
+        self.assertEqual(cfg["engine_bin"], str(self.exe))
         self.assertEqual(cfg["args"], ["--model", path])
         self.assertEqual(cfg["model_name"], "tiny-basalt")
         self.assertEqual(cfg["sampling"], META["sampling"])
@@ -144,7 +144,7 @@ class Vision(Tmp):
         side = self.exe.parent / "basalt-vision"
         side.write_text("")
         v = modelfile.model_config(path, str(self.exe), gpus=1, vision=True)["vision"]
-        self.assertEqual(v["exe"], str(side.resolve()))
+        self.assertEqual(v["vision_bin"], str(side.resolve()))
         self.assertEqual(Path(v["mmproj"]).read_bytes(), b"MMPROJ" * 100)
         self.assertEqual(Path(v["model"]).read_bytes(), b"VOCAB")
         self.assertEqual([p.name for p in Path(v["mmproj"]).parent.iterdir() if ".gguf." in p.name], [])
@@ -192,13 +192,13 @@ class Cli(Tmp):
         self.assertIn("engine binary", err.getvalue())
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--model", path, "--exe", str(self.exe), "--gpu", "x")
+            e = self.run_main("--model", path, "--engine-bin", str(self.exe), "--gpu", "x")
         self.assertEqual(getattr(e, "code", None), 2)
 
     def test_vision_flags_reach_model_config(self):
         from serve import server
         path = self.build(vision=True)
-        base = ["--model", path, "--exe", str(self.exe), "--gpu", "0"]
+        base = ["--model", path, "--engine-bin", str(self.exe), "--gpu", "0"]
         for flags, want in (([], False), (["--vision"], True), (["--vision-cpu"], "cpu"), (["--vision", "--vision-cpu"], "cpu")):
             with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
                     mock.patch("sys.stderr", io.StringIO()):
@@ -209,7 +209,7 @@ class Cli(Tmp):
         path = self.build(vision=True)
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--model", path, "--exe", str(self.exe), "--gpu", "0", "--vision")
+            e = self.run_main("--model", path, "--engine-bin", str(self.exe), "--gpu", "0", "--vision")
         self.assertEqual(getattr(e, "code", None), 2)
         self.assertIn("basalt-vision", err.getvalue())
 

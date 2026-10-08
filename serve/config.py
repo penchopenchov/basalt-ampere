@@ -17,10 +17,10 @@ ENGINE_PASSTHROUGH = ("spec", "spec-min-p", "mtp-max-t", "peer-exclusive", "max-
 CONFIG_PATHS = ("model", "tokenizer")       # resolved against the config file's directory
 
 
-def engine_flags_of(exe: str) -> set[str] | None:
+def engine_flags_of(engine_bin: str) -> set[str] | None:
     """The long flags the engine binary accepts (the option strings stored in it); None when it cannot be read."""
     try:
-        with open(exe, "rb") as f:
+        with open(engine_bin, "rb") as f:
             data = f.read()
     except OSError:
         return None

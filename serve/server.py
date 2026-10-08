@@ -82,7 +82,7 @@ def main() -> int:
     service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
     logs = LogBuffer()                                  # GET /api/logs: this process's output, and the engine's
     sys.stdout, sys.stderr = TeeStream(sys.stdout, logs, "srv"), TeeStream(sys.stderr, logs, "srv")
-    cfg = {}                                            # what the model file implies (serve/modelfile.py)
+    cfg = {}                                            # what the model file implies (serve/engine/modelfile.py)
     try:
         if a.gpu is not None:
             cfg["gpu"] = a.gpu
@@ -96,7 +96,7 @@ def main() -> int:
     if a.model:
         if not a.engine_bin:
             fail("--model needs --engine-bin BINARY")
-        from serve import modelfile
+        from serve.engine import modelfile
         listed = gpu_list(cfg)
         try:
             known = engine_flags_of(a.engine_bin)
@@ -160,7 +160,7 @@ def main() -> int:
         else:
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
         try:
-            engine = ProcessEngine(cfg["exe"], engine_args(cfg), log=cfg.get("log"), env=env, lazy=lazy)
+            engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg), log=cfg.get("log"), env=env, lazy=lazy)
         except EngineStartError as e:
             print(f"[server] error: {e}", file=sys.stderr, flush=True)
             if e.log:

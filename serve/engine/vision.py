@@ -18,7 +18,7 @@ class Vision:
     sends the same picture again (every turn, with most clients) encodes it once."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
-        args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
+        args = [cfg["vision_bin"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.stopped = False

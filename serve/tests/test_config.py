@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from serve.modelfile import with_arg  # noqa: E402
+from serve.engine.modelfile import with_arg  # noqa: E402
 from serve.config import ENGINE_PASSTHROUGH, build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings, load_config_file, parse_settings, server_options, split_engine_extras  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
 

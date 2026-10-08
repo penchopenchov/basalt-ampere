@@ -1051,7 +1051,7 @@ class GpuChoice(unittest.TestCase):
         from serve.engine.vision import Vision
         for gpu, want in ((True, ["--gpu"]), (False, [])):
             with mock.patch.object(Vision, "_start"):
-                v = Vision({"exe": "x", "mmproj": "m", "model": "t", "gpu": gpu})
+                v = Vision({"vision_bin": "x", "mmproj": "m", "model": "t", "gpu": gpu})
             self.assertEqual(v.spawn[0], ["x", "--mmproj", "m", "--model", "t"] + want)
             shutil.rmtree(v.dir, ignore_errors=True)
 

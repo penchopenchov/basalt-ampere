@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 from model_file import ModelFile  # noqa: E402
 
@@ -84,10 +84,10 @@ def gpu_count(visible_env: str | None = None) -> int:
     return sum(1 for line in out.splitlines() if line.startswith("GPU "))
 
 
-def vision_config(mf: ModelFile, exe: str) -> dict:
+def vision_config(mf: ModelFile, engine_bin: str) -> dict:
     """The vision sidecar's config (`basalt-vision` beside the engine binary, the projector and a vocab-only text
     model unpacked from the file).  ValueError says what is missing: vision was asked for, so no silent text-only."""
-    side = Path(exe).resolve().parent / VISION_EXE
+    side = Path(engine_bin).resolve().parent / VISION_EXE
     if "vision/mmproj" not in mf.sections:
         raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision / --vision-cpu")
     if not side.is_file():
@@ -99,7 +99,7 @@ def vision_config(mf: ModelFile, exe: str) -> dict:
     for name, dest in (("vision/mmproj", mmproj), ("vision/text_vocab", vocab)):
         if not dest.exists() or dest.stat().st_size != mf.section(name)[1]:
             write_section(mf, name, dest)
-    return {"exe": str(side), "mmproj": str(mmproj), "model": str(vocab)}
+    return {"vision_bin": str(side), "mmproj": str(mmproj), "model": str(vocab)}
 
 
 def with_arg(args: list[str], flag: str, value) -> list[str]:
@@ -114,7 +114,7 @@ def with_arg(args: list[str], flag: str, value) -> list[str]:
     return out
 
 
-def model_config(path: str, exe: str, gpus: int | None = None, vision: bool | str = False,
+def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bool | str = False,
                  overrides: dict | None = None) -> dict:
     """The engine settings the model file implies, with `overrides` ({flag: value}) replacing the file's
     engine arguments.  `vision` (False, True or "cpu"; True runs the encoder on the GPU) adds the vision sidecar and
@@ -129,10 +129,10 @@ def model_config(path: str, exe: str, gpus: int | None = None, vision: bool | st
         args += ["--peer-device", "1"]
     cdir = cache_dir(mf)
     cdir.mkdir(parents=True, exist_ok=True)
-    cfg = {"exe": os.path.abspath(exe), "args": args, "model_name": meta.get("name") or "basalt",
+    cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
            "sampling": dict(meta.get("sampling") or {}), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
-    v = vision_config(mf, exe) if vision else None
+    v = vision_config(mf, engine_bin) if vision else None
     if v:
         v["gpu"] = vision != "cpu"
         cfg["vision"] = v

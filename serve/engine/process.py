@@ -104,9 +104,9 @@ class ProcessEngine:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
-    def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
+    def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
-        self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died
+        self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again after it died
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
@@ -121,7 +121,7 @@ class ProcessEngine:
         self.silent_note = None
         self.last_err = None
         try:                            # a ready-made engine's BUILD.json says its version
-            self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
+            self.info["version"] = json.loads((Path(engine_bin).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
         if lazy:
@@ -142,7 +142,7 @@ class ProcessEngine:
                 _echoing.add(os.path.abspath(log))
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         sink = None if log else ProcessEngine.stderr_sink
-        self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
                                      bufsize=1, env=env)
         if sink:
