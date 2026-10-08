@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_dec_attn.cu - see include/basalt/kernels/qsa_dec_attn.hpp.
 #include "basalt/kernels/qsa_dec_attn.hpp"
+#include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
@@ -87,6 +88,7 @@ template <int KV_MODE> struct ChunkSmem {
 struct AttnArgs {
     const float* q;
     QsaAttnPools p;
+    QsaSegTable tab;           // SEG: each query's pools come from its slot
     const int32_t* ids;
     const int32_t* steps;
     int n_kv_heads, page_size, n_chunks, cap;
@@ -130,8 +132,9 @@ __device__ __forceinline__ float v1_from(const ChunkSmem<KV_MODE>& sm, int c, in
 }
 
 // One chunk of one query and KV head: partial acc / max / sum for the 12 query heads, as attn_chunk_kernel.
-template <int KV_MODE>
+template <int KV_MODE, bool SEG>
 __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int kvh, int qi, ChunkSmem<KV_MODE>& sm) {
+    const QsaAttnPools pools = SEG ? a.tab.slots[a.tab.rows[qi].slot].pools() : a.p;
     constexpr int ROW = ChunkSmem<KV_MODE>::ROW;
     constexpr int PER = ROW / 16;
     const float* q = a.q + (size_t) qi * (size_t) (a.n_kv_heads * G) * HD;
@@ -160,15 +163,15 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
     if (t < CHUNK) {
         long long r = -1;
         if (t < n_here) {
-            const long long page = (long long) a.p.page_table[cell / a.page_size];
+            const long long page = (long long) pools.page_table[cell / a.page_size];
             if (page >= 0) r = (page * a.n_kv_heads + kvh) * a.page_size + (cell % a.page_size);
         }
         sm.row[t] = r;
     }
     __syncthreads();
     {
-        const unsigned char* kb = KV_MODE == 0 ? (const unsigned char*) a.p.k_pool : (const unsigned char*) a.p.k_q;
-        const unsigned char* vb = KV_MODE == 0 ? (const unsigned char*) a.p.v_pool : (const unsigned char*) a.p.v_q;
+        const unsigned char* kb = KV_MODE == 0 ? (const unsigned char*) pools.k_pool : (const unsigned char*) pools.k_q;
+        const unsigned char* vb = KV_MODE == 0 ? (const unsigned char*) pools.v_pool : (const unsigned char*) pools.v_q;
         for (int i = t; i < CHUNK * PER; i += THREADS) {
             const int c = i / PER, j = i % PER;
             const long long r = sm.row[c];
@@ -184,8 +187,8 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
                 const int c = t & (CHUNK - 1);
                 const long long r = sm.row[c];
                 if (r >= 0) {
-                    if (t < CHUNK) cp_async8(&sm.ks[c][0], a.p.k_scale + r * NSC);
-                    else cp_async8(&sm.vs[c][0], a.p.v_scale + r * NSC);
+                    if (t < CHUNK) cp_async8(&sm.ks[c][0], pools.k_scale + r * NSC);
+                    else cp_async8(&sm.vs[c][0], pools.v_scale + r * NSC);
                 } else if (t >= CHUNK) {
                     *reinterpret_cast<uint2*>(&sm.vs[c][0]) = make_uint2(0, 0);
                 }
@@ -408,12 +411,12 @@ __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi,
     }
 }
 
-template <int KV_MODE>
+template <int KV_MODE, bool SEG>
 __global__ void __launch_bounds__(THREADS) attn_chunk_v2(AttnArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     pdl_launch_dependents();
     pdl_wait();
-    attn_chunk_dev<KV_MODE>(a, blockIdx.x, blockIdx.y, blockIdx.z, *reinterpret_cast<ChunkSmem<KV_MODE>*>(smem_raw));
+    attn_chunk_dev<KV_MODE, SEG>(a, blockIdx.x, blockIdx.y, blockIdx.z, *reinterpret_cast<ChunkSmem<KV_MODE>*>(smem_raw));
 }
 
 __global__ void __launch_bounds__(THREADS) attn_merge_v2(AttnArgs a) {
@@ -472,18 +475,57 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     if (mode == 1) {
         constexpr size_t bytes = sizeof(ChunkSmem<1>);
-        opt_in<1>(attn_chunk_v2<1>, bytes);
-        launch_pdl(attn_chunk_v2<1>, grid, dim3(THREADS), bytes, st, a);
+        opt_in<1>(attn_chunk_v2<1, false>, bytes);
+        launch_pdl(attn_chunk_v2<1, false>, grid, dim3(THREADS), bytes, st, a);
     } else {
         constexpr size_t bytes = sizeof(ChunkSmem<0>);
-        opt_in<0>(attn_chunk_v2<0>, bytes);
-        launch_pdl(attn_chunk_v2<0>, grid, dim3(THREADS), bytes, st, a);
+        opt_in<0>(attn_chunk_v2<0, false>, bytes);
+        launch_pdl(attn_chunk_v2<0, false>, grid, dim3(THREADS), bytes, st, a);
     }
     const size_t mbytes = (size_t) (2 * a.n_chunks + WARPS) * sizeof(float);
     launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_dec_attn: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+void qsa_dec_attn_seg(const float* q, const QsaSegTable& t, bool int8, const int32_t* ids, const int32_t* steps,
+                      int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream,
+                      const float* q_full, float* attn_gated, void* xq) {
+    if (n_q <= 0) return;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
+        n_q > 65535 || t.n_rows < n_q) {
+        std::fprintf(stderr, "qsa_dec_attn_seg: unsupported geometry, table or buffers\n");
+        std::exit(1);
+    }
+    AttnArgs a;
+    a.q = q; a.tab = t; a.ids = ids; a.steps = steps;
+    a.n_kv_heads = (int) s.n_head_kv; a.page_size = (int) s.page_size;
+    a.n_chunks = (int) ((cap + CHUNK - 1) / CHUNK); a.cap = (int) cap;
+    a.stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    a.scale = 1.0f / sqrtf((float) HD);
+    a.scratch = scratch; a.attn = attn;
+    a.q_full = attn_gated != nullptr ? q_full : nullptr;
+    a.attn_gated = q_full != nullptr ? attn_gated : nullptr;
+    cudaStream_t st = (cudaStream_t) stream;
+    a.xq = a.attn_gated != nullptr ? xq : nullptr;
+    const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
+    if (int8) {
+        constexpr size_t bytes = sizeof(ChunkSmem<1>);
+        opt_in<2>(attn_chunk_v2<1, true>, bytes);
+        launch_pdl(attn_chunk_v2<1, true>, grid, dim3(THREADS), bytes, st, a);
+    } else {
+        constexpr size_t bytes = sizeof(ChunkSmem<0>);
+        opt_in<3>(attn_chunk_v2<0, true>, bytes);
+        launch_pdl(attn_chunk_v2<0, true>, grid, dim3(THREADS), bytes, st, a);
+    }
+    const size_t mbytes = (size_t) (2 * a.n_chunks + WARPS) * sizeof(float);
+    launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_dec_attn_seg: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
 }
