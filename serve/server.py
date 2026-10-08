@@ -32,7 +32,8 @@ from serve.engine.vision import (Vision, child_env, engine_args, gpu_list, gpus_
                                  vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
-from serve.security import LOOPBACK_NAMES, allowed_hosts_of, exposed_without_key, lan_addresses, origins_of  # noqa: E402
+from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
+                            lan_addresses, origins_of)
 from serve.service import Service  # noqa: E402
 from serve.util.logbuf import LogBuffer, TeeStream, tail_file  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
@@ -166,7 +167,11 @@ def main() -> int:
         # an empty key would silently disable authentication
         print("[server] error: --api-key is empty (give a key, or leave it out)", file=sys.stderr)
         return 2
-    svc.api_key = a.api_key
+    try:
+        svc.api_key = api_key_of(a.api_key)
+    except ValueError as e:
+        print(f"[server] error: {e}: give a key, or leave --api-key out", file=sys.stderr)
+        return 2
     try:
         svc.cors_origins = origins_of(a.cors_origin, "--cors-origin", wildcard=True)
         svc.allowed_hosts = allowed_hosts_of(a.allowed_host)

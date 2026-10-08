@@ -1,7 +1,6 @@
 """The HTTP server and its request handler: routes, authentication, CORS and streaming."""
 from __future__ import annotations
 
-import hmac
 import json
 import os
 import select
@@ -20,7 +19,7 @@ from serve.engine.errors import EngineDied, EngineStarting, EngineStuck, GpuBusy
 from serve.frontend import anthropic_to_messages, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect, structured_chunks
 from serve.api.responses import ResponsesError
-from serve.security import host_allowed, host_names_for, origin_allowed
+from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
 from serve.api.structured import StructuredOutputError, prepare_format, validated_json
 from serve.util.text import stop_strings
@@ -203,7 +202,7 @@ def make_handler(svc: Service):
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # constant-time
+            if key_matches(given, svc.api_key):
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False

@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.handler import serve  # noqa: E402
-from serve.security import allowed_hosts_of, host_allowed, host_name, host_names_for, origin_allowed  # noqa: E402
+from serve.security import (allowed_hosts_of, api_key_of, host_allowed, host_name, host_names_for,  # noqa: E402
+                            key_matches, origin_allowed)
 from serve.service import Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
@@ -273,6 +274,53 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(self.req("POST", "/unload", {}, {"Content-Type": "application/json"})[0], 200)
         self.assertEqual(self.req("POST", "/load", {}, {"Content-Type": "application/json",
                                                         "Origin": f"http://127.0.0.1:{self.port}"})[0], 200)
+
+
+class ApiKeyForms(unittest.TestCase):
+    """A key no client could send (spaces or a line end around it), and a key outside ASCII."""
+
+    def test_the_key_loses_what_a_header_cannot_carry(self):
+        self.assertEqual(api_key_of(" s3cret "), "s3cret")
+        self.assertEqual(api_key_of("s3cret\r\n"), "s3cret")
+        self.assertEqual(api_key_of("two words"), "two words")
+        self.assertEqual(api_key_of(12345), "12345")
+        self.assertEqual(api_key_of(""), "")
+        self.assertEqual(api_key_of(None), "")
+
+    def test_a_blank_key_is_an_error_not_no_key(self):
+        for blank in (" ", "\r\n", "\t "):
+            with self.assertRaises(ValueError):
+                api_key_of(blank)
+
+    def test_a_key_outside_ascii_matches_as_utf8_and_as_latin1(self):
+        def as_read(key, enc):                                    # what http.server hands the handler
+            return key.encode(enc).decode("latin-1")
+        self.assertTrue(key_matches("s3cret", "s3cret"))
+        self.assertFalse(key_matches("s3cret ", "s3cret"))
+        self.assertFalse(key_matches("", "s3cret"))
+        self.assertTrue(key_matches(as_read("clé", "utf-8"), "clé"))
+        self.assertTrue(key_matches(as_read("clé", "latin-1"), "clé"))
+        self.assertTrue(key_matches(as_read("ключ", "utf-8"), "ключ"))
+        self.assertFalse(key_matches(as_read("ключ", "utf-8"), "ключx"))
+
+    def test_a_utf8_key_over_http(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=4096), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key = "ключ"
+        httpd = serve(svc, port=0)
+        port = httpd.server_address[1]
+        try:
+            for token, want in (("Bearer " + svc.api_key, 200), ("Bearer ???", 401)):
+                sent = token.encode().decode("latin-1")             # UTF-8 bytes, as curl and the web app send
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                try:
+                    conn.request("GET", "/v1/models", headers={"Authorization": sent.encode("latin-1")})
+                    self.assertEqual(conn.getresponse().status, want)
+                finally:
+                    conn.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 if __name__ == "__main__":
