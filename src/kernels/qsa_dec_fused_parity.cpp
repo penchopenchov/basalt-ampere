@@ -58,6 +58,7 @@ struct State {
 
 int main(int argc, char** argv) {
     const int iters = argc > 1 ? std::atoi(argv[1]) : 500;
+    const bool split = argc > 2 && std::atoi(argv[2]) != 0;   // kv_post as its two parts
     const k::QsaShapes s = k::qsa_real_shapes();
     const int NKV = (int) s.n_head_kv, HD = (int) s.head_dim, NH = (int) s.n_head, IQ = (int) s.idx_n_head,
               ID = (int) s.idx_dim, P = (int) s.page_size;
@@ -129,6 +130,11 @@ int main(int argc, char** argv) {
             a.k_q = x.kq; a.v_q = x.vq; a.k_scale = x.ks; a.v_scale = x.vs; a.page_table = d_table; a.host = hp;
             a.idx_raw = raw; a.idx_k_norm = iknorm; a.tail = x.tail; a.dead = x.dead; a.pooled = x.pooled;
             a.block_pos = x.bpos; a.tail_snap = x.snap; a.max_cells = max_cells; a.eps = 1e-6f;
+            if (split) {   // the indexer part, then the K/V part
+                a.part = 2;
+                k::qsa_dec_kv_post(a, n, s, sc, cs);
+                a.part = 1;
+            }
             k::qsa_dec_kv_post(a, n, s, sc, cs);
             k::QsaDecQPost b;
             b.q_full = qfull; b.qcur = qcur[1]; b.pos_q = pos_q; b.q_norm = qnorm; b.q_idx = qidx[1]; b.pos_i = pos_i;
