@@ -70,6 +70,11 @@ struct GdnCommitSeg {
     int C = 0, h_k = 0, h_v = 0, n_layers = 0, n_rows = 0;
 };
 void gdn_commit_layers_seg(const GdnCommitSeg& a, void* stream, int blocks = 32);
+/// The PLE history of each row's slot as data: `slots[slot]` is that slot's history (`n` floats).  Gather: work row t =
+/// the slot's history; scatter: the slot's history = row (row0 + n_keep - 1) of `work` for each segment's first row
+/// (n_keep <= 0 leaves it).
+void ple_hist_gather(float* work, float* const* slots, const SegRow* rows, int64_t n, int n_rows, void* stream);
+void ple_hist_scatter(float* const* slots, const float* work, const SegRow* rows, int64_t n, int n_rows, void* stream);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);

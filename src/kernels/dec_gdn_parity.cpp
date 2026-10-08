@@ -558,6 +558,59 @@ bool parity_seg(cudaStream_t s) {
     return ok;
 }
 
+// ple_hist_gather / ple_hist_scatter: shuffled slots, per-segment keep counts (0 leaves the slot's history).
+bool parity_ple_hist(cudaStream_t s) {
+    const int64_t n = 4 * 1000 + 37;
+    std::mt19937 rng(7);
+    bool ok = true;
+    for (int trial = 0; trial < 6; ++trial) {
+        const int S = 1 + (int) (rng() % 8);
+        std::vector<int> perm(8);
+        for (int i = 0; i < 8; ++i) perm[(size_t) i] = i;
+        std::shuffle(perm.begin(), perm.end(), rng);
+        std::vector<float> hs((size_t) 8 * n), hw((size_t) S * n);
+        for (auto& v : hs) v = (float) (rng() % 100000) / 7.0f;
+        for (auto& v : hw) v = (float) (rng() % 100000) / 11.0f;
+        float *d_hist, *d_work;
+        float** d_tab;
+        SegRow* d_rows;
+        CK(cudaMalloc(&d_hist, hs.size() * 4)); CK(cudaMalloc(&d_work, hw.size() * 4));
+        CK(cudaMalloc(&d_tab, 8 * sizeof(float*))); CK(cudaMalloc(&d_rows, 8 * sizeof(SegRow)));
+        CK(cudaMemcpy(d_hist, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_work, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice));
+        std::vector<float*> tab(8);
+        for (int i = 0; i < 8; ++i) tab[(size_t) i] = d_hist + (size_t) i * n;
+        CK(cudaMemcpy(d_tab, tab.data(), 8 * sizeof(float*), cudaMemcpyHostToDevice));
+        std::vector<SegRow> rows((size_t) S);
+        for (int t = 0; t < S; ++t) {
+            SegRow e{};
+            e.row0 = t; e.j = 0; e.n = 1; e.n_keep = (int) (rng() % 2); e.slot = perm[(size_t) t];
+            rows[(size_t) t] = e;
+        }
+        CK(cudaMemcpy(d_rows, rows.data(), (size_t) S * sizeof(SegRow), cudaMemcpyHostToDevice));
+        ple_hist_gather(d_work, d_tab, d_rows, n, S, s);
+        CK(cudaStreamSynchronize(s));
+        std::vector<float> got(hw.size());
+        CK(cudaMemcpy(got.data(), d_work, got.size() * 4, cudaMemcpyDeviceToHost));
+        for (int t = 0; t < S; ++t)
+            for (int64_t i = 0; i < n; ++i)
+                if (got[(size_t) t * n + i] != hs[(size_t) rows[(size_t) t].slot * n + i]) ok = false;
+        CK(cudaMemcpy(d_work, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice));
+        ple_hist_scatter(d_tab, d_work, d_rows, n, S, s);
+        CK(cudaStreamSynchronize(s));
+        std::vector<float> after(hs.size());
+        CK(cudaMemcpy(after.data(), d_hist, after.size() * 4, cudaMemcpyDeviceToHost));
+        std::vector<float> want = hs;
+        for (int t = 0; t < S; ++t)
+            if (rows[(size_t) t].n_keep > 0)
+                for (int64_t i = 0; i < n; ++i) want[(size_t) rows[(size_t) t].slot * n + i] = hw[(size_t) t * n + i];
+        if (after != want) ok = false;
+        cudaFree(d_hist); cudaFree(d_work); cudaFree(d_tab); cudaFree(d_rows);
+    }
+    std::printf("ple_hist gather/scatter: %s\n", ok ? "ok" : "MISMATCH");
+    return ok;
+}
+
 void bench(cudaStream_t s) {
     std::mt19937 rng(7);
     constexpr int NL = 12;   // distinct layers per graph: far more weight than the L2 holds
@@ -710,7 +763,7 @@ int main(int argc, char** argv) {
     CK(cudaStreamCreateWithFlags(&g_side, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&g_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&g_join, cudaEventDisableTiming));
-    const bool ok = mode == "--bench-only" || (parity_gdnf(s) && parity_seg(s));
+    const bool ok = mode == "--bench-only" || (parity_gdnf(s) && parity_seg(s) && parity_ple_hist(s));
     if (mode != "--bench-only") std::printf("dec_gdn_parity: %s\n", ok ? "PASS (bitwise, columns independent of T)" : "FAIL");
     if (ok && (mode == "--bench" || mode == "--bench-only")) { bench_seg(s); bench(s); }
     return ok ? 0 : 1;

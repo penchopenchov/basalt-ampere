@@ -511,6 +511,26 @@ __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __rest
         dst[i] = src[(size_t) idx * stride + i];
 }
 
+// dir 0: work row t <- slot's array.  dir 1: slot's array <- work row (row0 + n_keep - 1), segment first rows only.
+__global__ void ple_hist_seg_kernel(float* __restrict__ work, float* const* __restrict__ slots,
+                                    const SegRow* __restrict__ rows, int64_t n, int dir) {
+    const int t = blockIdx.y;
+    const SegRow r = rows[t];
+    float* slot = slots[r.slot];
+    const float* src = nullptr;
+    float* dst = nullptr;
+    if (dir == 0) {
+        src = slot;
+        dst = work + (size_t) t * n;
+    } else {
+        if (r.j != 0 || r.n_keep <= 0) return;
+        src = work + (size_t) (r.row0 + r.n_keep - 1) * n;
+        dst = slot;
+    }
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
 __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
                                    uint4* __restrict__ dst, long long per) {
     const long long total = (long long) *n * per;
@@ -1067,6 +1087,18 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
     const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
     copy_indexed_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, src, stride, index, n);
     check("copy_indexed");
+}
+
+void ple_hist_gather(float* work, float* const* slots, const SegRow* rows, int64_t n, int n_rows, void* stream) {
+    const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
+    ple_hist_seg_kernel<<<dim3(blocks, (unsigned) n_rows), 256, 0, (cudaStream_t) stream>>>(work, slots, rows, n, 0);
+    check("ple_hist_gather");
+}
+
+void ple_hist_scatter(float* const* slots, const float* work, const SegRow* rows, int64_t n, int n_rows, void* stream) {
+    const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
+    ple_hist_seg_kernel<<<dim3(blocks, (unsigned) n_rows), 256, 0, (cudaStream_t) stream>>>((float*) work, slots, rows, n, 1);
+    check("ple_hist_scatter");
 }
 
 // a GPU timestamp (ns, %globaltimer) into buf[i] - the verify window's stage profiler
