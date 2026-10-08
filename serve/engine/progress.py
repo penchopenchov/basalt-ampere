@@ -63,7 +63,7 @@ class LoadBars:
         self.started = 0                               # targets begun
         self.t0 = None
         self.drawn = 0                                 # lines of bars on screen
-        self.kv: list[tuple[str, int, int]] = []       # (target, bytes, tokens): allocated only
+        self.kv: list[tuple[str, int, int, str]] = []  # (target, bytes, tokens, kind): allocated only
 
     def name(self, target: str) -> str:
         if target == "ram":
@@ -123,8 +123,30 @@ class LoadBars:
         self.out.write(text + "\n")
         self._draw()
 
-    def set_kv(self, target: str, nbytes: int, tokens: int) -> None:
-        self.kv.append((target, nbytes, tokens))
+    def set_kv(self, target: str, nbytes: int, tokens: int, kind: str = "") -> None:
+        self.kv.append((target, nbytes, tokens, kind))
+
+    def kv_lines(self) -> list[str]:
+        """One line per device: all the session state allocated there (solo, batch slots, draft K/V)."""
+        out = []
+        for target in dict.fromkeys(t for t, _, _, _ in self.kv):
+            mine = [x for x in self.kv if x[0] == target]
+            total = sum(b for _, b, _, _ in mine)
+            solo = [tok for _, _, tok, k in mine if k == ""]
+            slots = [tok for _, _, tok, k in mine if k == "slot"]
+            draft = sum(b for _, b, _, k in mine if k == "draft")
+            head = f"[server] kv cache: {total / 2**30:.1f} GiB on {self.name(target)}"
+            if not slots and not draft:
+                out.append(head + "".join(f", {tok} tokens" for tok in solo))
+                continue
+            parts = [f"solo {tok} tokens" for tok in solo]
+            for tok in dict.fromkeys(slots):           # slots of one size read as `2 slots x 262144 tokens`
+                n = slots.count(tok)
+                parts.append(f"{n} slot{'s' if n != 1 else ''} x {tok} tokens")
+            if draft:
+                parts.append(f"draft K/V {draft / 2**30:.1f} GiB")
+            out.append(head + " (" + " + ".join(parts) + ")")
+        return out
 
     def set_total(self, total: int) -> None:
         """The bytes the whole start places."""
@@ -166,8 +188,8 @@ class LoadBars:
             extra = "".join(f"; {self.name(tg)} copy {b / 2**30:.1f} GiB" for tg, b in part(True).items())
             self.out.write(f"[server] loaded {done / 2**30:.1f} GiB in {time.time() - self.t0:.1f} s "
                            f"({parts}{extra})\n")
-        for target, nbytes, tokens in self.kv:
-            self.out.write(f"[server] kv cache: {nbytes / 2**30:.1f} GiB on {self.name(target)}, {tokens} tokens\n")
+        for line in self.kv_lines():
+            self.out.write(line + "\n")
         self.kv.clear()
         self.targets.clear()
         self.out.flush()
@@ -204,10 +226,15 @@ def load_plan(line: str):
 
 
 def load_kv(line: str):
-    """(target, bytes, tokens) from an engine `basalt load: kv <target> <bytes> <tokens>` line, else None."""
+    """(target, bytes, tokens, kind) from an engine `basalt load: kv [slot|draft ]<target> <bytes> <tokens>` line
+    (kind "" for the solo session), else None."""
     parts = line.split()
-    if len(parts) == 6 and parts[:3] == ["basalt", "load:", "kv"] and parts[4].isdigit() and parts[5].isdigit():
-        return parts[3], int(parts[4]), int(parts[5])
+    if parts[:3] != ["basalt", "load:", "kv"]:
+        return None
+    rest = parts[3:]
+    kind = rest.pop(0) if len(rest) == 4 and rest[0] in ("slot", "draft") else ""
+    if len(rest) == 3 and rest[1].isdigit() and rest[2].isdigit():
+        return rest[0], int(rest[1]), int(rest[2]), kind
     return None
 
 

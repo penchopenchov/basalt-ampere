@@ -1534,8 +1534,11 @@ class LoadProgress(unittest.TestCase):
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
         from serve.engine.progress import LoadBars, load_kv, load_progress
-        self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144))
+        self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144, ""))
+        self.assertEqual(load_kv("basalt load: kv slot cuda1 100 5"), ("cuda1", 100, 5, "slot"))
+        self.assertEqual(load_kv("basalt load: kv draft cuda0 100 5"), ("cuda0", 100, 5, "draft"))
         self.assertIsNone(load_kv("basalt load: kv cuda0 x 1"))
+        self.assertIsNone(load_kv("basalt load: kv other cuda0 1 2"))
         self.assertIsNone(load_progress("basalt load: kv cuda0 100 5"))
         out = io.StringIO()
         bars = LoadBars(out, gpus=[2, 3])
@@ -1546,6 +1549,18 @@ class LoadProgress(unittest.TestCase):
         first, second = out.getvalue().splitlines()
         self.assertTrue(first.startswith("[server] loaded 2.0 GiB in "))   # the allocation is not in the total
         self.assertEqual(second, "[server] kv cache: 4.0 GiB on cuda2, 262144 tokens")
+
+    def test_kv_line_sums_solo_slots_and_draft_per_device(self):
+        from serve.engine.progress import LoadBars
+        bars = LoadBars(io.StringIO(), gpus=[2, 3])
+        bars.set_kv("cuda0", 4 << 30, 262144)
+        bars.set_kv("cuda0", 4 << 30, 262144, "slot")
+        bars.set_kv("cuda0", 4 << 30, 262144, "slot")
+        bars.set_kv("cuda0", 1 << 29, 262144, "draft")
+        bars.set_kv("cuda1", 1 << 30, 1000, "slot")
+        self.assertEqual(bars.kv_lines(), [
+            "[server] kv cache: 12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)",
+            "[server] kv cache: 1.0 GiB on cuda3 (1 slot x 1000 tokens)"])
 
     def test_a_target_planned_empty_shows_nothing(self):
         from serve.engine.progress import LoadBars
