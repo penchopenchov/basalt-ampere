@@ -6,7 +6,7 @@ list`.  The admission state is now kept across a restart.  A waiter either goes 
 with a clean 503; never a hang, never a ValueError.  The fake engine of test_parallel runs behind the real
 ProcessEngine and Service.
 
-    python -m unittest serve.test_restart_waiters -v
+    python -m unittest serve.tests.test_restart_waiters -v
 """
 import json
 import subprocess
@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from serve import test_parallel
+from serve.tests import test_parallel
 
 REAL_POPEN = subprocess.Popen
 

@@ -16,7 +16,7 @@ from serve.handler import serve
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 from serve.engine.vision import engine_args
-from serve.test_lifecycle import ResidentEngine
+from serve.tests.test_lifecycle import ResidentEngine
 
 
 class VramEngine(ResidentEngine):
@@ -78,7 +78,7 @@ class Route(unittest.TestCase):
     def setUp(self):
         tok = ByteTokenizer()
         self.engine = VramEngine(tok)
-        self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

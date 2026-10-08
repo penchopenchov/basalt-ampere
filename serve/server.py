@@ -1,4 +1,4 @@
-"""serve/server.py - plan v0.3 P8: OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
+"""serve/server.py - OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
 
     basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
     python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...   (what basalt serve runs)

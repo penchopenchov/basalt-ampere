@@ -58,7 +58,7 @@ class Structured(unittest.TestCase):
     def setUp(self):
         self.tok = ByteTokenizer()
         self.engine = MockEngine(self.tok, json.dumps(STORY), max_context=16384)
-        self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -161,7 +161,7 @@ class Structured(unittest.TestCase):
         import sys
         code = ("import sys; import serve.server; "
                 "sys.exit(1 if any(m == 'jsonschema' or m.startswith('jsonschema.') for m in sys.modules) else 0)")
-        r = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[1]))
+        r = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[2]))
         self.assertEqual(r.returncode, 0)
 
 

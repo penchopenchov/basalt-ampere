@@ -1,6 +1,6 @@
-"""serve/test_responses.py - the Responses API (POST /v1/responses) against the mock engine (no GPU, no pack).
+"""serve/tests/test_responses.py - the Responses API (POST /v1/responses) against the mock engine (no GPU, no pack).
 
-    python -m unittest serve.test_responses -v
+    python -m unittest serve.tests.test_responses -v
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.api.responses import (ENCRYPTED_PREFIX, ResponsesError, input_messages, request_tools,  # noqa: E402
                              template_kwargs, text_format)
@@ -22,7 +22,7 @@ from serve.handler import serve  # noqa: E402
 from serve.service import Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ChatTemplate(ROOT / "serve/chat_template.jinja")
 
 CALL = ("Let me look.\n</think>\n\nChecking.\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\ncat a.txt\n"

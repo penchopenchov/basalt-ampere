@@ -22,7 +22,7 @@ from serve.util.text import ByteTokenizer
 from serve.engine.vision import gpus_in_play
 from serve.util.telemetry import GPU_KEYS, Telemetry
 
-TEMPLATE = Path(__file__).parent / "chat_template.jinja"
+TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
 
 
 class Clocked(MockEngine):

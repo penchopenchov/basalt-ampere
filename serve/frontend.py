@@ -1,10 +1,10 @@
-"""serve/frontend.py - plan v0.3 P8: the request/response layer between API clients and the engine.
+"""serve/frontend.py - the request/response layer between API clients and the engine.
 
 Everything here is text: no model, no GPU. The engine consumes token ids and produces text deltas; this module
 
   * normalizes OpenAI Chat Completions and Anthropic Messages requests into the chat template's message form,
   * renders the model's own Jinja chat template (pack `tokenizer/chat_template.jinja`) exactly as Hugging Face
-    does (checked against the pack's `chat_golden.json`, 10 cases incl. thinking and tools),
+    does,
   * parses the streamed output incrementally into reasoning (`<think>...</think>`), content and tool calls in
     the template's XML form (`<tool_call><function=NAME><parameter=P>VALUE</parameter>...</function></tool_call>`),
     never emitting a partial tag to the client.

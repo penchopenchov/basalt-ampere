@@ -1,7 +1,7 @@
 """The streaming detokenizer (perf-review F-1): the incremental one emits exactly what the old re-decode did, token
 by token, and its cost per token does not grow with the reply.
 
-    python -m unittest serve.test_detok      (needs a pack's tokenizer; skipped without one)
+    python -m unittest serve.tests.test_detok      (needs a pack's tokenizer; skipped without one)
 """
 import random
 import sys
@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 

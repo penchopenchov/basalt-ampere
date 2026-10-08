@@ -1,7 +1,7 @@
-"""serve/test_security.py - the Host check (DNS rebinding) and the Origin check for requests without an API key,
+"""serve/tests/test_security.py - the Host check (DNS rebinding) and the Origin check for requests without an API key,
 against the mock engine (no GPU, no pack).
 
-    python -m unittest serve.test_security -v
+    python -m unittest serve.tests.test_security -v
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.handler import serve  # noqa: E402
@@ -23,7 +23,7 @@ from serve.security import allowed_hosts_of, host_allowed, host_name, host_names
 from serve.service import Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 LOCAL = {"localhost", "127.0.0.1", "::1"}
 
 

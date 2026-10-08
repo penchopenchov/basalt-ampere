@@ -1,6 +1,6 @@
-"""serve/test_server.py - the max tokens budget over both APIs, against the mock engine (no GPU, no pack).
+"""serve/tests/test_server.py - the max tokens budget over both APIs, against the mock engine (no GPU, no pack).
 
-    python -m unittest serve.test_server -v
+    python -m unittest serve.tests.test_server -v
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve import service as service_module  # noqa: E402
 from serve.engine.errors import EngineDied, EngineStartError, GpuBusy  # noqa: E402
@@ -32,7 +32,7 @@ from serve.service import CTX_SLACK, Service, prompt_tokens_seen, request_timing
 from serve.util.text import ByteTokenizer, control_literals  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 CTX = 4096
 ANSWER = "xy" * 1000                             # longer than the old 1024 fallback: one token per byte (not
 #                                                one token repeated, which the server ends at 256)
