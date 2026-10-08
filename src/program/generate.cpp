@@ -909,6 +909,13 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
 /// expert cache for its layers, a verify window and a prompt path; the last one also holds the head (the drafter
 /// lives on its device too).
+/// A batch slot's session: owned, or (the first slot of a one-GPU --batch) the solo session itself.
+struct SlotDelete {
+    bool own = true;
+    void operator()(basalt::core::SessionState* p) const { if (own) delete p; }
+};
+using SlotSession = std::unique_ptr<basalt::core::SessionState, SlotDelete>;
+
 struct GpuStage {
     int dev = 0;
     int64_t lb = 0, le = 0;
@@ -2809,6 +2816,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    uint64_t solo_kv_bytes = 0;   // the solo session's state on CUDA0, reported once it is known to be a session of its own
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
@@ -2820,8 +2828,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt generate: session state allocation failed\n");
             return 1;
         }
-        basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(0),
-                                       basalt::core::session_bytes(g, o.max_context, K, 0, hi0), o.max_context);
+        solo_kv_bytes = basalt::core::session_bytes(g, o.max_context, K, 0, hi0);
         if (basalt::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
             std::fprintf(stderr, "basalt generate: session_init failed\n");
             return 1;
@@ -2878,9 +2885,10 @@ int main(int argc, char** argv) {
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
     // engine still starts and serves one request at a time.
-    std::vector<std::vector<std::unique_ptr<basalt::core::SessionState>>> bslot_ss;
+    std::vector<std::vector<SlotSession>> bslot_ss;
     std::vector<int64_t> slot_cap;   // each batch slot's context (cells)
-    uint64_t slot_kv_cuda0 = 0;      // the batch slots' sessions on CUDA0: VRAM the expert cache does not get
+    uint64_t slot_kv_cuda0 = 0;      // the batch slots' sessions on CUDA0 beyond the solo one: VRAM the expert cache does not get
+    bool slot0_is_solo = false;      // slot 0 is the solo session (no separate solo state)
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -2902,6 +2910,7 @@ int main(int argc, char** argv) {
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
         slot_cap.assign((size_t) o.batch, o.max_context);
+        slot0_is_solo = stages.empty();   // one GPU: the solo session's state is slot 0's
         int fit = o.batch;   // the slots every stage could carve
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
@@ -2911,7 +2920,13 @@ int main(int argc, char** argv) {
             uint64_t total = 0;
             for (int b = 0; b < fit; ++b) {
                 const uint64_t bytes = basalt::core::session_bytes(g, slot_cap[(size_t) b], K, lo, hi);
-                auto u = std::make_unique<basalt::core::SessionState>();
+                if (k == 0 && b == 0 && slot0_is_solo) {
+                    bslot_ss[0].push_back(SlotSession(&ss, SlotDelete{false}));
+                    std::fprintf(stderr, "basalt generate: --batch: slot 0 on CUDA%d is the solo session (%.2f GiB)\n", dev,
+                                 (double) bytes / 1073741824.0);
+                    continue;
+                }
+                SlotSession u(new basalt::core::SessionState());
                 void* buf = nullptr;
                 if (cudaMalloc(&buf, bytes) != cudaSuccess || basalt::core::session_init(g, slot_cap[(size_t) b], K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
@@ -2927,7 +2942,6 @@ int main(int argc, char** argv) {
                 basalt::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
                 total += bytes;
-                basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(dev), bytes, slot_cap[(size_t) b], "slot");
                 std::fprintf(stderr, "basalt generate: --batch: slot %d on CUDA%d holds %lld tokens (%.2f GiB)\n", b, dev,
                              (long long) slot_cap[(size_t) b], (double) bytes / 1073741824.0);
             }
@@ -2944,20 +2958,31 @@ int main(int argc, char** argv) {
             bslot_ss.clear();
             slot_cap.clear();
             o.batch = 0;
+            slot0_is_solo = false;
         } else {
             o.batch = fit;
+            for (size_t k = 0; k < bslot_ss.size(); ++k)   // every slot session allocated, solo state included
+                for (int b = 0; b < o.batch; ++b)
+                    basalt::core::LoadProgress::kv(
+                        basalt::core::LoadProgress::cuda(k == 0 ? 0 : stages[k - 1]->dev),
+                        basalt::core::session_bytes(g, slot_cap[(size_t) b], K, k == 0 ? 0 : stages[k - 1]->lb,
+                                                    k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le),
+                        slot_cap[(size_t) b], "slot");
             slot_cap.resize((size_t) fit);
             if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
             // the sessions' VRAM is the expert cache's: say what it costs (the slots carved on CUDA0 may be fewer than
             // were first carved when a later stage ran out)
             uint64_t kept = 0;
-            for (int b = 0; b < o.batch; ++b) kept += basalt::core::session_bytes(g, slot_cap[(size_t) b], K, 0, multi_gpu ? split_at[0] : -1);
+            for (int b = slot0_is_solo ? 1 : 0; b < o.batch; ++b)
+                kept += basalt::core::session_bytes(g, slot_cap[(size_t) b], K, 0, multi_gpu ? split_at[0] : -1);
             slot_kv_cuda0 = kept;
-            std::fprintf(stderr, "basalt generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
-                                 "expert cache would otherwise hold\n", o.batch, (double) kept / 1073741824.0);
+            std::fprintf(stderr, "basalt generate: --batch %d: the slot sessions beyond the solo one take %.2f GiB of VRAM "
+                                 "on CUDA0 that the expert cache would otherwise hold\n", o.batch, (double) kept / 1073741824.0);
         }
     }
 
+    if (!slot0_is_solo)
+        basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(0), solo_kv_bytes, o.max_context);
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts: the driver can
     // refuse the draft weights after mapping tens of GiB of host pages.
     basalt::core::MtpDrafter mtp;
@@ -5510,7 +5535,8 @@ int main(int argc, char** argv) {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
+                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                       " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "");
         }
         // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
         // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning
@@ -5790,6 +5816,7 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 basalt::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 basalt::core::SessionState& to = *bslot_ss[k][(size_t) b];
+                if (&from == &to) continue;   // slot 0 is the solo session: already in place
                 const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                 basalt::core::ConversationCheckpoint ck;
@@ -5819,6 +5846,7 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 basalt::core::SessionState& from = *bslot_ss[k][(size_t) b];
                 basalt::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
+                if (&from == &to) continue;   // slot 0 is the solo session: already in place
                 const basalt::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                 if (at != nullptr) {
@@ -6627,6 +6655,17 @@ int main(int argc, char** argv) {
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            // slot 0 is the solo session: what an idle slot 0 holds is the live conversation, in place
+            if (slot0_is_solo && !bs.empty() && bs[0].cached && !bs[0].active) {
+                BSlot& s0 = bs[0];
+                live = std::move(s0.ids);
+                live_imgs.clear();
+                live_ok = o.prompt_cache > 0;
+                cvec_cached = s0.cvec;
+                for (ConvCheckpoint& c : s0.checks) checks.push_back(std::move(c));
+                s0.checks.clear();
+                s0.cached = false;
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -7642,6 +7681,7 @@ int main(int argc, char** argv) {
                     cont = false;
                 }
                 if (cont) {
+                    if (slot0_is_solo && admit_slot == 0) live_ok = false;   // the batch windows move the state on
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
                     BSlot& sl = bs[(size_t) admit_slot];
                     sl = BSlot{};

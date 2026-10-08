@@ -642,6 +642,8 @@ class ProcessEngine:
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    if self.info.get("slot0_solo"):
+                        self.slot_held[0] = []              # the solo state is slot 0's: it holds this request now
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
@@ -664,6 +666,8 @@ class ProcessEngine:
                                     self._send(f"BYIELD {reserved}")
                             yield None
                     phase = "none"                          # DONE was read
+                    if self.info.get("slot0_solo") and not self.slot_busy[0]:
+                        self.slot_held[0] = list(ids) + out[:-1]   # the engine keeps this conversation in slot 0
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
