@@ -5730,6 +5730,21 @@ int main(int argc, char** argv) {
         int64_t bt_slotwin = 0, bt_dr_off = 0, bt_dr_acc = 0;
         std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript((size_t) std::max(o.batch, 0));
         const bool bdigest = basalt::core::exp_flag("concur5_digest", 0) != 0;
+        // concur9_logit_hash: a hash of the head logits of every accepted row, on stderr (solo and batch alike)
+        const bool logit_hash = basalt::core::exp_flag("concur9_logit_hash", 0) != 0;
+        std::vector<float> lh_buf;
+        auto row_hash = [&](int t) -> uint64_t {
+            lh_buf.resize((size_t) n_vocab);
+            if (!ver.copy_logits(t, lh_buf.data())) return 0;
+            uint64_t h = 1469598103934665603ull;
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(lh_buf.data());
+            for (size_t i = 0; i < lh_buf.size(); ++i) { h ^= w[i]; h *= 1099511628211ull; }
+            return h;
+        };
+        // adaptive tier rounds in the batch windows (routing counts from every row of every slot)
+        const bool batch_adapt = adapt_fast && !drive.d.usage.empty();
+        int64_t ba_win = 0, ba_swaps = 0, ba_rounds = 0, ba_swaps_l = 0, ba_rounds_l = 0, ba_h_l = 0, ba_m_l = 0;
+        double ba_ms = 0;
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -5959,6 +5974,38 @@ int main(int argc, char** argv) {
             drive.d.experts = 0;
             drive.d.failed = false;
             apply_pending(false);
+            if (batch_adapt) {
+                // the tier follows what all the slots' rows route: a round every --adapt-every windows, its steps
+                // taken once their copies are done, so no window waits for one
+                const Clock::time_point ta = Clock::now();
+                bool ok = true, acted = false;
+                ++ba_win;
+                if (xq_stage != 0) {
+                    if (cudaEventQuery(adapt_ev) == cudaSuccess) {
+                        const int was = xq_stage;
+                        ok = xq_advance();
+                        if (ok && was == 1 && xq_stage == 2) ver.flush_post_launch();
+                        acted = true;
+                    }
+                } else if (ba_win % o.adapt_every == 0) {
+                    ok = xq_round();
+                    ba_swaps += (int64_t) xq.size();
+                    ++ba_rounds;
+                    acted = true;
+                }
+                std::string perr;
+                if (ok && acted && !ver.dm_presync(perr)) std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
+                if (!ok) { std::printf("ERR an adaptive refill failed\n"); return false; }
+                ba_ms += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                if (ba_win % 2000 == 0 && ba_win > 0) {   // the swap rate and the hit rate over the last 2000 windows
+                    const int64_t h = drive.d.cache_hits, m = drive.d.multi_misses;
+                    std::fprintf(stderr, "basalt batch adapt: window %lld: %lld swaps in %lld rounds, VRAM hits %.2f and CPU "
+                                         "experts %.2f per layer-window\n", (long long) ba_win, (long long) (ba_swaps - ba_swaps_l),
+                                 (long long) (ba_rounds - ba_rounds_l), (double) (h - ba_h_l) / (2000.0 * g.n_layers),
+                                 (double) (m - ba_m_l) / (2000.0 * g.n_layers));
+                    ba_swaps_l = ba_swaps; ba_rounds_l = ba_rounds; ba_h_l = h; ba_m_l = m;
+                }
+            }
             if (bt_windows == 0) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
@@ -5985,6 +6032,11 @@ int main(int argc, char** argv) {
                 }
                 n_keep[sg] = k;
             }
+            if (logit_hash)
+                for (int sg = 0; sg < S; ++sg)
+                    for (int e = 0; e < n_keep[sg]; ++e)
+                        std::fprintf(stderr, "LH %d %lld %016llx\n", rows[sg], (long long) (bs[(size_t) rows[sg]].p + e),
+                                     (unsigned long long) row_hash(r0s[sg] + e));
             // the commit runs beside the drafts when nothing reads the committed state meanwhile
             const bool overlap = real && !bdigest;
             if (!(overlap ? ver.commit_slots_begin(n_keep, err) : ver.commit_slots(n_keep, err))) {
@@ -6109,6 +6161,14 @@ int main(int argc, char** argv) {
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                              (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
+                if (batch_adapt) {
+                    std::fprintf(stderr, "basalt batch adapt: %lld rounds, %lld swaps queued (%.1f per round), %.3f ms/window of host "
+                                         "time, peer swaps total %lld\n", (long long) ba_rounds, (long long) ba_swaps,
+                                 ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0, ba_ms / w,
+                                 (long long) (peer.valid() ? peer.swaps() : 0));
+                    ba_swaps = ba_rounds = 0;
+                    ba_ms = 0;
+                }
                 if (bt_slotwin > 0)
                     std::fprintf(stderr, "basalt batch spec: %.2f tokens/window/slot (%.2f slots/window, %.2f rows/window), "
                                          "drafts %lld accepted of %lld, draft %.2f ms/window (%.2f ms/slot-window), %.1f "
@@ -7218,6 +7278,8 @@ int main(int argc, char** argv) {
                         outv[(size_t) t] = ppl->token(p + t + 1);   // as if every draft were accepted: x, the MTP
                     }
                 }
+                if (logit_hash)   // the accepted rows' logits, per position (equality of the batch rows with these)
+                    for (int t = 0; t <= a; ++t) std::fprintf(stderr, "LH -1 %lld %016llx\n", (long long) (p + t), (unsigned long long) row_hash(t));
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (tk_log != nullptr && tk_valid && !from_sfx && ppl == nullptr && req_temperature > 0.0) {
                     std::vector<float> lg((size_t) n_vocab);
