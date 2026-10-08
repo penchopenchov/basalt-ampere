@@ -2951,6 +2951,7 @@ int main(int argc, char** argv) {
     if (!o.mtp.empty()) {
         if (o.spec < 2) o.mtp.clear();
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
+        if (o.batch > 0 && basalt::core::exp_flag("concur6_spec", 1) != 0) mtp.set_stores(o.batch);   // a draft K/V per batch slot
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const basalt::core::ModelGeometry draft_geometry{};
@@ -5693,8 +5694,33 @@ int main(int argc, char** argv) {
             // (script[0] is its first token); the windows draft from it, some drafts wrong, and keep what matches
             std::vector<int32_t> script;
             std::mt19937_64 rng;
+            // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
+            // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
+            // history and last proposal
+            int32_t dr[16] = {};
+            float dprob[16] = {};
+            int n_dr = 0;
+            double min_p = 0.0;
+            basalt::core::DraftCumAdapt cum;
+            std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
+            int32_t sbuf[16] = {};
+            int sk = 0, smatch = 0;
+            bool from_sfx = false;
+            double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
+            int64_t since_draft = 0;   ///< windows since the slot last drafted
+            int64_t windows = 0;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
+        const bool batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
+        const bool batch_catchup = basalt::core::exp_flag("concur6_catchup", 1) != 0;
+        const bool batch_overlap = basalt::core::exp_flag("concur6_overlap", 1) != 0;
+        const int S_all = S;
+        basalt::spec::DraftPolicy bpolicy(S);   // the lookup-or-MTP choice, costs per row
+        basalt::kernels::SamplerParams greedy_sp;
+        greedy_sp.greedy = true;
+        double bt_draft = 0, bt_draft_last = 0;
+        int64_t bt_slotwin = 0, bt_dr_off = 0, bt_dr_acc = 0;
         std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript((size_t) std::max(o.batch, 0));
         const bool bdigest = basalt::core::exp_flag("concur5_digest", 0) != 0;
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -5736,6 +5762,7 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
+            if (batch_spec && !mtp.copy_store(mtp.main_store(), b, upto, e)) return false;   // the draft layer's K/V
             return true;
         };
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
@@ -5769,6 +5796,7 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
+            if (batch_spec && !mtp.copy_store(b, mtp.main_store(), upto, e)) return false;
             return true;
         };
         // hashes of everything slot b's sessions hold for its first `upto` tokens, per part (GDN state, PLE history,
@@ -5815,7 +5843,7 @@ int main(int argc, char** argv) {
             int S = 0, R = 0;
             int rows[MR] = {}, lens[MR] = {}, n_keep[MR] = {}, r0s[MR] = {};
             int32_t tok[MR] = {}, outb[MR] = {};
-            int64_t pos[MR] = {};
+            int64_t pos[MR] = {}, p0s[MR] = {};
             std::vector<int32_t> drafts[MR];
             for (int b = 0; b < (int) bs.size() && S < MR; ++b)
                 if (bs[(size_t) b].active) {
@@ -5825,7 +5853,59 @@ int main(int argc, char** argv) {
                     ++S;
                 }
             if (S == 0) return true;
-            {   // the rows beyond one per slot go to the scripted slots, as many drafts as the script and the context allow
+            bool scripted = false;
+            for (int sg = 0; sg < S; ++sg) scripted = scripted || !bs[(size_t) rows[sg]].script.empty();
+            const bool real = batch_spec && !scripted;
+            if (real) {
+                // each slot's window as the solo rule makes it (the drafts that clear the cumulative or min-p cut, or a
+                // prompt-lookup run the policy prefers); the rows beyond MR go to the slots whose last kept draft is the
+                // least likely to be accepted
+                int Tw[MR] = {};
+                float val[MR][8] = {};
+                for (int sg = 0; sg < S; ++sg) {
+                    BSlot& sl = bs[(size_t) rows[sg]];
+                    int T = 1;
+                    if (sl.min_p > 0.0) {
+                        while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, (float) sl.min_p, sl.cum.th())) ++T;
+                    } else {
+                        T = std::min(S_mtp, 1 + sl.n_dr);
+                    }
+                    sl.from_sfx = false;
+                    sl.sk = 0;
+                    if (sl.sfx && sl.n_dr > 0) {
+                        sl.sk = sl.sfx->propose(S_all - 1, sl.sbuf);
+                        sl.smatch = sl.sfx->last_match();
+                        if (sl.sk > 0 && sl.sbuf[0] == sl.dr[0]) {
+                            const basalt::spec::DraftPolicy::Pick pk = bpolicy.choose(T, sl.sk, sl.smatch);
+                            if (pk.lookup) { T = pk.t; sl.from_sfx = true; }
+                        }
+                    }
+                    const int64_t room = o.max_context - sl.p - 1;
+                    T = (int) std::max<int64_t>(1, std::min<int64_t>(T, room));
+                    Tw[sg] = T;
+                    float c = 1.0f;
+                    const double q = sl.from_sfx ? bpolicy.lookup_rate(sl.smatch) : 0.0;
+                    for (int j = 0; j + 1 < 8; ++j) {   // val[j]: the chance drafts 0..j are all accepted
+                        c *= sl.from_sfx ? (float) q : basalt::core::draft_cum_acc(sl.dprob[j]);
+                        val[sg][j] = c;
+                    }
+                }
+                int sum = 0;
+                for (int sg = 0; sg < S; ++sg) sum += Tw[sg];
+                while (sum > MR) {
+                    int pick = -1;
+                    for (int sg = 0; sg < S; ++sg)
+                        if (Tw[sg] > 1 && (pick < 0 || val[sg][Tw[sg] - 2] < val[pick][Tw[pick] - 2])) pick = sg;
+                    --Tw[pick];
+                    --sum;
+                }
+                for (int sg = 0; sg < S; ++sg) {
+                    BSlot& sl = bs[(size_t) rows[sg]];
+                    lens[sg] = Tw[sg];
+                    const int32_t* src = sl.from_sfx ? sl.sbuf : sl.dr;
+                    drafts[sg].assign(src, src + (Tw[sg] - 1));
+                }
+            } else {   // the rows beyond one per slot go to the scripted slots, as many drafts as the script and the context allow
                 int extra = MR - S;
                 const int first = (int) (bs[(size_t) rows[0]].rng() % (uint64_t) S);
                 for (int i = 0; i < S && extra > 0; ++i) {
@@ -5883,7 +5963,9 @@ int main(int argc, char** argv) {
                 }
                 n_keep[sg] = k;
             }
-            if (!ver.commit_slots(n_keep, err)) {
+            // the commit runs beside the drafts when nothing reads the committed state meanwhile
+            const bool overlap = real && batch_overlap && !bdigest;
+            if (!(overlap ? ver.commit_slots_begin(n_keep, err) : ver.commit_slots(n_keep, err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
             }
@@ -5902,6 +5984,20 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", b, (int) outb[r0s[sg] + e]);
                 }
                 sl.produced += k;
+                if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
+                    const int a = k - 1, Tw = lens[sg];
+                    if (Tw > 1 && !sl.from_sfx) sl.cum.observe(sl.dprob, Tw - 1, a);
+                    if (Tw > 1) sl.acc = 0.8 * sl.acc + 0.2 * ((double) a / (double) (Tw - 1));
+                    if (sl.sfx) for (int e = 0; e < k; ++e) sl.sfx->append(outb[r0s[sg] + e]);
+                    if (sl.windows > 0 && fin_of[sg] == nullptr)
+                        bpolicy.observe(sl.from_sfx, Tw, a, sl.smatch, (msd(w0, w2) + bt_draft_last) * (double) Tw / (double) R);
+                    ++sl.windows;
+                    bt_slotwin += 1;
+                    bt_tokens += k;
+                    bt_dr_off += Tw - 1;
+                    bt_dr_acc += a;
+                    p0s[sg] = sl.p;
+                }
                 if (bdigest) {
                     uint64_t part[10] = {};
                     slot_digest(b, sl.p + k, part);
@@ -5920,7 +6016,62 @@ int main(int argc, char** argv) {
                 }
             }
             std::fflush(stdout);
-            bt_emit += msd(w2, Clock::now());
+            const Clock::time_point w3 = Clock::now();
+            bt_emit += msd(w2, w3);
+            if (real) {
+                // the next windows' drafts, one slot at a time on the slot's own draft K/V.  The rows beyond one per
+                // slot go to the slots most likely to use them; the others only advance their draft K/V.
+                int cont[MR], nc = 0;
+                for (int sg = 0; sg < S; ++sg) if (fin_of[sg] == nullptr) cont[nc++] = sg;
+                int nfull = std::min(nc, MR - nc);
+                std::sort(cont, cont + nc, [&](int x1, int x2) {
+                    const BSlot& s1 = bs[(size_t) rows[x1]];
+                    const BSlot& s2 = bs[(size_t) rows[x2]];
+                    return s1.acc + 0.05 * (double) s1.since_draft > s2.acc + 0.05 * (double) s2.since_draft;
+                });
+                mtp.set_draft_sampling(greedy_sp);   // (the drafts are the draft layer's own picks)
+                const float* Rw = ver.final_R_all();
+                const int64_t HCN = (int64_t) g.hc * g.n_embd;
+                for (int ci = 0; ci < nc; ++ci) {
+                    const int sg = cont[ci];
+                    const int b = rows[sg];
+                    BSlot& sl = bs[(size_t) b];
+                    const int Tw = lens[sg];
+                    const int a = n_keep[sg] - 1;
+                    mtp.set_ple_session(bslot_ss[0][(size_t) b].get());
+                    sl.n_dr = 0;
+                    if (ci < nfull) {
+                        mtp.set_cum_th(sl.cum.th());
+                        int nd = 0;
+                        if (!mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err, sl.dprob,
+                                           (float) sl.min_p, &nd)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return false;
+                        }
+                        sl.n_dr = nd;
+                        sl.since_draft = 0;
+                    } else {
+                        ++sl.since_draft;
+                        if (batch_catchup &&
+                            !mtp.defer_rows(b, Rw + (size_t) r0s[sg] * HCN, outb + r0s[sg], n_keep[sg], p0s[sg], err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return false;
+                        }
+                    }
+                }
+                mtp.set_ple_session(&ss);
+                if (!mtp.idle(err)) { std::printf("ERR %s\n", err.c_str()); return false; }   // (the kept rows are copied)
+                bt_draft += msd(w3, Clock::now());
+                bt_draft_last = msd(w3, Clock::now());
+            }
+            if (overlap) {
+                const Clock::time_point c0 = Clock::now();
+                if (!ver.commit_slots_end(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+                bt_commit += msd(c0, Clock::now());
+            }
             basalt::core::progress().busy.store(was_busy);
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
@@ -5929,16 +6080,22 @@ int main(int argc, char** argv) {
                                      "wait %.2f + CPU experts %.2f) + commit %.2f + emit %.2f; per layer-window: CPU experts "
                                      "%.2f, VRAM hits %.2f, PCIe %.2f; %.1f rows/s over %.0f ms of wall time (admissions "
                                      "included)\n",
-                             (long long) bt_windows, bt_rows / w, (bt_run + bt_commit + bt_emit) / w, bt_run / w,
+                             (long long) bt_windows, bt_rows / w, (bt_run + bt_commit + bt_emit + bt_draft) / w, bt_run / w,
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                              (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
+                if (bt_slotwin > 0)
+                    std::fprintf(stderr, "basalt batch spec: %.2f tokens/window/slot (%.2f slots/window, %.2f rows/window), "
+                                         "drafts %lld accepted of %lld, draft %.2f ms/window (%.2f ms/slot-window), %.1f "
+                                         "tokens/s\n", (double) bt_tokens / (double) bt_slotwin, (double) bt_slotwin / w,
+                                 bt_rows / w, (long long) bt_dr_acc, (long long) bt_dr_off, bt_draft / w,
+                                 bt_draft / (double) bt_slotwin, 1000.0 * (double) bt_tokens / std::max(wall, 1e-9));
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "basalt batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());
                 }
-                bt_run = bt_commit = bt_emit = 0;
-                bt_windows = bt_rows = bt_tokens = 0;
+                bt_run = bt_commit = bt_emit = bt_draft = 0;
+                bt_windows = bt_rows = bt_tokens = bt_slotwin = bt_dr_off = bt_dr_acc = 0;
             }
             return true;
         };
@@ -6136,6 +6293,7 @@ int main(int argc, char** argv) {
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // (batch windows swap the draft K/V)
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -6881,6 +7039,7 @@ int main(int argc, char** argv) {
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone
+            if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // the windows between prompt chunks swapped it
             int64_t p = n - 1;
             int32_t x = (int32_t) ids[(size_t) (n - 1)];
             std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
@@ -7343,6 +7502,11 @@ int main(int argc, char** argv) {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
+                // the draft layer's cell for the prompt's last token (it pairs with the first generated one), then its K/V
+                if (cont && batch_spec && !mtp.prefill(ver.final_R_all(), &x, 1, p - 1, err)) {
+                    std::fprintf(stderr, "basalt serve: batch admission failed: %s\n", err.c_str());
+                    cont = false;
+                }
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "basalt serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
@@ -7356,6 +7520,13 @@ int main(int argc, char** argv) {
                     sl.script = std::move(bscript[(size_t) admit_slot].first);
                     sl.rng.seed(bscript[(size_t) admit_slot].second);
                     bscript[(size_t) admit_slot].first.clear();
+                    sl.min_p = req_spec_min_p;
+                    if (batch_spec && o.suffix_draft > 0) {
+                        sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, o.suffix_draft), 64,
+                                                                               (size_t) o.max_context + 4096);
+                        for (int32_t t : live) sl.sfx->append(t);
+                        sl.sfx->append(x);
+                    }
                     sl.x = x;
                     sl.p = p;
                     sl.produced = 1;
