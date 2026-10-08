@@ -220,10 +220,7 @@ def make_handler(svc: Service):
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
                         loaded = True
-                    if svc.aliases:                       # the aliases, and each one listed under its own id
-                        model["aliases"] = list(svc.aliases)
-                    data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    self._json(200, {"object": "list", "data": data if loaded else []})
+                    self._json(200, {"object": "list", "data": [model] if loaded else []})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -343,7 +340,7 @@ def make_handler(svc: Service):
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
-            if model not in svc.model_names():
+            if model != svc.model:
                 self._json(404, {"error": {"message": "model not found"}})
                 return
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
@@ -582,7 +579,7 @@ def make_handler(svc: Service):
                     from None
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
-            asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
+            asm = responses_api.Assembler(req, svc.model, len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req

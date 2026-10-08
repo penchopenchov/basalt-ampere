@@ -12,7 +12,7 @@ from serve.api.structured import validated_json
 
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
-    model = svc.model_for(req)
+    model = svc.model
 
     def chunk(delta, finish=None):
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,

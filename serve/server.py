@@ -45,7 +45,7 @@ from serve.engine.vision import (Vision, child_env, engine_args, gpu_list, gpus_
                                  vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
-from serve.security import allowed_hosts_of, exposed_without_key, lan_addresses, origins_of  # noqa: E402
+from serve.security import LOOPBACK_NAMES, allowed_hosts_of, exposed_without_key, lan_addresses, origins_of  # noqa: E402
 from serve.service import Service  # noqa: E402
 from serve.util.logbuf import LogBuffer, TeeStream, tail_file  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
@@ -205,7 +205,7 @@ def main() -> int:
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''}", flush=True)
     print(f"[server] stats: http://{here}:{a.port}/ (Ctrl+C stops)", flush=True)
-    if a.host not in ("127.0.0.1", "localhost", "::1"):
+    if a.host not in LOOPBACK_NAMES:
         # reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:

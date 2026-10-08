@@ -98,7 +98,7 @@ def start_vision(cfg: dict, env: dict, log):
     if v.get("max_tokens"):
         args += ["--max-tokens", str(v["max_tokens"])]
     venv = dict(env)
-    if v.get("cuda_device") is not None:   # serve/server.py vision_env
+    if v.get("cuda_device") is not None:   # serve/engine/vision.py vision_env
         venv["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         venv["CUDA_VISIBLE_DEVICES"] = str(v["cuda_device"])
     p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, env=venv)

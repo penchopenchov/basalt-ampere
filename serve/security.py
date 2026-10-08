@@ -9,7 +9,7 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 
 def exposed_without_key(host: str, api_key: str) -> bool:
     """True when the server listens beyond this PC and no API key is set."""
-    return host not in ("127.0.0.1", "localhost", "::1") and not api_key
+    return host not in LOOPBACK_NAMES and not api_key
 
 
 def lan_addresses() -> list[str]:

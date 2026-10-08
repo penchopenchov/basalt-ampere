@@ -56,7 +56,6 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(control_literals(tokenizer))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
-        self.aliases: list[str] = []                  # other names of the model (--alias)
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling block
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -102,30 +101,6 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
-
-    def set_aliases(self, aliases) -> None:
-        """The model's other names - a list of names (or one comma-separated string), like llama-server's --alias.
-        ValueError for anything else."""
-        if aliases is None:
-            aliases = []
-        if isinstance(aliases, str):
-            aliases = aliases.split(",")
-        if not isinstance(aliases, list) or not all(isinstance(x, str) for x in aliases):
-            raise ValueError(f"aliases: expected a list of names, not {aliases!r}")
-        names = []
-        for x in (x.strip() for x in aliases):
-            if x and x != self.model and x not in names:
-                names.append(x)
-        self.aliases = names
-
-    def model_names(self) -> list[str]:
-        return [self.model, *self.aliases]
-
-    def model_for(self, req) -> str:
-        """The name to answer with: the request's own when it is the model's name or an alias, else the model's.
-        Other names are still served, as before."""
-        asked = req.get("model") if isinstance(req, dict) else None
-        return asked if isinstance(asked, str) and asked in self.aliases else self.model
 
     def reasoning_budget(self, req) -> int | None:
         """The most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else
