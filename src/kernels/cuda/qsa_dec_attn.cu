@@ -2,6 +2,7 @@
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/q8_1_finite.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -313,17 +314,14 @@ __device__ __forceinline__ void q8_1_store_fm(float xi, AttnQ81* y, size_t ib, i
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) sum = fm_add(sum, __shfl_xor_sync(0xffffffffu, sum, o));
     float d = fm_div(amax, 127.0f);
-    d = fabsf(d) > 65504.0f ? copysignf(65504.0f, d) : d;
+    d = q8_1_finite(d);
     int8_t q = 0;
     if (amax != 0.0f) {
         const float r = roundf(fm_div(xi, d));
         q = (int8_t) (r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r);
     }
     y[ib].qs[lane] = q;
-    if (lane == 0) {
-        const float sc = fabsf(sum) > 65504.0f ? copysignf(65504.0f, sum) : sum;
-        y[ib].ds = make_half2(__float2half(d), __float2half(sc));
-    }
+    if (lane == 0) y[ib].ds = q8_1_ds(d, sum);
 }
 
 // One query head of one query: merge the chunks the width reaches, as attn_merge_kernel (which skips the rest).
