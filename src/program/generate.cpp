@@ -2880,6 +2880,7 @@ int main(int argc, char** argv) {
     // engine still starts and serves one request at a time.
     std::vector<std::vector<std::unique_ptr<basalt::core::SessionState>>> bslot_ss;
     std::vector<int64_t> slot_cap;   // each batch slot's context (cells)
+    uint64_t slot_kv_cuda0 = 0;      // the batch slots' sessions on CUDA0: VRAM the expert cache does not get
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -2926,6 +2927,7 @@ int main(int argc, char** argv) {
                 basalt::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
                 total += bytes;
+                basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(dev), bytes, slot_cap[(size_t) b], "slot");
                 std::fprintf(stderr, "basalt generate: --batch: slot %d on CUDA%d holds %lld tokens (%.2f GiB)\n", b, dev,
                              (long long) slot_cap[(size_t) b], (double) bytes / 1073741824.0);
             }
@@ -2950,6 +2952,7 @@ int main(int argc, char** argv) {
             // were first carved when a later stage ran out)
             uint64_t kept = 0;
             for (int b = 0; b < o.batch; ++b) kept += basalt::core::session_bytes(g, slot_cap[(size_t) b], K, 0, multi_gpu ? split_at[0] : -1);
+            slot_kv_cuda0 = kept;
             std::fprintf(stderr, "basalt generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
                                  "expert cache would otherwise hold\n", o.batch, (double) kept / 1073741824.0);
         }
@@ -3115,6 +3118,20 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+        // The batch slots' sessions came out of the same VRAM: say when that leaves the cache short of the expert set
+        // (experts then swap in and out per token) or of half of what it would hold without them.
+        if (slot_kv_cuda0 > 0) {
+            int64_t without = ((int64_t) free_b + (int64_t) slot_kv_cuda0 - reserve) / blob;
+            if (!profile.empty()) without = std::min<int64_t>(without, (int64_t) profile.size());
+            const bool swaps = !profile.empty() && o.expert_cache < (int64_t) profile.size() && without >= (int64_t) profile.size();
+            if (without > 0 && (swaps || o.expert_cache * 2 < without))
+                std::fprintf(stderr, "basalt warning: the %d batch slot sessions take %.1f GiB of CUDA0, leaving an "
+                                     "expert cache of %d slots (%.1f GiB) where %lld would fit without them%s. Lower "
+                                     "--max-context or drop --slot-full-context (or use fewer --parallel slots)\n",
+                             o.batch, (double) slot_kv_cuda0 / 1073741824.0, o.expert_cache,
+                             (double) o.expert_cache * (double) blob / 1073741824.0, (long long) without,
+                             swaps ? "; the configured expert set no longer fits, so experts swap per token" : "");
+        }
         // The verify window cannot start without a cache, and a cache too small to lend the prompt path a 256-token
         // chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it allocate its own on
         // top - more than the reserve.  When the default reserve leaves less than that (a small card), the reserve
@@ -3157,10 +3174,12 @@ int main(int argc, char** argv) {
                                  "(%lld MiB), about %lld MiB more than this card has free. To make room: a smaller "
                                  "--max-context (the session, mostly its KV cache, takes %lld MiB at %lld tokens), "
                                  "--kv q4_0, a smaller draft vocabulary (the draft head takes "
-                                 "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU\n",
+                                 "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU%s\n",
                          (long long) min_slots, (long long) ((min_slots * blob) >> 20), (long long) short_mib,
                          (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
-                         reserve_tip.c_str());
+                         reserve_tip.c_str(),
+                         slot_kv_cuda0 == 0 ? "" : (", or fewer --parallel slots / no --slot-full-context (the slot sessions take " +
+                                                    std::to_string(slot_kv_cuda0 >> 20) + " MiB)").c_str());
         }
     } else if (multi_gpu && o.expert_cache > 0) {
         // an explicit cache size leaves room for the prompt path's buffers and the reserve, or the first prompt

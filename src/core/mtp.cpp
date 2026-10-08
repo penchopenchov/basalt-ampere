@@ -358,6 +358,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     cudaDeviceSynchronize();
     vram_ += sb;
     cur_ = n_stores_;
+    uint64_t draft_kv_bytes = sb;
     if (n_stores_ > 0) {   // one K/V per slot beside the working one (batch windows)
         KvArr lay[4];
         const int na = kv_layout(lay);
@@ -378,9 +379,11 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
                     if (cudaMalloc(&st[(size_t) i], bytes) != cudaSuccess) { err = "mtp: the slots' K/V do not fit"; return false; }
                     cudaMemset(st[(size_t) i], 0, bytes);
                     vram_ += bytes;
+                    draft_kv_bytes += bytes;
                 }
         }
     }
+    LoadProgress::kv(LoadProgress::cuda(device_), draft_kv_bytes, max_cells, "draft");
 
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;

@@ -7,8 +7,11 @@
 //   basalt load: copy <target> <done> <total>         a phase that copies bytes a counted phase already placed
 //
 // `<target>` is `cuda<N>` (bytes written into that device) or `ram` (experts copied or locked into system RAM).
-//   basalt load: kv <target> <bytes> <tokens>         the session state (KV and recurrent state) allocated on a
-//                                                     device for <tokens> of context; an allocation, not a load phase
+//   basalt load: kv [slot|draft ]<target> <bytes> <tokens>
+//                                                     the session state (KV and recurrent state) allocated on a
+//                                                     device for <tokens> of context; an allocation, not a load phase.
+//                                                     No kind: the solo session; `slot`: one batch slot's session;
+//                                                     `draft`: the draft layer's K/V (working copy and slot stores)
 // A plan is the sum of the totals of the phases the target will run (a later plan line replaces an earlier one).
 // The total is announced once, from the model file's tables, and counts every byte once: the sum of the phase totals
 // that are not copies.  If a part cannot be placed (the RAM is short and the experts are read from the file instead),
@@ -48,10 +51,11 @@ public:
                      (unsigned long long) bytes);
     }
     /// Reports the session state allocated on a device (not part of any load total).
-    static void kv(const std::string& target, uint64_t bytes, int64_t tokens) {
+    /// `kind` is "" (the solo session), "slot" or "draft".
+    static void kv(const std::string& target, uint64_t bytes, int64_t tokens, const char* kind = "") {
         std::lock_guard<std::mutex> lk(total_mu());
-        std::fprintf(stderr, "basalt load: kv %s %llu %lld\n", target.c_str(), (unsigned long long) bytes,
-                     (long long) tokens);
+        std::fprintf(stderr, "basalt load: kv %s%s%s %llu %lld\n", kind, kind[0] ? " " : "", target.c_str(),
+                     (unsigned long long) bytes, (long long) tokens);
     }
     /// Lowers the announced total by bytes that will not be placed after all; a no-op without a total.
     static void skipped(uint64_t bytes) {
