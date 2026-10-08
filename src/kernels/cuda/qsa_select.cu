@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "basalt/kernels/qsa_select.hpp"
+#include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
@@ -599,6 +600,63 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
     }
 }
 
+// block_scores_multi_kernel over rows of different sequences: row qi reads its slot's pooled / dead. The queries and
+// the per-row counts are staged once; per (block, row) the arithmetic and its order are the multi kernel's.
+constexpr int MQS = kQsaSegMaxRows;
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_seg_kernel(QsaSegTable tab,
+                                                                            const float* __restrict__ q_idx,
+                                                                            const int32_t* __restrict__ steps, int nq,
+                                                                            int64_t max_blocks, float* __restrict__ out,
+                                                                            int skip_identity) {
+    __shared__ __align__(16) float qs[MQS * IDX_HEADS * IDX_DIM];
+    __shared__ int64_t s_nkv[MQS], s_nbid[MQS];
+    __shared__ const float* s_pooled[MQS];
+    __shared__ const float* s_dead[MQS];
+    pdl_launch_dependents();
+    pdl_wait();
+    if (skip_identity) {
+        bool all = true;
+        for (int q = 0; q < nq; ++q) all = all && steps[q * kStepCount + kStepNKv] <= steps[q * kStepCount + kStepWidth];
+        if (all) return;
+    }
+    if (threadIdx.x < nq) {
+        const QsaSegSlot& sl = tab.slots[tab.rows[threadIdx.x].slot];
+        s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
+        s_nbid[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNBid];
+        s_pooled[threadIdx.x] = sl.pooled;
+        s_dead[threadIdx.x] = sl.dead;
+    }
+    __syncthreads();
+    int64_t top = 0;
+    for (int q = 0; q < nq; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
+    if ((int64_t) blockIdx.x * SCORE_WARPS > top) return;
+    for (int i = threadIdx.x; i < nq * IDX_HEADS * IDX_DIM; i += blockDim.x) qs[i] = q_idx[i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int64_t wstride = (int64_t) gridDim.x * SCORE_WARPS;
+    for (int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5); b <= top && b < max_blocks; b += wstride) {
+        for (int qi = 0; qi < nq; ++qi) {
+            const int64_t n_bid = s_nbid[qi];
+            if (b > n_bid) continue;
+            const float4 k4 = *reinterpret_cast<const float4*>((b == n_bid ? s_dead[qi] : s_pooled[qi] + b * IDX_DIM) + lane * 4);
+            const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
+            float score = 0.0f;
+#pragma unroll
+            for (int h = 0; h < IDX_HEADS; ++h) {
+                const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
+                float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+                score += d > 0.0f ? d : 0.0f;
+            }
+            if (lane == 0) {
+                if (b == n_bid && s_nkv[qi] % R != 0) score += 1e9f;
+                out[qi * max_blocks + b] = score;
+            }
+        }
+    }
+}
+
 // ---- the decode top-k on a thread-block cluster (needs thread-block clusters).  One CTA per query (block_topk_reg_kernel, or
 // block_topk_kernel above 33,792 blocks: a --max-context over ~135K) makes four radix passes and two scans over up to
 // 65,538 blocks on ONE SM while the rest of the GPU idles - a decode window has 1-5 queries.  Here a cluster of CL_N
@@ -845,6 +903,19 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                                                                               scores);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
+void qsa_block_scores_seg(const QsaSegTable& t, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks,
+                          const QsaShapes& s, float* scores, void* stream, bool skip_identity) {
+    if (nq <= 0) return;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > MQS || t.n_rows < nq) {
+        std::fprintf(stderr, "qsa_block_scores_seg: unsupported indexer geometry or row count\n");
+        std::exit(1);
+    }
+    launch_pdl(block_scores_seg_kernel, dim3(256), dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, t, q_idx, steps,
+               (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_seg: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
