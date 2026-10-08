@@ -476,7 +476,33 @@ class OutputParser:
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
         self.stream_tools = stream_tools
+        self.fence, self.line, self.ticks = "", "", 0     # code fence, current line and backticks of the answer so far
         self._reset_scan()
+
+    def _track(self, text: str) -> str:
+        """Follow the answer text that has gone out: the open code fence (``` or ~~~), the current line, and the
+        backticks of the current paragraph. Returns the text."""
+        parts = text.split("\n")
+        for k, part in enumerate(parts):
+            if k < len(parts) - 1:
+                line, self.line = self.line + part, ""
+                s = line.lstrip()
+                if self.fence:
+                    if s.startswith(self.fence * 3):
+                        self.fence = ""
+                elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
+                    self.fence = s[0]
+                elif not s:
+                    self.ticks = 0
+                else:
+                    self.ticks += line.count("`")
+            else:
+                self.line += part
+        return text
+
+    def _in_code(self) -> bool:
+        """The text so far leaves the next character inside a code fence or inline code."""
+        return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
 
     def _reset_scan(self):
         self.sp = 0                  # consumed part of self.buf (the call body)
@@ -614,6 +640,7 @@ class OutputParser:
                     out.append(Event("reasoning", self.buf[:i]))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
+                self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
             elif self.state == "content":
                 if self.lead:                                   # newlines after </think> or a call
                     stripped = self.buf.lstrip("\n")
@@ -628,11 +655,20 @@ class OutputParser:
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
                     if j > 0:
-                        out.append(Event("content", self.buf[:j]))
+                        out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
                     return out
+                # an opener inside a code fence or inline code is a quoted example: text, decided by the text before it
+                snap = (self.fence, self.line, self.ticks)
+                self._track(self.buf[:i])
+                in_code = self._in_code()
+                self.fence, self.line, self.ticks = snap
+                if in_code:
+                    out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
+                    self.buf = self.buf[i + len(CALL_START):]
+                    continue
                 if i and self.buf[:i].strip():
-                    out.append(Event("content", self.buf[:i].rstrip("\n")))
+                    out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
