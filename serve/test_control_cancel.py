@@ -8,12 +8,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from serve import server  # noqa: E402
+from serve.engine import ProcessEngine  # noqa: E402
 
 
 class ControlCancelTest(unittest.TestCase):
     def _engine(self, lines):
-        eng = object.__new__(server.ProcessEngine)
+        eng = object.__new__(ProcessEngine)
         eng.lines = queue.Queue()
         for l in lines:
             eng.lines.put(l)

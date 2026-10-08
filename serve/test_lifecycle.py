@@ -10,7 +10,10 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, EngineStuck, MockEngine, Service, ProcessEngine, serve
+from serve.engine import EngineDied, EngineStuck, MockEngine, ProcessEngine
+from serve.handler import serve
+from serve.service import Service
+from serve.text import ByteTokenizer
 
 
 class ResidentEngine(ProcessEngine):

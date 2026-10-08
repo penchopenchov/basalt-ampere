@@ -9,7 +9,10 @@ import unittest
 import json
 import urllib.request
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, ProcessEngine, Service, serve
+from serve.engine import EngineDied, ProcessEngine
+from serve.handler import serve
+from serve.service import Service
+from serve.text import ByteTokenizer
 
 FAKE=r'''
 import sys

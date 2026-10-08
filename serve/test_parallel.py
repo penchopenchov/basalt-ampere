@@ -5,6 +5,7 @@ real ProcessEngine and Service, so the server's side is tested without a GPU: re
 wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
 goes back to the slot that holds it."""
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,7 +17,10 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, Service, ProcessEngine, serve
+from serve.engine import ProcessEngine
+from serve.handler import serve
+from serve.service import Service
+from serve.text import ByteTokenizer
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
@@ -174,16 +178,15 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False):
-        import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
         self.log = Path(self.tmp.name) / "requests.log"
-        real = server.subprocess.Popen
+        real = subprocess.Popen
         extra = ["--batch", str(slots)] + (["--fit", str(fit)] if fit is not None else []) + ["--log", str(self.log)]
         extra += ["--slotcache"] if slot_cache else []
         extra += ["--fail-window"] if fail else []
-        with mock.patch.object(server.subprocess, "Popen",
+        with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
         tok = ByteTokenizer()

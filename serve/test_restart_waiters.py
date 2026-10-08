@@ -30,11 +30,10 @@ class RestartWaiters(unittest.TestCase):
 
     def start(self, slots, fit=None):
         """The fake engine, and it stays the engine for the restarts that follow (Popen is patched for the test)."""
-        import serve.server as server
         real = REAL_POPEN
         self._start(slots, fit=fit)
         script = Path(self.tmp.name) / "fake_engine.py"
-        patch = mock.patch.object(server.subprocess, "Popen",
+        patch = mock.patch.object(subprocess, "Popen",
                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw))
         patch.start()
         self.addCleanup(patch.stop)
@@ -174,7 +173,7 @@ class RestartWaiters(unittest.TestCase):
     def test_an_old_request_meets_a_restart_in_progress(self):
         """A request that learns its engine died while restart() has already taken the process (self.proc is None):
         its death note and its sends answer with EngineDied, not AttributeError (the client got no reply at all)."""
-        from serve.server import EngineDied
+        from serve.engine import EngineDied
         self.start(2)
         self.kill()
         self.engine.close()                                           # what restart() does first

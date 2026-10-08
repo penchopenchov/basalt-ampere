@@ -14,7 +14,11 @@ from pathlib import Path
 from serve import telemetry
 from serve.frontend import ChatTemplate
 from serve.logbuf import LogBuffer
-from serve.server import REQUESTS_SHOWN, ByteTokenizer, MockEngine, ProcessEngine, Service, gpus_in_play, serve
+from serve.engine import MockEngine, ProcessEngine
+from serve.handler import serve
+from serve.service import REQUESTS_SHOWN, Service
+from serve.text import ByteTokenizer
+from serve.vision import gpus_in_play
 from serve.telemetry import GPU_KEYS, Telemetry
 
 TEMPLATE = Path(__file__).parent / "chat_template.jinja"

@@ -17,8 +17,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (ByteTokenizer, MockEngine, Service, allowed_hosts_of, host_allowed,  # noqa: E402
-                          host_name, host_names_for, origin_allowed, serve)
+from serve.engine import MockEngine  # noqa: E402
+from serve.handler import serve  # noqa: E402
+from serve.security import allowed_hosts_of, host_allowed, host_name, host_names_for, origin_allowed  # noqa: E402
+from serve.service import Service  # noqa: E402
+from serve.text import ByteTokenizer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = {"localhost", "127.0.0.1", "::1"}
@@ -44,7 +47,7 @@ class HostNames(unittest.TestCase):
                 allowed_hosts_of(bad)
 
     def test_names_from_the_bind_address(self):
-        with mock.patch("serve.server.lan_addresses", return_value=["192.168.1.20"]):
+        with mock.patch("serve.security.lan_addresses", return_value=["192.168.1.20"]):
             self.assertEqual(host_names_for("127.0.0.1"), LOCAL)                 # this PC only: nothing else
             self.assertEqual(host_names_for("localhost"), LOCAL)
             names = host_names_for("0.0.0.0")                                    # other devices too

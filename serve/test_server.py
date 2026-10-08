@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -21,9 +22,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, ProcessEngine,  # noqa: E402
-                          control_literals, prompt_tokens_seen, request_timings, serve,
-                          start_failure_hint)
+from serve import service as service_module  # noqa: E402
+from serve.engine import EngineDied, EngineStartError, GpuBusy, MockEngine, ProcessEngine, start_failure_hint  # noqa: E402
+from serve.handler import serve  # noqa: E402
+from serve.service import CTX_SLACK, Service, prompt_tokens_seen, request_timings  # noqa: E402
+from serve.text import ByteTokenizer, control_literals  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,7 +101,7 @@ class MaxTokens(unittest.TestCase):
     def test_request_line_parses_the_engine_summary(self):
         line = ("basalt serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
-        from serve.server import ENGINE_REQUEST
+        from serve.engine import ENGINE_REQUEST
         m = ENGINE_REQUEST.search(line)
         self.assertIsNotNone(m)
         self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
@@ -164,8 +167,7 @@ class MaxTokens(unittest.TestCase):
     def test_debug_log_shows_the_resolved_budget(self):
         import contextlib
         import io
-        import serve.server as server
-        server.DEBUG = True
+        service_module.DEBUG = True
         try:
             for api in ("openai", "anthropic"):
                 with self.subTest(api=api):
@@ -174,7 +176,7 @@ class MaxTokens(unittest.TestCase):
                         _, _, pt, _ = self.call(api, max_tokens=-1)
                     self.assertIn(f"max_new={CTX - CTX_SLACK - pt} ", out.getvalue())
         finally:
-            server.DEBUG = False
+            service_module.DEBUG = False
 
 
 class FitMaxTokens(unittest.TestCase):
@@ -576,7 +578,7 @@ class StopStrings(unittest.TestCase):
                 self.assertEqual(code, 400)
 
     def test_matcher_holds_back_only_a_possible_prefix(self):
-        from serve.server import StopMatcher
+        from serve.text import StopMatcher
         m = StopMatcher(["</s>"])
         self.assertEqual(m.push("a <"), "a ")              # "<" may start "</s>"
         self.assertEqual(m.push("b"), "<b")                # it did not
@@ -809,7 +811,7 @@ class UnfinishedToolCall(unittest.TestCase):
         self.assertEqual((a["openai", True][0], a["anthropic", True][0]), ("length", "max_tokens"))
 
     def test_collect_keeps_calls_whose_arguments_parse(self):
-        from serve.server import openai_collect
+        from serve.openai_api import openai_collect
 
         def chunk(delta, finish=None):
             return {"id": "c", "created": 1, "model": "m", "usage": {},
@@ -959,7 +961,7 @@ class ClientShapes(unittest.TestCase):
 
     def test_vision_temp_image_removed_when_the_pipe_fails(self):
         # the temporary image goes even when the encoder's pipe raises
-        from serve.server import Vision
+        from serve.vision import Vision
 
         class Gone:
             def write(self, _):
@@ -1034,7 +1036,7 @@ class GpuChoice(unittest.TestCase):
     """--gpu reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
     def test_env(self):
-        from serve.server import child_env
+        from serve.vision import child_env
         env = child_env({"gpu": 1})
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
         self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
@@ -1043,7 +1045,7 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
     def test_vision_sidecar_args(self):
-        from serve.server import Vision
+        from serve.vision import Vision
         for gpu, want in ((True, ["--gpu"]), (False, [])):
             with mock.patch.object(Vision, "_start"):
                 v = Vision({"exe": "x", "mmproj": "m", "model": "t", "gpu": gpu})
@@ -1051,7 +1053,7 @@ class GpuChoice(unittest.TestCase):
             shutil.rmtree(v.dir, ignore_errors=True)
 
     def test_vision_startup_line(self):
-        from serve.server import vision_line
+        from serve.vision import vision_line
         self.assertEqual(vision_line(None, {}), "[server] vision: off (--vision or --vision-cpu to enable)")
         cpu = vision_line({"gpu": False}, {}, 2.34)
         self.assertRegex(cpu, r"^\[server\] vision: ready on the CPU \(\d+ threads\) in 2\.3 s$")
@@ -1062,7 +1064,7 @@ class GpuChoice(unittest.TestCase):
 
     def test_vision_device(self):
         # with two cards listed the image encoder takes the second; the engine's environment stays as it was
-        from serve.server import child_env, vision_env
+        from serve.vision import child_env, vision_env
         cfg = {"gpu": "0,1"}
         env = child_env(cfg)
         venv = vision_env(cfg, env)
@@ -1346,7 +1348,7 @@ class StartFailureLog(unittest.TestCase):
     """Whatever stopped the engine before READY, the error carries this start's last log lines."""
 
     def test_the_last_line_of_this_start(self):
-        from serve.server import start_last_line
+        from serve.engine import start_last_line
         d = tempfile.mkdtemp()
         p = Path(d) / "engine.log"
         before = "basalt serve: an earlier start's line\n"
@@ -1358,54 +1360,50 @@ class StartFailureLog(unittest.TestCase):
         self.assertEqual(start_last_line(str(Path(d) / "missing.log"), 0), "")
 
     def test_the_start_error_has_them(self):
-        import serve.server as server
         fake = "import sys\nsys.stderr.write('basalt serve: cannot open the pack packs/x\\n')\nsys.exit(2)\n"
         with tempfile.TemporaryDirectory() as d:
             script, log = Path(d) / "fake_engine.py", Path(d) / "engine.log"
             script.write_text(fake, encoding="utf-8")
             log.write_text("an earlier start\n", encoding="utf-8")
-            real = server.subprocess.Popen
-            with mock.patch.object(server.subprocess, "Popen",
+            real = subprocess.Popen
+            with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
-                    mock.patch.object(server, "narrate_start", lambda *a, **k: None):
-                with self.assertRaises(server.EngineStartError) as cm:
+                    mock.patch("serve.engine.narrate_start", lambda *a, **k: None):
+                with self.assertRaises(EngineStartError) as cm:
                     ProcessEngine("basalt", [], log=str(log))
             self.assertEqual(str(cm.exception), "cannot open the pack packs/x")
             self.assertEqual(cm.exception.log, str(log))
 
     def test_a_silent_exit_still_says_something(self):
-        import serve.server as server
         with tempfile.TemporaryDirectory() as d:
             script, log = Path(d) / "fake_engine.py", Path(d) / "engine.log"
             script.write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
-            real = server.subprocess.Popen
-            with mock.patch.object(server.subprocess, "Popen",
+            real = subprocess.Popen
+            with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
-                    mock.patch.object(server, "narrate_start", lambda *a, **k: None):
-                with self.assertRaises(server.EngineStartError) as cm:
+                    mock.patch("serve.engine.narrate_start", lambda *a, **k: None):
+                with self.assertRaises(EngineStartError) as cm:
                     ProcessEngine("basalt", [], log=str(log))
             self.assertIn("exited before it was ready", str(cm.exception))
 
     def test_a_failed_reload_says_so_and_raises_engine_died(self):
-        import serve.server as server
         eng = mock.Mock(unloaded=True)
         eng.loaded = lambda: False
-        eng.restart.side_effect = server.EngineStartError("no room", "/x/engine.log")
-        svc = server.Service.__new__(server.Service)
+        eng.restart.side_effect = EngineStartError("no room", "/x/engine.log")
+        svc = Service.__new__(Service)
         svc.engine, svc.vision, svc.before_load, svc.min_free_vram_mib = eng, None, None, 0
         svc.vram_reserve = None
         out = io.StringIO()
-        with mock.patch.object(server.Service, "loaded", lambda self: False), \
-                mock.patch.object(server.Service, "_vision_down", lambda self: False), \
+        with mock.patch.object(Service, "loaded", lambda self: False), \
+                mock.patch.object(Service, "_vision_down", lambda self: False), \
                 contextlib.redirect_stdout(out):
-            with self.assertRaises(server.EngineDied):
+            with self.assertRaises(EngineDied):
                 svc.ensure_loaded()
         self.assertIn("[server] error: no room", out.getvalue())
         self.assertIn("[server] engine log: /x/engine.log", out.getvalue())
 
 
     def test_the_engines_own_error_is_the_message(self):
-        import serve.server as server
         fake = ("import sys\nsys.stderr.write('basalt generate: GPU 0\\n')\n"
                 "sys.stderr.write('basalt error: the experts need 40.0 GiB of RAM, 27.1 GiB is available; use "
                 "--resident-experts or --mmap-experts\\n')\nsys.exit(1)\n")
@@ -1413,17 +1411,17 @@ class StartFailureLog(unittest.TestCase):
             script, log = Path(d) / "fake_engine.py", Path(d) / "engine.log"
             script.write_text(fake, encoding="utf-8")
             log.write_text("basalt error: an earlier start\n", encoding="utf-8")
-            real = server.subprocess.Popen
-            with mock.patch.object(server.subprocess, "Popen",
+            real = subprocess.Popen
+            with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
-                    mock.patch.object(server, "narrate_start", lambda *a, **k: None):
-                with self.assertRaises(server.EngineStartError) as cm:
+                    mock.patch("serve.engine.narrate_start", lambda *a, **k: None):
+                with self.assertRaises(EngineStartError) as cm:
                     ProcessEngine("basalt", [], log=str(log))
             self.assertEqual(str(cm.exception), "the experts need 40.0 GiB of RAM, 27.1 GiB is available; use "
                                                 "--resident-experts or --mmap-experts")
 
     def test_error_lines(self):
-        from serve.server import engine_error
+        from serve.engine import engine_error
         self.assertEqual(engine_error("basalt error: x y"), "x y")
         self.assertIsNone(engine_error("basalt error: "))
         self.assertIsNone(engine_error("basalt warning: x"))
@@ -1438,13 +1436,13 @@ class LoadProgress(unittest.TestCase):
     """The engine's `basalt load:` lines: one bar for the whole start, one line when it is done."""
 
     def test_parse(self):
-        from serve.server import engine_warning, load_progress, load_total
+        from serve.engine import engine_warning, load_progress, load_total
         self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100, False))
         self.assertEqual(load_progress("basalt load: copy cuda1 10 100"), ("cuda1", 10, 100, True))
         self.assertIsNone(load_progress("basalt load: total 100"))
         self.assertIsNone(load_progress("basalt load: cuda0 ten 100"))
         self.assertIsNone(load_progress("basalt generate: loaded 3 GiB"))
-        from serve.server import load_plan
+        from serve.engine import load_plan
         self.assertEqual(load_plan("basalt load: plan cuda0 100"), ("cuda0", 100, False))
         self.assertEqual(load_plan("basalt load: plan copy cuda1 100"), ("cuda1", 100, True))
         self.assertIsNone(load_plan("basalt load: plan cuda0 x"))
@@ -1458,7 +1456,7 @@ class LoadProgress(unittest.TestCase):
         self.assertIsNone(engine_warning("basalt generate: WARNING: x"))
 
     def test_log_output_prints_only_the_result(self):
-        from serve.server import LoadBars
+        from serve.engine import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(100 << 30)
@@ -1473,7 +1471,7 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(lines[0].endswith("(system ram 100.0 GiB)"))
 
     def test_phases_add_up_to_one_result(self):
-        from serve.server import LoadBars
+        from serve.engine import LoadBars
         out = io.StringIO()
         bars = LoadBars(out, gpus=[2, 3])
         bars.set_total(5 << 30)
@@ -1488,7 +1486,7 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(line.endswith("(cuda2 5.0 GiB; cuda3 copy 2.0 GiB)"))
 
     def test_unfinished_start_is_not_reported(self):
-        from serve.server import LoadBars
+        from serve.engine import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(4 << 30)
@@ -1497,7 +1495,7 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
     def test_one_bar_per_target_against_its_own_plan(self):
-        from serve.server import LoadBars
+        from serve.engine import LoadBars
         out = Tty()
         bars = LoadBars(out, gpus=[2, 3])
         bars.update("cuda0", 1 << 30, 1 << 30)                          # no plan yet: a count
@@ -1519,7 +1517,7 @@ class LoadProgress(unittest.TestCase):
         self.assertIn("\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
 
     def test_bars_follow_the_order_targets_start_loading(self):
-        from serve.server import LoadBars
+        from serve.engine import LoadBars
         out = Tty()
         bars = LoadBars(out, gpus=[2, 3])
         bars.set_plan("cuda0", 1 << 30)
@@ -1532,7 +1530,7 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2", "cuda3", "ram"])
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
-        from serve.server import LoadBars, load_kv, load_progress
+        from serve.engine import LoadBars, load_kv, load_progress
         self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144))
         self.assertIsNone(load_kv("basalt load: kv cuda0 x 1"))
         self.assertIsNone(load_progress("basalt load: kv cuda0 100 5"))
@@ -1547,7 +1545,7 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(second, "[server] kv cache: 4.0 GiB on cuda2, 262144 tokens")
 
     def test_a_target_planned_empty_shows_nothing(self):
-        from serve.server import LoadBars
+        from serve.engine import LoadBars
         out = Tty()
         bars = LoadBars(out)
         bars.set_plan("cuda0", 1 << 30)
@@ -1557,7 +1555,7 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(len(bars.lines()), 1)
 
     def test_a_lowered_total_ends_at_full(self):
-        from serve.server import LoadBars
+        from serve.engine import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(6 << 30)
@@ -1568,13 +1566,13 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(out.getvalue().startswith("[server] loaded 4.0 GiB in "))
 
     def test_names_follow_the_picked_cards(self):
-        from serve.server import LoadBars
+        from serve.engine import LoadBars
         self.assertEqual(LoadBars(gpus=[2, 3]).name("cuda1"), "cuda3")
         self.assertEqual(LoadBars().name("cuda1"), "cuda1")
         self.assertEqual(LoadBars().name("ram"), "system ram")
 
     def test_narrator_shows_warnings_and_the_result(self):
-        from serve.server import narrate_start
+        from serve.engine import narrate_start
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
         log.write_text("basalt load: total 200\nbasalt load: plan cuda0 100\nbasalt load: plan ram 100\nbasalt load: plan copy cuda1 100\nbasalt warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow\n"
@@ -1595,7 +1593,7 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(lines[1].endswith("(cuda0 0.0 GiB, system ram 0.0 GiB; cuda1 copy 0.0 GiB)"))
 
     def test_an_older_engine_without_a_total_counts_bytes(self):
-        from serve.server import narrate_start
+        from serve.engine import narrate_start
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
         log.write_text("basalt load: cuda0 0 100\nbasalt load: cuda0 100 100\n", encoding="utf-8")
@@ -2079,7 +2077,7 @@ class UsageAndStatus(unittest.TestCase):
             r.read()
 
     def test_origin_lists_are_checked(self):
-        from serve.server import origins_of
+        from serve.security import origins_of
         self.assertEqual(origins_of(None, "k", True), [])
         self.assertEqual(origins_of("https://a.example.com/", "k", False), ["https://a.example.com"])
         self.assertEqual(origins_of(["*", "http://localhost:3000"], "k", True), ["*", "http://localhost:3000"])
@@ -2350,7 +2348,7 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
 
     def test_the_budget_wraps_up_the_thinking(self):
-        from serve.server import REASONING_WRAP_UP
+        from serve.service import REASONING_WRAP_UP
         code, b = self.openai(reasoning_budget_tokens=20)
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
@@ -2365,7 +2363,7 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
 
     def test_a_turn_ended_while_thinking_is_closed_and_answered(self):
-        from serve.server import REASONING_CLOSE
+        from serve.service import REASONING_CLOSE
         self.engine.end_in_thought = True
         code, b = self.openai()
         self.assertEqual(code, 200, b)
@@ -2385,7 +2383,7 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual((msg["content"], b["choices"][0]["finish_reason"]), ("The ", "stop"))
 
     def test_anthropic_stream(self):
-        from serve.server import REASONING_WRAP_UP
+        from serve.service import REASONING_WRAP_UP
         code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 400, "stream": True,
                                                "reasoning_budget_tokens": 30,
                                                "messages": [{"role": "user", "content": "2+2?"}]})
@@ -2551,12 +2549,11 @@ class RestartWindow(unittest.TestCase):
 
     def test_not_alive_until_ready(self):
         from unittest import mock
-        import serve.server as server
         with tempfile.TemporaryDirectory() as d:
             script, gate = Path(d) / "fake_engine.py", Path(d) / "ready"
             script.write_text(FAKE_ENGINE, encoding="utf-8")
-            real = server.subprocess.Popen
-            with mock.patch.object(server.subprocess, "Popen",
+            real = subprocess.Popen
+            with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
                 gate.touch()
                 eng = ProcessEngine("basalt", ["--gate", str(gate)])
@@ -2599,12 +2596,11 @@ class RestartWindow(unittest.TestCase):
         """A dead engine's VRAM is freed only when its process is gone, so a new engine started at once can exit
         before READY; restart() tries again (3 times) instead of leaving the server with max_context 0."""
         from unittest import mock
-        import serve.server as server
         with tempfile.TemporaryDirectory() as d:
             script, gate, fail = Path(d) / "fake_engine.py", Path(d) / "ready", Path(d) / "fail_once"
             script.write_text(FAKE_ENGINE_FAIL_ONCE, encoding="utf-8")
-            real = server.subprocess.Popen
-            with mock.patch.object(server.subprocess, "Popen",
+            real = subprocess.Popen
+            with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)), \
                  mock.patch.object(ProcessEngine, "RESTART_RETRY_S", 0.0):
                 gate.touch()
@@ -2767,7 +2763,7 @@ class SilentEngine(unittest.TestCase):
         threading.Thread(target=put, daemon=True).start()
 
     def test_silence_mid_answer_ends_the_engine(self):
-        from serve.server import EngineSilent
+        from serve.engine import EngineSilent
         engine = self.bare(0.3)
         engine.lines.put("T 5")
         gen = engine.generate([1], 10, {}, threading.Event())
@@ -2799,7 +2795,7 @@ class SilentEngine(unittest.TestCase):
         engine.proc.kill.assert_not_called()
 
     def test_a_stop_never_acknowledged(self):
-        from serve.server import EngineSilent
+        from serve.engine import EngineSilent
         engine = self.bare(0.3, can_stop=True)
         engine.lines.put("T 5")
         gen = engine.generate([1], 10, {}, threading.Event())
@@ -2841,12 +2837,11 @@ class LostStep(unittest.TestCase):
     starts the engine again and is answered (the server used to wait forever, holding the request FIFO)."""
 
     def run_mode(self, mode, stream):
-        import serve.server as server
         with tempfile.TemporaryDirectory() as d:
             script, mark = Path(d) / "fake_engine.py", Path(d) / "lost"
             script.write_text(FAKE_LOST_STEP, encoding="utf-8")
-            real = server.subprocess.Popen
-            with mock.patch.object(server.subprocess, "Popen",
+            real = subprocess.Popen
+            with mock.patch.object(subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
                 eng = ProcessEngine("basalt", ["--mark", str(mark), "--mode", mode])
                 eng.silence_s = 0.5

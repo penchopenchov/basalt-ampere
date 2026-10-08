@@ -1,1 +1,4 @@
-"""serve - plan v0.3 P8: the API layer (text in, token ids to the engine, text deltas out)."""
+"""Basalt serve: the OpenAI- and Anthropic-compatible server in front of the engine."""
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]

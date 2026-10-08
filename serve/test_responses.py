@@ -17,7 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.responses import (ENCRYPTED_PREFIX, ResponsesError, input_messages, request_tools,  # noqa: E402
                              template_kwargs, text_format)
-from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
+from serve.engine import MockEngine  # noqa: E402
+from serve.handler import serve  # noqa: E402
+from serve.service import Service  # noqa: E402
+from serve.text import ByteTokenizer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ChatTemplate(ROOT / "serve/chat_template.jinja")

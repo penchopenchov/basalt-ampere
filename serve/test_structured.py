@@ -8,7 +8,10 @@ from unittest import mock
 
 from serve.frontend import ChatTemplate
 from serve import structured
-from serve.server import ByteTokenizer, MockEngine, Service, serve
+from serve.engine import MockEngine
+from serve.handler import serve
+from serve.service import Service
+from serve.text import ByteTokenizer
 
 try:
     import jsonschema  # noqa: F401
