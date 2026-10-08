@@ -141,12 +141,12 @@ class ProcessEngine:
                 _echoing.add(os.path.abspath(log))
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         sink = None if log else ProcessEngine.stderr_sink
+        self.max_context = 0                            # before the new process is visible: never its predecessor's
         self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
                                      bufsize=1, env=env)
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
-        self.max_context = 0
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
         ready_q: queue.Queue = queue.Queue()
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
