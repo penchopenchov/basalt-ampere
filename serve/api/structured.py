@@ -1,11 +1,6 @@
-"""JSON response formats at the HTTP boundary: prompt once, validate before delivery.
+"""JSON response formats: prompt once, validate before delivery; failures are errors, never retried.
 
-The native engine has no grammar decoder. Failed generations are errors, never
-silently retried or returned as successful structured output.
-
-`jsonschema` is optional (no new hard dependency of the server): json_object needs only the standard library, and
-json_schema is checked against its schema when the package is installed - without it, only that the answer is one
-JSON object, and the server says so once.
+`jsonschema` is optional: without it json_schema only checks for one JSON object (said once).
 """
 import json
 import threading

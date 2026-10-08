@@ -46,13 +46,13 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                                                           "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
                 calls += 1
         else:
-            # a streamed call without its final tool_call is one the output ended inside: not "tool_calls"
+            # a call whose final tool_call never came was cut off: not "tool_calls"
             whole = calls and streamed.keys() <= finished
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
             last["usage"] = {"prompt_tokens": len(ids), "completion_tokens": x["completion_tokens"],
                              "total_tokens": len(ids) + x["completion_tokens"],
-                             # the part of the prompt the conversation cache already held (OpenAI's field)
+                             # prompt tokens served from the conversation cache
                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show

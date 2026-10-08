@@ -1,23 +1,16 @@
-"""serve/api/responses.py - OpenAI's Responses API (POST /v1/responses), stateless, on the chat path.
+"""OpenAI's Responses API (POST /v1/responses), stateless, on the chat path.
 
-A Responses request becomes the same template messages, tools and kwargs a Chat Completions request does, runs through
-the same Service.run, and its events (reasoning, text, tool calls) come back as Responses output items and typed SSE
-events.  Nothing is stored: the client sends the whole conversation in `input` every time (`store: false`, as Codex CLI
-does), including the reasoning, message and function_call items of earlier answers.
+A request becomes the chat path's template messages and tools; Service.run's events come back as Responses items and
+typed SSE events.
+  * Stateless: the client resends the whole conversation in `input` (`store: false`).
+  * Leading `instructions`/`developer` messages merge into one system message so the cache prefix is stable.
+  * Function, `namespace` and `custom` tools are supported; hosted tools are dropped.
+  * Thinking returns as `reasoning_text` (no summaries) and, on request, as an opaque `encrypted_content` (base64,
+    not encrypted); either form sent back is restored into the prompt.
+  * Event order: response.created, response.in_progress, output_item.added, deltas, done events,
+    output_item.done, then response.completed / incomplete / failed.
 
-Codex CLI is the first client.  What it needs, and what this does:
-  * `instructions` and `developer` messages -> the system message (leading ones merged, so the prompt start is stable
-    and the conversation cache holds across turns);
-  * function tools, also inside `namespace` tools (Codex's MCP and agent tools: the model sees `namespace.name`) and
-    `custom` tools (a free-form `input` string); hosted tools (web search, ...) are left out, the model cannot run them;
-  * reasoning items: the model's thinking is returned as `reasoning_text` content (no summaries: this model does not
-    write them) and, when `include` asks for `reasoning.encrypted_content`, also as an opaque
-    `encrypted_content` string (base64, not encrypted: the client already holds the text).  Either form sent back is
-    put into the conversation again, so the prompt matches what the model wrote and the cache is reused;
-  * the official event order: response.created, response.in_progress, response.output_item.added, deltas,
-    ...done events, response.output_item.done, and response.completed / response.incomplete / response.failed.
-
-Based on a contribution by CC-David-CC (the item/event assembler, namespace tools, call_id ordering of tool results).
+Based on a contribution by CC-David-CC (item/event assembler, namespace tools, tool-result ordering).
 """
 from __future__ import annotations
 
@@ -86,8 +79,7 @@ def _content(content, param):
 
 
 def _reasoning_text(item, param) -> str:
-    """The thinking a reasoning item carries: its reasoning_text content, else our own encrypted_content.  A summary
-    alone, or another server's encrypted_content, carries none that can go back into the prompt."""
+    """The thinking of a reasoning item: reasoning_text content, else our own encrypted_content."""
     texts = [p.get("text") or "" for p in item.get("content") or [] if isinstance(p, dict)
              and p.get("type") in ("reasoning_text", "text")]
     if texts:
@@ -103,8 +95,7 @@ def _reasoning_text(item, param) -> str:
 
 
 def _arguments(raw, param) -> dict:
-    """A function_call's arguments (a JSON string) -> the mapping the template renders.  Arguments that are not a JSON
-    object (a call the output ended inside) are kept as text rather than refusing the whole conversation."""
+    """A function_call's arguments as the mapping the template renders; non-object arguments are kept as text."""
     if isinstance(raw, dict):
         return raw
     if raw is None or (isinstance(raw, str) and not raw.strip()):
@@ -198,8 +189,7 @@ def input_messages(req: dict) -> list[dict]:
             raise ResponsesError(f"input items of type {kind!r} are not supported", param + ".type",
                                  "unsupported_parameter")
     _order_tool_results(messages)
-    # leading system/developer messages (Codex: instructions, then its developer message) become one system message
-    # at the start; later ones become user messages in place, as on the chat path
+    # leading system/developer messages merge into one system message; later ones become user messages
     lead = 0
     while lead < len(messages) and messages[lead]["role"] == "system" and isinstance(messages[lead]["content"], str):
         lead += 1
@@ -209,9 +199,7 @@ def input_messages(req: dict) -> list[dict]:
 
 
 def _order_tool_results(messages):
-    """The template places tool results by position: each run of tool messages is put in the order of the calls of
-    the assistant turn before it (a client may send the results in the order they finished), then the private call
-    ids are dropped."""
+    """Reorder each run of tool messages to match the preceding assistant turn's calls, then drop the private ids."""
     i = 0
     while i < len(messages):
         if messages[i]["role"] != "tool":
@@ -336,8 +324,7 @@ def template_kwargs(req: dict) -> dict:
 
 # ------------------------------------------------------------------------------------------------ output
 class Assembler:
-    """One response: its output items and its typed events, built from Service.run's events.  The non-streaming
-    answer is the `response` of the last event, so both modes are the same items."""
+    """Builds one response's output items and typed events from Service.run's events."""
 
     def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool,
                  json_mode: bool = False):
@@ -374,7 +361,7 @@ class Assembler:
                 self.event("response.in_progress", response=self.snapshot())]
 
     def in_progress(self) -> dict:
-        """A keep-alive a client counts as activity (SSE comments are not events: Codex's idle timer ignores them)."""
+        """A keep-alive event; SSE comments would not reset a client's idle timer."""
         return self.event("response.in_progress", response=self.snapshot())
 
     def _open(self, item) -> list[dict]:
@@ -489,10 +476,9 @@ class Assembler:
         return item
 
     def finish(self, done: dict, validate=None) -> list[dict]:
-        """The end: close what is open, then response.completed (or .incomplete when max_output_tokens ran out).
-        `validate(text, finish)` checks a structured answer and returns its text (or raises)."""
+        """Close open items, then response.completed (or .incomplete on length). `validate` checks structured text."""
         length = done.get("finish") == "length"
-        # a call still open was cut off (its tool_call never came): incomplete, whatever the finish
+        # an open call was cut off: incomplete whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
         out = self.close("incomplete" if length or unfinished else "completed")
         if self.json_mode:
