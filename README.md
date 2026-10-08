@@ -16,8 +16,9 @@ It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped dow
 
 - `src/`, `include/`: the C++/CUDA engine (one binary, `basalt`).
 - `serve/`: a Python server with an OpenAI- and Anthropic-compatible API, and a stats page.
-- `tools/`: the model-file converter (`convert.py`, `model_file.py`), the drafter fetcher (`mtp_fetch.py`) and the
-  PPL/KLD quality gate (`ppl_gate.py`).
+- `tools/convert/`: the model-file converter (`convert.py`), its section builders and the drafter fetcher (`mtp_fetch.py`).
+- `tools/`: the .basalt reader and writer (`model_file.py`), the PPL/KLD quality gate (`ppl_gate.py`), the greedy-identity
+  check and the tokenizer.
 - `tests/`: parity and unit tests.
 
 ## Requirements
@@ -108,11 +109,11 @@ projector, and the default engine arguments and sampling. `basalt serve --model 
 Build one from the source GGUF shards (give shard 1; the others are found beside it):
 
 ```sh
-python3 tools/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \
+python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \
     [--mtp-source DIR] [--draft-vocab FILE] [--profile FILE] [--hc8 FILE] [--compat-bf16] [--name NAME]
 ```
 
-`python3 tools/convert.py --help` describes every input.
+`python3 tools/convert/convert.py --help` describes every input.
 
 ## Models
 

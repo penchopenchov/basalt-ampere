@@ -1,6 +1,6 @@
-"""Tests for tools/convert.py and tools/model_sections.py on a tiny synthetic model, drafter and side files.
+"""Tests for tools/convert/convert.py and tools/convert/model_sections.py on a tiny synthetic model, drafter and side files.
 
-    python3 -m unittest discover -s tools -p 'test_convert.py'
+    python3 -m unittest discover -s tools/convert -p 'test_convert.py'
 """
 import hashlib
 import json
@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import convert  # noqa: E402
 import model_sections as S  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402

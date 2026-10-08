@@ -1,12 +1,12 @@
-"""tools/mtp_fetch.py - the MTP block from the BF16 checkpoint, without the checkpoint.
+"""tools/convert/mtp_fetch.py - the MTP block from the BF16 checkpoint, without the checkpoint.
 
 The GSQ-RCO GGUF ships no MTP head. The BF16 checkpoint (Qwen/Qwen3.8-Flash-Next, 360 GB in 131 shards) does:
 31 `mtp.*` tensors scattered over 28 shards. Safetensors puts a JSON header (name -> dtype, shape, byte range)
 at the start of each shard, so HTTP range requests can read the headers and then only the MTP tensors.
 
-    python tools/mtp_fetch.py inventory --out DIR          # headers only (a few KB per shard)
-    python tools/mtp_fetch.py fetch --out DIR [--only SUBSTR]  # the MTP tensors themselves, resumable
-    python tools/mtp_fetch.py verify --out DIR             # the fetched tensors against SHA256 (exit 3: bad ones)
+    python tools/convert/mtp_fetch.py inventory --out DIR          # headers only (a few KB per shard)
+    python tools/convert/mtp_fetch.py fetch --out DIR [--only SUBSTR]  # the MTP tensors themselves, resumable
+    python tools/convert/mtp_fetch.py verify --out DIR             # the fetched tensors against SHA256 (exit 3: bad ones)
 
 `fetch` writes one raw file per tensor plus `mtp-manifest.json` (dtype, shape, source shard, byte range,
 sha256). It never downloads anything but the ranges named in the headers. Nothing here runs a model.

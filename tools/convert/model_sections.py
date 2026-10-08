@@ -1,4 +1,4 @@
-"""The sections of a .basalt model file that are built from the source weights (used by tools/convert.py).
+"""The sections of a .basalt model file that are built from the source weights (used by tools/convert/convert.py).
 
   dense / dense.index    the float tensors the engine reads from its weight pool, in the form it reads them, and the
                          table of every non-expert tensor (quantized ones are only listed: the engine serves them from
@@ -6,7 +6,7 @@
   experts / experts.layout  per layer, n_expert blobs of [gate rows | up rows | down rows], the raw GGUF slices, and
                          the text that says where each layer starts and what its formats are
   mtp/dense, mtp/dense.index, mtp/experts   the draft layer, from the BF16 `mtp.*` tensors fetched by
-                         tools/mtp_fetch.py: Q8_0 projections, BF16 hyper-connection and router weights, F32 norms,
+                         tools/convert/mtp_fetch.py: Q8_0 projections, BF16 hyper-connection and router weights, F32 norms,
                          and Q2_0 experts in the engine's blob layout
   profile                the expert ranking, from routing traces (--dump-routing) or an existing profile
 
@@ -26,7 +26,7 @@ from collections import defaultdict
 import numpy as np
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
 from gguf_reader import GGUFFile  # noqa: E402
 
 
@@ -415,14 +415,14 @@ def mtp_blob(gu: np.ndarray, dn: np.ndarray) -> bytes:
 
 
 class Mtp:
-    """The draft layer's sections, from a directory written by `tools/mtp_fetch.py fetch` (mtp-manifest.json and
+    """The draft layer's sections, from a directory written by `tools/convert/mtp_fetch.py fetch` (mtp-manifest.json and
     one raw BF16 file per tensor)."""
 
     def __init__(self, src):
         self.src = pathlib.Path(src)
         mf = self.src / "mtp-manifest.json"
         if not mf.is_file():
-            raise ConvertError(f"{mf} not found (run tools/mtp_fetch.py fetch --out {self.src})")
+            raise ConvertError(f"{mf} not found (run tools/convert/mtp_fetch.py fetch --out {self.src})")
         self.manifest = {t["name"]: t for t in json.loads(mf.read_text())}
         for n in MTP_EXPERTS:
             if n not in self.manifest:

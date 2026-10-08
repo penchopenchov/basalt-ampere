@@ -1,6 +1,6 @@
-"""tools/convert.py - build the single .basalt model file from the source GGUF shards.
+"""tools/convert/convert.py - build the single .basalt model file from the source GGUF shards.
 
-    python3 tools/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
+    python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
         [--mtp-source DIR] [--profile FILE | --profile-from TRACE ...] [--draft-vocab FILE] [--hc8 FILE] \\
         [--name NAME] [--compat-bf16] [--no-vision] [--force]
 
@@ -10,7 +10,7 @@ Inputs
                      Every section but the drafter, the profile's ranking, the hc8 table and the vision projector is
                      built from these.
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
-  --mtp-source DIR   the draft layer's BF16 tensors, as `tools/mtp_fetch.py fetch --out DIR` writes them
+  --mtp-source DIR   the draft layer's BF16 tensors, as `tools/convert/mtp_fetch.py fetch --out DIR` writes them
                      (mtp-manifest.json and one raw file per tensor).  The converter quantizes them: Q8_0
                      projections, BF16 hyper-connection and router weights, F32 norms, Q2_0 experts.  Without it the
                      file has no drafter and the engine runs without speculation.
@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -53,6 +52,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))   # model_file, gguf_reader, tokenizer
 import model_sections as S  # noqa: E402
 from model_file import TENSOR_ALIGN, ModelWriter  # noqa: E402
 
@@ -105,13 +105,8 @@ def json_safe(v):
 
 
 def load_vision_helper():
-    path = HERE / "vision" / "pack_vision.py"
-    if not path.exists():
-        return None
-    spec = importlib.util.spec_from_file_location("pack_vision", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return getattr(mod, "vision_sections", None)
+    import pack_vision
+    return pack_vision.vision_sections
 
 
 def export_tokenizer(first_gguf: Path, out_dir: Path) -> list[Path]:
@@ -218,7 +213,7 @@ def convert(a) -> None:
     if not a.no_vision:
         fn = load_vision_helper()
         if fn is None:
-            print("note: tools/vision/pack_vision.py (vision_sections) not found; only vision/mmproj is written")
+            print("note: pack_vision.py (vision_sections) not found; only vision/mmproj is written")
         else:
             vision_extra = list(fn(str(mmproj), [str(p) for p in model.paths]))
 
@@ -268,7 +263,7 @@ def convert(a) -> None:
                        for p in model.paths + ([mmproj] if not a.no_vision else [])]
             meta = {
                 "format": "basalt", "version": 1, "name": a.name,
-                "converter": {"tool": "tools/convert.py", "git": git_rev()},
+                "converter": {"tool": "tools/convert/convert.py", "git": git_rev()},
                 "sources": sources,
                 "gguf_kv": kv,
                 "tensors": {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.shape],
@@ -306,7 +301,7 @@ def main():
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
-    ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/mtp_fetch.py fetch")
+    ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/convert/mtp_fetch.py fetch")
     ap.add_argument("--draft-vocab", metavar="FILE", help="int32 token ids the draft head may propose (needs --mtp-source)")
     ap.add_argument("--profile", metavar="FILE", help="an expert profile to store as it is (--expert-profile-save's file)")
     ap.add_argument("--profile-from", nargs="+", metavar="TRACE",

@@ -159,7 +159,7 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
                     if (L.version > kExpertLayoutVersion) {
                         err = "the expert layout is v" + std::to_string(L.version) + "; this engine reads up to v" +
                               std::to_string(kExpertLayoutVersion) + " (the model was converted by a newer "
-                              "tools/convert.py: update the engine)";
+                              "tools/convert/convert.py: update the engine)";
                         return false;
                     }
                 }

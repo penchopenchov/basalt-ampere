@@ -1,9 +1,9 @@
-"""Tests for tools/mtp_fetch.py: a range read needs a 206 with the asked Content-Range, the pinned revision's
+"""Tests for tools/convert/mtp_fetch.py: a range read needs a 206 with the asked Content-Range, the pinned revision's
 tensors are checked against their sha256 (a wrong one is fetched again; a corrupt install is found by `verify` and
 a rerun fetches it again), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
 urlopen - nothing is downloaded.
 
-    python -m unittest tools.test_mtp_fetch
+    python -m unittest discover -s tools/convert -p test_mtp_fetch.py
 """
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "tools" / "convert"))
 import mtp_fetch as M  # noqa: E402
 
 
