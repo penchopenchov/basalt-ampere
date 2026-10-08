@@ -404,7 +404,7 @@ struct Options {
     /// decides residency by routing frequency instead of by first use.
     std::string expert_profile;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
-    /// then the routing counted since the start; tools/convert.py reads it as `--profile`); on QUIT and every
+    /// then the routing counted since the start; tools/convert/convert.py reads it as `--profile`); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
     std::string expert_profile_save;
     double expert_profile_save_min = 10.0;
@@ -741,7 +741,7 @@ void usage() {
                  "  --expert-profile-save P  --serve: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
-                 "                       0 = on QUIT only) between requests; tools/convert.py --profile reads it\n"
+                 "                       0 = on QUIT only) between requests; tools/convert/convert.py --profile reads it\n"
                  "  --no-hit-poke        A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -2444,7 +2444,7 @@ int main(int argc, char** argv) {
         if (!f16 || wc->bytes != (uint64_t) wc->elements * 2) {
             std::fprintf(stderr, "basalt generate: blk.1.ple_conv1d.weight is not stored as F16 (index kind %d, "
                                  "%llu B for %lld values); the PLE conv1d kernel reads F16 - convert the model again "
-                                 "with tools/convert.py\n",
+                                 "with tools/convert/convert.py\n",
                          (int) wc->kind, (unsigned long long) wc->bytes, (long long) wc->elements);
             return 1;
         }
