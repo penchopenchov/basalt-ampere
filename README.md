@@ -97,8 +97,13 @@ bin/basalt serve --config basalt_config.json --max-context 32768  # the command 
 engine's batch slots; the default 1 is the single-stream path. Further requests wait in arrival order (a later one
 may go first only to resume a slot that holds its conversation, a few times at most). A slot is freed when its
 request finishes, is cancelled or its client leaves. `/metrics` reports `live.slots` (`total`, `active`,
-`queue_depth`). Every slot holds a full `--max-context` of KV cache, taken from the expert cache; a per-slot
-context is not an engine option yet, so lower `--max-context` when raising N.
+`queue_depth`). As in llama.cpp, `--max-context` is shared: each slot holds `--max-context / N` tokens (`--parallel 4
+--max-context 262144` gives four slots of 65536; ask for `--max-context 1048576` for four of 262144). The solo
+path, used while one request runs alone, has the same length, so a request that fits a slot never outgrows it, and
+one that does not is refused with a 400 naming that length. `/slots`, `/props` and `/v1/models` report the context
+each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's `server` section) gives every slot
+the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
+solo session of the same length, come out of the expert cache.
 
 - `server` holds the server's options (`python -m serve.server --help`), named as the flags without the dashes:
   strings or numbers, `true`/`false` for a switch (`vision`, `lazy`, ...), a list for the repeatable ones
