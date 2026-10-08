@@ -141,6 +141,7 @@ MtpDrafter::~MtpDrafter() {
     for (auto& st : stores_)
         for (void* a : st) if (a) cudaFree(a);
     if (rstage_) cudaFree(rstage_);
+    if (rkeep_) cudaFree(rkeep_);
     for (float* r : pend_R_) if (r) cudaFree(r);
     for (auto& row : round_exec_)
         for (auto& e : row) if (e) cudaGraphExecDestroy(e);
@@ -366,9 +367,14 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         } else {
             stores_.assign((size_t) n_stores_ + 1, std::array<void*, 4>{});
             store_hi_.assign((size_t) n_stores_ + 1, 0);
-            for (auto& st : stores_)
+            store_pages_.assign((size_t) n_stores_ + 1, st_.n_pages);
+            const int64_t ps0 = shapes_of(g).page_size;
+            for (size_t id = 0; id < store_cells_.size() && (int) id < n_stores_; ++id)
+                store_pages_[id] = std::min<int64_t>(st_.n_pages, (store_cells_[id] + ps0 - 1) / ps0);
+            for (size_t id = 0; id < stores_.size(); ++id)
                 for (int i = 0; i < na; ++i) {
-                    const uint64_t bytes = (uint64_t) st_.n_pages * lay[i].page_bytes;
+                    auto& st = stores_[id];
+                    const uint64_t bytes = (uint64_t) store_pages_[id] * lay[i].page_bytes;
                     if (cudaMalloc(&st[(size_t) i], bytes) != cudaSuccess) { err = "mtp: the slots' K/V do not fit"; return false; }
                     cudaMemset(st[(size_t) i], 0, bytes);
                     vram_ += bytes;
@@ -430,6 +436,8 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (n_stores_ > 0) {
         if (cudaMalloc((void**) &rstage_, T * HC * N * sizeof(float)) != cudaSuccess) { err = "mtp: row staging"; return false; }
         vram_ += T * HC * N * sizeof(float);
+        if (cudaMalloc((void**) &rkeep_, kKeepRows * HC * N * sizeof(float)) != cudaSuccess) { err = "mtp: row copy"; return false; }
+        vram_ += kKeepRows * HC * N * sizeof(float);
         pend_R_.assign((size_t) n_stores_ + 1, nullptr);
         pend_tok_.assign((size_t) n_stores_ + 1, std::vector<int32_t>{});
         pend_cell0_.assign((size_t) n_stores_ + 1, 0);
@@ -1587,13 +1595,13 @@ bool MtpDrafter::use_store(int id, std::string& err) {
     const int na = kv_layout(lay);
     const int64_t ps = shapes_of(*g_).page_size;
     if (dirty_hi_ > dirty_lo_) {   // the written pages go back to the sequence that held them
-        const int64_t pg0 = dirty_lo_ / ps, pg1 = std::min<int64_t>(st_.n_pages, (dirty_hi_ + ps - 1) / ps);
-        for (int i = 0; i < na; ++i)
+        const int64_t pg0 = dirty_lo_ / ps, pg1 = std::min<int64_t>(store_pages_[(size_t) cur_], (dirty_hi_ + ps - 1) / ps);
+        for (int i = 0; i < na && pg1 > pg0; ++i)
             cudaMemcpyAsync((uint8_t*) stores_[(size_t) cur_][(size_t) i] + pg0 * lay[i].page_bytes,
                             (const uint8_t*) lay[i].p + pg0 * lay[i].page_bytes, (size_t) ((pg1 - pg0) * lay[i].page_bytes),
                             cudaMemcpyDeviceToDevice, cs_);
     }
-    const int64_t n1 = std::min<int64_t>(st_.n_pages, (store_hi_[(size_t) id] + ps - 1) / ps);
+    const int64_t n1 = std::min<int64_t>(store_pages_[(size_t) id], (store_hi_[(size_t) id] + ps - 1) / ps);
     for (int i = 0; i < na && n1 > 0; ++i)
         cudaMemcpyAsync(lay[i].p, stores_[(size_t) id][(size_t) i], (size_t) ((uint64_t) n1 * lay[i].page_bytes),
                         cudaMemcpyDeviceToDevice, cs_);
@@ -1612,12 +1620,12 @@ bool MtpDrafter::copy_store(int from, int to, int64_t cells, std::string& err) {
     KvArr lay[4];
     const int na = kv_layout(lay);
     const int64_t ps = shapes_of(*g_).page_size;
-    const int64_t n1 = std::min<int64_t>(st_.n_pages, (cells + ps - 1) / ps);
+    const int64_t n1 = std::min<int64_t>({store_pages_[(size_t) from], store_pages_[(size_t) to], (cells + ps - 1) / ps});
     for (int i = 0; i < na && n1 > 0; ++i)
         cudaMemcpyAsync(store_ptr(to, i, lay), store_ptr(from, i, lay), (size_t) ((uint64_t) n1 * lay[i].page_bytes),
                         cudaMemcpyDeviceToDevice, cs_);
     if (to == cur_) note_cells(0, cells);
-    store_hi_[(size_t) to] = std::min<int64_t>(cells, st_.max_cells);
+    store_hi_[(size_t) to] = std::min<int64_t>({cells, st_.max_cells, store_pages_[(size_t) to] * ps});
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: copying the K/V failed"; return false; }
     return true;
 }
@@ -1627,6 +1635,17 @@ QsaState& MtpDrafter::kv_state_rw() {
     if (!use_main(e)) std::fprintf(stderr, "basalt mtp: %s\n", e.c_str());
     note_cells(0, prompt_len_ > 0 ? prompt_len_ : st_.max_cells);
     return st_;
+}
+
+const float* MtpDrafter::keep_rows(const float* R_rows, int rows, std::string& err) {
+    if (rkeep_ == nullptr || rows > kKeepRows) { err = "mtp: no room to keep the window rows"; return nullptr; }
+    const OnDevice on_device(device_);
+    if (cudaMemcpyAsync(rkeep_, R_rows, (size_t) rows * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = "mtp: keeping the window rows failed";
+        return nullptr;
+    }
+    return rkeep_;
 }
 
 bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts,

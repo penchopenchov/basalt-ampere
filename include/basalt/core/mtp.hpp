@@ -114,13 +114,17 @@ public:
     /// `st_` the graphs address holds one sequence at a time, `use_store` swaps another in (the old one's written
     /// cells go to its store).  Store `n` is the main sequence (the prompt path and solo requests), so `use_main`
     /// must precede anything that reads or writes it.  Needs the K/V fully resident.
-    void set_stores(int n) { n_stores_ = n; }
+    /// `cells[i]` (optional) is slot i's context: its store holds that many cells, the main store the full state.
+    void set_stores(int n, std::vector<int64_t> cells = {}) { n_stores_ = n; store_cells_ = std::move(cells); }
     int main_store() const { return n_stores_; }
     bool use_store(int id, std::string& err);
     bool use_main(std::string& err) { return use_store(n_stores_, err); }
     /// Cells [0, cells) of sequence `from` into sequence `to`.
     bool copy_store(int from, int to, int64_t cells, std::string& err);
     /// `draft` for sequence `id` from the window rows `R_rows` (device, row 0 of the sequence's segment).
+    /// Copies a verify window's rows (all slots) out of the buffer the draft graphs also use, so each slot's
+    /// `draft_seq` / `defer_rows` reads its own rows intact; null on failure.
+    const float* keep_rows(const float* R_rows, int rows, std::string& err);
     bool draft_seq(int id, const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts,
                    std::string& err, float* probs, float min_p, int* n_drafts);
     /// The K/V cells [cell0, cell0 + n) of sequence `id` from window rows, no draft (`prefill` on that sequence).
@@ -248,7 +252,11 @@ private:
     std::vector<std::array<void*, 4>> stores_;
     int n_stores_ = 0, cur_ = 0;
     std::vector<int64_t> store_hi_;
+    std::vector<int64_t> store_cells_;   ///< set_stores: the slots' contexts
+    std::vector<int64_t> store_pages_;   ///< pages each store holds (the main store: all of st_'s)
     int64_t dirty_lo_ = 0, dirty_hi_ = 0;   // empty when hi <= lo
+    static constexpr int kKeepRows = 16;
+    float* rkeep_ = nullptr;    ///< a window's rows, kept while the slots draft one after another
     float* rstage_ = nullptr;   ///< draft_seq's copy of the rows
     static constexpr int kPendRows = 32;
     std::vector<float*> pend_R_;                  ///< per sequence: the deferred rows
