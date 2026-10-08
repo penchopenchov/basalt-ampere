@@ -141,6 +141,7 @@ MtpDrafter::~MtpDrafter() {
     for (auto& st : stores_)
         for (void* a : st) if (a) cudaFree(a);
     if (rstage_) cudaFree(rstage_);
+    for (float* r : pend_R_) if (r) cudaFree(r);
     for (auto& row : round_exec_)
         for (auto& e : row) if (e) cudaGraphExecDestroy(e);
     for (auto& row : step_exec_)
@@ -429,6 +430,13 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (n_stores_ > 0) {
         if (cudaMalloc((void**) &rstage_, T * HC * N * sizeof(float)) != cudaSuccess) { err = "mtp: row staging"; return false; }
         vram_ += T * HC * N * sizeof(float);
+        pend_R_.assign((size_t) n_stores_ + 1, nullptr);
+        pend_tok_.assign((size_t) n_stores_ + 1, std::vector<int32_t>{});
+        pend_cell0_.assign((size_t) n_stores_ + 1, 0);
+        for (float*& r : pend_R_) {
+            if (cudaMalloc((void**) &r, (size_t) kPendRows * HC * N * sizeof(float)) != cudaSuccess) { err = "mtp: row staging"; return false; }
+            vram_ += (uint64_t) kPendRows * HC * N * sizeof(float);
+        }
     }
     {
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
@@ -1598,6 +1606,8 @@ bool MtpDrafter::use_store(int id, std::string& err) {
 bool MtpDrafter::copy_store(int from, int to, int64_t cells, std::string& err) {
     if (n_stores_ == 0 || from == to) return true;
     if (from < 0 || from > n_stores_ || to < 0 || to > n_stores_) { err = "mtp: no such K/V store"; return false; }
+    if (!flush(from, err)) return false;
+    pend_tok_[(size_t) to].clear();
     const OnDevice on_device(device_);
     KvArr lay[4];
     const int na = kv_layout(lay);
@@ -1621,7 +1631,7 @@ QsaState& MtpDrafter::kv_state_rw() {
 
 bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts,
                            std::string& err, float* probs, float min_p, int* n_drafts) {
-    if (!use_store(id, err)) return false;
+    if (!flush(id, err) || !use_store(id, err)) return false;
     const OnDevice on_device(device_);
     const size_t bytes = (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float);
     if (R_rows != window_R_) {   // through a copy: the rows may overlap the ones the graphs read
@@ -1635,8 +1645,35 @@ bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* to
     return draft(T, tokens, p, a, drafts, err, probs, min_p, n_drafts);
 }
 
-bool MtpDrafter::catch_up(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+bool MtpDrafter::flush(int id, std::string& err) {
+    if (id < 0 || id >= (int) pend_tok_.size() || pend_tok_[(size_t) id].empty()) return true;
+    std::vector<int32_t> tk;
+    tk.swap(pend_tok_[(size_t) id]);
     if (!use_store(id, err)) return false;
+    return prefill_cur(pend_R_[(size_t) id], tk.data(), (int64_t) tk.size(), pend_cell0_[(size_t) id], err);
+}
+
+bool MtpDrafter::defer_rows(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+    if (id < 0 || id >= (int) pend_tok_.size()) { err = "mtp: no such K/V store"; return false; }
+    std::vector<int32_t>& tk = pend_tok_[(size_t) id];
+    if (!tk.empty() && (pend_cell0_[(size_t) id] + (int64_t) tk.size() != cell0 || (int64_t) tk.size() + n > kPendRows)) {
+        if (!flush(id, err)) return false;
+    }
+    if (n > kPendRows) return catch_up(id, R_rows, next_tokens, n, cell0, err);
+    const OnDevice on_device(device_);
+    const size_t HCN = (size_t) (g_->hc * g_->n_embd);
+    if (tk.empty()) pend_cell0_[(size_t) id] = cell0;
+    if (cudaMemcpyAsync(pend_R_[(size_t) id] + tk.size() * HCN, R_rows, (size_t) n * HCN * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = "mtp: keeping the window rows failed";
+        return false;
+    }
+    tk.insert(tk.end(), next_tokens, next_tokens + n);
+    return true;
+}
+
+bool MtpDrafter::catch_up(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+    if (!flush(id, err) || !use_store(id, err)) return false;
     return prefill_cur(R_rows, next_tokens, n, cell0, err);
 }
 

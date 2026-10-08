@@ -125,6 +125,10 @@ public:
                    std::string& err, float* probs, float min_p, int* n_drafts);
     /// The K/V cells [cell0, cell0 + n) of sequence `id` from window rows, no draft (`prefill` on that sequence).
     bool catch_up(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+    /// The same, later: the rows are kept and their cells are computed by the next `draft_seq` (or `flush`) of the
+    /// sequence, in one pass.  The copy runs on the drafter's stream: `idle` before the rows' buffer is reused.
+    bool defer_rows(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+    bool flush(int id, std::string& err);
     bool coupled() const { return coupled_active_; }
     /// Diagnostic (gate spec_log): the top-k tokens and softmax probabilities of the last draft's step j, from the
     /// draft head's logits kept per step.  Returns the count written (0 when the diagnostic is off).
@@ -246,6 +250,10 @@ private:
     std::vector<int64_t> store_hi_;
     int64_t dirty_lo_ = 0, dirty_hi_ = 0;   // empty when hi <= lo
     float* rstage_ = nullptr;   ///< draft_seq's copy of the rows
+    static constexpr int kPendRows = 32;
+    std::vector<float*> pend_R_;                  ///< per sequence: the deferred rows
+    std::vector<std::vector<int32_t>> pend_tok_;  ///< their next tokens
+    std::vector<int64_t> pend_cell0_;              ///< the first one's cell
     void note_cells(int64_t lo, int64_t hi);
     bool prefill_cur(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
 
