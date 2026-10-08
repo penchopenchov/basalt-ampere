@@ -142,6 +142,7 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
             src = cli_engine if "--max-context" in cli_engine or "--max-context" not in file_engine else file_engine
             ctx = int(src.get("--max-context", ENGINE_DEFAULT_CONTEXT))
             src["--max-context"] = max(MIN_SLOT_CONTEXT, ctx // a.parallel)
+            a.shared_context = ctx                         # the total, for the startup line
     return a, file_argv + cli, file_engine, cli_engine
 
 
@@ -161,11 +162,15 @@ def engine_settings(file_flags: dict, cli_flags: dict) -> tuple[dict, dict]:
     return flags, sources
 
 
-def engine_line(flags: dict, sources: dict, config: bool = True) -> str:
+def engine_line(flags: dict, sources: dict, config: bool = True, shared: tuple[int, int] | None = None) -> str:
     """The startup line listing engine settings from --config or the command line; without a config file it says
-    the built-in defaults apply."""
-    shown = ", ".join(f"no {f} ({sources[f]})" if v is False else f"{f}{'' if v is True else f' {v}'} ({sources[f]})"
-                      for f, v in flags.items())
+    the built-in defaults apply. `shared` is (total, slots) when --max-context was divided among the slots."""
+    def one(f, v):
+        if v is False:
+            return f"no {f} ({sources[f]})"
+        note = f"{sources[f]}: {shared[0]} / {shared[1]} slots" if shared and f == "--max-context" else sources[f]
+        return f"{f}{'' if v is True else f' {v}'} ({note})"
+    shown = ", ".join(one(f, v) for f, v in flags.items())
     if config:
         return f"[server] engine: {shown}" if shown else "[server] engine: config sets nothing, built-in defaults"
     spec = flags.get("--spec", 0)

@@ -160,6 +160,15 @@ class SlotContext(unittest.TestCase):
         self.assertEqual(self.flags(["--max-context", "262144"])["--max-context"], 262144)                  # solo: whole
         self.assertEqual(self.flags(["--parallel", "4"], {"engine": {"max-context": 8192}})["--max-context"], 2048)
 
+    def test_engine_line_shows_the_division(self):
+        ap = build_parser()
+        a, _, file_engine, cli_engine = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
+        flags, src = engine_settings(file_engine, cli_engine)
+        line = engine_line(flags, src, False, (a.shared_context, a.parallel))
+        self.assertEqual(flags["--max-context"], 16384)
+        self.assertIn("--max-context 16384 (cli: 65536 / 4 slots)", line)
+        self.assertNotIn("slots", engine_line(flags, src, False))
+
     def test_slot_full_context_keeps_the_whole(self):
         f = self.flags(["--parallel", "4", "--max-context", "262144", "--slot-full-context"])
         self.assertEqual(f["--max-context"], 262144)

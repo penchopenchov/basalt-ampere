@@ -102,7 +102,8 @@ def main() -> int:
         if off and cfg.get("args"):
             cfg["args"] = [x for x in cfg["args"] if x not in off]
         if not a.mock_engine:
-            print(engine_line(flags, sources, bool(a.config)), flush=True)
+            print(engine_line(flags, sources, bool(a.config),
+                                    (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None), flush=True)
     if a.alias:
         cfg["model_name"] = a.alias
     try:                                                # fail fast if the port is taken
