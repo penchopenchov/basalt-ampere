@@ -2,26 +2,27 @@
 """Perplexity and KL divergence through the decode path, against a llama.cpp base.
 
 The base is `llama-perplexity --kl-divergence-base`'s file (wikitext-2, 512-token chunks, second half scored). The
-engine starts as serve/server.py starts it (encoder first, so tiers are sized as in use) plus --ppl-base and
---ppl-out; per chunk it reads the first half as a prompt and teacher-forces the rest through verify windows of T
-tokens (see the engine's ppl_gate.hpp).
+engine runs as `--serve` with the model plus --ppl-base and --ppl-out; per chunk it reads the first half as a prompt
+and teacher-forces the rest through verify windows of T tokens (see the engine's ppl_gate.hpp). Flags this tool does
+not know are passed to the engine as they are; it sets only what the measurement needs (--spec 5 --spec-min-p 0.7,
+no adaptive swaps, a second visible GPU as the peer tier), and an engine flag given here replaces that value.
 
-  python3 tools/ppl_gate.py --exe build/basalt --config cfg.json --base base.kld --out DIR [--chunks 20] [--t 3]
-                            [--set="--spec 5 --spec-min-p 0.7"]
+  python3 tools/ppl_gate.py --model FILE.basalt --base base.kld --out DIR [--engine-bin BIN] [--chunks 20] [--t 3]
+                            [--peer-slots 64 ...]
   python3 tools/ppl_gate.py --report DIR/rows.tsv          # summary of a finished run
   python3 tools/ppl_gate.py --diff A/rows.tsv B/rows.tsv   # row by row: identical rows, largest NLL/KLD change
 """
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
 import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+ENGINE_BIN = Path(__file__).resolve().parents[1] / "bin" / "basalt"
 
 
 def read_base(path: str):
@@ -77,60 +78,51 @@ def diff(pa: str, pb: str) -> str:
             f"{'none' if first is None else 'chunk %s pos %s' % first}")
 
 
-def engine_env(cfg: dict) -> dict:
-    env = dict(os.environ)
-    env.update({k: str(v) for k, v in (cfg.get("env") or {}).items()})
-    dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
-    if dirs:
-        env["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
-    return env
+def gpu_count() -> int:
+    try:
+        out = subprocess.run(["nvidia-smi", "--list-gpus"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return sum(1 for line in out.splitlines() if line.startswith("GPU "))
 
 
-def start_vision(cfg: dict, env: dict, log):
-    v = cfg.get("vision")
-    if not v:
-        return None
-    args = [v["exe"], "--mmproj", v["mmproj"], "--model", v["model"]]
-    if v.get("gpu"):
-        args.append("--gpu")
-    if v.get("threads"):
-        args += ["--threads", str(v["threads"])]
-    if v.get("max_tokens"):
-        args += ["--max-tokens", str(v["max_tokens"])]
-    venv = dict(env)
-    if v.get("cuda_device") is not None:   # as serve/engine/vision.py vision_env
-        venv["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        venv["CUDA_VISIBLE_DEVICES"] = str(v["cuda_device"])
-    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True, env=venv)
-    line = p.stdout.readline()
-    if not line.startswith("READY"):
-        sys.exit("the vision encoder did not start: " + line.strip())
-    return p
+def set_args(args: list[str], extra: list[str]) -> list[str]:
+    """`args` with each flag of `extra` replacing the same flag (and its value) in `args`, or added."""
+    out = list(args)
+    i = 0
+    while i < len(extra):
+        flag = extra[i]
+        has_value = i + 1 < len(extra) and not extra[i + 1].startswith("--")
+        value = [extra[i + 1]] if has_value else []
+        if flag in out:
+            j = out.index(flag)
+            old_has_value = j + 1 < len(out) and not out[j + 1].startswith("--")
+            out[j:j + 1 + old_has_value] = [flag, *value]
+        else:
+            out += [flag, *value]
+        i += 1 + has_value
+    return out
 
 
 def run(a) -> int:
     n_ctx, n_vocab, n_chunk, chunks = read_base(a.base)
     first = n_ctx // 2
-    cfg = json.load(open(a.config))
-    args = list(cfg["args"])
-    for k in range(0, len(a.set), 2):   # --set FLAG VALUE ...: replace or add
-        if a.set[k] in args:
-            args[args.index(a.set[k]) + 1] = a.set[k + 1]
-        else:
-            args += [a.set[k], a.set[k + 1]]
+    args = ["--model", str(Path(a.model).resolve()), "--spec", "5", "--spec-min-p", "0.7",
+            "--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--max-context", "4096"]
+    if gpu_count() > 1:
+        args += ["--peer-device", "1"]
+    args = set_args(args, a.engine_args + ["--ppl-base", str(Path(a.base).resolve())])
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     rows = out / "rows.tsv"
     rows.unlink(missing_ok=True)
-    env = engine_env(cfg)
-    args += ["--ppl-base", a.base, "--ppl-out", str(rows)]
+    args = set_args(args, ["--ppl-out", str(rows)])
     log = open(out / "engine.log", "w")
-    log.write(f"ppl_gate: exe={a.exe} T={a.t} chunks={a.chunks} args={' '.join(args)}\n")
+    log.write(f"ppl_gate: engine={a.engine_bin} T={a.t} chunks={a.chunks} args={' '.join(args)}\n")
     log.flush()
     t0 = time.time()
-    vis = start_vision(cfg, env, log)
-    eng = subprocess.Popen([a.exe or cfg["exe"], "--serve", *args], cwd=cfg.get("cwd"), stdin=subprocess.PIPE,
-                           stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1, env=env)
+    eng = subprocess.Popen([a.engine_bin, "--serve", *args], stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1)
     try:
         for line in eng.stdout:
             if line.startswith("READY"):
@@ -174,43 +166,41 @@ def run(a) -> int:
             eng.wait(timeout=60)
         except subprocess.TimeoutExpired:
             eng.kill()
-        if vis is not None:
-            vis.kill()
     extra = {"T": a.t, "load s": f"{t_load:.0f}", "run s": f"{t_run:.1f}",
              "prompt ms/chunk": f"{pp_ms / nc:.0f}", "decode ms/chunk": f"{dec_ms / nc:.0f}",
              "decode routed experts": f"{look + off}: VRAM hits {100.0 * hits / max(1, look + off):.1f}%, "
                                       f"peer GPU/PCIe {100.0 * off / max(1, look + off):.1f}%, "
                                       f"CPU {100.0 * (look - hits) / max(1, look + off):.1f}%"}
     rep = summary(str(rows), extra)
-    (out / "report.txt").write_text(f"exe {a.exe}\nargs {' '.join(args)}\n{rep}\n")
+    (out / "report.txt").write_text(f"engine {a.engine_bin}\nargs {' '.join(args)}\n{rep}\n")
     print(rep)
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--exe")
-    ap.add_argument("--config")
+    ap.add_argument("--model", help="the .basalt file")
+    ap.add_argument("--engine-bin", default=str(ENGINE_BIN) if ENGINE_BIN.is_file() else None,
+                    help="the engine binary (default: bin/basalt in the repo)")
     ap.add_argument("--base")
     ap.add_argument("--out")
     ap.add_argument("--chunks", type=int, default=0, help="the first N chunks (0: all)")
     ap.add_argument("--t", type=int, default=3, help="tokens per verify window")
-    ap.add_argument("--set", default="", help='"FLAG VALUE ..." engine arguments to replace or add (--set="--spec 5")')
     ap.add_argument("--progress", type=int, default=10, help="a progress line every N chunks (0: none)")
     ap.add_argument("--report", help="print the summary of an existing rows.tsv and exit")
     ap.add_argument("--diff", nargs=2, metavar=("A", "B"), help="compare two rows.tsv files row by row and exit")
-    a = ap.parse_args()
+    a, extra = ap.parse_known_args()
+    a.engine_args = extra
     if a.diff:
         print(diff(*a.diff))
         return 0
     if a.report:
         print(summary(a.report))
         return 0
-    if not (a.config and a.base and a.out):
-        ap.error("--config, --base and --out are required")
-    a.set = a.set.split()
-    if len(a.set) % 2:
-        ap.error("--set takes FLAG VALUE pairs")
+    if not (a.model and a.base and a.out):
+        ap.error("--model, --base and --out are required")
+    if not a.engine_bin:
+        ap.error("no engine binary: pass --engine-bin")
     return run(a)
 
 
