@@ -5768,6 +5768,7 @@ int main(int argc, char** argv) {
             double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
             int64_t since_draft = 0;   ///< windows since the slot last drafted
             int64_t windows = 0;
+            int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
@@ -6126,6 +6127,8 @@ int main(int argc, char** argv) {
                     const int a = k - 1, Tw = lens[sg];
                     if (Tw > 1 && !sl.from_sfx) sl.cum.observe(sl.dprob, Tw - 1, a);
                     if (Tw > 1) sl.acc = 0.8 * sl.acc + 0.2 * ((double) a / (double) (Tw - 1));
+                    sl.drafts_offered += Tw - 1;
+                    sl.drafts_accepted += a;
                     if (sl.sfx) for (int e = 0; e < k; ++e) sl.sfx->append(outb[r0s[sg] + e]);
                     if (sl.windows > 0 && fin_of[sg] == nullptr)
                         bpolicy.observe(sl.from_sfx, Tw, a, sl.smatch, (msd(w0, w2) + bt_draft_last) * (double) Tw / (double) R);
@@ -6145,7 +6148,8 @@ int main(int argc, char** argv) {
                 }
                 if (fin_of[sg] != nullptr) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                    std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin_of[sg], ms);
+                    std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
+                                (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                     sl.active = false;
                     sl.cached = o.prompt_cache > 0 && !sl.img;   // its sessions hold sl.ids for the next turn
                 } else {
@@ -6299,7 +6303,7 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f 0 0\n", gi * GS + t, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
                     } else {
