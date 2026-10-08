@@ -2765,7 +2765,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         }
     }
     slots_ = slots;
-    batch_gdnf_ = exp_flag("concur2_gdnf", 0) != 0;
+    batch_gdnf_ = exp_flag("concur2_gdnf", 1) != 0;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     std::fprintf(stderr, "basalt verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
