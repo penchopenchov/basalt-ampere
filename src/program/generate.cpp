@@ -1576,6 +1576,12 @@ int main(int argc, char** argv) {
     // multi-GPU: without direct access the prompt path cannot take the peer, so it keeps the single-GPU kernels
     basalt::core::set_prompt_peer(o.peer_device >= 1 && o.peer_prefill_rows != 0 &&
                                   basalt::core::peers_access(o.peer_device));
+    // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
+    // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
+    // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
+    // peer-only experts, staged through the host, so streaming loses until later.
+    if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && !basalt::core::peers_access(o.peer_device))
+        basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "basalt serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -4737,7 +4743,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
-        if (peer.valid() && (basalt::core::prompt_peer() || basalt::core::exp_flag("pfsmall_peer", 0) != 0)) {
+        if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "basalt serve: %s - the prompt path stays on the primary GPU\n", err.c_str());

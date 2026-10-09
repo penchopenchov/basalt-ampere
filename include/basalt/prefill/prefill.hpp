@@ -78,6 +78,10 @@ public:
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all); sizes the prompt path's
     /// lend cap.
     static void set_pinned_share(double share);
+
+    /// The chunk size from which every expert streams (below it only the routed experts are staged and the peer card
+    /// computes the rows of its own); before init, which sizes the buffers by it.  Default 1024.
+    static void set_stream_all_min(int64_t tokens);
     static double pinned_share();
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).

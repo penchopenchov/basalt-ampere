@@ -60,11 +60,9 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 256;           // the arrays; the ring itself is ring_slots()
-// The chunk size from which every expert streams: below it only the routed experts are staged.  pfsmall_smin moves it.
-inline int64_t stream_all_min() {
-    static const int64_t v = (int64_t) core::exp_flag("pfsmall_smin", 1024);
-    return v;
-}
+// The chunk size from which every expert streams: below it only the routed experts are staged.
+int64_t g_stream_all_min = 1024;
+inline int64_t stream_all_min() { return g_stream_all_min; }
 // The streamed ring's slots (one whole expert blob each): a fixed count, so the buffers are the same for every pack.
 constexpr int kPrefillRing = 256;
 // Whether the fused experts' buffers apply: a streamed chunk of a pack the fused kernels cover.
@@ -918,10 +916,8 @@ void Prefill::set_ring_peer(core::PeerExperts* peer) {
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
-    // pfsmall_peer: without P2P the peer still takes the rows of the routed-only chunks (below stream_all_min()): the
-    // activations and result rows cross through host staging (cudaMemcpyPeerAsync), the streamed ring stays off
-    static const bool host_staged = core::exp_flag("pfsmall_peer", 0) != 0;
-    if (!peer->p2p() && !host_staged) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return false; }
+    // Without P2P the peer still takes the rows of the routed-only chunks (below stream_all_min()): the activations and
+    // result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
@@ -1004,6 +1000,7 @@ namespace {
 double g_pinned_share = 1.0;
 }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
