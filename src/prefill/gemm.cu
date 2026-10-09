@@ -34,7 +34,22 @@ void note(cublasStatus_t s, const char* what) {
 }
 
 
+// One handle made ahead of time per device, taken by the first Gemm that starts there.
+cublasHandle_t g_prepared[16] = {};
+
 }  // namespace
+
+bool Gemm::prepare_handle(std::string& err) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16 || g_prepared[dev] != nullptr) return true;
+    if (const cublasStatus_t s = cublasCreate(&g_prepared[dev]); s != CUBLAS_STATUS_SUCCESS) {
+        g_prepared[dev] = nullptr;
+        err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
+        return false;
+    }
+    return true;
+}
 
 Gemm::~Gemm() {
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
@@ -47,7 +62,12 @@ Gemm::~Gemm() {
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
                          std::string& err) {
     cublasHandle_t h = nullptr;
-    if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 16 && g_prepared[dev] != nullptr) {
+        h = g_prepared[dev];
+        g_prepared[dev] = nullptr;
+    } else if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
         err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
         return false;
     }

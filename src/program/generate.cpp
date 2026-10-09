@@ -47,6 +47,7 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/mtp.hpp"
+#include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/native_dense.hpp"
 #include "basalt/program/logits_selection.hpp"
@@ -3126,6 +3127,8 @@ int main(int argc, char** argv) {
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena
     const bool auto_cache = o.expert_cache < 0;
     if (o.expert_cache < 0) {
+        // the prompt path's cuBLAS handle is made now, so the free figure below already has its device memory out
+        if (o.serve && o.prefill_chunk > 0 && !basalt::prefill::Gemm::prepare_handle(err)) return fatal_start_error(err);
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         // The batched prompt path's chunk buffers are allocated later, so they are reserved here - an over-subscribed
@@ -3135,14 +3138,37 @@ int main(int argc, char** argv) {
         // the draft layer's head and logits are allocated when it binds, after this, so they come out of the reserve
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
                                      ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
+        // a server allocates its verify windows after the cache is sized: they come out of the reserve too, so the
+        // free VRAM after loading is the reserve itself
+        int64_t late_b = o.serve ? (kWindowMib << 20) : 0;
+        const int64_t base_b = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + late_b;
+        // the RAM copy of the experts the cache does not hold is page-locked and mapped, which takes device memory per
+        // GiB mapped: a 1 GiB probe gives the rate, applied to the experts that stay out of the cache
+        if (o.serve && o.resident_cpu_experts && expert_total_bytes > 0) {
+            void* probe = nullptr;
+            const size_t pb = (size_t) 1 << 30;
+            cudaDeviceSynchronize();
+            size_t f0 = 0, f1 = 0, t0 = 0;
+            cudaMemGetInfo(&f0, &t0);
+            if (cudaHostAlloc(&probe, pb, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+                cudaMemGetInfo(&f1, &t0);
+                cudaFreeHost(probe);
+                const double per_gib = f0 > f1 ? (double) (f0 - f1) : 0.0;
+                const double outside = std::max(0.0, (double) expert_total_bytes -
+                                                         (double) std::max<int64_t>((int64_t) free_b - base_b, 0));
+                late_b += (int64_t) (per_gib * outside / (double) pb);
+            }
+            cudaGetLastError();
+        }
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + late_b;
         const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "basalt generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
-                             "draft head) -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+                             "draft head, +%lld MiB for what loads after) -> %d slots\n",
+                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
+                     (long long) (late_b >> 20), o.expert_cache);
         // The batch slots' sessions came out of the same VRAM: say when that leaves the cache short of the expert set
         // (experts then swap in and out per token) or of half of what it would hold without them.
         if (slot_kv_cuda0 > 0) {
@@ -3170,10 +3196,10 @@ int main(int argc, char** argv) {
             ? ((int64_t) basalt::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
         if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
-            const int64_t fit_mib = ((int64_t) free_b - mtp_bind - min_slots * blob) / (1 << 20) - prefill_mib;
+            const int64_t fit_mib = ((int64_t) free_b - mtp_bind - late_b - min_slots * blob) / (1 << 20) - prefill_mib;
             if (fit_mib >= kSmallReserveMib) {
                 const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
-                int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind)) / blob;
+                int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind + late_b)) / blob;
                 if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
                 std::fprintf(stderr, "basalt generate: expert cache auto: the %d MiB reserve leaves too few slots on "
                                      "this card (a working cache needs %lld): a %d MiB reserve instead -> %lld slots\n",
@@ -3186,7 +3212,7 @@ int main(int argc, char** argv) {
             // what is short, and what makes room: the numbers a small card picks from
             const int64_t at_reserve = o.vram_reserve_given ? o.vram_reserve_mib
                                                             : std::min(o.vram_reserve_mib, kSmallReserveMib);
-            const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + min_slots * blob;
+            const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + late_b + min_slots * blob;
             const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) free_b + (1 << 20) - 1) >> 20);
             const int64_t session_mib =
                 (int64_t) (basalt::core::session_bytes(g, o.max_context, K, 0, g.n_layers) >> 20);

@@ -19,6 +19,11 @@ public:
     Gemm(const Gemm&) = delete;
     Gemm& operator=(const Gemm&) = delete;
 
+    /// Creates the current device's cuBLAS handle ahead of the first `init_external` there, which then takes it. A
+    /// server calls this before sizing the expert cache so the handle's device memory is already out of the free
+    /// figure the cache is sized from.
+    static bool prepare_handle(std::string& err);
+
     /// `scratch_elems`: BF16 elements of the dequantization scratch (the largest weight dequantized at once).
     bool init(void* stream, int64_t scratch_elems, std::string& err);
     /// The same with caller-owned device buffers (the prompt path borrowing expert-cache slots).
