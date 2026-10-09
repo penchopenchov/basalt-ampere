@@ -188,15 +188,6 @@ MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's
 source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`. The tuned layer ships with the
 packs, inside the model file; the converter input is only needed to build a pack yourself.
 
-A longer run of the same gate on the IQ3_S pack: 100 chunks of wikitext-2 (512 tokens each), 400 W.
-
-| model | PPL | KLD mean | same top-1 |
-|---|---:|---:|---:|
-| GSQ-RCO IQ3_S | 3.3723 | 0.1526 | 87.16% |
-| Q8_0 (base) | 3.2861 | reference | |
-
-The 100-chunk text is a larger sample than the first 20 chunks, so its PPL is not comparable with the table above.
-
 The model files are derived from Qwen3.8-Flash-Next and are distributed under the
 [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT
 license. The GSQ-RCO quants come from IST Austria's Deep Algorithms and Systems Lab; please cite the
