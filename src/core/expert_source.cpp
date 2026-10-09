@@ -1478,10 +1478,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (kind[i] < 0) { any_cpu = true; break; }
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
-        // --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
-        const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
+        // a token whose experts all run on a GPU (CUDA0, the peer or a helper) needs no CPU activation
         for (int64_t t = 0; t < n_tok; ++t) {
-            if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
+            if (std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && basalt::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
             else if (native)
