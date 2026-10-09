@@ -4,7 +4,6 @@
 #include "basalt/kernels/qsa_select.hpp"
 #include "basalt/kernels/qsa_seg.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/core/diag.hpp"
 
 #include <cuda_runtime.h>
 
@@ -540,69 +539,11 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
 }
 
 
-// Block scores with every key block read ONCE for all of a call's queries (block_scores_kernel's grid is
-// (max_blocks / 8) x nq: ~24,600 mostly-idle blocks per layer at a decode window, each key re-read per query).  A fixed
-// grid strides over the blocks; per (block, query) the same arithmetic in the same order as block_scores_kernel.
-// qsa_block_scores takes it for every call without an active-block count and at most MQ queries: the captured decode
-// window, the uncaptured decode, and prefill's pooled16 call.
+// Most queries a decode window scores in one call.
 constexpr int MQ = 8;
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
-                                                                              const float* __restrict__ dead,
-                                                                              const float* __restrict__ q_idx,
-                                                                              const int32_t* __restrict__ steps, int nq,
-                                                                              int64_t max_blocks, float* __restrict__ out,
-                                                                              int skip_identity) {
-    __shared__ __align__(16) float qs[MQ * IDX_HEADS * IDX_DIM];
-    __shared__ int64_t s_nkv[MQ], s_nbid[MQ];
-    pdl_launch_dependents();
-    pdl_wait();
-    if (skip_identity) {   // every selection the identity: the top-k reads no score
-        bool all = true;
-        for (int q = 0; q < nq; ++q) all = all && steps[q * kStepCount + kStepNKv] <= steps[q * kStepCount + kStepWidth];
-        if (all) return;
-    }
-    if (threadIdx.x < nq) {
-        s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
-        s_nbid[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNBid];
-    }
-    __syncthreads();
-    int64_t top = 0;
-    for (int q = 0; q < nq; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
-    // A CTA whose first block is past the batch's largest n_bid has no work: the grid is fixed and a decode window
-    // reaches only a few of its CTAs, so the rest return before staging the queries. top and blockIdx are CTA-uniform,
-    // so every thread takes the same branch and the barrier below is safe.
-    if ((int64_t) blockIdx.x * SCORE_WARPS > top) return;
-    for (int i = threadIdx.x; i < nq * IDX_HEADS * IDX_DIM; i += blockDim.x) qs[i] = q_idx[i];
-    __syncthreads();
-    const int lane = threadIdx.x & 31;
-    const int64_t wstride = (int64_t) gridDim.x * SCORE_WARPS;
-    for (int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5); b <= top && b < max_blocks; b += wstride) {
-        const float4 kp = *reinterpret_cast<const float4*>(pooled + b * IDX_DIM + lane * 4);
-        const float4 kd = *reinterpret_cast<const float4*>(dead + lane * 4);
-        for (int qi = 0; qi < nq; ++qi) {
-            const int64_t n_bid = s_nbid[qi];
-            if (b > n_bid) continue;
-            const float4 k4 = (b == n_bid) ? kd : kp;
-            const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
-            float score = 0.0f;
-#pragma unroll
-            for (int h = 0; h < IDX_HEADS; ++h) {
-                const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
-                float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
-                score += d > 0.0f ? d : 0.0f;
-            }
-            if (lane == 0) {
-                if (b == n_bid && s_nkv[qi] % R != 0) score += 1e9f;
-                out[qi * max_blocks + b] = score;
-            }
-        }
-    }
-}
 
-// block_scores_multi_kernel over rows of different sequences: row qi reads its slot's pooled / dead. The queries and
-// the per-row counts are staged once; per (block, row) the arithmetic and its order are the multi kernel's.
+// Block scores over rows of different sequences: row qi reads its slot's pooled / dead. The queries and the per-row
+// counts are staged once; per (block, row) the arithmetic and its order are block_scores_kernel's.
 constexpr int MQS = kQsaSegMaxRows;
 __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_seg_kernel(QsaSegTable tab,
                                                                             const float* __restrict__ q_idx,
@@ -679,7 +620,7 @@ __device__ __forceinline__ float heads_score(float a0, float a1, float a2, float
 
 // Block scores with the queries in registers (a lane holds its four dims of every head and query), so a CTA stages
 // nothing and needs no barrier, and the next block's key row is loaded before the current one is scored. Per (block,
-// query) the sums are the multi kernel's bit for bit. NQ is the register capacity: at least the call's query count.
+// query) the sums are block_scores_kernel's bit for bit. NQ is the register capacity: at least the call's query count.
 template <int NQ>
 __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rg_kernel(const float* __restrict__ pooled,
                                                                            const float* __restrict__ dead,
@@ -743,11 +684,10 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rg_kernel(const
 // block_topk_kernel above 33,792 blocks: a --max-context over ~135K) makes four radix passes and two scans over up to
 // 65,538 blocks on ONE SM while the rest of the GPU idles - a decode window has 1-5 queries.  Here a cluster of CL_N
 // CTAs shares a query: CTA r holds the keys of blocks [r * per, (r + 1) * per) in shared memory, builds the digit
-// histogram of its keys, and PUSHES it into slot r of every CTA's `hin` (distributed shared memory); after one cluster
-// barrier each CTA sums the CL_N slots itself, so all of them take the same digit.  The emit pass needs each CTA's
-// cells above / at the threshold: pushed the same way, then each CTA offsets its own by the ranks before it.
-// The one-CTA kernels' digit search is serial too: one thread over 256 bins per pass (decode_cluster_parity --bench
-// times both).
+// histogram of its keys, and the CTAs total the histograms by a reduce-scatter in distributed shared memory (below), so all
+// of them take the same digit. The emit pass needs each CTA's cells above / at the threshold: sent the same way, then
+// each CTA offsets its own by the ranks before it.
+// The one-CTA kernels' digit search is serial too: one thread over 256 bins per pass.
 //
 // IDENTICAL IDS, by construction rather than by luck: the threshold thr (the width-th largest key, cells counted with
 // their weights) and `above` (cells with a larger key) are pure functions of the multiset of (key, weight) - integer
@@ -757,12 +697,10 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rg_kernel(const
 // written in ascending cell order. Position of a thread's first cell = (cells above thr before it) + min(cells at thr
 // before it, eq_budget): the telescoped sum of the reference's per-thread clamp. NaN keys are 0 (order_key) as there.
 //
-// Barriers: barrier.cluster arrive / wait (each CTA's threads all take part; it also orders the CTA's own shared
-// memory, so it doubles as __syncthreads). Phase 0 is a relaxed arrive at entry, waited before the first remote store
-// (a CTA's shared memory exists once it runs). Pushes go out before the arrive that releases them, and nothing reads
-// another CTA's memory after the last wait - so a CTA may exit without a closing barrier (a wait counts the threads
-// that have not exited). `hin` alternates by pass parity: CTA x reads slot buffer p&1 in pass p before arriving at
-// pass p+1's barrier, and nobody writes buffer p&1 again (pass p+2) before waiting on that barrier.
+// Synchronisation: one barrier.cluster arrive at entry (after the CTA's mbarriers are initialised), waited before the first
+// remote store. After that CTAs talk only through st.async stores that add their bytes to the receiver's mbarrier, one
+// mbarrier per exchange and each used once, so no cluster barrier or fence is needed. A CTA may exit once it has waited
+// for every exchange it receives; the stores it sent are complete by then at their receivers.
 constexpr int CL_N = 8;        // CTAs per query (the portable cluster size)
 constexpr int CL_T = 1024;     // threads per CTA
 constexpr int CL_MAXQ = 16;    // larger calls (prefill sub-batches) fill the GPU with one CTA per query already
@@ -773,20 +711,12 @@ constexpr int CL_MAXQ = 16;    // larger calls (prefill sub-batches) fill the GP
 #endif
 
 #if SEL_CLUSTER
-__device__ __forceinline__ void cl_arrive_relaxed() {
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
-}
 __device__ __forceinline__ void cl_arrive() { asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory"); }
 __device__ __forceinline__ void cl_wait() { asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory"); }
 __device__ __forceinline__ unsigned cl_rank() {
     unsigned r;
     asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(r));
     return r;
-}
-template <typename T> __device__ __forceinline__ T* cl_map(T* p, unsigned rank) {   // p in CTA `rank`'s shared memory
-    uint64_t o;
-    asm volatile("mapa.u64 %0, %1, %2;\n" : "=l"(o) : "l"((uint64_t) p), "r"(rank));
-    return reinterpret_cast<T*>(o);
 }
 // exclusive block scan of a 64-bit value over CL_T threads; `total` = the CTA's sum
 __device__ __forceinline__ unsigned long long cl_excl_scan64(unsigned long long v, unsigned long long* s_warp,
@@ -817,150 +747,6 @@ __device__ __forceinline__ unsigned long long cl_excl_scan64(unsigned long long 
 }
 #endif
 
-// grid (CL_N, nq), cluster (CL_N, 1, 1), CL_T threads, dynamic shared memory: ceil(max_blocks / CL_N) keys
-__global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* __restrict__ scores,
-                                                                  const int32_t* __restrict__ steps, int64_t max_blocks,
-                                                                  int64_t cap, int32_t* __restrict__ ids) {
-#if SEL_CLUSTER
-    extern __shared__ uint32_t keys[];                  // this CTA's blocks' keys
-    __shared__ __align__(16) int hin[2][CL_N][256];     // the cluster's histograms, slot = the pushing rank
-    __shared__ __align__(16) int hloc[2][256];          // this CTA's histogram
-    __shared__ unsigned long long cnt[CL_N];            // per rank: its cells above thr (low 32 bits) and at it (high)
-    __shared__ unsigned long long s_warp[33];
-    __shared__ uint32_t s_prefix;
-    __shared__ int s_above;
-    const unsigned rank = cl_rank();
-    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    cl_arrive_relaxed();                                // phase 0: this CTA runs
-    pdl_launch_dependents();
-    pdl_wait();
-    const int64_t qi = blockIdx.y;
-    const int32_t* st = steps + qi * kStepCount;
-    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
-    int32_t* out = ids + qi * cap;
-    if (n_kv <= width) {                                // the identity, split over the cluster; no remote access
-        for (int64_t j = (int64_t) rank * CL_T + t; j < n_kv; j += (int64_t) CL_N * CL_T) out[j] = (int32_t) j;
-        return;
-    }
-    // the tail block n_bid weighs its cells (0..3); with none it is not a candidate (the reference skips w == 0)
-    const int wtail = (int) (n_kv - n_bid * R);
-    const int64_t nbe = n_bid + (wtail > 0 ? 1 : 0);
-    const int64_t per = (nbe + CL_N - 1) / CL_N;       // <= ceil(max_blocks / CL_N), the keys the host sized
-    const int64_t lo = (int64_t) rank * per < nbe ? (int64_t) rank * per : nbe;
-    const int64_t hi = lo + per < nbe ? lo + per : nbe;
-    const int n = (int) (hi - lo);
-    const int tail_i = (wtail > 0 && n_bid >= lo && n_bid < hi) ? (int) (n_bid - lo) : -1;
-    const float* sc = scores + qi * max_blocks + lo;
-    for (int i = t; i < n; i += CL_T) keys[i] = order_key(sc[i]);
-    for (int i = t; i < 2 * 256; i += CL_T) (&hloc[0][0])[i] = 0;
-    __syncthreads();
-    uint32_t prefix = 0;
-    int above = 0;                                      // cells strictly above the digits fixed so far
-    for (int pass = 0; pass < 4; ++pass) {
-        const int shift = 24 - 8 * pass;
-        const uint32_t hmask = pass == 0 ? 0u : (0xffffffffu << (shift + 8));
-        int* hl = hloc[pass & 1];
-        // warp-aggregated: the scores share their top bits, so plain atomics would queue on a few bins
-        for (int i0 = 0; i0 < n; i0 += CL_T) {
-            const int i = i0 + t;
-            int bin = -1;
-            if (i < n) {
-                const uint32_t k = keys[i];
-                if ((k & hmask) == prefix) bin = (int) ((k >> shift) & 255);
-            }
-            const unsigned same = __match_any_sync(0xffffffffu, bin);
-            if (bin >= 0 && lane == __ffs(same) - 1) atomicAdd(&hl[bin], __popc(same) * R);
-            if (bin >= 0 && i == tail_i) atomicAdd(&hl[bin], wtail - R);
-        }
-        __syncthreads();
-        if (pass == 0) cl_wait();                       // phase 0 done: every CTA's shared memory is there
-        for (int i = t; i < CL_N * 64; i += CL_T) {     // the histogram into slot `rank` of every CTA, as int4
-            const int dst = i >> 6, c = i & 63;
-            *cl_map(reinterpret_cast<int4*>(&hin[pass & 1][rank][0]) + c, (unsigned) dst) =
-                reinterpret_cast<const int4*>(hl)[c];
-        }
-        for (int i = t; i < 256; i += CL_T) hloc[(pass + 1) & 1][i] = 0;
-        cl_arrive();
-        cl_wait();
-        if (warp == 0) {
-            // lane L owns digits 255 - 8L down to 248 - 8L; the digit holding the need-th cell from the top
-            const int need = (int) width - above;
-            int tot[8], part = 0;
-#pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                const int d = 255 - 8 * lane - k;
-                int v = 0;
-#pragma unroll
-                for (int r = 0; r < CL_N; ++r) v += hin[pass & 1][r][d];
-                tot[k] = v;
-                part += v;
-            }
-            int incl = part;
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1) {
-                const int y = __shfl_up_sync(0xffffffffu, incl, o);
-                if (lane >= o) incl += y;
-            }
-            const int excl = incl - part;
-            const unsigned hit = __ballot_sync(0xffffffffu, excl < need && incl >= need);
-            // no hit cannot happen (the cells total n_kv > width); the reference would then take digit 0
-            const int who = hit ? __ffs(hit) - 1 : 31;
-            if (lane == who) {
-                int acc = excl, k = 0;
-                for (; k < 7; ++k) {
-                    if (acc + tot[k] >= need) break;
-                    acc += tot[k];
-                }
-                s_prefix = prefix | ((uint32_t) (255 - 8 * lane - k) << shift);
-                s_above = above + acc;
-            }
-        }
-        __syncthreads();
-        prefix = s_prefix;
-        above = s_above;
-    }
-    const uint32_t thr = prefix;
-    const int64_t eq_budget = width - above;           // cells at thr that fit, lowest index first
-    // each thread a contiguous run of the CTA's keys; an odd run length keeps the shared reads conflict-free
-    int seg = (n + CL_T - 1) / CL_T;
-    if ((seg & 1) == 0 && seg > 0) ++seg;
-    const int s0 = t * seg < n ? t * seg : n, s1 = s0 + seg < n ? s0 + seg : n;
-    uint32_t gt = 0, eq = 0;
-    for (int i = s0; i < s1; ++i) {
-        const uint32_t k = keys[i], w = i == tail_i ? (uint32_t) wtail : (uint32_t) R;
-        if (k > thr) gt += w;
-        else if (k == thr) eq += w;
-    }
-    unsigned long long cta;
-    const unsigned long long before =
-        cl_excl_scan64((unsigned long long) gt | ((unsigned long long) eq << 32), s_warp, cta);
-    if (t < CL_N) *cl_map(&cnt[rank], (unsigned) t) = cta;
-    cl_arrive();
-    cl_wait();
-    int64_t gt_off = 0, eq_off = 0;
-    for (unsigned r = 0; r < rank; ++r) {
-        gt_off += (int64_t) (cnt[r] & 0xffffffffu);
-        eq_off += (int64_t) (cnt[r] >> 32);
-    }
-    const int64_t eq_before = eq_off + (int64_t) (before >> 32);
-    int64_t wpos = gt_off + (int64_t) (before & 0xffffffffu) + (eq_before < eq_budget ? eq_before : eq_budget);
-    int64_t eq_left = eq_budget - eq_before;
-    if (eq_left < 0) eq_left = 0;
-    for (int i = s0; i < s1; ++i) {
-        const uint32_t k = keys[i];
-        const int w = i == tail_i ? wtail : R;
-        const int64_t b = lo + i;
-        if (k > thr) {
-            for (int c = 0; c < w; ++c) out[wpos++] = (int32_t) (b * R + c);
-        } else if (k == thr) {
-            for (int c = 0; c < w && eq_left > 0; ++c, --eq_left) out[wpos++] = (int32_t) (b * R + c);
-        }
-    }
-#else
-    (void) scores; (void) steps; (void) max_blocks; (void) cap; (void) ids;
-    __trap();
-#endif
-}
 #if SEL_CLUSTER
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void mbar_init(uint32_t a, int count) {
@@ -996,13 +782,13 @@ __device__ __forceinline__ void st_async2(uint32_t dst, unsigned long long v, ui
 }
 #endif
 
-// block_topk_cluster_kernel's selection with the radix passes exchanged as a reduce-scatter. Each pass: a CTA sends bins
+// The top-k of block_topk_kernel on a thread-block cluster, the radix passes exchanged as a reduce-scatter. Each pass: a CTA sends bins
 // [32 o, 32 o + 32) of its histogram to CTA o as 16-bit counts; CTA o totals them and sends its slice total to every CTA;
 // all see which slice holds the threshold digit, whose owner finds the digit and sends it (with the cells above it) to
 // every CTA. The stores land on the receiver's mbarrier, so there is no cluster barrier or release fence per pass. Needs
 // a CTA's cell count under 65,536 (the host checks).
 // grid (CL_N, nq), cluster (CL_N, 1, 1), CL_T threads, dynamic shared memory: ceil(max_blocks / CL_N) keys
-__global__ void __launch_bounds__(CL_T) block_topk_cluster_rs_kernel(const float* __restrict__ scores,
+__global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* __restrict__ scores,
                                                                   const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                   int64_t cap, int32_t* __restrict__ ids) {
 #if SEL_CLUSTER
@@ -1193,7 +979,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         std::exit(1);
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
-    if (nq <= MQ && active_blocks <= 0 && (static_cast<int>(core::exp_flag("idx50_indexer", 0)) & 1) != 0) {
+    if (nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
         static int grid_of[64] = {};   // two CTAs per multiprocessor
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); dev = 0; }
@@ -1214,13 +1000,6 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                        steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores rg: %s\n", cudaGetErrorString(e)); std::exit(1); }
-        return;
-    }
-    if (nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
-        launch_pdl(block_scores_multi_kernel, dim3(256), dim3(SCORE_WARPS * 32), 0, (cudaStream_t) stream, pooled, dead,
-                   q_idx, steps, (int) nq, max_blocks, scores, skip_identity ? 1 : 0);
-        const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
@@ -1298,15 +1077,14 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
 }
 
 namespace {
-template <bool RS>
 bool topk_cluster_launch(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                          const QsaShapes& s, int32_t* ids, void* stream) {
     if (nq <= 0) return true;
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || nq > 65535 || max_blocks <= 0) return false;
     const int64_t per_cta = (max_blocks + CL_N - 1) / CL_N;
-    if (RS && per_cta * R + R >= 65536) return false;   // the reduce-scatter kernel's 16-bit counts
+    if (per_cta * R + R >= 65536) return false;   // the kernel's 16-bit counts: the one-CTA kernels take it
     const size_t smem = (size_t) per_cta * sizeof(uint32_t);
-    const auto kern = RS ? block_topk_cluster_rs_kernel : block_topk_cluster_kernel;
+    const auto kern = block_topk_cluster_kernel;
     // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not. It needs thread-block clusters (the
     // card's) AND code built for it: a build with only older code JIT-compiles their PTX, whose
     // copy of this kernel is a trap - the function's PTX version says which. `opt`: the dynamic shared memory opted in.
@@ -1371,10 +1149,7 @@ bool topk_cluster_launch(const float* scores, const int32_t* steps, int64_t nq, 
 
 bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                             const QsaShapes& s, int32_t* ids, void* stream) {
-    if ((static_cast<int>(core::exp_flag("idx50_indexer", 0)) & 2) != 0 &&
-        topk_cluster_launch<true>(scores, steps, nq, max_blocks, cap, s, ids, stream))
-        return true;
-    return topk_cluster_launch<false>(scores, steps, nq, max_blocks, cap, s, ids, stream);
+    return topk_cluster_launch(scores, steps, nq, max_blocks, cap, s, ids, stream);
 }
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
