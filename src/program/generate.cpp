@@ -3007,7 +3007,7 @@ int main(int argc, char** argv) {
     if (!o.mtp.empty()) {
         if (o.spec < 2) o.mtp.clear();
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        if (o.batch > 0 && basalt::core::exp_flag("concur6_spec", 1) != 0) mtp.set_stores(o.batch, slot_cap);   // a draft K/V per batch slot
+        if (o.batch > 0) mtp.set_stores(o.batch, slot_cap);   // a draft K/V per batch slot
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const basalt::core::ModelGeometry draft_geometry{};
@@ -5833,7 +5833,6 @@ int main(int argc, char** argv) {
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
         const bool batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
-        const bool batch_catchup = basalt::core::exp_flag("concur6_catchup", 1) != 0;
         const int S_all = S;
         basalt::spec::DraftPolicy bpolicy(S);   // the lookup-or-MTP choice, costs per row
         basalt::kernels::SamplerParams greedy_sp;
@@ -6259,8 +6258,7 @@ int main(int argc, char** argv) {
                         sl.since_draft = 0;
                     } else {
                         ++sl.since_draft;
-                        if (batch_catchup &&
-                            !mtp.defer_rows(b, Rw + (size_t) r0s[sg] * HCN, outb + r0s[sg], n_keep[sg], p0s[sg], err)) {
+                        if (!mtp.defer_rows(b, Rw + (size_t) r0s[sg] * HCN, outb + r0s[sg], n_keep[sg], p0s[sg], err)) {
                             std::printf("ERR %s\n", err.c_str());
                             return false;
                         }

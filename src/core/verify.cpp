@@ -906,7 +906,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool dec_hc = hc_fused_supported();
     // the dense chain's kernels (pdl.hpp) may start during the previous kernel's tail.  Only where that previous kernel
     // is one of them or another plain kernel; never with the profile's stamps.
-    const bool pdl = pdl_rec_ && !prof_on_ && (!batch_rec_ || batch_pdl_);
+    const bool pdl = pdl_rec_ && !prof_on_;
     // the chain's kernels let their dependents in early (pdl.hpp), which stage their weights
     const bool pdl2 = pdl && pdl2_requested();
     auto stamp = [&](int64_t l, int i, int grp) {
@@ -999,7 +999,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // the rows' write, post-ops, history advance and snapshots in two launches, the value
             // projection on the side stream beside the key's
             // (one row too: there the multi-row GEMVs are ple_block's own)
-            const bool ple_win = (!batch_rec_ || batch_plew_) && gr_native_mmvf_enabled() &&
+            const bool ple_win = gr_native_mmvf_enabled() &&
                                  (ple_batch_kv || (n == 1 && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr &&
                                                    ple_native_bf16_enabled() && ple_native_postops_enabled()));
             if (batch_rec_) batch_seg_ple_ = ple_win;
@@ -1094,10 +1094,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (read_q8) h.xq = xq_;
                 // the GDN qkv+z pair kernel follows (dense_tc_pair_mask & 16): its blocks start on the SMs the read leaves
                 h.next_early = read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
-                               !is_qsa_layer(g, l) && (!batch_rec_ || batch_pdl_) && tb == 0 && N == 2560 && n <= kDecMaxT &&
+                               !is_qsa_layer(g, l) && tb == 0 && N == 2560 && n <= kDecMaxT &&
                                dec_gdnf_mode() != 0;
                 // a QSA layer's query projection follows (qsaf_wide path): its blocks start with the read
-                if (read_q8 && is_qsa_layer(g, l) && (!batch_rec_ || batch_pdl_) && tb == 0 && N == 2560 && n <= kDecMaxT) {
+                if (read_q8 && is_qsa_layer(g, l) && tb == 0 && N == 2560 && n <= kDecMaxT) {
                     const QsaState& st0 = ss.qsa_states[qsa_idx[(size_t) l]];
                     h.next_early = st0.kv_int8 && !st0.kv_rot && !st0.kv_hybrid && !st0.kv_q4 && native_qsa_enabled() &&
                                    native_rope_enabled() && qsa_dec_fused_supported(s) &&
@@ -1137,7 +1137,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // a batch window may take the fused recurrence where the qkv and z projections are one pair launch
                 const bool pair_ok = kernels::dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
                                      ((uintptr_t) wqkv->native_data & 15) == 0 && ((uintptr_t) wg->native_data & 15) == 0;
-                const int gdnf = ((!batch_rec_ || (pair_ok && batch_gdnf_)) && tb == 0 && N == 2560 && n <= kDecMaxT) ? dec_gdnf_mode() : 0;
+                const int gdnf = ((!batch_rec_ || pair_ok) && tb == 0 && N == 2560 && n <= kDecMaxT) ? dec_gdnf_mode() : 0;
                 auto rec = [&](const DecRecArgs& ra) {
                     if (batch_rec_) dec_gdn_rec_seg(ra, segb_, (size_t) gi * gdn_floats, n, n, cs);
                     else dec_gdn_rec(ra, n, cs);
@@ -2781,10 +2781,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         }
     }
     slots_ = slots;
-    batch_gdnf_ = exp_flag("concur2_gdnf", 1) != 0;
-    batch_dm_ = dm_ != nullptr && exp_flag("concur4_dm", 1) != 0;
-    batch_plew_ = exp_flag("concur4_plew", 1) != 0;
-    batch_pdl_ = exp_flag("concur4_pdl", 1) != 0;
+    batch_dm_ = dm_ != nullptr;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     std::fprintf(stderr, "basalt verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
                  (long long) lb_, (long long) le_);
@@ -2795,7 +2792,7 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
     const uint64_t key = bkey(R, hbase);
     cudaGraphExec_t& ex = exec_bm_[key];
     if (ex != nullptr) return true;
-    const bool pdl_try = batch_pdl_ && basalt::kernels::pdl_requested() && !pdl_off_;
+    const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
     auto retry_plain = [&](const std::string& why) {
         std::fprintf(stderr, "basalt verify: the %d-row batch window failed with programmatic dependent launch (%s): "
@@ -2825,7 +2822,7 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    if (!instantiate_batch(ex, graph, err, batch_pdl_)) {
+    if (!instantiate_batch(ex, graph, err, true)) {
         if (pdl_try) return retry_plain(err);
         return false;
     }

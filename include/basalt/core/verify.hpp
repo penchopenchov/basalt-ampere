@@ -346,10 +346,7 @@ private:
     std::vector<basalt::kernels::QsaSegSlot*> d_qslots_;   ///< per QSA layer ordinal: [slot] (null outside the stage)
     float** d_ple_slots_ = nullptr;        ///< each slot's PLE history
     float* ple_work_ = nullptr;            ///< each row's PLE history while the window runs
-    bool batch_plew_ = false;              ///< a batch window runs the PLE window kernels
-    bool batch_pdl_ = false;               ///< a batch window's dense chain uses programmatic dependent launch
     bool batch_dm_ = false;                ///< a batch window runs the device-planned tail
-    bool batch_gdnf_ = false;              ///< a batch window runs the fused GDN recurrence (a gate)
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
     bool capture_batch(int R, int hbase, std::string& err);
