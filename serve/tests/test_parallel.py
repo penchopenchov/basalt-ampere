@@ -30,6 +30,7 @@ fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
 fail = "--fail-window" in args        # the first window over two slots fails
 ready = int(args[args.index("--ready") + 1]) if "--ready" in args else 4096
 MULTI = int(args[args.index("--multi") + 1]) if "--multi" in args else 3
+nopp = "--nopp" in args               # no PP lines while a prompt is read: a read beside the windows reports none
 STEP = 0.02
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
@@ -110,7 +111,8 @@ while True:
         given = None
         for q in range(CH, len(ids) - 1, CH):
             time.sleep(STEP / 2)
-            print(f"PP {q} {len(ids)} 1 1", flush=True)
+            if not nopp:
+                print(f"PP {q} {len(ids)} 1 1", flush=True)
             held = []
             while True:
                 try:
@@ -189,7 +191,8 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
+              nopp=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -202,6 +205,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--draft-counts"] if counts else []
         extra += ["--ready", str(ready)] if ready else []
         extra += ["--multi", str(multi)] if multi else []
+        extra += ["--nopp"] if nopp else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -326,6 +330,57 @@ class ParallelService(unittest.TestCase):
         self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
         log = self.log.read_text().splitlines()
         self.assertTrue(any(x.startswith("YIELD ") for x in log), log)
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_a_silent_admission_gives_way_without_progress_lines(self):
+        """The engine reads a prompt beside the slots' windows and sends no progress line: a short request that
+        arrives meanwhile still gets the engine at the next chunk boundary, and the long read finishes after it."""
+        self.start(3, nopp=True)
+        bg = threading.Thread(target=lambda: self.chat("background", max_tokens=60))
+        bg.start()
+        time.sleep(0.05)
+        long_q, short_q = "long " * 600, "short"
+        res = self.race(long_q, short_q)
+        bg.join(30)
+        self.assertEqual(res[long_q][0], "ok, done.")
+        self.assertEqual(res[short_q][0], "ok, done.")
+        self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
+        log = self.log.read_text().splitlines()
+        yields = [x for x in log if x.startswith("YIELD ")]
+        self.assertEqual(len(yields), 1, log)
+        # the long prompt was sent twice: the part read, then again from the slot that held it
+        longs = [x.split()[2] for x in log if x.startswith("BGEN") and int(x.split()[2]) > 1000]
+        self.assertEqual(len(longs), 2, log)
+        self.assertEqual(longs[0], longs[1])
+        self.assertFalse(any(self.engine.slot_busy))
+
+    def test_a_long_read_gives_way_a_bounded_number_of_times(self):
+        """Short requests keep arriving: the read gives way at most YIELDS_MAX times, then runs to the end."""
+        self.start(3, nopp=True)
+        long_q = "long " * 700
+        out, errors = {}, []
+
+        def go(t, n=64):
+            try:
+                out[t] = self.chat(t, max_tokens=n)["choices"][0]["message"]["content"]
+            except Exception as e:   # noqa: BLE001 - reported below
+                errors.append(e)
+        a = threading.Thread(target=go, args=(long_q,))
+        a.start()
+        shorts = []
+        for i in range(8):
+            time.sleep(0.25)
+            t = threading.Thread(target=go, args=(f"short {i}",))
+            t.start()
+            shorts.append(t)
+        for t in shorts + [a]:
+            t.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(out[long_q], "ok, done.")
+        self.assertEqual([out[f"short {i}"] for i in range(8)], ["ok, done."] * 8)
+        yields = [x for x in self.log.read_text().splitlines() if x.startswith("YIELD ")]
+        self.assertGreaterEqual(len(yields), 1)
+        self.assertLessEqual(len(yields), ProcessEngine.YIELDS_MAX, yields)
         self.assertFalse(any(self.engine.slot_busy))
 
     def test_no_way_given_to_a_long_one(self):

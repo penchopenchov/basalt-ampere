@@ -449,9 +449,10 @@ class ProcessEngine:
         except (OSError, AttributeError):                # the pipe is gone
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
-    def _control(self, cancel, on_token, stop_when=None):
+    def _control(self, cancel, on_token, stop_when=None, idle=None):
         """Read the control lines of a GEN/BGEN, yielding None as heartbeat and False per token (on_token gets the id).
-        Ends at DONE (solo) or BADM; `stop_when()` true sends STOP once."""
+        Ends at DONE (solo) or BADM; `stop_when()` true sends STOP once. `idle()` runs whenever no line came for
+        0.5 s: a prompt read beside the slots' windows sends no progress line."""
         stopped = False
         beat = time.monotonic()
         while True:
@@ -462,6 +463,8 @@ class ProcessEngine:
                 if cancel.is_set() and not stopped:
                     self._send("STOP")
                     stopped = True
+                if idle is not None:
+                    idle()
                 if time.monotonic() - beat >= 10.0:
                     beat = time.monotonic()
                     yield None
@@ -781,16 +784,20 @@ class ProcessEngine:
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
                     asked = False
-                    for x in self._control(cancel, pending.append):
+
+                    def ask_yield():    # a shorter request waits: the read gives way at its next chunk boundary
+                        nonlocal asked
+                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                                self._shorter_waiting(len(prompt))):
+                            self._send(f"BYIELD {slot}")
+                            asked = True
+                    for x in self._control(cancel, pending.append, idle=ask_yield):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
                             yield t
                         if x is None:
-                            if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
-                                self._send(f"BYIELD {slot}")
-                                asked = True
+                            ask_yield()
                             yield None
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
