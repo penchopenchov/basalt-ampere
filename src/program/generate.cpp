@@ -713,6 +713,11 @@ void usage() {
                  "                       of the batched prompt path (default 64, 0 = off)\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
+                 "  --spec N             speculative decoding: verify windows of N tokens (the last accepted token\n"
+                 "                       plus N-1 MTP drafts); 0 or 1 = no speculation (default 0; the server config\n"
+                 "                       usually sets 7)\n"
+                 "  --spec-min-p P       a draft enters the window only while it and every draft before it have at\n"
+                 "                       least probability P under the drafter (default 0 = always N-1 drafts)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
@@ -721,10 +726,10 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens; auto =\n"
-                 "                       the largest chunk whose buffers the expert cache can lend (with\n"
-                 "                       --resident-experts the ceiling follows the lent slots the RAM copy\n"
-                 "                       backs, else 8192); auto:16384 / auto:32768 set the ceiling\n"
+                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens; auto = the fewest\n"
+                 "                       equal chunks of at most 12288 tokens (16384 with --peer-exclusive), within\n"
+                 "                       what the expert cache can lend (with --resident-experts the lent slots the\n"
+                 "                       RAM copy backs, else 8192); auto:N (8192, 16384, 32768) sets the ceiling\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --dump-mixed PATH    write the post-attention residual (n_embd, f32)\n"
@@ -753,8 +758,11 @@ void usage() {
                  "                       waits for the next driver entry and does not overlap at all.\n"
                  "  --no-ple-prefetch     A/B arm: read the PLE table's sixteen rows one at a time, instead of\n"
                  "                       issuing them in one prefetch.\n"
-                 "  --expert-cache N     keep N expert blobs resident in VRAM and compute their rows on the\n"
-                 "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.\n"
+                 "  --expert-cache N|auto  keep N expert blobs resident in VRAM and compute their rows on the\n"
+                 "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  auto = as many as fit in the VRAM\n"
+                 "                       left after the weights, the session and --vram-reserve-mib\n"
+                 "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
+                 "                       --expert-cache auto sizes the tier (default 700)\n"
                  "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
@@ -4294,8 +4302,9 @@ int main(int argc, char** argv) {
     // Hoisted out of plan_lend: the serve path's per-stage loans obey the same cap, one participant at a time.
     const int64_t kAutoLendPct = basalt::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85;
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
-    // but never below 8192.  A bare `auto` starts at 32768 and is cut back once the RAM complement is built (below),
-    // to what the lend can fund; without the resident RAM mode there is no complement to size it from, so it stays at 8192.
+    // but never below 8192.  A bare `auto` is cut back once the RAM complement is built (below) to what the lend can
+    // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
+    // complement to size it from, so it stays at 8192.
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
     // The auto scan bisects on the 256-token grid the prompt path works on (`request_chunk` rounds up to it):
