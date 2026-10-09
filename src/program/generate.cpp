@@ -7453,6 +7453,12 @@ int main(int argc, char** argv) {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
+            // A short read into a slot beside decoding slots is not split: each part pays the lend, refill and
+            // side-thread costs again, and a checkpoint stalls the windows.
+            if (in_slot && batch_on() && n - 1 - read_from <= std::max<int64_t>(sp.chunk(), 1)) {
+                turn_at = -1;
+                root_at = -1;
+            }
             int64_t at = read_from;
             for (const int64_t to : {root_at, turn_at, n - 1}) {
                 if (to <= at) continue;
