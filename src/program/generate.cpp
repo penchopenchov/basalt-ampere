@@ -4737,7 +4737,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
-        if (peer.valid() && basalt::core::prompt_peer()) {
+        if (peer.valid() && (basalt::core::prompt_peer() || basalt::core::exp_flag("pfsmall_peer", 0) != 0)) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "basalt serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
