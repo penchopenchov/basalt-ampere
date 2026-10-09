@@ -5834,6 +5834,8 @@ int main(int argc, char** argv) {
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
+        // a prompt read on its own thread beside the slots' windows: the tier stays as it is meanwhile
+        bool ov_active = false;
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
             if (in_lines.empty()) return false;
@@ -6055,8 +6057,8 @@ int main(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
-            apply_pending(false);
-            if (batch_adapt) {
+            if (!ov_active) apply_pending(false);
+            if (batch_adapt && !ov_active) {
                 // the tier follows what all the slots' rows route: a round every --adapt-every windows.  Its steps
                 // are taken once their copies are done; the copies out of the RAM tier (which may read the experts
                 // file) are queued from a worker thread beside the windows, so no window waits for one.
@@ -7103,6 +7105,7 @@ int main(int argc, char** argv) {
             // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
             // run on the CPU), never a prompt buffer.
             constexpr double decode_share = 0.5;
+            const bool ov_gate = basalt::core::exp_flag("overlap_on", 0) != 0;
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
@@ -7115,6 +7118,95 @@ int main(int argc, char** argv) {
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                if (ov_gate && batch_on() && stages.empty()) {
+                    // the whole range is read on a side thread, in the prompt path's own chunks, while this thread keeps
+                    // running the slots' windows; the work that touches the draft layer or the output runs here, between
+                    // two windows, when the prompt path asks for it
+                    if (!xq_drain()) { e = "an adaptive refill failed"; return false; }
+                    apply_pending(true);
+                    struct Mail {
+                        std::mutex mu;
+                        std::condition_variable cv;
+                        std::function<void()> job;
+                        bool job_done = false, fin = false;
+                    } mail;
+                    std::atomic<bool> abort_read{false};
+                    bool ok = false;
+                    std::string terr;
+                    auto orig_chunk = sp.on_chunk;
+                    auto orig_stop = sp.should_stop;
+                    sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& ce) -> bool {
+                        bool r = false;
+                        std::unique_lock<std::mutex> lk(mail.mu);
+                        mail.job = [&] { r = orig_chunk ? orig_chunk(R_rows, T, p0, ce) : true; };
+                        mail.job_done = false;
+                        mail.cv.wait(lk, [&] { return mail.job_done; });
+                        return r;
+                    };
+                    sp.should_stop = [&] { return abort_read.load() || (orig_stop && orig_stop()); };
+                    ov_active = true;
+                    std::thread th([&] {
+                        const basalt::core::OnDevice on(0);
+                        ok = sp.run(ids.data() + a0, b0 - a0, a0, terr);
+                        std::lock_guard<std::mutex> lk(mail.mu);
+                        mail.fin = true;
+                        mail.cv.notify_all();
+                    });
+                    bool fatal = false;
+                    int64_t ov_jobs = 0, ov_wins = 0;
+                    double ov_job_ms = 0, ov_job_max = 0, ov_win_ms = 0, ov_win_max = 0;
+                    for (;;) {
+                        std::function<void()> job;
+                        {
+                            std::unique_lock<std::mutex> lk(mail.mu);
+                            if (mail.job && !mail.job_done) job = mail.job;
+                            else if (mail.fin) break;
+                        }
+                        if (job) {
+                            const auto tj = Clock::now();
+                            job();
+                            const double jm = std::chrono::duration<double, std::milli>(Clock::now() - tj).count();
+                            ++ov_jobs; ov_job_ms += jm; ov_job_max = std::max(ov_job_max, jm);
+                            std::lock_guard<std::mutex> lk(mail.mu);
+                            mail.job = nullptr;
+                            mail.job_done = true;
+                            mail.cv.notify_all();
+                            continue;
+                        }
+                        {   // a BSTOP that came meanwhile ends its slot at its next window
+                            std::lock_guard<std::mutex> lk(in_mu);
+                            for (auto it = in_lines.begin(); it != in_lines.end();) {
+                                if (it->rfind("BSTOP ", 0) == 0) {
+                                    const int b = std::atoi(it->c_str() + 6);
+                                    if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                    it = in_lines.erase(it);
+                                } else {
+                                    ++it;
+                                }
+                            }
+                        }
+                        if (!fatal && batch_on()) {
+                            const auto tw = Clock::now();
+                            if (!batch_step()) { fatal = true; abort_read.store(true); }
+                            const double wm = std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+                            ++ov_wins; ov_win_ms += wm; ov_win_max = std::max(ov_win_max, wm);
+                        } else {
+                            std::unique_lock<std::mutex> lk(mail.mu);
+                            mail.cv.wait_for(lk, std::chrono::milliseconds(2), [&] { return mail.fin || (mail.job && !mail.job_done); });
+                        }
+                    }
+                    th.join();
+                    ov_active = false;
+                    std::fprintf(stderr, "basalt batch: overlapped prompt read: %lld windows (%.1f ms avg, %.0f ms max) beside "
+                                         "%lld chunk jobs run between windows (%.1f ms avg, %.0f ms max)\n",
+                                 (long long) ov_wins, ov_wins ? ov_win_ms / (double) ov_wins : 0.0, ov_win_max,
+                                 (long long) ov_jobs, ov_jobs ? ov_job_ms / (double) ov_jobs : 0.0, ov_job_max);
+                    sp.on_chunk = std::move(orig_chunk);
+                    sp.should_stop = std::move(orig_stop);
+                    if (fatal) { batch_fatal = true; e = "a batch window failed"; return false; }
+                    if (!ok) e = terr;
+                    return ok;
+                }
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 // while slots are decoding the prompt goes in chunks of a fixed small size, so a long prompt holds the
                 // slots' windows back for one short chunk at a time
