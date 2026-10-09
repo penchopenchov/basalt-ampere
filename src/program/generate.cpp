@@ -4287,9 +4287,8 @@ int main(int argc, char** argv) {
     // Hoisted out of plan_lend: the serve path's per-stage loans obey the same cap, one participant at a time.
     const int64_t kAutoLendPct = basalt::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85;
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
-    // but a bare `auto` always reaches 8192.  32768 and 16384 stay opt-in.
-    // A bare `auto` starts at the top and is cut back once the RAM complement is built (below), to what the
-    // lend can fund; without the resident RAM mode there is no complement to size it from, so it stays at 8192.
+    // but never below 8192.  A bare `auto` starts at 32768 and is cut back once the RAM complement is built (below),
+    // to what the lend can fund; without the resident RAM mode there is no complement to size it from, so it stays at 8192.
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
     // The auto scan bisects on the 256-token grid the prompt path works on (`request_chunk` rounds up to it):
