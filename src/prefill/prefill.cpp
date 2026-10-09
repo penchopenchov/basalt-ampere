@@ -449,7 +449,7 @@ struct Prefill::Impl {
     std::vector<int32_t> tok_host;
     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
     core::PeerExperts* ring_peer = nullptr;  // --peer-exclusive: experts held only there are copied from its memory
-    PeerStage peer_stage;                    // the asynchronous host-staged copy of those experts (--exp pgemm_peerstage)
+    PeerStage peer_stage;                    // the asynchronous host-staged copy of those experts
 };
 
 namespace {
@@ -1382,8 +1382,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             ~IssuerJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
         } issuer_join{&a_stop, &issuer};
         const bool threaded_issue = stream_all;
-        static const bool peer_async_gate = core::exp_flag("pgemm_peerstage", 0) != 0;
-        const bool peer_async = peer_async_gate && m.ring_peer && !m.ring_peer->p2p() &&
+        const bool peer_async = m.ring_peer && !m.ring_peer->p2p() &&
                                 m.peer_stage.setup(m.ring_peer->device(), (size_t) MAXBLOB());
         if (threaded_issue) {
             issuer = std::thread([&] {
