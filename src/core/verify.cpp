@@ -799,7 +799,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess ||
+    // with the prompt read beside the windows, the windows' main stream outranks the prompt path's kernels
+    int cs_least = 0, cs_greatest = 0;
+    cudaDeviceGetStreamPriorityRange(&cs_least, &cs_greatest);
+    const int cs_prio = exp_flag("overlap_on", 0) != 0 ? cs_greatest : 0;
+    if (cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
         cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
