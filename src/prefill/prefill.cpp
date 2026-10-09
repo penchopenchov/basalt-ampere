@@ -307,6 +307,13 @@ struct PeerPrefill {
 // the peer's device-to-host copies run ahead of the primary's host-to-device ones, and no host thread blocks in a
 // synchronous staged peer copy.
 struct PeerStage {
+    // a failed call here would let a buffer be reused early and corrupt weights silently: stop instead
+    static void must(cudaError_t e, const char* what) {
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "prefill peer stage: %s: %s\n", what, cudaGetErrorString(e));
+            std::exit(1);
+        }
+    }
     static constexpr int kBufs = 16;
     uint8_t* buf[kBufs] = {};
     cudaEvent_t d2h[kBufs] = {}, h2d[kBufs] = {};
@@ -321,11 +328,13 @@ struct PeerStage {
         bytes = blob_bytes;
         for (int i = 0; i < kBufs; ++i)
             if (cudaHostAlloc((void**) &buf[i], bytes, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); release(); return false; }
+        // h2d is recorded on the primary's copy stream, so it belongs to the current (primary) device; the rest to the peer
+        for (int i = 0; i < kBufs; ++i)
+            if (cudaEventCreateWithFlags(&h2d[i], cudaEventDisableTiming) != cudaSuccess) { release(); return false; }
         const core::OnDevice od(dev);
         if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) { release(); return false; }
         for (int i = 0; i < kBufs; ++i)
-            if (cudaEventCreateWithFlags(&d2h[i], cudaEventDisableTiming) != cudaSuccess ||
-                cudaEventCreateWithFlags(&h2d[i], cudaEventDisableTiming) != cudaSuccess) { release(); return false; }
+            if (cudaEventCreateWithFlags(&d2h[i], cudaEventDisableTiming) != cudaSuccess) { release(); return false; }
         ok = true;
         return true;
     }
@@ -334,13 +343,13 @@ struct PeerStage {
         const int b = n++ % kBufs;
         {
             const core::OnDevice od(dev);
-            cudaStreamWaitEvent(stream, h2d[b], 0);   // the buffer's previous host-to-device copy is done
-            cudaMemcpyAsync(buf[b], src, nbytes, cudaMemcpyDeviceToHost, stream);
-            cudaEventRecord(d2h[b], stream);
+            must(cudaStreamWaitEvent(stream, h2d[b], 0), "wait for the buffer's previous host-to-device copy");
+            must(cudaMemcpyAsync(buf[b], src, nbytes, cudaMemcpyDeviceToHost, stream), "device-to-host copy");
+            must(cudaEventRecord(d2h[b], stream), "record the device-to-host copy");
         }
-        cudaStreamWaitEvent(copy_stream, d2h[b], 0);
-        cudaMemcpyAsync(dst, buf[b], nbytes, cudaMemcpyHostToDevice, copy_stream);
-        cudaEventRecord(h2d[b], copy_stream);
+        must(cudaStreamWaitEvent(copy_stream, d2h[b], 0), "wait for the device-to-host copy");
+        must(cudaMemcpyAsync(dst, buf[b], nbytes, cudaMemcpyHostToDevice, copy_stream), "host-to-device copy");
+        must(cudaEventRecord(h2d[b], copy_stream), "record the host-to-device copy");
     }
     void release() {
         ok = false;
