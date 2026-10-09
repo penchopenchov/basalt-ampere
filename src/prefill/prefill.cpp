@@ -1948,8 +1948,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (via_peer) {
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, m.ring_peer->slot_ptr(l, e),
-                                                    m.ring_peer->device(), (size_t) lay.blob_bytes(l), m.copy);
+                                if (peer_async) m.peer_stage.copy(m.stage_dev[sl], m.ring_peer->slot_ptr(l, e),
+                                                                  (size_t) lay.blob_bytes(l), m.copy);
+                                else cudaMemcpyPeerAsync(m.stage_dev[sl], m.device, m.ring_peer->slot_ptr(l, e),
+                                                         m.ring_peer->device(), (size_t) lay.blob_bytes(l), m.copy);
                                 ++stats_.experts_dma;
                             } else if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
