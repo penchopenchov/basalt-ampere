@@ -609,6 +609,22 @@ class ProcessEngine:
             carry[0] += last["drafts_accepted"]
             carry[1] += last["drafts_offered"]
 
+    def _note_first_reused(self, first: list, last0):
+        """Keep the reused-prefix count of the request's first engine run: later runs of the same request (solo, then
+        a slot; a read that gave way) find its own prompt and tokens in the slot, which is not an earlier cache."""
+        last = self.last
+        if not first and isinstance(last, dict) and last is not last0 and last.get("reused") is not None:
+            first.append(last["reused"])
+
+    def _carry_run(self, carry: list[int], first: list, last0, final: bool):
+        """After an engine run: carry the draft counts and, at the request's last run, report the first run's reuse."""
+        self._note_first_reused(first, last0)
+        last = self.last
+        if final and first and isinstance(last, dict) and last is not last0:
+            last["reused"] = first[0]
+            first.clear()
+        self._carry_drafts(carry, final)
+
     BDONE_WAIT_S = 2.0   # a leaving consumer waits this long for its slot's BDONE (the request's draft counts)
 
     YIELDS_MAX = 2   # times one prompt read may give way to a shorter waiting one
@@ -687,6 +703,7 @@ class ProcessEngine:
         stop_sent = False
         yields, solo_again = 0, 0
         carry = [0, 0]            # draft counts (accepted, offered) of the runs before the current one
+        first, last0 = [], self.last   # reused prefix of the first run; `last` before this request's first DONE
         try:
             while True:   # loops when a request alone in a slot returns to solo
                 if not holding:
@@ -723,6 +740,7 @@ class ProcessEngine:
                                     self._send(f"BYIELD {reserved}")
                             yield None
                     phase = "none"                          # DONE was read
+                    self._note_first_reused(first, last0)
                     if self.info.get("slot0_solo") and not self.slot_busy[0]:
                         self.slot_held[0] = list(ids) + out[:-1]   # the engine keeps this conversation in slot 0
                     while pending:
@@ -740,9 +758,9 @@ class ProcessEngine:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
                         if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
-                            self._carry_drafts(carry, True)
+                            self._carry_run(carry, first, last0, True)
                             return
-                        self._carry_drafts(carry, False)
+                        self._carry_run(carry, first, last0, False)
                         prompt = list(ids) + out            # continues in a batch slot
                 while True:
                     if slot is None:
@@ -799,6 +817,7 @@ class ProcessEngine:
                         if x is None:
                             ask_yield()
                             yield None
+                    self._note_first_reused(first, last0)
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
                     while pending:
@@ -849,7 +868,7 @@ class ProcessEngine:
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                  and not (out and out[-1] in EOS_IDS))
-                        self._carry_drafts(carry, not again)
+                        self._carry_run(carry, first, last0, not again)
                         if again:
                             # continue on the solo path
                             self.slot_used[slot] = time.time()
@@ -877,7 +896,7 @@ class ProcessEngine:
                     if line and line.startswith("BADM ") and line.split()[2:3] in (["1"], ["2"]):
                         phase = "slot"
                 if drained and phase != "slot":
-                    self._carry_drafts(carry, True)     # a request that ran in earlier runs too
+                    self._carry_run(carry, first, last0, True)     # a request that ran in earlier runs too
             except EngineDied:
                 pass
             if holding:
@@ -894,7 +913,7 @@ class ProcessEngine:
                     f = self._release_slot_when_done(slot, stream, wait_s=self.BDONE_WAIT_S)
                     if f is not None:
                         self._bdone_last(f)
-                        self._carry_drafts(carry, True)
+                        self._carry_run(carry, first, last0, True)
                     elif isinstance(self.last, dict):
                         # the BDONE is still to come: the counts of the DONE before it are not this request's
                         for k in ("drafts_accepted", "drafts_offered"):

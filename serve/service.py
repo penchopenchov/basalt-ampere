@@ -569,6 +569,7 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        reused0 = None                                  # reused prefix of the request's first engine run
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (--debug)
         emb = getattr(self.embeddings, "path", None)
@@ -667,6 +668,10 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
+                        run_last = getattr(self.engine, "last", None)
+                        if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
+                                and run_last.get("reused") is not None:
+                            reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
                         if not (wrap or ended_thinking) or cancel.is_set():
                             break
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
@@ -712,6 +717,8 @@ class Service:
                             # same object as before: no DONE arrived
                             last = dict(getattr(self.engine, "last", {}) or {}) \
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
+                            if reused0 is not None and last.get("reused") is not None:
+                                last["reused"] = reused0
                             started = st.get("started", time.time())
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                             # experts read over PCIe or computed elsewhere are not in the hit rate's lookups

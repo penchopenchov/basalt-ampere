@@ -33,6 +33,13 @@ MULTI = int(args[args.index("--multi") + 1]) if "--multi" in args else 3
 nopp = "--nopp" in args               # no PP lines while a prompt is read: a read beside the windows reports none
 STEP = 0.02
 CH = 32
+keep = "--reuse" in args              # a conversation cache: a prompt reuses the longest start some earlier stream had
+held = []                             # streams (prompt + tokens read so far) of earlier requests
+def lcp(a, b):
+    k = 0
+    while k < min(len(a), len(b)) and a[k] == b[k]:
+        k += 1
+    return k
 lines, stop = queue.Queue(), threading.Event()
 def reader():
     for l in sys.stdin:
@@ -106,6 +113,7 @@ while True:
         if log:
             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
         toks = reply(ids)
+        reused = min(max([lcp([int(x) for x in ids], h) for h in held], default=0), len(ids) - 1) if keep else 0
         stop.clear()
         # the prompt read: CH tokens a chunk, a PP line each; a BYIELD <s> gives way at a chunk boundary
         given = None
@@ -149,7 +157,10 @@ while True:
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
         dc = f"{out} {2 * out}" if "--draft-counts" in args and slot is None else "0 0"   # a solo run drafts
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} {dc} 0", flush=True)
+        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} {dc} {reused}", flush=True)
+        if keep:
+            mine = [int(x) for x in ids] + toks[:out]
+            held[:] = [h for h in held if mine[:len(h)] != h] + [mine]
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
@@ -192,7 +203,7 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False):
+              nopp=False, reuse=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -206,6 +217,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--ready", str(ready)] if ready else []
         extra += ["--multi", str(multi)] if multi else []
         extra += ["--nopp"] if nopp else []
+        extra += ["--reuse"] if reuse else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -523,6 +535,59 @@ class ParallelService(unittest.TestCase):
         for th in threads:
             th.join(30)
         return out
+
+    def usages(self, texts, gap=0.05, max_tokens=200):
+        """Each text as a streamed request started `gap` s after the previous; the `usage` of every reply."""
+        out = [None] * len(texts)
+
+        def go(i):
+            body = {"messages": [{"role": "user", "content": texts[i]}], "max_tokens": max_tokens,
+                    "reasoning_effort": "none", "stream": True, "stream_options": {"include_usage": True}}
+            req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                for raw in r:
+                    line = raw.decode().strip()
+                    if line.startswith("data:") and line[5:].strip() != "[DONE]":
+                        j = json.loads(line[5:])
+                        if j.get("usage"):
+                            out[i] = j["usage"]
+
+        threads = [threading.Thread(target=go, args=(i,)) for i in range(len(texts))]
+        for th in threads:
+            th.start()
+            time.sleep(gap)
+        for th in threads:
+            th.join(30)
+        return out
+
+    def test_cached_tokens_are_the_prompt_found_in_an_earlier_cache(self):
+        self.start(2, reuse=True)
+        text = "a long enough question to share " + "z" * 100
+        cold = self.usages([text])[0]
+        self.assertEqual(cold["prompt_tokens_details"]["cached_tokens"], 0)        # nothing cached before it
+        again = self.usages([text])[0]
+        cached = again["prompt_tokens_details"]["cached_tokens"]
+        self.assertGreater(cached, 0)
+        self.assertLessEqual(cached, again["prompt_tokens"])
+
+    def test_tokens_a_request_generates_are_not_cached_for_it(self):
+        self.start(2, reuse=True, counts=True)
+        # the blocker starts solo and moves to a slot: its second run finds its own prompt and tokens in the slot
+        got = self.usages(["blocker LONGREPLY " + "x" * 100, "second one"], gap=0.1, max_tokens=400)
+        kinds = [l.split()[0] for l in self.log.read_text().splitlines()]
+        self.assertEqual(kinds[:2], ["GEN", "BGEN"], kinds)
+        for u in got:
+            self.assertEqual(u["prompt_tokens_details"]["cached_tokens"], 0, u)
+            self.assertGreater(u["completion_tokens"], 1)
+
+    def test_cached_tokens_never_pass_the_prompt_when_a_slot_extends_it(self):
+        self.start(2, reuse=True, counts=True, slot_cache=True)
+        text = "blocker LONGREPLY " + "x" * 100
+        self.usages([text, "second one"], gap=0.1, max_tokens=400)
+        got = self.usages([text, "another"], gap=0.1, max_tokens=400)
+        u = got[0]
+        self.assertLessEqual(u["prompt_tokens_details"]["cached_tokens"], u["prompt_tokens"], u)
 
     def check_counts(self, timings, batch_admissions):
         # the fake drafts 2 per accepted; the admission's own token is nobody's draft
