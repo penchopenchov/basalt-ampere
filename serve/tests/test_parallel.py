@@ -72,6 +72,8 @@ def window():        # one batch window: every active slot one token
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
             counts = f" {b + 3} {10 * (b + 1)}" if "--bdone-drafts" in args else ""   # accepted, offered
+            if "--draft-counts" in args:      # as the engine: the slot's own windows (not the admission's token)
+                counts = f" {produced - 1} {2 * (produced - 1)}"
             print(f"BDONE {b} {produced} {fin} 1.0{counts}", flush=True)
             del active[b]
         else:
@@ -144,7 +146,8 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 0", flush=True)
+        dc = f"{out} {2 * out}" if "--draft-counts" in args and slot is None else "0 0"   # a solo run drafts
+        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} {dc} 0", flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
@@ -186,7 +189,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -196,6 +199,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--slotcache"] if slot_cache else []
         extra += ["--fail-window"] if fail else []
         extra += ["--bdone-drafts"] if drafts else []
+        extra += ["--draft-counts"] if counts else []
         extra += ["--ready", str(ready)] if ready else []
         extra += ["--multi", str(multi)] if multi else []
         with mock.patch.object(subprocess, "Popen",
@@ -439,6 +443,63 @@ class ParallelService(unittest.TestCase):
         th.join(30)
         got = self.slot_drafts()
         self.assertEqual(got, {0: (3, 10), 1: (4, 20)})
+
+    def timed_chats(self, texts, gap=0.05, max_tokens=200):
+        """Each text as a streamed request started `gap` s after the previous; the `timings` of every reply."""
+        out = [None] * len(texts)
+
+        def go(i):
+            body = {"messages": [{"role": "user", "content": texts[i]}], "max_tokens": max_tokens,
+                    "reasoning_effort": "none", "stream": True, "stream_options": {"include_usage": True}}
+            req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                for raw in r:
+                    line = raw.decode().strip()
+                    if line.startswith("data:") and line[5:].strip() != "[DONE]":
+                        j = json.loads(line[5:])
+                        if j.get("timings"):
+                            out[i] = j["timings"]
+
+        threads = [threading.Thread(target=go, args=(i,)) for i in range(len(texts))]
+        for th in threads:
+            th.start()
+            time.sleep(gap)
+        for th in threads:
+            th.join(30)
+        return out
+
+    def check_counts(self, timings, batch_admissions):
+        # the fake drafts 2 per accepted; the admission's own token is nobody's draft
+        for t in timings:
+            self.assertIsNotNone(t)
+            self.assertEqual(t["draft_n_accepted"], t["predicted_n"] - batch_admissions, t)
+            self.assertEqual(t["draft_n"], 2 * t["draft_n_accepted"], t)
+
+    def test_timings_of_a_solo_request_carry_its_draft_counts(self):
+        self.start(2, counts=True)
+        self.check_counts(self.timed_chats(["alone LONGREPLY"]), 0)
+
+    def test_timings_of_requests_in_batch_slots_carry_their_own_draft_counts(self):
+        self.start(2, counts=True)
+        # the second request arrives while the first reads its prompt, so both run in slots
+        self.check_counts(self.timed_chats(["first LONGREPLY " + "x" * 400, "second LONGREPLY " + "y" * 400], gap=0), 1)
+
+    def test_timings_of_a_request_that_moves_from_solo_to_a_slot_sum_both_parts(self):
+        self.start(2, counts=True)
+        got = self.timed_chats(["blocker LONGREPLY", "second one"], gap=0.1)
+        kinds = [l.split()[0] for l in self.log.read_text().splitlines()]
+        self.assertEqual(kinds[:2], ["GEN", "BGEN"], kinds)          # the blocker did start solo and moved
+        self.check_counts(got[:1], 1)
+        self.check_counts(got[1:], 1)
+
+    def test_timings_of_a_request_that_returns_from_a_slot_to_solo_sum_all_parts(self):
+        self.start(2, counts=True, slot_cache=True)
+        got = self.timed_chats(["blocker LONGREPLY", "second one"], gap=0.1, max_tokens=400)
+        kinds = [l.split()[0] for l in self.log.read_text().splitlines()]
+        self.assertEqual(kinds, ["GEN", "BGEN", "BGEN", "GEN"], kinds)    # solo, a slot (and the other's), solo again
+        self.check_counts(got[:1], 1)
+        self.check_counts(got[1:], 1)
 
     def test_old_bdone_without_counts_keeps_drafts_unknown(self):
         self.start(2)

@@ -524,46 +524,89 @@ class ProcessEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
-        """BSTOP a slot whose consumer left and free it at BDONE in the background; `stream` (prompt + tokens so far)
-        becomes what the slot holds."""
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, wait_s: float = 0.0):
+        """BSTOP a slot whose consumer left and free it at BDONE; `stream` (prompt + tokens so far) becomes what the
+        slot holds. Waits up to `wait_s` for the BDONE and returns its fields (None when it has not come: the
+        rest is freed in the background)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots
-            return
+            return None
         try:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # restart() replaces them
+        tail = list(stream or [])
 
-        def wait():
-            end = time.monotonic() + 600.0
-            tail = list(stream or [])
+        def drain(end):             # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
             while time.monotonic() < end:
                 try:
-                    line = q.get(timeout=5.0)
+                    line = q.get(timeout=max(0.01, min(5.0, end - time.monotonic())))
                 except queue.Empty:
                     continue
                 if line is None:
-                    tail = []
-                    break
+                    tail.clear()
+                    return "gone", None
                 if line.startswith("BT "):
                     try:
                         tail.extend(int(x) for x in line.split()[2:])
                     except ValueError:
-                        tail = []
+                        tail.clear()
                 if line.startswith("BDONE "):
-                    self._note_bdone(slot, line.split())
-                    break
+                    f = line.split()
+                    self._note_bdone(slot, f)
+                    return "done", f
+            return "wait", None
+
+        def free():
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
                 busy[slot] = False
                 self.slot_cv.notify_all()
+
+        state, fields = drain(time.monotonic() + wait_s) if wait_s > 0 else ("wait", None)
+        if state != "wait":
+            free()
+            return fields
+
+        def wait():
+            drain(time.monotonic() + 600.0)
+            free()
         threading.Thread(target=wait, daemon=True).start()
+        return None
 
     def _note_bdone(self, slot: int, f: list[str]):
         """Keep a slot's draft counts from its BDONE line (optional trailing accepted, offered; None when absent)."""
         known = len(f) >= 7 and f[5].isdigit() and f[6].isdigit()
         self.slot_drafts[slot] = (int(f[5]) if known else None, int(f[6]) if known else None, time.time())
+
+    def _bdone_last(self, f: list[str]):
+        """This thread's `last` after a BDONE: finish, decode ms and the request's own draft counts (optional trailing
+        accepted, offered; without them they are unknown, never an earlier request's)."""
+        if len(f) < 5 or not isinstance(self.last, dict):
+            return
+        prev = {k: v for k, v in self.last.items() if k not in ("drafts_accepted", "drafts_offered")}
+        counts = {"drafts_accepted": int(f[5]), "drafts_offered": int(f[6])} \
+            if len(f) >= 7 and f[5].isdigit() and f[6].isdigit() else {}
+        self.last = {**prev, **counts, "finish": f[3], "decode_ms": float(f[4]),
+                     "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+
+    def _carry_drafts(self, carry: list[int], final: bool):
+        """Draft counts of a request that ran in several engine runs (solo, then a slot, ...): the run just read adds
+        to `carry`; at the request's last run `carry` joins its counts."""
+        last = self.last
+        if not isinstance(last, dict) or last.get("drafts_offered") is None or last.get("drafts_accepted") is None:
+            if final:
+                carry[:] = [0, 0]
+            return
+        if final:
+            last["drafts_accepted"] += carry[0]
+            last["drafts_offered"] += carry[1]
+            carry[:] = [0, 0]
+        else:
+            carry[0] += last["drafts_accepted"]
+            carry[1] += last["drafts_offered"]
+
+    BDONE_WAIT_S = 2.0   # a leaving consumer waits this long for its slot's BDONE (the request's draft counts)
 
     YIELDS_MAX = 2   # times one prompt read may give way to a shorter waiting one
 
@@ -640,6 +683,7 @@ class ProcessEngine:
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
         yields, solo_again = 0, 0
+        carry = [0, 0]            # draft counts (accepted, offered) of the runs before the current one
         try:
             while True:   # loops when a request alone in a slot returns to solo
                 if not holding:
@@ -693,7 +737,9 @@ class ProcessEngine:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
                         if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                            self._carry_drafts(carry, True)
                             return
+                        self._carry_drafts(carry, False)
                         prompt = list(ids) + out            # continues in a batch slot
                 while True:
                     if slot is None:
@@ -791,18 +837,13 @@ class ProcessEngine:
                         phase = "none"
                         f = line.split()
                         self._note_bdone(slot, f)
-                        if len(f) >= 5 and isinstance(self.last, dict):
-                            # draft counts are this request's own (optional trailing accepted, offered);
-                            # without them they are unknown, never an earlier request's
-                            prev = {k: v for k, v in self.last.items() if k not in ("drafts_accepted", "drafts_offered")}
-                            counts = {"drafts_accepted": int(f[5]), "drafts_offered": int(f[6])} \
-                                if len(f) >= 7 and f[5].isdigit() and f[6].isdigit() else {}
-                            self.last = {**prev, **counts, "finish": f[3], "decode_ms": float(f[4]),
-                                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+                        self._bdone_last(f)
                         # the slot holds the prompt and every token fed (all but the last)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
-                        if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                and not (out and out[-1] in EOS_IDS)):
+                        again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
+                                 and not (out and out[-1] in EOS_IDS))
+                        self._carry_drafts(carry, not again)
+                        if again:
                             # continue on the solo path
                             self.slot_used[slot] = time.time()
                             with self.slot_cv:
@@ -820,6 +861,7 @@ class ProcessEngine:
                     phase = "none"                      # engine gone: nothing to drain
                 if phase in ("solo", "admit") and self._ctl_erred:
                     phase = "none"                      # it ended on the engine's ERR: no DONE to wait for
+                drained = phase in ("solo", "admit")    # this run's DONE is read below
                 if phase == "solo":
                     self._send("STOP")
                     self._drain_control("DONE", born=born)
@@ -827,6 +869,8 @@ class ProcessEngine:
                     line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] in (["1"], ["2"]):
                         phase = "slot"
+                if drained and phase != "slot":
+                    self._carry_drafts(carry, True)     # a request that ran in earlier runs too
             except EngineDied:
                 pass
             if holding:
@@ -840,7 +884,15 @@ class ProcessEngine:
                 if phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)
+                    f = self._release_slot_when_done(slot, stream, wait_s=self.BDONE_WAIT_S)
+                    if f is not None:
+                        self._bdone_last(f)
+                        self._carry_drafts(carry, True)
+                    elif isinstance(self.last, dict):
+                        # the BDONE is still to come: the counts of the DONE before it are not this request's
+                        for k in ("drafts_accepted", "drafts_offered"):
+                            self.last.pop(k, None)
+                        carry[:] = [0, 0]
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
