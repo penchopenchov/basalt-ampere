@@ -311,15 +311,12 @@ function drawSlots(M, multi) {
     const el = rows[i]; if (!el) return;
     const q = c => el.querySelector(c);
     el.dataset.s = s.state;
-    text2(q(".l-st"), STATE[s.state] || s.state);
+    const pre = s.state === "prefill" && num(s.prefill_done) && s.prompt_tokens;
+    text2(q(".l-st"), (STATE[s.state] || s.state) + (pre ? ` ${Math.min(100, Math.round(s.prefill_done / s.prompt_tokens * 100))}%` : ""));
+    q(".l-st").title = pre ? `${kfmt(s.prefill_done)} of ${kfmt(s.prompt_tokens)} prompt tokens read` : "";
     const tps = q(".l-tps"); tps.replaceChildren();
     if (s.state === "decoding") tps.append(fmt(s.tok_s), Object.assign(document.createElement("small"), { textContent: "tok/s" }));
-    else if (s.state === "prefill") {
-      const small = document.createElement("small");
-      small.textContent = num(s.prefill_done) && s.prompt_tokens ? `% of ${kfmt(s.prompt_tokens)} prompt` : `reading ${kfmt(s.prompt_tokens || 0)} prompt`;
-      if (num(s.prefill_done) && s.prompt_tokens) tps.append(String(Math.round(s.prefill_done / s.prompt_tokens * 100)));
-      tps.append(small);
-    } else tps.append("—");
+    else tps.append("—");
     text2(q(".l-tok"), s.is_processing ? `${fmt(s.generated)} tokens` : "—");
     const f = s.n_ctx ? s.ctx_used / s.n_ctx : 0, m = q(".meter");
     m.firstChild.style.width = clamp(f, 0, 1) * 100 + "%"; m.classList.toggle("hot", f > .8);
