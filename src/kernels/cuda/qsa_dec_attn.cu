@@ -21,6 +21,13 @@ constexpr int CHUNK = 64;        // cells per block (the reference's chunk: the 
 constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
 constexpr int NSC = HD / KV_Q8_GROUP;   // int8 scales per row
+// The draft kernel's cells per CTA, from the window's width: a narrow window gets more CTAs of one tile, a wide one fewer
+// of up to four (the merge reads the same rule).
+constexpr int DT = 64;
+__device__ __forceinline__ int draft_tpc(int n_ids) {
+    const int tiles = (n_ids + DT - 1) / DT;
+    return tiles >= 256 ? 4 : tiles >= 96 ? 2 : 1;
+}
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -92,6 +99,7 @@ struct AttnArgs {
     const int32_t* ids;
     const int32_t* steps;
     int n_kv_heads, page_size, n_chunks, cap;
+    int chunk = CHUNK;         // cells per partial: CHUNK, or 0 for the draft kernel's (draft_tpc of the width)
     long long stride;          // scratch floats per query
     float scale;
     float* scratch;
@@ -342,7 +350,8 @@ __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi,
     const float* part_m = part_acc + (size_t) a.n_chunks * a.n_kv_heads * G * HD;
     const float* part_l = part_m + (size_t) a.n_chunks * a.n_kv_heads * G;
     const int n_ids = __ldg(a.steps + (size_t) qi * kStepCount + kStepWidth);
-    const int nc = min(a.n_chunks, (n_ids + CHUNK - 1) / CHUNK);
+    const int chunk_cells = a.chunk > 0 ? a.chunk : DT * draft_tpc(n_ids);
+    const int nc = min(a.n_chunks, (n_ids + chunk_cells - 1) / chunk_cells);
     const int kvh = h / G, hl = h % G;
     const int d = threadIdx.x;
     float mx = -FLT_MAX;
@@ -411,6 +420,282 @@ __device__ __forceinline__ void attn_merge_dev(const AttnArgs& a, int h, int qi,
     }
 }
 
+
+// ---- the draft layer's attention over a wide window of one row: tensor cores, fp16 products with fp32 accumulation,
+// the softmax online over 64-cell tiles, 256 cells per CTA.  The draft only proposes tokens (verify decides every
+// one), so this need not be the reference's arithmetic; the partials have the layout the merge reads, with chunks
+// of DCH cells.
+constexpr int DCH = 256;   // the most cells one CTA takes
+constexpr int DTHREADS = 256;
+constexpr int DROW = HD + 16;   // smem row bytes: fragment loads from 8 cells land in distinct banks
+struct DSmem {
+    alignas(16) unsigned char k[2][DT][DROW];
+    alignas(16) unsigned char v[2][DT][DROW];
+    alignas(16) uint16_t ks[2][DT][NSC];
+    alignas(16) uint16_t vs[2][DT][NSC];
+    alignas(16) float s[16][DT + 4];
+    alignas(16) __half p[16][DT + 8];
+    float alpha[16];
+    int row[DCH];
+};
+
+__device__ __forceinline__ uint32_t pack_h2(float a, float b) {
+    const __half2 h = __floats2half2_rn(a, b);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+__device__ __forceinline__ void mma_16816(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+__global__ void __launch_bounds__(DTHREADS) draft_attn_chunk(AttnArgs a) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    DSmem& sm = *reinterpret_cast<DSmem*>(smem_raw);
+    pdl_launch_dependents();
+    pdl_wait();
+    const int chunk = blockIdx.x, kvh = blockIdx.y, qi = blockIdx.z;
+    const QsaAttnPools& pools = a.p;
+    const float* q = a.q + (size_t) qi * (size_t) (a.n_kv_heads * G) * HD + (size_t) kvh * G * HD;
+    const int32_t* ids = a.ids + (size_t) qi * (size_t) a.cap;
+    const int32_t* step = a.steps + (size_t) qi * kStepCount;
+    float* part_acc = a.scratch + (size_t) qi * (size_t) a.stride;
+    float* part_m = part_acc + (size_t) a.n_chunks * a.n_kv_heads * G * HD;
+    float* part_l = part_m + (size_t) a.n_chunks * a.n_kv_heads * G;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, c4 = lane & 3, g8 = lane >> 2;
+    const int n_ids = __ldg(step + kStepWidth);
+    const int c0 = chunk * (DT * draft_tpc(n_ids));
+    const int n_here = min(DT * draft_tpc(n_ids), n_ids - c0);
+    if (n_here <= 0) return;
+    const int slot = kvh * a.n_chunks + chunk;
+    for (int i = t; i < DCH; i += DTHREADS) {
+        int r = -1;
+        if (i < n_here) {
+            const int cell = ids[c0 + i];
+            const long long page = (long long) pools.page_table[cell / a.page_size];
+            if (page >= 0) r = (int) ((page * a.n_kv_heads + kvh) * a.page_size + (cell % a.page_size));
+        }
+        sm.row[i] = r;
+    }
+    for (int i = t; i < 16 * (DT + 8); i += DTHREADS) (&sm.p[0][0])[i] = __float2half(0.0f);
+    __syncthreads();
+    const unsigned char* kb = (const unsigned char*) pools.k_q;
+    const unsigned char* vb = (const unsigned char*) pools.v_q;
+    auto load_tile = [&](int ti, int buf) {
+        for (int i = t; i < DT * (HD / 16); i += DTHREADS) {
+            const int c = i / (HD / 16), j = i % (HD / 16);
+            const int r = sm.row[ti * DT + c];
+            if (r < 0) {
+                *reinterpret_cast<uint4*>(&sm.v[buf][c][j * 16]) = make_uint4(0, 0, 0, 0);
+                continue;
+            }
+            cp_async16(&sm.k[buf][c][j * 16], kb + (size_t) r * HD + j * 16);
+            cp_async16(&sm.v[buf][c][j * 16], vb + (size_t) r * HD + j * 16);
+        }
+        if (t < 2 * DT) {
+            const int c = t & (DT - 1);
+            const int r = sm.row[ti * DT + c];
+            if (r >= 0) {
+                if (t < DT) cp_async8(&sm.ks[buf][c][0], pools.k_scale + (size_t) r * NSC);
+                else cp_async8(&sm.vs[buf][c][0], pools.v_scale + (size_t) r * NSC);
+            } else if (t >= DT) {
+                *reinterpret_cast<uint2*>(&sm.vs[buf][c][0]) = make_uint2(0, 0);
+            }
+        }
+    };
+    // the query rows as the A operand: 12 heads, rows 12..15 zero
+    uint32_t qa[HD / 16][4];
+#pragma unroll
+    for (int s = 0; s < HD / 16; ++s) {
+        const int d0 = 16 * s + 2 * c4;
+        const float2 x0 = *reinterpret_cast<const float2*>(q + (size_t) g8 * HD + d0);
+        const float2 x2 = *reinterpret_cast<const float2*>(q + (size_t) g8 * HD + d0 + 8);
+        float2 x1 = make_float2(0.0f, 0.0f), x3 = x1;
+        if (g8 + 8 < G) {
+            x1 = *reinterpret_cast<const float2*>(q + (size_t) (g8 + 8) * HD + d0);
+            x3 = *reinterpret_cast<const float2*>(q + (size_t) (g8 + 8) * HD + d0 + 8);
+        }
+        qa[s][0] = pack_h2(x0.x, x0.y); qa[s][1] = pack_h2(x1.x, x1.y);
+        qa[s][2] = pack_h2(x2.x, x2.y); qa[s][3] = pack_h2(x3.x, x3.y);
+    }
+    float o[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float m_run[2], l_run[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) { m_run[j] = -FLT_MAX; l_run[j] = 0.0f; }
+    const int ntiles = (n_here + DT - 1) / DT;
+    load_tile(0, 0);
+    cp_async_commit();
+    for (int ti = 0; ti < ntiles; ++ti) {
+        const int buf = ti & 1;
+        if (ti + 1 < ntiles) {
+            load_tile(ti + 1, buf ^ 1);
+            cp_async_commit();
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
+        }
+        __syncthreads();
+        const int base = ti * DT;
+        // scores: this warp's 8 cells
+        float sc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        {
+            const int cell = 8 * warp + g8;
+            const unsigned char* kr = sm.k[buf][cell];
+#pragma unroll
+            for (int s = 0; s < HD / 16; ++s) {
+                const float scl = __half2float(__ushort_as_half(sm.ks[buf][cell][s / 4]));
+                const ushort w0 = *reinterpret_cast<const ushort*>(kr + 16 * s + 2 * c4);
+                const ushort w1 = *reinterpret_cast<const ushort*>(kr + 16 * s + 2 * c4 + 8);
+                const uint32_t b0 = pack_h2((float) (int8_t) (w0 & 0xff) * scl, (float) (int8_t) (w0 >> 8) * scl);
+                const uint32_t b1 = pack_h2((float) (int8_t) (w1 & 0xff) * scl, (float) (int8_t) (w1 >> 8) * scl);
+                mma_16816(sc, qa[s], b0, b1);
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = g8 + ((e >> 1) << 3), col = 8 * warp + 2 * c4 + (e & 1);
+            if (row < G) {
+                const bool valid = base + col < n_here && sm.row[base + col] >= 0;
+                sm.s[row][col] = valid ? sc[e] * a.scale : -FLT_MAX;
+            }
+        }
+        __syncthreads();
+        // online softmax: warp w owns heads w and w + 8 (the second only for w < 4)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int h = warp + 8 * j;
+            if (h >= G) continue;
+            const float x0 = sm.s[h][lane], x1 = sm.s[h][lane + 32];
+            const bool v0 = base + lane < n_here && sm.row[base + lane] >= 0;
+            const bool v1 = base + lane + 32 < n_here && sm.row[base + lane + 32] >= 0;
+            const float m_new = fmaxf(m_run[j], warp_max(fmaxf(x0, x1)));
+            const float p0 = v0 ? __expf(x0 - m_new) : 0.0f, p1 = v1 ? __expf(x1 - m_new) : 0.0f;
+            const float alpha = __expf(m_run[j] - m_new);
+            l_run[j] = l_run[j] * alpha + warp_sum(p0 + p1);
+            m_run[j] = m_new;
+            sm.p[h][lane] = __float2half(p0);
+            sm.p[h][lane + 32] = __float2half(p1);
+            if (lane == 0) sm.alpha[h] = alpha;
+        }
+        __syncthreads();
+        const float alA = sm.alpha[g8], alB = g8 + 8 < G ? sm.alpha[g8 + 8] : 1.0f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            o[nt][0] *= alA; o[nt][1] *= alA; o[nt][2] *= alB; o[nt][3] *= alB;
+        }
+        // P . V: this warp's 64 dimensions, 4 k-steps of 16 cells
+#pragma unroll
+        for (int ks = 0; ks < DT / 16; ++ks) {
+            uint32_t pa[4];
+            pa[0] = *reinterpret_cast<const uint32_t*>(&sm.p[g8][16 * ks + 2 * c4]);
+            pa[1] = *reinterpret_cast<const uint32_t*>(&sm.p[g8 + 8][16 * ks + 2 * c4]);
+            pa[2] = *reinterpret_cast<const uint32_t*>(&sm.p[g8][16 * ks + 2 * c4 + 8]);
+            pa[3] = *reinterpret_cast<const uint32_t*>(&sm.p[g8 + 8][16 * ks + 2 * c4 + 8]);
+            const int ca = 16 * ks + 2 * c4;
+            const float vs0 = __half2float(__ushort_as_half(sm.vs[buf][ca][warp >> 1])),
+                        vs1 = __half2float(__ushort_as_half(sm.vs[buf][ca + 1][warp >> 1])),
+                        vs2 = __half2float(__ushort_as_half(sm.vs[buf][ca + 8][warp >> 1])),
+                        vs3 = __half2float(__ushort_as_half(sm.vs[buf][ca + 9][warp >> 1]));
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const int dim = 32 * warp + 8 * nt + g8;
+                const float v0 = (float) (int8_t) sm.v[buf][ca][dim] * vs0, v1 = (float) (int8_t) sm.v[buf][ca + 1][dim] * vs1,
+                            v2 = (float) (int8_t) sm.v[buf][ca + 8][dim] * vs2, v3 = (float) (int8_t) sm.v[buf][ca + 9][dim] * vs3;
+                mma_16816(o[nt], pa, pack_h2(v0, v1), pack_h2(v2, v3));
+            }
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            if (warp + 8 * j < G) {
+                part_m[slot * G + warp + 8 * j] = m_run[j];
+                part_l[slot * G + warp + 8 * j] = l_run[j];
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+        const int dim = 32 * warp + 8 * nt + 2 * c4;
+        *reinterpret_cast<float2*>(&part_acc[((size_t) slot * G + g8) * HD + dim]) = make_float2(o[nt][0], o[nt][1]);
+        if (g8 + 8 < G)
+            *reinterpret_cast<float2*>(&part_acc[((size_t) slot * G + g8 + 8) * HD + dim]) = make_float2(o[nt][2], o[nt][3]);
+    }
+}
+
+
+// The draft kernel's merge: four chunk groups per head work in parallel (thread: 4 dimensions of one group), then the
+// groups are added.  The order differs from attn_merge_dev's, which only the draft layer sees.
+__global__ void __launch_bounds__(THREADS) draft_merge(AttnArgs a) {
+    extern __shared__ __align__(16) float msm[];
+    float* s_w = msm;
+    float* s_l = msm + a.n_chunks;
+    __shared__ float s_red[WARPS], s_L[4];
+    __shared__ __align__(16) float sacc[4][HD];
+    pdl_launch_dependents();
+    pdl_wait();
+    const int h = blockIdx.x, qi = blockIdx.y;
+    const float* part_acc = a.scratch + (size_t) qi * (size_t) a.stride;
+    const float* part_m = part_acc + (size_t) a.n_chunks * a.n_kv_heads * G * HD;
+    const float* part_l = part_m + (size_t) a.n_chunks * a.n_kv_heads * G;
+    const int n_ids = __ldg(a.steps + (size_t) qi * kStepCount + kStepWidth);
+    const int chunk_cells = DT * draft_tpc(n_ids);
+    const int nc = min(a.n_chunks, (n_ids + chunk_cells - 1) / chunk_cells);
+    const int kvh = h / G, hl = h % G;
+    const int t = threadIdx.x;
+    float mx = -FLT_MAX;
+    for (int c = t; c < nc; c += THREADS) {
+        const int slot = kvh * a.n_chunks + c;
+        const float m = part_m[slot * G + hl];
+        s_w[c] = m;
+        s_l[c] = part_l[slot * G + hl];
+        mx = fmaxf(mx, m);
+    }
+    mx = warp_max(mx);
+    if ((t & 31) == 0) s_red[t >> 5] = mx;
+    __syncthreads();
+    float M = s_red[0];
+#pragma unroll
+    for (int w = 1; w < WARPS; ++w) M = fmaxf(M, s_red[w]);
+    for (int c = t; c < nc; c += THREADS) {
+        const float m = s_w[c];
+        s_w[c] = m == -FLT_MAX ? -1.0f : __expf(m - M);
+    }
+    __syncthreads();
+    const int dg = t & 63, cg = t >> 6;
+    const size_t cs = (size_t) G * HD;
+    const float* pa = part_acc + ((size_t) (kvh * a.n_chunks) * G + hl) * HD + 4 * dg;
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float L = 0.0f;
+#pragma unroll 8
+    for (int c = cg; c < nc; c += 4) {
+        const float w = s_w[c];
+        if (w < 0.0f) continue;
+        const float4 v = *reinterpret_cast<const float4*>(pa + (size_t) c * cs);
+        acc.x = fmaf(v.x, w, acc.x); acc.y = fmaf(v.y, w, acc.y); acc.z = fmaf(v.z, w, acc.z); acc.w = fmaf(v.w, w, acc.w);
+        L = fmaf(s_l[c], w, L);
+    }
+    *reinterpret_cast<float4*>(&sacc[cg][4 * dg]) = acc;
+    if (dg == 0) s_L[cg] = L;
+    __syncthreads();
+    const float Lt = s_L[0] + s_L[1] + s_L[2] + s_L[3];
+    const float tot = (sacc[0][t] + sacc[1][t]) + (sacc[2][t] + sacc[3][t]);
+    const int n_head = a.n_kv_heads * G;
+    const float o = Lt > 0.0f ? tot / Lt : 0.0f;
+    a.attn[((size_t) qi * n_head + h) * HD + t] = o;
+    if (a.attn_gated != nullptr) {
+        const float raw = a.q_full[((size_t) qi * n_head + h) * 2 * HD + HD + t];
+        const float gv = gate_fast(o, raw);
+        a.attn_gated[((size_t) qi * n_head + h) * HD + t] = gv;
+        if (a.xq != nullptr) q8_1_store_fm(gv, static_cast<AttnQ81*>(a.xq), (((size_t) qi * n_head + h) * HD + t) / 32, t & 31);
+    }
+}
+
 template <int KV_MODE, bool SEG>
 __global__ void __launch_bounds__(THREADS) attn_chunk_v2(AttnArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -473,7 +758,19 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     cudaStream_t st = (cudaStream_t) stream;
     a.xq = a.attn_gated != nullptr ? xq : nullptr;
     const dim3 grid((unsigned) a.n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
-    if (mode == 1) {
+    if (mode == 1 && n_q == 1 && cap >= 8192) {   // the draft layer's wide window (verify's cap is a few thousand cells)
+        a.chunk = 0;
+        constexpr size_t bytes = sizeof(DSmem);
+        static bool done[64] = {};
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
+        if (!done[dev]) {
+            cudaFuncSetAttribute(draft_attn_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes);
+            cudaFuncSetAttribute(draft_attn_chunk, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            done[dev] = true;
+        }
+        launch_pdl(draft_attn_chunk, dim3((unsigned) a.n_chunks, (unsigned) s.n_head_kv, 1u), dim3(DTHREADS), bytes, st, a);
+    } else if (mode == 1) {
         constexpr size_t bytes = sizeof(ChunkSmem<1>);
         opt_in<1>(attn_chunk_v2<1, false>, bytes);
         launch_pdl(attn_chunk_v2<1, false>, grid, dim3(THREADS), bytes, st, a);
@@ -483,7 +780,8 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
         launch_pdl(attn_chunk_v2<0, false>, grid, dim3(THREADS), bytes, st, a);
     }
     const size_t mbytes = (size_t) (2 * a.n_chunks + WARPS) * sizeof(float);
-    launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
+    if (a.chunk == 0) launch_pdl(draft_merge, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
+    else launch_pdl(attn_merge_v2, dim3((unsigned) s.n_head, (unsigned) n_q), dim3(THREADS), mbytes, st, a);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_dec_attn: %s\n", cudaGetErrorString(e));
