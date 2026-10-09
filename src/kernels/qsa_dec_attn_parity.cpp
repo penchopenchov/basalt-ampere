@@ -351,6 +351,49 @@ int main(int argc, char** argv) {
         }
         cudaFree(flush);
     }
+    {   // microbench: the verify window at long context - 3 rows each selecting cap cells as random 4-cell blocks out of
+        // the pools (a block's rows are contiguous), the pools' lines evicted before every call
+        up(p.table, table);
+        const int n_q = 3, n_kv = max_cells;
+        std::vector<int32_t> hs((size_t) n_q * k::kStepCount), hid((size_t) n_q * cap, 0);
+        for (int i = 0; i < n_q; ++i) {
+            k::qsa_step_fill(hs.data() + i * k::kStepCount, n_kv - 1 - i, s);
+            hs[i * k::kStepCount + k::kStepWidth] = cap;
+            std::vector<int32_t> blocks(n_kv / 4);
+            for (int b = 0; b < (int) blocks.size(); ++b) blocks[b] = b;
+            std::shuffle(blocks.begin(), blocks.end(), rng);
+            blocks.resize((cap + 3) / 4);
+            std::sort(blocks.begin(), blocks.end());
+            for (int c = 0; c < cap; ++c) hid[(size_t) i * cap + c] = blocks[c / 4] * 4 + c % 4;
+        }
+        int32_t* ids = dalloc<int32_t>((size_t) n_q * cap);
+        up(ids, hid);
+        up(steps, hs);
+        float* scr = dalloc<float>(k::qsa_decode_attn_scratch_floats(cap, s) * n_q);
+        const size_t fn = 256u << 20;
+        char* flush = dalloc<char>(fn);
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        for (int mode = 1; mode >= 0; --mode) {
+            const k::QsaAttnPools a = pools_of(mode);
+            for (int cold = 0; cold < 2; ++cold) {
+                double tot = 0;
+                for (int it = 0; it < iters; ++it) {
+                    if (cold) cudaMemsetAsync(flush, it, fn, st);
+                    cudaEventRecord(e0, st);
+                    k::qsa_dec_attn(q, a, ids, steps, cap, s, scr, out_new, n_q, st, qfull, gated_new, xq_fm);
+                    cudaEventRecord(e1, st);
+                    cudaEventSynchronize(e1);
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    tot += ms;
+                }
+                std::printf("   bench verify window 3 x %d cells in blocks, mode %d, pools %-6s: %7.2f us/call (chunk + merge)\n", cap,
+                            mode, cold ? "cold" : "warm", tot / iters * 1000.0);
+            }
+        }
+    }
     std::printf("%s\n", g_fail ? "qsa_dec_attn_parity: FAIL" : "qsa_dec_attn_parity: OK (bitwise)");
     return g_fail ? 1 : 0;
 }

@@ -696,8 +696,10 @@ __global__ void __launch_bounds__(THREADS) draft_merge(AttnArgs a) {
     }
 }
 
+// the int8 rows' block is small enough for two per multiprocessor: a decode window's chunk blocks (3 queries x 2 KV heads x
+// 33 chunks) then all run at once
 template <int KV_MODE, bool SEG>
-__global__ void __launch_bounds__(THREADS) attn_chunk_v2(AttnArgs a) {
+__global__ void __launch_bounds__(THREADS, KV_MODE == 1 ? 2 : 1) attn_chunk_v2(AttnArgs a) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     pdl_launch_dependents();
     pdl_wait();
@@ -726,6 +728,7 @@ template <int MODE> void opt_in(void (*kernel)(AttnArgs), size_t bytes) {
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
     if (!done[dev]) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
         done[dev] = true;
     }
 }
