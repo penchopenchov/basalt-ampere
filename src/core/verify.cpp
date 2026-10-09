@@ -2833,6 +2833,16 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
     return true;
 }
 
+bool Verifier::warm_graphs(std::string& err) {
+    refresh_ar();
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture(T, err)) return false;
+    if (slots_.empty()) return true;
+    for (int R = 1; R <= max_t_; ++R)
+        if (!capture_batch(R, 0, err) || !capture_commit_batch(R, err)) return false;
+    return true;
+}
+
 bool Verifier::instantiate_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err, bool priority) {
     const cudaError_t ie = priority ? cudaGraphInstantiateWithFlags(&ex, graph, cudaGraphInstantiateFlagUseNodePriority)
                                     : cudaGraphInstantiate(&ex, graph, 0);

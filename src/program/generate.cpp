@@ -5630,6 +5630,11 @@ int main(int argc, char** argv) {
                                  "while generating (slow)\n",
                          (double) (src.resident_bytes() + topped_up) / 1073741824.0);
         basalt::platform::stop_memory_watchdog();
+        // every window width's graph is captured before READY, not by the first request that needs it
+        if (o.serve && stages.empty() && !ver.warm_graphs(err)) {
+            std::fprintf(stderr, "basalt serve: capturing the verify windows failed: %s\n", err.c_str());
+            return 1;
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -7077,6 +7082,7 @@ int main(int argc, char** argv) {
                         if (!p.lent.empty() && !refill_one(p, e)) return false;
                 }
                 if (n_parts > 0) res_upload();
+                ov_copied = false;
                 return true;
             };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens

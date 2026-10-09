@@ -216,6 +216,9 @@ public:
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
+    /// Captures every window width's graph now (the solo windows, and the batch windows when slots exist), so no
+    /// request pays a capture while others decode.  After the verifier is configured.
+    bool warm_graphs(std::string& err);
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err);
