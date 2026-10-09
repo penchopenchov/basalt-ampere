@@ -105,6 +105,19 @@ each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
 solo session of the same length, come out of the expert cache.
 
+While other slots are decoding, a new prompt is read beside them: the prompt path runs on its own thread, the slots'
+decode windows keep running (their kernels take the higher stream priority), and the few steps that touch the draft
+layer or the output run between two windows. A long prompt therefore does not stop the other requests. A prompt that
+arrives while no other slot is decoding is read as in the single-stream path.
+
+At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
+example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. Because that memory is
+taken from the expert cache, the engine warns (`basalt warning: the N batch slots' sessions ... take X GiB of CUDA0
+...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and
+names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session
+does not fit at all, the engine says which slot (`WARNING: --batch N: slot K's session does not fit`) and starts with
+the slots that did fit; if fewer than two fit, `--batch is off` and the server runs one request at a time.
+
 - `server` holds the server's options (`python -m serve.server --help`), named as the flags without the dashes:
   strings or numbers, `true`/`false` for a switch (`vision`, `lazy`, ...), a list for the repeatable ones
   (`allowed-host`, `cors-origin`). `model` and `tokenizer` paths are relative to the file.
@@ -116,6 +129,17 @@ solo session of the same length, come out of the expert cache.
 - The API key is command line only (`--api-key`); a config file that sets it is refused.
 - The startup line `[server] engine: ...` lists the settings that came from the file or the command line; without
   `--config` it says the built-in defaults apply.
+
+### Prompt chunks: `--prefill`
+
+A prompt is read in chunks. `--prefill auto` (the usual setting) takes the largest chunk whose buffers the expert cache
+can lend: the buffers are carved from the cache's last slots for the length of the prompt and the experts in those slots
+are copied back afterwards, so a short prompt lends only what it needs. A bare `auto` starts its ceiling at 32768 tokens
+and, with `--resident-experts`, cuts it to the lent slots whose experts the RAM copy holds plus a fixed amount of file
+reading; without `--resident-experts` it stays at 8192. `--prefill auto:16384` or `auto:32768` sets the ceiling
+yourself; a number sets a fixed chunk. A prompt longer than one chunk is split into the fewest equal chunks (a short tail
+chunk costs nearly a whole pass over the streamed experts). The startup line `prompt chunk auto: N tokens` says what was
+chosen.
 
 ## The `.basalt` model file
 
@@ -161,7 +185,17 @@ path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer
 The IQ3_S, IQ3_XXS and Q2_0 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
 raises draft acceptance. Output is unchanged, because verify decides every token. Q4_K_XL and Q8_0 keep the original
 MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's raw bytes, checked against the
-source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`.
+source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`. The tuned layer ships with the
+packs, inside the model file; the converter input is only needed to build a pack yourself.
+
+A longer run of the same gate on the IQ3_S pack: 100 chunks of wikitext-2 (512 tokens each), 400 W.
+
+| model | PPL | KLD mean | same top-1 |
+|---|---:|---:|---:|
+| GSQ-RCO IQ3_S | 3.3723 | 0.1526 | 87.16% |
+| Q8_0 (base) | 3.2861 | reference | |
+
+The 100-chunk text is a larger sample than the first 20 chunks, so its PPL is not comparable with the table above.
 
 The model files are derived from Qwen3.8-Flash-Next and are distributed under the
 [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT
