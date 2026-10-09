@@ -165,13 +165,26 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
     }
 }
 
-template <int TYPE, typename T>
+// One thread per 32-value group.  VEC: the group's outputs are collected in registers and written as 16-byte stores
+// (the destination is 16-byte aligned and a group is 32 values), instead of 32 scalar stores.
+template <int TYPE, typename T, bool VEC>
 __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
                                int64_t groups_per_row, T* __restrict__ out) {
     const int64_t g = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= rows * groups_per_row) return;
     const int64_t r = g / groups_per_row, gi = g % groups_per_row;
-    group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
+    const uint8_t* row = blocks + (row0 + r) * row_bytes;
+    if constexpr (VEC) {
+        T tmp[32];
+        group32<TYPE>(row, (int) gi, tmp);
+        constexpr int n16 = 32 * (int) sizeof(T) / 16;
+        const uint4* src = reinterpret_cast<const uint4*>(tmp);
+        uint4* dst = reinterpret_cast<uint4*>(out + g * 32);
+#pragma unroll
+        for (int i = 0; i < n16; ++i) dst[i] = src[i];
+    } else {
+        group32<TYPE>(row, (int) gi, out + g * 32);
+    }
 }
 
 bool geometry(int type, int& block_elems, int& block_bytes) {
@@ -203,7 +216,11 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
-#define DEQUANT_CASE(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
+const bool vec = (reinterpret_cast<uintptr_t>(out) & 15) == 0;
+#define DEQUANT_CASE(TY) \
+    if (vec) dequant_kernel<TY, T, true><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); \
+    else dequant_kernel<TY, T, false><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); \
+    break
     switch (type) {
     case 2: DEQUANT_CASE(2);
     case 6: DEQUANT_CASE(6);
