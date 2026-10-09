@@ -441,6 +441,7 @@ struct Options {
     /// Opt-in: the largest chunk `--prefill auto` may take - 8192 by default; `--prefill auto:16384` or
     /// `auto:32768` lets it go further, never past the context
     int64_t prefill_auto_max = 8192;
+    bool prefill_auto_fit = false;   // a bare `auto`: the ceiling is what the lend can fund (see auto_ceiling)
     bool no_split_rows = false;   // A/B: one whole expert per pool thread
     /// The prompt path borrows the top expert-cache slots for its buffers and refills them after the prompt (default);
     /// `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -1382,7 +1383,8 @@ int main(int argc, char** argv) {
             o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
             // auto:N (N = 16384 or 32768) lets auto take chunks above 8192
             const long long want_max = v.rfind("auto:", 0) == 0 ? std::atoll(v.c_str() + 5) : 8192;
-            o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
+            o.prefill_auto_fit = v == "auto";
+            o.prefill_auto_max = o.prefill_auto_fit || want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
@@ -4286,7 +4288,10 @@ int main(int argc, char** argv) {
     const int64_t kAutoLendPct = basalt::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85;
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
     // but a bare `auto` always reaches 8192.  32768 and 16384 stay opt-in.
-    const int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
+    // A bare `auto` starts at the top and is cut back once the RAM complement is built (below), to what the
+    // lend can fund; without the resident RAM mode there is no complement to size it from, so it stays at 8192.
+    int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
+    if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
     // The auto scan bisects on the 256-token grid the prompt path works on (`request_chunk` rounds up to it):
     // `bytes_needed` is a sum of (T x positive constant) terms plus a max of such sums, so it rises monotonically
     // with T, and so does every test the scan applies - the largest size that fits is a bisection, one `bytes_needed`
@@ -4391,6 +4396,14 @@ int main(int argc, char** argv) {
             }
             else
                 err = whole_err + "; " + err;
+        }
+        if (resident_ok && o.prefill_auto_fit && lend_from >= 0) {
+            // A lent slot whose expert the complement holds is refilled from RAM; the others are read from the file.
+            // Allow the backed slots plus a fixed amount of file reading per prompt.
+            constexpr uint64_t kUnbackedLendBytes = 3584ull << 20;
+            const int64_t allow = src.resident_lent_slots() +
+                                  (int64_t) (kUnbackedLendBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
+            auto_ceiling = std::max<int64_t>(8192, biggest_chunk(auto_ceiling, [&](int64_t t) { return lend_slots(t) <= allow; }));
         }
         if (resident_ok) {
             if (o.serve) basalt::platform::watch_resident_ram(true, src.resident_bytes());
@@ -7075,7 +7088,13 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = request_chunk(tokens, o.prefill_chunk);
+                int64_t want_full = request_chunk(tokens, o.prefill_chunk);
+                if (want_full > 0 && tokens > o.prefill_chunk) {
+                    // equal chunks for the fewest chunks: every chunk streams the experts, so a short tail costs a
+                    // whole stream
+                    const int64_t parts = (tokens + o.prefill_chunk - 1) / o.prefill_chunk;
+                    want_full = request_chunk((tokens + parts - 1) / parts, o.prefill_chunk);
+                }
                 const int64_t want = want_full;
                 if (want <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";
