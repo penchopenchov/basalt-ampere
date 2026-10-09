@@ -7100,12 +7100,20 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
-                int64_t want_full = request_chunk(tokens, o.prefill_chunk);
-                if (want_full > 0 && tokens > o.prefill_chunk) {
+                // A bare `auto` reads a prompt in equal chunks of at most this many tokens: past a few thousand tokens
+                // a chunk's cost per token stops falling (its experts stream once whatever its size) and then rises
+                // with the chunk, so the rule is the fewest equal parts of at most this size, never a small tail.  An
+                // exclusive peer tier streams its experts through the host, which pays for larger chunks.  `auto:N`
+                // and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
+                // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
+                const int64_t cap = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, o.peer_exclusive ? 16384 : 12288)
+                                                       : o.prefill_chunk;
+                int64_t want_full = request_chunk(tokens, cap);
+                if (want_full > 0 && tokens > cap) {
                     // equal chunks for the fewest chunks: every chunk streams the experts, so a short tail costs a
                     // whole stream
-                    const int64_t parts = (tokens + o.prefill_chunk - 1) / o.prefill_chunk;
-                    want_full = request_chunk((tokens + parts - 1) / parts, o.prefill_chunk);
+                    const int64_t parts = (tokens + cap - 1) / cap;
+                    want_full = request_chunk((tokens + parts - 1) / parts, cap);
                 }
                 const int64_t want = want_full;
                 if (want <= 0) {
