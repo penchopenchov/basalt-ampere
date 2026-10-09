@@ -5836,6 +5836,8 @@ int main(int argc, char** argv) {
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         // a prompt read on its own thread beside the slots' windows: the tier stays as it is meanwhile
         bool ov_active = false;
+        std::function<bool()> ov_post;   // what the overlapped read's thread does right after its last chunk
+        bool ov_post_done = false;
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
             if (in_lines.empty()) return false;
@@ -7014,14 +7016,16 @@ int main(int argc, char** argv) {
             // its own cache and its own device - a slot refilled into the wrong cache would leave that stage's cache
             // holding an expert it does not own, which is silent and produces plausible tokens.
             // (split in two halves so a layer split can queue every stage's copies before it waits for any)
-            auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
+            // `copied`: the copies already ran (and were waited for) on the overlapped read's thread, so only the table is left
+            bool ov_copied = false;
+            auto refill_issue = [&](PfPart& p, std::string& e, bool assign = true) -> bool {
                 const basalt::core::OnDevice on(p.dev);
                 for (const auto& [i, slot] : p.lent) {   // queued, one wait
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
-                    host_res[(size_t) i] = slot;
+                    if (assign) host_res[(size_t) i] = slot;
                 }
                 return true;
             };
@@ -7034,6 +7038,13 @@ int main(int argc, char** argv) {
             };
             auto refill_one = [&](PfPart& p, std::string& e) -> bool {
                 if (p.lent.empty()) return true;
+                if (ov_copied) {
+                    for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
+                    p.lent.clear();
+                    p.lent_chunk = 0;
+                    ov_copied = false;
+                    return true;
+                }
                 return refill_issue(p, e) && refill_wait(p, e);
             };
             // with several stages every stage's copies go out first (each card on its own link), then each is waited
@@ -7073,7 +7084,7 @@ int main(int argc, char** argv) {
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        if (want <= p.lent_chunk && !ov_copied) continue;   // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -7148,6 +7159,11 @@ int main(int argc, char** argv) {
                     std::thread th([&] {
                         const basalt::core::OnDevice on(0);
                         ok = sp.run(ids.data() + a0, b0 - a0, a0, terr);
+                        if (ok && ov_post) {   // (the checkpoint's copy to the host beside the windows)
+                            ok = ov_post();
+                            ov_post_done = ok;
+                            if (!ok) terr = "saving a conversation checkpoint failed" + ckpt_why;
+                        }
                         std::lock_guard<std::mutex> lk(mail.mu);
                         mail.fin = true;
                         mail.cv.notify_all();
@@ -7349,8 +7365,30 @@ int main(int argc, char** argv) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
+                // beside slots: a window between the serial steps of a short read keeps them from stopping
+                auto ov_window = [&]() -> bool {
+                    if (!ov_gate || !batch_on()) return true;
+                    if (!batch_step()) { batch_fatal = true; err = "a batch window failed"; return false; }
+                    if (mtp_on && !mtp.use_main(err)) return false;
+                    return true;
+                };
+                if (win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                ov_post_done = false;
+                ov_post = [&, to]() -> bool {
+                    if ((to == turn_at || to == root_at) && !checkpoint_at(to)) return false;
+                    // the lent slots get their experts back here, beside the windows; the table follows on the main thread
+                    for (PfPart& p : pf_parts) {
+                        if (p.lent.empty()) continue;
+                        std::string re;
+                        const basalt::core::OnDevice on(p.dev);
+                        if (!refill_issue(p, re, false) || !p.cache->sync_queued(re)) { ckpt_why = ": " + re; return false; }
+                    }
+                    ov_copied = true;
+                    return true;
+                };
                 const auto tsp = Clock::now();
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
+                if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
@@ -7368,7 +7406,8 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                ov_post = nullptr;
+                if ((to == turn_at || to == root_at) && !ov_post_done && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
