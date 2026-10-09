@@ -673,7 +673,7 @@ class ProcessEngine:
     def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
         """Whether a request alone in a slot should go back to the solo path (needs INFO slot_cache=1)."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache")):
+                not (self.info or {}).get("slot_cache") or (self.info or {}).get("slot0_solo")):
             return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
@@ -712,12 +712,12 @@ class ProcessEngine:
                         return
                     holding, born = True, self.gen
                 with self.slot_cv:
-                    alone = not any(self.slot_busy) and self.waiting == 0
+                    # With slot 0 as the solo session, every conversation stays in its own slot (a solo run would copy
+                    # its conversation into slot 0 over the one that slot holds), so a lone request is a batch of one.
+                    alone = not any(self.slot_busy) and self.waiting == 0 and not self.info.get("slot0_solo")
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
-                    if self.info.get("slot0_solo"):
-                        self.slot_held[0] = []              # the solo state is slot 0's: it holds this request now
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
@@ -741,8 +741,6 @@ class ProcessEngine:
                             yield None
                     phase = "none"                          # DONE was read
                     self._note_first_reused(first, last0)
-                    if self.info.get("slot0_solo") and not self.slot_busy[0]:
-                        self.slot_held[0] = list(ids) + out[:-1]   # the engine keeps this conversation in slot 0
                     while pending:
                         t = pending.pop(0)
                         out.append(t)

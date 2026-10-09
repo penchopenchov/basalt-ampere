@@ -32,7 +32,9 @@ ready = int(args[args.index("--ready") + 1]) if "--ready" in args else 4096
 MULTI = int(args[args.index("--multi") + 1]) if "--multi" in args else 3
 nopp = "--nopp" in args               # no PP lines while a prompt is read: a read beside the windows reports none
 STEP = 0.02
-CH = 32
+s0 = "--slot0solo" in args           # slot 0 is the solo session: GEN copies the best slot's conversation over slot 0
+CH = 4096 if s0 else 32
+sstore = {}                           # slot -> the stream its storage holds (s0 only)
 keep = "--reuse" in args              # a conversation cache: a prompt reuses the longest start some earlier stream had
 held = []                             # streams (prompt + tokens read so far) of earlier requests
 def lcp(a, b):
@@ -51,7 +53,7 @@ def reader():
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
-      (" slot_cache=1" if "--slotcache" in args else ""), flush=True)
+      (" slot_cache=1" if "--slotcache" in args else "") + (" slot0_solo=1" if s0 else ""), flush=True)
 print(f"READY {ready} stop", flush=True)
 LONG = list(b"LONGREPLY")
 def reply(ids):            # the rest of the reply after what the prompt already ends with (a request continued)
@@ -114,10 +116,13 @@ while True:
             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
         toks = reply(ids)
         reused = min(max([lcp([int(x) for x in ids], h) for h in held], default=0), len(ids) - 1) if keep else 0
+        if s0:
+            src = [sstore.get(slot, [])] if slot is not None else list(sstore.values())
+            reused = min(max([lcp([int(x) for x in ids], h) for h in src], default=0), len(ids) - 1)
         stop.clear()
         # the prompt read: CH tokens a chunk, a PP line each; a BYIELD <s> gives way at a chunk boundary
         given = None
-        for q in range(CH, len(ids) - 1, CH):
+        for q in range(CH * (reused // CH + 1) if s0 else CH, len(ids) - 1, CH):
             time.sleep(STEP / 2)
             if not nopp:
                 print(f"PP {q} {len(ids)} 1 1", flush=True)
@@ -158,6 +163,8 @@ while True:
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
         dc = f"{out} {2 * out}" if "--draft-counts" in args and slot is None else "0 0"   # a solo run drafts
         print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} {dc} {reused}", flush=True)
+        if s0:
+            sstore[0 if slot is None else slot] = [int(x) for x in ids] + toks[:-1]
         if keep:
             mine = [int(x) for x in ids] + toks[:out]
             held[:] = [h for h in held if mine[:len(h)] != h] + [mine]
@@ -203,7 +210,7 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False):
+              nopp=False, reuse=False, slot0_solo=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -218,6 +225,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--multi", str(multi)] if multi else []
         extra += ["--nopp"] if nopp else []
         extra += ["--reuse"] if reuse else []
+        extra += ["--slot0solo"] if slot0_solo else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -588,6 +596,54 @@ class ParallelService(unittest.TestCase):
         got = self.usages([text, "another"], gap=0.1, max_tokens=400)
         u = got[0]
         self.assertLessEqual(u["prompt_tokens_details"]["cached_tokens"], u["prompt_tokens"], u)
+
+    def convo(self, msgs, text):
+        """One more turn of the conversation `msgs`: its usage; the reply is added to `msgs`."""
+        msgs.append({"role": "user", "content": text})
+        body = {"messages": msgs, "max_tokens": 16, "reasoning_effort": "none"}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            j = json.loads(r.read().decode())
+        msgs.append({"role": "assistant", "content": j["choices"][0]["message"]["content"]})
+        return j["usage"]
+
+    def kept(self, u, before):
+        """Whether a turn reused the previous turn's whole prompt, but for a short tail."""
+        return u["prompt_tokens_details"]["cached_tokens"] >= before - 40
+
+    def test_alternating_conversations_each_keep_their_slot_when_slot_0_is_the_solo_session(self):
+        self.start(2, reuse=True, slot_cache=True, slot0_solo=True, ready=200000)
+        a = [{"role": "user", "content": "conversation A " + "a" * 70000}, {"role": "assistant", "content": "ok, done."}]
+        b = [{"role": "user", "content": "conversation B " + "b" * 60000}, {"role": "assistant", "content": "ok, done."}]
+        sizes = {"a": self.convo(a, "first")["prompt_tokens"], "b": self.convo(b, "first")["prompt_tokens"]}
+        for turn in range(4):                    # every request alone: they alternate
+            for name, msgs in (("a", a), ("b", b)):
+                u = self.convo(msgs, f"turn {turn} " + name * 300)
+                self.assertTrue(self.kept(u, sizes[name]), (name, turn, u, sizes[name]))
+                sizes[name] = u["prompt_tokens"]
+        for turn in range(3):                    # one conversation alone for a while
+            u = self.convo(a, f"alone {turn}")
+            self.assertTrue(self.kept(u, sizes["a"]), (turn, u, sizes["a"]))
+            sizes["a"] = u["prompt_tokens"]
+        u = self.convo(b, "back")                # and the other one is still where it was
+        self.assertTrue(self.kept(u, sizes["b"]), (u, sizes["b"]))
+        sizes["b"] = u["prompt_tokens"]
+        kinds = {x.split()[0] for x in self.log.read_text().splitlines() if not x.startswith("YIELD")}
+        self.assertEqual(kinds, {"BGEN"})        # a lone request is a batch of one: no solo run copies into slot 0
+
+    def test_a_third_conversation_evicts_the_least_recently_used_slot(self):
+        self.start(2, reuse=True, slot_cache=True, slot0_solo=True, ready=200000)
+        a = [{"role": "user", "content": "conversation A " + "a" * 20000}, {"role": "assistant", "content": "ok, done."}]
+        b = [{"role": "user", "content": "conversation B " + "b" * 20000}, {"role": "assistant", "content": "ok, done."}]
+        c = [{"role": "user", "content": "conversation C " + "c" * 20000}, {"role": "assistant", "content": "ok, done."}]
+        sizes = [self.convo(m, "first")["prompt_tokens"] for m in (a, b)]
+        sizes[0] = self.convo(a, "again")["prompt_tokens"]              # A is now the most recently used
+        self.assertLess(self.convo(c, "first")["prompt_tokens_details"]["cached_tokens"], 100)   # (the template's head)
+        u = self.convo(a, "after C")
+        self.assertTrue(self.kept(u, sizes[0]), (u, sizes))             # A kept its slot
+        u = self.convo(b, "after C")                                    # B was the one evicted
+        self.assertLess(u["prompt_tokens_details"]["cached_tokens"], 100, u)
 
     def check_counts(self, timings, batch_admissions):
         # the fake drafts 2 per accepted; the admission's own token is nobody's draft
