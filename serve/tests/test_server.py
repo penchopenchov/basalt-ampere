@@ -2324,6 +2324,23 @@ class ThinkingEngine(MockEngine):
             yield t
 
 
+class CachingThinkingEngine(ThinkingEngine):
+    """Each pass ends with a DONE-like `last`: a cache holding FIRST tokens, and what the pass's prompt shares with
+    the previous pass's stream (a continued request finds its own prompt and tokens there)."""
+    FIRST = 3
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        reused = self.FIRST if not self.prompts else len(self.prompts[-1])
+        n = 0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                n += 1
+                yield t
+        finally:
+            self.last = {"generated": n, "prompt_tokens": len(ids), "prompt_ms": 40.0, "decode_ms": 20.0 * n,
+                         "finish": "stop", "reused": min(reused, len(ids)), "hits": 9, "lookups": 10}
+
+
 class ThinkingBudget(unittest.TestCase):
     """reasoning_budget_tokens: at the budget the thinking is wrapped up and the model answers."""
 
@@ -2359,6 +2376,16 @@ class ThinkingBudget(unittest.TestCase):
         msg = b["choices"][0]["message"]
         self.assertEqual((msg["reasoning_content"], msg["content"]), (ThinkingEngine.THOUGHT, ThinkingEngine.ANSWER))
         self.assertEqual(len(self.engine.prompts), 1)
+
+    def test_cached_tokens_of_a_wrapped_up_request_come_from_its_first_pass(self):
+        self.engine = CachingThinkingEngine(self.tok)
+        self.svc.engine = self.engine
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)               # the second pass extends the first
+        self.assertEqual(b["usage"]["prompt_tokens_details"]["cached_tokens"], CachingThinkingEngine.FIRST)
+        self.assertEqual(b["timings"]["cache_n"], CachingThinkingEngine.FIRST)
+        self.assertEqual(b["timings"]["prompt_n"] + b["timings"]["cache_n"], b["usage"]["prompt_tokens"])
 
     def test_the_budget_wraps_up_the_thinking(self):
         from serve.service import REASONING_WRAP_UP
