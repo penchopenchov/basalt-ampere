@@ -50,6 +50,10 @@ The kernel parity tests need the GPU; the file-format, cache and memory unit tes
 need local expert data (`experts.bin` in the source directory, not shipped), and `platform_memory_test` needs a locked-memory
 limit raised first (`ulimit -l`); without that, those three fail.
 
+`basalt-bench` reads its pre-tokenized prompts from `data/bench` (token ids for the Qwen3.8-Flash-Next tokenizer: the
+three decode prompts and a prefill filler); run it from the repository root or pass `--fixtures DIR`. `basalt-bench
+--help` says how the files are made.
+
 The build needs nothing outside this repository and fetches nothing. The parts of ggml and llama.cpp that Basalt uses
 (quantization formats, CPU dot products, the prompt path's MMQ kernels) are extracted into `src/` and `include/basalt/ggml/`,
 with their MIT licence in `THIRD_PARTY_LICENSES`.
