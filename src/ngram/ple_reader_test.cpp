@@ -7,10 +7,12 @@
 // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
 #include "basalt/artifact/dequant.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/platform/direct_file.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -197,10 +199,65 @@ int selftest(const std::string& dir, uint32_t rb) {
     return g_fail ? 1 : 0;
 }
 
+// A decode-shaped thread (prefetch a window's tokens, then gather exactly those) beside a prompt-shaped thread
+// (large gather_rows requests) on one table: every result must equal the mapped table's, and neither side may
+// see a ticket error.
+void stress(k::PleTable& mm, k::PleTable& direct, double secs) {
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> n_decode{0}, n_prompt{0};
+    const uint64_t N = direct.rows();
+    auto expect = [&](const uint32_t* rows, size_t tokens, const std::vector<float>& got, const char* who) {
+        std::vector<float> ref(k::NG_N_EMBD);
+        for (size_t t = 0; t < tokens; ++t) {
+            mm.gather(rows + t * k::PLE_N_HEADS, ref.data());
+            CHECK(!std::memcmp(ref.data(), got.data() + t * k::NG_N_EMBD, ref.size() * sizeof(float)), "%s: token %zu differs", who, t);
+        }
+    };
+    std::thread dec([&] {
+        std::mt19937_64 rng(1);
+        while (!stop.load()) {
+            const size_t T = 1 + rng() % 8;
+            std::vector<uint32_t> rows(T * k::PLE_N_HEADS);
+            for (auto& r : rows) r = (uint32_t) (rng() % N);
+            for (size_t t = 0; t < T; ++t) direct.prefetch_rows(rows.data() + t * k::PLE_N_HEADS);
+            std::vector<float> out(T * k::NG_N_EMBD);
+            std::string err;
+            if (!direct.gather_batch(rows.data(), T, out.data(), err)) { CHECK(false, "decode gather_batch: %s", err.c_str()); break; }
+            expect(rows.data(), T, out, "decode");
+            ++n_decode;
+        }
+    });
+    std::thread pre([&] {
+        std::mt19937_64 rng(2);
+        while (!stop.load()) {
+            const size_t T = 64 + rng() % 192;
+            std::vector<uint32_t> rows(T * k::PLE_N_HEADS);
+            for (auto& r : rows) r = (uint32_t) (rng() % N);
+            std::vector<float> out(T * k::NG_N_EMBD);
+            std::string err;
+            if (!direct.gather_rows(rows.data(), T, out.data(), err)) { CHECK(false, "prompt gather_rows: %s", err.c_str()); break; }
+            expect(rows.data(), T, out, "prompt");
+            ++n_prompt;
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::duration<double>(secs));
+    stop.store(true);
+    dec.join();
+    pre.join();
+    std::printf("stress %.0f s: %llu decode gathers, %llu prompt gathers\n", secs, (unsigned long long) n_decode.load(),
+                (unsigned long long) n_prompt.load());
+}
+
 int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
-         bool direct_only, bool sync_submit) {
+         bool direct_only, bool sync_submit, double stress_secs) {
     k::PleTable mm, direct;
     std::string err;
+    basalt::core::ModelFile container;   // a .basalt file serves its source tensors as a GGUF view
+    if (gguf.size() > 7 && gguf.compare(gguf.size() - 7, 7, ".basalt") == 0 &&
+        (!container.open(gguf, err) || !container.load_meta(err) || !container.register_gguf_view(err))) {
+        std::fprintf(stderr, "container open: %s\n", err.c_str());
+        return 2;
+    }
     k::PleIoOptions mo;
     mo.mode = k::PleIo::Mmap;
     k::PleIoOptions dopt;
@@ -257,6 +314,7 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
         if (!direct_only)
             CHECK(!std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), "token rows differ between mmap and direct");
     }
+    if (stress_secs > 0 && !direct_only) stress(mm, direct, stress_secs);
     std::printf("tokens %zu: mmap %.1f us/token, direct %.1f us/token (issue on this thread %.1f us)\n%s\n",
                 tickets.size(), t_mm / (double) tickets.size(), t_dir / (double) tickets.size(),
                 t_issue / (double) tickets.size(), direct.io_report().c_str());
@@ -302,6 +360,7 @@ int main(int argc, char** argv) {
     bool direct_only = false;
     bool sync_submit = false;
     bool self = false;
+    double stress_secs = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") self = true;
@@ -313,7 +372,8 @@ int main(int argc, char** argv) {
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
         else if (a == "--sync") sync_submit = true;
-        else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
+        else if (a == "--stress" && i + 1 < argc) stress_secs = std::atof(argv[++i]);
+        else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--stress SECS]\n"); return 2; }
     }
     if (self) {
         // ng::ROW_BYTES (90, IQ4_NL, production default), 110 (Q5_0) and 170 (Q8_0) rows through the
@@ -324,7 +384,7 @@ int main(int argc, char** argv) {
         const int q8 = q8_decode_check();
         return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8;
     }
-    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit);
+    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, stress_secs);
     std::fprintf(stderr, "nothing to do\n");
     return 2;
 }

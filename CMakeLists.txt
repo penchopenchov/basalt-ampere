@@ -603,7 +603,7 @@ endif()
 # the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
 add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
 target_include_directories(ple_reader_test PRIVATE ${_gpu_include_directories})
-target_link_libraries(ple_reader_test PRIVATE kernels ${_gpu_runtime_target})
+target_link_libraries(ple_reader_test PRIVATE kernels core ${_gpu_runtime_target})
 add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 
 # The GPU test runs ON THE TARGET PC. `--selftest` allocates

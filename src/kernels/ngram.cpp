@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <mutex>
 #include <sys/mman.h>
 #include <vector>
 #include <stdexcept>
@@ -113,11 +115,15 @@ struct PleTable::Impl {
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
     PleFormat fmt = PleFormat::IQ4_NL;
-    mutable uint64_t bytes_read = 0;
+    mutable std::atomic<uint64_t> bytes_read{0};
     // Direct mode: the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
     basalt::ngram::PleReader reader;
+    // `ring_mu` guards the single-token slot (ticket, pending, rows) and the prefetch ring (n_prefetch,
+    // prefetch_tickets, prefetch_keys). It is held only to read or change those fields, never across a reader
+    // wait or an SSD read. The ring and the slot belong to the decode path; the prompt path uses `gather_rows`.
+    std::mutex ring_mu;
     basalt::ngram::PleReader::Ticket ticket;
     bool pending = false;
     bool locked = false;
@@ -244,21 +250,33 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
 }
 
 void PleTable::wait_prefetches() {
-    if (impl_->n_prefetch == 0) return;
+    basalt::ngram::PleReader::Ticket claimed[Impl::kMaxPrefetch];
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(impl_->ring_mu);
+        n = impl_->n_prefetch;
+        std::memcpy(claimed, impl_->prefetch_tickets, n * sizeof(claimed[0]));
+        impl_->n_prefetch = 0;
+    }
     std::string dummy;
-    for (size_t i = 0; i < impl_->n_prefetch; ++i) (void) impl_->reader.collect(impl_->prefetch_tickets[i], dummy);
-    impl_->n_prefetch = 0;
+    for (size_t i = 0; i < n; ++i) (void) impl_->reader.collect(claimed[i], dummy);
 }
 
 void PleTable::prefetch_rows(const uint32_t* rows16) {
-    if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
-        for (size_t i = 0; i < impl_->n_prefetch; ++i)
-            if (std::memcmp(impl_->prefetch_keys[i], rows16, sizeof(uint32_t) * PLE_N_HEADS) == 0) return;
-        if (impl_->n_prefetch >= Impl::kMaxPrefetch) wait_prefetches();
-        const size_t slot = impl_->n_prefetch++;
-        std::memcpy(impl_->prefetch_keys[slot], rows16, sizeof(uint32_t) * PLE_N_HEADS);
-        impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
-        return;
+    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(impl_->ring_mu);
+            for (size_t i = 0; i < impl_->n_prefetch; ++i)
+                if (std::memcmp(impl_->prefetch_keys[i], rows16, sizeof(uint32_t) * PLE_N_HEADS) == 0) return;
+            if (impl_->n_prefetch < Impl::kMaxPrefetch) {
+                const size_t slot = impl_->n_prefetch++;
+                std::memcpy(impl_->prefetch_keys[slot], rows16, sizeof(uint32_t) * PLE_N_HEADS);
+                impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
+                return;
+            }
+        }
+        wait_prefetches();    // the ring is full: drain it outside the lock, then take a slot
     }
 }
 
@@ -308,6 +326,7 @@ void PleTable::read_row(uint32_t row, float* out160) const {
 
 bool PleTable::issue(const uint32_t* rows16) {
     wait_prefetches();
+    std::lock_guard<std::mutex> lk(impl_->ring_mu);
     std::memcpy(impl_->rows, rows16, sizeof impl_->rows);
     if (impl_->mode == PleIo::Direct) {
         if (impl_->pending) return false;              // one token in flight per table
@@ -320,10 +339,15 @@ bool PleTable::issue(const uint32_t* rows16) {
 }
 
 bool PleTable::collect(float* out2560, std::string& err) {
-    if (!impl_->pending) { err = "PleTable::collect without issue"; return false; }
-    impl_->pending = false;
+    basalt::ngram::PleReader::Ticket t;
+    {
+        std::lock_guard<std::mutex> lk(impl_->ring_mu);
+        if (!impl_->pending) { err = "PleTable::collect without issue"; return false; }
+        impl_->pending = false;
+        t = impl_->ticket;
+    }
     if (impl_->mode == PleIo::Direct) {
-        if (!impl_->reader.collect(impl_->ticket, err)) return false;
+        if (!impl_->reader.collect(t, err)) return false;
         for (int h = 0; h < PLE_N_HEADS; ++h)
             impl_->decode(impl_->raw + (size_t) h * impl_->rb, out2560 + (size_t) h * PLE_HEAD_DIM);
         impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
@@ -333,39 +357,10 @@ bool PleTable::collect(float* out2560, std::string& err) {
     return true;
 }
 
-bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
-    if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
+bool PleTable::gather_rows(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
-        // Fast path: if all requested tokens match our in-flight/completed prefetch slots, collect them directly
-        // without issuing a second PleReader ticket or copying through RowCache.
-        if (impl_->n_prefetch >= n_tokens && n_tokens <= Impl::kMaxPrefetch) {
-            bool exact_match = true;
-            for (size_t t = 0; t < n_tokens; ++t) {
-                if (std::memcmp(impl_->prefetch_keys[t], rows + t * PLE_N_HEADS, sizeof(uint32_t) * PLE_N_HEADS) != 0) {
-                    exact_match = false;
-                    break;
-                }
-            }
-            if (exact_match) {
-                for (size_t i = 0; i < impl_->n_prefetch; ++i) {
-                    if (!impl_->reader.collect(impl_->prefetch_tickets[i], err)) {
-                        impl_->n_prefetch = 0;
-                        return false;
-                    }
-                }
-                impl_->n_prefetch = 0;
-                for (size_t t = 0; t < n_tokens; ++t) {
-                    for (int h = 0; h < PLE_N_HEADS; ++h) {
-                        impl_->decode(impl_->prefetch_raw[t] + (size_t) h * impl_->rb,
-                                      out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
-                    }
-                }
-                impl_->bytes_read += (uint64_t) n * impl_->rb;
-                return true;
-            }
-        }
-        wait_prefetches();
+        // own ticket and own buffer: nothing here touches the decode path's ring or single-token slot
         std::vector<uint8_t> raw(n * impl_->rb);
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
         if (!impl_->reader.collect(ticket, err)) return false;
@@ -373,9 +368,46 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;
     }
-    wait_prefetches();
     for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     return true;
+}
+
+bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    if (impl_->mode != PleIo::Direct) {
+        if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
+        return gather_rows(rows, n_tokens, out, err);
+    }
+    // Fast path: the requested tokens are exactly the in-flight prefetches, so collect those instead of issuing
+    // a second request. The tickets are claimed under the lock and collected outside it.
+    basalt::ngram::PleReader::Ticket claimed[Impl::kMaxPrefetch];
+    size_t n_claimed = 0;
+    {
+        std::lock_guard<std::mutex> lk(impl_->ring_mu);
+        if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
+        if (impl_->n_prefetch >= n_tokens && n_tokens <= Impl::kMaxPrefetch) {
+            bool exact_match = true;
+            for (size_t t = 0; t < n_tokens && exact_match; ++t)
+                exact_match = std::memcmp(impl_->prefetch_keys[t], rows + t * PLE_N_HEADS, sizeof(uint32_t) * PLE_N_HEADS) == 0;
+            if (exact_match) {
+                n_claimed = impl_->n_prefetch;
+                std::memcpy(claimed, impl_->prefetch_tickets, n_claimed * sizeof(claimed[0]));
+                impl_->n_prefetch = 0;
+            }
+        }
+    }
+    if (n_claimed > 0) {
+        bool ok = true;
+        for (size_t i = 0; i < n_claimed; ++i) ok = impl_->reader.collect(claimed[i], err) && ok;
+        if (!ok) return false;
+        for (size_t t = 0; t < n_tokens; ++t)
+            for (int h = 0; h < PLE_N_HEADS; ++h)
+                impl_->decode(impl_->prefetch_raw[t] + (size_t) h * impl_->rb, out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) n * impl_->rb;
+        return true;
+    }
+    wait_prefetches();
+    return gather_rows(rows, n_tokens, out, err);
 }
 
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
