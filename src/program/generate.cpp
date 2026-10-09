@@ -7174,6 +7174,42 @@ int main(int argc, char** argv) {
             // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  Cooperative preemption, with a slot as the park.
+            // BYIELD: a read gives way at a chunk boundary after `q` tokens, into slot `ys`, when the rest is read the same
+            // way afterwards (more than a chunk and a short read left), text only, and the slot is not decoding
+            auto can_yield = [&](int64_t q, int64_t b0, int ys) -> bool {
+                return ys >= 0 && ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                       n + (admit_slot >= 0 ? admit_max_new : (long long) max_new) + 8 <= slot_cap[(size_t) ys] &&
+                       (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
+                       (!in_slot || ys == admit_slot) && b0 - q > std::max<int64_t>(std::max<int64_t>(sp.chunk(), 1), o.short_read);
+            };
+            // the first `q` tokens of this read go to slot `ys`, which holds them until the request is sent again
+            auto park_read = [&](int64_t q, int ys, std::string& ye) -> bool {
+                std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
+                if (!copy_to_slot(ys, pre, ye)) {
+                    bs[(size_t) ys].cached = false;   // half written
+                    return false;
+                }
+                if (in_slot) {   // the read ran in this slot's own state: its PLE token window goes with it
+                    basalt::core::SessionState& t = *bslot_ss[0][(size_t) ys];
+                    t.ple_prev[0] = rview.ple_prev[0];
+                    t.ple_prev[1] = rview.ple_prev[1];
+                    t.ple_token = rview.ple_token;
+                }
+                BSlot& sl = bs[(size_t) ys];
+                sl = BSlot{};
+                sl.ids = std::move(pre);
+                sl.cached = true;
+                sl.partial = true;
+                sl.partial_from0 = read_from == 0 || resumed_from0;
+                sl.cvec = cvec_cached;
+                for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
+                    if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
+                            [](int32_t x, int64_t y) { return (int64_t) x == y; }))
+                        sl.checks.push_back(c);
+                yielded_at = q;
+                yielded_slot = ys;
+                return true;
+            };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
@@ -7192,12 +7228,30 @@ int main(int argc, char** argv) {
                     std::atomic<bool> abort_read{false};
                     bool ok = false;
                     std::string terr;
+                    int yield_req = -1;                 // a BYIELD <slot> not acted on yet
+                    int64_t yield_q = -1;               // the chunk boundary the read stopped at, to give way
+                    int yield_slot = -1;
                     auto orig_chunk = sp.on_chunk;
                     auto orig_stop = sp.should_stop;
                     sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& ce) -> bool {
                         bool r = false;
                         std::unique_lock<std::mutex> lk(mail.mu);
-                        mail.job = [&] { r = orig_chunk ? orig_chunk(R_rows, T, p0, ce) : true; };
+                        mail.job = [&] {
+                            r = orig_chunk ? orig_chunk(R_rows, T, p0, ce) : true;
+                            if (!r || yield_req < 0) return;
+                            // a shorter request waits: the read stops after this chunk (the draft layer has it) when the
+                            // slot can take what was read, or goes on
+                            const int ys = yield_req;
+                            yield_req = -1;
+                            if (can_yield(p0 + T, b0, ys)) {
+                                yield_q = p0 + T;
+                                yield_slot = ys;
+                                abort_read.store(true);
+                            } else {
+                                std::fprintf(stderr, "basalt batch: BYIELD %d not taken at %lld of %lld\n", ys,
+                                             (long long) (p0 + T), (long long) n);
+                            }
+                        };
                         mail.job_done = false;
                         mail.cv.wait(lk, [&] { return mail.job_done; });
                         return r;
@@ -7237,12 +7291,15 @@ int main(int argc, char** argv) {
                             mail.cv.notify_all();
                             continue;
                         }
-                        {   // a BSTOP that came meanwhile ends its slot at its next window
+                        {   // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD is for this read
                             std::lock_guard<std::mutex> lk(in_mu);
                             for (auto it = in_lines.begin(); it != in_lines.end();) {
                                 if (it->rfind("BSTOP ", 0) == 0) {
                                     const int b = std::atoi(it->c_str() + 6);
                                     if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                    it = in_lines.erase(it);
+                                } else if (it->rfind("BYIELD ", 0) == 0) {
+                                    yield_req = std::atoi(it->c_str() + 7);
                                     it = in_lines.erase(it);
                                 } else {
                                     ++it;
@@ -7267,6 +7324,23 @@ int main(int argc, char** argv) {
                                  (long long) ov_jobs, ov_jobs ? ov_job_ms / (double) ov_jobs : 0.0, ov_job_max);
                     sp.on_chunk = std::move(orig_chunk);
                     sp.should_stop = std::move(orig_stop);
+                    if (yield_q >= 0 && !fatal) {   // the read stopped at a chunk boundary to give way (BYIELD)
+                        std::string ye;
+                        const auto ty = Clock::now();
+                        if (yield_q >= 2) {   // a run that ends early leaves the token window of the PLE hash where it began
+                            rsp->ple_prev[0] = (int32_t) ids[(size_t) yield_q - 2];
+                            rsp->ple_prev[1] = (int32_t) ids[(size_t) yield_q - 1];
+                        }
+                        if (!park_read(yield_q, yield_slot, ye)) {
+                            e = "BYIELD: parking the prompt read failed: " + ye;
+                            return false;
+                        }
+                        std::fprintf(stderr, "basalt batch: the prompt read gives way at %lld of %lld tokens; slot %d "
+                                             "holds it (copied in %.1f ms)\n", (long long) yield_q, (long long) n, yield_slot,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
+                        e = "yield";
+                        return false;
+                    }
                     if (fatal) { batch_fatal = true; e = "a batch window failed"; return false; }
                     if (!ok) e = terr;
                     return ok;
@@ -7298,36 +7372,15 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (ys >= 0) {
-                        // only where the rest is read the same way after it (more than a chunk and more than a short
-                        // read left), text only, and into a slot that is not decoding
-                        const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
-                                         n + (admit_slot >= 0 ? admit_max_new : (long long) max_new) + 8 <= slot_cap[(size_t) ys] &&
-                                         (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 && !in_slot &&
-                                         b0 - q > std::max<int64_t>(C, o.short_read);
                         std::string ye;
                         const auto ty = Clock::now();
-                        std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
-                        if (can && copy_to_slot(ys, pre, ye)) {
-                            BSlot& sl = bs[(size_t) ys];
-                            sl = BSlot{};
-                            sl.ids = std::move(pre);
-                            sl.cached = true;
-                            sl.partial = true;
-                            sl.partial_from0 = read_from == 0 || resumed_from0;
-                            sl.cvec = cvec_cached;
-                            for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
-                                if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
-                                        [](int32_t x, int64_t y) { return (int64_t) x == y; }))
-                                    sl.checks.push_back(c);
-                            yielded_at = q;
-                            yielded_slot = ys;
+                        if (can_yield(q, b0, ys) && park_read(q, ys, ye)) {
                             std::fprintf(stderr, "basalt batch: the prompt read gives way at %lld of %lld tokens; slot %d "
                                                  "holds it (copied in %.1f ms)\n", (long long) q, (long long) n, ys,
                                          std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
                             e = "yield";
                             return false;
                         }
-                        if (can) bs[(size_t) ys].cached = false;   // half written
                         std::fprintf(stderr, "basalt batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
