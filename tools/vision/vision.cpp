@@ -49,6 +49,12 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
     return !img.empty() && !out.empty();
 }
 
+const char* const kUsage =
+    "usage: basalt-vision --mmproj <mmproj.gguf> [--model <model.gguf>] [--gpu] [--threads N] [--max-tokens N] "
+    "[--flash-attn on|off|auto]\n"
+    "  reads \"ENC <image> <output>\" lines on stdin and writes each image's embeddings to <output>;\n"
+    "  --gpu runs the encoder on the GPU, else on the CPU\n";
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -61,6 +67,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); }
             return argv[++i];
         };
+        if (a == "--help" || a == "-h") {
+            std::printf("%s", kUsage);
+            return 0;
+        }
         if (a == "--mmproj") mmproj = next();
         else if (a == "--model" || a == "--flash-attn") next();
         else if (a == "--gpu") gpu = true;
@@ -69,8 +79,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (mmproj.empty()) {
-        std::fprintf(stderr, "usage: basalt-vision --mmproj <mmproj.gguf> [--model <model.gguf>] [--gpu] [--threads N] "
-                             "[--max-tokens N] [--flash-attn on|off|auto]\n");
+        std::fprintf(stderr, "%s", kUsage);
         return 2;
     }
     const auto load_t0 = std::chrono::steady_clock::now();
