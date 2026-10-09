@@ -171,6 +171,15 @@ int main(int argc, char** argv) {
         }
         g_fail += !same;
         std::printf("%-30s segment vs reference: %s  %s\n", "6 rows on 2 slots", same ? "bitwise" : "DIFFERS", same ? "ok" : "FAIL");
+        {
+            const size_t flush_n = 256u << 20;
+            char* flush = dalloc<char>(flush_n);
+            for (int cold = 0; cold < 2; ++cold) {
+                const double us = time_us(st, iters, cold ? flush : nullptr, flush_n,
+                                          [&] { k::qsa_block_scores_seg(tab, d_q, d_steps, nq, MAXB, S_, d_a, st, true); });
+                std::printf("bench segment scores keys %-5s: %7.2f us/call\n", cold ? "cold" : "warm", us);
+            }
+        }
     }
 
     {   // the cluster top-k against the reference top-k
