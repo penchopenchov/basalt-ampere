@@ -112,6 +112,8 @@ public:
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
+    /// Before init: the window's main stream outranks other streams' kernels (a prompt read running beside the windows).
+    void set_main_priority(bool high) { main_high_ = high; }
     /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
     /// per layer.  Before init.
     void set_peer(PeerExperts* peer) { peer_ = peer; }
@@ -288,6 +290,7 @@ public:
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
+    bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);

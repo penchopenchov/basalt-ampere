@@ -4818,6 +4818,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
         }
         ver.set_remote_expert_opt(remote_opt.get());
+        ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
         if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
             (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
@@ -7116,7 +7117,6 @@ int main(int argc, char** argv) {
             // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
             // run on the CPU), never a prompt buffer.
             constexpr double decode_share = 0.5;
-            const bool ov_gate = basalt::core::exp_flag("overlap_on", 0) != 0;
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
@@ -7129,7 +7129,7 @@ int main(int argc, char** argv) {
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
-                if (ov_gate && batch_on() && stages.empty()) {
+                if (batch_on() && stages.empty()) {
                     // the whole range is read on a side thread, in the prompt path's own chunks, while this thread keeps
                     // running the slots' windows; the work that touches the draft layer or the output runs here, between
                     // two windows, when the prompt path asks for it
@@ -7367,7 +7367,7 @@ int main(int argc, char** argv) {
                 }
                 // beside slots: a window between the serial steps of a short read keeps them from stopping
                 auto ov_window = [&]() -> bool {
-                    if (!ov_gate || !batch_on()) return true;
+                    if (!batch_on()) return true;
                     if (!batch_step()) { batch_fatal = true; err = "a batch window failed"; return false; }
                     if (mtp_on && !mtp.use_main(err)) return false;
                     return true;
