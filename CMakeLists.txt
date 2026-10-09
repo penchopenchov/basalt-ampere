@@ -499,6 +499,10 @@ add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
 
 # the QSA top-k the engine dispatches against the original kernel: identical ids on both sides of the register
 # kernel's reach, with tied and with equal scores (synthetic, no model)
+add_executable(qsa_scores_parity src/kernels/qsa_scores_parity.cpp)
+target_include_directories(qsa_scores_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(qsa_scores_parity PRIVATE kernels ${_gpu_runtime_target})
+add_test(NAME qsa_scores_parity COMMAND qsa_scores_parity 20)
 add_executable(qsa_topk_parity src/kernels/qsa_topk_parity.cpp)
 target_include_directories(qsa_topk_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(qsa_topk_parity PRIVATE kernels ${_gpu_runtime_target})
