@@ -1188,6 +1188,22 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
 // [round, h1 <- p0 >= min_p] -> IF h1 [step 1, h2 <- p1 >= min_p] -> IF h2 [...] ...  Every record
 // is copied once, by the round.  The host compares the same probabilities with the same min_p, so it waits only for
 // the drafts the graph makes; the device side only removes the host round trip between steps.
+bool MtpDrafter::prewarm(std::string& err) {
+    const OnDevice on_device(device_);
+    const int max_steps = std::min(max_t_ - 1, max_drafts_);
+    if (cond_off_ || max_steps < 2) return true;
+    const int saved = tier_;
+    bool ok = true;
+    for (int tier = 0; ok && tier < (tier2_.empty() ? 1 : 2); ++tier) {
+        tier_ = tier2_.empty() ? saved : tier;
+        for (int T = 1; ok && T <= max_t_ && !cond_off_; ++T) ok = capture_cond(T, false, max_steps);
+    }
+    tier_ = saved;
+    if (!ok && cond_off_) return true;   // the per-step graphs take over, as at a lazy failure
+    if (!ok) err = "mtp: draft graph capture";
+    return ok;
+}
+
 bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
     const int c = coupled ? 1 : 0;
     cudaGraphExec_t& exec = cond_exec_[tier_][c][T];

@@ -72,6 +72,9 @@ public:
     void begin_request(const int64_t* prompt, int64_t n);
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// Captures every conditional draft graph (each draft-head tier, each window width) now rather than at its first
+    /// use. After `bind` and `set_max_drafts`.
+    bool prewarm(std::string& err);
     /// The cumulative draft rule's threshold for the next draft() chain (default: the rule's own).
     void set_cum_th(float th) { cum_th_ = th; }
     uint64_t vram_bytes() const { return vram_; }

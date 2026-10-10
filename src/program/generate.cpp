@@ -5714,13 +5714,17 @@ int main(int argc, char** argv) {
                          o.batch - 1, std::chrono::duration<double, std::milli>(Clock::now() - tw).count(),
                          (double) ((int64_t) free0 - (int64_t) free1) / 1048576.0);
         }
+        const int S = o.spec;
+        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
+        if (mtp_on && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
+        if (mtp_on && !mtp.prewarm(err)) {
+            std::fprintf(stderr, "basalt serve: capturing the draft graphs failed: %s\n", err.c_str());
+            return 1;
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
-        const int S = o.spec;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
-        if (mtp_on && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         basalt::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
@@ -8509,6 +8513,10 @@ int main(int argc, char** argv) {
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
+        if (use_mtp && !mtp.prewarm(err)) {
+            std::fprintf(stderr, "mtp: capturing the draft graphs failed: %s\n", err.c_str());
+            return 1;
+        }
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         basalt::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
