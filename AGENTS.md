@@ -13,4 +13,5 @@ Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts
 - **Don't write tools nobody asked for.**
 - **Headline benchmark numbers come from the maintainer's own runs.** Agent benches are development A/Bs only. Label every number with its GPU power limit.
 - **Quality gate:** PPL/KLD against the Q8_0 reference, through the decode path (`basalt-bench --quality`). Byte identity with old output is not required, but say whenever numerics change. Bitwise-neutral refactors need only the greedy-identity check.
+- **Keep `docs/precision.md` current.** Any engine change that can alter precision (weight formats, activation or accumulation types, KV/state formats, reduction order, decode or MTP paths) updates that page in the same change, with fresh numbers where it quotes them.
 - **Basalt's own kernels are the reference.** Parity tests compare a changed kernel against the current one and against a plain CPU reference; Strata's original kernels are not kept as oracles. Every new kernel gets a parity test (random inputs + real geometry) and a microbench line.
