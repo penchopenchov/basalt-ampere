@@ -1533,11 +1533,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 16, grp);
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-        const bool router_multi = n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
+        const bool router_multi = w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
         bool routed = false;   // the fused read ran the router too
         const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
-        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr && n >= 2 ? sh_hi_ : sh_cs_) : cs;
+        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr ? sh_hi_ : sh_cs_) : cs;
         // the ring on its own stream, forked after the router, joined where the side branch is
         const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && ring_hi_ != nullptr;
         ring_fork[grp] = pk_ring;
