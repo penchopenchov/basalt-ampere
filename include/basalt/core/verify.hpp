@@ -267,6 +267,12 @@ public:
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
+    /// The solo windows (run, commit) work on session `s` from here on: a session carved like init's, kept at one
+    /// address (its graphs are keyed by it).  Back to init's session: bind_session(&ss).  No copy of any state; a
+    /// session's graphs are captured on its first use, or ahead of it by warm_session.
+    bool bind_session(SessionState* s, std::string& err);
+    /// Captures every solo window width's graph and the commit for session `s` now.
+    bool warm_session(SessionState* s, std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -418,6 +424,10 @@ private:
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // the doorbell variant of a stage that is all-resident otherwise
     cudaGraphExec_t commit_exec_ = nullptr;
+    struct SoloGraphs {
+        cudaGraphExec_t exec[9] = {}, exec_nr[9] = {}, commit = nullptr;
+    };
+    std::map<SessionState*, SoloGraphs> solo_sets_;   // the solo graphs of the sessions not bound now
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

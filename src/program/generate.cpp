@@ -4897,7 +4897,8 @@ int main(int argc, char** argv) {
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // the session the request path reads, parks and restores: the solo one, or (a --batch request for a slot other
         // than 0) a view of it carrying that slot's state, so the prompt is read in the slot itself
-        basalt::core::SessionState rview;
+        // (one view per slot, each at a fixed address: the verifier keeps solo window graphs per view)
+        std::vector<basalt::core::SessionState> rviews((size_t) std::max(o.batch, 1));
         basalt::core::SessionState* rsp = &ss;
         basalt::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
@@ -5595,7 +5596,8 @@ int main(int argc, char** argv) {
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "");
+                                       " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0) +
+                                       " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "");
         }
         // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
         // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning
@@ -5646,10 +5648,43 @@ int main(int argc, char** argv) {
                                  "while generating (slow)\n",
                          (double) (src.resident_bytes() + topped_up) / 1073741824.0);
         basalt::platform::stop_memory_watchdog();
+        // a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
+        // request that runs in that slot
+        auto make_view = [&](basalt::core::SessionState& v, int b) {
+            const basalt::core::SessionState& t = *bslot_ss[0][(size_t) b];
+            v = ss;
+            v.gdn_state = t.gdn_state;
+            v.qsa_states = t.qsa_states;
+            v.ple_hist = t.ple_hist;
+            v.ple.hist = t.ple_hist;
+            v.ple_prev[0] = t.ple_prev[0];
+            v.ple_prev[1] = t.ple_prev[1];
+            v.ple_token = t.ple_token;
+            v.ple.token = &v.ple_token;
+            v.ple.prev = v.ple_prev;
+        };
         // every window width's graph is captured before READY, not by the first request that needs it
         if (o.serve && stages.empty() && !ver.warm_graphs(err)) {
             std::fprintf(stderr, "basalt serve: capturing the verify windows failed: %s\n", err.c_str());
             return 1;
+        }
+        // the solo windows of every slot session, so a lone request in any slot runs the solo path in place
+        if (o.serve && slot0_is_solo && o.batch > 1) {
+            const auto tw = Clock::now();
+            size_t free0 = 0, total0 = 0;
+            cudaMemGetInfo(&free0, &total0);
+            for (int b = 1; b < o.batch; ++b) {
+                make_view(rviews[(size_t) b], b);
+                if (!ver.warm_session(&rviews[(size_t) b], err)) {
+                    std::fprintf(stderr, "basalt serve: capturing slot %d's solo windows failed: %s\n", b, err.c_str());
+                    return 1;
+                }
+            }
+            size_t free1 = 0;
+            cudaMemGetInfo(&free1, &total0);
+            std::fprintf(stderr, "basalt serve: solo windows of %d more slot sessions captured in %.0f ms (%.1f MiB of VRAM)\n",
+                         o.batch - 1, std::chrono::duration<double, std::milli>(Clock::now() - tw).count(),
+                         (double) ((int64_t) free0 - (int64_t) free1) / 1048576.0);
         }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
@@ -5865,6 +5900,7 @@ int main(int argc, char** argv) {
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0;
         Clock::time_point bt_start = Clock::now();
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
+        int solo_slot = -1;                ///< SGEN: the slot a solo request runs in, on that slot's own state
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         // a prompt read on its own thread beside the slots' windows: the tier stays as it is meanwhile
@@ -6479,6 +6515,19 @@ int main(int argc, char** argv) {
                 continue;
             }
             admit_slot = -1;
+            solo_slot = -1;
+            if (line.rfind("SGEN ", 0) == 0 || line.rfind("SGENI ", 0) == 0) {   // SGEN <slot> <max_new> ...: a GEN in that slot
+                const bool simg = line.rfind("SGENI ", 0) == 0;
+                char* e1 = nullptr;
+                const long b = std::strtol(line.c_str() + (simg ? 6 : 5), &e1, 10);
+                if (!slot0_is_solo || bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || e1 == line.c_str() + (simg ? 6 : 5)) {
+                    std::printf("ERR SGEN: no such free slot or slot 0 is not the solo session\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                solo_slot = (int) b;
+                line = std::string(simg ? "GENI" : "GEN") + e1;
+            }
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
                 char* e1 = nullptr;
@@ -6729,8 +6778,10 @@ int main(int argc, char** argv) {
             // A request for a slot other than 0 reads its prompt in that slot: the request path works on a view of the
             // solo session that carries the slot's state, with the slot's own conversation bookkeeping swapped in
             // for the request (the solo one is put back after it)
-            const int slot_b = admit_slot;
+            const int slot_b = solo_slot >= 0 ? solo_slot : admit_slot;
             const bool in_slot = slot0_is_solo && slot_b > 0;
+            const bool solo_req = in_slot && solo_slot > 0;   // decoded here, solo-style, on the slot's own state
+            basalt::core::SessionState& rview = rviews[(size_t) std::max(slot_b, 0)];
             struct SoloBook {
                 std::vector<int32_t> live;
                 std::vector<ImgKey> live_imgs;
@@ -6757,23 +6808,17 @@ int main(int argc, char** argv) {
                 sb.cached = false;
                 sb.partial = false;
                 sb.checks.clear();
-                const basalt::core::SessionState& t = *bslot_ss[0][(size_t) slot_b];
-                rview = ss;
-                rview.gdn_state = t.gdn_state;
-                rview.qsa_states = t.qsa_states;
-                rview.ple_hist = t.ple_hist;
-                rview.ple.hist = t.ple_hist;
-                rview.ple_prev[0] = t.ple_prev[0];
-                rview.ple_prev[1] = t.ple_prev[1];
-                rview.ple_token = t.ple_token;
-                rview.ple.token = &rview.ple_token;
-                rview.ple.prev = rview.ple_prev;
+                make_view(rview, slot_b);
                 rsp = &rview;
+                if (solo_req && !ver.bind_session(&rview, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 sp.set_session(rview);
                 if (mtp_on) mtp.set_ple_session(&rview);
             }
             // slot 0 is the solo session: what an idle slot 0 holds is the live conversation, in place
-            if (slot0_is_solo && !bs.empty() && bs[0].cached && !bs[0].active) {
+            if (slot0_is_solo && !in_slot && !bs.empty() && bs[0].cached && !bs[0].active) {
                 BSlot& s0 = bs[0];
                 live = std::move(s0.ids);
                 live_imgs.clear();
@@ -6998,7 +7043,7 @@ int main(int argc, char** argv) {
             // the misses on the CPU.  Each part below is decided on its own, so a long first message is read batched
             // and its header still goes through the windows.  Picture rows need the batched path.
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (in_slot || b - a > o.short_read) return false;   // (the solo verifier is bound to slot 0's state)
+                if ((in_slot && !solo_req) || b - a > o.short_read) return false;   // (the verifier is bound to this request's state)
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -7178,7 +7223,7 @@ int main(int argc, char** argv) {
                 return ys >= 0 && ys < (int) bs.size() && !bs[(size_t) ys].active &&
                        n + (admit_slot >= 0 ? admit_max_new : (long long) max_new) + 8 <= slot_cap[(size_t) ys] &&
                        (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
-                       (!in_slot || ys == admit_slot) && b0 - q > std::max<int64_t>(std::max<int64_t>(sp.chunk(), 1), o.short_read);
+                       (!in_slot || ys == slot_b) && b0 - q > std::max<int64_t>(std::max<int64_t>(sp.chunk(), 1), o.short_read);
             };
             // the first `q` tokens of this read go to slot `ys`, which holds them until the request is sent again
             auto park_read = [&](int64_t q, int ys, std::string& ye) -> bool {
@@ -7590,7 +7635,7 @@ int main(int argc, char** argv) {
             TkStep tk_prev[16];
             bool tk_valid = false;
             if (tk_log != nullptr) { std::fprintf(tk_log, "R temp=%g S=%d\n", (double) req_temperature, S_mtp); std::fflush(tk_log); }
-            while (!cancelled && produced_n < max_new && !in_slot) {   // (a slot's first token comes from the batch window)
+            while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
                     T = 1;
@@ -8050,7 +8095,30 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 admit_slot = -1;
             }
+            if (solo_req) {   // the conversation stays in the slot it ran in
+                basalt::core::SessionState& t = *bslot_ss[0][(size_t) slot_b];
+                t.ple_prev[0] = rview.ple_prev[0];
+                t.ple_prev[1] = rview.ple_prev[1];
+                t.ple_token = rview.ple_token;
+                if (yielded_at < 0) {   // (a read that gave way was parked in the slot already)
+                    BSlot& sb = bs[(size_t) slot_b];
+                    sb = BSlot{};
+                    sb.ids = live;
+                    sb.cvec = cvec_cached;
+                    sb.img = !live_imgs.empty();
+                    sb.cached = live_ok && !sb.img && o.prompt_cache > 0;
+                    if (sb.cached) sb.checks = std::move(checks);
+                    if (sb.cached && batch_spec && !mtp.copy_store(mtp.main_store(), slot_b, (int64_t) live.size(), err)) {
+                        err.clear();
+                        sb.cached = false;
+                    }
+                }
+            }
             if (in_slot) {   // the solo session and its bookkeeping again
+                if (solo_req && !ver.bind_session(&ss, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 rsp = &ss;
                 sp.set_session(ss);
                 if (mtp_on) mtp.set_ple_session(&ss);

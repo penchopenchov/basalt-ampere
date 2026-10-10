@@ -511,6 +511,13 @@ Verifier::~Verifier() {
     for (auto& e : exec_nr_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+    for (auto& kv : solo_sets_) {
+        for (auto& e : kv.second.exec)
+            if (e) cudaGraphExecDestroy(e);
+        for (auto& e : kv.second.exec_nr)
+            if (e) cudaGraphExecDestroy(e);
+        if (kv.second.commit) cudaGraphExecDestroy(kv.second.commit);
+    }
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
@@ -2828,6 +2835,39 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
     }
     std::fprintf(stderr, "basalt verify: captured the batch window for %d rows\n", R);
     return true;
+}
+
+bool Verifier::bind_session(SessionState* s, std::string& err) {
+    if (s == nullptr || ss_ == nullptr) { err = "verify: bind_session without a session"; return false; }
+    if (s == ss_) return true;
+    if (!wait_commit(err)) return false;   // the last commit still works on the old session's state
+    SoloGraphs cur;
+    std::copy(std::begin(exec_), std::end(exec_), std::begin(cur.exec));
+    std::copy(std::begin(exec_nr_), std::end(exec_nr_), std::begin(cur.exec_nr));
+    cur.commit = commit_exec_;
+    solo_sets_[ss_] = cur;
+    SoloGraphs nx;
+    const auto it = solo_sets_.find(s);
+    if (it != solo_sets_.end()) {
+        nx = it->second;
+        solo_sets_.erase(it);
+    }
+    std::copy(std::begin(nx.exec), std::end(nx.exec), std::begin(exec_));
+    std::copy(std::begin(nx.exec_nr), std::end(nx.exec_nr), std::begin(exec_nr_));
+    commit_exec_ = nx.commit;
+    ss_ = s;
+    return true;
+}
+
+bool Verifier::warm_session(SessionState* s, std::string& err) {
+    SessionState* home = ss_;
+    if (!bind_session(s, err)) return false;
+    refresh_ar();
+    bool ok = capture_commit(err);
+    for (int T = 1; ok && T <= max_t_; ++T) ok = capture(T, err);
+    std::string e2;
+    if (!bind_session(home, e2) && ok) { err = e2; return false; }
+    return ok;
 }
 
 bool Verifier::warm_graphs(std::string& err) {
