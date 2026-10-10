@@ -6,6 +6,8 @@ Protocol (one line each):
     `RESUME <n>`, then `DONE ...`; `STOP` ends it early. `ERR ...` is a failure.
   * batch slots: `BGEN <slot> ...` -> `BADM <slot> <continues>`, `BT <slot> <id>`, `BDONE <slot> ...`;
     `BSTOP <slot>`; `BYIELD <slot>` makes a long prompt read give way (answered by `YIELDED <slot> <n>`).
+  * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
+    that slot's own state, answered like a GEN.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
   * Requests share one pipe, serialized by the service FIFO (batch: by the `ctl` lock).
 """
@@ -673,7 +675,8 @@ class ProcessEngine:
     def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
         """Whether a request alone in a slot should go back to the solo path (needs INFO slot_cache=1)."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache") or (self.info or {}).get("slot0_solo")):
+                not (self.info or {}).get("slot_cache") or
+                ((self.info or {}).get("slot0_solo") and not (self.info or {}).get("solo_any_slot"))):
             return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
@@ -699,6 +702,7 @@ class ProcessEngine:
             return
         holding, born = True, self.gen                  # born: engine generation holding the control lines
         slot, gen0, reserved = None, None, None
+        solo_slot, run0 = None, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
         yields, solo_again = 0, 0
@@ -711,13 +715,31 @@ class ProcessEngine:
                     if not ok:
                         return
                     holding, born = True, self.gen
+                solo_slot = None
                 with self.slot_cv:
-                    # With slot 0 as the solo session, every conversation stays in its own slot (a solo run would copy
-                    # its conversation into slot 0 over the one that slot holds), so a lone request is a batch of one.
-                    alone = not any(self.slot_busy) and self.waiting == 0 and not self.info.get("slot0_solo")
+                    # With slot 0 as the solo session, a solo run on another slot's state is only possible when the
+                    # engine runs it there (solo_any_slot); else every conversation stays in its own slot (a solo run
+                    # would copy its conversation into slot 0 over the one that slot holds) and a lone request is a
+                    # batch of one.
+                    any_slot = bool(self.info.get("solo_any_slot"))
+                    alone = not any(self.slot_busy) and self.waiting == 0 and (any_slot or not self.info.get("slot0_solo"))
+                    if alone and left > 1 and any_slot:
+                        solo_slot = self.pick_slot(prompt)       # the slot holding the longest start, else a free one
+                        if solo_slot is None:
+                            alone = False
+                        else:
+                            self.slot_busy[solo_slot] = True
+                            reserved = solo_slot
                 if alone and left > 1:
-                    head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    if solo_slot is not None:
+                        head = f"SGENI {solo_slot} {left}{keys} {embeddings}" if embeddings else \
+                            f"SGEN {solo_slot} {left}{keys}"
+                    else:
+                        head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    run0, yield_sent = len(out), False
+                    if solo_slot is not None:
+                        self.slot_held[solo_slot] = []          # the run overwrites what the slot held
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
@@ -730,14 +752,16 @@ class ProcessEngine:
                             out.append(t)
                             yield t
                         if x is None:                       # heartbeat
-                            if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
+                            if (not yield_sent and not out and not embeddings and yields < self.YIELDS_MAX and
                                     self._shorter_waiting(len(prompt))):
-                                with self.slot_cv:          # slot the partial read will wait in
-                                    reserved = self.pick_slot(prompt)
-                                    if reserved is not None:
-                                        self.slot_busy[reserved] = True
-                                if reserved is not None:
+                                if solo_slot is None:
+                                    with self.slot_cv:      # slot the partial read will wait in
+                                        reserved = self.pick_slot(prompt)
+                                        if reserved is not None:
+                                            self.slot_busy[reserved] = True
+                                if reserved is not None:    # (a solo run in a slot parks its read in that slot)
                                     self._send(f"BYIELD {reserved}")
+                                    yield_sent = True
                             yield None
                     phase = "none"                          # DONE was read
                     self._note_first_reused(first, last0)
@@ -748,6 +772,7 @@ class ProcessEngine:
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read continues in that slot
                     elif reserved is not None:              # did not give way: release the slot
+                        self._solo_kept(solo_slot, prompt, out[run0:])
                         with self.slot_cv:
                             self.slot_busy[reserved] = False
                             self.slot_cv.notify_all()
@@ -900,6 +925,8 @@ class ProcessEngine:
             if holding:
                 self.ctl.release()
             if reserved is not None:
+                if reserved == solo_slot:
+                    self._solo_kept(solo_slot, prompt, out[run0:])
                 with self.slot_cv:
                     self.slot_busy[reserved] = False
                     self.slot_cv.notify_all()
@@ -921,6 +948,13 @@ class ProcessEngine:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_cv.notify_all()
+
+    def _solo_kept(self, slot, prompt: list[int], gen: list[int]) -> None:
+        """A solo run in `slot` ended: the engine keeps its prompt and every token it fed (all but the last) there."""
+        if slot is None:
+            return
+        self.slot_held[slot] = list(prompt) + gen[:-1] if gen else []
+        self.slot_used[slot] = time.time()
 
     def _resumes(self, slot: int, prompt: list[int]) -> bool:
         """Whether `slot` holds the start of `prompt`."""

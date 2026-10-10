@@ -53,7 +53,8 @@ def reader():
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
-      (" slot_cache=1" if "--slotcache" in args else "") + (" slot0_solo=1" if s0 else ""), flush=True)
+      (" slot_cache=1" if "--slotcache" in args else "") + (" slot0_solo=1" if s0 else "") +
+      (" solo_any_slot=1" if s0 and "--soloany" in args else ""), flush=True)
 print(f"READY {ready} stop", flush=True)
 LONG = list(b"LONGREPLY")
 def reply(ids):            # the rest of the reply after what the prompt already ends with (a request continued)
@@ -104,10 +105,11 @@ while True:
             active[b][1] = 0
             stopped.add(b)
         continue
-    if line.startswith(("GEN ", "BGEN ")):
+    if line.startswith(("GEN ", "BGEN ", "SGEN ")):
         f = line.split()
-        slot = int(f[1]) if f[0] == "BGEN" else None
-        max_new = int(f[2] if f[0] == "BGEN" else f[1])
+        slot = int(f[1]) if f[0] in ("BGEN", "SGEN") else None
+        max_new = int(f[2] if slot is not None else f[1])
+        bslot = slot if f[0] == "BGEN" else None      # SGEN: a solo run on that slot's own state
         ids = f[-1].split(",")
         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # refused up front, then idle (no DONE)
             print("ERR refused: images are not enabled", flush=True)
@@ -149,10 +151,10 @@ while True:
                 log.write(f"YIELD {given[0]} {given[1]}\n"); log.flush()
             print(f"YIELDED {given[0]} {given[1]}", flush=True)
             print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 0", flush=True)
-            if slot is not None:
+            if bslot is not None:
                 print(f"BADM {slot} 0", flush=True)
             continue
-        n = 1 if slot is not None else max_new
+        n = 1 if bslot is not None else max_new
         out = 0
         for t in toks[:n]:
             if stop.is_set():
@@ -161,14 +163,14 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        dc = f"{out} {2 * out}" if "--draft-counts" in args and slot is None else "0 0"   # a solo run drafts
+        dc = f"{out} {2 * out}" if "--draft-counts" in args and bslot is None else "0 0"   # a solo run drafts
         print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} {dc} {reused}", flush=True)
         if s0:
             sstore[0 if slot is None else slot] = [int(x) for x in ids] + toks[:-1]
         if keep:
             mine = [int(x) for x in ids] + toks[:out]
             held[:] = [h for h in held if mine[:len(h)] != h] + [mine]
-        if slot is not None:
+        if bslot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
                 active[slot] = [toks[1:], max_new, 1]
@@ -210,7 +212,7 @@ class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -226,6 +228,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--nopp"] if nopp else []
         extra += ["--reuse"] if reuse else []
         extra += ["--slot0solo"] if slot0_solo else []
+        extra += ["--soloany"] if solo_any else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -631,6 +634,22 @@ class ParallelService(unittest.TestCase):
         sizes["b"] = u["prompt_tokens"]
         kinds = {x.split()[0] for x in self.log.read_text().splitlines() if not x.startswith("YIELD")}
         self.assertEqual(kinds, {"BGEN"})        # a lone request is a batch of one: no solo run copies into slot 0
+
+    def test_a_lone_request_runs_solo_in_the_slot_holding_its_conversation_when_the_engine_can(self):
+        self.start(2, reuse=True, slot_cache=True, slot0_solo=True, solo_any=True, ready=200000)
+        a = [{"role": "user", "content": "conversation A " + "a" * 70000}, {"role": "assistant", "content": "ok, done."}]
+        b = [{"role": "user", "content": "conversation B " + "b" * 60000}, {"role": "assistant", "content": "ok, done."}]
+        sizes = {"a": self.convo(a, "first")["prompt_tokens"], "b": self.convo(b, "first")["prompt_tokens"]}
+        for turn in range(3):                    # every request alone: they alternate
+            for name, msgs in (("a", a), ("b", b)):
+                u = self.convo(msgs, f"turn {turn} " + name * 300)
+                self.assertTrue(self.kept(u, sizes[name]), (name, turn, u, sizes[name]))
+                sizes[name] = u["prompt_tokens"]
+        reqs = [x.split() for x in self.log.read_text().splitlines() if not x.startswith("YIELD")]
+        self.assertEqual({r[0] for r in reqs}, {"SGEN"})          # solo runs, in place: no batch of one
+        slots = [r[1] for r in reqs]
+        self.assertEqual(sorted(set(slots)), ["0", "1"])
+        self.assertEqual(slots[2:], slots[:2] * 3, slots)         # each conversation returns to its own slot
 
     def test_a_third_conversation_evicts_the_least_recently_used_slot(self):
         self.start(2, reuse=True, slot_cache=True, slot0_solo=True, ready=200000)
