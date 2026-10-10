@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png">
-    <img src="assets/basalt-lockup-light.png" alt="Basalt" width="360">
+    <img src="assets/basalt-lockup-light.png" alt="Basalt" width="480">
   </picture>
 </p>
 
