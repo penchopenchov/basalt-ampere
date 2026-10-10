@@ -2994,8 +2994,12 @@ int main(int argc, char** argv) {
             for (int b = slot0_is_solo ? 1 : 0; b < o.batch; ++b)
                 kept += basalt::core::session_bytes(g, slot_cap[(size_t) b], K, 0, multi_gpu ? split_at[0] : -1);
             slot_kv_cuda0 = kept;
-            std::fprintf(stderr, "basalt generate: --batch %d: the slot sessions beyond the solo one take %.2f GiB of VRAM "
-                                 "on CUDA0 that the expert cache would otherwise hold\n", o.batch, (double) kept / 1073741824.0);
+            const uint64_t per_slot = basalt::core::session_bytes(g, slot_cap[0], K, 0, multi_gpu ? split_at[0] : -1);
+            std::fprintf(stderr, "basalt generate: --batch %d: %.2f GiB of KV cache and state per slot (%lld tokens), "
+                                 "%.2f GiB in all; the slots beyond the solo one take %.2f GiB of VRAM on CUDA0 that "
+                                 "the expert cache would otherwise hold\n", o.batch, (double) per_slot / 1073741824.0,
+                         (long long) slot_cap[0], (double) (per_slot * (uint64_t) o.batch) / 1073741824.0,
+                         (double) kept / 1073741824.0);
         }
     }
 
@@ -4370,8 +4374,6 @@ int main(int argc, char** argv) {
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
-    bool ram_short_check = false;   // warn after the top-up if the RAM still holds only part of the experts
-    uint64_t topped_up = 0;
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
@@ -4402,12 +4404,6 @@ int main(int argc, char** argv) {
             if (resident_ok) {
                 std::fprintf(stderr, "basalt generate: the whole complement does not fit in RAM (%s); the hottest %.2f GiB "
                                      "are kept in RAM\n", whole_err.c_str(), (double) src.resident_bytes() / 1073741824.0);
-                // a server tops the copy up before it is ready: it warns then, with what the RAM ended up holding
-                if (o.serve) ram_short_check = !ssd_warned;
-                else if (!ssd_warned)
-                    std::fprintf(stderr, "basalt warning: RAM holds only %.1f GiB of the experts, the rest is read from "
-                                         "the SSD while generating (slow)\n",
-                                 (double) src.resident_bytes() / 1073741824.0);
             }
             else
                 err = whole_err + "; " + err;
@@ -4436,17 +4432,11 @@ int main(int argc, char** argv) {
                                                                 : "off");
         } else if (o.resident_soft) {
             std::fprintf(stderr, "basalt generate: the resident RAM mode does not fit (%s)\n", err.c_str());
-            if (!ssd_warned)
-                std::fprintf(stderr, "basalt warning: not enough RAM for the experts, they are read from the SSD while "
-                                     "generating (slow)\n");
         } else if (o.resident_budget > 0) {
             // a RAM budget that cannot be kept is not a reason to stop - the experts it would have held are read from
             // the files like the ones outside it (pin_cache_complement leaves nothing half-built)
             std::fprintf(stderr, "basalt generate: the RAM budget (--resident-budget-gib) cannot be kept (%s)\n",
                          err.c_str());
-            if (!ssd_warned)
-                std::fprintf(stderr, "basalt warning: not enough RAM for the experts, they are read from the SSD while "
-                                     "generating (slow)\n");
         } else {
             std::fprintf(stderr, "basalt generate: CPU expert residency: %s\n", err.c_str());
             return 1;
@@ -4463,6 +4453,45 @@ int main(int argc, char** argv) {
     // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
     if (o.peer_device >= 1 && !peer.valid() && !open_peer(false)) return 1;
     drive.d.peer = peer.valid() ? &peer : nullptr;
+    // Where the routed experts live, fastest tier first, and a warning when a share of them is only in the file (decode
+    // reads those from the SSD).  Called once the tiers are final.
+    auto report_expert_tiers = [&]() {
+        uint64_t b_vram = 0, b_peer = 0, b_ram = 0, b_file = 0;
+        const bool ram_ok = srcp == &src && src.complement_ready();
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const uint64_t blob = basalt::kernels::cpu::expert_layout().blob_bytes(l);
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const size_t i = (size_t) (l * g.n_expert + e);
+                bool on_gpu = (i < host_res.size() && host_res[i] >= 0);
+                for (const auto& st : stages) on_gpu = on_gpu || st->cache.slot_of(l, e) >= 0;
+                for (const auto& r : remote_experts) on_gpu = on_gpu || (r.resident() > 0 && r.owns((int64_t) i));
+                if (on_gpu) b_vram += blob;
+                else if (peer.valid() && peer.has(l, e)) b_peer += blob;
+                else if (ram_ok && src.has_resident(l, e)) b_ram += blob;
+                else b_file += blob;
+            }
+        }
+        const double total = (double) (b_vram + b_peer + b_ram + b_file);
+        if (total <= 0.0) return;
+        constexpr double kGiB = 1073741824.0;
+        auto pct = [&](uint64_t b) { return 100.0 * (double) b / total; };
+        std::fprintf(stderr, "basalt generate: experts live in VRAM %.1f GiB (%.0f%%), peer GPU %.1f GiB (%.0f%%), RAM "
+                             "%.1f GiB (%.0f%%), file (SSD) %.1f GiB (%.0f%%); %.1f GiB in all\n",
+                     (double) b_vram / kGiB, pct(b_vram), (double) b_peer / kGiB, pct(b_peer), (double) b_ram / kGiB,
+                     pct(b_ram), (double) b_file / kGiB, pct(b_file), total / kGiB);
+        // The file holds the coldest experts (the tiers fill in profile order), so its share of the bytes is well above
+        // its share of the reads; 2% is where a decode window starts to meet SSD reads that cost far more than a RAM hit.
+        if (pct(b_file) < 2.0) return;
+        std::string levers = "a smaller quant, more RAM";
+        if (!o.resident_cpu_experts) levers += ", --resident-experts";
+        if (o.peer_device < 1) levers += ", a second GPU as the peer tier (--peer-device)";
+        if (o.batch > 1) levers += ", fewer --parallel slots or no --slot-full-context (the slots hold " +
+                                   std::to_string((slot_kv_cuda0 + (1u << 29)) >> 30) + " GiB of KV beyond the solo one)";
+        std::fprintf(stderr, "basalt warning: %.0f%% of the experts (%.1f GiB) are only in the file: decode reads them "
+                             "from the SSD and may be much slower. To fit them: %s\n",
+                     pct(b_file), (double) b_file / kGiB, levers.c_str());
+    };
+    if (!o.serve) report_expert_tiers();
     if (o.serve) {
         if ((!no_spec && (o.spec < 2 || o.mtp.empty())) || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -5634,7 +5663,6 @@ int main(int argc, char** argv) {
             const uint64_t add = src.top_up(profile, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
             }, o.resident_pin, n_top, later);
-            topped_up = add;
             if (add > 0) {
                 basalt::platform::watch_resident_ram(true, src.resident_bytes() + add);
                 std::fprintf(stderr, "basalt generate: RAM top-up: +%.2f GiB, %lld experts (total %.2f GiB)\n",
@@ -5642,11 +5670,7 @@ int main(int argc, char** argv) {
                              (double) (src.resident_bytes() + add) / 1073741824.0);
             }
         }
-        if (ram_short_check && src.complement_ready() &&
-            src.resident_bytes() + topped_up + (64ull << 20) < expert_total_bytes - cache_fill_bytes - peer_only_bytes)
-            std::fprintf(stderr, "basalt warning: RAM holds only %.1f GiB of the experts, the rest is read from the SSD "
-                                 "while generating (slow)\n",
-                         (double) (src.resident_bytes() + topped_up) / 1073741824.0);
+        report_expert_tiers();
         basalt::platform::stop_memory_watchdog();
         // a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
         // request that runs in that slot
