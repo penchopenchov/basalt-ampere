@@ -27,21 +27,38 @@ namespace basalt::vision {
 
 namespace {
 constexpr int E = 1152, F = 4304, H = 16, D = 72, DP = 80;
-}
+
+constexpr size_t kAlign = 256;
+// the product library's scratch: a fixed size, so the algorithm choice never depends on where the arena sits
+constexpr size_t kBlasWorkspace = 32u << 20;
+
+size_t up(size_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
+
+}  // namespace
 
 struct CudaEncoder::Impl {
+    // byte offsets of the tensors inside the weight image (host copy and device region share the layout)
+    struct LayerOff {
+        size_t ln1w, ln1b, ln2w, ln2b, bqkv, bo, bup, bdown, wqkv, wo, wup, wdown;
+    };
     struct Layer {
         float *ln1w, *ln1b, *ln2w, *ln2b, *bqkv, *bo, *bup, *bdown;
         __nv_bfloat16 *wqkv, *wo, *wup, *wdown;
     };
-    const Mmproj* mp = nullptr;
     int layers = 0, proj = 0, nmax = 0;
     float eps = 1e-6f;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
-    std::vector<void*> allocs;
-    size_t bytes = 0;
     std::string err;
+    // weight image
+    uint8_t* image = nullptr;
+    bool image_pinned = false;
+    size_t wbytes = 0;
+    size_t o_wpatch = 0, o_bpatch = 0, o_pos = 0, o_postw = 0, o_postb = 0, o_bm0 = 0, o_bm2 = 0, o_wm0 = 0, o_wm2 = 0;
+    std::vector<LayerOff> LO;
+    // placement
+    uint8_t* arena = nullptr;
+    size_t arena_size = 0;
     std::vector<Layer> L;
     float *wpatch = nullptr, *bpatch = nullptr, *pos = nullptr, *postw = nullptr, *postb = nullptr, *bm0 = nullptr, *bm2 = nullptr;
     __nv_bfloat16 *wm0 = nullptr, *wm2 = nullptr;
@@ -51,25 +68,27 @@ struct CudaEncoder::Impl {
     __half *qh = nullptr, *kh = nullptr, *vh = nullptr;
 
     void fail(const std::string& s) { err = s; }
-    template <class T>
-    bool alloc(T*& p, size_t n) {
-        void* q = nullptr;
-        if (cudaMalloc(&q, n * sizeof(T)) != cudaSuccess) { fail("out of device memory"); return false; }
-        allocs.push_back(q);
-        bytes += n * sizeof(T);
-        p = (T*) q;
-        return true;
-    }
-    template <class T>
-    bool upload(T*& p, const void* src, size_t n) {
-        if (!alloc(p, n)) return false;
-        CK(cudaMemcpy(p, src, n * sizeof(T), cudaMemcpyHostToDevice));
-        return true;
-    }
     ~Impl() {
-        for (void* p : allocs) cudaFree(p);
+        release_image();
         if (blas) cublasDestroy(blas);
         if (stream) cudaStreamDestroy(stream);
+    }
+    void release_image() {
+        if (!image) return;
+        if (image_pinned) cudaFreeHost(image);
+        else std::free(image);
+        image = nullptr;
+    }
+
+    // the work buffers' sizes for `patches` patches, in placement order
+    struct Work {
+        size_t patches, x, g, act, rope, q, k, v, out, blas;
+        size_t total() const { return patches + x + g + act + rope + q + k + v + out + blas; }
+    };
+    Work work(size_t N) const {
+        return {up(N * 768 * 4), up(N * E * 4), up(N * F * 4), up(N * F * 2), up(N * 36 * 2 * 4),
+                up((size_t) H * N * DP * 2), up((size_t) H * N * DP * 2), up((size_t) H * N * DP * 2),
+                up(N / 4 * (size_t) proj * 4), kBlasWorkspace};
     }
 
     // Y[M][N] = X[M][K] . W[N][K]^T
@@ -86,8 +105,17 @@ struct CudaEncoder::Impl {
         return true;
     }
 
-    bool init(const Mmproj& m, int max_tokens, std::string& e) {
-        mp = &m;
+    bool create(std::string& e) {
+        if (stream) return true;
+        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess || cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS ||
+            cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) {
+            e = "cannot create the encoder's stream and product handle";
+            return false;
+        }
+        return true;
+    }
+
+    bool stage(const Mmproj& m, bool pinned, std::string& e) {
         const Hparams& h = m.hp();
         if (h.embd != E || h.heads != H || h.ffn != F || h.patch != 16 || h.merge != 2 || h.layers < 1) {
             e = "unexpected projector hyper-parameters";
@@ -96,57 +124,132 @@ struct CudaEncoder::Impl {
         layers = h.layers;
         proj = h.proj;
         eps = h.eps;
-        nmax = max_tokens * 4;
-        CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        CB(cublasCreate(&blas));
-        CB(cublasSetStream(blas, stream));
+        size_t cur = 0;
+        auto take = [&](size_t bytes) { const size_t o = cur; cur += up(bytes); return o; };
+        o_wpatch = take((size_t) E * 768 * 4);
+        o_bpatch = take((size_t) E * 4);
+        o_pos = take((size_t) E * 2304 * 4);
+        o_postw = take((size_t) E * 4);
+        o_postb = take((size_t) E * 4);
+        o_bm0 = take((size_t) 4 * E * 4);
+        o_bm2 = take((size_t) proj * 4);
+        o_wm0 = take((size_t) 4 * E * 4 * E * 2);
+        o_wm2 = take((size_t) 4 * E * proj * 2);
+        LO.assign(layers, {});
+        for (LayerOff& y : LO) {
+            y.ln1w = take(E * 4); y.ln1b = take(E * 4); y.ln2w = take(E * 4); y.ln2b = take(E * 4);
+            y.bqkv = take(3 * E * 4); y.bo = take(E * 4); y.bup = take((size_t) F * 4); y.bdown = take(E * 4);
+            y.wqkv = take((size_t) 3 * E * E * 2); y.wo = take((size_t) E * E * 2);
+            y.wup = take((size_t) F * E * 2); y.wdown = take((size_t) E * F * 2);
+        }
+        wbytes = cur;
+        release_image();
+        if (pinned) {
+            if (cudaHostAlloc((void**) &image, wbytes, cudaHostAllocDefault) != cudaSuccess) { e = "cannot pin the encoder weights"; return false; }
+            image_pinned = true;
+        } else {
+            image = (uint8_t*) std::malloc(wbytes);
+            image_pinned = false;
+            if (!image) { e = "out of memory"; return false; }
+        }
+        std::memset(image, 0, wbytes);
         std::string er;
-        auto f32 = [&](const std::string& n, int64_t c) { const auto* t = m.need(n, 0, c, er); return t ? (const float*) t->data : nullptr; };
-        auto b16 = [&](const std::string& n, int64_t c) { const auto* t = m.need(n, 30, c, er); return t ? t->data : nullptr; };
-        auto upf = [&](float*& d, const std::string& n, int64_t c) {
-            const float* s = f32(n, c);
-            return s && upload(d, s, (size_t) c);
-        };
-        auto upb = [&](__nv_bfloat16*& d, const std::string& n, int64_t c) {
-            const void* s = b16(n, c);
-            return s && upload(d, s, (size_t) c);
-        };
         bool ok = true;
+        auto put = [&](size_t off, const std::string& n, uint32_t type, int64_t count, size_t esize) {
+            const auto* t = m.need(n, type, count, er);
+            if (!t) { ok = false; return; }
+            std::memcpy(image + off, t->data, (size_t) count * esize);
+        };
+        auto f32 = [&](size_t off, const std::string& n, int64_t c) { put(off, n, 0, c, 4); };
+        auto b16 = [&](size_t off, const std::string& n, int64_t c) { put(off, n, 30, c, 2); };
         {
-            const float *w0 = f32("v.patch_embd.weight", (int64_t) E * 768), *w1 = f32("v.patch_embd.weight.1", (int64_t) E * 768);
+            const auto* w0 = m.need("v.patch_embd.weight", 0, (int64_t) E * 768, er);
+            const auto* w1 = m.need("v.patch_embd.weight.1", 0, (int64_t) E * 768, er);
             if (w0 && w1) {
-                std::vector<float> w((size_t) E * 768);
-                for (size_t i = 0; i < w.size(); ++i) w[i] = w0[i] + w1[i];
-                ok = upload(wpatch, w.data(), w.size());
+                float* w = (float*) (image + o_wpatch);
+                for (size_t i = 0; i < (size_t) E * 768; ++i) w[i] = ((const float*) w0->data)[i] + ((const float*) w1->data)[i];
             } else ok = false;
         }
-        ok = ok && upf(bpatch, "v.patch_embd.bias", E) && upf(pos, "v.position_embd.weight", (int64_t) E * 2304) &&
-             upf(postw, "v.post_ln.weight", E) && upf(postb, "v.post_ln.bias", E) && upf(bm0, "mm.0.bias", 4 * E) &&
-             upf(bm2, "mm.2.bias", proj) && upb(wm0, "mm.0.weight", (int64_t) 4 * E * 4 * E) &&
-             upb(wm2, "mm.2.weight", (int64_t) 4 * E * proj);
-        L.resize(layers);
+        f32(o_bpatch, "v.patch_embd.bias", E);
+        f32(o_pos, "v.position_embd.weight", (int64_t) E * 2304);
+        f32(o_postw, "v.post_ln.weight", E);
+        f32(o_postb, "v.post_ln.bias", E);
+        f32(o_bm0, "mm.0.bias", 4 * E);
+        f32(o_bm2, "mm.2.bias", proj);
+        b16(o_wm0, "mm.0.weight", (int64_t) 4 * E * 4 * E);
+        b16(o_wm2, "mm.2.weight", (int64_t) 4 * E * proj);
         for (int l = 0; ok && l < layers; ++l) {
             const std::string p = "v.blk." + std::to_string(l) + ".";
-            Layer& y = L[l];
-            ok = upf(y.ln1w, p + "ln1.weight", E) && upf(y.ln1b, p + "ln1.bias", E) && upf(y.ln2w, p + "ln2.weight", E) &&
-                 upf(y.ln2b, p + "ln2.bias", E) && upf(y.bqkv, p + "attn_qkv.bias", 3 * E) && upf(y.bo, p + "attn_out.bias", E) &&
-                 upf(y.bup, p + "ffn_up.bias", F) && upf(y.bdown, p + "ffn_down.bias", E) &&
-                 upb(y.wqkv, p + "attn_qkv.weight", (int64_t) 3 * E * E) && upb(y.wo, p + "attn_out.weight", (int64_t) E * E) &&
-                 upb(y.wup, p + "ffn_up.weight", (int64_t) F * E) && upb(y.wdown, p + "ffn_down.weight", (int64_t) E * F);
+            const LayerOff& y = LO[l];
+            f32(y.ln1w, p + "ln1.weight", E); f32(y.ln1b, p + "ln1.bias", E);
+            f32(y.ln2w, p + "ln2.weight", E); f32(y.ln2b, p + "ln2.bias", E);
+            f32(y.bqkv, p + "attn_qkv.bias", 3 * E); f32(y.bo, p + "attn_out.bias", E);
+            f32(y.bup, p + "ffn_up.bias", F); f32(y.bdown, p + "ffn_down.bias", E);
+            b16(y.wqkv, p + "attn_qkv.weight", (int64_t) 3 * E * E); b16(y.wo, p + "attn_out.weight", (int64_t) E * E);
+            b16(y.wup, p + "ffn_up.weight", (int64_t) F * E); b16(y.wdown, p + "ffn_down.weight", (int64_t) E * F);
         }
-        if (!ok) { e = er.empty() ? err : er; return false; }
-        const size_t N = nmax;
-        ok = alloc(d_patches, N * 768) && alloc(x, N * E) && alloc(g, N * F) && alloc(act, N * F) && alloc(rope, N * 36 * 2) &&
-             alloc(qh, (size_t) H * N * DP) && alloc(kh, (size_t) H * N * DP) && alloc(vh, (size_t) H * N * DP) &&
-             alloc(d_out, N / 4 * proj);
-        if (!ok) { e = err; return false; }
+        if (!ok) { e = er; release_image(); return false; }
+        return true;
+    }
+
+    size_t arena_bytes(int max_tokens) const { return wbytes + work((size_t) max_tokens * 4).total(); }
+
+    bool attach(void* base, size_t bytes, int max_tokens, std::string& e) {
+        if (!image) { e = "the encoder weights are not staged"; return false; }
+        if (!create(e)) return false;
+        nmax = max_tokens * 4;
+        const Work w = work((size_t) nmax);
+        if (bytes < wbytes + w.total()) { e = "the encoder's device region is too small"; return false; }
+        arena = (uint8_t*) base;
+        arena_size = bytes;
+        auto at = [&](size_t off) { return arena + off; };
+        wpatch = (float*) at(o_wpatch); bpatch = (float*) at(o_bpatch); pos = (float*) at(o_pos);
+        postw = (float*) at(o_postw); postb = (float*) at(o_postb); bm0 = (float*) at(o_bm0); bm2 = (float*) at(o_bm2);
+        wm0 = (__nv_bfloat16*) at(o_wm0); wm2 = (__nv_bfloat16*) at(o_wm2);
+        L.resize(layers);
+        for (int l = 0; l < layers; ++l) {
+            const LayerOff& o = LO[l];
+            Layer& y = L[l];
+            y.ln1w = (float*) at(o.ln1w); y.ln1b = (float*) at(o.ln1b); y.ln2w = (float*) at(o.ln2w); y.ln2b = (float*) at(o.ln2b);
+            y.bqkv = (float*) at(o.bqkv); y.bo = (float*) at(o.bo); y.bup = (float*) at(o.bup); y.bdown = (float*) at(o.bdown);
+            y.wqkv = (__nv_bfloat16*) at(o.wqkv); y.wo = (__nv_bfloat16*) at(o.wo);
+            y.wup = (__nv_bfloat16*) at(o.wup); y.wdown = (__nv_bfloat16*) at(o.wdown);
+        }
+        size_t cur = wbytes;
+        auto next = [&](size_t n) { uint8_t* p = at(cur); cur += n; return p; };
+        d_patches = (float*) next(w.patches); x = (float*) next(w.x); g = (float*) next(w.g);
+        act = (__nv_bfloat16*) next(w.act); rope = (float*) next(w.rope);
+        qh = (__half*) next(w.q); kh = (__half*) next(w.k); vh = (__half*) next(w.v);
+        d_out = (float*) next(w.out);
+        uint8_t* ws = next(w.blas);
+        CB(cublasSetWorkspace(blas, ws, w.blas));
+        CK(cudaMemcpyAsync(arena, image, wbytes, cudaMemcpyHostToDevice, stream));
         // the padding columns of q, k, v stay zero for good: the kernels write columns 0..71 only
-        CK(cudaMemset(qh, 0, (size_t) H * N * DP * sizeof(__half)));
-        CK(cudaMemset(kh, 0, (size_t) H * N * DP * sizeof(__half)));
-        CK(cudaMemset(vh, 0, (size_t) H * N * DP * sizeof(__half)));
+        CK(cudaMemsetAsync(qh, 0, (size_t) H * nmax * DP * sizeof(__half), stream));
+        CK(cudaMemsetAsync(kh, 0, (size_t) H * nmax * DP * sizeof(__half), stream));
+        CK(cudaMemsetAsync(vh, 0, (size_t) H * nmax * DP * sizeof(__half), stream));
         CK(cudaStreamSynchronize(stream));
         return true;
     }
+
+    void detach() {
+        if (stream) cudaStreamSynchronize(stream);
+        arena = nullptr;
+        arena_size = 0;
+        nmax = 0;
+    }
+
+    bool init(const Mmproj& m, int max_tokens, std::string& e) {
+        if (!stage(m, false, e)) return false;
+        void* base = nullptr;
+        const size_t bytes = arena_bytes(max_tokens);
+        if (cudaMalloc(&base, bytes) != cudaSuccess) { e = "out of device memory"; return false; }
+        own = base;
+        if (!attach(base, bytes, max_tokens, e)) { if (e.empty()) e = err; return false; }
+        release_image();   // the weights are on the device
+        return true;
+    }
+    void* own = nullptr;   // the arena `init` allocated
 
     bool run(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap) {
         const int gx = canvas.w / 16, gy = canvas.h / 16, n = gx * gy, m = n / 4;
@@ -202,7 +305,9 @@ struct CudaEncoder::Impl {
 };
 
 CudaEncoder::CudaEncoder() : impl_(new Impl) {}
-CudaEncoder::~CudaEncoder() = default;
+CudaEncoder::~CudaEncoder() {
+    if (impl_->own) { impl_->detach(); cudaFree(impl_->own); }
+}
 
 bool CudaEncoder::init(const Mmproj& mp, int max_tokens, std::string& err) {
     if (impl_->init(mp, max_tokens, err)) return true;
@@ -214,7 +319,17 @@ bool CudaEncoder::encode(const std::vector<float>& patches, Size canvas, std::ve
     return impl_->run(patches, canvas, out, tap);
 }
 
-size_t CudaEncoder::device_bytes() const { return impl_->bytes; }
+bool CudaEncoder::stage(const Mmproj& mp, bool pinned, std::string& err) { return impl_->stage(mp, pinned, err); }
+bool CudaEncoder::create(std::string& err) { return impl_->create(err); }
+size_t CudaEncoder::weights_bytes() const { return impl_->wbytes; }
+size_t CudaEncoder::arena_bytes(int max_tokens) const { return impl_->arena_bytes(max_tokens); }
+bool CudaEncoder::attach(void* arena, size_t bytes, int max_tokens, std::string& err) {
+    if (impl_->attach(arena, bytes, max_tokens, err)) return true;
+    if (err.empty()) err = impl_->err;
+    return false;
+}
+void CudaEncoder::detach() { impl_->detach(); }
+size_t CudaEncoder::device_bytes() const { return impl_->arena_size; }
 std::string CudaEncoder::last_error() const { return impl_->err; }
 
 }  // namespace basalt::vision
