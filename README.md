@@ -8,6 +8,7 @@
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing:
 Linux with an NVIDIA Blackwell GPU (sm_120). The experts that do not fit in VRAM live in system RAM (and optionally on
 a second GPU used as a peer expert tier), so a large MoE model runs on a single workstation.
+Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt).
 
 It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped down to that one target. See
 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
