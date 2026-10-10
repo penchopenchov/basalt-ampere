@@ -298,6 +298,8 @@ private:
     void ctx_note(int64_t t);
     void ctx_flush(cudaStream_t cs);
     void* top_scratch_ = nullptr;   ///< the head's fused argmax partials
+    uint8_t* proxy_ = nullptr;      ///< a 2-bit copy of the draft head's leading rows (n_tier1_), for the two-stage argmax
+    void* proxy_scratch_ = nullptr;
     unsigned long long* gstamp_ = nullptr;   ///< --profile: the round's first and the draft's last GPU time
     FileRange draft_vocab_;   ///< the draft head's token subset, when the files have one
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)

@@ -430,4 +430,275 @@ void q5k_head_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, 
     }
 }
 
+// ---- the 2-bit copy and the two-stage argmax
+
+namespace {
+
+constexpr int kPxNw4 = 2560 / 64;   // uint4 of weight words per row
+constexpr int kPxPer = 4;           // candidates kept per tile of 32 rows
+constexpr int kPxMaxCand = 64;      // rows rescored exactly
+constexpr float kPxDelta = 5.0f;    // a row is rescored when its approximate score is within this of the best
+
+__host__ __device__ inline int64_t px_tiles(int64_t n_cap) { return (n_cap + 31) / 32; }
+
+// One thread per 32-weight group: the group's dequantized Q5_K values, quantized to four levels with the scale (of a
+// few candidates) that leaves the least squared error.
+__global__ void q5k_proxy_pack_kernel(const uint8_t* __restrict__ q5, int64_t row0, int64_t n,
+                                      uint4* __restrict__ wq, uint16_t* __restrict__ sc) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * 80) return;
+    const int64_t row = row0 + i / 80;
+    const int g = (int) (i % 80);
+    const Q5KBlock* b = reinterpret_cast<const Q5KBlock*>(q5 + (size_t) row * 1760) + g / 8;
+    const int j = g % 8;
+    int sci, mi;
+    if (j < 4) { sci = b->scales[j] & 63; mi = b->scales[j + 4] & 63; }
+    else {
+        sci = (b->scales[j + 4] & 0xF) | ((b->scales[j - 4] >> 6) << 4);
+        mi = (b->scales[j + 4] >> 4) | ((b->scales[j] >> 6) << 4);
+    }
+    const float2 dm = __half22float2(b->dm);
+    const float d = dm.x * (float) sci, mn = dm.y * (float) mi;
+    float w[32], amax = 1e-9f;
+    for (int l = 0; l < 32; ++l) {
+        const int nib = (j & 1) ? (b->qs[32 * (j / 2) + l] >> 4) : (b->qs[32 * (j / 2) + l] & 15);
+        const int q = nib | (((b->qh[l] >> j) & 1) << 4);
+        w[l] = d * (float) q - mn;
+        amax = fmaxf(amax, fabsf(w[l]));
+    }
+    float best_s = amax / 1.5f, best_e = INFINITY;
+    for (int t = 0; t < 6; ++t) {
+        const float s = amax / 1.5f * (1.0f - 0.1f * (float) t);
+        const float sh = __half2float(__float2half(s));
+        float e = 0.0f;
+        for (int l = 0; l < 32; ++l) {
+            const int q = min(3, max(0, (int) floorf(w[l] / sh + 2.0f)));
+            const float r = ((float) q - 1.5f) * sh - w[l];
+            e += r * r;
+        }
+        if (e < best_e) { best_e = e; best_s = s; }
+    }
+    const __half hs = __float2half(best_s);
+    const float sh = __half2float(hs);
+    const int tile = (int) (row >> 5), lane = (int) (row & 31), w4 = g / 2, h = g & 1;
+    uint32_t words[2] = {0u, 0u};
+    for (int c = 0; c < 2; ++c)
+        for (int ii = 0; ii < 4; ++ii)
+            for (int bb = 0; bb < 4; ++bb) {
+                const int q = min(3, max(0, (int) floorf(w[c * 16 + 4 * ii + bb] / sh + 2.0f)));
+                words[c] |= (uint32_t) q << (8 * bb + 2 * ii);
+            }
+    uint32_t* wd = reinterpret_cast<uint32_t*>(wq) + (((size_t) tile * kPxNw4 + w4) * 32 + lane) * 4 + 2 * h;
+    wd[0] = words[0];
+    wd[1] = words[1];
+    sc[(((size_t) tile * kPxNw4 + w4) * 32 + lane) * 2 + h] = __half_as_ushort(hs);
+}
+
+// One tile per block, four warps splitting the row length; lane = row.  Writes the tile's best kPxPer approximate
+// scores and the tile's softmax partial (max, sum of exp(score - max)).
+__global__ void __launch_bounds__(128) q5k_proxy_score_kernel(const uint4* __restrict__ wq,
+                                                              const uint32_t* __restrict__ sc,
+                                                              const Q81Block* __restrict__ x, int n_rows,
+                                                              const int32_t* __restrict__ map,
+                                                              float2* __restrict__ cand, float2* __restrict__ part) {
+    __shared__ __align__(16) int xi[640];
+    __shared__ float xs[80], xdd[80];
+    __shared__ float red[4][32];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, tile = blockIdx.x;
+    const size_t base = ((size_t) tile * kPxNw4 + warp * 10) * 32 + lane;
+    uint4 w[10];
+    uint32_t s[10];
+#pragma unroll
+    for (int j = 0; j < 10; ++j) {   // constant data: read before the wait
+        w[j] = __ldcs(wq + base + (size_t) j * 32);
+        s[j] = __ldcs(sc + base + (size_t) j * 32);
+    }
+    const int row = tile * 32 + lane;
+    const int32_t id = (warp == 0 && row < n_rows) ? __ldg(map + row) : 0;
+    pdl_wait();
+    for (int i = tid; i < 640; i += 128) xi[i] = reinterpret_cast<const int*>(x[i / 8].qs)[i % 8];
+    if (tid < 80) {
+        const int* q = reinterpret_cast<const int*>(x[tid].qs);
+        int sum = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sum = DP4A(0x01010101, q[i], sum);
+        const float d8 = __low2float(x[tid].ds);
+        xdd[tid] = d8;
+        xs[tid] = d8 * (float) sum;
+    }
+    __syncthreads();
+    float acc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 10; ++j) {
+        const int w4 = warp * 10 + j;
+        const uint32_t ww[4] = {w[j].x, w[j].y, w[j].z, w[j].w};
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int g = 2 * w4 + h;
+            int P = 0;
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const uint32_t v = ww[2 * h + c];
+                const int4 x0 = *reinterpret_cast<const int4*>(&xi[g * 8 + c * 4]);
+                P = DP4A((int) (v & 0x03030303u), x0.x, P);
+                P = DP4A((int) ((v >> 2) & 0x03030303u), x0.y, P);
+                P = DP4A((int) ((v >> 4) & 0x03030303u), x0.z, P);
+                P = DP4A((int) ((v >> 6) & 0x03030303u), x0.w, P);
+            }
+            const float sg = __half2float(__ushort_as_half((unsigned short) (h ? (s[j] >> 16) : (s[j] & 0xffff))));
+            acc += sg * (xdd[g] * (float) P - 1.5f * xs[g]);
+        }
+    }
+    red[warp][lane] = acc;
+    __syncthreads();
+    if (warp != 0) return;
+    float v = red[0][lane] + red[1][lane] + red[2][lane] + red[3][lane];
+    if (row >= n_rows || id < 0) v = __int_as_float(0xff800000);
+    float m = v;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    float e = v > __int_as_float(0xff800000) ? __expf(v - m) : 0.0f;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
+    if (lane == 0) part[tile] = make_float2(m, e);
+    for (int k = 0; k < kPxPer; ++k) {
+        float bv = v;
+        int bi = lane;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) cand[tile * kPxPer + k] = make_float2(bv, __int_as_float(tile * 32 + bi));
+        if (lane == bi) v = __int_as_float(0xff800000);
+    }
+}
+
+// One block: the rows near the best approximate score are scored exactly (a warp per row), the exact best is the pick.
+__global__ void __launch_bounds__(512) q5k_proxy_final_kernel(const Q5KBlock* __restrict__ w,
+                                                              const Q81Block* __restrict__ x, int n_tiles,
+                                                              const int32_t* __restrict__ map,
+                                                              const float2* __restrict__ cand,
+                                                              const float2* __restrict__ part, int* __restrict__ out_id,
+                                                              float* __restrict__ out_prob) {
+    __shared__ __align__(16) int4 xe[80 * XS];
+    __shared__ float wmax[16];
+    __shared__ int list[kPxMaxCand];
+    __shared__ float lp[kPxMaxCand], ex[kPxMaxCand];
+    __shared__ int cnt;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    pdl_wait();
+    if (tid == 0) cnt = 0;
+    for (int i = tid; i < 80 * 4; i += blockDim.x) {
+        const int b = i / 4, pos = i % 4;
+        const Q81Block* blk = x + b;
+        const int* q8 = reinterpret_cast<const int*>(blk->qs) + pos;
+        const int u0 = __ldg(q8), u1 = __ldg(q8 + 4);
+        const unsigned dsb = __ldg(reinterpret_cast<const unsigned*>(&blk->ds));
+        const float d8 = __low2float(*reinterpret_cast<const half2*>(&dsb));
+        xe[xslot(b) + pos] = make_int4(u0, u1, DP4A(0x01010101, u0, DP4A(0x01010101, u1, 0)), __float_as_int(d8));
+    }
+    const int nc = n_tiles * kPxPer;
+    float m = __int_as_float(0xff800000);
+    for (int i = tid; i < nc; i += 512) m = fmaxf(m, __ldcg(&cand[i].x));
+#pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) wmax[warp] = m;
+    __syncthreads();
+    m = wmax[0];
+    for (int i = 1; i < 16; ++i) m = fmaxf(m, wmax[i]);
+    const float ninf = __int_as_float(0xff800000);
+    if (m == ninf) {   // every row is masked
+        if (tid == 0) { *out_id = map[0] < 0 ? 0 : map[0]; *out_prob = 1.0f; }
+        return;
+    }
+    for (int i = tid; i < nc; i += 512) {
+        const float2 c = __ldcg(&cand[i]);
+        if (c.x > ninf && c.x >= m - kPxDelta) {
+            const int p = atomicAdd(&cnt, 1);
+            if (p < kPxMaxCand) { list[p] = __float_as_int(c.y); lp[p] = c.x; }
+        }
+    }
+    __syncthreads();
+    const int n = cnt < kPxMaxCand ? cnt : kPxMaxCand;
+    const XCol xc[1] = {XCol{xe}};
+    for (int c = warp; c < n; c += 16) {
+        float y = 0.0f;
+        q5k_row_dev<1, 10>(w + (size_t) list[c] * 10, xc, &y, 1, 10, 0, lane);
+        if (lane == 0) ex[c] = y;
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    // the pick: largest exact score, the lowest row on a tie
+    float bv = ninf;
+    int bi = 0x7fffffff;
+    for (int c = lane; c < n; c += 32)
+        if (ex[c] > bv || (ex[c] == bv && list[c] < bi)) { bv = ex[c]; bi = list[c]; }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    // the softmax sum relative to the pick: the tiles' sums, with the rescored rows' approximate terms swapped for
+    // their exact ones
+    float sum = 0.0f;
+    for (int t = lane; t < n_tiles; t += 32) {
+        const float2 p = __ldcg(&part[t]);
+        if (p.y > 0.0f) sum += p.y * __expf(p.x - bv);
+    }
+    for (int c = lane; c < n; c += 32) sum += __expf(ex[c] - bv) - __expf(lp[c] - bv);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (lane == 0) {
+        float one = 0.0f;   // the pick's own term is exactly 1
+        for (int c = 0; c < n; ++c) if (list[c] == bi) one = 1.0f;
+        sum = fmaxf(sum, one);
+        *out_id = map[bi < 0x7fffffff ? bi : 0];
+        *out_prob = 1.0f / sum;
+    }
+}
+
+}  // namespace
+
+size_t q5k_proxy_bytes(int64_t n_cap) { return (size_t) px_tiles(n_cap) * kPxNw4 * 32 * (16 + 4); }
+
+size_t q5k_proxy_scratch_bytes(int64_t n_cap) { return (size_t) px_tiles(n_cap) * (kPxPer + 1) * sizeof(float2); }
+
+void q5k_proxy_pack(const void* q5k_rows, int64_t row0, int64_t n, void* proxy, int64_t n_cap, void* stream) {
+    if (n <= 0) return;
+    uint4* wq = (uint4*) proxy;
+    uint16_t* sc = (uint16_t*) ((char*) proxy + (size_t) px_tiles(n_cap) * kPxNw4 * 32 * 16);
+    const int64_t total = n * 80;
+    q5k_proxy_pack_kernel<<<(unsigned) ((total + 127) / 128), 128, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) q5k_rows, row0, n, wq, sc);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "q5k_proxy_pack: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+bool q5k_proxy_top1(const void* proxy, const void* q5k_rows, const void* x_q8_1, int n_rows, int64_t n_cap,
+                    const int32_t* map, int* out_id, float* out_prob, void* scratch, void* stream) {
+    if (n_rows <= 0 || n_rows > n_cap || !proxy || !q5k_rows || !x_q8_1 || !map || !out_id || !out_prob || !scratch)
+        return false;
+    const int tiles = (int) px_tiles(n_rows);
+    const uint4* wq = (const uint4*) proxy;
+    const uint32_t* sc = (const uint32_t*) ((const char*) proxy + (size_t) px_tiles(n_cap) * kPxNw4 * 32 * 16);
+    float2* cand = (float2*) scratch;
+    float2* part = cand + (size_t) px_tiles(n_cap) * kPxPer;
+    launch_pdl(q5k_proxy_score_kernel, dim3((unsigned) tiles), dim3(128), 0, (cudaStream_t) stream, wq, sc,
+               (const Q81Block*) x_q8_1, n_rows, map, cand, part);
+    launch_pdl(q5k_proxy_final_kernel, dim3(1), dim3(512), 0, (cudaStream_t) stream, (const Q5KBlock*) q5k_rows,
+               (const Q81Block*) x_q8_1, tiles, map, (const float2*) cand, (const float2*) part, out_id, out_prob);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "q5k_proxy_top1: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
+
 }  // namespace basalt::kernels

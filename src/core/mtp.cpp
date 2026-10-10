@@ -173,6 +173,8 @@ MtpDrafter::~MtpDrafter() {
     if (dhead_) cudaFree(dhead_);
     if (dvocab_) cudaFree(dvocab_);
     if (top_scratch_) cudaFree(top_scratch_);
+    if (proxy_) cudaFree(proxy_);
+    if (proxy_scratch_) cudaFree(proxy_scratch_);
     if (gstamp_) cudaFree(gstamp_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
@@ -514,6 +516,15 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
             if (size >= 4 && size % 4 == 0) {
                 const uint64_t xr = (uint64_t) kDraftCtxRows;
                 bytes += (uint64_t) (size / 4 + xr) * head_row_bytes + (uint64_t) size + xr * 8;
+                std::vector<uint8_t> raw;   // the 2-bit copy of the leading rows (the base rows and the context rows)
+                if (read_file(draft_vocab_, raw) && raw.size() == (size_t) size) {
+                    const int32_t* ids = (const int32_t*) raw.data();
+                    int64_t n_base = size / 4;
+                    for (int64_t i = 1; i < size / 4; ++i)
+                        if (ids[i] < ids[i - 1]) { n_base = i; break; }
+                    bytes += basalt::kernels::q5k_proxy_bytes(n_base + (int64_t) xr) +
+                             basalt::kernels::q5k_proxy_scratch_bytes(n_base + (int64_t) xr);
+                }
             }
         }
     }
@@ -648,6 +659,20 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             std::fprintf(stderr, "basalt mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             n_tier1_ = n_base + n_xcap_;
+            if (head->type() == 13) {   // the 2-bit copy of the leading rows scores them in a third of the bytes
+                const size_t pb = basalt::kernels::q5k_proxy_bytes(n_tier1_);
+                const size_t sb = basalt::kernels::q5k_proxy_scratch_bytes(n_tier1_);
+                if (cudaMalloc((void**) &proxy_, pb) == cudaSuccess && cudaMalloc(&proxy_scratch_, sb) == cudaSuccess) {
+                    cudaMemset(proxy_, 0, pb);
+                    basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
+                    cudaDeviceSynchronize();
+                    vram_ += pb + sb;
+                } else {
+                    cudaGetLastError();
+                    if (proxy_) cudaFree(proxy_);
+                    proxy_ = nullptr;
+                }
+            }
             if (n_xcap_ > 0) {
                 in_sub_.assign((size_t) n_vocab_, 0);
                 for (int64_t i = 0; i < n_raw; ++i)
@@ -967,6 +992,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         const int64_t nv = sub ? ((tier_ == 0 && !coupled_rec_) ? n_tier1_ : n_dvocab_) : n_vocab_;
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
         // another order: last bits)
+        if (!coupled_rec_ && T == 1 && sub && proxy_ != nullptr && nv == n_tier1_ && diag_ == nullptr &&
+            basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
+                                            proxy_scratch_, cs))
+            return true;
         if (!coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
@@ -1397,6 +1426,7 @@ void MtpDrafter::ctx_flush(cudaStream_t cs) {
     const int64_t at = xbase_ + n_xused_;
     cudaMemcpyAsync(dxids_, xpend_.data(), (size_t) n * 4, cudaMemcpyHostToDevice, cs);
     basalt::kernels::gather_rows((const uint8_t*) head_->weights(), row_bytes, dxids_, n, dhead_ + at * row_bytes, cs);
+    if (proxy_ != nullptr) basalt::kernels::q5k_proxy_pack(dhead_, at, n, proxy_, n_tier1_, cs);
     cudaMemcpyAsync(dvocab_ + at, dxids_, (size_t) n * 4, cudaMemcpyDeviceToDevice, cs);
     if (!diag_map_.empty()) std::copy(xpend_.begin(), xpend_.end(), diag_map_.begin() + at);
     xlist_.insert(xlist_.end(), xpend_.begin(), xpend_.end());

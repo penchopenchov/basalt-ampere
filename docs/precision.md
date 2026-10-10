@@ -43,7 +43,7 @@ hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_
 | Output head | A native_mmvq type with dedicated Q5_K and Q6_K kernels; the IQ3 packs use a Q5_K head | verify.cpp:1877-1882 |
 | MTP drafter dense | Q8_0 for fc_embedding, fc_hidden, q/k/v/o, indexer projection and the shared-expert projections; BF16 for the rest; 1-D tensors F32 | model_sections.py:334-338, 444-470 |
 | MTP drafter experts | Q2_0, all in VRAM | model_sections.py:482-487 |
-| MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset | mtp.cpp:614-643 |
+| MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset; the leading rows are first scored from a 2-bit copy and the near-best rows rescored exactly, so a draft differs from the exact argmax only in rare cases, and the draft probability is approximate | mtp.cpp, q5k_head.cu |
 | MTP hc matrices | The same int8 copies | mtp.cpp:218-263 |
 
 The drafter only proposes tokens; verify decides every token, so the drafter's precision affects speed, not output.
