@@ -152,23 +152,34 @@ class Vision:
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
-                self.proc.stdin.write(f"ENC {img} {out}\n")
-                self.proc.stdin.flush()
-                try:
-                    line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
-                except RuntimeError as e:               # silent: the encoder was ended
-                    self.stopped = True                 # alive() is False, so the next request starts it again
-                    raise ValueError(str(e)) from None
+                line = self._enc(img, out)
             finally:                                                   # also when the pipe is gone
                 img.unlink(missing_ok=True)
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
-            self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
-                old = next(iter(self.cache))
-                self.cache.pop(old)[0].unlink(missing_ok=True)
-            return self.cache[key]
+            return self._remember(key, out, int(line.split()[1]))
+
+    def _enc(self, img: Path, out: Path) -> str:
+        """One ENC round trip with the sidecar: its `OK <n> ...` or `ERR ...` line."""
+        self.proc.stdin.write(f"ENC {img} {out}\n")
+        self.proc.stdin.flush()
+        try:
+            return self._readline(VISION_ENCODE_S, "the image could not be read").strip()
+        except RuntimeError as e:                       # silent: the encoder was ended
+            self.stopped = True                         # alive() is False, so the next request starts it again
+            raise ValueError(str(e)) from None
+
+    def _remember(self, key: str, out: Path, n: int) -> tuple[Path, int]:
+        self.cache[key] = (out, n)
+        if len(self.cache) > 64:                                       # oldest first
+            old = next(iter(self.cache))
+            self.cache.pop(old)[0].unlink(missing_ok=True)
+        return self.cache[key]
+
+    def encode_many(self, sources: list[str]) -> list[tuple[Path, int]]:
+        """`encode` for each image of a request, in order."""
+        return [self.encode(src) for src in sources]
 
     def close(self):
         try:
@@ -177,6 +188,61 @@ class Vision:
             self.proc.wait(timeout=10)
         except Exception:
             self.proc.kill()
+
+
+class EngineVision(Vision):
+    """The encoder inside the engine process (`--vision dynamic`): `ENC` lines go over the engine's own pipe, the engine
+    borrows expert-cache slots for the encode and gives them back. Same cache, same files as the sidecar's."""
+    in_engine = True
+
+    def __init__(self, cfg: dict):
+        self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
+        self.engine = None                              # set by attach() once the engine exists
+        self.stopped = False
+        self.ready_s = 0.0
+        self.lock = threading.Lock()
+        self.cache: dict[str, tuple[Path, int]] = {}
+
+    def attach(self, engine) -> None:
+        self.engine = engine
+
+    def alive(self) -> bool:                            # the engine's life is the engine's business
+        return True
+
+    def unload(self):
+        """The engine unloads itself; encoded images stay cached on disk."""
+
+    def restart(self):
+        pass
+
+    def close(self):
+        pass
+
+    def encode(self, source: str) -> tuple[Path, int]:
+        return self.encode_many([source])[0]
+
+    def encode_many(self, sources: list[str]) -> list[tuple[Path, int]]:
+        """Every image not cached yet goes to the engine in one ENC, so it borrows its slots once."""
+        keys, datas = [], {}
+        for src in sources:
+            data = self.normalize(self.load(src))
+            key = hashlib.sha256(data).hexdigest()[:32]
+            keys.append(key)
+            datas[key] = data
+        with self.lock:
+            todo = [k for k in dict.fromkeys(keys) if k not in self.cache]
+            jobs = [(self.dir / f"{k}.img", self.dir / f"{k}.sve") for k in todo]
+            try:
+                for (img, _), k in zip(jobs, todo):
+                    img.write_bytes(datas[k])
+                if jobs:
+                    lines = self.engine.encode_images(jobs)
+                    for k, (_, out), line in zip(todo, jobs, lines):
+                        self._remember(k, out, int(line.split()[1]))
+            finally:
+                for img, _ in jobs:
+                    img.unlink(missing_ok=True)
+            return [self.cache[k] for k in keys]
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -214,14 +280,51 @@ def child_env(cfg: dict) -> dict:
     return env
 
 
-def vision_env(cfg: dict, env: dict) -> dict:
-    """The encoder environment: the engine's, or the second listed card alone to stay off the model's card."""
+VISION_MODES = ("on", "off", "peer", "dynamic", "cpu")
+VISION_USAGE = "vision: use one of " + ", ".join(VISION_MODES)
+
+
+def vision_mode(value) -> str:
+    """The --vision setting as one of VISION_MODES (None: "off"); booleans and anything else are a ValueError."""
+    if value is None:
+        return "off"
+    text = str(value).strip().lower()
+    if isinstance(value, bool) or text not in VISION_MODES:
+        raise ValueError(f"{VISION_USAGE} (got {value!r})")
+    return text
+
+
+def peer_card(cfg: dict) -> int | None:
+    """The card the peer tier runs on (the second of --gpu); None without a second card."""
     gpus = gpu_list(cfg)
-    if len(gpus) < 2:
-        return env
+    if len(gpus) >= 2:
+        return gpus[1]
+    if not gpus:
+        from serve.engine.modelfile import gpu_count
+        if gpu_count() > 1:
+            return 1
+    return None
+
+
+def vision_env(cfg: dict, env: dict, mode: str = "peer") -> dict:
+    """The encoder process's environment: `peer` puts it on the second card alone (the engine's when there is none),
+    `on` on the model's own card alone."""
+    gpus = gpu_list(cfg)
+    if mode == "on":
+        if len(gpus) < 2:
+            return env
+        card = gpus[0]
+    else:
+        if len(gpus) < 2:
+            if gpus or peer_card(cfg) is None:
+                return env
+            env = dict(env)
+            env["CUDA_VISIBLE_DEVICES"] = "1"
+            return env
+        card = gpus[1]
     env = dict(env)
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    env["CUDA_VISIBLE_DEVICES"] = str(gpus[1])
+    env["CUDA_VISIBLE_DEVICES"] = str(card)
     return env
 
 
@@ -239,11 +342,20 @@ def gpu_card_name(index: int) -> str | None:
 def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_card_name) -> str:
     """The startup line about the encoder: off, or where it runs and its ready time."""
     if not vision:
-        return "[server] vision: off (--vision or --vision-cpu to enable)"
-    took = f" in {ready_s:.1f} s"
-    if not vision.get("gpu"):
-        return f"[server] vision: ready on the CPU ({max(1, (os.cpu_count() or 2) // 2)} threads){took}"
+        return "[server] vision mode: off"
+    took = f"ready in {ready_s:.1f} s"
+    mode = vision.get("mode") or ("peer" if vision.get("gpu") else "cpu")
     listed = gpu_list(cfg)
-    card = listed[1] if len(listed) > 1 else listed[0] if listed else 0
-    n = name(card)
-    return f"[server] vision: ready on GPU {card}{f' ({n})' if n else ''}{took}"
+    main = listed[0] if listed else 0
+
+    def card(i):
+        n = name(i)
+        return f"GPU {i}{f' ({n})' if n else ''}"
+    if mode == "cpu" or not vision.get("gpu"):
+        return f"[server] vision mode: cpu, {max(1, (os.cpu_count() or 2) // 2)} threads, {took}"
+    if mode == "dynamic":
+        return f"[server] vision mode: dynamic, {card(main)}, loads per image"
+    if mode == "on":
+        return f"[server] vision mode: on, {card(main)}, {took}"
+    other = peer_card(cfg)
+    return f"[server] vision mode: peer, {card(other if other is not None else main)}, {took}"

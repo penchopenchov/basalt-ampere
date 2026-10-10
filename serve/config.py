@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from serve import ROOT
+from serve.engine.vision import VISION_MODES, VISION_USAGE, vision_mode
 
 
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
@@ -88,6 +89,13 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         if act is None:
             raise ValueError(f"server.{key}: not a server option")
         flag = "--" + name
+        if name == "vision":                               # a mode; booleans are refused
+            try:
+                mode = vision_mode(value)
+            except ValueError as e:
+                raise ValueError(f"server.{key}: {e}") from None
+            argv += ["--vision", mode]
+            continue
         if act.nargs == 0:                                 # a switch
             if not isinstance(value, bool):
                 raise ValueError(f"server.{key}: true or false")
@@ -124,6 +132,8 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
     if a_cli.config:
         file_argv, file_engine = load_config_file(a_cli.config, ap)
     a = ap.parse_known_args(file_argv + cli)[0]
+    if a.vision == "":                                     # a bare --vision
+        ap.error(VISION_USAGE)
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
         if isinstance(act, argparse._AppendAction) and getattr(a_cli, act.dest) != act.default:
             setattr(a, act.dest, getattr(a_cli, act.dest))
@@ -233,6 +243,14 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+def vision_setting(text: str) -> str:
+    """argparse type: one of the --vision modes."""
+    try:
+        return vision_mode(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def parallel_count(text: str) -> int:
     """argparse type: a whole number of request slots, 1..PARALLEL_MAX."""
     try:
@@ -270,11 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--config", metavar="FILE",
                     help="a JSON object of engine flags, e.g. {\"max-context\": 32768, \"spec\": 7, "
                          "\"resident-experts\": true}; the server's own flags win over it")
-    ap.add_argument("--vision", action="store_true",
-                    help="image input, encoded on the GPU (off by default: the encoder holds VRAM; with two cards "
-                         "listed in --gpu it uses the second)")
-    ap.add_argument("--vision-cpu", action="store_true",
-                    help="image input, encoded on the CPU (no VRAM, slower; wins over --vision)")
+    ap.add_argument("--vision", nargs="?", const="", default="off", type=vision_setting, choices=VISION_MODES, metavar="MODE",
+                    help="image input: off (default), on (the encoder always on the main GPU, ~2.2 GiB of VRAM), "
+                         "peer (always on the second GPU), dynamic (inside the engine: it borrows expert-cache slots "
+                         "on the main GPU while it reads an image, no standing VRAM) or cpu (no VRAM, slow); a value is "
+                         "required")
     ap.add_argument("--peer-exclusive", action="store_true",
                     help="the peer card's experts live only there, not also in RAM: less RAM, slower prefill")
     ap.add_argument("--host", default="127.0.0.1",

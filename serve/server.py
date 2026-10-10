@@ -28,8 +28,8 @@ from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
-from serve.engine.vision import (Vision, child_env, engine_args, gpu_list, gpus_in_play, vision_env,  # noqa: E402
-                                 vision_line)
+from serve.engine.vision import (EngineVision, Vision, child_env, engine_args, gpu_list, gpus_in_play,  # noqa: E402
+                                 peer_card, vision_env, vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
@@ -91,9 +91,11 @@ def main() -> int:
         except ValueError as e:
             fail(str(e))
         flags, sources = engine_settings(file_engine, cli_engine)
+        mode = a.vision
+        vision_arg = False if a.mock_engine or mode == "off" else mode
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
-                a.model, a.engine_bin, gpus=len(listed) if listed else None, vision=("cpu" if a.vision_cpu else True) if not a.mock_engine and (a.vision or a.vision_cpu) else False,
+                a.model, a.engine_bin, gpus=len(listed) if listed else None, vision=vision_arg,
                 overrides={f: v for f, v in flags.items() if v is not False}).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
@@ -135,10 +137,20 @@ def main() -> int:
         lazy = a.lazy
         if lazy and cfg.get("vision"):
             print("[server] warning: lazy loading is text-only, vision off", flush=True)
+            if "--vision-mmproj" in cfg["args"]:
+                at = cfg["args"].index("--vision-mmproj")
+                del cfg["args"][at:at + 2]
             del cfg["vision"]
         if cfg.get("vision"):
-            vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env))
+            mode = cfg["vision"].get("mode")
+            if mode == "peer" and peer_card(cfg) is None:
+                print("[server] warning: --vision peer needs a second GPU in --gpu; the encoder is loaded on the "
+                      "only GPU", flush=True)
+            if mode == "dynamic":
+                vision = EngineVision(cfg["vision"])
+            else:
+                vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                                env=vision_env(cfg, env, "on" if mode == "on" else "peer"))
         print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
         if lazy:
             print("[server] model unloaded, the first request loads it", flush=True)
@@ -153,6 +165,8 @@ def main() -> int:
             if e.log:
                 print(f"[server] engine log: {e.log}", file=sys.stderr, flush=True)
             return 1
+        if isinstance(vision, EngineVision):
+            vision.attach(engine)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [

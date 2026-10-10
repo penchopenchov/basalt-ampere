@@ -4,7 +4,7 @@ Basalt is a single-purpose engine: Qwen3.8-Flash-Next on Linux with NVIDIA Black
 
 ## Scope
 
-- **CUDA on Blackwell (sm_120) only.** No ROCm/HIP, no AMD, no Intel/SYCL/oneAPI, no Apple/Metal, no CPU-only main path (a CPU fallback is fine where the GPU path is the default, like the experts held in RAM or `--vision-cpu`), and no older NVIDIA architectures (Hopper sm_90 and earlier). No compatibility layers or `#if` branches for them. Pull requests adding another backend or architecture will be closed.
+- **CUDA on Blackwell (sm_120) only.** No ROCm/HIP, no AMD, no Intel/SYCL/oneAPI, no Apple/Metal, no CPU-only main path (a CPU fallback is fine where the GPU path is the default, like the experts held in RAM or `--vision cpu`), and no older NVIDIA architectures (Hopper sm_90 and earlier). No compatibility layers or `#if` branches for them. Pull requests adding another backend or architecture will be closed.
 - **Linux only.** No Windows code paths, no MSVC support, no `.bat` or PowerShell scripts.
 - **One fast path.** No per-user tuning flags or alternative kernels selected at run time. A change that wins replaces the old path; a change that doesn't win isn't merged. User-facing settings are limited to model, context, multi-GPU and serving options.
 - **No environment-variable knobs.** Everything the engine reads is a command-line flag or a config entry; diagnostics (profiling, timing, logs) are flags too, off by default.

@@ -1059,27 +1059,94 @@ class GpuChoice(unittest.TestCase):
             self.assertEqual(v.spawn[0], ["x", "--mmproj", "m", "--model", "t"] + want)
             shutil.rmtree(v.dir, ignore_errors=True)
 
+    def test_engine_vision_sends_one_enc_for_the_uncached_images(self):
+        from serve.engine.vision import EngineVision
+        sent = []
+
+        class Eng:
+            def encode_images(self, jobs):
+                sent.append([(i.name, o.name) for i, o in jobs])
+                for _, out in jobs:
+                    out.write_bytes(b"sve")
+                return [f"OK {10 + n} 2 2 5" for n, _ in enumerate(jobs)]
+
+        v = EngineVision({})
+        v.attach(Eng())
+        try:
+            with mock.patch.object(EngineVision, "load", side_effect=lambda s: s.encode()), \
+                    mock.patch.object(EngineVision, "normalize", side_effect=lambda d: d):
+                first = v.encode_many(["a", "b", "a"])
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(len(sent[0]), 2)                       # the repeat is one image
+                self.assertEqual([n for _, n in first], [10, 11, 10])
+                v.encode_many(["b", "a"])                               # cached: the engine is not asked again
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(v.encode("c")[1], 10)
+                self.assertEqual(len(sent), 2)
+            self.assertEqual(list(v.dir.glob("*.img")), [])             # the temporary images are removed
+            self.assertTrue(v.alive())
+        finally:
+            shutil.rmtree(v.dir, ignore_errors=True)
+
+    def test_process_engine_enc_replies(self):
+        import queue as q
+        from serve.engine.process import ProcessEngine
+        e = ProcessEngine.__new__(ProcessEngine)
+        e.lines, e.batch, e.ended, e.unloaded = q.Queue(), 0, False, False
+        e.proc = SimpleNamespace(poll=lambda: None)
+        sent = []
+        e._send = sent.append
+        for line in ("ENC OK 64 8 8 12\n", "ENC OK 16 4 4 3\n"):
+            e.lines.put(line)
+        self.assertEqual(e.encode_images([("/a", "/a.sve"), ("/b", "/b.sve")]), ["OK 64 8 8 12", "OK 16 4 4 3"])
+        self.assertEqual(sent, ["ENC /a /a.sve /b /b.sve"])
+        e.lines.put("ENC ERR cannot read the image /x\n")
+        with self.assertRaisesRegex(ValueError, "cannot read the image /x"):
+            e.encode_images([("/x", "/x.sve")])
+
     def test_vision_startup_line(self):
         from serve.engine.vision import vision_line
-        self.assertEqual(vision_line(None, {}), "[server] vision: off (--vision or --vision-cpu to enable)")
-        cpu = vision_line({"gpu": False}, {}, 2.34)
-        self.assertRegex(cpu, r"^\[server\] vision: ready on the CPU \(\d+ threads\) in 2\.3 s$")
-        self.assertEqual(vision_line({"gpu": True}, {"gpu": "0,1"}, 5.0, name=lambda i: f"card{i}"),
-                         "[server] vision: ready on GPU 1 (card1) in 5.0 s")
-        self.assertEqual(vision_line({"gpu": True}, {}, 5.0, name=lambda i: None),
-                         "[server] vision: ready on GPU 0 in 5.0 s")
+        name = lambda i: f"card{i}"
+        self.assertEqual(vision_line(None, {}), "[server] vision mode: off")
+        cpu = vision_line({"gpu": False, "mode": "cpu"}, {}, 2.34)
+        self.assertRegex(cpu, r"^\[server\] vision mode: cpu, \d+ threads, ready in 2\.3 s$")
+        self.assertEqual(vision_line({"gpu": True, "mode": "peer"}, {"gpu": "0,1"}, 5.0, name=name),
+                         "[server] vision mode: peer, GPU 1 (card1), ready in 5.0 s")
+        self.assertEqual(vision_line({"gpu": True, "mode": "peer"}, {"gpu": "0"}, 5.0, name=lambda i: None),
+                         "[server] vision mode: peer, GPU 0, ready in 5.0 s")
+        self.assertEqual(vision_line({"gpu": True, "mode": "on"}, {"gpu": "0,1"}, 5.0, name=name),
+                         "[server] vision mode: on, GPU 0 (card0), ready in 5.0 s")
+        self.assertEqual(vision_line({"gpu": True, "mode": "dynamic"}, {"gpu": "0,1"}, 0.0, name=name),
+                         "[server] vision mode: dynamic, GPU 0 (card0), loads per image")
 
     def test_vision_device(self):
-        # with two cards listed the encoder takes the second
+        from unittest import mock
         from serve.engine.vision import child_env, vision_env
         cfg = {"gpu": "0,1"}
         env = child_env(cfg)
-        venv = vision_env(cfg, env)
+        venv = vision_env(cfg, env)                         # peer: the second card
         self.assertEqual(venv["CUDA_VISIBLE_DEVICES"], "1")
         self.assertEqual(venv["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
-        self.assertIs(vision_env({"gpu": "0"}, env), env)   # one card, or none listed: the engine's environment
-        self.assertIs(vision_env({}, env), env)
+        main = vision_env(cfg, env, "on")                 # true: the model's own card
+        self.assertEqual(main["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertEqual(main["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertIs(vision_env({"gpu": "0"}, env), env)   # one card listed: the engine's environment
+        self.assertIs(vision_env({"gpu": "0"}, env, "on"), env)
+        with mock.patch("serve.engine.modelfile.gpu_count", return_value=1):
+            self.assertIs(vision_env({}, env), env)         # none listed, one card
+        with mock.patch("serve.engine.modelfile.gpu_count", return_value=2):
+            self.assertEqual(vision_env({}, env)["CUDA_VISIBLE_DEVICES"], "1")
+            self.assertIs(vision_env({}, env, "on"), env)
+
+    def test_vision_modes(self):
+        from serve.engine.vision import vision_mode
+        for given, want in ((None, "off"), ("off", "off"), ("on", "on"), ("Peer", "peer"), ("dynamic", "dynamic"),
+                            ("cpu", "cpu")):
+            self.assertEqual(vision_mode(given), want)
+        for bad in (True, False, "true", "false", "gpu"):
+            with self.assertRaisesRegex(ValueError, "vision: use one of on, off, peer, dynamic, cpu"):
+                vision_mode(bad)
 
 
 class RecordingPrompt(MockEngine):

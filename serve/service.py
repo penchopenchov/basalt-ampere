@@ -450,13 +450,16 @@ class Service:
         images = images_of(messages)
         if images:
             if self.vision is None:
-                raise ValueError("this server was started without image input (--vision or --vision-cpu), "
+                raise ValueError("this server was started without image input (--vision), "
                                  "so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
             # encode under the fifo: the encoder and a running engine must not use the GPU together
             with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+                if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
+                    self.ensure_loaded()
+                many = getattr(self.vision, "encode_many", None)
+                encoded = many(images) if many else [self.vision.encode(src) for src in images]
             # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0

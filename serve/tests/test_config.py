@@ -52,11 +52,11 @@ def engine_parser_flags() -> dict:
 class ConfigFile(unittest.TestCase):
     def test_server_and_engine_sections(self):
         ap = build_parser()
-        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": True, "lazy": False,
+        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": "on", "lazy": False,
                                                          "allowed-host": ["a", "b"], "--gpu": "0,1"},
                                               "engine": {"max-context": 32768, "--kv": "int8",
                                                          "resident-experts": True}}), ap)
-        self.assertEqual(argv, ["--port", "9000", "--vision", "--allowed-host", "a", "--allowed-host", "b",
+        self.assertEqual(argv, ["--port", "9000", "--vision", "on", "--allowed-host", "a", "--allowed-host", "b",
                                 "--gpu", "0,1"])
         self.assertEqual(engine, {"--max-context": 32768, "--kv": "int8", "--resident-experts": True})
 
@@ -72,7 +72,9 @@ class ConfigFile(unittest.TestCase):
                          ({"server": {"nope": 1}}, "not a server option"),
                          ({"server": {"spec": 7}}, "under \"engine\""),
                          ({"server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
-                         ({"server": {"vision": "yes"}}, "true or false"),
+                         ({"server": {"vision": "yes"}}, "vision: use one of on, off, peer, dynamic, cpu"),
+                         ({"server": {"vision": True}}, "vision: use one of on, off, peer, dynamic, cpu"),
+                         ({"server": {"vision": False}}, "vision: use one of on, off, peer, dynamic, cpu"),
                          ({"server": {"port": [1]}}, "one value"),
                          ({"server": {"config": "x"}}, "not a server option"),
                          ({"engine": {"port": 1}}, "a server option"),

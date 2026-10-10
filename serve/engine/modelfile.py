@@ -82,15 +82,15 @@ def gpu_count(visible_env: str | None = None) -> int:
     return sum(1 for line in out.splitlines() if line.startswith("GPU "))
 
 
-def vision_config(mf: ModelFile, engine_bin: str) -> dict:
-    """The vision sidecar's config; ValueError names what is missing."""
+def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
+    """The vision sidecar's config (the projector alone without `sidecar`); ValueError names what is missing."""
     side = Path(engine_bin).resolve().parent / VISION_EXE
     if "vision/mmproj" not in mf.sections:
-        raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision / --vision-cpu")
-    if not side.is_file():
-        raise ValueError(f"{side} not found (build the vision sidecar), or drop --vision / --vision-cpu")
+        raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
+    if sidecar and not side.is_file():
+        raise ValueError(f"{side} not found (build the vision sidecar), or drop --vision")
     if "vision/text_vocab" not in mf.sections:
-        raise ValueError("this model file has no vision/text_vocab section; drop --vision / --vision-cpu")
+        raise ValueError("this model file has no vision/text_vocab section; drop --vision")
     vdir = cache_dir(mf) / "vision"
     mmproj, vocab = vdir / "mmproj.gguf", vdir / "text_vocab.gguf"
     for name, dest in (("vision/mmproj", mmproj), ("vision/text_vocab", vocab)):
@@ -113,8 +113,9 @@ def with_arg(args: list[str], flag: str, value) -> list[str]:
 
 def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bool | str = False,
                  overrides: dict | None = None) -> dict:
-    """The engine settings the file implies; `overrides` ({flag: value}) replace its arguments, `vision` (True or
-    "cpu") adds the sidecar (ValueError if it cannot be set up). A second visible GPU becomes the peer tier."""
+    """The engine settings the file implies; `overrides` ({flag: value}) replace its arguments, `vision` (True, "peer"
+    or "cpu") adds the sidecar and "dynamic" the in-engine encoder (ValueError if it cannot be set up). A second
+    visible GPU becomes the peer tier."""
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
@@ -128,10 +129,13 @@ def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bo
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
            "sampling": dict(meta.get("sampling") or {}), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
-    v = vision_config(mf, engine_bin) if vision else None
+    v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
     if v:
+        v["mode"] = "on" if vision is True else vision
         v["gpu"] = vision != "cpu"
         cfg["vision"] = v
+        if vision == "dynamic":     # the engine encodes: it reads the projector itself
+            args += ["--vision-mmproj", v["mmproj"]]
         if "--vision" not in args:   # image embeddings need --vision
             args.append("--vision")
     return cfg

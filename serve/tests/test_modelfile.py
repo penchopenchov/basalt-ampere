@@ -162,6 +162,22 @@ class Vision(Tmp):
         self.assertTrue(modelfile.model_config(path, str(self.engine_bin), gpus=1, vision=True)["vision"]["gpu"])
         self.assertFalse(modelfile.model_config(path, str(self.engine_bin), gpus=1, vision="cpu")["vision"]["gpu"])
 
+    def test_modes_name_the_encoder(self):
+        path = self.build(vision=True)
+        (self.engine_bin.parent / "basalt-vision").write_text("")
+        for mode, name in (("on", "on"), (True, "on"), ("peer", "peer"), ("cpu", "cpu"), ("dynamic", "dynamic")):
+            self.assertEqual(modelfile.model_config(path, str(self.engine_bin), gpus=1, vision=mode)["vision"]["mode"], name)
+
+    def test_dynamic_gives_the_engine_the_projector_and_needs_no_sidecar(self):
+        path = self.build(vision=True)                      # no basalt-vision next to the engine
+        cfg = modelfile.model_config(path, str(self.engine_bin), gpus=1, vision="dynamic")
+        at = cfg["args"].index("--vision-mmproj")
+        self.assertEqual(cfg["args"][at + 1], cfg["vision"]["mmproj"])
+        self.assertIn("--vision", cfg["args"])
+        self.assertNotIn("--vision-mmproj", modelfile.model_config(path, str(self.engine_bin), gpus=1)["args"])
+        with self.assertRaisesRegex(ValueError, "basalt-vision"):
+            modelfile.model_config(path, str(self.engine_bin), gpus=1, vision="peer")
+
     def test_error_when_the_sidecar_is_missing(self):
         path = self.build(vision=True)
         with self.assertRaisesRegex(ValueError, "basalt-vision"):
@@ -199,7 +215,8 @@ class Cli(Tmp):
         from serve import server
         path = self.build(vision=True)
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
-        for flags, want in (([], False), (["--vision"], True), (["--vision-cpu"], "cpu"), (["--vision", "--vision-cpu"], "cpu")):
+        for flags, want in (([], False), (["--vision", "on"], "on"), (["--vision", "peer"], "peer"),
+                            (["--vision", "dynamic"], "dynamic"), (["--vision", "cpu"], "cpu"), (["--vision", "off"], False)):
             with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
                     mock.patch("sys.stderr", io.StringIO()):
                 self.run_main(*base, *flags)
@@ -209,7 +226,7 @@ class Cli(Tmp):
         path = self.build(vision=True)
         err = io.StringIO()
         with mock.patch("sys.stderr", err):
-            e = self.run_main("--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0", "--vision")
+            e = self.run_main("--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0", "--vision", "on")
         self.assertEqual(getattr(e, "code", None), 2)
         self.assertIn("basalt-vision", err.getvalue())
 

@@ -9,6 +9,7 @@ Protocol (one line each):
   * solo in a slot (INFO solo_any_slot=1): `SGEN <slot> <max_new> [k=v ...] <ids>` (SGENI with embeddings) is a GEN on
     that slot's own state, answered like a GEN.
   * `VRAM [mib]` -> `VRAM k=v ...`; `QUIT` ends the engine.
+  * `ENC <image> <out> [<image> <out> ...]` (--vision-mmproj): one `ENC OK <n> <nx> <ny> <ms>` per image, or `ENC ERR`.
   * Requests share one pipe, serialized by the service FIFO (batch: by the `ctl` lock).
 """
 from __future__ import annotations
@@ -396,6 +397,46 @@ class ProcessEngine:
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    ENC_TIMEOUT_S = 300.0
+
+    def encode_images(self, jobs: list, timeout: float | None = None) -> list[str]:
+        """ENC: the engine's in-process image encoder reads each (image file, output file) of `jobs` and answers one
+        `OK <n> <nx> <ny> <ms>` line per image. Caller holds the service FIFO; with batch slots the control lines are
+        taken here too (a decoding slot pauses for the encode). ValueError carries the engine's refusal."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        timeout = self.ENC_TIMEOUT_S if timeout is None else timeout
+        have_ctl = False
+        if self.batch:
+            turn = self._take_control(threading.Event(), 1)
+            try:
+                while True:
+                    next(turn)
+            except StopIteration:
+                have_ctl = True
+        try:
+            self._send("ENC " + " ".join(f"{img} {out}" for img, out in jobs))
+            deadline = time.time() + timeout
+            got: list[str] = []
+            while len(got) < len(jobs):
+                try:
+                    line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                except queue.Empty:
+                    raise EngineDied("the engine did not answer the image command") from None
+                if line is None:
+                    raise EngineDied("the engine ended")
+                line = line.strip()
+                if line.startswith("ENC ERR"):
+                    raise ValueError("the image could not be read: " + (line[8:].strip() or "the engine refused it"))
+                if line.startswith("ENC OK "):
+                    got.append(line[4:])
+                elif time.time() > deadline:
+                    raise EngineDied("the engine did not answer the image command")
+            return got
+        finally:
+            if have_ctl:
+                self.ctl.release()
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
