@@ -52,7 +52,7 @@ def reader():
             lines.put(l)
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
-print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
+print("INFO engine=0.0.1" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (" slot0_solo=1" if s0 else "") +
       (" solo_any_slot=1" if s0 and "--soloany" in args else ""), flush=True)
 print(f"READY {ready} stop", flush=True)
