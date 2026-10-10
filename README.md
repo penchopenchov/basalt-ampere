@@ -65,16 +65,6 @@ The build needs nothing outside this repository and fetches nothing. The parts o
 (quantization formats, CPU dot products, the prompt path's MMQ kernels) are extracted into `src/` and `include/basalt/ggml/`,
 with their MIT licence in `THIRD_PARTY_LICENSES`.
 
-Image input uses the vision sidecar, `bin/basalt-vision`, which the main build also produces (its encoder runs on Basalt's
-own kernels; `tools/vision` also builds on its own). The server looks for it next to `bin/basalt`. Start the server with
-`--vision` (encoder on the GPU; with two cards in `--gpu` it uses the second), or `"vision": true` in the config file's
-`server` section. `--vision-cpu` runs the encoder on the CPU as a fallback (no VRAM, slower). Vision is off by default.
-
-The image encoder is Basalt's own, written for this model's vision tower (no llama.cpp or ggml): bf16 tensor-core
-products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on the CPU. It replaces llama.cpp's
-mtmd encoder as a drop-in, is faster than it at every image size, and stays closer to an fp32 reference: mtmd's fp16
-attention drifts on large images, ours does not.
-
 ## Run
 
 ```sh
@@ -143,7 +133,7 @@ does not fit at all, the engine says which slot (`WARNING: --batch N: slot K's s
 the slots that did fit; if fewer than two fit, `--batch is off` and the server runs one request at a time.
 
 - `server` holds the server's options (`python -m serve.server --help`), named as the flags without the dashes:
-  strings or numbers, `true`/`false` for a switch (`vision`, `lazy`, ...), a list for the repeatable ones
+  strings or numbers, `true`/`false` for a switch (`lazy`, ...), a list for the repeatable ones
   (`allowed-host`, `cors-origin`). `model` and `tokenizer` paths are relative to the file.
 - `engine` holds engine flags (`bin/basalt --help`), the same way: a string or number, `true` for a switch, `false`
   to leave it off. Any flag the engine accepts works, on the command line as well (`--kv int8`, `--resident-experts`).
@@ -165,6 +155,38 @@ a chunk's cost per token stops falling past a few thousand tokens; it is still l
 fixed chunk. A prompt longer than one chunk is split into equal chunks (a short tail chunk costs nearly a whole pass over
 the streamed experts). The startup line `prompt chunk auto: N tokens` says what was
 chosen.
+
+### Vision: `--vision`
+
+Image input is one server option, `--vision off | on | peer | dynamic | cpu` (config: `"vision": "peer"` in the
+`server` section). It is `off` by default. The encoder is Basalt's own and shares its kernels in every mode, so all
+five give bitwise identical embeddings.
+
+| mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W) |
+| --- | --- | --- | --- |
+| `off` | no image input | none | |
+| `on` | sidecar `bin/basalt-vision` on the main GPU, always loaded | about 2.2 GiB of the main card's expert cache | TTFT 0.77 s at 1k image tokens, 1.4 s at 3k, 1.8 s at 4k |
+| `peer` | the same sidecar on the second `--gpu` card | about 1.8 GiB of the peer card's cache, none on the main card | 0.86 s, 2.1 s, 2.9 s |
+| `dynamic` | inside the engine, on the main GPU | none at rest (0.87 GiB of pinned RAM) | 0.77 s, 1.45 s, 1.8 s |
+| `cpu` | sidecar on the CPU | none | about 6 s at 1k, 40 s at 3k, 70 s at 4k |
+
+`dynamic` borrows up to 1.55 GiB of expert-cache slots per image (the prompt path's lend), uploads the weights from the
+pinned copy (about 30 ms), encodes on a side stream, and refills the same slots from RAM (about 60 ms), so the cache is
+identical afterwards. Other `--parallel` slots pause for the encode. An image already seen is served from the
+encoder cache in tens of milliseconds in every mode. `peer` on a single GPU warns and loads the encoder on that GPU;
+with two cards, `on` says so at startup and names `peer` as the way to put it on the second card.
+
+```json
+{ "server": { "gpu": "0,1", "vision": "peer" } }
+```
+
+`on` and `peer` use the sidecar, which the main build also produces (`tools/vision` also builds on its own); the
+server looks for it next to `bin/basalt`. `dynamic` needs no sidecar.
+
+The image encoder is Basalt's own, written for this model's vision tower (no llama.cpp or ggml): bf16 tensor-core
+products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on the CPU. It replaces llama.cpp's
+mtmd encoder as a drop-in, is faster than it at every image size, and stays closer to an fp32 reference: mtmd's fp16
+attention drifts on large images, ours does not.
 
 ## The `.basalt` model file
 
