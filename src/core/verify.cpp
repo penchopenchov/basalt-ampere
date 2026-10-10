@@ -226,6 +226,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    if (h_flag_ != nullptr) *(volatile uint32_t*) (h_flag_ + 8) = UINT32_MAX;
     if (dm_ != nullptr) {   // the peer window stops at its next ring; CUDA0's waits on it pass
         *(volatile uint32_t*) (dm_->h_w + 0) = UINT32_MAX;
         *(volatile uint32_t*) (dm_->h_w + 16) = UINT32_MAX;
@@ -530,6 +531,9 @@ Verifier::~Verifier() {
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
     if (ring_hi_) cudaStreamDestroy(ring_hi_);
+    if (ple_s_) cudaStreamDestroy(ple_s_);
+    if (ev_ple_fork_) cudaEventDestroy(ev_ple_fork_);
+    if (ev_ple_join_) cudaEventDestroy(ev_ple_join_);
     for (cudaStream_t q : qs_)
         if (q) cudaStreamDestroy(q);
     for (cudaEvent_t e : qev_)
@@ -780,6 +784,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
         hist_snap_ = b.take<float>(T * HS);
         ple_win_ = b.take<float>(2 * T * HC * N);
+        ple_key_ = b.take<float>(T * HC * N); ple_val_ = b.take<float>(T * N);
     };
     Bump count;
     carve(count);
@@ -820,7 +825,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             cudaStreamCreateWithPriority(&sh_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
             cudaStreamCreateWithPriority(&ring_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_ring_, cudaEventDisableTiming) != cudaSuccess ||
-            cudaEventCreateWithFlags(&ev_ring_join_, cudaEventDisableTiming) != cudaSuccess) {
+            cudaEventCreateWithFlags(&ev_ring_join_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&ple_s_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_ple_fork_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_ple_join_, cudaEventDisableTiming) != cudaSuccess) {
             err = "verify: side stream create failed";
             return false;
         }
@@ -924,6 +932,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
 
     if (prof_on_ && !batch_rec_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 2), cs);
+    // layer 1's PLE projections read only the host-gathered rows, so they run beside layer 0 from the window's start;
+    // layer 1 joins them before the PLE window
+    const bool ple_side = ple_on && !batch_rec_ && dm && G == 1 && lb_ <= 1 && le_ > 1 && !prof_on_ &&
+                          ple_s_ != nullptr && ev_ple_fork_ != nullptr && ev_ple_join_ != nullptr &&
+                          gr_native_mmvf_enabled() && ss.ple.w.key_bf16 != nullptr && ss.ple.w.value_bf16 != nullptr &&
+                          ple_native_bf16_enabled() && ple_native_postops_enabled();
+    if (!batch_rec_) ple_side_ = ple_side;
+    if (ple_side) {
+        try {
+            cudaEventRecord(ev_ple_fork_, cs);
+            cudaStreamWaitEvent(ple_s_, ev_ple_fork_, 0);
+            wait_flag_ge(m_flag_ + 8, 1, ple_s_);
+            copy_from_mapped(ple_, m_ple_, (int64_t) T * N, ple_s_);
+            bf16_gemv_fp32_mmvf_multi(ple_, N, ss.ple.w.key_bf16, ple_key_, HC * N, N, HC * N, T, ple_s_);
+            bf16_gemv_fp32_mmvf_multi(ple_, N, ss.ple.w.value_bf16, ple_val_, N, N, N, T, ple_s_);
+            cudaEventRecord(ev_ple_join_, ple_s_);
+        } catch (const std::exception& e) {
+            err = std::string("verify PLE side: ") + e.what();
+            return false;
+        }
+    }
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     if (batch_rec_) {   // the segment tables: which slot each row is
@@ -995,7 +1024,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // already applied it)
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
-            if (grp == 0) {
+            if (grp == 0 && !ple_side) {
                 if (ar_on() || dm) wait_flag_ge(m_flag_, 1, cs);
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
@@ -1012,7 +1041,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (batch_rec_) batch_seg_ple_ = ple_win;
             cudaStream_t pside = sh_hi_ != nullptr ? sh_hi_ : sh_cs_;
             const bool ple_fork = ple_win && pside != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
-            if (ple_batch_kv || ple_win) {
+            if (ple_side) {
+                cudaStreamWaitEvent(cs, ev_ple_join_, 0);
+            } else if (ple_batch_kv || ple_win) {
                 try {
                     if (ple_fork) {
                         cudaEventRecord(ev_fork_, cs);
@@ -1034,7 +1065,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (ple_win) {
                 PleWindowArgs pa;
                 pa.R = Rt(tb); pa.block_out = bo_ + (size_t) tb * N; pa.inject = inj2_ + (size_t) tb * HC;
-                pa.key = xn_ + (size_t) tb * HC * N; pa.value = z_ + (size_t) tb * N;
+                pa.key = ple_side ? ple_key_ : xn_ + (size_t) tb * HC * N;
+                pa.value = ple_side ? ple_val_ : z_ + (size_t) tb * N;
                 pa.history = batch_rec_ ? ple_work_ : ss.ple.hist; pa.segs = batch_rec_ ? segb_ : nullptr;
                 pa.hist_snap = hist_snap_ + (size_t) tb * HS; pa.scratch = ple_win_; pa.T = n;
                 try {
@@ -2110,6 +2142,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
+    *(volatile uint32_t*) (h_flag_ + 8) = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2453,11 +2486,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             *flag = 1;
+            *(volatile uint32_t*) (h_flag_ + 8) = 1;
             ms_host += ms_since(tp);
         } else {
             *flag = 1;
+            *(volatile uint32_t*) (h_flag_ + 8) = 1;
         }
-    } else
+    } else {
+    // the side branch of layer 1's PLE projections waits for the rows alone
+    const bool ple_early = ple_side_ && do_ple;
+    if (ple_early) {
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        *(volatile uint32_t*) (h_flag_ + 8) = 1;
+        ms_host += ms_since(tp);
+    }
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int) (k % G);
@@ -2520,7 +2565,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
         // Layer 0's VRAM experts, and before raising *flag = 1), the NVMe PLE reads overlap with both
         // MtpDrafter::draft and Layer 0's attention + router + expert execution!
-        if (k == 0 && do_ple) {
+        if (k == 0 && do_ple && !ple_early) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2530,6 +2575,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+    }
     }
     // each stage stages its own inputs (the layer split's order)
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);

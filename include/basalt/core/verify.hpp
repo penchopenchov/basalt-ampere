@@ -421,6 +421,9 @@ private:
     cudaEvent_t qev_[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     cudaStream_t ring_hi_ = nullptr;   // the MoE ring's stream at the greatest priority
     cudaEvent_t ev_ring_ = nullptr, ev_ring_join_ = nullptr;
+    cudaStream_t ple_s_ = nullptr;   // layer 1's PLE projections, from the window's start
+    cudaEvent_t ev_ple_fork_ = nullptr, ev_ple_join_ = nullptr;
+    bool ple_side_ = false;          // the window's graph computes them there (the host raises h_flag_[8] with the rows)
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // the doorbell variant of a stage that is all-resident otherwise
     cudaGraphExec_t commit_exec_ = nullptr;
@@ -490,6 +493,7 @@ private:
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM
+    float *ple_key_ = nullptr, *ple_val_ = nullptr;   // the PLE key / value projections: T * HC * N, T * N
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
