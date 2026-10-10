@@ -13,6 +13,12 @@ Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga
 It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped down to that one target. See
 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
 
+<p align="center">
+  <img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720">
+</p>
+
+<p align="center"><sub>The web UI at <code>/</code> while a reply streams: live decode speed, draft accept rate, context, GPU load and the request log.</sub></p>
+
 ## What is in the repository
 
 - `src/`, `include/`: the C++/CUDA engine (one binary, `basalt`).
