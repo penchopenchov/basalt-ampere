@@ -329,18 +329,21 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     if ((int) swaps.size() > max_swaps) swaps.resize((size_t) max_swaps);
     On on(device_);
     if (fsrc_ != nullptr) {
-        // exclusive: the victim has no RAM place, so it is copied into a free one first (it stays resident and
-        // computing meanwhile); the slot is refilled at apply_pending, once that copy has landed
+        // exclusive: a victim without a RAM place is copied into a free one first (it stays resident and computing
+        // meanwhile); one that has a place already (a slot reassigned from the primary) needs no copy.  Either way
+        // the slot is refilled at apply_pending, once the copy has landed
         for (const Swap& s : swaps) {
             const int32_t slot = res_[(size_t) (s.layer * n_expert_ + s.out)];
             if (slot < 0 || !fsrc_->has_resident(s.layer, s.in)) continue;
-            uint64_t off = 0;
-            uint8_t* dst = fsrc_->spare_take(s.layer, off);
-            if (dst == nullptr) continue;
-            if (!ck(cudaMemcpyAsync(dst, cache_.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
-                                    cudaMemcpyDeviceToHost, refill_), "evict", err)) {
-                fsrc_->spare_return(s.layer, off);
-                return false;
+            uint64_t off = kHasPlace;
+            if (!fsrc_->has_resident(s.layer, s.out)) {
+                uint8_t* dst = fsrc_->spare_take(s.layer, off);
+                if (dst == nullptr) continue;
+                if (!ck(cudaMemcpyAsync(dst, cache_.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
+                                        cudaMemcpyDeviceToHost, refill_), "evict", err)) {
+                    fsrc_->spare_return(s.layer, off);
+                    return false;
+                }
             }
             evicting_.push_back({s.layer, s.in, s.out, slot, off});
         }
@@ -370,6 +373,8 @@ bool PeerExperts::reassign(int64_t layer, int32_t in, int32_t out, const uint8_t
     if (res_[i_out] >= 0 || blob == nullptr) return true;
     for (const auto& p : pending_)
         if (p.second == slot) return true;
+    for (const Evict& x : evicting_)
+        if (x.slot == slot) return true;
     const auto& lay = basalt::kernels::cpu::expert_layout();
     On on(device_);
     if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), blob, (size_t) lay.blob_bytes(layer), cudaMemcpyHostToDevice,
@@ -395,8 +400,18 @@ bool PeerExperts::issue_pending(bool wait) {
     // the victims are in RAM now: they are computed from there while their slots take the incoming experts
     const auto& lay = basalt::kernels::cpu::expert_layout();
     for (const Evict& x : evicting_) {
+        const bool placed = x.off == kHasPlace;
+        // the slot may have been reassigned or its victim promoted since the round was planned
+        if (res_[(size_t) (x.layer * n_expert_ + x.out)] != x.slot || (placed && !fsrc_->has_resident(x.layer, x.out))) {
+            if (!placed) fsrc_->spare_return(x.layer, x.off);
+            continue;
+        }
         const uint8_t* b = src_->blob(x.layer, x.in);
-        if (!fsrc_->spare_land(x.layer, x.out, x.off) || b == nullptr ||
+        if (!placed && !fsrc_->spare_land(x.layer, x.out, x.off)) {
+            fsrc_->spare_return(x.layer, x.off);   // the victim got a place meanwhile: try again next round
+            continue;
+        }
+        if (b == nullptr ||
             cudaMemcpyAsync(cache_.device_slot(x.slot), b, (size_t) lay.blob_bytes(x.layer), cudaMemcpyHostToDevice,
                             refill_) != cudaSuccess) {
             std::fprintf(stderr, "peer experts: an exclusive swap failed (layer %d, expert %d)\n", (int) x.layer,

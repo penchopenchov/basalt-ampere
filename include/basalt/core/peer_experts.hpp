@@ -118,6 +118,8 @@ private:
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
     FileExpertSource* fsrc_ = nullptr;                ///< set with --peer-exclusive
     std::vector<uint8_t> hold_;                       ///< [n_layers * n_expert]: not to be evicted
+    /// `off` is the RAM place the victim is copied to, or `kHasPlace` when the victim already has one
+    static constexpr uint64_t kHasPlace = ~0ull;
     struct Evict { int32_t layer, in, out, slot; uint64_t off; };
     std::vector<Evict> evicting_;                     ///< exclusive swaps whose victim is still being copied to RAM
     cudaEvent_t evict_ev_ = nullptr;
