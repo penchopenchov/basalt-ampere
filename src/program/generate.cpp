@@ -7192,13 +7192,16 @@ int main(int argc, char** argv) {
                 // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
                 int64_t cap = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, o.peer_exclusive ? 16384 : 12288)
                                                  : o.prefill_chunk;
-                // Loan limits: with slots decoding the loan stays within kLendCapDecoding slots (they keep their
-                // experts in the cache), and a loan only takes slots whose expert has a RAM copy (a lent slot is
-                // refilled from RAM, never read from the file).  The chunk shrinks to the loan, but not below the
-                // smallest chunk the prompt path runs.
+                // Loan limits, only while slots decode: the loan stays within kLendCapDecoding slots (they keep their
+                // experts in the cache), and takes only slots whose expert has a RAM copy (a lent slot is refilled
+                // from RAM, never read from the file).  A read alone may refill lent slots from the file, so a larger
+                // chunk is worth it.  The chunk shrinks to the loan, but not below the smallest chunk the prompt path
+                // runs.
                 int64_t loan_lim = std::numeric_limits<int64_t>::max();
-                if (batch_on()) loan_lim = kLendCapDecoding;
-                if (src.complement_ready()) loan_lim = std::min<int64_t>(loan_lim, src.resident_lent_slots());
+                if (batch_on()) {
+                    loan_lim = kLendCapDecoding;
+                    if (src.complement_ready()) loan_lim = std::min<int64_t>(loan_lim, src.resident_lent_slots());
+                }
                 if (loan_lim != std::numeric_limits<int64_t>::max() && !pf_parts.empty() && pf_parts[0].first >= 0) {
                     const int64_t lc = std::max<int64_t>(256, biggest_chunk(cap, [&](int64_t t) {
                         return part_slots(pf_parts[0], t) <= loan_lim;
