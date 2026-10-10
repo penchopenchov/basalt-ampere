@@ -140,6 +140,10 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     weights += tk * k;
     float4 v[KM];
     float w[KM];
+    // the mapped rows are read in place; a peer row's own words say it arrived, so its first read needs no wait
+    auto mapped_row = [&](int j, int kd) {
+        return reinterpret_cast<const float4*>((kd == 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col);
+    };
 #pragma unroll
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
@@ -147,33 +151,38 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
         if (s_kind[j] == 0) {
             const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
             v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
+        } else if (TAG && s_kind[j] == 2) {
+            v[j] = __ldcv(mapped_row(j, 2));
         }
     }
     float4 h = shared ? *reinterpret_cast<const float4*>(shared + tk * n_embd + col) : make_float4(0.f, 0.f, 0.f, 0.f);
     if constexpr (DEP) pdl_wait();
+    // every other mapped row's load is issued before the first one is used
 #pragma unroll
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
         const int kd = s_kind[j];
-        if (TAG && kd == 2) {
-            // the row's own words say it arrived: poll until none is the tag word; a released window (tag_done past
-            // ring) ends the poll after one more read, with whatever the rows hold
-            float4* const src = const_cast<float4*>(reinterpret_cast<const float4*>(peer_rows + (tk * k + j) * n_embd + col));
-            constexpr unsigned tag = 0x7fa5a5a5u;
+        if (kd != 0 && !(TAG && kd == 2)) v[j] = __ldcv(mapped_row(j, kd));
+    }
+    if constexpr (TAG) {
+        // a peer row still holding the tag word is read again until none is; a released window (tag_done past ring)
+        // ends the poll after one more read, with whatever the rows hold
+        constexpr unsigned tag = 0x7fa5a5a5u;
+#pragma unroll
+        for (int j = 0; j < KM; ++j) {
+            if (j >= k) break;
+            if (s_kind[j] != 2) continue;
+            float4* const src = const_cast<float4*>(mapped_row(j, 2));
             unsigned spins = 0;
             bool rel = false;
-            while (true) {
-                const float4 r = __ldcv(src);
-                if (__float_as_uint(r.x) != tag && __float_as_uint(r.y) != tag && __float_as_uint(r.z) != tag &&
-                    __float_as_uint(r.w) != tag) {
-                    v[j] = r;
-                    break;
-                }
-                if (rel) { v[j] = r; break; }
+            while (__float_as_uint(v[j].x) == tag || __float_as_uint(v[j].y) == tag || __float_as_uint(v[j].z) == tag ||
+                   __float_as_uint(v[j].w) == tag) {
+                if (rel) break;
                 if ((++spins & 63u) == 0u && *tag_done >= ring) { __threadfence_system(); rel = true; }
+                v[j] = __ldcv(src);
             }
             __stcs(src, make_float4(__uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag), __uint_as_float(tag)));
-        } else if (kd != 0) v[j] = __ldcv(reinterpret_cast<const float4*>((kd == 2 ? peer_rows : cpu_rows) + (tk * k + j) * n_embd + col));
+        }
     }
     float sx = v[0].x * w[0], sy = v[0].y * w[0], sz = v[0].z * w[0], sw = v[0].w * w[0];
 #pragma unroll
