@@ -61,6 +61,9 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/draft_cum.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/vision/encoder_cuda.hpp"
+#include "basalt/vision/mmproj.hpp"
+#include "basalt/vision/preprocess.hpp"
 #include <unistd.h>
 #include <cerrno>
 #include <sys/stat.h>
@@ -94,6 +97,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <set>
@@ -502,6 +506,9 @@ struct Options {
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
+    /// --vision-mmproj PATH: the image encoder runs in this process on the model's GPU (implies --vision).  Its weights
+    /// stay in pinned host memory; each ENC command borrows expert-cache slots, encodes in them and refills them.
+    std::string vision_mmproj;
     int adapt_swaps = 96;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole prompt
     /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
@@ -693,6 +700,8 @@ void usage() {
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from basalt-vision)\n"
+                 "  --vision-mmproj PATH --vision, with the image encoder in this process: ENC requests borrow\n"
+                 "                       expert-cache slots for the encoder and give them back refilled\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
@@ -1422,6 +1431,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
+        else if (a == "--vision-mmproj") { o.vision_mmproj = next("--vision-mmproj"); o.vision = true; }
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib") {
@@ -2492,6 +2502,45 @@ int main(int argc, char** argv) {
         }
         ss.ple.emb_dev = ple_emb_dev;
         ss.ple.scratch = ple_scratch;
+    }
+
+    // ---- --vision-mmproj: the image encoder's weights staged in pinned host memory, its stream and product handle made,
+    // and one full-size encode run in a temporary region (the product library loads its kernels on first use), all
+    // before the expert cache is sized: afterwards the encoder holds no VRAM until an ENC borrows cache slots
+    basalt::vision::CudaEncoder vis_enc;
+    const int vis_max_tokens = basalt::vision::Geometry{}.max_tokens;
+    if (!o.vision_mmproj.empty() && o.serve) {
+        const auto t0 = Clock::now();
+        std::string verr;
+        basalt::vision::Mmproj mp;
+        if (!mp.open(o.vision_mmproj, verr) || !vis_enc.stage(mp, true, verr) || !vis_enc.create(verr)) {
+            std::fprintf(stderr, "basalt generate: the image encoder: %s\n", verr.c_str());
+            return 1;
+        }
+        mp.release();
+        void* tmp = nullptr;
+        const size_t tmp_bytes = vis_enc.arena_bytes(vis_max_tokens);
+        if (cudaMalloc(&tmp, tmp_bytes) != cudaSuccess || !vis_enc.attach(tmp, tmp_bytes, vis_max_tokens, verr)) {
+            std::fprintf(stderr, "basalt generate: the image encoder warm-up: %s\n", verr.empty() ? "out of device memory" : verr.c_str());
+            return 1;
+        }
+        const basalt::vision::Image gray{2048, 2048, std::vector<uint8_t>((size_t) 2048 * 2048 * 3, 128)};
+        const basalt::vision::Geometry geo;
+        const basalt::vision::Size sz = basalt::vision::fit_size(gray.w, gray.h, geo);
+        std::vector<float> planar, patches, out;
+        basalt::vision::normalize_planar(basalt::vision::to_canvas(gray, sz), planar);
+        basalt::vision::patchify(planar, sz, geo, patches);
+        const bool warm = vis_enc.encode(patches, sz, out);
+        vis_enc.detach();
+        cudaFree(tmp);
+        if (!warm) {
+            std::fprintf(stderr, "basalt generate: the image encoder warm-up failed: %s\n", vis_enc.last_error().c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "basalt serve: image encoder staged: %.0f MiB of weights in pinned memory, %.2f GiB of expert-cache "
+                             "slots borrowed per image at most (%.1f s)\n",
+                     (double) vis_enc.weights_bytes() / 1048576.0, (double) tmp_bytes / 1073741824.0,
+                     std::chrono::duration<double>(Clock::now() - t0).count());
     }
 
     float* d_parts = nullptr;
@@ -4780,7 +4829,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
             if (err.find("fit") != std::string::npos)   // say what frees VRAM
                 std::fprintf(stderr, "basalt serve: the GPU has too little free VRAM for the prompt path: move images "
-                                     "to the CPU (--vision-cpu) or off, close other programs using the GPU, use a shorter "
+                                     "to the CPU (--vision cpu) or off, close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
@@ -5946,6 +5995,133 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
+        // ---- ENC <image> <out> [<image> <out> ...] (--vision-mmproj), between requests and between batch windows.  The
+        // images are decoded on the host first; then the encoder borrows the last expert-cache slots (the prompt path's
+        // way: their rows are marked missing for the time), uploads its weights from the pinned copy, encodes each
+        // image on its own stream, and the slots get their experts back from RAM before anything else reads the cache.
+        // One reply line per image: `ENC OK <n> <nx> <ny> <ms>`, or a single `ENC ERR <message>`.
+        auto enc_command = [&](const std::string& cmd) {
+            auto reply_err = [&](const std::string& m) { std::printf("ENC ERR %s\n", m.c_str()); std::fflush(stdout); };
+            if (o.vision_mmproj.empty()) { reply_err("this engine was started without --vision-mmproj"); return; }
+            if (pf_parts.size() != 1 || pf_parts[0].first < 0 || !stages.empty()) {
+                reply_err("the in-engine image encoder needs one GPU's expert cache with a prompt lend region");
+                return;
+            }
+            std::vector<std::string> words;
+            {
+                size_t pos = 3;
+                for (;;) {
+                    pos = cmd.find_first_not_of(' ', pos);
+                    if (pos == std::string::npos) break;
+                    const size_t end = cmd.find(' ', pos);
+                    words.push_back(cmd.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+                    if (end == std::string::npos) break;
+                    pos = end;
+                }
+            }
+            if (words.empty() || words.size() % 2 != 0) { reply_err("expected: ENC <image> <output> [<image> <output> ...]"); return; }
+            const auto t0 = Clock::now();
+            struct Job { std::string out; basalt::vision::Size sz; std::vector<float> patches; };
+            std::vector<Job> jobs;
+            const basalt::vision::Geometry geo;
+            int max_patches = 0;
+            for (size_t i = 0; i < words.size(); i += 2) {
+                std::ifstream f(words[i], std::ios::binary);
+                const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                basalt::vision::Image img;
+                std::string ierr;
+                if (!f || bytes.empty() || !basalt::vision::decode_image(bytes.data(), bytes.size(), img, ierr)) {
+                    reply_err("cannot read the image " + words[i]);
+                    return;
+                }
+                Job j;
+                j.out = words[i + 1];
+                j.sz = basalt::vision::fit_size(img.w, img.h, geo);
+                std::vector<float> planar;
+                basalt::vision::normalize_planar(basalt::vision::to_canvas(img, j.sz), planar);
+                basalt::vision::patchify(planar, j.sz, geo, j.patches);
+                max_patches = std::max(max_patches, j.sz.w / 16 * (j.sz.h / 16));
+                jobs.push_back(std::move(j));
+            }
+            const int tokens = std::max(max_patches / 4, geo.min_tokens);
+            const auto t_dec = Clock::now();
+            // the work that touches the cache starts from a quiet cache and device
+            std::string e;
+            if (ba_job) { ba_thr.join(); ba_job = false; }
+            if (!ver.wait_commit(e)) { reply_err(e); return; }
+            apply_pending(true);
+            if (!xq_drain()) { reply_err("an adaptive swap failed"); return; }
+            if (cudaDeviceSynchronize() != cudaSuccess) { reply_err(std::string("device: ") + cudaGetErrorString(cudaGetLastError())); return; }
+            PfPart& p = pf_parts[0];
+            if (!p.lent.empty()) { reply_err("a prompt's loan is still out"); return; }
+            const int64_t k = cache_slots_for(*p.cache, vis_enc.arena_bytes(tokens));
+            int64_t room = p.cache->slots() - p.first;
+            if (batch_on()) room = std::min<int64_t>(room, kLendCapDecoding);
+            if (k <= 0 || k > room) {
+                reply_err("the image needs " + std::to_string((long long) k) + " expert-cache slots and " +
+                          std::to_string((long long) room) + " can be lent");
+                return;
+            }
+            const int32_t first = (int32_t) (p.cache->slots() - k);
+            for (int64_t l = p.lb; l < p.le; ++l)
+                for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                    const size_t i = (size_t) (l * g.n_expert + ex);
+                    if (host_res[i] >= first) {
+                        p.lent.emplace_back((int32_t) i, host_res[i]);
+                        host_res[i] = basalt::core::kNotResident;
+                    }
+                }
+            res_upload();
+            const auto t_lent = Clock::now();
+            std::vector<std::array<double, 4>> done;   // n, nx, ny, ms
+            std::string eerr;
+            bool ok = vis_enc.attach(p.cache->device_slot(first), part_bytes(p, first), tokens, eerr);
+            if (!ok && eerr.empty()) eerr = "the encoder could not be placed";
+            const auto t_up = Clock::now();
+            for (size_t i = 0; ok && i < jobs.size(); ++i) {
+                const Job& j = jobs[i];
+                const auto ti = Clock::now();
+                std::vector<float> out;
+                if (!vis_enc.encode(j.patches, j.sz, out)) { ok = false; eerr = "the vision encoder failed: " + vis_enc.last_error(); break; }
+                const int nx = j.sz.w / 32, ny = j.sz.h / 32, n = nx * ny, n_embd = (int) g.n_embd;
+                std::FILE* fo = std::fopen(j.out.c_str(), "wb");
+                if (!fo) { ok = false; eerr = "cannot write " + j.out; break; }
+                const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
+                const bool wrote = (int) (out.size() / (size_t) n_embd) == n && std::fwrite(hdr, sizeof hdr, 1, fo) == 1 &&
+                                   std::fwrite(out.data(), sizeof(float) * (size_t) n_embd, (size_t) n, fo) == (size_t) n;
+                std::fclose(fo);
+                if (!wrote) { ok = false; eerr = "short write to " + j.out; break; }
+                done.push_back({(double) n, (double) nx, (double) ny,
+                                std::chrono::duration<double, std::milli>(Clock::now() - ti).count()});
+            }
+            vis_enc.detach();
+            const auto t_enc = Clock::now();
+            // the slots get their experts back from RAM, in the same slots, then the table goes up again
+            for (const auto& [i, slot] : p.lent) {
+                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                if (b == nullptr || !p.cache->fill_slot_queued(slot, b, e, nb)) {
+                    std::printf("ENC ERR refilling the expert cache failed: %s\n", e.c_str());
+                    std::fflush(stdout);
+                    return;
+                }
+                host_res[(size_t) i] = slot;
+            }
+            if (!p.cache->sync_queued(e)) { std::printf("ENC ERR refilling the expert cache failed: %s\n", e.c_str()); std::fflush(stdout); return; }
+            const int64_t n_lent = (int64_t) p.lent.size();
+            p.lent.clear();
+            p.lent_chunk = 0;
+            p.first_now = -1;   // the prompt path lays its buffers out again at its next loan
+            res_upload();
+            const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            std::fprintf(stderr, "basalt serve: image encoder: %zu image(s) up to %d tokens in %lld cache slots (%.2f GiB), "
+                                 "%lld expert rows lent; decode %.0f ms, lend %.0f ms, weights %.0f ms, encode %.0f ms, refill %.0f ms\n",
+                         jobs.size(), tokens, (long long) k, (double) vis_enc.arena_bytes(tokens) / 1073741824.0, (long long) n_lent,
+                         ms(t0, t_dec), ms(t_dec, t_lent), ms(t_lent, t_up), ms(t_up, t_enc), ms(t_enc, Clock::now()));
+            if (!ok) { reply_err(eerr); return; }
+            for (const auto& d : done) std::printf("ENC OK %d %d %d %.0f\n", (int) d[0], (int) d[1], (int) d[2], d[3]);
+            std::fflush(stdout);
+        };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
@@ -6538,6 +6714,10 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
+            if (line.rfind("ENC ", 0) == 0) {   // the in-engine image encoder, between requests and windows
+                enc_command(line);
+                continue;
+            }
             if (line.rfind("VRAM", 0) == 0) {   // between requests, not a request
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
