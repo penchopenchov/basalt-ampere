@@ -188,7 +188,8 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 ## Models
 
 Quality measured with `basalt-bench --quality`: 20 chunks of wikitext-2 (512 tokens each), scored through the decode
-path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer to Q8_0.
+path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer to Q8_0. How precision is handled and how quality is measured:
+[docs/precision.md](docs/precision.md).
 
 | model | source | file | experts | PPL | KLD mean | same top-1 |
 |---|---|---:|---:|---:|---:|---:|
