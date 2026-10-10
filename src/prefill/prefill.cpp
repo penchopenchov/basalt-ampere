@@ -32,9 +32,11 @@
 #include "basalt/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <atomic>
@@ -121,10 +123,14 @@ struct Alloc {
 // j - kRing (recorded by the launching thread, `issued`) is done.
 struct Stager {
     // the pinned ring's depth: how far the host copies can run ahead of the DMAs of the unpinned experts' blobs
-    int kRing = 16;
+    int kRing = 32;
     // how many jobs ahead of the one being copied the OS is asked to read from the file
     static constexpr size_t kAhead = 64;
-    struct Job { const uint8_t* src; size_t bytes; };
+    // a job whose bytes are only in the model file (fd >= 0) is read into the buffer with pread at `off`; the others
+    // are copied from `src`
+    struct Job { const uint8_t* src; size_t bytes; int fd = -1; uint64_t off = 0; };
+    // reader threads for the file-backed jobs: each blocks in its read, so the threads are the reads in flight
+    static constexpr int kIoThreads = 16;
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
@@ -193,12 +199,27 @@ struct Stager {
                 // was a ring entry the routing skipped (an event never recorded returns at once)
                 cudaEventSynchronize(dma_done[b]);
                 const Job& jb = jobs[(size_t) j];
-                if ((size_t) j + kAhead < jobs.size()) basalt::platform::advise_willneed(jobs[(size_t) j + kAhead].src, jobs[(size_t) j + kAhead].bytes);
-                std::memcpy(buf[b], jb.src, jb.bytes);
+                if (jb.fd >= 0) {
+                    if (!read_file(jb, buf[b])) std::memcpy(buf[b], jb.src, jb.bytes);   // the mapping as the fallback
+                } else {
+                    const size_t a = (size_t) j + kAhead;
+                    if (a < jobs.size() && jobs[a].fd < 0) basalt::platform::advise_willneed(jobs[a].src, jobs[a].bytes);
+                    std::memcpy(buf[b], jb.src, jb.bytes);
+                }
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
             }
         }
+    }
+    static bool read_file(const Job& jb, uint8_t* dst) {
+        size_t done = 0;
+        while (done < jb.bytes) {
+            const ssize_t n = pread(jb.fd, dst + done, jb.bytes - done, (off_t) (jb.off + done));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return false;
+            done += (size_t) n;
+        }
+        return true;
     }
     int claim(uint32_t g) {
         uint64_t cur = head.load(std::memory_order_acquire);
@@ -219,7 +240,12 @@ struct Stager {
             ready.reset(new std::atomic<int>[ready_cap]);
         }
         for (size_t i = 0; i < jobs.size(); ++i) ready[i].store(0, std::memory_order_relaxed);
-        for (size_t i = 0; i < std::min(jobs.size(), kAhead); ++i) basalt::platform::advise_willneed(jobs[i].src, jobs[i].bytes);
+        bool any_file = false;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (jobs[i].fd >= 0) any_file = true;
+            else if (i < kAhead) basalt::platform::advise_willneed(jobs[i].src, jobs[i].bytes);
+        }
+        while (any_file && (int) threads.size() < kIoThreads) threads.emplace_back([this] { work(); });
         issued.store(0);
         ++gen;
         head.store((uint64_t) gen << 32 | (uint64_t) jobs.size() << 16, std::memory_order_release);
@@ -242,6 +268,15 @@ struct Stager {
         while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     }
 };
+
+// A stager job for the expert's blob `b`: read from the model file when that is where it lives.
+static Stager::Job make_job(core::ExpertSource& src, int64_t l, int32_t e, const uint8_t* b, size_t bytes) {
+    Stager::Job j{b, bytes};
+    int fd = -1;
+    uint64_t off = 0;
+    if (src.file_extent(l, e, fd, off)) { j.fd = fd; j.off = off; }
+    return j;
+}
 
 // multi-GPU: the peer GPU's share of a prompt chunk's experts.  Per MoE layer the primary copies its normed
 // activations over P2P, the peer quantizes the rows routed to the experts it holds, runs the same MMQ products the
@@ -1362,7 +1397,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (!m.src->pinned(l, e)) {
                             job = (int) js.size();
-                            js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                            js.push_back(make_job(*m.src, l, e, b, (size_t) lay0.blob_bytes(l)));
                         }
                     }
                     seq.push_back({(int32_t) l, e, b, job, nullptr});
@@ -1948,7 +1983,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 job_of[j] = (int) js.size();
                                 const uint8_t* b = m.src->blob(l, e);
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
-                                js.push_back({b, (size_t) lay.blob_bytes(l)});
+                                js.push_back(make_job(*m.src, l, e, b, (size_t) lay.blob_bytes(l)));
                             }
                             m.stager->start(std::move(js));
                         }

@@ -529,6 +529,18 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return true;
 }
 
+bool FileExpertSource::file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const {
+    const uint8_t* b = mapped_blob(layer, expert);
+    if (b == nullptr || fd_ < 0) return false;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    // a blob held in RAM (the complement, or a staged exchange) is not read from the file
+    if (complement_ready_ && (complement_offsets_[index] != kNoComplement || (!override_.empty() && override_[index] != nullptr)))
+        return false;
+    fd = fd_;
+    offset = file_off_ + (uint64_t) (b - base_);
+    return true;
+}
+
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
     const size_t i = (size_t) layer;

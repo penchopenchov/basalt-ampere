@@ -163,6 +163,12 @@ public:
     /// copy has no expert 0 when the GPU cache holds it, so it answers for the whole copy.
     virtual bool pcie_layer(int64_t layer) const { return device_alias(layer, 0) != nullptr; }
 
+    /// Whether `blob(layer, expert)` is served from the mapped model file (not from a RAM copy): its bytes are at
+    /// `offset` of the open file `fd`, so they can be read with pread.  False by default.
+    virtual bool file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const {
+        (void) layer; (void) expert; (void) fd; (void) offset; return false;
+    }
+
     /// The blob's bytes into `dst` (blob_bytes(layer) of them).
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
     /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by default.
@@ -472,6 +478,7 @@ public:
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     bool pinned(int64_t layer, int64_t expert) const override;
+    bool file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
