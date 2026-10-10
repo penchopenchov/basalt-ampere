@@ -63,8 +63,11 @@ constexpr int RING_MAX = 256;           // the arrays; the ring itself is ring_s
 // The chunk size from which every expert streams: below it only the routed experts are staged.
 int64_t g_stream_all_min = 1024;
 inline int64_t stream_all_min() { return g_stream_all_min; }
-// The streamed ring's slots (one whole expert blob each): a fixed count, so the buffers are the same for every pack.
+// The streamed ring's slots (one whole expert blob each): the most a layout holds (the same for every pack), and the
+// depth the next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower
+// ring).
 constexpr int kPrefillRing = 256;
+int g_ring_depth = kPrefillRing;
 // Whether the fused experts' buffers apply: a streamed chunk of a pack the fused kernels cover.
 inline bool fused_ring() {
     if (!fused::enabled()) return false;
@@ -81,7 +84,7 @@ inline bool fused_ring() {
     }();
     return all;
 }
-inline int ring_slots(size_t T) { return (int64_t) T >= stream_all_min() ? kPrefillRing : STAGE; }
+inline int ring_slots(size_t T) { return (int64_t) T >= stream_all_min() ? g_ring_depth : STAGE; }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -1065,6 +1068,8 @@ double g_pinned_share = 1.0;
 }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
+void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRing)); }
+int Prefill::ring_depth() const { return impl_->ring; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {

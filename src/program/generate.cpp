@@ -4544,6 +4544,10 @@ int main(int argc, char** argv) {
                                            (uint64_t) basalt::kernels::cpu::expert_layout().max_blob;
         };
         std::vector<PfPart> pf_parts;
+        // While slots decode, a prompt read lends at most this many cache slots, so their experts stay in the cache,
+        // and its streamed ring is this deep (the loan shrinks with it); otherwise the ring is full depth.
+        constexpr int64_t kLendCapDecoding = 1216;
+        constexpr int kRingDecoding = 64;
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
@@ -7174,6 +7178,10 @@ int main(int argc, char** argv) {
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
+                // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
+                // the full depth is restored on the way out for the sizing done elsewhere
+                basalt::prefill::Prefill::set_ring_depth(batch_on() ? kRingDecoding : 1 << 20);
+                struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(1 << 20); } } ring_reset;
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
                 // A bare `auto` reads a prompt in equal chunks of at most this many tokens: past a few thousand tokens
@@ -7182,8 +7190,21 @@ int main(int argc, char** argv) {
                 // exclusive peer tier streams its experts through the host, which pays for larger chunks.  `auto:N`
                 // and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
                 // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
-                const int64_t cap = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, o.peer_exclusive ? 16384 : 12288)
-                                                       : o.prefill_chunk;
+                int64_t cap = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, o.peer_exclusive ? 16384 : 12288)
+                                                 : o.prefill_chunk;
+                // Loan limits: with slots decoding the loan stays within kLendCapDecoding slots (they keep their
+                // experts in the cache), and a loan only takes slots whose expert has a RAM copy (a lent slot is
+                // refilled from RAM, never read from the file).  The chunk shrinks to the loan, but not below the
+                // smallest chunk the prompt path runs.
+                int64_t loan_lim = std::numeric_limits<int64_t>::max();
+                if (batch_on()) loan_lim = kLendCapDecoding;
+                if (src.complement_ready()) loan_lim = std::min<int64_t>(loan_lim, src.resident_lent_slots());
+                if (loan_lim != std::numeric_limits<int64_t>::max() && !pf_parts.empty() && pf_parts[0].first >= 0) {
+                    const int64_t lc = std::max<int64_t>(256, biggest_chunk(cap, [&](int64_t t) {
+                        return part_slots(pf_parts[0], t) <= loan_lim;
+                    }));
+                    cap = std::min(cap, lc);
+                }
                 int64_t want_full = request_chunk(tokens, cap);
                 if (want_full > 0 && tokens > cap) {
                     // equal chunks for the fewest chunks: every chunk streams the experts, so a short tail costs a
@@ -7197,10 +7218,11 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 bool any = false;
+                const int ring_now = (int) basalt::prefill::Prefill::ring_slots_for(want);
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk && !ov_copied) continue;   // its current loan already covers this
+                        if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied) continue;   // its loan covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -7208,7 +7230,7 @@ int main(int argc, char** argv) {
                     }
                     const basalt::core::OnDevice on(p.dev);
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
-                    if (want != p.sp->chunk() || first != p.first_now) {
+                    if (want != p.sp->chunk() || first != p.first_now || p.sp->ring_depth() != ring_now) {
                         if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }

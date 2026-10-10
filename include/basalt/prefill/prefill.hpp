@@ -82,6 +82,12 @@ public:
     /// The chunk size from which every expert streams (below it only the routed experts are staged and the peer card
     /// computes the rows of its own); before init, which sizes the buffers by it.  Default 1024.
     static void set_stream_all_min(int64_t tokens);
+
+    /// The streamed ring's depth for the layouts made from now on (`relayout`, `bytes_needed`, `ring_slots_for`); at
+    /// most the one `init` laid out.  A shallower ring takes fewer of the lent cache slots.
+    static void set_ring_depth(int slots);
+    /// The ring depth of the current layout.
+    int ring_depth() const;
     static double pinned_share();
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
