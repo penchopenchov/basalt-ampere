@@ -28,6 +28,7 @@
 #include "basalt/prefill/moe_fused_iq.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -121,6 +122,8 @@ struct Alloc {
 struct Stager {
     // the pinned ring's depth: how far the host copies can run ahead of the DMAs of the unpinned experts' blobs
     int kRing = 16;
+    // how many jobs ahead of the one being copied the OS is asked to read from the file
+    static constexpr size_t kAhead = 64;
     struct Job { const uint8_t* src; size_t bytes; };
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
@@ -190,6 +193,7 @@ struct Stager {
                 // was a ring entry the routing skipped (an event never recorded returns at once)
                 cudaEventSynchronize(dma_done[b]);
                 const Job& jb = jobs[(size_t) j];
+                if ((size_t) j + kAhead < jobs.size()) basalt::platform::advise_willneed(jobs[(size_t) j + kAhead].src, jobs[(size_t) j + kAhead].bytes);
                 std::memcpy(buf[b], jb.src, jb.bytes);
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
@@ -215,6 +219,7 @@ struct Stager {
             ready.reset(new std::atomic<int>[ready_cap]);
         }
         for (size_t i = 0; i < jobs.size(); ++i) ready[i].store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < std::min(jobs.size(), kAhead); ++i) basalt::platform::advise_willneed(jobs[i].src, jobs[i].bytes);
         issued.store(0);
         ++gen;
         head.store((uint64_t) gen << 32 | (uint64_t) jobs.size() << 16, std::memory_order_release);
