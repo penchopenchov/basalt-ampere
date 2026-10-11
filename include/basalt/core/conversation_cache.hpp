@@ -173,9 +173,11 @@ public:
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
     // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
+    // `owner`: the session the buffers were restored into; only that session's own state may be captured with them.
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
-                std::vector<std::vector<ConversationKv>>&& stage_kv = {}) {
+                std::vector<std::vector<ConversationKv>>&& stage_kv = {}, const void* owner = nullptr) {
         reuse_ = {};
+        reuse_owner_ = owner;
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
         for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
         if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
@@ -185,7 +187,15 @@ public:
         for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
     }
-    ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    // Buffers retained for another session (a batch slot's, or the one a slot's copy has since overwritten) hold
+    // another conversation's K/V: they are dropped, never handed to this session's capture.
+    void drop_reuse_unless(const void* owner) {
+        if (owner != reuse_owner_) reuse_ = {};
+    }
+    ConversationKvReuse take_reuse(const void* owner = nullptr) {
+        drop_reuse_unless(owner);
+        return std::exchange(reuse_, {});
+    }
     size_t retained_bytes() const { return reuse_.bytes(); }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
@@ -278,6 +288,7 @@ private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;
+    const void* reuse_owner_ = nullptr;
 };
 
 } // namespace basalt::core

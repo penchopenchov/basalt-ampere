@@ -5009,7 +5009,7 @@ int main(int argc, char** argv) {
                 ~MergeBack() { if (on && !basalt::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
             const basalt::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            auto reuse = conversations.take_reuse();
+            auto reuse = conversations.take_reuse(rsp);
             std::vector<basalt::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -7123,6 +7123,7 @@ int main(int argc, char** argv) {
                     from_live = false;
                 } else {
                     checks.clear();   // the main session's checkpoints were of the conversation it held before
+                    conversations.limit_reuse(0);   // its cells now hold the slot's conversation, not the retained buffers'
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
                     // checkpoints as if it had not stopped
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
@@ -7182,7 +7183,7 @@ int main(int argc, char** argv) {
                 from_live = parked.live;
                 std::vector<std::vector<basalt::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                 for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), rsp);
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "basalt serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint",
@@ -7234,6 +7235,7 @@ int main(int argc, char** argv) {
                 mtp.begin_request(ids.data(), (int64_t) ids.size());
             }
             const int64_t read_from = resume;
+            conversations.drop_reuse_unless(rsp);   // another session may have overwritten the cells since
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
