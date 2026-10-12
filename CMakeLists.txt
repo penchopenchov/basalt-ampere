@@ -165,6 +165,10 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/verify_kernels.cu
                         src/kernels/stamp_ring.cpp
                         src/kernels/cuda/attn_chain.cu
+                        src/kernels/cuda/fused_layer.cu
+                        src/kernels/cuda/fused_layer_t2.cu
+                        src/kernels/cuda/fused_layer_t3.cu
+                        src/kernels/cuda/fused_layer_t4.cu
                         src/kernels/cuda/qsa_full.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
@@ -430,6 +434,13 @@ add_executable(shared_expert_parity src/kernels/shared_expert_parity.cpp)
 target_include_directories(shared_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(shared_expert_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
+# the fused layer's experts half against today's launch sequence, bitwise, every IQ3_S shared-expert format triple
+# (GPU, synthetic, no model)
+add_executable(fused_moe_parity src/kernels/fused_moe_parity.cu)
+target_include_directories(fused_moe_parity PRIVATE src src/kernels/cuda ${_gpu_include_directories})
+target_link_libraries(fused_moe_parity PRIVATE kernels CUDA::cuda_driver ${_gpu_runtime_target})
+add_test(NAME fused_moe_parity COMMAND fused_moe_parity)
+set_tests_properties(fused_moe_parity PROPERTIES SKIP_RETURN_CODE 77)
 
 # the MoE half of a decode layer: the engine's launch sequence against the persistent experts kernel (GPU, synthetic)
 add_executable(pk_moe_bench src/kernels/pk_moe_bench.cpp)
