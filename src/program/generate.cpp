@@ -209,6 +209,17 @@ private:
     std::thread th_;
 };
 
+// Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
+// the driver page GPU memory, and a verify graph spinning on a host flag then never finishes.
+constexpr int kVramStallMib = 256;
+
+// A byte count in GiB with one decimal, rounded down (a safe limit must not round up past itself).
+std::string gib_text(uint64_t bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f", std::floor((double) bytes / 1073741824.0 * 10.0) / 10.0);
+    return buf;
+}
+
 // A start-ending failure: one `basalt error:` line, which the server shows as the reason.  Returns the exit code.
 int fatal_start_error(const std::string& text) {
     std::fprintf(stderr, "basalt error: %s\n", text.c_str());
@@ -771,7 +782,7 @@ void usage() {
                  "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  auto = as many as fit in the VRAM\n"
                  "                       left after the weights, the session and --vram-reserve-mib\n"
                  "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
-                 "                       --expert-cache auto sizes the tier (default 700)\n"
+                 "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
                  "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
@@ -815,7 +826,12 @@ void usage() {
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
                  "  --resident-experts   the low-RAM resident mode: --mmap-experts --resident-cpu-experts\n"
                  "                       with the copy page-locked when possible, 4 GiB headroom, plain mmap if it\n"
-                 "                       does not fit.  Same answers as --mmap-experts for the same placement.\n");
+                 "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
+                 "                       When some experts stay in the file, the copy leaves a RAM floor free for\n"
+                 "                       the OS file cache (the RAM margin + 3.5 GiB + two layers' experts).\n"
+                 "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first);\n"
+                 "                       a budget that would leave less than the RAM floor free is refused, naming\n"
+                 "                       the largest safe value.\n");
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
@@ -1860,6 +1876,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt generate: invalid sampling or resource parameter\n");
         return 2;
     }
+    if (o.vram_reserve_given && o.vram_reserve_mib < kVramStallMib) {
+        std::fprintf(stderr, "basalt error: --vram-reserve-mib %d leaves less VRAM free than the engine needs to keep "
+                             "requests from stalling; the smallest safe value is %d\n", o.vram_reserve_mib, kVramStallMib);
+        return 2;
+    }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
         std::fprintf(stderr, "basalt generate: --expert-cache-remote-placement must be stripe or layer\n");
         return 2;
@@ -2214,11 +2235,21 @@ int main(int argc, char** argv) {
                     (void) cudaGetLastError();
                 }
                 ssd_warned = model_bytes > vram + peer_vram + ram;
-                if (ssd_warned)
+                if (ssd_warned) {
+                    // experts read from the SSD: the RAM copy also leaves the file cache its floor, as the loader does
+                    uint64_t largest = 0;
+                    for (int64_t l = 0; l < g.n_layers; ++l)
+                        largest = std::max<uint64_t>(largest, (uint64_t) g.n_expert *
+                                                                  basalt::kernels::cpu::expert_layout().blob_bytes(l));
+                    if (o.resident_cpu_experts && o.resident_budget == 0) {
+                        const uint64_t cache = basalt::platform::file_cache_floor(1, largest);
+                        ram = ram > cache ? ram - cache : 0;
+                    }
                     std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
                                          "the SSD while generating (slow)\n",
                                  (double) model_bytes / 1073741824.0,
                                  (double) (vram + peer_vram + ram) / 1073741824.0);
+                }
             } else if (o.mmap_experts) {
                 (void) cudaGetLastError();
             }
@@ -4449,6 +4480,12 @@ int main(int argc, char** argv) {
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
+    // every expert of the largest layer: what one prompt layer can read from the file (see platform::file_cache_floor)
+    uint64_t largest_layer_bytes = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        largest_layer_bytes = std::max<uint64_t>(largest_layer_bytes,
+                                                 (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
+    uint64_t ram_floor_bytes = basalt::platform::ram_margin();   // the RAM the copy leaves free; the serve guard's floor
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
@@ -4463,9 +4500,42 @@ int main(int argc, char** argv) {
             src.set_spares(o.peer_exclusive ? o.adapt_swaps + std::max(o.peer_adapt_swaps, o.adapt_swaps) : o.adapt_swaps);
         // A server also leaves room for what it allocates after this copy, before it is ready (the top-up below takes
         // back whatever that does not use).
-        const uint64_t resident_headroom =
-            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + basalt::platform::kLateHostBytes)
-                    : o.resident_headroom;
+        const uint64_t late = o.serve ? basalt::platform::kLateHostBytes : 0;
+        uint64_t resident_headroom =
+            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late) : o.resident_headroom;
+        // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
+        // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
+        {
+            const uint64_t gpu_held = std::min(expert_total_bytes, cache_fill_bytes + peer_only_bytes);
+            const uint64_t complement = expert_total_bytes - gpu_held;
+            const uint64_t avail = basalt::platform::available_memory();
+            const uint64_t margin = basalt::platform::ram_margin();
+            const uint64_t room = avail > std::max(resident_headroom, margin) ? avail - std::max(resident_headroom, margin) : 0;
+            const uint64_t copy = o.resident_budget > 0 ? std::min(o.resident_budget, complement) : std::min(room, complement);
+            const uint64_t file_bytes = complement - copy;
+            ram_floor_bytes = basalt::platform::ram_floor(margin, file_bytes, largest_layer_bytes);
+            if (avail > 0 && file_bytes > 0) {
+                const uint64_t safe = basalt::platform::max_safe_copy(avail, late, ram_floor_bytes);
+                constexpr double kGiB = 1073741824.0;
+                if (o.resident_budget > 0 && o.resident_budget > safe) {
+                    return fatal_start_error(
+                        "--resident-budget-gib " + gib_text(o.resident_budget) + " leaves too little RAM: " +
+                        gib_text(avail) + " GiB is available and " + gib_text(file_bytes) + " GiB of experts are read "
+                        "from the SSD, which needs " + gib_text(ram_floor_bytes) + " GiB free (" + gib_text(margin) +
+                        " margin + " + gib_text(ram_floor_bytes - margin) + " file cache)" +
+                        (late > 0 ? " beside " + gib_text(late) + " GiB the server takes later" : std::string()) +
+                        "; the largest safe value is " + gib_text(safe));
+                }
+                resident_headroom = std::max(resident_headroom, ram_floor_bytes + late);
+                std::fprintf(stderr, "basalt generate: RAM floor %.1f GiB (%.1f margin + %.1f file cache): %.1f GiB of "
+                                     "experts are read from the SSD; the RAM copy takes at most %.1f of %.1f GiB "
+                                     "available\n",
+                             (double) ram_floor_bytes / kGiB, (double) margin / kGiB,
+                             (double) (ram_floor_bytes - margin) / kGiB, (double) file_bytes / kGiB,
+                             (double) (o.resident_budget > 0 ? std::min(o.resident_budget, safe) : safe) / kGiB,
+                             (double) avail / kGiB);
+            }
+        }
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_only, lend_from, resident_headroom,
                                                     o.resident_budget, &profile);
         std::string whole_err;
@@ -4486,9 +4556,8 @@ int main(int argc, char** argv) {
         if (resident_ok && o.prefill_auto_fit && lend_from >= 0) {
             // A lent slot whose expert the complement holds is refilled from RAM; the others are read from the file.
             // Allow the backed slots plus a fixed amount of file reading per prompt.
-            constexpr uint64_t kUnbackedLendBytes = 3584ull << 20;
             const int64_t allow = src.resident_lent_slots() +
-                                  (int64_t) (kUnbackedLendBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
+                                  (int64_t) (basalt::platform::kPromptFileReadBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
             auto_ceiling = std::max<int64_t>(8192, biggest_chunk(auto_ceiling, [&](int64_t t) { return lend_slots(t) <= allow; }));
         }
         if (resident_ok) {
@@ -4530,6 +4599,7 @@ int main(int argc, char** argv) {
     drive.d.peer = peer.valid() ? &peer : nullptr;
     // Where the routed experts live, fastest tier first, and a warning when a share of them is only in the file (decode
     // reads those from the SSD).  Called once the tiers are final.
+    uint64_t tier_file_bytes = 0;   // the experts only the file holds, once the tiers are final
     auto report_expert_tiers = [&]() {
         uint64_t b_vram = 0, b_peer = 0, b_ram = 0, b_file = 0;
         const bool ram_ok = srcp == &src && src.complement_ready();
@@ -4546,6 +4616,7 @@ int main(int argc, char** argv) {
                 else b_file += blob;
             }
         }
+        tier_file_bytes = b_file;
         const double total = (double) (b_vram + b_peer + b_ram + b_file);
         if (total <= 0.0) return;
         constexpr double kGiB = 1073741824.0;
@@ -5652,16 +5723,23 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
+        // a request also stops when the RAM guard reads MemAvailable below its floor; `ram_stop` keeps that it did, so
+        // the request ends on an error instead of a cancel
+        std::atomic<bool> ram_stop{false};
+        auto halted = [&]() -> bool {
+            if (stop_req.load()) return true;
+            if (!basalt::platform::ram_guard_low()) return false;
+            ram_stop.store(true);
+            return true;
+        };
+        sp.should_stop = [&] { return halted(); };
         {
             // what is left once everything is allocated: a GPU filled to the brim may not fail but page, and a page-in
             // while the verify graph spins on a host flag stalls the request for good
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
-            // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
-            // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
-            if (free_mib >= 256) {
+            if (free_mib >= kVramStallMib) {
                 std::fprintf(stderr, "basalt serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
             } else {
                 std::fprintf(stderr, "basalt warning: only %lld MiB of VRAM free, requests may stall; close other "
@@ -5738,7 +5816,9 @@ int main(int argc, char** argv) {
         if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
             int64_t n_top = 0;
             // what the engine still takes once serving: the parked conversations
-            const uint64_t later = o.prompt_cache > 0 ? (uint64_t) o.conversation_cache_mib << 20 : 0;
+            // and the file cache's floor while experts are read from the SSD (none when every expert has a tier)
+            const uint64_t later = (o.prompt_cache > 0 ? (uint64_t) o.conversation_cache_mib << 20 : 0) +
+                                   (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
             const uint64_t add = src.top_up(profile, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
             }, o.resident_pin, n_top, later);
@@ -5751,6 +5831,8 @@ int main(int argc, char** argv) {
         }
         report_expert_tiers();
         basalt::platform::stop_memory_watchdog();
+        // from here a request that runs the RAM below the floor stops with an error instead of the machine swapping
+        basalt::platform::start_ram_guard(basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes));
         // a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
         // request that runs in that slot
         auto make_view = [&](basalt::core::SessionState& v, int b) {
@@ -5840,6 +5922,11 @@ int main(int argc, char** argv) {
             const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
             const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
             if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+            if (reserve < kVramStallMib) {
+                e = "VRAM: a reserve below " + std::to_string(kVramStallMib) + " MiB lets requests stall; the smallest "
+                    "safe value is " + std::to_string(kVramStallMib);
+                return false;
+            }
             if (!xcache.segmented()) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;
@@ -6793,6 +6880,7 @@ int main(int argc, char** argv) {
                 ~BusyScope() { basalt::core::progress().busy.store(false); basalt::core::progress_at("idle"); }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            ram_stop.store(false);
             err.clear();
             if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // (batch windows swap the draft K/V)
             const bool geni = line.rfind("GENI ", 0) == 0;
@@ -7300,7 +7388,7 @@ int main(int argc, char** argv) {
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 for (int64_t q = a; q < b;) {
-                    if (stop_req.load()) { e = "cancelled"; return false; }
+                    if (halted()) { e = "cancelled"; return false; }
                     const int T = (int) std::min<int64_t>(S, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
@@ -7801,7 +7889,7 @@ int main(int argc, char** argv) {
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
                 if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
-                    if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
+                    if (yielded_at < 0 && (batch_fatal || !(stop_req.load() || ram_stop.load()))) {
                         std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         // a CUDA fault (an illegal address) poisons the context for the whole process, and unwinding
@@ -8166,7 +8254,7 @@ int main(int argc, char** argv) {
                                        std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                     basalt::core::decode_gaps().mark(17);
                     if (eos) { finish = "stop"; break; }
-                    if (stop_req.load()) { finish = "cancel"; break; }
+                    if (halted()) { finish = "cancel"; break; }
                     x = outv[(size_t) a];
                     p += a + 1;
                     basalt::core::decode_events().stamp(2);
@@ -8225,7 +8313,7 @@ int main(int argc, char** argv) {
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 basalt::core::decode_gaps().mark(17);
                 if (eos) { finish = "stop"; break; }
-                if (stop_req.load()) { finish = "cancel"; break; }
+                if (halted()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
             }
@@ -8286,8 +8374,22 @@ int main(int argc, char** argv) {
             //      [prompt tokens read]   (fewer than <prompt> - <reused> when a cancel stopped the read)
             //      [offloaded]   (the decode's routed experts the GPU read over PCIe or another GPU computed;
             //                    not in [lookups])
-            if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
+            const bool ram_out = ram_stop.load();
+            if (ram_out) {
+                // the client gets the reason as the request's error; the engine stays up for the next request
+                uint64_t avail = 0, floor = 0;
+                (void) basalt::platform::ram_guard_low(&avail, &floor);
+                char msg[320];
+                std::snprintf(msg, sizeof msg, "RAM ran low while generating (%llu MiB available, below the %llu MiB "
+                                               "floor): the request was stopped to keep the machine usable; close other "
+                                               "programs or start with a smaller --resident-budget-gib",
+                              (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
+                std::fprintf(stderr, "basalt error: %s\n", msg);
+                std::fflush(stderr);
+                std::printf("ERR %s\n", msg);
+            }
+            if (!ram_out && yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+            if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
@@ -8296,7 +8398,7 @@ int main(int argc, char** argv) {
                         (long long) req_offload);
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
-                bool cont = in_slot ? !cancelled && (int64_t) live.size() == p
+                bool cont = ram_out ? false : in_slot ? !cancelled && (int64_t) live.size() == p
                                     : !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                                       (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
@@ -8352,7 +8454,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "basalt batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
-                std::printf("BADM %d %d\n", admit_slot, cont ? (in_slot ? 2 : 1) : 0);   // 2: no token yet
+                if (!ram_out)   // (after ERR the server reads no BADM)
+                    std::printf("BADM %d %d\n", admit_slot, cont ? (in_slot ? 2 : 1) : 0);   // 2: no token yet
                 std::fflush(stdout);
                 admit_slot = -1;
             }
