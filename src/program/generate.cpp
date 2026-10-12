@@ -2179,20 +2179,46 @@ int main(int argc, char** argv) {
                                 basalt::core::Verifier::hc8_plan_bytes(
                                     [&](const std::string& n) { return index_names.count(n) > 0; }, g);
             model_bytes = cuda0_fixed_bytes + expert_total_bytes;
-            // the model's bytes against what the primary card and the RAM have free: with the file-backed modes the
-            // rest is read from the SSD (the default arena mode was checked against the RAM above)
+            // the model's bytes against what the primary card, the peer card and the RAM copy can hold: with the
+            // file-backed modes the rest is read from the SSD (the default arena mode was checked against the RAM above)
             size_t free_vram = 0, total_vram = 0;
             const auto free_ram = basalt::core::conversation_available_memory();
             if (o.mmap_experts && cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_ram) {
                 const uint64_t vram = (uint64_t) free_vram > ((uint64_t) o.vram_reserve_mib << 20)
                                           ? (uint64_t) free_vram - ((uint64_t) o.vram_reserve_mib << 20) : 0;
-                const uint64_t headroom = std::max(o.resident_headroom, basalt::platform::ram_margin());
-                const uint64_t ram = *free_ram > headroom ? *free_ram - headroom : 0;
-                ssd_warned = model_bytes > vram + ram;
+                // the RAM copy is sized as the loader sizes it: the room past the headroom (a server also leaves
+                // room for its late allocations), less a small margin when a budget or the soft mode caps it, and
+                // never more than the budget
+                const uint64_t headroom = o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() +
+                                                                                      basalt::platform::kLateHostBytes)
+                                                  : std::max(o.resident_headroom, basalt::platform::ram_margin());
+                uint64_t ram = *free_ram > headroom ? *free_ram - headroom : 0;
+                if (o.resident_cpu_experts && (o.resident_budget > 0 || o.resident_soft)) {
+                    const uint64_t margin = 256ull << 20;
+                    ram = ram > margin ? ram - margin : 0;
+                    if (o.resident_budget > 0) ram = std::min(ram, o.resident_budget);
+                }
+                // the peer tier holds experts too: what its card has free beyond the reserve the tier leaves
+                uint64_t peer_vram = 0;
+                if (o.peer_device >= 1) {
+                    int cur = 0, count = 0;
+                    size_t pfree = 0, ptotal = 0;
+                    if (cudaGetDevice(&cur) == cudaSuccess && cudaGetDeviceCount(&count) == cudaSuccess &&
+                        o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
+                        if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
+                            const uint64_t reserve = (uint64_t) std::max(o.peer_reserve_mib, 128) << 20;
+                            peer_vram = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
+                        }
+                        (void) cudaSetDevice(cur);
+                    }
+                    (void) cudaGetLastError();
+                }
+                ssd_warned = model_bytes > vram + peer_vram + ram;
                 if (ssd_warned)
                     std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
                                          "the SSD while generating (slow)\n",
-                                 (double) model_bytes / 1073741824.0, (double) (vram + ram) / 1073741824.0);
+                                 (double) model_bytes / 1073741824.0,
+                                 (double) (vram + peer_vram + ram) / 1073741824.0);
             } else if (o.mmap_experts) {
                 (void) cudaGetLastError();
             }
