@@ -1,9 +1,9 @@
-// M3b: the MoE half of a decode layer (routed experts resident on CUDA0 + shared expert + combine) as one
-// persistent kernel, 170 CTAs x 16 warps (512 threads), bitwise equal to today's kernel sequence
+// The MoE half of a decode layer (routed experts resident on CUDA0 + shared expert + combine) as one
+// persistent kernel, one CTA per SM, 16 warps (512 threads), bitwise equal to today's kernel sequence
 // (dec_moe_glue gate/up + SwiGLU + down, shared_expert_multi, dec_moe_wait, dec_moe_combine).
 //
-// Input release (as M3a hands over): the window's top-10 ids/weights and q8_1(mixed) are visible.  Every CTA plans the
-// layer itself from the ids (dm_glue's grouping, no plan hop), then:
+// Input release (as the attention half hands over): the window's top-10 ids/weights and q8_1(mixed) are visible.
+// Every CTA plans the layer itself from the ids (dm_glue's grouping, no plan hop), then:
 //  - gate/up items (expert group g, ff block j of 32: 32 gate + 32 up rows) round-robin over CTAs, the shared
 //    expert's 20 items first; the item owner applies SwiGLU and writes the q8_1 block of h (one per entry), then
 //    counts the item in its group's counter.
@@ -150,7 +150,7 @@ __device__ __forceinline__ void pf_l2(const void* p, size_t n) {
 }
 
 // tagged hop data: a q8_1 block (9 words) as 3 x {3 words, epoch}; no release fence (a fence waits for the SM's
-// in-flight prefetches: mb_pf), the consumer checks every vector's epoch
+// in-flight prefetches), the consumer checks every vector's epoch
 __device__ __forceinline__ void st_rlx4(uint4* p, uint4 v) { asm volatile("st.relaxed.gpu.global.v4.u32 [%0],{%1,%2,%3,%4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory"); }
 __device__ __forceinline__ uint4 ld_rlx4(const uint4* p) { uint4 v; asm volatile("ld.relaxed.gpu.global.v4.u32 {%0,%1,%2,%3},[%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory"); return v; }
 // lanes 0..2 of the warp that wrote blk: its tagged copy at dst
@@ -1248,26 +1248,23 @@ static void edge_rows(std::vector<float>& m, std::mt19937& r) {
         }
     }
 }
-// bitwise differences of the last run (bo floats); synth_sets: run on synthetic records instead of a trace file
-long long mkb4_bad = 0;
-int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_synth = 0) {
-    const int T = argc > 1 ? atoi(argv[1]) : 3;
-    const int iters = argc > 2 ? atoi(argv[2]) : 96;
-    const char* pack = getenv("MB_PACK") ? getenv("MB_PACK") : "IQ3_XXS";
-    const long long gap = getenv("MB_GAP") ? atoll(getenv("MB_GAP")) : 10000;
-    const int mode = getenv("MB_MODE") ? atoi(getenv("MB_MODE")) : 0;
-    const int hot = getenv("MB_HOT") ? atoi(getenv("MB_HOT")) : 0;   // 1: one record repeated (L2-hot)
-    const long long ahead = (getenv("MB_AHEAD") ? atoll(getenv("MB_AHEAD")) : 2);
-    const long long guw = getenv("MB_GUW") ? atoll(getenv("MB_GUW")) : 100;
-    const long long dnpf = getenv("MB_DNPF") ? atoll(getenv("MB_DNPF")) : 0;
-    const int reps = getenv("MB_REPS") ? atoi(getenv("MB_REPS")) : 3;
+// Parity harness options: fused selects moe_body<true> (one record per launch), ieee feeds the routed experts the IEEE
+// q8_1 rows, edge puts the activations on the q8_1 rounding edge, nopeer moves the peer tier's experts to the CPU tier
+// (the experts half resets each peer row it reads, so a launch over several records would read those resets).
+struct MoeParityOpts { bool fused = false, ieee = false, edge = false, nopeer = false; };
+// bitwise differences of the last run (bo floats)
+long long moe_parity_bad = 0;
+// Runs `iters` synthetic records round-robin over the layers in synth_sets ({layer, gate/up, down, shared gate, up, down}).
+int moe_parity_run(int T, int iters, const int* synth_sets, int n_synth, const MoeParityOpts& opt) {
+    const long long gap = 10000, ahead = 2, guw = 100, dnpf = 0;
+    const int mode = 0;
     if (T > TMX) { printf("T %d > TMX %d\n", T, TMX); return 1; }
     int nrec = 0, fmt[48][2] = {};
     std::vector<int8_t> tier(48 * 512, 0);
     struct Rec { int layer; std::vector<int> ids; std::vector<float> w; };
     std::vector<Rec> recs;
     int sh_syn[48][3] = {};
-    if (synth_sets != nullptr) {   // synthetic records: n_synth layers {layer, gate/up, down, shared gate, up, down}, round-robin
+    {
         std::mt19937 r(11);
         std::uniform_real_distribution<float> uw(0.01f, 1.f);
         for (int k = 0; k < n_synth; ++k) {
@@ -1289,21 +1286,8 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
                     rc.ids[t * KT + k] = e; rc.w[t * KT + k] = uw(r);
                 }
         }
-    } else {
-    char fn[256]; snprintf(fn, sizeof fn, "/home/jay/poc/mkb4/trace_%s_T%d.bin", pack, T);
-    FILE* f = fopen(fn, "rb"); if (!f) { printf("no %s\n", fn); return 1; }
-    int tt; fread(&nrec, 4, 1, f); fread(&tt, 4, 1, f);
-    fread(fmt, 4, 96, f);
-    fread(tier.data(), 1, tier.size(), f);
-    recs.resize(nrec);
-    for (auto& r : recs) { r.ids.resize(T * KT); r.w.resize(T * KT); fread(&r.layer, 4, 1, f); fread(r.ids.data(), 4, T * KT, f); fread(r.w.data(), 4, T * KT, f); }
-    fclose(f);
     }
-    // the experts half sets each peer row it reads back to the peer's "not yet written" tag (the next layer's peer
-    // window rewrites it); a launch over several records would read those tags, so MB_NOPEER moves the peer tier's
-    // entries to the CPU tier (rows read the same way, never tagged)
-    if (getenv("MB_NOPEER")) for (auto& t : tier) if (t == 2) t = 1;
-    if (hot) for (int i = 1; i < nrec; ++i) recs[i] = recs[0];
+    if (opt.nopeer) for (auto& t : tier) if (t == 2) t = 1;
     const int NI = std::min(iters, nrec);
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -1337,10 +1321,7 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
         }
         exp_bytes += (size_t) k * M.L.bytes;
         M.ptab = upload(ptab); M.res1 = upload(res1);
-        M.sgt = 23; M.sut = 21; M.sdt = 20;
-        { char tf[256]; snprintf(tf, sizeof tf, "/home/jay/poc/mkb4/shtypes_%s.txt", pack);
-          if (FILE* q = fopen(tf, "r")) { for (int ll = 0; ll <= l; ++ll) if (fscanf(q, "%d %d %d", &M.sgt, &M.sut, &M.sdt) != 3) break; fclose(q); } }
-        if (synth_sets != nullptr) { M.sgt = sh_syn[l][0]; M.sut = sh_syn[l][1]; M.sdt = sh_syn[l][2]; }
+        M.sgt = sh_syn[l][0]; M.sut = sh_syn[l][1]; M.sdt = sh_syn[l][2];
         std::vector<uint8_t> sg((size_t) NFF * sh_rowbytes(M.sgt, N)), su((size_t) NFF * sh_rowbytes(M.sut, N)), sd((size_t) N * sh_rowbytes(M.sdt, NFF));
         rand_rows(sg.data(), sg.size(), M.sgt, rng); rand_rows(su.data(), su.size(), M.sut, rng); rand_rows(sd.data(), sd.size(), M.sdt, rng);
         M.sg = upload(sg); M.su = upload(su); M.sd = upload(sd);
@@ -1349,14 +1330,13 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
         M.glue = dec_moe_glue_ok(M.L) ? 1 : 0;
     }
     LayerM* dlay = upload(hl);
-    printf("T %d, %d iterations over %zu layers, %.2f GB of CUDA0 experts, %d SMs, gap %lld ns, mode %d%s\n", T, NI,
-           layers.size(), exp_bytes / 1e9, nsm, gap, mode, hot ? " HOT" : "");
+    printf("T %d, %d iterations over %zu layers, %.2f GB of CUDA0 experts, %d SMs\n", T, NI, layers.size(), exp_bytes / 1e9, nsm);
     // ---- per-iteration inputs: 8 activation sets; ids/weights from the records
     constexpr int NX = 8;
     std::vector<float*> mixed(NX); std::vector<block_q8_1*> xq(NX), xqr(NX);
     for (int x = 0; x < NX; ++x) {
         std::vector<float> m((size_t) T * N); for (auto& v : m) v = nd(rng);
-        if (getenv("MB_EDGE")) edge_rows(m, rng);
+        if (opt.edge) edge_rows(m, rng);
         mixed[x] = upload(m);
         CK(cudaMalloc(&xq[x], (size_t) T * XQB * sizeof(block_q8_1)));
         native_quantize_q8_1(mixed[x], xq[x], N, T, cs);
@@ -1370,7 +1350,7 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
         I.layer = lay_of[recs[i].layer];
         I.ids = upload(recs[i].ids); I.w = upload(recs[i].w);
         I.xq = xq[i % NX]; I.mixed = mixed[i % NX];
-        if (getenv("MB_IEEE") && hl[I.layer].glue) I.xq = xqr[i % NX];   // the engine (glue layers): the routed experts read the hc read's IEEE q8_1
+        if (opt.ieee && hl[I.layer].glue) I.xq = xqr[i % NX];   // the engine (glue layers): the routed experts read the hc read's IEEE q8_1
         I.xqn = xq[i % NX];
         I.xqr = hl[I.layer].glue ? I.xq : xqr[i % NX];
         CK(cudaMalloc(&bo[i], (size_t) T * N * 4)); CK(cudaMalloc(&bo_ref[i], (size_t) T * N * 4));
@@ -1403,13 +1383,9 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
     uint16_t* sh_bf; CK(cudaMalloc(&sh_bf, (size_t) TMXH * N * 2));
     float *sh_gate, *sh_up, *sh_g, *sh_out;
     CK(cudaMalloc(&sh_gate, (size_t) TMXH * NFF * 4)); CK(cudaMalloc(&sh_up, (size_t) TMXH * NFF * 4)); CK(cudaMalloc(&sh_g, 64)); CK(cudaMalloc(&sh_out, (size_t) TMXH * N * 4));
-    float* parts_ref_dbg = nullptr;
-    const bool dbg = getenv("MB_DBG") != nullptr;
-    std::vector<float> ref_parts_h;
-    if (dbg) CK(cudaMalloc(&parts_ref_dbg, (size_t) kDmCap * N * 4));
     shared_expert_set_native_bf16(true);
     unsigned long long *t0d, *t1d; CK(cudaMalloc(&t0d, NI * 8)); CK(cudaMalloc(&t1d, NI * 8));
-    const long long pre_ns = getenv("MB_PRE") ? atoll(getenv("MB_PRE")) : 3000;
+    const long long pre_ns = 3000;
     auto launch_pdl_k = [&](auto kern, cudaStream_t s, auto... args) {
         cudaLaunchAttribute at[1]; at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[0].val.programmaticStreamSerializationAllowed = 1;
         cudaLaunchConfig_t cfg{}; cfg.gridDim = dim3(1); cfg.blockDim = dim3(32); cfg.stream = s; cfg.attrs = at; cfg.numAttrs = 1;
@@ -1449,32 +1425,12 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
         }
         launch_pdl_k(k_end, cs, t1d, i);
     };
-    std::vector<std::vector<double>> ref_per;
-    auto run_graph = [&](bool empty, int i_lo, int i_hi) {
-        cudaGraph_t g; cudaGraphExec_t ge;
-        CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal));
-        for (int i = i_lo; i < i_hi; ++i) record_ref(i, empty);
-        CK(cudaStreamEndCapture(cs, &g)); CK(cudaGraphInstantiate(&ge, g, 0));
-        CK(cudaGraphLaunch(ge, cs)); CK(cudaStreamSynchronize(cs));
-        CK(cudaGraphLaunch(ge, cs)); CK(cudaStreamSynchronize(cs));
-        std::vector<unsigned long long> a(NI), z(NI);
-        CK(cudaMemcpy(a.data(), t0d, NI * 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(z.data(), t1d, NI * 8, cudaMemcpyDeviceToHost));
-        std::vector<double> d; for (int i = i_lo + 2; i < i_hi; ++i) d.push_back((z[i] - a[i]) / 1e3);
-        if (!empty) { ref_per.assign(layers.size(), {}); for (int i = i_lo + 2; i < i_hi; ++i) ref_per[hi[i].layer].push_back((z[i] - a[i]) / 1e3); }
-        CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
-        return med(d);
-    };
-    if (dbg) {   // the first iteration's parts (CUDA0 rows) for the per-row compare
-        record_ref(0, false); CK(cudaStreamSynchronize(cs));
-        ref_parts_h.resize((size_t) kDmCap * N); CK(cudaMemcpy(ref_parts_h.data(), parts, ref_parts_h.size() * 4, cudaMemcpyDeviceToHost));
-    }
     // ================= the persistent kernel
     const size_t smem = sizeof(Sm);
     CK(cudaFuncSetAttribute(k_moe, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
     CK(cudaFuncSetAttribute(k_moef, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
-    const bool fused = getenv("MB_FUSED") != nullptr;
+    const bool fused = opt.fused;
     unsigned* rdy1; CK(cudaMalloc(&rdy1, 4)); { const unsigned one = 1; CK(cudaMemcpy(rdy1, &one, 4, cudaMemcpyHostToDevice)); }
-    if (fused) printf("MB_FUSED: moe_body<true> (k_layer's experts half), one launch per record\n");
     int occ = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_moe, CT, smem));
     if (occ < 1) { printf("k_moe does not fit (smem %zu)\n", smem); return 1; }
     printf("k_moe smem %zu B\n", smem);
@@ -1486,15 +1442,14 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
     uint2* gs; CK(cudaMalloc(&gs, (size_t) TMXH * 8)); CK(cudaMemset(gs, 0, TMXH * 8));
     unsigned long long *tx, *tend, *stp; CK(cudaMalloc(&tx, NI * 8)); CK(cudaMalloc(&tend, NI * 8));
     CK(cudaMalloc(&stp, (size_t) NI * nsm * NST * 8)); CK(cudaMemset(stp, 0, (size_t) NI * nsm * NST * 8));
-    float* dbgp = nullptr; if (dbg) { CK(cudaMalloc(&dbgp, (size_t) kDmCap * N * 4)); CK(cudaMemset(dbgp, 0, (size_t) kDmCap * N * 4)); }
     std::vector<std::vector<double>> last_per;
     auto run_mk = [&](int md, bool stamps) {
         CK(cudaMemsetAsync(cnt, 0, (size_t) NI * NCTR * 4, cs)); CK(cudaMemsetAsync(tend, 0, NI * 8, cs));
         CK(cudaMemsetAsync(hq, 0, (size_t) kDmCap * HB * 48, cs)); CK(cudaMemsetAsync(hqs, 0, (size_t) TMXH * HB * 48, cs));
         CK(cudaMemsetAsync(gs, 0, TMXH * 8, cs));
-        KP p{dlay, dit, dbg ? 1 : NI, T, gap, md, ahead, dnpf, guw, peer_rows, cpu_rows, words, words + 1, cnt, hq, hqs, gs, tx, tend,
-             stamps ? stp : nullptr, dbgp};
-        if (fused && !dbg) {
+        KP p{dlay, dit, NI, T, gap, md, ahead, dnpf, guw, peer_rows, cpu_rows, words, words + 1, cnt, hq, hqs, gs, tx, tend,
+             stamps ? stp : nullptr, nullptr};
+        if (fused) {
             for (int i = 0; i < NI; ++i) {
                 KP q = p;
                 q.iters = 1; q.cnt = cnt + (size_t) i * NCTR; q.tx = tx + i; q.tend = tend + i;
@@ -1516,23 +1471,12 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
         }
         std::vector<unsigned long long> a(NI), z(NI);
         CK(cudaMemcpy(a.data(), tx, NI * 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(z.data(), tend, NI * 8, cudaMemcpyDeviceToHost));
-        std::vector<double> d; for (int i = 2; i < (dbg ? 1 : NI); ++i) d.push_back((z[i] - a[i]) / 1e3);
+        std::vector<double> d; for (int i = 2; i < NI; ++i) d.push_back((z[i] - a[i]) / 1e3);
         last_per.assign(layers.size(), {});
-        for (int i = 2; i < (dbg ? 1 : NI); ++i) last_per[hi[i].layer].push_back((z[i] - a[i]) / 1e3);
+        for (int i = 2; i < NI; ++i) last_per[hi[i].layer].push_back((z[i] - a[i]) / 1e3);
         return med(d);
     };
     run_mk(mode, false);
-    if (dbg) {
-        std::vector<float> mp((size_t) kDmCap * N); CK(cudaMemcpy(mp.data(), dbgp, mp.size() * 4, cudaMemcpyDeviceToHost));
-        int bad = 0, tot = 0;
-        std::vector<int> ids = recs[0].ids;
-        for (int e = 0; e < T * KT; ++e) {
-            if (tier[recs[0].layer * 512 + ids[e]] != 0) continue;
-            int be = 0; for (int r = 0; r < N; ++r) { ++tot; if (memcmp(&mp[(size_t) e * N + r], &ref_parts_h[(size_t) e * N + r], 4)) { ++be; if (bad + be < 4) printf("  entry %d row %d: %g vs %g\n", e, r, mp[(size_t) e * N + r], ref_parts_h[(size_t) e * N + r]); } }
-            bad += be;
-        }
-        printf("debug parts: %d of %d rows differ\n", bad, tot);
-    }
     // ---- bitwise: the reference graph over every iteration once, then compare bo
     {
         cudaGraph_t g; cudaGraphExec_t ge;
@@ -1543,57 +1487,14 @@ int mkb4_moe_main(int argc, char** argv, const int* synth_sets = nullptr, int n_
         CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
         long long bad = 0, tot = 0; int bad_it = 0;
         std::vector<float> a((size_t) T * N), r((size_t) T * N);
-        for (int i = 0; i < (dbg ? 1 : NI); ++i) {
+        for (int i = 0; i < NI; ++i) {
             CK(cudaMemcpy(a.data(), bo[i], a.size() * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(r.data(), bo_ref[i], r.size() * 4, cudaMemcpyDeviceToHost));
             long long b0 = 0;
             for (size_t k = 0; k < a.size(); ++k) if (memcmp(&a[k], &r[k], 4)) { if (bad + b0 < 3) printf("  it %d tok %zu row %zu: %.9g vs %.9g\n", i, k / N, k % N, a[k], r[k]); ++b0; }
             bad += b0; tot += (long long) a.size(); bad_it += b0 > 0;
         }
-        mkb4_bad = bad;
-        printf("BITWISE bo: %lld of %lld floats differ (%d of %d iterations)%s\n", bad, tot, bad_it, dbg ? 1 : NI, (mode & 1) ? " [mode 1: no compute]" : "");
-    }
-    if (dbg) return 0;
-    // ---- timing: interleaved, reps rounds; ref per-iteration release -> end, minus the empty-graph offset
-    std::vector<double> rmk, rref, remp;
-    for (int r = 0; r < reps; ++r) {
-        rmk.push_back(run_mk(mode, false));
-        if (getenv("MB_NOREF")) { rref.push_back(0); remp.push_back(0); continue; }
-        rref.push_back(run_graph(false, 0, NI));
-        remp.push_back(run_graph(true, 0, NI));
-    }
-    const double off = med(remp);
-    printf("today (graph+PDL) release->combine done: %.2f us (raw %.2f, empty rel->end %.2f) | persistent: %.2f us   [rounds:",
-           med(rref) - off, med(rref), off, med(rmk));
-    for (int r = 0; r < reps; ++r) printf(" %.2f/%.2f", rref[r] - off, rmk[r]);
-    printf("]\n");
-    printf("per layer (gate/up x down): persistent med us:");
-    for (size_t li = 0; li < layers.size(); ++li) printf("  L%d (%d,%d) %.2f%s", layers[li], hl[li].L.gu_type, hl[li].L.d_type, med(last_per[li]),
-        ref_per.empty() ? "" : (" [today " + std::to_string(med(ref_per[li]) - off).substr(0, 5) + "]").c_str());
-    printf("\n");
-    if (getenv("MB_STAMPS")) {
-        run_mk(mode, true);
-        std::vector<unsigned long long> st((size_t) NI * nsm * NST), a(NI);
-        CK(cudaMemcpy(st.data(), stp, st.size() * 8, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(a.data(), tx, NI * 8, cudaMemcpyDeviceToHost));
-        const char* nm[] = {"seen", "plan", "xq", "gu", "pf", "down", "shdown", "item1", "end", "ids", "", "", "", "", "ready"};
-        for (int s : {0, 9, 1, 4, 2, 7, 3, 14, 5, 6, 8}) {
-            std::vector<double> v, mx;
-            for (int i = 2; i < NI; ++i) { double m = 0; for (int b = 0; b < nsm; ++b) { const double d = (st[((size_t) i * nsm + b) * NST + s] - a[i]) / 1e3; v.push_back(d); m = std::max(m, d); } mx.push_back(m); }
-            std::sort(v.begin(), v.end());
-            printf("  %-7s med %6.2f  p10 %6.2f  p90 %6.2f  max-CTA med %6.2f\n", nm[s], v[v.size() / 2], v[v.size() / 10], v[v.size() * 9 / 10], med(mx));
-        }
-        for (int q = 16; q < 32; ++q) {
-            std::vector<double> v;
-            for (int i = 2; i < NI; ++i) for (int b = 0; b < nsm; ++b) { const unsigned long long x = st[((size_t) i * nsm + b) * NST + q]; if (x) v.push_back((x - a[i]) / 1e3); }
-            if (v.empty()) continue;
-            std::sort(v.begin(), v.end());
-            printf("  Q(%d)    med %6.2f  p90 %6.2f\n", q - 16, v[v.size() / 2], v[v.size() * 9 / 10]);
-        }
-        for (int s : {10, 11, 12, 13}) {
-            std::vector<double> v;
-            for (int i = 2; i < NI; ++i) for (int b = 0; b < nsm; ++b) v.push_back(st[((size_t) i * nsm + b) * NST + s] / (s == 13 ? 1.0 : 1e3));
-            std::sort(v.begin(), v.end());
-            printf("  down %-9s med %6.2f p90 %6.2f\n", s == 10 ? "wait us" : s == 11 ? "copy us" : s == 12 ? "comp us" : "batches", v[v.size() / 2], v[v.size() * 9 / 10]);
-        }
+        moe_parity_bad = bad;
+        printf("BITWISE bo: %lld of %lld floats differ (%d of %d iterations)\n", bad, tot, bad_it, NI);
     }
     return 0;
 }

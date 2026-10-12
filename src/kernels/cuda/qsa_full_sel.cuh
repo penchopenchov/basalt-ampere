@@ -1,4 +1,4 @@
-// mkQ2 phase 2 device code: indexer scoring phase + top-k phase (see qsel.cu for the harness).
+// Device code for the QSA selection: indexer scoring phase + top-k phase.
 #pragma once
 #include "basalt/kernels/qsa_select.hpp"
 #include <cuda_runtime.h>

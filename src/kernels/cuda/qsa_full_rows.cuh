@@ -1,9 +1,9 @@
 #pragma once
-// M3b: the MoE half of a decode layer (routed experts resident on CUDA0 + shared expert + combine) as one
-// persistent kernel, 170 CTAs x 16 warps (512 threads), bitwise equal to today's kernel sequence
+// The MoE half of a decode layer (routed experts resident on CUDA0 + shared expert + combine) as one
+// persistent kernel, one CTA per SM, 16 warps (512 threads), bitwise equal to today's kernel sequence
 // (dec_moe_glue gate/up + SwiGLU + down, shared_expert_multi, dec_moe_wait, dec_moe_combine).
 //
-// Input release (as M3a hands over): the window's top-10 ids/weights and q8_1(mixed) are visible.  Every CTA plans the
+// Input release (as the attention half hands over): the window's top-10 ids/weights and q8_1(mixed) are visible.  Every CTA plans the
 // layer itself from the ids (dm_glue's grouping, no plan hop), then:
 //  - gate/up items (expert group g, ff block j of 32: 32 gate + 32 up rows) round-robin over CTAs, the shared
 //    expert's 20 items first; the item owner applies SwiGLU and writes the q8_1 block of h (one per entry), then
@@ -126,7 +126,7 @@ __device__ __forceinline__ void pf_l2(const void* p, size_t n) {
 }
 
 // tagged hop data: a q8_1 block (9 words) as 3 x {3 words, epoch}; no release fence (a fence waits for the SM's
-// in-flight prefetches: mb_pf), the consumer checks every vector's epoch
+// in-flight prefetches), the consumer checks every vector's epoch
 __device__ __forceinline__ void st_rlx4(uint4* p, uint4 v) { asm volatile("st.relaxed.gpu.global.v4.u32 [%0],{%1,%2,%3,%4};" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory"); }
 __device__ __forceinline__ uint4 ld_rlx4(const uint4* p) { uint4 v; asm volatile("ld.relaxed.gpu.global.v4.u32 {%0,%1,%2,%3},[%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory"); return v; }
 // lanes 0..2 of the warp that wrote blk: its tagged copy at dst

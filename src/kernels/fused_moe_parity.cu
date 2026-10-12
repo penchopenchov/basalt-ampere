@@ -2,8 +2,8 @@
 // (dec_moe_glue / route + native_expert_grouped, shared_expert_multi, dec_moe_wait, dec_moe_combine), bitwise on the
 // layer output, T = 1..4. Both instances run: k_moe (moe_body<false>, records in one launch) and moe_body<true>, the
 // one k_layer runs after the attention half (one record per launch, the chain's ready count already full).
-// Synthetic weights and routing (CUDA0 and CPU tiers; MB_NOPEER), every shared-expert format triple of the IQ3_S pack
-// with its layer's expert formats. The activations sit on the q8_1 rounding edge (MB_EDGE), where IEEE division and
+// Synthetic weights and routing (CUDA0 and CPU tiers; the peer tier is moved to the CPU tier), every shared-expert format triple of the IQ3_S pack
+// with its layer's expert formats. The activations sit on the q8_1 rounding edge , where IEEE division and
 // the fast-math native quantize round apart, so a q8_1 row quantized the wrong way changes the output. The routed
 // experts read the hc read's IEEE q8_1 rows as in the engine, and, as a second pass, the native q8_1 rows.
 #include "fused_bound.cuh"
@@ -26,22 +26,16 @@ int main(int argc, char** argv) {
     };
     const int n = (int) (sizeof sets / sizeof sets[0] / 6);
     const int iters = argc > 1 ? std::atoi(argv[1]) : 2 * n;
-    setenv("MB_REPS", "0", 1);
-    setenv("MB_NOPEER", "1", 1);   // see MB_NOPEER in fused_moe.cuh
-    setenv("MB_EDGE", "1", 1);
     long long bad = 0;
     for (int fused = 0; fused <= 1; ++fused) {
-        if (fused) setenv("MB_FUSED", "1", 1); else unsetenv("MB_FUSED");
         for (int ieee = 1; ieee >= 0; --ieee) {
-            if (ieee) setenv("MB_IEEE", "1", 1); else unsetenv("MB_IEEE");
             for (int T = 1; T <= 4; ++T) {
-                char t[8], it[16];
-                std::snprintf(t, sizeof t, "%d", T); std::snprintf(it, sizeof it, "%d", iters);
-                char* av[] = {argv[0], t, it, nullptr};
-                if (mkb4_moe_main(3, av, sets, n) != 0) return 1;
+                MoeParityOpts opt;
+                opt.fused = fused != 0; opt.ieee = ieee != 0; opt.edge = true; opt.nopeer = true;
+                if (moe_parity_run(T, iters, sets, n, opt) != 0) return 1;
                 std::printf("fused_moe_parity: %s T%d %s q8_1: %lld floats differ\n", fused ? "moe_body<true>" : "k_moe", T,
-                            ieee ? "IEEE" : "native", mkb4_bad);
-                bad += mkb4_bad;
+                            ieee ? "IEEE" : "native", moe_parity_bad);
+                bad += moe_parity_bad;
             }
         }
     }

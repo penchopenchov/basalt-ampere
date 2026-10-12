@@ -1,5 +1,5 @@
-// mkQ4: QSA projection phases (q tiles, k/v/indexer rows, attn_output) as device phases. dense_tc.cu is included with its
-// external symbols renamed and its Fmt renamed (DtcFmt) so it can share a TU with moe_mkb3.cu / iq_kernels.cu.
+// QSA projection phases (q tiles, k/v/indexer rows, attn_output) as device phases. dense_tc.cu is included with its
+// external symbols renamed and its Fmt renamed (DtcFmt) so it can share a TU with the MoE and IQ kernels.
 #pragma once
 #include "basalt/kernels/dense_tc.hpp"
 #include "basalt/kernels/pdl.hpp"
