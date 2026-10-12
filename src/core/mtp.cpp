@@ -1576,7 +1576,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             if (probs) probs[j] = pj;
             ++n;
         }
-        prefetch_ple(drafts[n - 1]);
+        // the last draft is a window row only when it passed the cutoff; a row nobody needs would make the window's
+        // PLE collect wait for its SSD read
+        if (draft_keep(pr, n - 1, min_p, cum_th)) prefetch_ple(drafts[n - 1]);
         decode_gaps().mark(8);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
