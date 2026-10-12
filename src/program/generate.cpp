@@ -2242,8 +2242,11 @@ int main(int argc, char** argv) {
                         largest = std::max<uint64_t>(largest, (uint64_t) g.n_expert *
                                                                   basalt::kernels::cpu::expert_layout().blob_bytes(l));
                     if (o.resident_cpu_experts && o.resident_budget == 0) {
-                        const uint64_t cache = basalt::platform::file_cache_floor(1, largest);
-                        ram = ram > cache ? ram - cache : 0;
+                        const uint64_t late = o.serve ? basalt::platform::kLateHostBytes : 0;
+                        const uint64_t floor_headroom =
+                            std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), 1, largest) + late);
+                        ram = *free_ram > floor_headroom ? *free_ram - floor_headroom : 0;
+                        if (o.resident_soft) ram = ram > (256ull << 20) ? ram - (256ull << 20) : 0;
                     }
                     std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
                                          "the SSD while generating (slow)\n",
