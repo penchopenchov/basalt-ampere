@@ -71,6 +71,59 @@ class TeeStream:
         return getattr(self._stream, name)
 
 
+class ColorStream:
+    """Wraps a terminal stream: whole lines with `error:` or a server "refused" are red, with `warning:` yellow.
+    Off a terminal, or with NO_COLOR set, the stream is returned unwrapped. Text that moves the cursor (escape
+    codes, carriage returns) is passed through at once so in-place redraws keep working."""
+
+    RED, YELLOW, RESET = "\x1b[31m", "\x1b[33m", "\x1b[0m"
+    RED_LINE = re.compile(r"\berror:|^\s*\[server\] refused\b")
+    YELLOW_LINE = re.compile(r"\bwarning:")
+
+    @classmethod
+    def wrap(cls, stream):
+        try:
+            tty = stream.isatty()
+        except (AttributeError, ValueError):
+            tty = False
+        return cls(stream) if tty and not os.environ.get("NO_COLOR") else stream
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._partial = ""
+        self._lock = threading.Lock()
+
+    def paint(self, line: str) -> str:
+        color = self.RED if self.RED_LINE.search(line) else self.YELLOW if self.YELLOW_LINE.search(line) else ""
+        return color + line + self.RESET if color else line
+
+    def write(self, text):
+        if not isinstance(text, str):
+            return self._stream.write(text)
+        with self._lock:
+            *done, rest = (self._partial + text).split("\n")
+            self._partial = ""
+            if "\x1b" in rest or "\r" in rest:        # a redraw in progress: no waiting for its newline
+                done.append(rest)
+                out = "\n".join(self.paint(x) if i < len(done) - 1 else x for i, x in enumerate(done))
+            else:
+                self._partial = rest
+                out = "".join(self.paint(x) + "\n" for x in done)
+            if out:
+                self._stream.write(out)
+        return len(text)
+
+    def flush(self):
+        with self._lock:
+            if self._partial:
+                self._stream.write(self._partial)
+                self._partial = ""
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def tail_file(buffer: LogBuffer, path: str, src: str = "eng", poll_s: float = 0.25) -> None:
     """Follow a file from its end, adding complete lines to the buffer; waits for a missing file and rereads a
     shrunk one from the start."""

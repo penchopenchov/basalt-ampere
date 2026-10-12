@@ -1,12 +1,14 @@
 """serve/util/logbuf.py: the line buffer behind GET /api/logs, the stream tee and the file tail."""
 import io
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from serve.util.logbuf import CAPACITY, MAX_LINE, LogBuffer, TeeStream, level, tail_file
+from serve.util.logbuf import CAPACITY, MAX_LINE, ColorStream, LogBuffer, TeeStream, level, tail_file
 
 
 class Levels(unittest.TestCase):
@@ -126,6 +128,61 @@ class Tail(unittest.TestCase):
             log.write_text("hello\n", encoding="utf-8")
             self.wait_for(b, 1)
             self.assertEqual(b.since(0)[0][0]["msg"], "hello")
+
+
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+LINES = ("[server] warning: model 76.9 GiB\nbasalt error: boom\n[server] refused Host 'x'\n"
+         "[server] listening\nbasalt warning: low\n")
+
+
+class Color(unittest.TestCase):
+    def wrapped(self, stream, env=None):
+        with mock.patch.dict(os.environ, env or {}, clear=False):
+            if env is None:
+                os.environ.pop("NO_COLOR", None)
+            return ColorStream.wrap(stream)
+
+    def test_plain_off_a_terminal(self):
+        out = io.StringIO()
+        w = self.wrapped(out)
+        self.assertIs(w, out)
+        w.write(LINES)
+        self.assertEqual(out.getvalue(), LINES)
+
+    def test_terminal_colors_warning_error_refused(self):
+        out = Tty()
+        w = self.wrapped(out)
+        for ch in LINES:                                 # print() style: pieces, newline apart
+            w.write(ch)
+        w.flush()
+        y, r, z = "\x1b[33m", "\x1b[31m", "\x1b[0m"
+        self.assertEqual(out.getvalue(), f"{y}[server] warning: model 76.9 GiB{z}\n{r}basalt error: boom{z}\n"
+                         f"{r}[server] refused Host 'x'{z}\n[server] listening\n{y}basalt warning: low{z}\n")
+
+    def test_no_color_disables(self):
+        out = Tty()
+        self.assertIs(self.wrapped(out, {"NO_COLOR": "1"}), out)
+
+    def test_empty_no_color_still_colors(self):
+        self.assertIsInstance(self.wrapped(Tty(), {"NO_COLOR": ""}), ColorStream)
+
+    def test_redraw_passes_through_at_once(self):
+        out = Tty()
+        w = self.wrapped(out)
+        w.write("\x1b[1A\x1b[2K")
+        w.write("bar 50%\r")
+        self.assertEqual(out.getvalue(), "\x1b[1A\x1b[2Kbar 50%\r")
+
+    def test_tee_logs_plain_text(self):
+        b = LogBuffer()
+        t = TeeStream(self.wrapped(Tty()), b, "srv")
+        t.write("[server] warning: x\n")
+        self.assertEqual(b.since(0)[0][0]["msg"], "warning: x")
+        self.assertTrue(t.isatty())
 
 
 if __name__ == "__main__":

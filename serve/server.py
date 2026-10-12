@@ -35,7 +35,7 @@ from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
                             lan_addresses, origins_of)
 from serve.service import Service  # noqa: E402
-from serve.util.logbuf import LogBuffer, TeeStream, tail_file  # noqa: E402
+from serve.util.logbuf import ColorStream, LogBuffer, TeeStream, tail_file  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
 
 
@@ -67,7 +67,8 @@ def main() -> int:
         fail(f"--config: {e}")
     service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
     logs = LogBuffer()                                  # this process's and the engine's output
-    sys.stdout, sys.stderr = TeeStream(sys.stdout, logs, "srv"), TeeStream(sys.stderr, logs, "srv")
+    sys.stdout, sys.stderr = (TeeStream(ColorStream.wrap(sys.stdout), logs, "srv"),
+                              TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))
     cfg = {}                                            # what the model file implies
     try:
         if a.gpu is not None:
