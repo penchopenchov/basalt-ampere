@@ -203,6 +203,25 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
     return true;
 }
 
+// cgroup v1's memory.stat: the group's hierarchical counters (total_*), the same allowance as v2's.  False when the
+// file or total_inactive_file is missing (the usage is then taken as it is).
+bool read_cgroup_v1_memory_stat(const std::filesystem::path& path, uint64_t usage, detail::CgroupMemoryStat& stat) {
+    std::ifstream input(path / "memory.stat");
+    if (!input) return false;
+    bool inactive_file = false;
+    std::string key;
+    uint64_t value = 0;
+    while (input >> key >> value) {
+        if (key == "total_inactive_file") { stat.inactive_file = value; inactive_file = true; }
+        else if (key == "total_dirty") stat.file_dirty = value;
+        else if (key == "total_writeback") stat.file_writeback = value;
+    }
+    if (!inactive_file) return false;
+    stat.current = usage;
+    stat.valid = true;
+    return true;
+}
+
 }  // namespace
 
 namespace detail {
@@ -222,35 +241,62 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
     }
     if (bytes == 0) return false;
-    // Account for the tightest cgroup ancestor limit when its normal mount is visible.
+    // The tightest cgroup limit of this process's group and its ancestors.  A group whose path is not visible here
+    // (a container's own cgroup namespace shows its group as the mount's root) is read at that root; a group without
+    // a readable limit has none of its own.  No cgroup file or line: MemAvailable alone.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
-    std::ifstream groups(self_cgroup);
-    if (!groups) return false;
     const std::filesystem::path root(cgroup_root);
     bool v2 = false;
-    std::string v1_path;   // the memory controller's group (cgroup v1), when there is no v2 line
-    while (std::getline(groups, line)) {
-        if (line.rfind("0::/", 0) != 0) {
+    std::string v2_path, v1_path;   // the unified group; the v1 memory controller's group
+    if (std::ifstream groups(self_cgroup); groups) {
+        while (std::getline(groups, line)) {
+            if (line.rfind("0::/", 0) == 0) {
+                v2 = true;
+                v2_path = line.substr(4);
+                continue;
+            }
             // v1: "N:controller[,controller]:/path"
             const size_t c1 = line.find(':'), c2 = c1 == std::string::npos ? c1 : line.find(':', c1 + 1);
             if (c2 == std::string::npos) continue;
             std::istringstream ctl(line.substr(c1 + 1, c2 - c1 - 1));
             for (std::string c; std::getline(ctl, c, ',');)
                 if (c == "memory") v1_path = line.substr(c2 + 1);
-            continue;
         }
-        auto path = (root / line.substr(4)).lexically_normal();
-        if (path.string().rfind(root.string(), 0) != 0 || !std::filesystem::is_directory(path)) return false;
-        v2 = true;
-        while (path.string().rfind(root.string(), 0) == 0) {
+    }
+    // the group's directory under `top`, or `top` itself when the group is not visible there
+    auto visible_group = [](const std::filesystem::path& top, const std::string& rel) {
+        const std::string sub = rel.substr(rel.rfind('/', 0) == 0 ? 1 : 0);
+        if (sub.empty()) return top;
+        auto path = (top / sub).lexically_normal();
+        if (path.string().rfind(top.string(), 0) != 0 || !std::filesystem::is_directory(path)) return top;
+        return path;
+    };
+    if (!v1_path.empty()) {
+        // cgroup v1 (also the hybrid layout, where the unified line carries no memory controller): the memory
+        // controller's memory.limit_in_bytes - memory.usage_in_bytes, with the clean inactive file cache counted as
+        // free as for v2.  An unlimited group says a number near 2^63 (rounded to its page size).
+        const std::filesystem::path mroot = root / "memory";
+        for (auto path = visible_group(mroot, v1_path); path.string().rfind(mroot.string(), 0) == 0;
+             path = path.parent_path()) {
+            std::ifstream limit_file(path / "memory.limit_in_bytes"), usage_file(path / "memory.usage_in_bytes");
+            uint64_t cap = 0, usage = 0;
+            if (limit_file >> cap && usage_file >> usage && cap < (1ull << 62)) {
+                uint64_t room = usage < cap ? cap - usage : 0;
+                CgroupMemoryStat stat;
+                if (read_cgroup_v1_memory_stat(path, usage, stat) && !cgroup_available_bytes(cap, stat, room)) return false;
+                bytes = std::min(bytes, room);
+                m.cgroup_limit = std::min(m.cgroup_limit, cap);
+            }
+            if (path == mroot) break;
+        }
+    } else if (v2) {
+        for (auto path = visible_group(root, v2_path); path.string().rfind(root.string(), 0) == 0;
+             path = path.parent_path()) {
             std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");
             std::string limit;
             uint64_t current = 0;
-            const bool readable = bool(limit_file >> limit) && bool(current_file >> current);
-            // The host's root cgroup has no memory.max; ordinary child groups must expose their limits.
-            if (!readable && !(path == root && !std::filesystem::exists(path / "memory.max") &&
-                               std::filesystem::exists(path / "cgroup.controllers"))) return false;
-            if (readable && limit != "max") {
+            // the host's root group, and a group whose parent does not enable the memory controller, have no limit
+            if (limit_file >> limit && current_file >> current && limit != "max") {
                 try {
                     size_t consumed = 0;
                     const uint64_t cap = std::stoull(limit, &consumed);
@@ -264,24 +310,6 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                 } catch (...) { return false; }
             }
             if (path == root) break;
-            path = path.parent_path();
-        }
-    }
-    if (!v2 && !v1_path.empty()) {
-        // cgroup v1: the memory controller's group and its ancestors.  An unlimited group says a number near 2^63
-        // (rounded to its page size); a group whose files are not visible (no mount in this namespace) is skipped -
-        // MemAvailable alone, as with no cgroup at all.
-        const std::filesystem::path mroot = root / "memory";
-        auto path = (mroot / v1_path.substr(v1_path.rfind('/', 0) == 0 ? 1 : 0)).lexically_normal();
-        while (path.string().rfind(mroot.string(), 0) == 0) {
-            std::ifstream limit_file(path / "memory.limit_in_bytes"), usage_file(path / "memory.usage_in_bytes");
-            uint64_t cap = 0, usage = 0;
-            if (limit_file >> cap && usage_file >> usage && cap < (1ull << 62)) {
-                bytes = std::min(bytes, usage < cap ? cap - usage : 0);
-                m.cgroup_limit = std::min(m.cgroup_limit, cap);
-            }
-            if (path == mroot) break;
-            path = path.parent_path();
         }
     }
     m.available = bytes;

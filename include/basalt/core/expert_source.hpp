@@ -74,9 +74,11 @@ struct HostMemory {
 };
 
 /// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
-/// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
-/// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
-/// MemAvailable alone.  False when the RAM cannot be determined.
+/// defaults are the real files).  A v1 memory controller line wins over the unified line (the hybrid layout): v1 reads
+/// `<root>/memory/<path>` (memory.limit_in_bytes - memory.usage_in_bytes, clean inactive file cache counted as free),
+/// v2 reads `<root>/<path>` (memory.max, memory.current, memory.stat).  A group not visible here is read at the mount's
+/// root (a container's own namespace); groups without a readable limit add none; no cgroup file or line is MemAvailable
+/// alone.  False when MemAvailable is missing or a visible v2 limit or its memory.stat is malformed.
 bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",
                            const std::string& self_cgroup = "/proc/self/cgroup",
                            const std::string& cgroup_root = "/sys/fs/cgroup");

@@ -279,7 +279,8 @@ void test_host_memory() {
     put("fs/box/memory.max", "48G\n");
     require(!probe("0::/box\n"), "v2 malformed limit accepted");
     fs::remove(t.path / "fs/box/memory.max");
-    require(!probe("0::/box\n"), "v2 group without memory.max accepted");
+    require(probe("0::/box\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull,
+            "v2 group without memory.max (no memory controller there): MemAvailable alone");
     // v1: the memory controller's group (a hybrid line list), a 32 GiB limit with 10 GiB used
     put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
     put("fs/memory/docker/abc/memory.usage_in_bytes", std::to_string(10 * GiB) + "\n");
@@ -289,11 +290,90 @@ void test_host_memory() {
             m.available == 22 * GiB && m.cgroup_limit == 32 * GiB, "v1 limit");
     put("fs/memory/docker/abc/memory.limit_in_bytes", "9223372036854771712\n");
     require(probe("4:memory:/docker/abc\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v1 unlimited");
-    // a v1 group not visible here (another namespace): MemAvailable alone
-    require(probe("4:memory:/elsewhere\n") && m.available == 100 * GiB, "v1 group not mounted");
+    // v1 memory.stat: the clean inactive file cache counts as free, dirty and writeback pages do not
+    put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
+    put("fs/memory/docker/abc/memory.stat", "cache 1\ntotal_inactive_file " + std::to_string(6 * GiB) +
+                                            "\ntotal_dirty " + std::to_string(1 * GiB) + "\ntotal_writeback " +
+                                            std::to_string(1 * GiB) + "\n");
+    require(probe("4:memory:/docker/abc\n") && m.available == 26 * GiB && m.cgroup_limit == 32 * GiB,
+            "v1 page cache counted as used");
+    // a v1 group not visible here, and no limit at the mount's root: MemAvailable alone
+    require(probe("4:memory:/elsewhere\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull,
+            "v1 group not mounted");
+    // no /proc/self/cgroup at all: MemAvailable alone
+    require(host_available_memory(m, mi, (t.path / "missing").string(), root) && m.available == 100 * GiB &&
+                m.cgroup_limit == ~0ull, "no cgroup file");
+    // no MemAvailable: the RAM cannot be determined
+    put("meminfo-old", "MemTotal: 134217728 kB\nMemFree: 1024 kB\n");
+    require(!host_available_memory(m, (t.path / "meminfo-old").string(), cg, root), "no MemAvailable accepted");
 #else
     require(host_available_memory(m) && m.available > 0 && m.cgroup_limit == ~0ull, "this PC's RAM");
     (void) GiB;
+#endif
+}
+
+// A container whose own cgroup namespace shows its group as the mount's root, while /proc/self/cgroup names the
+// group by its host path (not visible here): the limit is read at the root.  The hybrid layout (v1 controllers plus a
+// unified line) reads the v1 memory controller.
+void test_host_memory_namespaced() {
+#if defined(__linux__)
+    using namespace basalt::core::detail;
+    constexpr uint64_t GiB = 1ull << 30;
+    const std::string id = "/docker/4f3c2a";
+    struct Tree {
+        TempDirectory t;
+        void put(const fs::path& rel, const std::string& text) {
+            fs::create_directories((t.path / rel).parent_path());
+            std::ofstream(t.path / rel) << text;
+        }
+        bool probe(HostMemory& m, const std::string& self) {
+            put("meminfo", "MemTotal: 134217728 kB\nMemAvailable: 104857600 kB\n");   // 100 GiB available
+            put("cgroup", self);
+            return host_available_memory(m, (t.path / "meminfo").string(), (t.path / "cgroup").string(),
+                                         (t.path / "fs").string());
+        }
+    };
+    HostMemory m;
+    {   // hybrid (the rented container's layout): v1 controllers, memory among them, and a unified line
+        Tree h;
+        h.put("fs/memory/memory.limit_in_bytes", std::to_string(64 * GiB) + "\n");
+        h.put("fs/memory/memory.usage_in_bytes", std::to_string(20 * GiB) + "\n");
+        h.put("fs/memory/memory.stat", "total_inactive_file " + std::to_string(8 * GiB) +
+                                       "\ntotal_dirty 0\ntotal_writeback 0\n");
+        h.put("fs/unified/cgroup.controllers", "\n");
+        const std::string self = "12:pids:" + id + "\n11:cpu,cpuacct:" + id + "\n4:memory:" + id +
+                                 "\n1:name=systemd:" + id + "\n0::" + id + "\n";
+        require(h.probe(m, self) && m.available == 52 * GiB && m.cgroup_limit == 64 * GiB, "hybrid layout");
+        // the same without a limit on the container: MemAvailable alone
+        h.put("fs/memory/memory.limit_in_bytes", "9223372036854771712\n");
+        require(h.probe(m, self) && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "hybrid, unlimited");
+        // and without the v1 mount at all
+        fs::remove_all(h.t.path / "fs/memory");
+        require(h.probe(m, self) && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "hybrid, no v1 mount");
+    }
+    {   // pure v1, the group's path hidden: read at the memory mount's root
+        Tree v1;
+        v1.put("fs/memory/memory.limit_in_bytes", std::to_string(16 * GiB) + "\n");
+        v1.put("fs/memory/memory.usage_in_bytes", std::to_string(4 * GiB) + "\n");
+        require(v1.probe(m, "4:memory:" + id + "\n3:cpuset:" + id + "\n") && m.available == 12 * GiB &&
+                    m.cgroup_limit == 16 * GiB, "v1, hidden path");
+    }
+    {   // pure v2, the group's path hidden: read at the mount's root
+        Tree v2;
+        v2.put("fs/cgroup.controllers", "cpu memory pids\n");
+        v2.put("fs/memory.max", std::to_string(48 * GiB) + "\n");
+        v2.put("fs/memory.current", std::to_string(16 * GiB) + "\n");
+        v2.put("fs/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
+        require(v2.probe(m, "0::" + id + "\n") && m.available == 36 * GiB && m.cgroup_limit == 48 * GiB,
+                "v2, hidden path");
+        // the host's own root (no memory.max): MemAvailable alone
+        fs::remove(v2.t.path / "fs/memory.max");
+        require(v2.probe(m, "0::/\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2, root group");
+    }
+    {   // no cgroup line at all
+        Tree none;
+        require(none.probe(m, "") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "no cgroup line");
+    }
 #endif
 }
 
@@ -306,6 +386,7 @@ int main() {
         test_resident_exchange();
         test_cgroup_memory_budget();
         test_host_memory();
+        test_host_memory_namespaced();
         test_native_variable_layout();
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
