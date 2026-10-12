@@ -15,6 +15,9 @@
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/fused_gr.hpp"
+#include "basalt/kernels/attn_chain.hpp"
+#include "basalt/kernels/qsa_full.hpp"
+#include "basalt/kernels/fused_layer.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/dec_gdn.hpp"
@@ -378,7 +381,7 @@ bool Verifier::dm_init(std::string& err) {
              cudaMalloc(&d->pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
-        d->tag = true;
+        d->tag = false;   // mkb25: no tag protocol, every combine waits for the peer window
         d->rows_words = (size_t) (T * K * N);
         for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
@@ -677,6 +680,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     basalt::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     basalt::kernels::hc_fused_init();
+    basalt::kernels::attn_chain_init();
+    basalt::kernels::qsa_full_init();
+    fused_ok_ = basalt::kernels::fused_layer_init();
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -1031,7 +1037,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork[2] = {false, false};   // the group's ring stream is joined in post
+    int chain_ord = 0;   // the attention chain's launches so far in this graph
+    int qsa_ord = 0;     // the QSA kernel's launches so far in this graph
     bool glue_on[2] = {false, false};   // post's gate/up launch plans the group's VRAM share
+    bool fz_done[2] = {false, false};   // the group's layer ran as one fused kernel (experts half included)
     DmRouteArgs glue_ring[2];   // the ring's work for post's gate/up launch
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
@@ -1149,7 +1158,138 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return h;
         };
         const bool read_q8 = dec_hc && hc_fused_q8_rows_ok();
-        {
+        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        const bool router_multi = w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
+        const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
+                             ev_join_ != nullptr;
+        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr ? sh_hi_ : sh_cs_) : cs;
+        // the ring on its own stream, forked after the router, joined where the side branch is
+        const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && ring_hi_ != nullptr;
+        ring_fork[grp] = pk_ring;
+        // the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
+        glue_on[grp] = false;
+        if (pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
+            const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
+            glue_on[grp] = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
+            if (!glue_on[grp]) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
+        }
+        // a GDN layer's attention half as one persistent kernel (attn_chain.hpp): the reads, the qkv + z pair, the
+        // recurrence, the output projection and the router, bitwise the kernels it replaces
+        bool chain_done = false;
+        if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ && tb == 0 && G == 1 &&
+            n <= kAttnChainMaxT && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
+            const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
+                            *wout = v.get("ssm_out.weight"), *wa = v.get("ssm_alpha.weight"),
+                            *wb = v.get("ssm_beta.weight"), *wc = v.get("ssm_conv1d.weight"),
+                            *wnm = v.get("ssm_norm.weight"), *wdt = v.get("ssm_dt.bias"), *wsa = v.get("ssm_a");
+            if (wqkv && wg && wout && wa && wb && wc && wnm && wdt && wsa && wqkv->native_data && wg->native_data &&
+                wout->native_data && dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
+                dense_tc_supported(wout->native_type, (int) ZV, (int) N, wout->native_data) &&
+                dense_tc_type_on(wout->native_type)) {
+                const int64_t gi = gdn_idx[(size_t) l];
+                AttnChainArgs ca;
+                ca.T = n;
+                ca.h1 = hc_args(0, pending, inj2_, inj_);
+                ca.h1.xq = xq_;
+                ca.h2 = hc_args(1, true, inj_, inj2_);
+                ca.h2.w_router = (const uint16_t*) w_router->data;
+                ca.h2.logits = logits_ + tb * NE; ca.h2.ids = ids_ + tb * K; ca.h2.weights = w_ + tb * K;
+                if (glue_on[grp]) ca.h2.xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
+                ca.wq = wqkv->native_data; ca.type_q = wqkv->native_type;
+                ca.wz = wg->native_data; ca.type_z = wg->native_type;
+                ca.wo = wout->native_data; ca.type_o = wout->native_type;
+                DecRecArgs& ra = ca.rec;
+                ra.state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
+                ra.qkv = qkv_L_ + (size_t) gi * MT * C; ra.conv_w = (const float*) wc->data; ra.x = mixed_ + tb * N;
+                ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+                ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
+                ra.gamma = (const float*) wnm->data; ra.h = h_L_ + (size_t) gi * MT * C;
+                ra.gate = gate_L_ + (size_t) gi * MT * HV; ra.beta = beta_L_ + (size_t) gi * MT * HV; ra.yq = xq_;
+                ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                // the whole layer (attention half + experts + tier ring + combine) as one kernel where the experts half covers it
+                const WeightRef *wsg = v.get("ffn_gate_shexp.weight"), *wsu = v.get("ffn_up_shexp.weight"),
+                                *wsd = v.get("ffn_down_shexp.weight"), *wgi = v.get("ffn_gate_inp_shexp.weight");
+                FusedLayerArgs fz;
+                const bool fz_shared = wsg && wsu && wsd && wgi && wsg->native_data && wsu->native_data && wsd->native_data;
+                if (fused_ok_ && glue_on[grp] && dm && l + 1 < g.n_layers) {
+                    if (!fz_shared) {
+                        std::fprintf(stderr, "verify: FATAL: layer %d has no native shared-expert weights; the fused layer needs them\n", (int) l);
+                        std::exit(1);
+                    }
+                    if (dm_->wstat != nullptr) note_fallback("fused layer off: --wait-stats", 0, 0);
+                    if (remote_opt_ != nullptr) note_fallback("fused layer off: remote experts", 0, 0);
+                }
+                bool fz_try = fused_ok_ && glue_on[grp] && dm && dm_->wstat == nullptr && remote_opt_ == nullptr &&
+                              l + 1 < g.n_layers && fz_shared;
+                if (fz_try) {
+                    const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
+                    const int64_t r = l - lb_;
+                    fz.chain = ca;
+                    fz.layer = (int) l; fz.gu_type = f.gu_type; fz.d_type = f.d_type;
+                    fz.ptab = dm_->ptab0 + l * g.n_expert;
+                    fz.res1 = dm_->pdev >= 0 ? dm_->res1 + l * g.n_expert : nullptr;
+                    fz.sg = wsg->native_data; fz.su = wsu->native_data; fz.sd = wsd->native_data;
+                    fz.sgi = (const uint16_t*) wgi->data;
+                    fz.sgt = wsg->native_type; fz.sut = wsu->native_type; fz.sdt = wsd->native_type;
+                    fz.bo = bo_ + tb * N;
+                    fz.peer_rows = dm_->m_rows; fz.cpu_rows = m_ymiss_ + (size_t) tb * K * N;
+                    fz.peer_done = dm_->m_w + 16; fz.cpu_done = m_flag_;
+                    fz.ring = (uint32_t) (r * G + grp + 1);
+                    fz.ring_m = dm_->m_ring + r; fz.x_m = dm_->m_x + (size_t) r * dm_->x_stride;
+                    fz.xq_m = dm_->m_xq + (size_t) r * dm_->xq_stride;
+                    fz.host_seq_m = m_seq_; fz.peer_seq_m = dm_->m_w; fz.abort_m = dm_->m_w + 32;
+                    fz_try = basalt::kernels::fused_layer_supported(fz);
+                    if (!fz_try) {
+                        const bool jay_shape = (fz.sgt == 12 || fz.sgt == 13 || fz.sgt == 14 || fz.sgt == 23 || fz.sgt == 21) &&
+                                               (fz.sdt == 20 || fz.sdt == 8);
+                        if (jay_shape) {   // a covered shape that the kernel then refuses is an error, not a silent fallback
+                            std::fprintf(stderr, "verify: FATAL: fused layer %d refused (gu %d d %d shared %d/%d/%d)\n", (int) l, f.gu_type,
+                                         f.d_type, fz.sgt, fz.sut, fz.sdt);
+                            std::exit(1);
+                        }
+                        note_fallback("fused layer unsupported", f.gu_type, f.d_type);
+                    }
+                }
+                if (fz_try) {
+                    const bool after_kernel = pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
+                    PdlScope ps(pdl, !after_kernel || chain_ord == 0);
+                    fz.ord = ca.ord = chain_ord++;
+                    fz.chain = ca;
+                    basalt::kernels::fused_layer(fz, cs);
+                    fz_done[grp] = true;
+                    return true;
+                }
+                if (attn_chain_supported(ca)) {
+                    // after the device-planned tail's combine kernel the chain starts during its tail (PDL); its first
+                    // weight copies are already issued by then
+                    const bool after_kernel = pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
+                    PdlScope ps(pdl, !after_kernel || chain_ord == 0);
+                    ca.ord = chain_ord++;
+                    attn_chain(ca, cs);
+                    chain_done = true;
+                }
+            }
+        }
+        // a QSA layer's attention half as one persistent kernel (qsa_full.hpp) where the layer's state is plain INT8 K/V,
+        // resident, and the window is not a batch window; the unfused kernels below run any other layer
+        bool qsa_full_on = false;
+        if (!chain_done && is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ && N == 2560 && n <= kQsaFullMaxT && G == 1 &&
+            native_qsa_enabled() && native_rope_enabled() && qsa_dec_fused_supported(s) &&
+            (dense_tc_mask() & 8) && (dense_tc_mask() & 16) && !(dense_tc_mask() & 32)) {
+            const QsaState& stq = ss.qsa_states[qsa_idx[(size_t) l]];
+            const WeightRef *fq = v.get("attn_q.weight"), *fk = v.get("attn_k.weight"), *fv = v.get("attn_v.weight"),
+                            *fo = v.get("attn_output.weight"), *fik = v.get("indexer.k_proj.weight"),
+                            *fiq = v.get("indexer.q_proj.weight");
+            qsa_full_on = stq.kv_int8 && !stq.kv_rot && !stq.kv_hybrid && !stq.kv_q4 && stq.kv_mode != 1 &&
+                          fq && fk && fv && fo && fik && fiq && fq->native_data && fk->native_data &&
+                          fv->native_data && fo->native_data && qsa_ord < kQsaFullMaxLaunches &&
+                          dense_tc_supported(fq->native_type, (int) N, (int) (NH * 2 * HD), fq->native_data) &&
+                          dense_tc_type_on(fq->native_type) &&
+                          dense_tc_supported(fo->native_type, (int) (NH * HD), (int) N, fo->native_data) &&
+                          dense_tc_type_on(fo->native_type);
+        }
+        bool routed = chain_done;   // the fused read ran the router too
+        if (!chain_done) {
             // the read's first kernel follows a combine, copy or wait: a plain launch, except after the device-planned
             // tail's combine kernel (PDL2)
             const bool after_kernel = pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
@@ -1164,7 +1304,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // a QSA layer's query projection follows (qsaf_wide path): its blocks start with the read
                 if (read_q8 && is_qsa_layer(g, l) && tb == 0 && N == 2560 && n <= kDecMaxT) {
                     const QsaState& st0 = ss.qsa_states[qsa_idx[(size_t) l]];
-                    h.next_early = st0.kv_int8 && !st0.kv_rot && !st0.kv_hybrid && !st0.kv_q4 && native_qsa_enabled() &&
+                    h.next_early = !qsa_full_on && st0.kv_int8 && !st0.kv_rot && !st0.kv_hybrid && !st0.kv_q4 && native_qsa_enabled() &&
                                    native_rope_enabled() && qsa_dec_fused_supported(s) &&
                                    qs_[0] != nullptr;
                 }
@@ -1177,7 +1317,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
         try {
-            if (!is_qsa_layer(g, l)) {
+            if (chain_done) {
+                // the attention half ran in the chain
+            } else if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
                 const WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
                                 *wout = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
@@ -1376,6 +1518,38 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     qp.idx_q_norm = (const float*) wiqn->data; qp.eps = EPS;
                     return qp;
                 };
+                bool qf_run = false;
+                if (qsa_full_on) {
+                    QsaFullArgs fa;
+                    fa.n = (int) n; fa.tq = wq->native_type; fa.tk = wk->native_type; fa.tv = wv->native_type;
+                    fa.to = wo->native_type;
+                    fa.wq = wq->native_data; fa.wk = wk->native_data; fa.wv = wv->native_data; fa.wo = wo->native_data;
+                    fa.wik = (const uint16_t*) wik->data; fa.wiq = (const uint16_t*) wiq->data;
+                    fa.xmix = xq_; fa.mixed = xm;
+                    fa.qfull = qfull_ + tb * NH * 2 * HD; fa.kcur = kcur_ + tb * NKV * HD; fa.vcur = vcur_ + tb * NKV * HD;
+                    fa.idx_raw = idx_raw + tb * ID; fa.qidx = qidx_ + tb * IQ * ID; fa.bo = bo_ + tb * N;
+                    fa.kv = kv_post_args(); fa.qp = q_post_args();
+                    fa.shapes = s; fa.pooled = st.idx_pooled; fa.dead = st.idx_dead; fa.steps = step_ + tb * kStepCount;
+                    fa.max_blocks = max_blocks_; fa.scores = scores_ + (size_t) tb * max_blocks_;
+                    fa.ids = sel_ + (size_t) tb * cap_; fa.cap = cap_;
+                    fa.pools = qsa_attn_pools(st);
+                    fa.scratch = attn_scratch_ + (size_t) tb * attn_scratch_floats_; fa.attn = attn_ + tb * NH * HD;
+                    fa.gated = attn32_ + tb * NH * HD;
+                    fa.ord = qsa_ord;
+                    if (qsa_full_supported(fa)) {
+                        if (!read_q8) {
+                            PdlScope pq0(pdl);   // after the hc read
+                            native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                        }
+                        PdlScope pf(pdl, qsa_ord == 0);   // after the hc read (the first follows the counters' memset)
+                        qsa_full(fa, cs);
+                        ++qsa_ord;
+                        qf_run = true;
+                    } else {
+                        note_fallback("qsa_full unsupported", (int) fa.tq, (int) fa.to);
+                    }
+                }
+                if (!qf_run) {
                 // K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
                 // multi-row GEMV is the one-row one)
                 const bool qsaf_wide = fused_pre && (qb || n == 1) && qs_[0] != nullptr;
@@ -1584,29 +1758,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 PdlScope ps(pdl);   // after the gate kernel
                 if (!attn_q8) native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 dense_proj(16, wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+                }
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
             return false;
         }
         stamp(l, 16, grp);
-        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-        const bool router_multi = w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
-        bool routed = false;   // the fused read ran the router too
-        const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
-                             ev_join_ != nullptr;
-        cudaStream_t sh_stream = sh_fork ? (sh_hi_ != nullptr ? sh_hi_ : sh_cs_) : cs;
-        // the ring on its own stream, forked after the router, joined where the side branch is
-        const bool pk_ring = dm && sh_fork && sh_stream == sh_hi_ && ring_hi_ != nullptr;
-        ring_fork[grp] = pk_ring;
-        // the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
-        glue_on[grp] = false;
-        if (pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
-            const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
-            glue_on[grp] = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
-            if (!glue_on[grp]) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
-        }
-        {
+        if (!chain_done) {
             PdlScope ps(pdl);   // after the out projection's kernel
             if (dec_hc) {
                 HcFusedArgs h = hc_args(1, true, inj_, inj2_);
@@ -1740,6 +1899,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
+        if (fz_done[grp]) {   // the fused kernel ran the experts and the combine: only the residual's tail is left
+            fz_done[grp] = false;
+            stamp(l, 24, grp);
+            if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
+            return true;
+        }
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
