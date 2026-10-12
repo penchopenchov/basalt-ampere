@@ -81,7 +81,7 @@ Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_
 | Indexer | Keys fp16-rounded, held fp32; block scores fp32; radix top-k, ties to the lowest cell | native_qsa_indexer.hpp:14-18; qsa_select.hpp:6-9 |
 | GDN recurrent state and conv history | fp32 | dec_gdn.hpp:21; verify.cpp:1134, 1158-1160 |
 | Router softmax and top-10 | fp32, ties to the lower expert index, weights renormalized over the ten | native_router.cu:39-91 |
-| Router, n_expert other than 512 (pruned packs) | Generic router path instead of the fused native one; same fp32 softmax and top-10 rules, no precision change | README.md (Coder pack) |
+| Router, n_expert other than 512 (pruned packs) | Generic router kernel instead of the fused native one. Max in fp32; per-expert exp in double of (logit - max); the sum in double, ascending on one thread; probabilities rounded to fp32 as `(float)(exp * (float)(1/sum))`. Top-10 by ten block-wide argmax passes over the fp32 probabilities, ties to the lower expert index. The ten weights are summed in double, floored at 2^-14, divided in double and stored fp32. The native path takes exp, sum and reciprocal in fp32 with a warp-ordered sum, so the probabilities differ in the last bits and the chosen experts or weights can differ from it in rare near-tie cases | router_top10.cu:56-173 (max 74-88, exp 92, sum 96-102, probabilities 114, selection 131-162, renormalization 166-172); native_router.cu:46-91 |
 | Expert combine | fp32, in router rank order, plus shared expert | native_moe.cu:35-50 |
 | Final logits | fp32 `[T][n_vocab]` | verify.hpp:489 |
 | Greedy sampling | fp32 argmax, lowest index wins ties | sampler.cu:79-90 |
