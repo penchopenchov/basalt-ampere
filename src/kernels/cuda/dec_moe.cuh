@@ -312,6 +312,7 @@ __device__ void dm_poll_tiers(const DmPlan* plan, const volatile uint32_t* peer_
 
 __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
                                uint32_t ring, unsigned long long* stats, int layer, int trigger) {
+    BASALT_SPAN(::basalt::kernels::stamp::kDmWait);
     if ((trigger & 1) != 0) pdl_trigger();
     if (stats != nullptr) {
         stats[1] = dm_clock();
@@ -417,6 +418,7 @@ __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExp
     __shared__ int32_t s_ng, s_ne;
     __shared__ alignas(16) int32_t s_key[kDmCap];
     __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
+    BASALT_SPAN(::basalt::kernels::stamp::kDmGu);
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     const bool lead = blockIdx.x == 0;
     if (!lead) pdl_trigger();   // the lead block lets the SwiGLU and down launches start once the plan is out
@@ -434,6 +436,9 @@ __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExp
     if (tid == 0 && (int) blockIdx.x * 16 < a.n_expert)   // the layer's table into L2
         asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + blockIdx.x * 16));
     pdl_wait();
+#ifdef BASALT_PROFILE
+    sp_.rearm();
+#endif
     // the table entry is read at once, beside the id's validity check
     const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
     const unsigned long long praw = (e0 >= 0 && e0 < a.n_expert) ? a.ptab[e0] : 0ull;
@@ -1044,8 +1049,10 @@ struct DmTmaShared {
 __device__ __forceinline__ uint32_t dm_smem(const void* p) { return (uint32_t) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void dm_bulk(void* dst, const void* src, uint32_t bytes, unsigned long long* bar) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(dm_smem(bar)), "r"(bytes) : "memory");
-    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                 :: "r"(dm_smem(dst)), "l"(src), "r"(bytes), "r"(dm_smem(bar)) : "memory");
+    unsigned long long pol;   // the expert bytes are streamed once: evict-first in L2
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+                 :: "r"(dm_smem(dst)), "l"(src), "r"(bytes), "r"(dm_smem(bar)), "l"(pol) : "memory");
 }
 __device__ __forceinline__ void dm_bar_wait(unsigned long long* bar, uint32_t parity) {
     uint32_t ok = 0;

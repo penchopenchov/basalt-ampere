@@ -443,7 +443,7 @@ __device__ void cn_x(const HcFusedArgs& a, int hs, int tid, char* smem, float* p
                 v.x = fmaf(bb[k][j].x, gw, v.x); v.y = fmaf(bb[k][j].y, gw, v.y);
                 v.z = fmaf(bb[k][j].z, gw, v.z); v.w = fmaf(bb[k][j].w, gw, v.w);
             }
-            sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            sq += fmaf(v.w, v.w, fmaf(v.z, v.z, fmaf(v.x, v.x, v.y * v.y)));   // the fusion spelled out
             X[k * (CN_W / 4) + (e4 & 1) * (CN_W / 8) + (e4 >> 1)] = make_float4(v.x * g[j].x, v.y * g[j].y, v.z * g[j].z, v.w * g[j].w);
         }
         if (ss) {
@@ -1107,6 +1107,7 @@ __global__ void hc_l2_prefetch_kernel(const void* p0, size_t n0, const void* p1,
     }
 }
 
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the fused layer) takes only the device code
 using KernelFn = void (*)(HcLaunch);
 constexpr KernelFn kKernels[2][MAXT] = {
     {hc_fused_kernel<1, false>, hc_fused_kernel<2, false>, hc_fused_kernel<3, false>, hc_fused_kernel<4, false>,
@@ -1116,7 +1117,9 @@ constexpr KernelFn kKernels[2][MAXT] = {
 
 unsigned long long* g_dbg = nullptr;
 int g_slot = 0;
+#endif
 }  // namespace
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the fused layer) takes only the device code
 
 bool hc_fused_q8_rows_ok() { return true; }
 
@@ -1405,15 +1408,17 @@ bool cn_maps(const HcFusedArgs& h, CUtensorMap* tm) {
 }
 
 
-void hc_fused_read(const HcFusedArgs& a, void* stream) {
+// The launch record of a read: its counter set, the 8-bit copies of the matrices and the tensor maps.  False (with a
+// message) for invalid arguments or a missing 8-bit copy.
+static bool hc_prepare(const HcFusedArgs& a, HcLaunch& L) {
     const DevInfo& d = dev_info();
     if (!d.ok || a.T < 1 || a.T > MAXT || !a.R || !a.R_out || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs ||
         !a.mixed || !a.xn || (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev)) ||
         (a.w_router && (!a.logits || !a.ids || !a.weights)) || (a.apply && a.inj_prev == a.inject_out)) {
         std::fprintf(stderr, "hc_fused_read: invalid arguments or unsupported device\n");
-        std::exit(1);
+        return false;
     }
-    HcLaunch L{};
+    L = HcLaunch{};
     L.a = a;
     L.nb = d.sms;
     L.slot = g_slot;
@@ -1441,7 +1446,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         }
         if (!q8) {
             std::fprintf(stderr, "hc_fused_read: the matrices need their 8-bit copies (hc8_prepare)\n");
-            std::exit(1);
+            return false;
         }
         if (a.w_inject == nullptr) h.q_inject = nullptr;
     }
@@ -1450,9 +1455,15 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.lg64 = d.lg + (size_t) L.slot * MAXT * NE;
     if (!cn_maps(L.a, L.tm)) {
         std::fprintf(stderr, "hc_fused_read: the tensor maps of the 8-bit matrices failed\n");
-        std::exit(1);
+        return false;
     }
     L.nu = a.xq != nullptr && a.w_router == nullptr ? CN_MIN_NU : 0;   // whole q8_1 blocks
+    return true;
+}
+
+void hc_fused_read(const HcFusedArgs& a, void* stream) {
+    HcLaunch L;
+    if (!hc_prepare(a, L)) std::exit(1);
     launch_pdl(kKernels[g_dbg != nullptr ? 1 : 0][a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM,
                (cudaStream_t) stream, L);
     const cudaError_t e = cudaGetLastError();
@@ -1486,4 +1497,5 @@ void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* s
     hc_l2_prefetch_kernel<<<8, 32, 0, (cudaStream_t) stream>>>(p[0], b[0], p[1], b[1], p[2], b[2], p[3], b[3]);
 }
 
+#endif
 }  // namespace basalt::kernels

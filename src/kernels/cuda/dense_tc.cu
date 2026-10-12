@@ -974,6 +974,7 @@ int sm_count() {
     return n;
 }
 
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the fused layer) takes only the device code
 // The live configuration: DEC_DTC2 2 | 4 | 8 | 16 and DEC_PAIR 2 | 4 | 16 (see verify.cpp).
 constexpr int g_v2 = 30;
 constexpr int g_pair = 22;
@@ -1058,7 +1059,9 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
     }
 }
 
+#endif
 }  // namespace
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the fused layer) takes only the device code
 
 bool dense_tc_supported(int t, int n_in) noexcept {
     return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42);
@@ -1154,4 +1157,5 @@ int dense_tc_pair_mask() { return g_pair; }
 
 int dense_tc_mask() { return 29; }   // DEC_DTC 1 | 4 | 8 | 16 (see verify.cpp)
 
+#endif
 }  // namespace basalt::kernels

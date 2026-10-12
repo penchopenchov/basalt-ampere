@@ -61,7 +61,7 @@ __device__ __forceinline__ float conv_silu(const float (&hist)[3], const float (
         win[j] = src < 3 ? hist[src] : xv[src - 3];
     }
     const float v0 = win[0], v1 = win[1], v2 = win[2], x = xv[t];
-    float sum = v0 * w[0] + v1 * w[1] + v2 * w[2] + x * w[3];
+    const float sum = fmaf(x, w[3], fmaf(v2, w[2], fmaf(v0, w[0], v1 * w[1])));   // the fusion spelled out
     return sum / (1.0f + __expf(-sum));
 }
 
@@ -352,6 +352,7 @@ __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T
 
 }  // namespace
 
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the fused layer) takes only the device code
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0) {
         std::fprintf(stderr, "dec_gdn_rec: invalid arguments\n");
@@ -402,4 +403,5 @@ void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream) {
     if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec_norm: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
+#endif
 }  // namespace basalt::kernels

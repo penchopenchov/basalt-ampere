@@ -13,7 +13,7 @@
 
 namespace gu2 {
 
-__device__ __forceinline__ uint32_t ldw(const uint8_t* p) { return __ldg((const unsigned int*) p); }
+__device__ __forceinline__ uint32_t ldw(const uint8_t* p) { return __ldcs((const unsigned int*) p); }   // streamed once: evict-first (see wget_b2)
 
 // the 32-bit value at the 2-byte aligned p
 __device__ __forceinline__ uint32_t int_at(const uint8_t* p) {
@@ -197,7 +197,7 @@ template<> struct Fmt2<21> {   // IQ3_S: 110-byte blocks (d, 64 grid bytes, qh[8
         const int j = k & 7;
         uint32_t q0, q1;
         int2_at(b + 2 + 8 * j, q0, q1);
-        const uint32_t qh = b[66 + j], sg = int_at(b + 74 + 4 * j), sc = b[106 + (j >> 1)];
+        const uint32_t qh = (uint32_t) wld8(b + 66 + j), sg = int_at(b + 74 + 4 * j), sc = (uint32_t) wld8(b + 106 + (j >> 1));
         W r;
 #pragma unroll
         for (int p = 0; p < 4; ++p) {
@@ -210,7 +210,7 @@ template<> struct Fmt2<21> {   // IQ3_S: 110-byte blocks (d, 64 grid bytes, qh[8
             r.g[2 * p + 1] = neg(g1, m1);
         }
         r.ls = 1 + 2 * (int) ((sc >> 4 * (j & 1)) & 0x0Fu);
-        r.dw = __half2float(*(const __half*) b);
+        r.dw = wld_h2f(b);
         return r;
     }
     __device__ static void apply(const W& r, const block_q8_1* __restrict__ x, float& d, float& f) {
@@ -378,6 +378,7 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_pdl_kernel(const floa
                                                                       const int32_t* __restrict__ grp_start,
                                                                       const int32_t* __restrict__ n_groups, int n_ff,
                                                                       block_q8_1* __restrict__ hq) {
+    BASALT_SPAN(::basalt::kernels::stamp::kDmSwi);
     pdl_trigger();
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     pdl_wait();

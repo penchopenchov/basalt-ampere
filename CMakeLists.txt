@@ -164,14 +164,13 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/qsa_select.cu
                         src/kernels/cuda/verify_kernels.cu
                         src/kernels/stamp_ring.cpp
-                        src/kernels/cuda/dec_gdn_rec.cu
-                        src/kernels/cuda/dense_tc.cu
+                        src/kernels/cuda/attn_chain.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
                         src/ngram/ple_reader.cpp
                         src/platform/direct_file.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
-target_sources(kernels PRIVATE src/kernels/cuda/hc_fused.cu src/kernels/cuda/hc8_gr.cu)
+target_sources(kernels PRIVATE src/kernels/cuda/hc8_gr.cu)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
 if(BUILD_TESTING)
   add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
@@ -439,6 +438,11 @@ target_link_libraries(pk_moe_bench PRIVATE kernels ${_gpu_runtime_target})
 add_executable(hc_fused_parity src/kernels/hc_fused_parity.cpp)
 target_include_directories(hc_fused_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(hc_fused_parity PRIVATE kernels ${_gpu_runtime_target})
+add_executable(attn_chain_parity src/kernels/attn_chain_parity.cpp)
+target_include_directories(attn_chain_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(attn_chain_parity PRIVATE kernels ${_gpu_runtime_target})
+add_test(NAME attn_chain_parity COMMAND attn_chain_parity 20)
+set_tests_properties(attn_chain_parity PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(gr_parity src/kernels/gr_parity.cpp)
 target_include_directories(gr_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(gr_parity PRIVATE kernels ${_gpu_runtime_target})
