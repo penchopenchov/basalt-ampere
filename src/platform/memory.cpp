@@ -106,6 +106,41 @@ void stop_memory_watchdog() {
 }
 
 namespace {
+std::atomic<bool> g_guard_on{false};
+std::atomic<bool> g_guard_low{false};
+std::atomic<uint64_t> g_guard_avail{0};
+std::atomic<uint64_t> g_guard_floor{0};
+}  // namespace
+
+void start_ram_guard(uint64_t floor_bytes) {
+    g_guard_floor = floor_bytes;
+    if (g_guard_on.exchange(true)) return;
+    std::thread([] {
+        bool was_low = false;
+        for (;;) {
+            const uint64_t avail = available_memory(), floor = g_guard_floor.load();
+            const bool low = ram_below_floor(avail, floor);
+            g_guard_avail = avail;
+            g_guard_low = low;
+            if (low && !was_low) {
+                std::fprintf(stderr, "basalt warning: RAM is low: %llu MiB available, below the %llu MiB floor; "
+                                     "requests stop until memory is freed\n",
+                             (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
+                std::fflush(stderr);
+            }
+            was_low = low;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }).detach();   // runs for the life of the process
+}
+
+bool ram_guard_low(uint64_t* avail, uint64_t* floor) {
+    if (avail) *avail = g_guard_avail.load();
+    if (floor) *floor = g_guard_floor.load();
+    return g_guard_low.load(std::memory_order_relaxed);
+}
+
+namespace {
 constexpr uint64_t kAdviseStep = 128ull << 10;
 }
 

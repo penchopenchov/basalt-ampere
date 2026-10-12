@@ -34,6 +34,43 @@ uint64_t ram_margin();
 /// host memory, the prompt path's and the verifier's staging.  A resident copy leaves this much beside the margin.
 inline constexpr uint64_t kLateHostBytes = 2ull << 30;
 
+/// The expert bytes one prompt chunk may read from the expert file for the slots it borrows from the GPU cache (the
+/// chunk is sized to stay within it).
+inline constexpr uint64_t kPromptFileReadBytes = 3584ull << 20;
+
+/// The least RAM kept for the OS file cache while any expert is read from the file.
+inline constexpr uint64_t kMinFileCacheBytes = 4ull << 30;
+
+/// The RAM the OS file cache needs beside ram_margin() while `file_bytes` of experts are read from the file through
+/// it (0: every expert is held by a GPU tier or the RAM copy, nothing is read from the file).  A prompt chunk reads
+/// up to kPromptFileReadBytes for its borrowed slots, plus the file-held experts of the layer it computes and of the
+/// next one it reads ahead: at most two whole layers (`largest_layer_bytes`, every expert of the largest layer).
+/// Pages evicted before that pass is over are read again, and the reclaim then runs at drive speed.
+inline uint64_t file_cache_floor(uint64_t file_bytes, uint64_t largest_layer_bytes) {
+    if (file_bytes == 0) return 0;
+    const uint64_t pass = kPromptFileReadBytes + 2 * largest_layer_bytes;
+    return pass > kMinFileCacheBytes ? pass : kMinFileCacheBytes;
+}
+
+/// The RAM left free once the experts are placed: `margin` (ram_margin()) plus the file cache's floor.
+inline uint64_t ram_floor(uint64_t margin, uint64_t file_bytes, uint64_t largest_layer_bytes) {
+    return margin + file_cache_floor(file_bytes, largest_layer_bytes);
+}
+
+/// Where a running request stops while serving: the margin plus one prompt chunk's file reads when experts are read
+/// from the file (the margin alone when none are).  Below ram_floor() by the two layers' read-ahead, so the engine's
+/// own growth after the load (conversation cache, an image's buffers) does not end requests on a machine still
+/// sized as asked.
+inline uint64_t ram_guard_floor(uint64_t margin, uint64_t file_bytes) {
+    return margin + (file_bytes > 0 ? kPromptFileReadBytes : 0);
+}
+
+/// The largest RAM copy that leaves `floor` free, with `avail` bytes available and `late` bytes still to be taken by
+/// the engine after the copy.
+inline uint64_t max_safe_copy(uint64_t avail, uint64_t late, uint64_t floor) {
+    return avail > late + floor ? avail - late - floor : 0;
+}
+
 /// The RAM a page-locked or fully resident allocation may take now: MemAvailable less ram_margin().  `known` is
 /// false when /proc/meminfo cannot be read (nothing is refused then).
 uint64_t ram_budget(bool* known = nullptr);
@@ -45,6 +82,15 @@ void start_memory_watchdog(uint64_t floor_bytes);
 /// its error names the copy's cap instead of the resident mode.
 void watch_resident_ram(bool resident, uint64_t copy_bytes);
 void stop_memory_watchdog();
+
+/// Whether a MemAvailable reading `avail` is below `floor` (a reading of 0, unknown, is not).
+inline bool ram_below_floor(uint64_t avail, uint64_t floor) { return avail > 0 && avail < floor; }
+
+/// While serving: polls MemAvailable and keeps whether it is below `floor_bytes`, for ram_guard_low.  The request
+/// that is running then stops with an error instead of the machine swapping; nothing is shrunk or exited.
+void start_ram_guard(uint64_t floor_bytes);
+/// True while the last reading was below the guard's floor; `avail` and `floor` get that reading and the floor.
+bool ram_guard_low(uint64_t* avail = nullptr, uint64_t* floor = nullptr);
 
 /// Whether the OS file cache could keep the `read_bytes` the expert file is read for, beside
 /// `arena_bytes` of RAM held by the engine's own copy of the experts and `margin` for everything else, with `avail`
