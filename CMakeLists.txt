@@ -165,6 +165,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/verify_kernels.cu
                         src/kernels/stamp_ring.cpp
                         src/kernels/cuda/attn_chain.cu
+                        src/kernels/cuda/qsa_full.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
                         src/ngram/ple_reader.cpp
@@ -443,6 +444,11 @@ target_include_directories(attn_chain_parity PRIVATE ${_gpu_include_directories}
 target_link_libraries(attn_chain_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME attn_chain_parity COMMAND attn_chain_parity 20)
 set_tests_properties(attn_chain_parity PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(qsa_full_parity src/kernels/qsa_full_parity.cpp)
+target_include_directories(qsa_full_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(qsa_full_parity PRIVATE kernels ${_gpu_runtime_target})
+add_test(NAME qsa_full_parity COMMAND qsa_full_parity 20)
+set_tests_properties(qsa_full_parity PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(gr_parity src/kernels/gr_parity.cpp)
 target_include_directories(gr_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(gr_parity PRIVATE kernels ${_gpu_runtime_target})
