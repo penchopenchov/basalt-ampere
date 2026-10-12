@@ -1055,6 +1055,11 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return index < complement_offsets_.size() && complement_offsets_[index] != kNoComplement;
 }
 
+bool FileExpertSource::resident_in_top_up(int64_t layer, int64_t expert) const {
+    if (!has_resident(layer, expert)) return false;
+    return complement_offsets_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] >= complement_bytes_;
+}
+
 bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     err.clear();
     if (n <= xstage_cap_) return true;

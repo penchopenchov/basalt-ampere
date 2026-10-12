@@ -4625,7 +4625,7 @@ int main(int argc, char** argv) {
     // reads those from the SSD).  Called once the tiers are final.
     uint64_t tier_file_bytes = 0;   // the experts only the file holds, once the tiers are final
     auto report_expert_tiers = [&]() {
-        uint64_t b_vram = 0, b_peer = 0, b_ram = 0, b_file = 0;
+        uint64_t b_vram = 0, b_peer = 0, b_ram = 0, b_top = 0, b_file = 0;
         const bool ram_ok = srcp == &src && src.complement_ready();
         for (int64_t l = 0; l < g.n_layers; ++l) {
             const uint64_t blob = basalt::kernels::cpu::expert_layout().blob_bytes(l);
@@ -4636,19 +4636,22 @@ int main(int argc, char** argv) {
                 for (const auto& r : remote_experts) on_gpu = on_gpu || (r.resident() > 0 && r.owns((int64_t) i));
                 if (on_gpu) b_vram += blob;
                 else if (peer.valid() && peer.has(l, e)) b_peer += blob;
-                else if (ram_ok && src.has_resident(l, e)) b_ram += blob;
+                else if (ram_ok && src.has_resident(l, e)) (src.resident_in_top_up(l, e) ? b_top : b_ram) += blob;
                 else b_file += blob;
             }
         }
         tier_file_bytes = b_file;
-        const double total = (double) (b_vram + b_peer + b_ram + b_file);
+        const double total = (double) (b_vram + b_peer + b_ram + b_top + b_file);
         if (total <= 0.0) return;
         constexpr double kGiB = 1073741824.0;
         auto pct = [&](uint64_t b) { return 100.0 * (double) b / total; };
+        // RAM is the loaded copy (the bytes the loader reports); the top-up added after the load is shown beside it
+        char top[48] = "";
+        if (b_top > 0) std::snprintf(top, sizeof top, " + %.1f GiB topped up", (double) b_top / kGiB);
         std::fprintf(stderr, "basalt generate: experts live in VRAM %.1f GiB (%.0f%%), peer GPU %.1f GiB (%.0f%%), RAM "
-                             "%.1f GiB (%.0f%%), file (SSD) %.1f GiB (%.0f%%); %.1f GiB in all\n",
-                     (double) b_vram / kGiB, pct(b_vram), (double) b_peer / kGiB, pct(b_peer), (double) b_ram / kGiB,
-                     pct(b_ram), (double) b_file / kGiB, pct(b_file), total / kGiB);
+                             "%.1f GiB%s (%.0f%%), file (SSD) %.1f GiB (%.0f%%); %.1f GiB in all\n",
+                     (double) b_vram / kGiB, pct(b_vram), (double) b_peer / kGiB, pct(b_peer), (double) b_ram / kGiB, top,
+                     pct(b_ram + b_top), (double) b_file / kGiB, pct(b_file), total / kGiB);
         // The file holds the coldest experts (the tiers fill in profile order), so its share of the bytes is well above
         // its share of the reads; 2% is where a decode window starts to meet SSD reads that cost far more than a RAM hit.
         if (pct(b_file) < 2.0) return;

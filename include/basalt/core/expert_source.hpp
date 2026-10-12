@@ -428,6 +428,8 @@ public:
     // `in`'s place, so the copy keeps holding exactly the experts the GPU does not - with no read of the file.
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
+    /// Whether `(layer, expert)` sits in the region added after the load (the RAM top-up) rather than the loaded copy.
+    bool resident_in_top_up(int64_t layer, int64_t expert) const;
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     bool reserve_exchanges(int64_t n, std::string& err);
     int64_t exchange_capacity() const { return xstage_cap_; }
