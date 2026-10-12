@@ -51,6 +51,9 @@ public:
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
               std::string& err, bool exclusive = false);
     void close();
+    /// The device bytes `open` allocates besides the expert slots (buffers and kernel scratch), taken before the
+    /// slots are sized from what is left.
+    static uint64_t device_overhead_bytes();
     bool valid() const { return device_ >= 0; }
     int device() const { return device_; }
 

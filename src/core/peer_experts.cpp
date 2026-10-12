@@ -94,6 +94,24 @@ void PeerExperts::close() {
     device_ = -1;
 }
 
+namespace {
+
+size_t scratch_bytes() {
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    int64_t ff = basalt::kernels::cpu::FF;
+    if (lay.native)
+        for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
+    return std::max<size_t>((size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(CAP, H, ff),
+                            basalt::kernels::native_expert_scratch_bytes(CAP, ff));
+}
+
+}  // namespace
+
+uint64_t PeerExperts::device_overhead_bytes() {
+    return (uint64_t) scratch_bytes() + (uint64_t) CAP * H * sizeof(float) * 2 + sizeof(Meta) +
+           (uint64_t) CAP * (H / 32) * 36;
+}
+
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
                        std::string& err, bool exclusive) {
@@ -129,11 +147,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     On on(device);
     device_ = device;
     // scratch first, so the slots take what is really left
-    int64_t ff = basalt::kernels::cpu::FF;
-    if (lay.native)
-        for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
-    const size_t scratch = std::max<size_t>((size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(CAP, H, ff),
-                                            basalt::kernels::native_expert_scratch_bytes(CAP, ff));
+    const size_t scratch = scratch_bytes();
     const bool alloc_ok =
         ck(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err) &&
         ck(cudaStreamCreateWithFlags(&refill_, cudaStreamNonBlocking), "refill stream", err) &&

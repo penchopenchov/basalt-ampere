@@ -2170,7 +2170,6 @@ int main(int argc, char** argv) {
     // draft layer, the head and every expert (the GPU cache plus its complement in RAM).  Each term is the total its own
     // load phase reports.  A layer split places bytes per stage: no total, the progress lines stand alone.
     uint64_t model_bytes = 0, expert_total_bytes = 0, cuda0_fixed_bytes = 0;   // the latter: all but the cache fill
-    bool ssd_warned = false;   // the fit check already said the experts will be read from the SSD
     for (int64_t l = 0; l < g.n_layers; ++l)
         expert_total_bytes += (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l);
     // The default expert mode copies every expert into RAM and keeps it there, so a machine that cannot hold them
@@ -2200,62 +2199,6 @@ int main(int argc, char** argv) {
                                 basalt::core::Verifier::hc8_plan_bytes(
                                     [&](const std::string& n) { return index_names.count(n) > 0; }, g);
             model_bytes = cuda0_fixed_bytes + expert_total_bytes;
-            // the model's bytes against what the primary card, the peer card and the RAM copy can hold: with the
-            // file-backed modes the rest is read from the SSD (the default arena mode was checked against the RAM above)
-            size_t free_vram = 0, total_vram = 0;
-            const auto free_ram = basalt::core::conversation_available_memory();
-            if (o.mmap_experts && cudaMemGetInfo(&free_vram, &total_vram) == cudaSuccess && free_ram) {
-                const uint64_t vram = (uint64_t) free_vram > ((uint64_t) o.vram_reserve_mib << 20)
-                                          ? (uint64_t) free_vram - ((uint64_t) o.vram_reserve_mib << 20) : 0;
-                // the RAM copy is sized as the loader sizes it: the room past the headroom (a server also leaves
-                // room for its late allocations), less a small margin when a budget or the soft mode caps it, and
-                // never more than the budget
-                const uint64_t headroom = o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() +
-                                                                                      basalt::platform::kLateHostBytes)
-                                                  : std::max(o.resident_headroom, basalt::platform::ram_margin());
-                uint64_t ram = *free_ram > headroom ? *free_ram - headroom : 0;
-                if (o.resident_cpu_experts && (o.resident_budget > 0 || o.resident_soft)) {
-                    const uint64_t margin = 256ull << 20;
-                    ram = ram > margin ? ram - margin : 0;
-                    if (o.resident_budget > 0) ram = std::min(ram, o.resident_budget);
-                }
-                // the peer tier holds experts too: what its card has free beyond the reserve the tier leaves
-                uint64_t peer_vram = 0;
-                if (o.peer_device >= 1) {
-                    int cur = 0, count = 0;
-                    size_t pfree = 0, ptotal = 0;
-                    if (cudaGetDevice(&cur) == cudaSuccess && cudaGetDeviceCount(&count) == cudaSuccess &&
-                        o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
-                        if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
-                            const uint64_t reserve = (uint64_t) std::max(o.peer_reserve_mib, 128) << 20;
-                            peer_vram = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
-                        }
-                        (void) cudaSetDevice(cur);
-                    }
-                    (void) cudaGetLastError();
-                }
-                ssd_warned = model_bytes > vram + peer_vram + ram;
-                if (ssd_warned) {
-                    // experts read from the SSD: the RAM copy also leaves the file cache its floor, as the loader does
-                    uint64_t largest = 0;
-                    for (int64_t l = 0; l < g.n_layers; ++l)
-                        largest = std::max<uint64_t>(largest, (uint64_t) g.n_expert *
-                                                                  basalt::kernels::cpu::expert_layout().blob_bytes(l));
-                    if (o.resident_cpu_experts && o.resident_budget == 0) {
-                        const uint64_t late = o.serve ? basalt::platform::kLateHostBytes : 0;
-                        const uint64_t floor_headroom =
-                            std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), 1, largest) + late);
-                        ram = *free_ram > floor_headroom ? *free_ram - floor_headroom : 0;
-                        if (o.resident_soft) ram = ram > (256ull << 20) ? ram - (256ull << 20) : 0;
-                    }
-                    std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
-                                         "the SSD while generating (slow)\n",
-                                 (double) model_bytes / 1073741824.0,
-                                 (double) (vram + peer_vram + ram) / 1073741824.0);
-                }
-            } else if (o.mmap_experts) {
-                (void) cudaGetLastError();
-            }
             basalt::core::LoadProgress::announce_total(model_bytes);
             // the experts' places follow once the cache is sized; with the arena every expert goes to RAM first
             basalt::core::LoadProgress::plan("cuda0", cuda0_fixed_bytes);
@@ -3516,6 +3459,78 @@ int main(int argc, char** argv) {
     // the policy rather than a hint.
     int64_t prefilled = 0;
     uint64_t cache_fill_bytes = 0;   // what the GPU cache took from the profile (counted by its load phase)
+    // The model's bytes against what the tiers will hold, from the same quantities the loader uses: the primary card
+    // keeps its weights and the cache just sized, the peer card its free memory less its buffers and reserve, and the
+    // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
+    // arena mode was checked against the RAM above).
+    if (model_bytes > 0 && o.mmap_experts) {
+        const auto free_ram = basalt::core::conversation_available_memory();
+        if (free_ram) {
+            uint64_t cache_bytes_now = 0;
+            if (!profile.empty() && srcp != nullptr) {
+                const int64_t n = xcache.per_layer_admission()
+                                      ? (int64_t) profile.size()
+                                      : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+                for (int64_t i = 0; i < n; ++i)
+                    cache_bytes_now += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            }
+            cache_bytes_now = std::min(cache_bytes_now, expert_total_bytes);
+            const uint64_t vram = cuda0_fixed_bytes + cache_bytes_now;
+            uint64_t outside = expert_total_bytes - cache_bytes_now;   // the experts no cache on the primary holds
+            const uint64_t headroom = o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() +
+                                                                                  basalt::platform::kLateHostBytes)
+                                              : std::max(o.resident_headroom, basalt::platform::ram_margin());
+            uint64_t ram = *free_ram > headroom ? *free_ram - headroom : 0;
+            if (o.resident_cpu_experts && (o.resident_budget > 0 || o.resident_soft)) {
+                const uint64_t margin = 256ull << 20;
+                ram = ram > margin ? ram - margin : 0;
+                if (o.resident_budget > 0) ram = std::min(ram, o.resident_budget);
+            }
+            // the peer tier holds experts too: what its card has free beyond its buffers and the reserve it leaves
+            uint64_t peer_vram = 0;
+            if (o.peer_device >= 1) {
+                int cur = 0, count = 0;
+                size_t pfree = 0, ptotal = 0;
+                if (cudaGetDevice(&cur) == cudaSuccess && cudaGetDeviceCount(&count) == cudaSuccess &&
+                    o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
+                    if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
+                        const uint64_t reserve =
+                            ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+                            basalt::core::PeerExperts::device_overhead_bytes();
+                        peer_vram = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
+                        if (o.peer_slots > 0)
+                            peer_vram = std::min<uint64_t>(
+                                peer_vram, (uint64_t) o.peer_slots * basalt::kernels::cpu::expert_layout().max_blob);
+                    }
+                    (void) cudaSetDevice(cur);
+                }
+                (void) cudaGetLastError();
+            }
+            peer_vram = std::min(peer_vram, outside);
+            outside -= peer_vram;
+            uint64_t file_headroom = headroom;
+            if (model_bytes > vram + peer_vram + ram) {
+                // experts read from the SSD: the RAM copy also leaves the file cache its floor, as the loader does
+                uint64_t largest = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    largest = std::max<uint64_t>(largest, (uint64_t) g.n_expert *
+                                                              basalt::kernels::cpu::expert_layout().blob_bytes(l));
+                if (o.resident_cpu_experts && o.resident_budget == 0) {
+                    const uint64_t late = o.serve ? basalt::platform::kLateHostBytes : 0;
+                    file_headroom =
+                        std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), 1, largest) + late);
+                    ram = *free_ram > file_headroom ? *free_ram - file_headroom : 0;
+                    if (o.resident_soft) ram = ram > (256ull << 20) ? ram - (256ull << 20) : 0;
+                }
+                ram = std::min(ram, outside);
+                if (model_bytes > vram + peer_vram + ram)
+                    std::fprintf(stderr, "basalt warning: model %.1f GiB, free VRAM + RAM %.1f GiB: the rest is read from "
+                                         "the SSD while generating (slow)\n",
+                                 (double) model_bytes / 1073741824.0,
+                                 (double) (vram + peer_vram + ram) / 1073741824.0);
+            }
+        }
+    }
     if (!profile.empty() && srcp != nullptr) {
         // per layer, a full layer skips only its own pairs - each layer takes its hottest experts until its range is
         // full
