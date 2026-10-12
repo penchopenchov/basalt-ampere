@@ -253,6 +253,14 @@ def engine_warning(line: str):
     return None
 
 
+def engine_ram_floor(line: str):
+    """The text after `RAM floor ` of an engine `basalt generate: RAM floor ...` line, else None."""
+    head = "basalt generate: RAM floor "
+    if line.startswith(head) and line[len(head):].strip():
+        return line[len(head):].strip()
+    return None
+
+
 def engine_error(line: str):
     """The text of an engine `basalt error: <text>` line, else None."""
     if line.startswith("basalt error: ") and line[14:].strip():
@@ -303,6 +311,8 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                     last = time.time()
                 elif (w := engine_warning(line)) is not None:
                     bars.say(f"[server] warning: {w}")
+                elif (r := engine_ram_floor(line)) is not None:
+                    bars.say(f"[server] RAM floor: {r}")
         if stop:
             bars.finish()
             return

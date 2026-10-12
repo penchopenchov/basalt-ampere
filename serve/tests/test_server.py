@@ -1677,6 +1677,24 @@ class LoadProgress(unittest.TestCase):
         self.assertTrue(lines[1].startswith("[server] loaded 0.0 GiB in "))
         self.assertTrue(lines[1].endswith("(cuda0 0.0 GiB, system ram 0.0 GiB; cuda1 copy 0.0 GiB)"))
 
+    def test_narrator_shows_the_ram_floor_line(self):
+        from serve.engine.progress import engine_ram_floor, narrate_start
+        text = "9.3 GiB (2.0 margin + 7.3 file cache): 20.0 GiB of experts are read from the SSD; the RAM copy takes at most 12.0 of 30.0 GiB available"
+        self.assertEqual(engine_ram_floor("basalt generate: RAM floor " + text), text)
+        self.assertIsNone(engine_ram_floor("basalt generate: RAM floor "))
+        self.assertIsNone(engine_ram_floor("basalt generate: session is up"))
+        d = tempfile.mkdtemp()
+        log = Path(d) / "engine.log"
+        log.write_text("basalt generate: RAM floor " + text + "\nbasalt generate: session is up (engine 1)\n", encoding="utf-8")
+        done, out = threading.Event(), io.StringIO()
+        with contextlib.redirect_stdout(out):
+            t = threading.Thread(target=narrate_start, args=(str(log), 0, done))
+            t.start()
+            time.sleep(0.6)
+            done.set()
+            t.join(5)
+        self.assertEqual(out.getvalue().splitlines()[0], "[server] RAM floor: " + text)
+
     def test_an_older_engine_without_a_total_counts_bytes(self):
         from serve.engine.progress import narrate_start
         d = tempfile.mkdtemp()
