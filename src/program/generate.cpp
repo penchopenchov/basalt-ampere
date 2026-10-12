@@ -4490,6 +4490,12 @@ int main(int argc, char** argv) {
                                                  (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
     uint64_t ram_floor_bytes = basalt::platform::ram_margin();   // the RAM the copy leaves free; the serve guard's floor
     if (o.resident_cpu_experts) {
+        // the RAM copy is sized from the available RAM: without a reading the experts would silently stay in the file
+        if (basalt::core::detail::HostMemory hm; !basalt::core::detail::host_available_memory(hm))
+            return fatal_start_error(
+                "cannot determine the available RAM (no MemAvailable in /proc/meminfo, or a malformed cgroup memory "
+                "limit or memory.stat), which the resident RAM mode (--resident-experts) sizes its copy of the "
+                "experts from");
         int64_t lend_from = -1;
         if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr && xcache.slots() > 0) {
             int64_t chunk = o.prefill_chunk;
