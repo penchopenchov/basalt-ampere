@@ -15,6 +15,10 @@ endif()
 
 option(BUILD_TESTING "Build the tests and parity programs" OFF)
 option(WERROR "Treat compiler warnings as errors" OFF)
+option(BASALT_PROFILE "Compile the in-kernel phase stamps (BASALT_STAMP_FILE) into the persistent kernels" OFF)
+if(BASALT_PROFILE)
+  add_compile_definitions(BASALT_PROFILE=1)
+endif()
 if(BUILD_TESTING)
   enable_testing()
 endif()
@@ -159,6 +163,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/dequant_bf16.cu
                         src/kernels/cuda/qsa_select.cu
                         src/kernels/cuda/verify_kernels.cu
+                        src/kernels/stamp_ring.cpp
                         src/kernels/cuda/dec_gdn_rec.cu
                         src/kernels/cuda/dense_tc.cu
                         src/kernels/cuda/iq_kernels.cu
