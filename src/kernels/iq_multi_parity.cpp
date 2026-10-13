@@ -64,10 +64,19 @@ const char* name_of(int t) {
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
+        case 40: return "NVFP4";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+// NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales in 0.5 .. 2
+void append_nvfp4_tail(std::vector<uint8_t>& b, std::mt19937& rng) {
+    std::uniform_real_distribution<float> u(0.5f, 2.0f);
+    const float t[4] = {u(rng), u(rng), u(rng), 0.0f};
+    const uint8_t* p = (const uint8_t*) t;
+    b.insert(b.end(), p, p + sizeof t);
+}
+
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -76,7 +85,10 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 3);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
-        if (t == 29) {
+        if (t == 40) {
+            // NVFP4: four UE4M3 sub-block scales, exponent 1..4: 2^-7 .. 2^-4 as ggml decodes them
+            for (int j = 0; j < 4; ++j) w[o + j] = (uint8_t) (((1 + byte(rng) % 4) << 3) | (byte(rng) & 7));
+        } else if (t == 29) {
             // IQ1_M: the fp16 scale is the top nibbles of the four scale words (bytes 48..55); nibble 3 carries the
             // sign and the exponent's top bits: 0x1 / 0x2 (or 0x9 / 0xA) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) == 0 ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
@@ -268,6 +280,7 @@ struct Grouped {
             auto b = random_rows(gu, 2 * FF, H, rng);
             const auto d = random_rows(dt, H, FF, rng);
             b.insert(b.end(), d.begin(), d.end());
+            if (gu == 40) append_nvfp4_tail(b, rng);
             if (b.size() != L.bytes) { std::fprintf(stderr, "blob size %zu != %zu\n", b.size(), L.bytes); std::exit(2); }
             uint8_t* db = dalloc<uint8_t>(b.size());
             ck(cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice), "blob");
@@ -405,10 +418,11 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dy);
     }
     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
-    for (int gu : {16, 17, 18, 21, 22, 29}) {
-        std::printf("%-8s/Q2_0 grouped, 16 groups of m entries:", name_of(gu));
+    for (int gu : {16, 17, 18, 21, 22, 29, 40}) {   // NVFP4 with its own down format
+        const int dt = gu == 40 ? 40 : 42;
+        std::printf("%-8s/%-5s grouped, 16 groups of m entries:", name_of(gu), name_of(dt));
         for (int m : {1, 2, 3, 4, 8}) {
-            Grouped G(gu, 42, 2560, 640, std::vector<int>(16, m), 8, rng);
+            Grouped G(gu, dt, 2560, 640, std::vector<int>(16, m), 8, rng);
             float us[2];
             for (int old = 1; old >= 0; --old)
                 us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
@@ -490,7 +504,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 40}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
@@ -498,6 +512,8 @@ int main(int argc, char** argv) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
+    check_grouped(40, 40, 2560, 640, s, rng);                               // NVFP4: its own pair, with the scale tail
+    check_grouped(40, 40, 1024, 512, s, rng);
     check_mmvq_mma(s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
