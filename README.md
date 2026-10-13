@@ -237,12 +237,12 @@ path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer
 
 | model | source | file | experts | PPL | KLD mean | same top-1 |
 |---|---|---:|---:|---:|---:|---:|
+| GSQ-RCO-Coder IQ1_M (256 experts) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) | 57.4 GiB | 23.4 GiB | | 1.03 | 69% |
 | GSQ-RCO Q2_0 | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 64.9 GiB | 31.6 GiB | 2.971 | 0.486 | 80.6% |
 | GSQ-RCO IQ3_XXS | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 74.4 GiB | 40.0 GiB | 2.535 | 0.277 | 86.8% |
-| GSQ-RCO IQ3_S | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 81.0 GiB | 46.8 GiB | 2.387 | 0.177 | 89.4% |
-| GSQ-RCO-Coder IQ1_M (256 experts) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) | 57.4 GiB | 23.4 GiB | | 1.03 | 69% |
 | UD-Q2_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 76.5 GiB | 42.9 GiB | 2.755 | 0.323 | 84.3% |
 | UD-IQ3_XXS | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 79.4 GiB | 45.3 GiB | 2.564 | 0.244 | 87.0% |
+| GSQ-RCO IQ3_S | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 81.0 GiB | 46.8 GiB | 2.387 | 0.177 | 89.4% |
 | UD-Q3_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 86.8 GiB | 52.0 GiB | 2.457 | 0.160 | 89.3% |
 | UD-Q4_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 106.7 GiB | 71.7 GiB | 2.321 | 0.068 | 93.0% |
 | Q8_0 | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 178.3 GiB | 119.5 GiB | 2.282 | reference | |
@@ -252,21 +252,6 @@ raises draft acceptance. Output is unchanged, because verify decides every token
 MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's raw bytes, checked against the
 source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`. The tuned layer ships with the
 packs, inside the model file; the converter input is only needed to build a pack yourself.
-
-### Coder pack (expert-pruned)
-
-[GSQ-RCO-Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) keeps 256 of the 512 routed
-experts (IQ1_M, about 3.5 bits per weight; two GGUF shards, 29.6 GB transformer and 28.8 GB n-gram) and targets code,
-agentic tool use, vision and spatial reasoning. Their card reports SWE-bench Verified 75.6 (BF16: 82.8) and
-LiveCodeBench v6 86.3 (87.4). `tools/convert` reads the expert count from the tensors, and the canonical 512-expert
-tuned MTP drafter attaches to it. The table row is general text (wikitext-2), where the pack is clearly worse by
-design. On code (20 chunks of C++, CUDA and Python source, perplexity against the Q8_0 pack) it is close: Q8_0 3.08,
-IQ3_S 3.06, Coder 3.22 (+4.7%).
-
-Speed (RTX 5090 + RTX 5060 Ti, 400 W, `--peer-exclusive`, resident experts, int8 KV): all experts fit on the GPUs,
-and decode runs at 303 tok/s on conversation, 240 on prose and 419 on structured output, with 16k prefill at 7,356
-tok/s. The native fused router covers only 512 experts, so a pruned pack takes the generic router, about a third of
-each decode step. A native router for it is not planned; Q2_0 is the pack for small setups.
 
 The model files are derived from Qwen3.8-Flash-Next and are distributed under the
 [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT
