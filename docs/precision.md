@@ -35,6 +35,7 @@ hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_
 | Tensor class | Format | Source |
 |---|---|---|
 | Routed experts | GGUF blocks copied byte for byte, no requantization. Gate and up share one type per layer; types are mixed across layers (IQ3_XXS pack: gate/up IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S; down Q2_0 on 30 layers, IQ4_NL on 18. IQ3_S pack: gate/up mostly IQ3_XXS, IQ3_S, IQ2_S, one IQ4_XS; down IQ4_NL on 39, Q2_0 on 9) | README.md (The `.basalt` model file); iq_kernels.cu:541-542; tests/data/native_experts/ |
+| Routed experts, NVFP4 format | NVFP4 (type 40): per 16 weights, 8 bytes of E2M1 codes and one UE4M3 scale; per expert a 16-byte FP32 tail {s_gate, s_up, s_down, 0}. 4.5 bits per weight, all 48 layers | native_experts.txt; iq_kernels.cu (nvfp4_scale_dev) |
 | Shared expert gate/up/down | GGUF blocks, any native_mmvq type | native_mmvq.hpp:55-58 |
 | Shared-expert scalar gate | BF16 | model_sections.py:48-51 |
 | QSA q/k/v/o, GDN qkv, z (attn_gate), ssm_out | GGUF blocks (dense_tc takes Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0; native_mmvq otherwise) | dense_tc.cu:1063-1075; dense_tc.hpp:2-12 |
@@ -105,7 +106,7 @@ Prefill and decode are different computations that read and write the same KV an
 | hc matrices | Activations rounded to BF16; down/up use the int8 copy dequantized to BF16; inject uses the BF16 tensor | prefill.cpp:1500-1506; gemm.cu:136-159 |
 | Router | BF16 activation (decode: fp32) | prefill.cpp:1631 |
 | Shared expert | fp16 activation, fp16 SwiGLU | prefill.cpp:1634-1637 |
-| Routed experts | Fused int8 mma kernels, llama.cpp MMQ (q8_1) or dequant-to-fp16 cuBLAS (IQ1_M only). The K-quants (Q4_K, Q5_K, Q5_1: UD-Q4_K_XL) run on MMQ with fp16 activation scales and per-32 partial sums taken from the rounded int8 values (llama.cpp sums the floats), so the product is exactly the dequantized weights times the rounded activations | moe_fused_iq.hpp:1-12; moe_mmq.hpp:1-6; mmq/quantize.cu:59-69 |
+| Routed experts | Fused int8 mma kernels, llama.cpp MMQ (q8_1) or dequant-to-fp16 cuBLAS (IQ1_M only); NVFP4 takes MMQ (see the Activations table). The K-quants (Q4_K, Q5_K, Q5_1: UD-Q4_K_XL) run on MMQ with fp16 activation scales and per-32 partial sums taken from the rounded int8 values (llama.cpp sums the floats), so the product is exactly the dequantized weights times the rounded activations | moe_fused_iq.hpp:1-12; moe_mmq.hpp:1-6; mmq/quantize.cu:59-69 |
 | Routed experts on the CPU (chunks below 1,024 tokens) | Non-resident experts with a host copy and at most 8 rows run on the CPU pool with ggml's dot products, as decode's RAM tier does: the activation in the weight type's `vec_dot` format (Q8_K per 256 values for the IQ types, not q8_1 per 32), H quantized to the down type's format. Their rows are written unweighted and the combine weights them like the GPU's. Which experts go is set per layer from the measured CPU and GPU cost per expert, so it can differ from run to run | prefill.cpp:1862-1900,1928-1985,2339-2352 |
 | Attention | fp16 mma with hi/lo split of q and p, fp32 accumulate | qsa_prompt_attn.hpp:1-22 |
 | Indexer scores | 3xTF32 tensor cores | qsa_select.hpp:36-38 |
