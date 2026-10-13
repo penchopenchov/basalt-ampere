@@ -3,7 +3,7 @@
 //     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
 //     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
-//     build/native_expert_parity --synthetic nvfp4/nvfp4      NVFP4 (CPU tier only until its GPU kernels land)
+//     build/native_expert_parity --synthetic nvfp4/nvfp4      NVFP4: the CPU tier and the GPU's generic kernels
 //     build/native_expert_parity --experts FILE [layer ...]   NVFP4 experts of a pack's experts.bin or a .basalt
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
@@ -432,8 +432,13 @@ std::vector<uint8_t> synthetic_nvfp4_blob(const cpu::NativeFmt& f, int seed) {
 // NVFP4 on the CPU tier: (1) the AVX2 and AVX-512 vec_dot against the plain-C one on the expert's own rows and Q8_0
 // activations (the same integer sums: float order only); (2) the CPU expert (native_gu_rows / native_down_rows, the
 // tail's scales applied) against a double-precision expert on ggml's to_float weights with s_gate/s_up before SwiGLU
-// and s_down on the output; (3) a single-thread microbench line.
-int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label) {
+// and s_down on the output; (3) a single-thread microbench line; (4) the GPU (gpu_nvfp4).
+int gpu_nvfp4(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const std::vector<float>& x,
+              const std::vector<float>& G, const std::vector<float>& U, const std::vector<float>& D, const float* sc,
+              const std::vector<float>& ref, const std::vector<float>& got_c, cudaStream_t s);
+
+int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
+                    cudaStream_t s) {
     int failures = 0;
     float sc[4];
     std::memcpy(sc, blob.data() + f.bytes - f.tail, sizeof sc);
@@ -550,7 +555,160 @@ int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, i
                 label.c_str(), f.bytes, sc[0], sc[1], sc[2], e, eq, ok ? "ok" : "FAIL");
     std::printf("          bench: cpu expert 1 token 1 thread %.0f us (%.2f GB/s of weights)\n", us,
                 (double) f.bytes / us * 1e-3);
+    failures += gpu_nvfp4(f, blob, x, G, U, D, sc, ref, got, s);
     return failures + (ok ? 0 : 1);
+}
+
+// NVFP4 on the GPU's generic grouped kernels (native_expert_grouped: Fmt<40> dp4a dot, the tail's scales applied in
+// the gate/up and down kernels).  Checks, on one group of NT entries:
+//  - gate, up (scaled, read back from the scratch) and the output against a double-precision expert on the GPU's
+//    OWN q8_1 activations (x and h as the kernels rounded them, from the scratch): the same integer sums, so only
+//    float order and the fp32 products are left -> rel < 1e-5 (measured ~1e-7);
+//  - the output against the double expert on the unrounded x (rel < 3e-2, as every format: the q8_1 rounding of x
+//    and h) and against the CPU tier (printed; the two round their activations differently, q8_0 vs q8_1);
+//  - the dequantizers against ggml's to_float: fp32 bit for bit (E2M1 x UE4M3 is exact in fp32), and the scaled fp16
+//    gate/up/down of the prompt fallback equal to fp16(to_float * s) in every value;
+//  - a microbench line: one token, the blob L2-resident.
+int gpu_nvfp4(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const std::vector<float>& x,
+              const std::vector<float>& G, const std::vector<float>& U, const std::vector<float>& D, const float* sc,
+              const std::vector<float>& ref, const std::vector<float>& got_c, cudaStream_t s) {
+    namespace K = basalt::kernels;
+    int failures = 0;
+    if (!K::native_expert_supported(f.gu_type, f.d_type, H, FF)) {
+        std::printf("          gpu: NVFP4 is not a pair the GPU expert kernels take  FAIL\n");
+        return 1;
+    }
+    const auto L = K::native_expert_layout(f.gu_type, f.d_type, H, FF);
+    if (L.bytes != f.bytes || L.up_off != f.up_off || L.down_off != f.down_off) {
+        std::printf("          gpu layout %zu B differs from the CPU's %zu B  FAIL\n", L.bytes, f.bytes);
+        return 1;
+    }
+    const size_t scr_bytes = K::native_expert_scratch_bytes(NT, FF);
+    uint8_t *dblob, *dxq, *dscr;
+    float *dx, *dout;
+    unsigned long long* dptr;
+    int32_t *dstart, *dn, *didx;
+    cudaMalloc((void**) &dblob, blob.size());
+    cudaMalloc((void**) &dx, x.size() * 4);
+    cudaMalloc((void**) &dxq, (size_t) NT * H / 32 * 36);
+    cudaMalloc((void**) &dscr, scr_bytes);
+    cudaMalloc((void**) &dout, (size_t) NT * H * 4);
+    cudaMalloc((void**) &dptr, 8);
+    cudaMalloc((void**) &dstart, 8);
+    cudaMalloc((void**) &dn, 4);
+    cudaMalloc((void**) &didx, NT * 4);
+    cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+    const unsigned long long p = (unsigned long long) dblob;
+    const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
+    cudaMemcpy(dptr, &p, 8, cudaMemcpyHostToDevice);
+    cudaMemcpy(dstart, st, 8, cudaMemcpyHostToDevice);
+    cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(didx, idx, NT * 4, cudaMemcpyHostToDevice);
+    cudaMemset(dscr, 0, scr_bytes);
+    K::quantize_q8_1_rows(dx, NT, H, dxq, s);
+    K::native_expert_grouped(L, dptr, dstart, dn, didx, didx, 1, NT, dxq, dscr, dout, s);
+    cudaStreamSynchronize(s);
+    std::vector<float> got((size_t) NT * H), gate((size_t) NT * FF), up((size_t) NT * FF);
+    std::vector<uint8_t> xq((size_t) NT * H / 32 * 36), hq((size_t) NT * FF / 32 * 36);
+    // the scratch: gate, up, h (fp32, cap x n_ff each, 256-aligned), then h as q8_1
+    const size_t fa = (((size_t) NT * FF * 4) + 255) & ~(size_t) 255;
+    cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(gate.data(), dscr, gate.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(up.data(), dscr + fa, up.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hq.data(), dscr + 3 * fa, hq.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(xq.data(), dxq, xq.size(), cudaMemcpyDeviceToHost);
+    const cudaError_t ce = cudaGetLastError();
+    // q8_1 blocks: {half d, half s} then 32 int8
+    auto deq8_1 = [](const uint8_t* b, int64_t n, std::vector<double>& o) {
+        o.resize((size_t) n);
+        for (int64_t i = 0; i < n; ++i) {
+            const uint8_t* blk = b + (i / 32) * 36;
+            uint16_t dh;
+            std::memcpy(&dh, blk, 2);
+            o[(size_t) i] = (double) ggml_fp16_to_fp32(dh) * (double) (int8_t) blk[4 + i % 32];
+        }
+    };
+    std::vector<float> rg((size_t) NT * FF), ru((size_t) NT * FF), ro((size_t) NT * H);
+    for (int k = 0; k < NT; ++k) {
+        std::vector<double> xd, hd;
+        deq8_1(xq.data() + (size_t) k * H / 32 * 36, H, xd);
+        deq8_1(hq.data() + (size_t) k * FF / 32 * 36, FF, hd);
+        for (int64_t r = 0; r < FF; ++r) {
+            double g = 0, u = 0;
+            for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * xd[i]; u += (double) U[r * H + i] * xd[i]; }
+            rg[k * FF + r] = (float) (g * sc[0]);
+            ru[k * FF + r] = (float) (u * sc[1]);
+        }
+        for (int64_t r = 0; r < H; ++r) {
+            double o = 0;
+            for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * hd[i];
+            ro[k * H + r] = (float) (o * sc[2]);
+        }
+    }
+    const double eg = rel(gate, rg), eu = rel(up, ru), eo = rel(got, ro), e = rel(got, ref), ecg = rel(got, got_c);
+    const bool ok = ce == cudaSuccess && eg < 1e-5 && eu < 1e-5 && eo < 1e-5 && e < 3e-2 && std::isfinite(e);
+    std::printf("          gpu: gate %.2e up %.2e down %.2e vs double on its own q8_1 x/h; vs double ref %.2e; "
+                "cpu-gpu %.2e  %s\n", eg, eu, eo, e, ecg, ok ? "ok" : "FAIL");
+    if (!ok) ++failures;
+    {   // the dequantizers: fp32 unscaled vs to_float bitwise; fp16 scaled (the prompt fallback) vs fp16(to_float * s)
+        float* dq = nullptr;
+        uint16_t* dh = nullptr;
+        cudaMalloc((void**) &dq, (size_t) FF * H * 4);
+        cudaMalloc((void**) &dh, (size_t) 2 * FF * H * 2);
+        std::vector<float> got_dq((size_t) FF * H);
+        std::vector<uint16_t> got_h((size_t) 2 * FF * H);
+        const float* dtail = (const float*) (dblob + f.bytes - f.tail);
+        size_t differ = 0, h_differ = 0;
+        const struct { const uint8_t* src; const std::vector<float>* want; } mats[3] = {
+            {dblob, &G}, {dblob + f.up_off, &U}, {dblob + f.down_off, &D}};
+        for (const auto& m : mats) {
+            K::iq_dequant_f32(GGML_TYPE_NVFP4, m.src, FF * H, dq, s);
+            cudaStreamSynchronize(s);
+            cudaMemcpy(got_dq.data(), dq, got_dq.size() * 4, cudaMemcpyDeviceToHost);
+            for (size_t i = 0; i < got_dq.size(); ++i) differ += std::memcmp(&got_dq[i], &(*m.want)[i], 4) != 0;
+        }
+        K::iq_dequant_gu_f16(GGML_TYPE_NVFP4, dblob, dblob + f.up_off, FF, H, dh, s, dtail);
+        cudaStreamSynchronize(s);
+        cudaMemcpy(got_h.data(), dh, got_h.size() * 2, cudaMemcpyDeviceToHost);
+        for (int64_t r = 0; r < FF; ++r)
+            for (int64_t c = 0; c < H; ++c) {
+                h_differ += got_h[(size_t) (2 * r) * H + c] != ggml_fp32_to_fp16(G[r * H + c] * sc[0]);
+                h_differ += got_h[(size_t) (2 * r + 1) * H + c] != ggml_fp32_to_fp16(U[r * H + c] * sc[1]);
+            }
+        K::iq_dequant_f16(GGML_TYPE_NVFP4, dblob + f.down_off, FF * H, dh, s, dtail + 2);
+        cudaStreamSynchronize(s);
+        cudaMemcpy(got_h.data(), dh, (size_t) FF * H * 2, cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < (size_t) FF * H; ++i) h_differ += got_h[i] != ggml_fp32_to_fp16(D[i] * sc[2]);
+        cudaFree(dq); cudaFree(dh);
+        std::printf("          gpu dequant: fp32 vs to_float %zu of %lld differ in any bit; scaled fp16 (prompt "
+                    "fallback) vs fp16(to_float * s): %zu differ  %s\n", differ, (long long) (3 * FF * H), h_differ,
+                    differ || h_differ ? "FAIL" : "ok");
+        if (differ || h_differ) ++failures;
+    }
+    {   // microbench: one entry, one group, the blob L2-resident (repeated launches); the generic per-entry kernels
+        const int32_t st1[2] = {0, 1};
+        cudaMemcpy(dstart, st1, 8, cudaMemcpyHostToDevice);
+        cudaEvent_t a, b;
+        cudaEventCreate(&a);
+        cudaEventCreate(&b);
+        for (int i = 0; i < 20; ++i) K::native_expert_grouped(L, dptr, dstart, dn, didx, didx, 1, 1, dxq, dscr, dout, s);
+        const int it = 200;
+        cudaEventRecord(a, s);
+        for (int i = 0; i < it; ++i) K::native_expert_grouped(L, dptr, dstart, dn, didx, didx, 1, 1, dxq, dscr, dout, s);
+        cudaEventRecord(b, s);
+        cudaEventSynchronize(b);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, a, b);
+        const double us = 1e3 * ms / it;
+        std::printf("          bench: gpu expert (native_expert_grouped, 1 entry) %.1f us (%.0f GB/s of weights)\n", us,
+                    (double) f.bytes / us * 1e-3);
+        cudaEventDestroy(a);
+        cudaEventDestroy(b);
+    }
+    cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
+    cudaFree(dstart); cudaFree(dn); cudaFree(didx);
+    return failures;
 }
 
 // Expert `e` of `layer` from an NVFP4 pack: a native experts.bin (its native_experts.txt beside it) or a .basalt
@@ -831,7 +989,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     int failures = 0;
-    cudaStream_t s = nullptr;   // created only for the GPU checks: the NVFP4 CPU checks touch no GPU
+    cudaStream_t s = nullptr;   // created on first use
     auto gpu = [&]() {
         if (s == nullptr) cudaStreamCreate(&s);
         return s;
@@ -854,7 +1012,7 @@ int main(int argc, char** argv) {
             cpu::NativeFmt f;
             std::string err;
             if (gu == GGML_TYPE_NVFP4 && dn == GGML_TYPE_NVFP4 && cpu::native_fmt(gu, dn, H, FF, f, err)) {
-                failures += check_nvfp4_cpu(f, synthetic_nvfp4_blob(f, i), i, "synthetic");
+                failures += check_nvfp4_cpu(f, synthetic_nvfp4_blob(f, i), i, "synthetic", gpu());
                 continue;
             }
             if (gu < 0 || dn < 0 || !cpu::native_fmt(gu, dn, H, FF, f, err) ||
@@ -883,7 +1041,7 @@ int main(int argc, char** argv) {
                 ++failures;
                 continue;
             }
-            failures += check_nvfp4_cpu(f, blob, l, "layer " + std::to_string(l));
+            failures += check_nvfp4_cpu(f, blob, l, "layer " + std::to_string(l), gpu());
         }
     } else {
         const basalt::GgufModel model(basalt::gguf_split_paths(argv[1]));
