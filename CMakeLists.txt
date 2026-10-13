@@ -653,7 +653,7 @@ if(BUILD_TESTING)
 endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
 target_include_directories(kernels_cpu PUBLIC include)
 # only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -765,6 +765,9 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(cpu_quota_test src/kernels/cpu/cpu_quota_test.cpp)
+  target_link_libraries(cpu_quota_test PRIVATE kernels_cpu)
+  add_test(NAME cpu_quota_test COMMAND cpu_quota_test)
   add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_linux_test.cpp)
   target_link_libraries(pool_affinity_test PRIVATE kernels_cpu)
   add_test(NAME pool_affinity_test COMMAND pool_affinity_test)

@@ -127,6 +127,8 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    /// The cgroup CPU quota, in CPUs, that capped the default worker count; 0 when it did not.
+    double quota_limit() const { return quota_limit_; }
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
@@ -199,6 +201,7 @@ private:
     void publish();
 
     int n_ = 0;
+    double quota_limit_ = 0.0;
     bool host_works_ = true;
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;

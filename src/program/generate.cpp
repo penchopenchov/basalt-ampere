@@ -809,7 +809,8 @@ void usage() {
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
                  "  --pool-workers N     CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on (with --pool-affinity auto or\n"
-                 "                       p-cores on a hybrid CPU: P-cores minus 1).  \n"
+                 "                       p-cores on a hybrid CPU: P-cores minus 1), lowered so the workers and the\n"
+                 "                       host thread fit a cgroup CPU quota (container CPU limit).\n"
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
                  "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
@@ -3862,7 +3863,9 @@ int main(int argc, char** argv) {
     basalt::core::HitFn hit_fn =
         (o.no_pool || o.expert_cache <= 0) ? nullptr : &basalt::core::expert_hit_run;
     void* pool_user = o.no_pool ? nullptr : (void*) &drive;
-    std::fprintf(stderr, "basalt generate: %d expert-pool workers%s%s\n", pool.workers(),
+    char quota_note[64] = "";
+    if (pool.quota_limit() > 0) std::snprintf(quota_note, sizeof quota_note, " (quota %.2f CPUs)", pool.quota_limit());
+    std::fprintf(stderr, "basalt generate: %d expert-pool workers%s%s%s\n", pool.workers(), quota_note,
                  pool.host_works() ? " + the host thread" : "",
                  o.no_pool ? " (UNUSED: --no-pool)" : "");
 
