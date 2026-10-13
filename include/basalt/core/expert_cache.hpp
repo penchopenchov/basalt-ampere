@@ -95,6 +95,12 @@ public:
     /// prompt path's loan all hold addresses into it).  0 (the default): one cudaMalloc.  The slots past `slots()`
     /// after a shrink must hold no resident expert and no loan: the CALLER evicts them first (they become CPU misses).
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
+    /// **THE ELASTIC TAIL.**  With `tail_bytes` set before `open`/`open_sized` (and no segment size), the arena is
+    /// segmented too: large segments up to the last `tail_bytes`, then segments of the driver's granularity, so the
+    /// tail can be lent to the elastic KV pools one granule at a time (`shrink`/`grow`, same rules as above).
+    void set_elastic_tail(int64_t tail_bytes) { tail_req_ = tail_bytes > 0 ? tail_bytes : 0; }
+    /// The bytes of the granule-sized tail (0 when there is none).
+    int64_t elastic_bytes() const;
     bool segmented() const { return !segs_.empty(); }
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
@@ -186,6 +192,9 @@ private:
     uint64_t reserved_ = 0;   // the reserved address range's size
     std::vector<unsigned long long> segs_;   // each segment's physical handle (0: unmapped)
     std::vector<int64_t> seg_size_;   // each segment's size (the last one may be shorter)
+    std::vector<int64_t> seg_off_;    // each segment's offset in the arena
+    int64_t tail_req_ = 0;   // the elastic tail asked for (0: none)
+    int64_t head_end_ = 0;   // where the granule-sized tail segments start
     int64_t mapped_segs_ = 0;   // segments [0, mapped_segs_) are backed
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;

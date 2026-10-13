@@ -90,6 +90,24 @@ int main() {
         c.close();
         if (c.valid() || c.slots() != 0) return fail("close");
     }
+    // the elastic tail: large head segments, granule-sized ones over the last bytes; a shrink by whole granules
+    {
+        basalt::core::ExpertCache c;
+        std::string err;
+        constexpr int64_t kTail = 20ll << 20;
+        c.set_elastic_tail(kTail);
+        if (!c.open(kSlots, 4, 64, kBlob, err)) return fail("tail open", err);
+        if (!c.segmented() || c.elastic_bytes() < kTail - (2ll << 20) || c.elastic_bytes() > kTail)
+            return fail("tail size");
+        uint8_t* const first = c.device_slot(0);
+        if (!fill(c, 0, kSlots, kBlob)) return fail("tail fill");
+        const int64_t keep = c.full_bytes() - c.elastic_bytes() / 2;
+        if (!c.shrink(keep, err) || c.mapped_bytes() > keep + (2ll << 20) || c.mapped_bytes() < keep)
+            return fail("tail shrink", err);
+        if (c.slots() != c.slots_within(c.mapped_bytes()) || !check(c, c.slots(), kBlob)) return fail("tail kept");
+        if (!c.grow(c.full_bytes(), err) || c.slots() != kSlots || c.device_slot(0) != first) return fail("tail grow", err);
+        if (!check(c, keep / kBlob, kBlob)) return fail("tail head after grow");
+    }
     // the default (no segment size): one allocation, shrink refused
     basalt::core::ExpertCache d;
     std::string err;
