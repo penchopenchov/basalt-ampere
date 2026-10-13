@@ -437,6 +437,92 @@ int gpu_nvfp4(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const s
               const std::vector<float>& G, const std::vector<float>& U, const std::vector<float>& D, const float* sc,
               const std::vector<float>& ref, const std::vector<float>& got_c, cudaStream_t s);
 
+// NVFP4 multi-token AVX-512 kernel against the single-token ggml dot this CPU would otherwise run (gate/up with s_gate,
+// s_up and SwiGLU, down with s_down): bitwise equal for every token count 1..9 (9 crosses the 8-token pass) and for
+// a row range that splits a down row pair; then a single-thread microbench, ggml dot vs the kernel, 1/2/4/8 tokens.
+int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed) {
+    if (!cpu::cpu_avx512_ok()) { std::printf("          nvfp4 multi-token: no AVX-512 on this CPU\n"); return 0; }
+    constexpr int MT = 9;
+    float sc[4];
+    std::memcpy(sc, blob.data() + f.bytes - f.tail, sizeof sc);
+    const ggml_vec_dot_t dot = ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4)->vec_dot;
+    std::mt19937 rng(23 + seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<std::vector<uint8_t>> act(MT, std::vector<uint8_t>(f.act_bytes)), hq(MT, std::vector<uint8_t>(f.h_bytes));
+    std::vector<float> x(H), h(FF);
+    const void* a[MT];
+    const void* hp[MT];
+    for (int t = 0; t < MT; ++t) {
+        for (auto& v : x) v = nd(rng) * (t == 4 ? 30.f : 1.f);
+        for (auto& v : h) v = 0.05f * nd(rng);
+        cpu::native_quant_act(f, x.data(), act[t].data());
+        cpu::native_quant_h(f, h.data(), hq[t].data());
+        a[t] = act[t].data();
+        hp[t] = hq[t].data();
+    }
+    // the old path: one ggml dot per row and token
+    auto old_gu = [&](int nt, float* const* ff, int r0, int r1) {
+        for (int r = r0; r < r1; ++r)
+            for (int t = 0; t < nt; ++t) {
+                float g = 0.f, u = 0.f;
+                dot((int) H, &g, 0, blob.data() + r * f.gu_row, 0, a[t], 0, 1);
+                dot((int) H, &u, 0, blob.data() + f.up_off + r * f.gu_row, 0, a[t], 0, 1);
+                g *= sc[0];
+                u *= sc[1];
+                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            }
+    };
+    auto old_down = [&](int nt, float* const* out, int r0, int r1) {
+        for (int r = r0; r < r1; ++r)
+            for (int t = 0; t < nt; ++t) {
+                float v = 0.f;
+                dot((int) FF, &v, 0, blob.data() + f.down_off + r * f.d_row, 0, hp[t], 0, 1);
+                out[t][r] = v * sc[2];
+            }
+    };
+    std::vector<std::vector<float>> f0(MT, std::vector<float>(FF)), f1(MT, std::vector<float>(FF));
+    std::vector<std::vector<float>> o0(MT, std::vector<float>(H)), o1(MT, std::vector<float>(H));
+    float* pf0[MT]; float* pf1[MT]; float* po0[MT]; float* po1[MT];
+    for (int t = 0; t < MT; ++t) { pf0[t] = f0[t].data(); pf1[t] = f1[t].data(); po0[t] = o0[t].data(); po1[t] = o1[t].data(); }
+    size_t diff = 0, total = 0;
+    old_gu(MT, pf0, 0, (int) FF);
+    old_down(MT, po0, 0, (int) H);
+    for (int nt = 1; nt <= MT; ++nt) {
+        for (int t = 0; t < MT; ++t) { std::fill(f1[t].begin(), f1[t].end(), -1.f); std::fill(o1[t].begin(), o1[t].end(), -1.f); }
+        cpu::native_gu_rows(f, blob.data(), a, nt, pf1, 0, 7);   // two calls: a split row range
+        cpu::native_gu_rows(f, blob.data(), a, nt, pf1, 7, (int) FF);
+        cpu::native_down_rows(f, blob.data(), hp, nt, po1, 0, 5);
+        cpu::native_down_rows(f, blob.data(), hp, nt, po1, 5, (int) H);
+        for (int t = 0; t < nt; ++t) {
+            diff += std::memcmp(f0[t].data(), f1[t].data(), FF * 4) != 0;
+            diff += std::memcmp(o0[t].data(), o1[t].data(), H * 4) != 0;
+            total += 2;
+        }
+    }
+    std::printf("          nvfp4 multi-token vs ggml dot: %zu token-rowsets, %zu differ  %s\n", total, diff,
+                diff == 0 ? "bitwise ok" : "FAIL");
+    // microbench: one thread, the blob cache-resident across passes
+    const int it = 30;
+    std::string line = "          bench: nvfp4 expert 1 thread, us per expert (ggml dot / multi-token):";
+    for (int nt : {1, 2, 4, 8}) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it; ++i) { old_gu(nt, pf0, 0, (int) FF); old_down(nt, po0, 0, (int) H); }
+        const double us0 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it; ++i) {
+            cpu::native_gu_rows(f, blob.data(), a, nt, pf1, 0, (int) FF);
+            cpu::native_down_rows(f, blob.data(), hp, nt, po1, 0, (int) H);
+        }
+        const double us1 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+        char b[128];
+        std::snprintf(b, sizeof b, "  %dt %.0f/%.0f (x%.2f, %.1f GB/s)", nt, us0, us1, us0 / us1,
+                      (double) f.bytes / us1 * 1e-3);
+        line += b;
+    }
+    std::printf("%s\n", line.c_str());
+    return diff == 0 ? 0 : 1;
+}
+
 int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
                     cudaStream_t s) {
     int failures = 0;
@@ -555,6 +641,7 @@ int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, i
                 label.c_str(), f.bytes, sc[0], sc[1], sc[2], e, eq, ok ? "ok" : "FAIL");
     std::printf("          bench: cpu expert 1 token 1 thread %.0f us (%.2f GB/s of weights)\n", us,
                 (double) f.bytes / us * 1e-3);
+    failures += check_nvfp4_multi(f, blob, seed);
     failures += gpu_nvfp4(f, blob, x, G, U, D, sc, ref, got, s);
     return failures + (ok ? 0 : 1);
 }
