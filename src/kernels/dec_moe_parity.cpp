@@ -1,6 +1,7 @@
 // src/kernels/dec_moe_parity.cpp - DEC_MOE's kernels on real GGUF experts against the path they replace.
 //
 //     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]
+//     build/dec_moe_parity --nvfp4 [--bench]     (synthetic NVFP4 experts with their scale tail, no GGUF)
 //
 // Per layer (default: one of each gate/up + down format pair):
 //   peer math   the persistent kernel's work items (dec_moe_peer_math_test) vs native_expert_grouped, every card
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -71,6 +73,25 @@ size_t ndiff_rows(const std::vector<float>& a, const std::vector<float>& b, cons
     for (int r : rows)
         for (int64_t c = 0; c < H; ++c) d += std::memcmp(&a[(size_t) r * H + c], &b[(size_t) r * H + c], 4) != 0;
     return d;
+}
+
+// NX synthetic NVFP4 expert blobs: random nibbles, UE4M3 sub-block scales with exponent 1..4, then the FP32 tail
+// {s_gate, s_up, s_down, 0} in 0.5 .. 2
+std::vector<uint8_t> nvfp4_blobs(const K::NativeExpertLayout& L, int nx, std::mt19937& rng) {
+    std::vector<uint8_t> b((size_t) nx * L.bytes);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> u(0.5f, 2.0f);
+    constexpr size_t bs = 36;   // block_nvfp4: 4 scale bytes, 32 nibble bytes
+    for (int x = 0; x < nx; ++x) {
+        uint8_t* p = b.data() + (size_t) x * L.bytes;
+        const size_t q = L.bytes - 16;
+        for (size_t i = 0; i < q; ++i) p[i] = (uint8_t) byte(rng);
+        for (size_t o = 0; o < q; o += bs)
+            for (int j = 0; j < 4; ++j) p[o + j] = (uint8_t) (((1 + byte(rng) % 4) << 3) | (byte(rng) & 7));
+        const float t[4] = {u(rng), u(rng), u(rng), 0.0f};
+        std::memcpy(p + q, t, sizeof t);
+    }
+    return b;
 }
 
 struct Groups {   // a grouped call's lists on one device
@@ -406,7 +427,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
         std::fprintf(stderr, "usage: dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N [--stress-dup] [--stress-torn] "
-                     "[--stress-seed N]]\n");
+                     "[--stress-seed N]]\n       dec_moe_parity --nvfp4 [--bench]\n");
         return 2;
     }
     bool bench = false;
@@ -424,7 +445,9 @@ int main(int argc, char** argv) {
         std::string t;
         while (std::getline(ss, t, ',')) layers.push_back(std::atoi(t.c_str()));
     }
-    basalt::GgufFile gguf(argv[1]);
+    const bool nvfp4 = std::strcmp(argv[1], "--nvfp4") == 0;
+    std::unique_ptr<basalt::GgufFile> gguf_p;
+    if (!nvfp4) gguf_p = std::make_unique<basalt::GgufFile>(argv[1]);
     int ndev = 0;
     ck(cudaGetDeviceCount(&ndev), "device count");
     const bool two = ndev >= 2;
@@ -432,7 +455,9 @@ int main(int argc, char** argv) {
     // the layers' formats; by default the first layer of each pair
     std::vector<std::pair<int, int>> fmt(64, {-1, -1});
     std::vector<int> auto_layers;
-    for (int l = 0; l < 64; ++l) {
+    if (nvfp4) { fmt[0] = {40, 40}; auto_layers.push_back(0); layers.clear(); stress_n = 0; }
+    for (int l = 0; !nvfp4 && l < 64; ++l) {
+        const basalt::GgufFile& gguf = *gguf_p;
         const auto* g = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
         const auto* d = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
         if (!g || !d) continue;
@@ -444,7 +469,7 @@ int main(int argc, char** argv) {
     if (layers.empty()) layers = auto_layers;
     if (stress_n > 0) {   // the first listed layer only
         if (!two || fmt[layers[0]].first < 0) { std::fprintf(stderr, "--stress: two cards and a layer with experts\n"); return 2; }
-        stress(gguf, layers[0], fmt[layers[0]].first, fmt[layers[0]].second, stress_n, stress_dup, stress_torn, stress_seed);
+        stress(*gguf_p, layers[0], fmt[layers[0]].first, fmt[layers[0]].second, stress_n, stress_dup, stress_torn, stress_seed);
         std::printf("dec_moe_parity --stress: %s\n", g_fail ? "FAILED" : "no hang, bitwise equal");
         return g_fail ? 1 : 0;
     }
@@ -467,13 +492,14 @@ int main(int argc, char** argv) {
         std::printf("layer %d: gate/up type %d, down type %d, %.2f MB per expert, formats %s\n", l, gt, dt,
                     L.bytes / 1e6, K::dec_moe_formats_ok(gt, dt, H, FF) ? "covered" : "NOT COVERED");
         if (!K::dec_moe_formats_ok(gt, dt, H, FF)) { ++g_fail; continue; }
-        const auto* tg = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
-        const auto* tu = gguf.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
-        const auto* td = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
         // NX distinct experts' blobs; expert id e uses blob e % NX
         constexpr int NX = 48;
-        std::vector<uint8_t> blobs((size_t) NX * L.bytes);
-        for (int x = 0; x < NX; ++x) {
+        std::vector<uint8_t> blobs = nvfp4 ? nvfp4_blobs(L, NX, rng) : std::vector<uint8_t>((size_t) NX * L.bytes);
+        for (int x = 0; !nvfp4 && x < NX; ++x) {
+            const basalt::GgufFile& gguf = *gguf_p;
+            const auto* tg = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
+            const auto* tu = gguf.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
+            const auto* td = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
             const size_t E = (size_t) ((x * 37 + 5) % NE);
             uint8_t* b = blobs.data() + (size_t) x * L.bytes;
             std::memcpy(b, gguf.tensor_data(*tg) + E * L.up_off, L.up_off);
