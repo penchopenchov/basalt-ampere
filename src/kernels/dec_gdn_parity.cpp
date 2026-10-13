@@ -514,6 +514,7 @@ bool parity_seg(cudaStream_t s) {
                 int32_t* nk;
                 CK(cudaMalloc(&nk, 4));
                 CK(cudaMemcpy(nk, &keep[k], 4, cudaMemcpyHostToDevice));
+                CK(cudaDeviceSynchronize());   // the stream is non-blocking: a small pageable copy can return before it lands
                 GdnCommitLayers a;
                 a.state = sref[k]; a.h = d_hL + (size_t) row0[k] * C; a.qkv = d_qL + (size_t) row0[k] * C;
                 a.gate = d_gL + (size_t) row0[k] * HV; a.beta = d_bL + (size_t) row0[k] * HV;
@@ -588,6 +589,7 @@ bool parity_ple_hist(cudaStream_t s) {
             rows[(size_t) t] = e;
         }
         CK(cudaMemcpy(d_rows, rows.data(), (size_t) S * sizeof(SegRow), cudaMemcpyHostToDevice));
+        CK(cudaDeviceSynchronize());   // the stream is non-blocking: pageable copies are not ordered before its kernels
         ple_hist_gather(d_work, d_tab, d_rows, n, S, s);
         CK(cudaStreamSynchronize(s));
         std::vector<float> got(hw.size());
@@ -596,6 +598,7 @@ bool parity_ple_hist(cudaStream_t s) {
             for (int64_t i = 0; i < n; ++i)
                 if (got[(size_t) t * n + i] != hs[(size_t) rows[(size_t) t].slot * n + i]) ok = false;
         CK(cudaMemcpy(d_work, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaDeviceSynchronize());
         ple_hist_scatter(d_tab, d_work, d_rows, n, S, s);
         CK(cudaStreamSynchronize(s));
         std::vector<float> after(hs.size());
