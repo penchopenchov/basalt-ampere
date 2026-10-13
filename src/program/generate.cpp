@@ -3215,6 +3215,12 @@ int main(int argc, char** argv) {
         // a server allocates its verify windows after the cache is sized: they come out of the reserve too, so the
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;
+        // the deferred checkpoint copy's spare device buffer is allocated after the cache, so it comes out of the reserve
+        if (o.serve && o.prompt_cache > 0 && !multi_gpu) {
+            basalt::core::ConversationStateSizes zc;
+            std::string ce;
+            if (basalt::core::conversation_state_sizes(g, zc, ce)) late_b += (int64_t) zc.gdn;
+        }
         const int64_t base_b = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + late_b;
         // the RAM copy of the experts the cache does not hold is page-locked and mapped, which takes device memory per
         // GiB mapped: a 1 GiB probe gives the rate, applied to the experts that stay out of the cache
@@ -5103,6 +5109,33 @@ int main(int argc, char** argv) {
         bool live_ok = false;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+        // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
+        // is declared after `checks` so it is destroyed, and its copy finished, before the checkpoints are.
+        basalt::core::ConversationCheckpointDeferral ckd;
+        {
+            ConvCheckpoint warm;   // one set of pooled blocks, page-faulted now instead of on the first request
+            const ConvStateSizes zw = conv_state_sizes(g, ss);
+            if (o.prompt_cache > 0) {
+                warm.gdn.resize(zw.gdn);
+                std::memset(warm.gdn.data(), 0, warm.gdn.size());
+                if (ss.ple_hist) { warm.ple.resize(zw.ple); std::memset(warm.ple.data(), 0, warm.ple.size()); }
+            }
+            if (o.prompt_cache > 0 && !multi_gpu) {
+                std::string ce;
+                if (!ckd.reserve(zw.gdn, ce))
+                    std::fprintf(stderr, "basalt serve: deferred checkpoint copy off: %s\n", ce.c_str());
+            }
+        }
+        // finishes the in-flight host copy; a failed one drops its checkpoint
+        auto ckd_finish = [&]() {
+            const void* dst = ckd.pending();
+            if (dst == nullptr) return;
+            std::string ce;
+            if (ckd.finish(ce)) return;
+            std::fprintf(stderr, "basalt serve: %s\n", ce.c_str());
+            checks.erase(std::remove_if(checks.begin(), checks.end(),
+                                        [&](const ConvCheckpoint& k) { return k.gdn.data() == dst; }), checks.end());
+        };
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // the session the request path reads, parks and restores: the solo one, or (a --batch request for a slot other
         // than 0) a view of it carrying that slot's state, so the prompt is read in the slot itself
@@ -5115,6 +5148,7 @@ int main(int argc, char** argv) {
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current = [&](size_t held) -> bool {
+            ckd_finish();
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold nothing
             // the outgoing chain does not, apart from the tail this conversation rewrote)
@@ -5263,8 +5297,9 @@ int main(int argc, char** argv) {
                        ") - a GPU hang";
             return false;
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr) -> bool {
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false) -> bool {
             ckpt_why.clear();
+            ckd_finish();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
@@ -5280,7 +5315,11 @@ int main(int argc, char** argv) {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, *rsp, g)) return false;
+                if (!gpu_sync_ok()) return false;
+                std::string ce;
+                if (defer && stages.empty()) {
+                    if (!ckd.save(c, *rsp, g, ce)) { std::fprintf(stderr, "basalt serve: checkpoint save: %s\n", ce.c_str()); return false; }
+                } else if (!checkpoint_save(c, *rsp, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const basalt::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
@@ -5297,6 +5336,7 @@ int main(int argc, char** argv) {
                 for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
                 const size_t victim = basalt::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
                                                                                    o.prompt_cache);
+                if (checks[victim].gdn.data() == ckd.pending()) ckd_finish();
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
@@ -7334,6 +7374,7 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
+            ckd_finish();
             if (want_cvec != cvec_cached) {
                 live_ok = false;
                 checks.clear();
@@ -7936,7 +7977,7 @@ int main(int argc, char** argv) {
                 }
                 at = to;
                 ov_post = nullptr;
-                if ((to == turn_at || to == root_at) && !ov_post_done && !checkpoint_at(to)) {
+                if ((to == turn_at || to == root_at) && !ov_post_done && !checkpoint_at(to, nullptr, !in_slot && !batch_on())) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
@@ -8392,6 +8433,7 @@ int main(int argc, char** argv) {
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0;
             }
+            ckd_finish();
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
             const int64_t req_offload = drive.d.offload_entries - offload0;

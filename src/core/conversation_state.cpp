@@ -169,6 +169,70 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     return true;
 }
 
+ConversationCheckpointDeferral::~ConversationCheckpointDeferral() {
+    if (worker_.joinable()) worker_.join();
+    if (stream_) cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
+    if (spare_) cudaFree(spare_);
+}
+
+bool ConversationCheckpointDeferral::reserve(size_t bytes, std::string& error) {
+    if (spare_ || !bytes) return true;
+    cudaStream_t s = nullptr;
+    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+        cudaGetLastError();
+        return fail(error, "cannot create the deferred checkpoint stream");
+    }
+    if (cudaMalloc(&spare_, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        spare_ = nullptr;
+        cudaStreamDestroy(s);
+        return fail(error, "cannot allocate the deferred checkpoint buffer");
+    }
+    stream_ = s;
+    cap_ = bytes;
+    return true;
+}
+
+bool ConversationCheckpointDeferral::save(ConversationCheckpoint& c, const SessionState& ss,
+                                          const ModelGeometry& g, std::string& error) {
+    if (dst_ && !finish(error)) return false;
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
+    if (!spare_ || z.gdn > cap_ || !z.gdn) return conversation_checkpoint_save(c, ss, g, error);
+    const size_t layers = owned_qsa(ss);
+    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
+    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    if (!copy(spare_, ss.gdn_state, z.gdn, error) ||
+        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    for (size_t j = 0; j < layers; ++j) {
+        const auto& st = owned(ss, j);
+        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
+            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
+            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+    }
+    int dev = 0;
+    cudaGetDevice(&dev);
+    dst_ = c.gdn.data();
+    status_ = cudaSuccess;
+    worker_ = std::thread([this, dev, n = z.gdn] {
+        cudaSetDevice(dev);
+        auto s = static_cast<cudaStream_t>(stream_);
+        int st = cudaMemcpyAsync(const_cast<void*>(dst_), spare_, n, cudaMemcpyDeviceToHost, s);
+        if (st == cudaSuccess) st = cudaStreamSynchronize(s);
+        status_ = st;
+    });
+    return true;
+}
+
+bool ConversationCheckpointDeferral::finish(std::string& error) {
+    if (worker_.joinable()) worker_.join();
+    dst_ = nullptr;
+    if (status_ == cudaSuccess) return true;
+    error = std::string("conversation checkpoint deferred copy: ") + cudaGetErrorString((cudaError_t) status_);
+    status_ = cudaSuccess;
+    return false;
+}
+
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
