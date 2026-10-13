@@ -478,6 +478,34 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
     return d8_0 * d8_1 * ((float) sumi);
 }
 
+// NVFP4's UE4M3 sub-block scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0 and 0x7F as 0, bit 7
+// ignored), built from its bits: exact, and the same float as the CPU tier's nvfp4_scale.
+__device__ __forceinline__ float nvfp4_scale_dev(uint32_t x) {
+    const uint32_t v = x & 0x7F;
+    if (v == 0 || v == 0x7F) return 0.0f;
+    const uint32_t e = v >> 3, m = v & 7;
+    if (e == 0) return (float) m * (1.0f / 1024.0f);
+    return __uint_as_float(((e + 119) << 23) | (m << 20));
+}
+// NVFP4: one call per 16-value sub-block (iqs 0..3).  Sub-block s meets q8_1 block s/2, half s&1; its byte j holds
+// value j (low nibble) and value j + 8 (high nibble), so the low nibbles of a word meet activation word w and the
+// high ones word w + 2.  Integer sum per sub-block, scaled by d8 * d4 in float (the per-expert FP32 scale is applied
+// by the expert kernels).
+__device__ __forceinline__ float vec_dot_nvfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_nvfp4* b = (const block_nvfp4*) vbq + kbx;
+    const block_q8_1* y = bq8_1 + (iqs >> 1);
+    const int a0 = 4 * (iqs & 1);
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int2 v = get_int_from_table_16(get_int_b4(b->qs, 2 * iqs + i), kvalues_fp4);
+        sumi = ggml_cuda_dp4a(v.x, get_int_b4(y->qs, a0 + i), sumi);
+        sumi = ggml_cuda_dp4a(v.y, get_int_b4(y->qs, a0 + i + 2), sumi);
+    }
+    return __low2float(y->ds) * nvfp4_scale_dev(b->d[iqs]) * (float) sumi;
+}
+
 // Q6_K (vecdotq.cuh's vec_dot_q6_K_q8_1, VDR 1)
 __device__ __forceinline__ float vec_dot_q6_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {
@@ -535,12 +563,20 @@ template<> struct Fmt<6> { static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0,
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 4, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
+
+// NVFP4 experts end in a 16-byte tail {s_gate, s_up, s_down, 0}: the FP32 scale of each matrix, on its output.
+constexpr size_t kNvfp4Tail = 16;
+__device__ __forceinline__ const float* nvfp4_tail(const void* blob, const NativeExpertLayout& L) {
+    return (const float*) ((const uint8_t*) blob + L.bytes - kNvfp4Tail);
+}
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
-#define D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
-#define MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
+#define GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8) X(40)
+#define D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8) X(40)
+#define MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(40)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -1110,8 +1146,11 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        [[maybe_unused]] float sc = 1.0f;
+        if constexpr (TG == 40) sc = nvfp4_tail((const void*) grp_ptr[g], L)[is_up ? 1 : 0];
         for (int e = e0; e < e1; ++e) {
-            const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
+            float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
+            if constexpr (TG == 40) s *= sc;
             if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
         }
     }
@@ -1662,8 +1701,11 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {   // as native_gu_kernel
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        [[maybe_unused]] float sc = 1.0f;
+        if constexpr (TD == 40) sc = nvfp4_tail((const void*) grp_ptr[g], L)[2];
         for (int e = e0; e < e1; ++e) {
-            const float s = row_dot<TD>(wr, hq + (size_t) e * hb, nb, lane);
+            float s = row_dot<TD>(wr, hq + (size_t) e * hb, nb, lane);
+            if constexpr (TD == 40) s *= sc;
             if (lane == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s;
         }
     }
@@ -2186,11 +2228,24 @@ __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) yy[tid * 8 + j] = cvt<dst_t>(__uint_as_float((uint32_t) x[j] << 16));
 }
 
+// NVFP4: superblock ibs is four 64-value blocks; thread tid writes 8 values of block tid/8, sub-block (tid%8)/2, the
+// low (even tid) or high nibbles.  `s` is the matrix's FP32 scale (1 leaves ggml's to_float values unchanged).
+template<typename dst_t>
+__device__ void dq_nvfp4(const void* vx, int64_t ibs, dst_t* yy, int tid, float s) {
+    const block_nvfp4* x = (const block_nvfp4*) vx + 4 * ibs + tid / 8;
+    const int sb = (tid % 8) / 2, sh = 4 * (tid & 1);
+    const float d = nvfp4_scale_dev(x->d[sb]);
+    const uint8_t* q = x->qs + 8 * sb;
+    dst_t* y = yy + 64 * (tid / 8) + 16 * sb + 2 * sh;
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>((float) kvalues_fp4[(q[j] >> sh) & 0xf] * d * s);
+}
+
 // Every type below must also be in is_iq() (BF16 and Q6_K: embed_type_supported): the host entry points refuse the others,
 // so the default is unreachable.
 template<typename dst_t>
-__device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
+__device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid, float s = 1.0f) {
     switch (ty) {
+        case 40: dq_nvfp4(vx, ibs, y, tid, s); break;
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
         case 17: dq_iq2_xs(vx, ibs, y, tid); break;
         case 18: dq_iq3_xxs(vx, ibs, y, tid); break;
@@ -2214,23 +2269,25 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
 
 // flat: superblock i -> y + 256 i
 template<typename dst_t>
-__global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* __restrict__ y) {
+__global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* __restrict__ y,
+                                    const float* __restrict__ scale = nullptr) {
     const int64_t i = blockIdx.x;
-    dq_dispatch<dst_t>(ty, vx, i, y + i * QK_K, threadIdx.x);
+    dq_dispatch<dst_t>(ty, vx, i, y + i * QK_K, threadIdx.x, scale ? *scale : 1.0f);
 }
 // gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity
 __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
-                                  __half* __restrict__ y) {
+                                  __half* __restrict__ y, const float* __restrict__ scale) {
     const int64_t i = blockIdx.x;
     const int parity = blockIdx.y;
     const int64_t r = i / per_row, c = i % per_row;
-    dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
+    dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x,
+                        scale ? scale[parity] : 1.0f);
 }
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
+           t == 12 || t == 13 || t == 7 || t == 6 || t == 8 || t == 40;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -2442,6 +2499,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
     }
@@ -2468,9 +2526,9 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     check("iq_mmvq");
 }
 
-void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
+void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
-    dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
+    dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst, scale);
     check("iq_dequant_f16");
 }
 
@@ -2499,12 +2557,13 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
     check("iq_dequant_f32");
 }
 
-void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
+void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream,
+                       const float* scale) {
     // checked like the other entry points: an unknown type would leave `dst` unwritten, a wrong prompt and no error
     if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
-                                                                                           (__half*) dst);
+                                                                                           (__half*) dst, scale);
     check("iq_dequant_gu_f16");
 }
 
@@ -2524,7 +2583,7 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.d_row = iq_row_bytes(d_type, n_ff);
     L.up_off = (size_t) n_ff * L.gu_row;
     L.down_off = 2 * L.up_off;
-    L.bytes = L.down_off + (size_t) n_embd * L.d_row;
+    L.bytes = L.down_off + (size_t) n_embd * L.d_row + (gu_type == 40 ? kNvfp4Tail : 0);   // NVFP4's scale tail
     return L;
 }
 
