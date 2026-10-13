@@ -406,6 +406,51 @@ class ParallelService(unittest.TestCase):
         self.assertLessEqual(len(yields), ProcessEngine.YIELDS_MAX, yields)
         self.assertFalse(any(self.engine.slot_busy))
 
+    def test_a_request_waiting_for_a_slot_leaves_the_control_lines(self):
+        """Every slot is taken: the request waits for one without holding the control lines (a read that gave way
+        waits in its slot for them), and runs once a slot frees."""
+        self.start(2)
+        with self.engine.slot_cv:
+            self.engine.slot_busy[:] = [True, True]
+        res = {}
+        th = threading.Thread(target=lambda: res.setdefault("r", self.chat("waits for a slot")))
+        th.start()
+        time.sleep(1.0)
+        self.assertTrue(th.is_alive())
+        self.assertFalse(self.engine.ctl.locked())
+        self.assertFalse(any(x.startswith("BGEN") for x in self.log.read_text().splitlines()))
+        with self.engine.slot_cv:
+            self.engine.slot_busy[1] = False
+            self.engine.slot_cv.notify_all()
+        th.join(30)
+        self.assertEqual(res["r"]["choices"][0]["message"]["content"], "ok, done.")
+        with self.engine.slot_cv:
+            self.engine.slot_busy[0] = False
+
+    def test_reads_that_gave_way_in_every_slot_do_not_stall(self):
+        """Two long reads, then short requests: no read gives way to a request that finds no free slot, and
+        nothing stalls with every slot holding a read that gave way (issue #2)."""
+        self.start(2)
+        out, errors = {}, []
+
+        def go(t):
+            try:
+                out[t] = self.chat(t, max_tokens=16)["choices"][0]["message"]["content"]
+            except Exception as e:   # noqa: BLE001 - reported below
+                errors.append(e)
+        texts = [("aaaa " * 600, 0.0), ("bbbb " * 700, 0.05), ("short one", 0.6), ("short two", 0.1)]
+        threads = []
+        for t, delay in texts:
+            time.sleep(delay)
+            threads.append(threading.Thread(target=go, args=(t,)))
+            threads[-1].start()
+        for th in threads:
+            th.join(20)
+        self.assertFalse(any(th.is_alive() for th in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(out.values()), ["ok, done."] * 4)
+        self.assertFalse(any(self.engine.slot_busy))
+
     def test_no_way_given_to_a_long_one(self):
         """Two prompts of about the same length: no BYIELD (it only goes to a much shorter one)."""
         self.start(2)
