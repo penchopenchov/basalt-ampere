@@ -2,6 +2,7 @@
 #include "basalt/core/session.hpp"
 #include "basalt/kernels/mrope.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/core/kv_arena.hpp"
 
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -12,6 +13,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -129,11 +131,50 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 }
 
 void session_release(SessionState& s) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) qsa_state_release(s.qsa_states[s.qsa_ord0 + j]);
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (s.qsa_states[j].owns_rope) {
             basalt::kernels::rope_table_release(s.qsa_states[j].cos_tab);
             s.qsa_states[j].owns_rope = false;
         }
+}
+
+int64_t session_kv_cells(const SessionState& s) {
+    int64_t c = -1;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena;
+        if (a == nullptr) return -1;
+        c = c < 0 ? a->cells() : std::min(c, a->cells());
+    }
+    return c;
+}
+
+uint64_t session_kv_grow_bytes(const SessionState& s, int64_t cells) {
+    uint64_t b = 0;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->grow_bytes(cells);
+    return b;
+}
+
+uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells) {
+    uint64_t b = 0;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->bytes_for(cells);
+    return b;
+}
+
+bool session_kv_map(SessionState& s, int64_t cells, std::string& err) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena)
+            if (!a->map(cells, err)) return false;
+    return true;
+}
+
+bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err) {
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena)
+            if (!a->unmap(cells, err)) return false;
+    return true;
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {

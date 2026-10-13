@@ -45,6 +45,8 @@
 
 namespace basalt::core {
 
+class KvArena;
+
 /// Select pinned CUDA BF16/F32 projections for SSM gates, routing and the sparse indexer.
 /// Configure before session capture; captured graphs retain the selected implementation.
 /// Does not change GR, PLE or the shared expert's scalar gate.
@@ -222,6 +224,9 @@ struct QsaState {
     /// back: for Q4_0
     bool kv_rot = false;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
+    /// The elastic KV (qsa_set_kv_elastic): the pool arrays above live in this arena's ranges, and only its first
+    /// `cells()` cells are backed.  Null: the pools are carved from the session arena, all backed.
+    KvArena* kv_arena = nullptr;
     int64_t n_pages = 0;
     int64_t max_cells = 0;
 
@@ -283,6 +288,12 @@ uint64_t qsa_kv_host_bytes();
 /// Store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and initializing the
 /// session; default off.
 void qsa_set_kv_int8(bool enabled);
+/// The elastic KV: states initialized while `floor_cells` > 0 (and not streamed, not a ring) put their K/V pools in a
+/// KvArena with the first `floor_cells` cells backed, instead of in the session arena; 0 turns it off.
+void qsa_set_kv_elastic(int64_t floor_cells);
+int64_t qsa_kv_elastic();
+/// Frees a state's elastic KV (no-op without one).
+void qsa_state_release(QsaState& st);
 bool qsa_kv_int8();
 /// Store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);

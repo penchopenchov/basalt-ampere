@@ -1,0 +1,136 @@
+// src/core/kv_arena.cpp - the elastic KV pools.  Read the header first.
+#include "basalt/core/kv_arena.hpp"
+#include "basalt/core/vmm.hpp"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+
+namespace basalt::core {
+
+KvArena::~KvArena() { close(); }
+
+bool KvArena::open(const std::vector<uint64_t>& page_bytes, int64_t pages, int64_t page_cells, std::string& err) {
+    close();
+    if (pages <= 0 || page_cells <= 0 || page_bytes.empty()) {
+        err = "KvArena: empty layout";
+        return false;
+    }
+    if (!vmm::supported() || (gran_ = vmm::granularity()) == 0) {
+        err = "KvArena: the elastic KV needs the driver's virtual memory management, which this GPU or driver does "
+              "not offer";
+        return false;
+    }
+    pages_ = pages;
+    page_cells_ = page_cells;
+    for (const uint64_t pb : page_bytes) {
+        Array a;
+        a.page_bytes = pb;
+        a.reserved = (pb * (uint64_t) pages + gran_ - 1) / gran_ * gran_;
+        a.base = vmm::reserve(a.reserved);
+        if (a.base == nullptr) {
+            err = "KvArena: cannot reserve the address range of a KV pool";
+            close();
+            return false;
+        }
+        arrays_.push_back(a);
+    }
+    return true;
+}
+
+void KvArena::close() {
+    if (!arrays_.empty()) cudaDeviceSynchronize();
+    for (Array& a : arrays_) {
+        for (const Extent& x : a.extents) vmm::unmap(a.base + x.off, x.bytes, x.handle);
+        vmm::release_range(a.base, a.reserved);
+    }
+    arrays_.clear();
+    cells_ = 0;
+    pages_ = 0;
+}
+
+uint64_t KvArena::need(const Array& a, int64_t cells) const {
+    const int64_t pages = std::min<int64_t>(pages_, (std::max<int64_t>(cells, 0) + page_cells_ - 1) / page_cells_);
+    return std::min(a.reserved, ((uint64_t) pages * a.page_bytes + gran_ - 1) / gran_ * gran_);
+}
+
+void KvArena::recount() {
+    int64_t pages = pages_;
+    for (const Array& a : arrays_) pages = std::min<int64_t>(pages, (int64_t) (a.mapped() / a.page_bytes));
+    cells_ = pages * page_cells_;
+}
+
+uint64_t KvArena::mapped_bytes() const {
+    uint64_t b = 0;
+    for (const Array& a : arrays_) b += a.mapped();
+    return b;
+}
+
+uint64_t KvArena::bytes_for(int64_t cells) const {
+    uint64_t b = 0;
+    for (const Array& a : arrays_) b += need(a, cells);
+    return b;
+}
+
+uint64_t KvArena::grow_bytes(int64_t cells) const {
+    uint64_t b = 0;
+    for (const Array& a : arrays_) b += std::max(need(a, cells), a.mapped()) - a.mapped();
+    return b;
+}
+
+bool KvArena::map(int64_t cells, std::string& err) {
+    bool any = false;
+    for (Array& a : arrays_) {
+        const uint64_t at = a.mapped(), want = need(a, cells);
+        if (want <= at) continue;
+        const unsigned long long h = vmm::map(a.base + at, want - at);
+        if (h == 0) {
+            (void) cudaGetLastError();
+            recount();
+            err = "the driver has no VRAM for the KV pools";
+            return false;
+        }
+        a.extents.push_back({at, want - at, h});
+        if (cudaMemset(a.base + at, 0, (size_t) (want - at)) != cudaSuccess) {
+            recount();
+            err = std::string("zeroing new KV pages failed: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        any = true;
+    }
+    recount();
+    // the zeroing is ordered before work on any stream that follows
+    if (any && cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("zeroing new KV pages failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
+bool KvArena::unmap(int64_t cells, std::string& err) {
+    bool synced = false;
+    for (Array& a : arrays_) {
+        const uint64_t want = need(a, cells);
+        while (!a.extents.empty() && a.extents.back().off >= want) {
+            if (!synced) {
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    err = std::string("the device failed before the KV pools shrank: ") +
+                          cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                synced = true;
+            }
+            const Extent x = a.extents.back();
+            if (!vmm::unmap(a.base + x.off, x.bytes, x.handle)) {
+                recount();
+                err = "the driver refused to release a KV pool mapping";
+                return false;
+            }
+            a.extents.pop_back();
+        }
+    }
+    recount();
+    return true;
+}
+
+}  // namespace basalt::core
