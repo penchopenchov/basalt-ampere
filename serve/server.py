@@ -56,7 +56,7 @@ def warn_tight_ram(arena_mib) -> None:
         return
     left = total / 2**30 - arena_mib / 1024
     if left < 6:
-        print(f"[server] warning: low RAM, {left:.1f} of {total / 2**30:.0f} GB left after the experts", flush=True)
+        print(f"[server] warning: low RAM: {left:.1f} of {total / 2**30:.0f} GB left after experts", flush=True)
 
 
 def main() -> int:

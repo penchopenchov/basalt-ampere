@@ -1679,7 +1679,7 @@ class LoadProgress(unittest.TestCase):
 
     def test_narrator_shows_the_ram_floor_line(self):
         from serve.engine.progress import engine_ram_floor, narrate_start
-        text = "9.3 GiB (2.0 margin + 7.3 file cache): 20.0 GiB of experts are read from the SSD; the RAM copy takes at most 12.0 of 30.0 GiB available"
+        text = "9.3 GiB (2.0 margin + 7.3 cache), 20.0 GiB experts on SSD, RAM copy <= 12.0 of 30.0 GiB"
         self.assertEqual(engine_ram_floor("basalt generate: RAM floor " + text), text)
         self.assertIsNone(engine_ram_floor("basalt generate: RAM floor "))
         self.assertIsNone(engine_ram_floor("basalt generate: session is up"))

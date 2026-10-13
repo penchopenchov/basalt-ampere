@@ -84,13 +84,11 @@ void start_memory_watchdog(uint64_t floor_bytes) {
                     // the copy shrunk by what the margin is short of leaves the margin free again
                     const uint64_t copy = g_resident_copy.load(), margin = ram_margin();
                     const uint64_t keep = copy - std::min(copy, margin > avail ? margin - avail : 0);
-                    std::fprintf(stderr, "basalt error: RAM ran out while loading (%llu MiB available): the RAM copy of "
-                                         "the experts left too little room; cap it with --resident-budget-gib %llu, or "
-                                         "free memory\n", mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
+                    std::fprintf(stderr, "basalt error: RAM ran out loading (%llu MiB free); use "
+                                         "--resident-budget-gib %llu\n", mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
                 } else {
-                    std::fprintf(stderr, "basalt error: RAM ran out while loading (%llu MiB available); stopped to keep "
-                                         "the machine usable. Use --resident-experts or --mmap-experts, or free "
-                                         "memory\n", mib);
+                    std::fprintf(stderr, "basalt error: RAM ran out loading (%llu MiB free); use "
+                                         "--resident-experts or --mmap-experts\n", mib);
                 }
                 std::fflush(stderr);
                 _exit(1);
@@ -123,8 +121,7 @@ void start_ram_guard(uint64_t floor_bytes) {
             g_guard_avail = avail;
             g_guard_low = low;
             if (low && !was_low) {
-                std::fprintf(stderr, "basalt warning: RAM is low: %llu MiB available, below the %llu MiB floor; "
-                                     "requests stop until memory is freed\n",
+                std::fprintf(stderr, "basalt warning: RAM low: %llu MiB free < %llu MiB guard\n",
                              (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
                 std::fflush(stderr);
             }

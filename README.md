@@ -166,11 +166,14 @@ Basalt refuses settings that would leave the machine without memory, and never s
   floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus 3.5 GiB plus two layers'
   experts, which is what one prompt chunk reads from the file. The startup line `RAM floor ...` gives the figures.
   When every expert has a place, only the margin is kept, as before.
+- A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the
+  model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
+  buffers and a request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
-  states the RAM available and the largest safe value.
+  states the RAM free and the largest safe value ('max').
 - While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is
-  read from the SSD) stops with an error (`basalt error: RAM ran low
-  while generating ...`, also returned to the client); the server keeps running and takes the next request.
+  read from the SSD) stops with an error (`RAM low (... free < ... guard): request stopped`, also returned to the
+  client); the server keeps running and takes the next request.
 
 ### Vision: `--vision`
 

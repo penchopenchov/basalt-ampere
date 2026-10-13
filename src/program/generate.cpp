@@ -4573,17 +4573,14 @@ int main(int argc, char** argv) {
                 constexpr double kGiB = 1073741824.0;
                 if (o.resident_budget > 0 && o.resident_budget > safe) {
                     return fatal_start_error(
-                        "--resident-budget-gib " + gib_text(o.resident_budget) + " leaves too little RAM: " +
-                        gib_text(avail) + " GiB is available and " + gib_text(file_bytes) + " GiB of experts are read "
-                        "from the SSD, which needs " + gib_text(ram_floor_bytes) + " GiB free (" + gib_text(margin) +
-                        " margin + " + gib_text(ram_floor_bytes - margin) + " file cache)" +
-                        (late > 0 ? " beside " + gib_text(late) + " GiB the server takes later" : std::string()) +
-                        "; the largest safe value is " + gib_text(safe));
+                        "--resident-budget-gib " + gib_text(o.resident_budget) + " too high: " + gib_text(avail) +
+                        " GiB free, " + gib_text(ram_floor_bytes) + " GiB floor" +
+                        (late > 0 ? " + " + gib_text(late) + " GiB for serving" : std::string()) + "; max " +
+                        gib_text(safe));
                 }
                 resident_headroom = std::max(resident_headroom, ram_floor_bytes + late);
-                std::fprintf(stderr, "basalt generate: RAM floor %.1f GiB (%.1f margin + %.1f file cache): %.1f GiB of "
-                                     "experts are read from the SSD; the RAM copy takes at most %.1f of %.1f GiB "
-                                     "available\n",
+                std::fprintf(stderr, "basalt generate: RAM floor %.1f GiB (%.1f margin + %.1f cache), %.1f GiB "
+                                     "experts on SSD, RAM copy <= %.1f of %.1f GiB\n",
                              (double) ram_floor_bytes / kGiB, (double) margin / kGiB,
                              (double) (ram_floor_bytes - margin) / kGiB, (double) file_bytes / kGiB,
                              (double) (o.resident_budget > 0 ? std::min(o.resident_budget, safe) : safe) / kGiB,
@@ -5926,8 +5923,7 @@ int main(int argc, char** argv) {
         const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes);
         basalt::platform::start_ram_guard(guard_floor);
         if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
-            std::fprintf(stderr, "basalt serve: RAM %.2f GiB available, requests stop below %.2f GiB; serving takes up "
-                                 "to %.2f GiB more (conversation checkpoints, images, request buffers)\n",
+            std::fprintf(stderr, "basalt serve: RAM %.2f GiB free, guard %.2f GiB, %.2f GiB kept for serving\n",
                          (double) avail / 1073741824.0, (double) guard_floor / 1073741824.0,
                          (double) serve_growth_bytes(o, g) / 1073741824.0);
         // a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
@@ -8479,9 +8475,8 @@ int main(int argc, char** argv) {
                 uint64_t avail = 0, floor = 0;
                 (void) basalt::platform::ram_guard_low(&avail, &floor);
                 char msg[320];
-                std::snprintf(msg, sizeof msg, "RAM ran low while generating (%llu MiB available, below the %llu MiB "
-                                               "floor): the request was stopped to keep the machine usable; close other "
-                                               "programs or start with a smaller --resident-budget-gib",
+                std::snprintf(msg, sizeof msg, "RAM low (%llu MiB free < %llu MiB guard): request stopped; lower "
+                                               "--resident-budget-gib",
                               (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
                 std::fprintf(stderr, "basalt error: %s\n", msg);
                 std::fflush(stderr);
