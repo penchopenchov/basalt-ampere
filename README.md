@@ -119,6 +119,14 @@ each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
 solo session of the same length, come out of the expert cache.
 
+On one GPU (not with `--kv-resident` or `--vram-elastic`) the KV cache is elastic: each session backs its first 32768
+cells at startup, and the rest of its KV's VRAM holds the expert cache's last slots until a request needs it. A request
+backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
+those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
+The next request that needs less gives the cells back and the cache refills the slots from RAM. A short request so
+decodes with the cache a 32k context would have, whatever `--max-context` is. The startup line `elastic KV: ...` says
+how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`).
+
 While other slots are decoding, a new prompt is read beside them: the prompt path runs on its own thread, the slots'
 decode windows keep running (their kernels take the higher stream priority), and the few steps that touch the draft
 layer or the output run between two windows. A long prompt therefore does not stop the other requests. A prompt that
