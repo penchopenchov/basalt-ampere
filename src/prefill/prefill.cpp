@@ -609,6 +609,9 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// A group buffer's down part ends in MMQ_GROUP 16-byte slots after its zeroed tail: each NVFP4 expert's FP32 scale
+// tail {s_gate, s_up, s_down, 0}, gathered with it and applied in mmq::swiglu.
+constexpr size_t MMQ_SCALES = (size_t) MMQ_GROUP * 16;
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -635,6 +638,8 @@ const MmqPlan& mmq_plan() {
     }();
     return plan;
 }
+// The scale slots of a group buffer (see MMQ_SCALES)
+float* grp_scales(uint8_t* grp_d) { return (float*) (grp_d + MMQ_GROUP * mmq_plan().d_max + MMQ_TAIL); }
 // A layout whose chunks run the fused experts (a streamed chunk of stream_all_min() tokens or more).  Its GU, H and Xq hold only the fused path's grouping tables, int8 H and per-token
 // int8 activations, and Hq nothing: far less than MMQ's FP32 GU / H and per-slot q8_1 rows, which is what
 // lets a bigger chunk or ring fit in the slots the prompt path borrows.  A last chunk below stream_all_min() still runs
@@ -846,7 +851,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
@@ -1108,7 +1113,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     pp->ident = (int32_t*) take((size_t) Rt * 4);
     pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
     pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
-    pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL);
+    pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES);
     if (ok) {
         pp->ctx = std::make_unique<mmq::Context>();
         pp->run_ctx = pp->ctx.get();
@@ -2072,7 +2077,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         const size_t q = j - j0;
                                         if (lay.native)
                                             mmq::gather_native(bd, bd + f.up_off, mmq_gub / 2, bd + f.down_off, mmq_db,
-                                                               P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
+                                                               P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps,
+                                                               f.tail ? bd + f.bytes - f.tail : nullptr,
+                                                               grp_scales(P.grp_d) + 4 * q);
                                         else
                                             mmq::gather_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
                                         if (psl >= 0) {   // the slot is free once gathered
@@ -2092,7 +2099,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
                                     gu.total_rows = nr; gu.max_rows = maxr; gu.dst = P.GU_g; gu.ld_dst = 1280;
                                     P.run_ctx->run(gu, ps);
-                                    mmq::swiglu(P.GU_g, P.H_g, nr, 640, !lay.native, ps);
+                                    mmq::swiglu(P.GU_g, P.H_g, nr, 640, !lay.native, ps,
+                                                lay.native && f.tail ? grp_scales(P.grp_d) : nullptr, rel, ngx);
                                     mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, 640, 640, nr, ps);
                                     const int b = (int) (g2 & 1);
                                     if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
@@ -2201,12 +2209,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
                                 cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
                             }
+                            float* sc = f.tail ? grp_scales(m.grp_d) : nullptr;
                             if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
-                                                          m.grp_d, mmq_db, m.cs)) {
+                                                          m.grp_d, mmq_db, m.cs, sc ? f.bytes - f.tail : 0, sc)) {
                                 for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
                                     const uint8_t* b = gg.blob[i];
                                     mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
-                                                       m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
+                                                       m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs,
+                                                       sc ? b + f.bytes - f.tail : nullptr, sc ? sc + 4 * i : nullptr);
                                 }
                             }
                             if (gg_nslots > 0) {
@@ -2234,7 +2244,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
-                                                       mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                                       mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs,
+                                                       f.tail ? blob_dev + f.bytes - f.tail : nullptr,
+                                                       grp_scales(m.grp_d) + 4 * q);
                                 } else {
                                     mmq::gather_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
@@ -2254,7 +2266,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                                 m.mmq_ctx->run(gu, m.cs);
-                                mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                                const bool scaled = lay.native && lay.fmt[(size_t) l].tail != 0;
+                                mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs,
+                                            scaled ? grp_scales(m.grp_d) : nullptr,
+                                            m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1), ngx);
                                 mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
                                 mmq::Product dn;
                                 dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;

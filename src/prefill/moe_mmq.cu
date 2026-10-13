@@ -20,17 +20,22 @@ void ck(cudaError_t e, const char* what) {
 
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
 
+// `t` (optional): 16 more bytes (an NVFP4 expert's scale tail) to t_dst
 __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uint4* __restrict__ b, int64_t nb,
-                              uint4* __restrict__ ab_dst, const uint4* __restrict__ c, int64_t nc, uint4* __restrict__ c_dst) {
+                              uint4* __restrict__ ab_dst, const uint4* __restrict__ c, int64_t nc, uint4* __restrict__ c_dst,
+                              const uint4* __restrict__ t, uint4* __restrict__ t_dst) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < na) ab_dst[i] = a[i];
     else if (i < na + nb) ab_dst[i] = b[i - na];
     else if (i < na + nb + nc) c_dst[i - na - nb] = c[i - na - nb];
+    else if (i == na + nb + nc && t != nullptr) *t_dst = *t;
 }
 // copy16_kernel for an MMQ group: blockIdx.y is the expert (first + y)
 struct GroupArgs {
     const uint8_t* blob[kGatherGroupMax];
     int64_t up_off, down_off, gu_stride, d_stride;   // in uint4
+    int64_t tail_off;                                // in uint4; with tail_dst, the blob's 16-byte scale tail
+    uint4* tail_dst;                                 // ... to tail_dst[q] (nullptr: none)
 };
 __global__ void copy16_group_kernel(GroupArgs ga, int first, int64_t na, int64_t nc, uint4* __restrict__ gu_dst,
                                     uint4* __restrict__ d_dst) {
@@ -42,13 +47,16 @@ __global__ void copy16_group_kernel(GroupArgs ga, int first, int64_t na, int64_t
     if (i < na) ab[i] = src[i];
     else if (i < 2 * na) ab[i] = src[ga.up_off + (i - na)];
     else if (i < 2 * na + nc) cd[i - 2 * na] = src[ga.down_off + (i - 2 * na)];
+    else if (i == 2 * na + nc && ga.tail_dst != nullptr) ga.tail_dst[q] = src[ga.tail_off];
 }
 __global__ void copy1_kernel(const uint8_t* __restrict__ a, int64_t na, const uint8_t* __restrict__ b, int64_t nb,
-                             uint8_t* __restrict__ ab_dst, const uint8_t* __restrict__ c, int64_t nc, uint8_t* __restrict__ c_dst) {
+                             uint8_t* __restrict__ ab_dst, const uint8_t* __restrict__ c, int64_t nc, uint8_t* __restrict__ c_dst,
+                             const uint8_t* __restrict__ t, uint8_t* __restrict__ t_dst) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < na) ab_dst[i] = a[i];
     else if (i < na + nb) ab_dst[i] = b[i - na];
     else if (i < na + nb + nc) c_dst[i - na - nb] = c[i - na - nb];
+    else if (i < na + nb + nc + 16 && t != nullptr) t_dst[i - na - nb - nc] = t[i - na - nb - nc];
 }
 
 // Pack blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales
@@ -83,13 +91,23 @@ __global__ void q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict
 }
 
 __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
-                              bool interleaved) {
+                              bool interleaved, const float4* __restrict__ tail, const int32_t* __restrict__ bounds, int n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * n_ff) return;
     const int64_t r = i / n_ff, k = i % n_ff;
     const float* row = gu + r * 2 * n_ff;
-    const float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
-    h[i] = g / (1.0f + __expf(-g)) * u;
+    float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
+    if (tail == nullptr) {
+        h[i] = g / (1.0f + __expf(-g)) * u;
+        return;
+    }
+    // the row's expert: the last q with bounds[q] <= r
+    int q = 0;
+    while (q + 1 < n && bounds[q + 1] <= r) ++q;
+    const float4 s = tail[q];   // {s_gate, s_up, s_down, -}
+    g *= s.x;
+    u *= s.y;
+    h[i] = g / (1.0f + __expf(-g)) * u * s.z;
 }
 
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
@@ -110,6 +128,7 @@ bool supported(int t) {
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // the UD-Q4_K_XL experts
+        case GGML_TYPE_NVFP4:  // the products leave out the per-expert tail scales (see swiglu)
             return true;
         default:
             return false;
@@ -191,6 +210,7 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
         case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+        case GGML_TYPE_NVFP4: mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s); break;
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
@@ -199,26 +219,31 @@ void Context::run(const Product& p, void* stream) {
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
-                   void* gu_dst, void* d_dst, void* stream) {
+                   void* gu_dst, void* d_dst, void* stream, const void* tail, void* tail_dst) {
     const cudaStream_t s = (cudaStream_t) stream;
+    if (tail_dst == nullptr) tail = nullptr;
     const bool a16 = ((uintptr_t) gate | (uintptr_t) up | (uintptr_t) down | (uintptr_t) gu_dst | (uintptr_t) d_dst |
-                      gu_half_bytes | d_bytes) % 16 == 0;
+                      (uintptr_t) tail | (uintptr_t) tail_dst | gu_half_bytes | d_bytes) % 16 == 0;
     if (a16) {
         const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
-        copy16_kernel<<<blocks(2 * na + nc), 256, 0, s>>>((const uint4*) gate, na, (const uint4*) up, na, (uint4*) gu_dst,
-                                                          (const uint4*) down, nc, (uint4*) d_dst);
+        copy16_kernel<<<blocks(2 * na + nc + 1), 256, 0, s>>>((const uint4*) gate, na, (const uint4*) up, na,
+                                                              (uint4*) gu_dst, (const uint4*) down, nc, (uint4*) d_dst,
+                                                              (const uint4*) tail, (uint4*) tail_dst);
     } else {
         const int64_t na = (int64_t) gu_half_bytes, nc = (int64_t) d_bytes;
-        copy1_kernel<<<blocks(2 * na + nc), 256, 0, s>>>((const uint8_t*) gate, na, (const uint8_t*) up, na,
-                                                         (uint8_t*) gu_dst, (const uint8_t*) down, nc, (uint8_t*) d_dst);
+        copy1_kernel<<<blocks(2 * na + nc + 16), 256, 0, s>>>((const uint8_t*) gate, na, (const uint8_t*) up, na,
+                                                              (uint8_t*) gu_dst, (const uint8_t*) down, nc, (uint8_t*) d_dst,
+                                                              (const uint8_t*) tail, (uint8_t*) tail_dst);
     }
     ck(cudaGetLastError(), "gather_native");
 }
 
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
-                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream) {
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream, size_t tail_off,
+                         void* tail_dst) {
     if (g.first < 0 || g.n <= g.first || g.n > kGatherGroupMax) return false;
-    uintptr_t a = (uintptr_t) gu_dst | (uintptr_t) d_dst | up_off | gu_half_bytes | down_off | d_bytes | gu_stride | d_stride;
+    uintptr_t a = (uintptr_t) gu_dst | (uintptr_t) d_dst | up_off | gu_half_bytes | down_off | d_bytes | gu_stride | d_stride |
+                  tail_off | (uintptr_t) tail_dst;
     for (int q = g.first; q < g.n; ++q) a |= (uintptr_t) g.blob[q];
     if (a % 16 != 0) return false;
     GroupArgs ga{};
@@ -227,8 +252,10 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
     ga.down_off = (int64_t) down_off / 16;
     ga.gu_stride = (int64_t) gu_stride / 16;
     ga.d_stride = (int64_t) d_stride / 16;
+    ga.tail_off = (int64_t) tail_off / 16;
+    ga.tail_dst = (uint4*) tail_dst;
     const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
-    copy16_group_kernel<<<dim3(blocks(2 * na + nc), (unsigned) (g.n - g.first)), 256, 0, (cudaStream_t) stream>>>(
+    copy16_group_kernel<<<dim3(blocks(2 * na + nc + 1), (unsigned) (g.n - g.first)), 256, 0, (cudaStream_t) stream>>>(
         ga, g.first, na, nc, (uint4*) gu_dst, (uint4*) d_dst);
     ck(cudaGetLastError(), "gather_native_group");
     return true;
@@ -240,9 +267,12 @@ void gather_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
     ck(cudaGetLastError(), "gather_q2");
 }
 
-void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
+void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream, const float* tail,
+            const int32_t* bounds, int n) {
     if (rows <= 0) return;
-    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
+    if (bounds == nullptr || n <= 0) tail = nullptr;
+    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved,
+                                                                           (const float4*) tail, bounds, n);
     ck(cudaGetLastError(), "swiglu");
 }
 

@@ -480,6 +480,59 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// NVFP4 (Basalt): the UE4M3 sub-block scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0 and 0x7F
+// as 0, bit 7 ignored), built from its bits: the same float as the decode kernels' nvfp4_scale_dev.
+static __device__ __forceinline__ float ggml_cuda_mmq_nvfp4_scale(const uint32_t x) {
+    const uint32_t v = x & 0x7F;
+    if (v == 0 || v == 0x7F) return 0.0f;
+    const uint32_t e = v >> 3, m = v & 7;
+    if (e == 0) return (float) m * (1.0f / 1024.0f);
+    return __uint_as_float(((e + 119) << 23) | (m << 20));
+}
+
+// NVFP4 (Basalt): one thread per 16-value sub-block.  Its 8 code bytes hold value j in the low nibble of byte j and
+// value j + 8 in the high one, so the tile gets 4 ints in value order and the sub-block's scale goes into the
+// per-16 scale slot (the Q3_K layout that ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma reads).  The per-expert FP32 scale
+// is not applied here (the caller applies it to the products).
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nvfp4(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+
+    constexpr int nsub            = QK_NVFP4 / QK_NVFP4_SUB;
+    constexpr int threads_per_row = MMQ_ITER_K / QK_NVFP4_SUB;
+    constexpr int nrows           = warp_size / threads_per_row;
+    const int txi = threadIdx.x % threads_per_row;
+    const int kbx = txi / nsub;   // block within the tile row
+    const int sb  = txi % nsub;   // sub-block within the block
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_nvfp4 * bxi = (const block_nvfp4 *) x + kbx0 + i*stride + kbx;
+
+        const int2 v0 = get_int_from_table_16(get_int_b4(bxi->qs, 2*sb + 0), kvalues_fp4);
+        const int2 v1 = get_int_from_table_16(get_int_b4(bxi->qs, 2*sb + 1), kvalues_fp4);
+        const int k0 = 4*txi;
+
+        x_qs[i*sram_stride + k0 + 0] = v0.x;
+        x_qs[i*sram_stride + k0 + 1] = v1.x;
+        x_qs[i*sram_stride + k0 + 2] = v0.y;
+        x_qs[i*sram_stride + k0 + 3] = v1.y;
+        x_df[i*sram_stride + txi]    = ggml_cuda_mmq_nvfp4_scale(bxi->d[sb]);
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q5_1(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
