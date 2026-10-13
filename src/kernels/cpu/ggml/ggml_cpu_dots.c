@@ -1228,6 +1228,90 @@ static void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+// UE4M3 scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0x7F as 0; bit 7 ignored), built from
+// its bits: exact, and the same as dequantize_row_nvfp4.
+static inline float nvfp4_scale(uint8_t x) {
+    const uint32_t v = x & 0x7F;
+    if (v == 0 || v == 0x7F) return 0.0f;
+    const uint32_t e = v >> 3, m = v & 7;
+    if (e == 0) return (float) m * (1.0f / 1024.0f);
+    const uint32_t bits = ((e + 119) << 23) | (m << 20);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+// NVFP4 x Q8_0: a 64-value block meets two Q8_0 blocks; sub-block s (16 values) has scale d[s] and Q8_0 block s/2.
+// The codes of sub-block s are qs[8s..8s+7], low nibbles first.  Integer sums per sub-block, scaled in float.
+static void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_NVFP4 == 0);
+    static_assert(QK_NVFP4 == 2 * QK8_0, "an NVFP4 block spans two Q8_0 blocks");
+
+    const block_nvfp4 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+    const int nb = n / QK_NVFP4;
+#if defined(__AVX512BW__) && defined(__AVX512F__)
+    // one block per step: lanes are the four sub-blocks in order
+    const __m512i values = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) kvalues_fp4));
+    const __m512i m4b = _mm512_set1_epi8(0x0f);
+    const __m512i ones = _mm512_set1_epi16(1);
+    const __m512i lane = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+    __m512 acc = _mm512_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256i q = _mm256_loadu_si256((const __m256i *) x[ib].qs);
+        const __m256i lo = _mm256_and_si256(q, _mm512_castsi512_si256(m4b));
+        const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), _mm512_castsi512_si256(m4b));
+        // per 128-bit lane: [lo 8 | hi 8] of one sub-block; unpack gives sub-blocks (0, 2) and (1, 3)
+        const __m512i c02_13 = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_unpacklo_epi64(lo, hi)),
+                                                  _mm256_unpackhi_epi64(lo, hi), 1);
+        const __m512i codes = _mm512_shuffle_i64x2(c02_13, c02_13, _MM_SHUFFLE(3, 1, 2, 0));
+        const __m512i w = _mm512_shuffle_epi8(values, codes);
+        const __m512i a = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) y[2*ib].qs)),
+                                             _mm256_loadu_si256((const __m256i *) y[2*ib + 1].qs), 1);
+        const __m512i aw = _mm512_abs_epi8(w);
+        const __m512i sa = _mm512_mask_sub_epi8(a, _mm512_movepi8_mask(w), _mm512_setzero_si512(), a);
+        const __m512i p = _mm512_madd_epi16(_mm512_maddubs_epi16(aw, sa), ones);
+        const float d0 = GGML_CPU_FP16_TO_FP32(y[2*ib].d), d1 = GGML_CPU_FP16_TO_FP32(y[2*ib + 1].d);
+        const __m128 sc = _mm_setr_ps(d0 * nvfp4_scale(x[ib].d[0]), d0 * nvfp4_scale(x[ib].d[1]),
+                                      d1 * nvfp4_scale(x[ib].d[2]), d1 * nvfp4_scale(x[ib].d[3]));
+        acc = _mm512_fmadd_ps(_mm512_permutexvar_ps(lane, _mm512_castps128_ps512(sc)), _mm512_cvtepi32_ps(p), acc);
+    }
+    *s = _mm512_reduce_add_ps(acc);
+#else
+    // one block per step: ymm a = sub-blocks (0, 2), ymm b = (1, 3), one per 128-bit lane
+    const __m256i values = MM256_SET_M128I(_mm_loadu_si128((const __m128i *) kvalues_fp4),
+                                           _mm_loadu_si128((const __m128i *) kvalues_fp4));
+    const __m256i m4b = _mm256_set1_epi8(0x0f);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256i q = _mm256_loadu_si256((const __m256i *) x[ib].qs);
+        const __m256i lo = _mm256_and_si256(q, m4b);
+        const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4b);
+        const __m256i wa = _mm256_shuffle_epi8(values, _mm256_unpacklo_epi64(lo, hi));
+        const __m256i wb = _mm256_shuffle_epi8(values, _mm256_unpackhi_epi64(lo, hi));
+        const __m256i y0 = _mm256_loadu_si256((const __m256i *) y[2*ib].qs);
+        const __m256i y1 = _mm256_loadu_si256((const __m256i *) y[2*ib + 1].qs);
+        const __m256i ya = _mm256_permute2x128_si256(y0, y1, 0x20);
+        const __m256i yb = _mm256_permute2x128_si256(y0, y1, 0x31);
+        const __m256i pa = _mm256_madd_epi16(mul_add_epi8(wa, ya), ones);
+        const __m256i pb = _mm256_madd_epi16(mul_add_epi8(wb, yb), ones);
+        const float d0 = GGML_CPU_FP16_TO_FP32(y[2*ib].d), d1 = GGML_CPU_FP16_TO_FP32(y[2*ib + 1].d);
+        const __m256 sa = _mm256_setr_m128(_mm_set1_ps(d0 * nvfp4_scale(x[ib].d[0])), _mm_set1_ps(d1 * nvfp4_scale(x[ib].d[2])));
+        const __m256 sb = _mm256_setr_m128(_mm_set1_ps(d0 * nvfp4_scale(x[ib].d[1])), _mm_set1_ps(d1 * nvfp4_scale(x[ib].d[3])));
+        acc1 = _mm256_fmadd_ps(sa, _mm256_cvtepi32_ps(pa), acc1);
+        acc2 = _mm256_fmadd_ps(sb, _mm256_cvtepi32_ps(pb), acc2);
+    }
+    *s = hsum_float_8(_mm256_add_ps(acc1, acc2));
+#endif
+}
+
 static void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
@@ -1349,6 +1433,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IQ2_S]   = {NULL, ggml_vec_dot_iq2_s_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ4_XS]  = {NULL, ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_M]   = {NULL, ggml_vec_dot_iq1_m_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_NVFP4]   = {NULL, ggml_vec_dot_nvfp4_q8_0, GGML_TYPE_Q8_0, 1},
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {

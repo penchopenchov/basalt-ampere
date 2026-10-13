@@ -1153,6 +1153,27 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// The plain-C NVFP4 x Q8_0 dot: the reference for the SIMD ones in ggml_cpu_dots.c (same integer sums per sub-block,
+// float order may differ).
+void ggml_vec_dot_nvfp4_q8_0_ref(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
+                                 const void * GGML_RESTRICT vy) {
+    assert(n % QK_NVFP4 == 0);
+    const block_nvfp4 * x = vx;
+    const block_q8_0 * y = vy;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < n / QK_NVFP4; ++ib) {
+        for (int sb = 0; sb < QK_NVFP4 / QK_NVFP4_SUB; ++sb) {
+            const block_q8_0 * yb = y + 2 * ib + sb / 2;
+            const int8_t * a = yb->qs + (sb & 1) * QK_NVFP4_SUB;
+            const uint8_t * q = x[ib].qs + sb * 8;
+            int sumi = 0;
+            for (int j = 0; j < 8; ++j) sumi += kvalues_fp4[q[j] & 0xf] * a[j] + kvalues_fp4[q[j] >> 4] * a[j + 8];
+            sumf += GGML_FP16_TO_FP32(yb->d) * ggml_ue4m3_to_fp32(x[ib].d[sb]) * (float) sumi;
+        }
+    }
+    *s = sumf;
+}
+
 // Round-to-nearest NVFP4 for synthetic test weights (no per-tensor scale): per sub-block the UE4M3 scale nearest
 // amax / 6, then each value's nearest E2M1 code under it.
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
