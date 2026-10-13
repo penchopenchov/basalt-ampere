@@ -542,26 +542,30 @@ template<int TG> int dm_glue_blocks() {
 // ---------------------------------------------------------------- the grouped rows, one work item at a time
 // native_gu_multi_kernel's body for block row `rb` of one group (entries [e0, e1)): the same calls in the same order.
 // gate/up row `row` (0 .. 2 n_ff: gate rows, then up rows) at `wr`, for entries [e0, e1)
+// `blob` is the expert's blob (its output scales: expert_out_scale).
 template<int TG, bool STAGE_GRID>
 __device__ __forceinline__ void dm_gu_row(const uint8_t* wr, int row, int e0, int e1, const int32_t* __restrict__ ent_tok,
                                           const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
                                           float* __restrict__ gate, float* __restrict__ up, const uint32_t* s_grid,
-                                          int lane) {
+                                          int lane, unsigned long long blob) {
     const bool is_up = row >= L.n_ff;
     const int r = is_up ? row - (int) L.n_ff : row;
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
     float* dst = is_up ? up : gate;
+    [[maybe_unused]] const float sc = expert_out_scale<TG>(blob, L, is_up ? 1 : 0);
     for (int e = e0; e < e1; e += GRP_NC) {
         const int n = min(GRP_NC, e1 - e);
         if (n == 1) {
             const int off1[1] = { ent_tok[e] * xb };
             float s1[1];
             row_dot_multi<TG, 1, true, STAGE_GRID>(wr, xq, off1, 1, nb, lane, s1, s_grid);
+            tail_scale<TG>(s1, sc);
             if (lane == 0) dst[(size_t) e * L.n_ff + r] = s1[0];
         } else if (n == 2) {
             const int off2[2] = { ent_tok[e] * xb, ent_tok[e + 1] * xb };
             float s2[2];
             row_dot_multi<TG, 2, true, STAGE_GRID>(wr, xq, off2, 2, nb, lane, s2, s_grid);
+            tail_scale<TG>(s2, sc);
             if (lane < 2) dst[(size_t) (e + lane) * L.n_ff + r] = s2[lane];
         } else {
             int off[GRP_NC];
@@ -569,6 +573,7 @@ __device__ __forceinline__ void dm_gu_row(const uint8_t* wr, int row, int e0, in
             for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
             float s[GRP_NC];
             row_dot_multi<TG, GRP_NC, false, STAGE_GRID>(wr, xq, off, n, nb, lane, s, s_grid);
+            tail_scale<TG>(s, sc);
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c)
                 if (c < n && lane == c) dst[(size_t) (e + c) * L.n_ff + r] = s[c];
@@ -584,11 +589,12 @@ __device__ __forceinline__ void dm_gu_item(const uint8_t* blob, int e0, int e1, 
     const int row = rb * GU_ROWS + warp;
     if (row >= 2 * L.n_ff) return;
     // gate and up rows are contiguous in the blob: row `row` is at row * gu_row
-    dm_gu_row<TG, STAGE_GRID>(blob + (size_t) row * L.gu_row, row, e0, e1, ent_tok, xq, L, gate, up, s_grid, lane);
+    dm_gu_row<TG, STAGE_GRID>(blob + (size_t) row * L.gu_row, row, e0, e1, ent_tok, xq, L, gate, up, s_grid, lane,
+                              (unsigned long long) blob);
 }
 
 // rows per down work item: native_down_multi_kernel's block rows at n_ff == 640
-template<int TD> __host__ __device__ constexpr int dm_down_rows() { return TD == 20 ? 32 : TD == 42 ? 16 : 8; }
+template<int TD> __host__ __device__ constexpr int dm_down_rows() { return TD == 20 || TD == 40 ? 32 : TD == 42 ? 16 : 8; }
 
 // The SwiGLU product and its q8_1 blocks for entries [e0, e1) into shared memory (swiglu_q8_1_entries_kernel's values).
 __device__ __forceinline__ void dm_swiglu_q8(const float* __restrict__ gate, const float* __restrict__ up, int e0,
@@ -605,13 +611,15 @@ __device__ __forceinline__ void dm_swiglu_q8(const float* __restrict__ gate, con
 // native_down_multi_kernel's body (hb == 20) for block row `rb` of one group (`rows`: the address of its first row),
 // from the group's q8_1 rows in s_hq
 // (entry e at s_hq + (e - e0) * 20); row r of entry e lands in s_out[(e - e0) * ROWS + r - rb * R], R the item's
-// rows (dm_down_rows) and ROWS the stride of s_out's entries.
+// rows (dm_down_rows) and ROWS the stride of s_out's entries.  `blob` is the expert's blob (expert_out_scale).
 template<int TD>
 __device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1, const block_q8_1* s_hq,
-                                             const NativeExpertLayout& L, int rb, float* s_out, int tid, int ROWS) {
+                                             const NativeExpertLayout& L, int rb, float* s_out, int tid, int ROWS,
+                                             unsigned long long blob) {
     const int nb = (int) (L.n_ff / Fmt<TD>::qk);
     (void) nb;
-    if constexpr (TD == 20) {
+    [[maybe_unused]] const float sc = expert_out_scale<TD>(blob, L, 2);
+    if constexpr (TD == 20 || TD == 40) {   // K = 40 calls per row: 8 lanes a row
         const int rl = tid >> 3, r = rb * 32 + rl, t = tid & 7;
         if (r >= L.n_embd) return;
         const uint8_t* wr = rows + (size_t) rl * L.d_row;
@@ -621,11 +629,13 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1
                 const int off1[1] = { b };
                 float s1[1];
                 row_dot_40_sub8<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
+                tail_scale<TD>(s1, sc);
                 if (t == 0) s_out[(e - e0) * ROWS + rl] = s1[0];
             } else if (n == 2) {
                 const int off2[2] = { b, b + 20 };
                 float s2[2];
                 row_dot_40_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
+                tail_scale<TD>(s2, sc);
                 if (t < 2) s_out[(e - e0 + t) * ROWS + rl] = s2[t];
             } else {
                 int off[GRP_NC];
@@ -633,6 +643,7 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1
                 for (int c = 0; c < GRP_NC; ++c) off[c] = b + min(c, n - 1) * 20;
                 float s[GRP_NC];
                 row_dot_40_sub8<TD, GRP_NC>(wr, s_hq, off, n, t, s);
+                tail_scale<TD>(s, sc);
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
                     if (c < n && t == c) s_out[(e - e0 + c) * ROWS + rl] = s[c];
@@ -648,11 +659,13 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1
                 const int off1[1] = { b };
                 float s1[1];
                 row_dot_20_sub16<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
+                tail_scale<TD>(s1, sc);
                 if (t == 0) s_out[(e - e0) * ROWS + rl] = s1[0];
             } else if (n == 2) {
                 const int off2[2] = { b, b + 20 };
                 float s2[2];
                 row_dot_20_sub16<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
+                tail_scale<TD>(s2, sc);
                 if (t < 2) s_out[(e - e0 + t) * ROWS + rl] = s2[t];
             } else {
                 int off[GRP_NC];
@@ -660,6 +673,7 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1
                 for (int c = 0; c < GRP_NC; ++c) off[c] = b + min(c, n - 1) * 20;
                 float s[GRP_NC];
                 row_dot_20_sub16<TD, GRP_NC>(wr, s_hq, off, n, t, s);
+                tail_scale<TD>(s, sc);
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
                     if (c < n && t == c) s_out[(e - e0 + c) * ROWS + rl] = s[c];
@@ -675,11 +689,13 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1
                 const int off1[1] = { b };
                 float s1[1];
                 row_dot_multi<TD, 1, true>(wr, s_hq, off1, 1, nb, lane, s1);
+                tail_scale<TD>(s1, sc);
                 if (lane == 0) s_out[(e - e0) * ROWS + warp] = s1[0];
             } else if (n == 2) {
                 const int off2[2] = { b, b + 20 };
                 float s2[2];
                 row_dot_multi<TD, 2, true>(wr, s_hq, off2, 2, nb, lane, s2);
+                tail_scale<TD>(s2, sc);
                 if (lane < 2) s_out[(e - e0 + lane) * ROWS + warp] = s2[lane];
             } else {
                 int off[GRP_NC];
@@ -687,6 +703,7 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1
                 for (int c = 0; c < GRP_NC; ++c) off[c] = b + min(c, n - 1) * 20;
                 float s[GRP_NC];
                 row_dot_multi<TD, GRP_NC>(wr, s_hq, off, n, nb, lane, s);
+                tail_scale<TD>(s, sc);
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
                     if (c < n && lane == c) s_out[(e - e0 + c) * ROWS + warp] = s[c];
@@ -842,7 +859,7 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
         }
         for (int sb = 0; sb < SUB; ++sb)
             dm_down_item<TD>((const uint8_t*) sm.gptr[g] + L.down_off + (size_t) ((sp * SUB + sb) * R) * L.d_row, e0, e1,
-                             sm.hq, L, sp * SUB + sb, sm.out + sb * R, tid, kDmSpan);
+                             sm.hq, L, sp * SUB + sb, sm.out + sb * R, tid, kDmSpan, sm.gptr[g]);
         __syncthreads();
         constexpr int q = kDmSpan / 4;           // kDmSpan floats per entry, 16 bytes per thread
         const int nq = (e1 - e0) * q;
@@ -855,11 +872,12 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     }
 }
 
-#define DM_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42)
-#define DM_D_FMTS(X) X(20) X(42)
+#define DM_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(40)
+#define DM_D_FMTS(X) X(20) X(42) X(40)
 #define DM_PAIRS(X) \
     X(16, 20) X(17, 20) X(18, 20) X(21, 20) X(22, 20) X(23, 20) X(29, 20) X(42, 20) \
-    X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42)
+    X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42) \
+    X(40, 40)
 
 template<bool Q2 = false>
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
@@ -1128,7 +1146,7 @@ __device__ int dm_experts_tma(DmTmaShared& sm, int ng, const block_q8_1* __restr
             const int g = it / nga, c = it - g * nga;
             dm_bar_wait(&sm.bar[st], parity);
             dm_gu_row<TG, false>(rows + (size_t) warp * L.gu_row, c * kTmaGuRows + warp, sm.start[g], sm.start[g + 1],
-                                 sm.tok, xq, L, gate, up, nullptr, lane);
+                                 sm.tok, xq, L, gate, up, nullptr, lane, sm.gptr[g]);
             __threadfence();
             __syncthreads();
             if (tid == 0) atomicAdd(done + g, 1u);
@@ -1150,7 +1168,7 @@ __device__ int dm_experts_tma(DmTmaShared& sm, int ng, const block_q8_1* __restr
 #pragma unroll
             for (int sb = 0; sb < kTmaDownRows / R; ++sb)
                 dm_down_item<TD>(rows + (size_t) (sb * R) * L.d_row, e0, e1, sm.hq, L, c * (kTmaDownRows / R) + sb,
-                                 sm.out + sb * R, tid, kTmaDownRows);
+                                 sm.out + sb * R, tid, kTmaDownRows, sm.gptr[g]);
             __syncthreads();
             constexpr int q = kTmaDownRows / 4;
             const int nq = (e1 - e0) * q;
@@ -1270,8 +1288,12 @@ __global__ void __launch_bounds__(256) dm_gu_kernel(const DmPlan* __restrict__ p
         rr[i] = row0 + GU_ROWS * i < nrow ? row0 + GU_ROWS * i : row0;
         rows[i] = blob + (size_t) rr[i] * L.gu_row;
     }
+    [[maybe_unused]] float sc[NR];
+#pragma unroll
+    for (int i = 0; i < NR; ++i) sc[i] = expert_out_scale<TG>(plan->ptr[g], L, rr[i] >= L.n_ff ? 1 : 0);
     auto put = [&](int i, int e, float v) {
         if (row0 + GU_ROWS * i >= nrow) return;
+        if constexpr (TG == 40) v *= sc[i];
         const int row = rr[i];
         if (row >= L.n_ff) up[(size_t) e * L.n_ff + row - (int) L.n_ff] = v;
         else gate[(size_t) e * L.n_ff + row] = v;
@@ -1415,8 +1437,9 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
         case 17: go(dm_glue_gu_kernel<17>, dm_glue_blocks<17>()); break;
         case 18: go(dm_glue_gu_kernel<18>, dm_glue_blocks<18>()); break;
         case 21: go(dm_glue_gu_kernel<21>, dm_glue_blocks<21>()); break;
+        case 22: go(dm_glue_gu_kernel<22>, dm_glue_blocks<22>()); break;
         case 42: go(dm_glue_gu_kernel<42>, dm_glue_blocks<42>()); break;
-        default: go(dm_glue_gu_kernel<22>, dm_glue_blocks<22>()); break;
+        default: std::fprintf(stderr, "dec_moe_glue: gate/up %d\n", L.gu_type); std::exit(1);
     }
     check("dec_moe_glue/gu");
     const DmPlan* P = a.plan;
@@ -1424,7 +1447,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     launch_dependent(swiglu_q8_1_entries_pdl_kernel, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
                      (const float*) up, (const int32_t*) P->start, (const int32_t*) P->counts, (int) L.n_ff, hq);
     check("dec_moe_glue/swiglu");
-    const int d_rows = L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8);
+    const int d_rows = L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8);
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
     switch (L.d_type) {
 #define DM_DOWN(T) case T: launch_down<T>(gd, s, P->ptr, P->start, P->counts, P->dst, hq, L, out, true); break;
@@ -1543,6 +1566,7 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
 #undef DM_OK
         default: break;
     }
+    if ((gu_type == 40) != (d_type == 40)) return false;   // NVFP4 is a pair of its own (DM_PAIRS)
     return gu && d && n_ff == 640 && n_embd % 256 == 0 && !g_old_kernels && !g_grouped_v1;
 }
 
@@ -1622,7 +1646,7 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         const long long nh = (long long) cap * L.n_ff;
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, plan->start, plan->counts,
                                                                                 (int) L.n_ff, hq);
-        const int d_rows = L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8);
+        const int d_rows = L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8);
         const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) cap);
         switch (L.d_type) {
 #define DM_DOWN(T) case T: launch_down<T>(gd, s, plan->ptr, plan->start, plan->counts, plan->dst, hq, L, out); break;
