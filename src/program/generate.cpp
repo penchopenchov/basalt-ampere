@@ -4687,6 +4687,8 @@ int main(int argc, char** argv) {
     auto report_expert_tiers = [&]() {
         uint64_t b_vram = 0, b_peer = 0, b_ram = 0, b_top = 0, b_file = 0;
         const bool ram_ok = srcp == &src && src.complement_ready();
+        // the arena holds every expert in RAM (opening it fails when it cannot), so nothing it serves is file-backed
+        const bool arena_ok = srcp == &arena_src && arena_src.mapped();
         for (int64_t l = 0; l < g.n_layers; ++l) {
             const uint64_t blob = basalt::kernels::cpu::expert_layout().blob_bytes(l);
             for (int64_t e = 0; e < g.n_expert; ++e) {
@@ -4696,6 +4698,7 @@ int main(int argc, char** argv) {
                 for (const auto& r : remote_experts) on_gpu = on_gpu || (r.resident() > 0 && r.owns((int64_t) i));
                 if (on_gpu) b_vram += blob;
                 else if (peer.valid() && peer.has(l, e)) b_peer += blob;
+                else if (arena_ok) b_ram += blob;
                 else if (ram_ok && src.has_resident(l, e)) (src.resident_in_top_up(l, e) ? b_top : b_ram) += blob;
                 else b_file += blob;
             }
