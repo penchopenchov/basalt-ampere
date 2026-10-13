@@ -6,6 +6,7 @@
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/iq_avx2.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
+#include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/ggml/ggml.h"
@@ -108,6 +109,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         std::memcpy(&sg, blob + f.bytes - f.tail, 4);
         std::memcpy(&su, blob + f.bytes - f.tail + 4, 4);
     }
+    // NVFP4 on AVX-512: the multi-token kernel, bitwise equal per token to the ggml dot it replaces.
+    if (avx512 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
+        nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
@@ -136,6 +142,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     const int n = (int) f.n_ff;
     float sd = 1.f;
     if (f.tail) std::memcpy(&sd, blob + f.bytes - f.tail + 8, 4);
+    static const bool avx512 = cpu_avx512_ok();
+    if (avx512 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
+        nvfp4_512_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
         for (int t = 0; t < nt; ++t) {
