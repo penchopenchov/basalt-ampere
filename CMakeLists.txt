@@ -763,6 +763,14 @@ if(BUILD_TESTING)
   set_tests_properties(prefill_mmq_kq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 if(BUILD_TESTING)
+  # NVFP4 experts through MMQ (tile loader, per-16-scale dot, scale tail in SwiGLU) against CPU references, with a
+  # microbench line
+  add_executable(prefill_mmq_nvfp4_test tests/cuda/prefill_mmq_nvfp4_test.cpp)
+  target_link_libraries(prefill_mmq_nvfp4_test PRIVATE mmq ${_gpu_runtime_target})
+  add_test(NAME prefill_mmq_nvfp4_test COMMAND prefill_mmq_nvfp4_test --no-bench)
+  set_tests_properties(prefill_mmq_nvfp4_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
+if(BUILD_TESTING)
   # NVFP4 block decode against the E2M1/UE4M3 spec (exhaustive) and ggml's row dequantizer; with an experts.bin,
   # a real NVFP4 expert's blocks and scale tail
   add_executable(nvfp4_format_test tests/core/nvfp4_format_test.cpp)
