@@ -780,6 +780,7 @@ target_link_libraries(native_expert_bench PRIVATE kernels kernels_cpu artifact $
 add_executable(dec_moe_parity src/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(dec_moe_parity PRIVATE kernels artifact ${_gpu_runtime_target})
+add_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic experts: no GGUF needed
 if(BUILD_TESTING)
   # native expert pairs on synthetic ggml-quantized weights at 2560/640: GPU and CPU experts against the float
   # reference, GPU dequantizers against to_float.
