@@ -39,6 +39,7 @@ enum ggml_type {
     GGML_TYPE_IQ2_S = 22,
     GGML_TYPE_IQ4_XS = 23,
     GGML_TYPE_IQ1_M = 29,
+    GGML_TYPE_NVFP4 = 40,
     GGML_TYPE_Q2_0 = 42,
     GGML_TYPE_COUNT = 43,
 };

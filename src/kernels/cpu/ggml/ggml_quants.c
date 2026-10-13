@@ -1129,6 +1129,63 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
     }
 }
 
+// UE4M3 scale as ggml decodes it: half the value (kvalues_fp4 is doubled), 0x7F (NaN) as 0, bit 7 ignored.
+static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int exp = (x >> 3) & 0xF, man = x & 0x7;
+    const float raw = exp == 0 ? ldexpf((float) man, -9) : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
+void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NVFP4 == 0);
+    const int64_t nb = k / QK_NVFP4;
+    for (int64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < QK_NVFP4 / QK_NVFP4_SUB; s++) {
+            const float d = ggml_ue4m3_to_fp32(x[i].d[s]);
+            const uint8_t * qs = x[i].qs + s * 8;
+            float * yb = y + i * QK_NVFP4 + s * QK_NVFP4_SUB;
+            for (int j = 0; j < 8; ++j) {
+                yb[j + 0] = kvalues_fp4[qs[j] & 0xf] * d;
+                yb[j + 8] = kvalues_fp4[qs[j] >> 4] * d;
+            }
+        }
+    }
+}
+
+// Round-to-nearest NVFP4 for synthetic test weights (no per-tensor scale): per sub-block the UE4M3 scale nearest
+// amax / 6, then each value's nearest E2M1 code under it.
+void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NVFP4 == 0);
+    const int64_t nb = k / QK_NVFP4;
+    for (int64_t i = 0; i < nb; i++) {
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int s = 0; s < QK_NVFP4 / QK_NVFP4_SUB; s++) {
+            const float * xb = x + i * QK_NVFP4 + s * QK_NVFP4_SUB;
+            float amax = 0.0f;
+            for (int j = 0; j < QK_NVFP4_SUB; j++) amax = fmaxf(amax, fabsf(xb[j]));
+            const float target = amax / 6.0f;   // the E2M1 maximum maps to amax
+            int best = 0;
+            float best_err = INFINITY;
+            for (int c = 0; c < 0x7F; c++) {
+                const float err = fabsf(2.0f * ggml_ue4m3_to_fp32((uint8_t) c) - target);
+                if (err < best_err) { best_err = err; best = c; }
+            }
+            y[i].d[s] = (uint8_t) best;
+            const float d = ggml_ue4m3_to_fp32((uint8_t) best);
+            for (int j = 0; j < QK_NVFP4_SUB; j++) {
+                int q = 0;
+                float q_err = INFINITY;
+                for (int c = 0; c < 16; c++) {
+                    const float err = fabsf(kvalues_fp4[c] * d - xb[j]);
+                    if (err < q_err) { q_err = err; q = c; }
+                }
+                y[i].qs[s * 8 + (j & 7)] |= (uint8_t) (j < 8 ? q : q << 4);
+            }
+        }
+    }
+}
+
 float ggml_fp16_to_fp32(ggml_fp16_t x) { return GGML_FP16_TO_FP32(x); }
 
 ggml_fp16_t ggml_fp32_to_fp16(float x) { return GGML_FP32_TO_FP16(x); }
@@ -1154,6 +1211,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     TYPE(GGML_TYPE_IQ2_S, "iq2_s", QK_K, block_iq2_s, dequantize_row_iq2_s, NULL),
     TYPE(GGML_TYPE_IQ4_XS, "iq4_xs", QK_K, block_iq4_xs, dequantize_row_iq4_xs, NULL),
     TYPE(GGML_TYPE_IQ1_M, "iq1_m", QK_K, block_iq1_m, dequantize_row_iq1_m, NULL),
+    TYPE(GGML_TYPE_NVFP4, "nvfp4", QK_NVFP4, block_nvfp4, dequantize_row_nvfp4, quantize_row_nvfp4_ref),
 #undef TYPE
 };
 
