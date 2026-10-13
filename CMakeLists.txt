@@ -798,6 +798,9 @@ if(BUILD_TESTING)
   # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
   add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
   set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
+  # NVFP4 on the CPU tier: AVX2/AVX-512 dots vs plain C, the expert with its tail scales vs a double reference
+  add_test(NAME native_expert_parity_nvfp4 COMMAND native_expert_parity --synthetic nvfp4/nvfp4 nvfp4/nvfp4)
+  set_tests_properties(native_expert_parity_nvfp4 PROPERTIES TIMEOUT 120)
 endif()
 # real-weight checks: test programs, not part of a release
 if(BUILD_TESTING)

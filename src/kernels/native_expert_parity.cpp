@@ -3,6 +3,8 @@
 //     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
 //     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
+//     build/native_expert_parity --synthetic nvfp4/nvfp4      NVFP4 (CPU tier only until its GPU kernels land)
+//     build/native_expert_parity --experts FILE [layer ...]   NVFP4 experts of a pack's experts.bin or a .basalt
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
@@ -29,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -403,6 +406,190 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
     return blob;
 }
 
+// NVFP4 random weights with the pack's magnitudes: block values in the thousands, FP32 per-expert scales in the
+// blob's tail bring them back ({s_gate, s_up, s_down, 0}, s_gate == s_up).
+std::vector<uint8_t> synthetic_nvfp4_blob(const cpu::NativeFmt& f, int seed) {
+    std::vector<uint8_t> blob(f.bytes);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const float sgu = 4e-5f * (1.f + 0.1f * (float) (seed % 5)), sd = 9e-5f;
+    auto quant = [&](float scale, int64_t rows, int64_t cols, uint8_t* dst) {
+        std::vector<float> w((size_t) (rows * cols));
+        for (int64_t r = 0; r < rows; ++r) {
+            const float rs = 0.02f * (0.5f + (float) (r % 7) / 7.0f) / scale;
+            for (int64_t c = 0; c < cols; ++c) w[(size_t) (r * cols + c)] = rs * nd(rng);
+        }
+        ggml_quantize_chunk(GGML_TYPE_NVFP4, w.data(), dst, 0, rows, cols);
+    };
+    quant(sgu, FF, H, blob.data());
+    quant(sgu, FF, H, blob.data() + f.up_off);
+    quant(sd, H, FF, blob.data() + f.down_off);
+    const float tail[4] = {sgu, sgu, sd, 0.f};
+    std::memcpy(blob.data() + f.bytes - f.tail, tail, sizeof tail);
+    return blob;
+}
+
+// NVFP4 on the CPU tier: (1) the AVX2 and AVX-512 vec_dot against the plain-C one on the expert's own rows and Q8_0
+// activations (the same integer sums: float order only); (2) the CPU expert (native_gu_rows / native_down_rows, the
+// tail's scales applied) against a double-precision expert on ggml's to_float weights with s_gate/s_up before SwiGLU
+// and s_down on the output; (3) a single-thread microbench line.
+int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label) {
+    int failures = 0;
+    float sc[4];
+    std::memcpy(sc, blob.data() + f.bytes - f.tail, sizeof sc);
+    std::mt19937 rng(11 + seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x((size_t) NT * H);
+    for (auto& v : x) v = nd(rng);
+    // (1) the dots
+    {
+        const ggml_type_traits_cpu* isa[2] = {ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4),
+                                              cpu::cpu_avx512_ok() ? ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4)
+                                                                   : nullptr};
+        const char* name[2] = {"avx2", "avx512"};
+        std::vector<uint8_t> xq(ggml_row_size(GGML_TYPE_Q8_0, H)), hq(ggml_row_size(GGML_TYPE_Q8_0, FF));
+        std::vector<float> h(FF);
+        for (auto& v : h) v = 0.05f * nd(rng);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, x.data(), xq.data(), 0, 1, H);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, h.data(), hq.data(), 0, 1, FF);
+        for (int i = 0; i < 2; ++i) {
+            if (isa[i] == nullptr) { std::printf("          nvfp4 %s dot: not on this CPU\n", name[i]); continue; }
+            std::vector<float> want, got;
+            for (int64_t r = 0; r < FF; ++r) {
+                float a = 0.f, b = 0.f;
+                ggml_vec_dot_nvfp4_q8_0_ref((int) H, &a, blob.data() + r * f.gu_row, xq.data());
+                isa[i]->vec_dot((int) H, &b, 0, blob.data() + r * f.gu_row, 0, xq.data(), 0, 1);
+                want.push_back(a); got.push_back(b);
+            }
+            for (int64_t r = 0; r < H; ++r) {
+                float a = 0.f, b = 0.f;
+                ggml_vec_dot_nvfp4_q8_0_ref((int) FF, &a, blob.data() + f.down_off + r * f.d_row, hq.data());
+                isa[i]->vec_dot((int) FF, &b, 0, blob.data() + f.down_off + r * f.d_row, 0, hq.data(), 0, 1);
+                want.push_back(a); got.push_back(b);
+            }
+            const double e = rel(got, want);
+            std::printf("          nvfp4 %-6s dot vs plain C: %zu rows, rel %.2e  %s\n", name[i], want.size(), e,
+                        e < 1e-6 ? "ok" : "FAIL");
+            if (!(e < 1e-6)) ++failures;
+        }
+    }
+    // (2) the expert
+    const auto* tt = ggml_get_type_traits(GGML_TYPE_NVFP4);
+    std::vector<float> G((size_t) FF * H), U((size_t) FF * H), D((size_t) H * FF);
+    for (int64_t r = 0; r < FF; ++r) {
+        tt->to_float(blob.data() + r * f.gu_row, G.data() + r * H, H);
+        tt->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
+    }
+    for (int64_t r = 0; r < H; ++r) tt->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+    std::vector<float> ref((size_t) NT * H), got((size_t) NT * H);
+    for (int k = 0; k < NT; ++k) {
+        std::vector<double> h(FF);
+        for (int64_t r = 0; r < FF; ++r) {
+            double g = 0, u = 0;
+            for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * x[k * H + i]; u += (double) U[r * H + i] * x[k * H + i]; }
+            g *= sc[0];
+            u *= sc[1];
+            h[r] = g / (1.0 + std::exp(-g)) * u;
+        }
+        for (int64_t r = 0; r < H; ++r) {
+            double o = 0;
+            for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
+            ref[k * H + r] = (float) (o * sc[2]);
+        }
+    }
+    std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
+    std::vector<std::vector<uint8_t>> hqv(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
+    std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
+    const void* a[NT];
+    const void* hp[NT];
+    float* ffp[NT];
+    float* op[NT];
+    for (int k = 0; k < NT; ++k) {
+        cpu::native_quant_act(f, x.data() + k * H, act[k].data());
+        a[k] = act[k].data();
+        ffp[k] = ff[k].data();
+        op[k] = got.data() + k * H;
+        hp[k] = hqv[k].data();
+    }
+    cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
+    for (int k = 0; k < NT; ++k) cpu::native_quant_h(f, ff[k].data(), hqv[k].data());
+    cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
+    // (3) one token, one thread: gate/up rows and down rows (the blob stays cache-resident across passes)
+    const int it = 20;
+    float* f1[1] = {ffp[0]};
+    float* o1[1] = {op[0]};
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < it; ++i) {
+        cpu::native_gu_rows(f, blob.data(), a, 1, f1, 0, (int) FF);
+        cpu::native_down_rows(f, blob.data(), hp, 1, o1, 0, (int) H);
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+    for (int k = 0; k < NT; ++k) {   // the timing loop overwrote token 0
+        cpu::native_gu_rows(f, blob.data(), a, 1, ffp + k, 0, (int) FF);
+        cpu::native_down_rows(f, blob.data(), hp + k, 1, op + k, 0, (int) H);
+    }
+    // the same double expert on the CPU's own Q8_0 activations (x and h as the CPU rounded them): what is left is
+    // float order, so the scales sit where the reference puts them
+    std::vector<float> ref_q((size_t) NT * H);
+    {
+        const auto* t8 = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        std::vector<float> xd(H), hd(FF);
+        for (int k = 0; k < NT; ++k) {
+            t8->to_float(act[k].data(), xd.data(), H);
+            t8->to_float(hqv[k].data(), hd.data(), FF);
+            for (int64_t r = 0; r < H; ++r) {
+                double o = 0;
+                for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * hd[i];
+                ref_q[k * H + r] = (float) (o * sc[2]);
+            }
+        }
+    }
+    const double e = rel(got, ref), eq = rel(got, ref_q);
+    const bool ok = e < 3e-2 && std::isfinite(e) && eq < 1e-5;
+    std::printf("%-9s nvfp4/nvfp4 blob %8zu  scales g %.3g u %.3g d %.3g  cpu rel %.2e (vs its own q8_0 h: %.2e)  %s\n",
+                label.c_str(), f.bytes, sc[0], sc[1], sc[2], e, eq, ok ? "ok" : "FAIL");
+    std::printf("          bench: cpu expert 1 token 1 thread %.0f us (%.2f GB/s of weights)\n", us,
+                (double) f.bytes / us * 1e-3);
+    return failures + (ok ? 0 : 1);
+}
+
+// Expert `e` of `layer` from an NVFP4 pack: a native experts.bin (its native_experts.txt beside it) or a .basalt
+// (its `experts` section and `experts.layout`).  Blobs are layer-major, `blob` bytes each.
+bool read_pack_expert(const std::string& path, int layer, int e, const cpu::NativeFmt& f, std::vector<uint8_t>& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    uint64_t base = 0, n_expert = 512;
+    char magic[8] = {};
+    in.read(magic, 8);
+    if (std::memcmp(magic, "BASALTMF", 8) == 0) {   // header (64 B) then 128-byte entries: name[64], off, size, ...
+        uint32_t ver = 0, n = 0;
+        in.read((char*) &ver, 4);
+        in.read((char*) &n, 4);
+        for (uint32_t i = 0; i < n; ++i) {
+            char ent[128];
+            in.seekg(64 + (std::streamoff) i * 128);
+            in.read(ent, 128);
+            uint64_t off, size;
+            std::memcpy(&off, ent + 64, 8);
+            std::memcpy(&size, ent + 72, 8);
+            if (std::strncmp(ent, "experts", 64) == 0) base = off;
+            if (std::strncmp(ent, "experts.layout", 64) == 0) {
+                std::string text(size, '\0');
+                in.seekg((std::streamoff) off);
+                in.read(text.data(), (std::streamsize) size);
+                const size_t at = text.find("(n_expert ");
+                if (at != std::string::npos) n_expert = std::strtoull(text.c_str() + at + 10, nullptr, 10);
+            }
+        }
+        if (base == 0) return false;
+    }
+    out.assign(f.bytes, 0);
+    in.clear();
+    in.seekg((std::streamoff) (base + ((uint64_t) layer * n_expert + (uint64_t) e) * f.bytes));
+    in.read((char*) out.data(), (std::streamsize) f.bytes);
+    return (size_t) in.gcount() == f.bytes;
+}
+
 // The Q5_1 min term.  Activations x = d * (q + 0.45) round to q, so each q8_1 block's sum of the ORIGINAL values
 // (`ds.y`, what llama.cpp CUDA multiplies the min by) exceeds d * sum(q) by 0.45 * 32 * d.  The GPU dot must take
 // the quantized sum, as ggml-cpu's vec_dot does: equal to ggml-cpu on the same blocks with s = d * sum(q), and far
@@ -636,6 +823,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
+                             "       native_expert_parity --experts experts.bin|MODEL.basalt [layer ...]   (NVFP4)\n"
                              "       native_expert_parity --q5_1-min\n"
                              "       native_expert_parity --q8k-quant\n"
                              "       native_expert_parity --bf16-embd\n"
@@ -643,17 +831,20 @@ int main(int argc, char** argv) {
         return 2;
     }
     int failures = 0;
-    cudaStream_t s;
-    cudaStreamCreate(&s);
+    cudaStream_t s = nullptr;   // created only for the GPU checks: the NVFP4 CPU checks touch no GPU
+    auto gpu = [&]() {
+        if (s == nullptr) cudaStreamCreate(&s);
+        return s;
+    };
     const std::string mode = argv[1];
     if (mode == "--q8k-quant") {
         failures += check_q8k_quant();
     } else if (mode == "--q5_1-min") {
-        failures += check_q5_1_min(s);
+        failures += check_q5_1_min(gpu());
     } else if (mode == "--bf16-embd") {
-        failures += check_bf16_embd(s);
+        failures += check_bf16_embd(gpu());
     } else if (mode == "--q6k-embd") {
-        failures += check_q6k_embd(s);
+        failures += check_q6k_embd(gpu());
     } else if (mode == "--synthetic") {
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -662,13 +853,37 @@ int main(int argc, char** argv) {
             const int dn = slash == std::string::npos ? -1 : type_of(arg.substr(slash + 1));
             cpu::NativeFmt f;
             std::string err;
+            if (gu == GGML_TYPE_NVFP4 && dn == GGML_TYPE_NVFP4 && cpu::native_fmt(gu, dn, H, FF, f, err)) {
+                failures += check_nvfp4_cpu(f, synthetic_nvfp4_blob(f, i), i, "synthetic");
+                continue;
+            }
             if (gu < 0 || dn < 0 || !cpu::native_fmt(gu, dn, H, FF, f, err) ||
                 !basalt::kernels::native_expert_supported(gu, dn, H, FF)) {
                 std::printf("%s: %s\n", arg.c_str(), err.empty() ? "not a pair the GPU expert kernels take" : err.c_str());
                 ++failures;
                 continue;
             }
-            failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
+            failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", gpu());
+        }
+    } else if (mode == "--experts") {
+        if (argc < 3) { std::fprintf(stderr, "--experts FILE [layer ...]\n"); return 2; }
+        cpu::NativeFmt f;
+        std::string err;
+        if (!cpu::native_fmt(GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, H, FF, f, err)) {
+            std::printf("%s\n", err.c_str());
+            return 1;
+        }
+        std::vector<int> layers;
+        for (int i = 3; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+        if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
+        for (int l : layers) {
+            std::vector<uint8_t> blob;
+            if (!read_pack_expert(argv[2], l, E, f, blob)) {
+                std::printf("layer %d: cannot read expert %d from %s\n", l, E, argv[2]);
+                ++failures;
+                continue;
+            }
+            failures += check_nvfp4_cpu(f, blob, l, "layer " + std::to_string(l));
         }
     } else {
         const basalt::GgufModel model(basalt::gguf_split_paths(argv[1]));
@@ -695,7 +910,7 @@ int main(int argc, char** argv) {
             std::memcpy(blob.data() + f.up_off, data[1] + (size_t) E * f.up_off, f.up_off);
             std::memcpy(blob.data() + f.down_off, data[2] + (size_t) E * (f.bytes - f.down_off),
                         f.bytes - f.down_off);
-            failures += check_blob(f, blob, l, "layer " + std::to_string(l), s);
+            failures += check_blob(f, blob, l, "layer " + std::to_string(l), gpu());
         }
     }
     std::printf("native_expert_parity: %d failures\n", failures);
