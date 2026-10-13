@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -331,7 +332,8 @@ bool available_memory_bytes(uint64_t& bytes) {
 
 // ================================ THE FILE-BACKED SOURCE ================================
 
-FileExpertSource::~FileExpertSource() { close(); }
+FileExpertSource::FileExpertSource() = default;
+FileExpertSource::~FileExpertSource() { advise_worker_.reset(); close(); }
 
 bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
@@ -1219,6 +1221,49 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     return result;
 }
 
+// A helper thread issues the read-ahead so the caller never waits on the kernel.  The queue is bounded; a request
+// that does not fit is dropped (the pages are then read on first touch, as without the advice).
+struct FileExpertSource::AdviseWorker {
+    explicit AdviseWorker(const FileExpertSource* s) : src(s), th([this] { run(); }) {}
+    ~AdviseWorker() {
+        { std::lock_guard<std::mutex> g(mu); stop = true; }
+        cv.notify_one();
+        th.join();
+    }
+    void run() {
+        std::vector<std::pair<int32_t, int32_t>> batch;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> g(mu);
+                cv.wait(g, [this] { return stop || !q.empty(); });
+                if (q.empty()) return;
+                batch.swap(q);
+            }
+            (void) src->advise_pairs(batch.data(), (int64_t) batch.size());
+            batch.clear();
+        }
+    }
+    static constexpr size_t kMaxQueued = 512;
+    const FileExpertSource* src;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<std::pair<int32_t, int32_t>> q;
+    bool stop = false;
+    std::thread th;
+};
+
+void FileExpertSource::advise_cpu(int64_t layer, const int32_t* ids, int64_t n) const {
+    if (base_ == nullptr || ids == nullptr || n <= 0 || !basalt::platform::read_ahead_enabled()) return;
+    std::call_once(advise_once_, [this] { advise_worker_.reset(new AdviseWorker(this)); });
+    AdviseWorker& w = *advise_worker_;
+    {
+        std::lock_guard<std::mutex> g(w.mu);
+        if (w.q.size() + (size_t) n > AdviseWorker::kMaxQueued) return;
+        for (int64_t i = 0; i < n; ++i) w.q.emplace_back((int32_t) layer, ids[i]);
+    }
+    w.cv.notify_one();
+}
+
 bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -1246,6 +1291,22 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
 
 // ================================ THE ADAPTER ================================
 
+// Read-ahead for what the CPU tier may read from the file: every routed id that no GPU holds.
+static void advise_routed(ExpertDispatch& d, const int32_t* ids, int64_t n) {
+    int32_t want[128];
+    int64_t m = 0;
+    for (int64_t i = 0; i < n && m < 128; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= d.n_expert) continue;
+        if (d.host_res != nullptr && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+        if (d.peer != nullptr && d.peer->has(d.layers, e)) continue;
+        bool seen = false;
+        for (int64_t j = 0; j < m && !seen; ++j) seen = want[j] == e;
+        if (!seen) want[m++] = e;
+    }
+    if (m > 0) d.src->advise_cpu(d.layers, want, m);
+}
+
 void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                           int64_t k, float* out) {
     (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
@@ -1269,6 +1330,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         d.fail_layer = d.layers;
         return;
     }
+    advise_routed(d, ids, k);
     if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
 
     // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
@@ -1403,6 +1465,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // ---- the GPU's share, decided and published FIRST so the GPU starts while the CPU works.  Distinct experts in
     // routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
+    if (n <= kMaxWindowEntries) advise_routed(d, ids, n);
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
     // the device planned the layer; only its CPU entries are the pool's
     const bool ext = d.plan != nullptr && d.plan->ext_kind != nullptr && n <= kMaxWindowEntries;
