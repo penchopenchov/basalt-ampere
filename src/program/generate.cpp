@@ -1124,6 +1124,29 @@ ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basa
     return z;
 }
 
+/// Host RAM a server takes while it serves, beyond what it holds once ready: the conversation checkpoints (the solo
+/// session's and those a batch slot keeps, each the whole running state), the parked conversations, one image's
+/// host buffers at the largest canvas and a running request's own buffers.  The RAM copy of the experts leaves this
+/// free beside the margin, so serving stays above the RAM guard.
+uint64_t serve_growth_bytes(const Options& o, const basalt::core::ModelGeometry& g) {
+    if (!o.serve) return 0;
+    uint64_t bytes = basalt::platform::kRequestHostBytes;
+    ConvStateSizes z;
+    std::string error;
+    if (o.prompt_cache > 0 && basalt::core::conversation_state_sizes(g, z, error)) {
+        const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
+        bytes += (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
+        bytes += (uint64_t) o.conversation_cache_mib << 20;
+    }
+    if (!o.vision_mmproj.empty()) {
+        // the canvas (8-bit RGB), its normalized planar floats and the patches
+        const basalt::vision::Geometry vg;
+        const uint64_t pixels = (uint64_t) vg.max_tokens * (uint64_t) (vg.patch * vg.merge) * (uint64_t) (vg.patch * vg.merge);
+        bytes += pixels * 3 * (1 + 2 * sizeof(float));
+    }
+    return bytes;
+}
+
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const basalt::core::SessionState& ss, const basalt::core::ModelGeometry& g) {
     std::string error;
@@ -3484,9 +3507,8 @@ int main(int argc, char** argv) {
             cache_bytes_now = std::min(cache_bytes_now, expert_total_bytes);
             const uint64_t vram = cuda0_fixed_bytes + cache_bytes_now;
             uint64_t outside = expert_total_bytes - cache_bytes_now;   // the experts no cache on the primary holds
-            const uint64_t headroom = o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() +
-                                                                                  basalt::platform::kLateHostBytes)
-                                              : std::max(o.resident_headroom, basalt::platform::ram_margin());
+            const uint64_t late = o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0;
+            const uint64_t headroom = std::max(o.resident_headroom, basalt::platform::ram_margin() + late);
             uint64_t ram = *free_ram > headroom ? *free_ram - headroom : 0;
             if (o.resident_cpu_experts && (o.resident_budget > 0 || o.resident_soft)) {
                 const uint64_t margin = 256ull << 20;
@@ -3523,7 +3545,6 @@ int main(int argc, char** argv) {
                     largest = std::max<uint64_t>(largest, (uint64_t) g.n_expert *
                                                               basalt::kernels::cpu::expert_layout().blob_bytes(l));
                 if (o.resident_cpu_experts && o.resident_budget == 0) {
-                    const uint64_t late = o.serve ? basalt::platform::kLateHostBytes : 0;
                     file_headroom =
                         std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), 1, largest) + late);
                     ram = *free_ram > file_headroom ? *free_ram - file_headroom : 0;
@@ -4532,8 +4553,8 @@ int main(int argc, char** argv) {
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps + std::max(o.peer_adapt_swaps, o.adapt_swaps) : o.adapt_swaps);
         // A server also leaves room for what it allocates after this copy, before it is ready (the top-up below takes
-        // back whatever that does not use).
-        const uint64_t late = o.serve ? basalt::platform::kLateHostBytes : 0;
+        // back whatever that does not use), and for what it takes while serving.
+        const uint64_t late = o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0;
         uint64_t resident_headroom =
             o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late) : o.resident_headroom;
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
@@ -5885,9 +5906,9 @@ int main(int argc, char** argv) {
         // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
         if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
             int64_t n_top = 0;
-            // what the engine still takes once serving: the parked conversations
-            // and the file cache's floor while experts are read from the SSD (none when every expert has a tier)
-            const uint64_t later = (o.prompt_cache > 0 ? (uint64_t) o.conversation_cache_mib << 20 : 0) +
+            // what the engine still takes once serving (see serve_growth_bytes) and the file cache's floor while
+            // experts are read from the SSD (none when every expert has a tier)
+            const uint64_t later = serve_growth_bytes(o, g) +
                                    (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
             const uint64_t add = src.top_up(profile, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
@@ -5902,7 +5923,13 @@ int main(int argc, char** argv) {
         report_expert_tiers();
         basalt::platform::stop_memory_watchdog();
         // from here a request that runs the RAM below the floor stops with an error instead of the machine swapping
-        basalt::platform::start_ram_guard(basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes));
+        const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes);
+        basalt::platform::start_ram_guard(guard_floor);
+        if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
+            std::fprintf(stderr, "basalt serve: RAM %.2f GiB available, requests stop below %.2f GiB; serving takes up "
+                                 "to %.2f GiB more (conversation checkpoints, images, request buffers)\n",
+                         (double) avail / 1073741824.0, (double) guard_floor / 1073741824.0,
+                         (double) serve_growth_bytes(o, g) / 1073741824.0);
         // a view of the solo session carrying slot b's state: what the request path and the solo verifier work on for a
         // request that runs in that slot
         auto make_view = [&](basalt::core::SessionState& v, int b) {

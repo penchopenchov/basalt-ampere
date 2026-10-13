@@ -34,6 +34,10 @@ uint64_t ram_margin();
 /// host memory, the prompt path's and the verifier's staging.  A resident copy leaves this much beside the margin.
 inline constexpr uint64_t kLateHostBytes = 2ull << 30;
 
+/// Host RAM one running request allocates beside its checkpoints and images: token lists, the reply, the server
+/// process's own buffers.
+inline constexpr uint64_t kRequestHostBytes = 256ull << 20;
+
 /// The expert bytes one prompt chunk may read from the expert file for the slots it borrows from the GPU cache (the
 /// chunk is sized to stay within it).
 inline constexpr uint64_t kPromptFileReadBytes = 3584ull << 20;
