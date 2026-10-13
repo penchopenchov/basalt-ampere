@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 #include <cuda_runtime.h>
@@ -231,7 +232,7 @@ void full_session(int fmt, int mode, int experts) {
     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
     std::vector<uint8_t> spare(sizes.dead);
     cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
-    check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
+    check(std::equal(spare.begin(),spare.end(),a.checkpoints[0].dead.begin(),a.checkpoints[0].dead.end()),"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
 }
