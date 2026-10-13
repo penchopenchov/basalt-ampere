@@ -20,7 +20,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
 
 ENCRYPTED_PREFIX = "basalt.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -270,7 +270,7 @@ def request_tools(req: dict):
     choice = req.get("tool_choice")
     if choice == "none":
         return None, names, skipped
-    return tools or None, names, skipped
+    return (stable_tool_order(tools, lambda t: t["name"]) if tools else None), names, skipped
 
 
 def text_format(req: dict):

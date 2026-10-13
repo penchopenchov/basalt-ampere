@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -227,6 +229,44 @@ def _object_list(value, name: str) -> list[dict]:
     return value
 
 
+_TOOL_ORDERS: "OrderedDict[tuple, None]" = OrderedDict()   # orders of tool names seen, least recently used first
+_TOOL_ORDERS_LOCK = threading.Lock()
+_TOOL_ORDERS_MAX = 64
+
+
+def stable_tool_order(tools: list[dict], name_of) -> list[dict]:
+    """Put `tools` in the order their names were first seen, so a client that lists the same tools in another order
+    keeps the prompt prefix (the template renders tools before the system prompt, so one swap re-reads the whole
+    conversation). The closest remembered order that shares at least half the names decides: its tools keep its
+    order and tools it lacks follow in the order sent, which moves the prefix back the least. A tool set with no such
+    relative, a single tool, or duplicate names is left as sent. Based on Strata 1a62f6d."""
+    if len(tools) < 2:
+        return tools
+    names = [name_of(t) for t in tools]
+    have = set(names)
+    if len(have) != len(names):
+        return tools
+    with _TOOL_ORDERS_LOCK:
+        best, shared = None, 0
+        for order in reversed(_TOOL_ORDERS):         # most recent first, so ties go to the newest
+            n = len(have.intersection(order))
+            if n > shared:
+                best, shared = order, n
+        if best is None or shared * 2 < len(names):
+            result = tuple(names)
+        else:
+            known = set(best)
+            result = tuple([n for n in best if n in have] + [n for n in names if n not in known])
+        _TOOL_ORDERS.pop(result, None)
+        _TOOL_ORDERS[result] = None
+        while len(_TOOL_ORDERS) > _TOOL_ORDERS_MAX:
+            _TOOL_ORDERS.popitem(last=False)
+    if list(result) == names:
+        return tools
+    pos = {n: k for k, n in enumerate(result)}
+    return sorted(tools, key=lambda t: pos[name_of(t)])
+
+
 def _tool_list(value, wrapper: str | None) -> list[dict]:
     """A request's tools as named objects, in the OpenAI shape (`wrapper` "function") or Anthropic's (None);
     anything else is a ValueError, no value is no tools. A tool's schema ("parameters" / "input_schema") is an object
@@ -248,7 +288,7 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
         if schema is not None and not isinstance(schema, dict):
             raise ValueError(f'tools[{i}] ({fn["name"]}): "{key}" must be an object (the JSON schema of its '
                              f"parameters), not {type(schema).__name__}")
-    return tools
+    return stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
