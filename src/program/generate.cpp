@@ -6350,7 +6350,7 @@ int main(int argc, char** argv) {
             basalt::core::ConversationCheckpoint ck;
             ck.ids.assign((size_t) upto, 0);
             if (!basalt::core::conversation_checkpoint_save(ck, from, g, e)) return false;
-            const std::vector<uint8_t>* cv[5] = {&ck.gdn, &ck.ple, &ck.tails, &ck.dead, &ck.block_pos};
+            const basalt::core::CheckpointBytes* cv[5] = {&ck.gdn, &ck.ple, &ck.tails, &ck.dead, &ck.block_pos};
             for (int i = 0; i < 5; ++i) mix(i, cv[i]->data(), cv[i]->size());
             for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                 basalt::core::ConversationKv img;

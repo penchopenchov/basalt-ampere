@@ -316,5 +316,23 @@ int main() {
         r = cache.take_reuse();
         check(r.kv.size() == 2 && r.stages.empty(), "no layer split: no stage reuse, as before");
     }
+    {
+        // a large checkpoint buffer returns to the pool and comes back at the same size, with its contents intact
+        const size_t big = (size_t(3) << 20) + 5;
+        const uint8_t* first = nullptr;
+        {
+            CheckpointBytes a;
+            a.resize(big);
+            first = a.data();
+            a[0] = 9;
+            a[big - 1] = 4;
+        }
+        CheckpointBytes b;
+        b.resize(big);
+        check(b.data() == first, "a freed large checkpoint buffer is handed out again");
+        check(b[0] == 9 && b[big - 1] == 4, "a reused buffer is not zeroed");
+        CheckpointBytes small(100, 3), copy = small;
+        check(copy.size() == 100 && copy[99] == 3, "small buffers still copy and fill");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
