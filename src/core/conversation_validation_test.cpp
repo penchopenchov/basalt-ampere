@@ -1,5 +1,6 @@
 // Host-only validation fixtures. CUDA is linked but must never be initialized:
 // invalid restores must return before the first CUDA call or destination write.
+#include <algorithm>
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/kernels/kv_q4.hpp"
 
@@ -191,7 +192,8 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     reset();
     check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::restored,
           "injected host transfer backend completes a valid restore");
-    check(gdn==image.live.gdn && history==image.live.ple && ss.ple_prev[0]==8 && ss.ple_prev[1]==9,
+    auto same=[](const auto& a,const auto& b){ return std::equal(a.begin(),a.end(),b.begin(),b.end()); };
+    check(same(gdn,image.live.gdn) && same(history,image.live.ple) && ss.ple_prev[0]==8 && ss.ple_prev[1]==9,
           "successful restore publishes correct running state and PLE window");
     uint64_t fingerprint = 0;
     check(conversation_kv_verify(image.kv.back(),draft.st,g,9,false,fingerprint,error), "read-back verifies complete draft payload");
