@@ -98,9 +98,21 @@ Prefill and decode are different computations that read and write the same KV an
 | Router | BF16 activation (decode: fp32) | prefill.cpp:1631 |
 | Shared expert | fp16 activation, fp16 SwiGLU | prefill.cpp:1634-1637 |
 | Routed experts | Fused int8 mma kernels, llama.cpp MMQ (q8_1) or dequant-to-fp16 cuBLAS | moe_fused_iq.hpp:1-12; moe_mmq.hpp:1-6 |
+| Routed experts on the CPU (chunks below 1,024 tokens) | Non-resident experts with a host copy and at most 8 rows run on the CPU pool with ggml's dot products, as decode's RAM tier does: the activation in the weight type's `vec_dot` format (Q8_K per 256 values for the IQ types, not q8_1 per 32), H quantized to the down type's format. Their rows are written unweighted and the combine weights them like the GPU's. Which experts go is set per layer from the measured CPU and GPU cost per expert, so it can differ from run to run | prefill.cpp:1862-1900,1928-1985,2339-2352 |
 | Attention | fp16 mma with hi/lo split of q and p, fp32 accumulate | qsa_prompt_attn.hpp:1-22 |
 | Indexer scores | 3xTF32 tensor cores | qsa_select.hpp:36-38 |
 | GDN | State fp32; out-projection input fp16 | kernels.cu:609-623 |
+
+**CPU share of the experts.** `tests/cuda/prefill_cpu_share_test.cpp` runs the pool and the MMQ path on random native
+blobs at the model's geometry, up to 8 rows per expert, against a double-precision reference. Relative RMS error of the
+expert outputs, MMQ / CPU: 1.0e-2 / 1.2e-2 with plain activations (all four format pairs), 1.4e-2 to 1.6e-2 / 3.1e-2 to
+3.4e-2 when 0.5% of the activations are 12 times larger (the CPU's Q8_K block is 256 values wide, MMQ's 32). A row's output
+does not depend on how many tokens share its expert's job (bitwise, every pair). Quality gate, IQ3_S, 100 chunks, 400 W,
+the 256-token prompt half through this path: PPL 3.3727, KLD 0.15267, top-1 87.22% against 3.3769, 0.15351, 87.19%
+for the build without it. Prefill with the share is not reproducible bit for bit between runs, because the share follows
+the measured costs. The identity checks below compare logits across engine sessions, so for a prompt whose chunks are
+below 1,024 tokens the two sessions' KV, and with it their rows, can differ at this level, and those checks are no longer
+bit-identical across sessions.
 
 ## Speculative decoding does not change output
 
