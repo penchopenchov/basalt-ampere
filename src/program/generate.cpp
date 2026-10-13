@@ -2041,9 +2041,10 @@ int main(int argc, char** argv) {
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
             if (!basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
-                char msg[192];
+                char msg[224];
                 std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s (ggml types %d/%d), which this "
-                                               "engine has no GPU kernels for", (long long) l,
+                                               "engine has no GPU kernels for: format not supported for decode",
+                              (long long) l,
                               basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
                               f.gu_type, f.d_type);
                 return fatal_start_error(msg);

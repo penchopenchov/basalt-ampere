@@ -73,11 +73,12 @@ void real_layouts(const std::string& data) {
 }
 
 // ---- 2. the refusals
-std::string layout(int version, int64_t blob, const std::string& extra_column, int n_expert = 2) {
+std::string layout(int version, int64_t blob, const std::string& extra_column, int n_expert = 2,
+                   const std::string& types = "12 7") {
     std::string s = "# experts v" + std::to_string(version) + ": layer gu_type d_type offset blob_bytes (n_expert " +
                     std::to_string(n_expert) + ", total " + std::to_string(2 * blob * n_expert) + ")\n";
-    s += "0 12 7 0 " + std::to_string(blob) + extra_column + "\n";
-    s += "1 12 7 " + std::to_string(blob * n_expert) + " " + std::to_string(blob) + extra_column + "\n";
+    s += "0 " + types + " 0 " + std::to_string(blob) + extra_column + "\n";
+    s += "1 " + types + " " + std::to_string(blob * n_expert) + " " + std::to_string(blob) + extra_column + "\n";
     return s;
 }
 
@@ -92,7 +93,17 @@ void refusals() {
     check(load(layout(5, blob, ""), 2, 512, err), "a v5 layout loads" + (err.empty() ? "" : ": " + err));
     check(load(layout(3, blob, " 100 200 300 shard.gguf"), 2, 512, err),
           "columns past the fifth are ignored" + (err.empty() ? "" : ": " + err));
-    check(!load(layout(6, blob, ""), 2, 512, err) && err.find("v6") != std::string::npos, "v6 is refused");
+    check(!load(layout(7, blob, ""), 2, 512, err) && err.find("v7") != std::string::npos, "v7 is refused");
+    // NVFP4: the blob carries a 16-byte FP32 scale tail after down, counted in the blob size
+    basalt::kernels::cpu::NativeFmt nv;
+    check(basalt::kernels::cpu::native_fmt(40, 40, 2560, 640, nv, err) && nv.tail == 16 &&
+              nv.bytes == 2 * 640 * (2560 / 64 * 36) + 2560 * (640 / 64 * 36) + 16,
+          "NVFP4 blob is 2,764,816 B with its scale tail" + (err.empty() ? "" : ": " + err));
+    check(load(layout(6, (int64_t) nv.bytes, "", 2, "40 40"), 2, 512, err),
+          "a v6 NVFP4 layout loads" + (err.empty() ? "" : ": " + err));
+    check(!load(layout(6, (int64_t) nv.bytes - 16, "", 2, "40 40"), 2, 512, err),
+          "an NVFP4 blob without its tail is refused");
+    check(!basalt::kernels::cpu::native_fmt(40, 7, 2560, 640, nv, err), "NVFP4 gate/up with a Q5_1 down is refused");
     check(!load(std::string(), 2, 512, err), "an empty layout is refused");
     check(!load(layout(5, blob, "").substr(0, layout(5, blob, "").rfind("1 12 7")), 2, 512, err),
           "a missing layer is refused");

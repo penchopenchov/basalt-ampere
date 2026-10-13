@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 namespace basalt::kernels::cpu {
 namespace {
@@ -51,6 +52,14 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = 2 * f.up_off;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
+    // NVFP4 keeps its per-expert FP32 scales in a tail after down, so they move with the blob through every tier.
+    // The scales cover all three projections: the two kinds cannot mix in one expert.
+    if ((gu_type == GGML_TYPE_NVFP4) != (d_type == GGML_TYPE_NVFP4)) {
+        err = "native experts: NVFP4 gate/up and down come together (the scale tail covers all three)";
+        return false;
+    }
+    f.tail = gu_type == GGML_TYPE_NVFP4 ? kNvfp4Tail : 0;
+    f.bytes += f.tail;
     f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
     f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
     if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
@@ -94,6 +103,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
+    float sg = 1.f, su = 1.f;
+    if (f.tail) {
+        std::memcpy(&sg, blob + f.bytes - f.tail, 4);
+        std::memcpy(&su, blob + f.bytes - f.tail + 4, 4);
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
@@ -101,6 +115,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
+            if (f.tail) {
+                g *= sg;
+                u *= su;
+            }
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;
         }
     }
@@ -116,12 +134,14 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
+    float sd = 1.f;
+    if (f.tail) std::memcpy(&sd, blob + f.bytes - f.tail + 8, 4);
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);
-            out[t][r] = s;
+            out[t][r] = f.tail ? s * sd : s;
         }
     }
 }

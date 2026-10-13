@@ -66,6 +66,7 @@ The drafter only proposes tokens; verify decides every token, so the drafter's p
 | GDN alpha/beta, indexer projections | fp32 activation times BF16 weight, fp32 FMA | dec_gdn_rec.cu:88-112; verify.cpp:1315-1327 |
 | Output head | q8_1 of the fp32 final stream, mmvq or the Q5_K/Q6_K kernels; the two-stage Q6_K head's first stage takes the same q8_1 codes as int8 mma inputs (exact int32 per 32-group), fp32 scale terms | verify.cpp (the head); q6k_head.cu |
 | CPU expert tier (experts not resident on a GPU) | The fp32 input quantized with ggml's vec_dot_type (Q8_K per 256 for i-quant gate/up; Q8_0 or Q8_K for down), so it rounds differently from the GPU tiers | native_expert.cpp:52-62, 84-139 |
+| CPU expert tier, NVFP4 experts (work in progress: no GPU decode path yet) | Q8_0 per 32 of the fp32 input and of the fp32 SwiGLU output; integer sums per 16-value sub-block, times the UE4M3 sub-block scale and the Q8_0 scale in fp32. The expert's FP32 tail scales go on in fp32: s_gate and s_up on the gate/up dots before SwiGLU, s_down on the down output (folding s_down into up would put h near 1e-5, where the activation block scale goes subnormal). Against a double-precision expert on the same weights: rel 1.2e-2 from activation rounding, 7e-8 with the CPU's own rounded activations | native_expert.cpp (native_gu_rows, native_down_rows); ggml_cpu_dots.c (ggml_vec_dot_nvfp4_q8_0); native_expert_parity --synthetic nvfp4/nvfp4 |
 
 Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_0.
 
