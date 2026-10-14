@@ -6,7 +6,7 @@
 #include <cstdint>
 
 // One thread quantizes 4 consecutive floats; the 8 threads of a 32-value block share one scale (and, for DS4, the
-// sum of the block's floats).  Row i of the output is row ids[i] of the input (row i without `ids`).
+// sum of its rounded values times the scale).  Row i of the output is row ids[i] of the input (row i without `ids`).
 template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
@@ -48,17 +48,6 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
-    float sum = 0.0f;
-    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
-        sum = xi.x + xi.y + xi.z + xi.w;
-
-        // Calculate sums across vals_per_scale/4 threads.
-#pragma unroll
-        for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
-        }
-    }
-
     const float d_inv = 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
@@ -66,6 +55,17 @@ static __global__ void quantize_mmq_q8_1(
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
     const float d = 1.0f / d_inv;
+
+    // DS4: the block's sum of the rounded values times d, so the minimum's term meets the same activations as the codes
+    float sum = 0.0f;
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+        int isum = (int) q.x + (int) q.y + (int) q.z + (int) q.w;
+#pragma unroll
+        for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+            isum += __shfl_xor_sync(0xFFFFFFFF, isum, offset, WARP_SIZE);
+        }
+        sum = d * (float) isum;
+    }
 
     const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
     const int64_t ib  = ib0 + k_block*ne1 + blockIdx.x;
