@@ -4492,6 +4492,8 @@ int main(int argc, char** argv) {
     // but never below 8192.  A bare `auto` is cut back once the RAM complement is built (below) to what the lend can
     // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
     // complement to size it from, so it stays at 8192.
+    // The largest chunk a bare `auto` reads a prompt in: past it a chunk's cost per token stops falling.
+    constexpr int64_t kMaxAutoChunk = 16384;
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
     // The auto scan bisects on the 256-token grid the prompt path works on (`request_chunk` rounds up to it):
@@ -4639,10 +4641,13 @@ int main(int argc, char** argv) {
         }
         if (resident_ok && o.prefill_auto_fit && lend_from >= 0) {
             // A lent slot whose expert the complement holds is refilled from RAM; the others are read from the file.
-            // Allow the backed slots plus a fixed amount of file reading per prompt.
+            // Allow the backed slots plus a fixed amount of file reading per prompt.  Those reads are evictable page
+            // cache that the refill passes through once, so two chunks' worth are funded; the read-time cap
+            // (kMaxAutoChunk) bounds the chunk, so the ceiling stops there too.
             const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - kv_tail_slots) +
-                                  (int64_t) (basalt::platform::kPromptFileReadBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
-            auto_ceiling = std::max<int64_t>(8192, biggest_chunk(auto_ceiling, [&](int64_t t) { return lend_slots(t) <= allow; }));
+                                  (int64_t) (2 * basalt::platform::kPromptFileReadBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
+            auto_ceiling = std::max<int64_t>(8192, biggest_chunk(std::min<int64_t>(auto_ceiling, kMaxAutoChunk),
+                                                                 [&](int64_t t) { return lend_slots(t) <= allow; }));
         }
         if (resident_ok) {
             if (o.serve) basalt::platform::watch_resident_ram(true, src.resident_bytes());
@@ -7766,11 +7771,10 @@ int main(int argc, char** argv) {
                 // prompt needs, so a large chunk costs a short prompt nothing
                 // A bare `auto` reads a prompt in equal chunks of at most this many tokens: past a few thousand tokens
                 // a chunk's cost per token stops falling (its experts stream once whatever its size) and then rises
-                // with the chunk, so the rule is the fewest equal parts of at most this size, never a small tail.  An
-                // exclusive peer tier streams its experts through the host, which pays for larger chunks.  `auto:N`
-                // and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
+                // with the chunk, so the rule is the fewest equal parts of at most this size, never a small tail.
+                // `auto:N` and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
                 // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
-                int64_t cap = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, o.peer_exclusive ? 16384 : 12288)
+                int64_t cap = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk)
                                                  : o.prefill_chunk;
                 // Loan limits, only while slots decode: the loan stays within kLendCapDecoding slots (they keep their
                 // experts in the cache), and takes only slots whose expert has a RAM copy (a lent slot is refilled

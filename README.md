@@ -156,9 +156,9 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
 
 A prompt is read in chunks. `--prefill auto` (the usual setting) takes the largest chunk whose buffers the expert cache
 can lend: the buffers are carved from the cache's last slots for the length of the prompt and the experts in those slots
-are copied back afterwards, so a short prompt lends only what it needs. A bare `auto` reads a prompt in the fewest equal chunks of at most 12288 tokens (16384 with `--peer-exclusive`), because
+are copied back afterwards, so a short prompt lends only what it needs. A bare `auto` reads a prompt in the fewest equal chunks of at most 16384 tokens, because
 a chunk's cost per token stops falling past a few thousand tokens; it is still limited to what the lend can fund, which with
-`--resident-experts` is the lent slots whose experts the RAM copy holds plus a fixed amount of file reading, and without
+`--resident-experts` is the lent slots whose experts the RAM copy holds plus a fixed amount of file reading (7 GiB), and without
 `--resident-experts` is 8192. `--prefill auto:N` (N = 8192, 16384 or 32768) sets the ceiling yourself; a number sets a
 fixed chunk. A prompt longer than one chunk is split into equal chunks (a short tail chunk costs nearly a whole pass over
 the streamed experts). The startup line `prompt chunk auto: N tokens` says what was
