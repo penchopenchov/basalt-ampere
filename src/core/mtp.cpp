@@ -342,6 +342,10 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+    // the draft K/V is elastic like the layers' (its arena grows and shrinks with the session's), except where a
+    // store per batch slot copies whole pools
+    const int64_t kv_elastic_was = qsa_kv_elastic();
+    if (n_stores_ > 0) qsa_set_kv_elastic(0);
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
@@ -357,6 +361,8 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
+    qsa_set_kv_elastic(kv_elastic_was);
+    if (st_.kv_arena != nullptr) ss.kv_extra.push_back(st_.kv_arena);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;

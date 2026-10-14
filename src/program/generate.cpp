@@ -3089,7 +3089,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    basalt::core::qsa_set_kv_elastic(0);   // the drafter's and every later state: whole
+    // the drafter's K/V is elastic like the sessions' (MtpDrafter::load keeps it whole with a K/V per batch slot)
+    basalt::core::qsa_set_kv_elastic(kv_floor);
     if (!slot0_is_solo)
         basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(0), solo_kv_bytes, o.max_context);
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts: the driver can
@@ -3107,6 +3108,7 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "basalt generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
+    basalt::core::qsa_set_kv_elastic(0);   // every later state: whole
     const bool mtp_on = !o.mtp.empty();
     const basalt::core::QsaState* const mtp_kv = mtp_on ? &mtp.kv_state() : nullptr;   // the draft layer's K/V, if any
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so

@@ -36,6 +36,9 @@ struct SessionState {
 
     QsaState* qsa_states = nullptr;      ///< one per QSA layer
     void* qsa_state_arena = nullptr;
+    /// Elastic arenas of state that grows with the sequence but is not a QSA layer of this session (the MTP draft
+    /// layer's K/V): `session_kv_*` below map and give back theirs with the layers'.  Not owned.
+    std::vector<KvArena*> kv_extra;
     QsaBuffers qsa_bufs;                 ///< scratch, shared across the 12 (they never run concurrently)
     void* qsa_buf_arena = nullptr;
 

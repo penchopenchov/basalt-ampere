@@ -146,6 +146,7 @@ int64_t session_kv_cells(const SessionState& s) {
         if (a == nullptr) return -1;
         c = c < 0 ? a->cells() : std::min(c, a->cells());
     }
+    for (const KvArena* a : s.kv_extra) c = c < 0 ? a->cells() : std::min(c, a->cells());
     return c;
 }
 
@@ -153,6 +154,7 @@ uint64_t session_kv_grow_bytes(const SessionState& s, int64_t cells) {
     uint64_t b = 0;
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->grow_bytes(cells);
+    for (const KvArena* a : s.kv_extra) b += a->grow_bytes(cells);
     return b;
 }
 
@@ -160,6 +162,7 @@ uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells) {
     uint64_t b = 0;
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->bytes_for(cells);
+    for (const KvArena* a : s.kv_extra) b += a->bytes_for(cells);
     return b;
 }
 
@@ -167,6 +170,8 @@ bool session_kv_map(SessionState& s, int64_t cells, std::string& err) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena)
             if (!a->map(cells, err)) return false;
+    for (KvArena* a : s.kv_extra)
+        if (!a->map(cells, err)) return false;
     return true;
 }
 
@@ -174,6 +179,8 @@ bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena)
             if (!a->unmap(cells, err)) return false;
+    for (KvArena* a : s.kv_extra)
+        if (!a->unmap(cells, err)) return false;
     return true;
 }
 
