@@ -804,6 +804,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        if (head_ != nullptr && head_->vproxy() != nullptr)
+            vhead_scratch_ = b.take<uint8_t>(basalt::kernels::q6k_vhead_scratch_bytes());
         hist_snap_ = b.take<float>(T * HS);
         ple_win_ = b.take<float>(2 * T * HC * N);
         ple_key_ = b.take<float>(T * HC * N); ple_val_ = b.take<float>(T * N);
@@ -1930,6 +1932,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                 if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits, one wave
                     q5k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                else if (head_->type() == 14 && vhead_scratch_ != nullptr && q6k_vhead_supported((int) N, (int) n_vocab_, T))
+                    q6k_vhead(head_->vproxy(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T,
+                              vhead_scratch_, cs);
                 else if (head_->type() == 14 && q6k_head_supported((int) N, T))
                     q6k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
                 else

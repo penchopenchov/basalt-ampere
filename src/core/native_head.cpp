@@ -3,6 +3,7 @@
 #include "basalt/core/load_progress.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/q6k_head.hpp"
 #include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -14,6 +15,7 @@
 namespace basalt::core {
 
 NativeHead::~NativeHead() {
+    if (vproxy_) cudaFree(vproxy_);
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
 }
@@ -28,6 +30,8 @@ bool NativeHead::plan_bytes(const std::vector<std::string>& shards, uint64_t& ou
         }
         out = basalt::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) tensor->shape[0],
                                                         (int) tensor->shape[1]);
+        if (tensor->type == 14 && basalt::kernels::q6k_vhead_supported((int) tensor->shape[0], (int) tensor->shape[1], 1))
+            out += basalt::kernels::q6k_vproxy_bytes((int64_t) tensor->shape[1]);
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
@@ -86,6 +90,20 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
+        // the verify head's 2-bit copy, packed once from the uploaded rows (without it the exact head runs)
+        if (type_ == 14 && basalt::kernels::q6k_vhead_supported((int) n_in, (int) n_out, 1)) {
+            const size_t pb = basalt::kernels::q6k_vproxy_bytes(n_out);
+            if (cudaMalloc(&vproxy_, pb) == cudaSuccess) {
+                basalt::kernels::q6k_vproxy_pack(weights_, n_out, vproxy_, nullptr);
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    cudaFree(vproxy_);
+                    vproxy_ = nullptr;
+                }
+            } else {
+                vproxy_ = nullptr;
+            }
+            cudaGetLastError();
+        }
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();

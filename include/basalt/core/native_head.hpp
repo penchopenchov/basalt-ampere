@@ -30,9 +30,13 @@ public:
     int type() const { return type_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
+    /// A Q6_K head's 2-bit copy for the verify window's two-stage head (q6k_vhead); null for other types or when it
+    /// did not fit.
+    const void* vproxy() const { return vproxy_; }
 
 private:
     void* weights_ = nullptr;
+    void* vproxy_ = nullptr;
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;

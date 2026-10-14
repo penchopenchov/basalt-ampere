@@ -12,9 +12,12 @@ tier, 32 GB of system RAM.
   both packs tested, and every full-vocabulary fp32 logit row (62,271 and 60,878) was bit-identical between `--spec 0`
   and `--spec 7`.
 - **KLD matches llama.cpp.** On the same GGUFs against the same base, Basalt and llama.cpp's own `llama-perplexity`
-  agree: IQ3_S 0.15264 vs 0.1526, IQ3_XXS 0.2433 vs 0.2428 at 100 chunks.
+  agree: IQ3_S 0.15264 vs 0.1526, IQ3_XXS 0.2433 vs 0.2428 at 100 chunks, with the exact head. The two-stage
+  verify head of a Q6_K head (IQ3_S) adds about 0.0017 ([see below](#two-stage-verify-head)).
 - **No requantization.** Weights are the GGUF blocks as shipped. The one exception is the hyper-connection matrices,
-  which decode reads from an int8 copy with one fp16 scale per 32 inputs.
+  which decode reads from an int8 copy with one fp16 scale per 32 inputs. A Q6_K output head is also screened through a
+  2-bit copy in verify: the rows near the top are the exact Q6_K logits, the far tail keeps the copy's approximate logits
+  ([details](#two-stage-verify-head)).
 - **fp32 where it matters.** Activations are fp32 in the residual stream, norms, router, softmax and logits, and int8
   (q8_1) into the quantized matmuls. GDN state is fp32. KV is fp16 by default, with int8, q4_0 and k8v4 options.
 - **Quality is scored through decode.** Prefill is a different computation (fp16/BF16 GEMMs); the quality gate scores
@@ -40,7 +43,7 @@ hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_
 | Norm weights, ssm_a, ssm_dt, conv1d, ssm_norm | F32 | model_sections.py:55-60 |
 | Hyper-connection (hc) matrices (down, up, inject; per layer and for the output head) | Stored BF16 in the pack; decode reads an int8 copy: int8 codes with one fp16 scale per 32 consecutive inputs, scale = f16(absmax/127), codes clamped to ±127 | hc_fused.cu:343, 1168-1186, 1210-1227; verify.cpp:561-572 |
 | Token embedding | GGUF type kept in mapped host memory, one row dequantized to fp32 per token | native_head.hpp:42-45; verify.cpp:948-961 |
-| Output head | A native_mmvq type with dedicated Q5_K and Q6_K kernels; the IQ3_S pack's head is Q6_K | verify.cpp:1877-1882 |
+| Output head | A native_mmvq type with dedicated Q5_K and Q6_K kernels; the IQ3_S pack's head is Q6_K. A Q6_K head runs in two stages in verify: every row is scored from a 2-bit copy (the draft head's fit below: four levels and an fp16 scale per 32 weights, the scale raised by sqrt(\|w\|²/⟨w, ŵ⟩)), on int8 tensor cores; the rows within 4 of a lower bound on the column's 64th-best approximate logit are rescored exactly (the bits of the plain Q6_K kernel), and every other row keeps its approximate logit. The argmax and the sampler's top-64 list come from exact rows; the tail of the softmax is approximate (see [Two-stage verify head](#two-stage-verify-head)). The copy (199 MB for 248,320 rows) is packed at load, before the expert cache is sized | native_head.cpp; verify.cpp (the head); q6k_head.cu (q6k_vhead) |
 | MTP drafter dense | Q8_0 for fc_embedding, fc_hidden, q/k/v/o, indexer projection and the shared-expert projections; BF16 for the rest; 1-D tensors F32 | model_sections.py:334-338, 444-470 |
 | MTP drafter experts | Q2_0, all in VRAM | model_sections.py:482-487 |
 | MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset; for a Q5_K or Q6_K head the leading rows are first scored from a 2-bit copy (four levels and an fp16 scale per 32 weights) and the rows within 5 of the best approximate score (at most 64) rescored exactly, so a draft differs from the exact argmax only in rare cases, and the draft probability is approximate: the other rows' terms of its softmax sum come from the 2-bit scores. The Q6_K copy's scale is raised by sqrt(\|w\|²/⟨w, ŵ⟩) per group, since the least-squares copy scores the near-best rows low and inflates the probability; on 1500 real draft-head inputs of the IQ3_S pack the probability's mean error is +0.005 (+0.017 with the least-squares scale) and the pick matches the exact argmax in 99.93% | mtp.cpp, head_proxy.cuh, q5k_head.cu, q6k_head.cu |
@@ -61,7 +64,7 @@ The drafter only proposes tokens; verify decides every token, so the drafter's p
 | Routed experts down | fp32 SwiGLU, then q8_1 per 32 | iq_kernels.cu:1909-1920 |
 | Shared expert | q8_1 into gate/up; fp32 SwiGLU, q8_1 into down; sigmoid gate fp32 | shared_expert.cu:178-215 |
 | GDN alpha/beta, indexer projections | fp32 activation times BF16 weight, fp32 FMA | dec_gdn_rec.cu:88-112; verify.cpp:1315-1327 |
-| Output head | q8_1 of the fp32 final stream, mmvq or the Q5_K/Q6_K kernels | verify.cpp:1876-1885 |
+| Output head | q8_1 of the fp32 final stream, mmvq or the Q5_K/Q6_K kernels; the two-stage Q6_K head's first stage takes the same q8_1 codes as int8 mma inputs (exact int32 per 32-group), fp32 scale terms | verify.cpp (the head); q6k_head.cu |
 | CPU expert tier (experts not resident on a GPU) | The fp32 input quantized with ggml's vec_dot_type (Q8_K per 256 for i-quant gate/up; Q8_0 or Q8_K for down), so it rounds differently from the GPU tiers | native_expert.cpp:52-62, 84-139 |
 
 Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_0.
@@ -124,6 +127,45 @@ by at most 7e-4 of the row's largest output: MMQ's stream-k split and tile width
 rounding can turn a reordered sum into one int8 step. The i-quant MMQ path does the same (6.5e-4, IQ4_XS/IQ4_NL). Quality
 gate, UD-Q4_K_XL, 100 chunks, 400 W, the 256-token prompt half through this path: PPL 3.3297, KLD 0.05653, top-1 92.06%
 against 3.3223, 0.05695, 92.22% with the FP16 path.
+
+## Two-stage verify head
+
+A Q6_K output head (the IQ3_S pack's) runs in two stages in the verify window (`q6k_vhead`, q6k_head.cu). Every one of the
+248,320 rows is scored from a 2-bit copy (the draft head's fit, head_proxy.cuh) on int8 tensor cores against the same
+q8_1 codes the exact kernel reads. Each block of rows adds its per-column maximum to a histogram; the lower edge of the bin
+holding the 64th largest block maximum is at or below the column's 64th largest approximate logit, and every row within 4
+of it is rescored exactly with the plain Q6_K kernel's arithmetic (the same bits). The other rows keep their approximate
+logits, so log-probabilities stay finite. The block partition does not depend on the window width, so a token's logits
+are the same bits at every T.
+
+What it changes: the argmax and the sampler's top-64 list come from exact rows unless the copy's error exceeds the margin;
+the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit).
+
+Offline, on 3,614 real verify-head inputs dumped from the engine (conv, struct, prose fixtures), all 248,320 rows, exact =
+Q6_K x q8_1 in float:
+
+| Fixture | Inputs | Top-64 recall, margin 4 | Margin 6 | Margin 8 | Rows rescored per column, margin 4 (mean / p99) | Greedy pick unchanged | KLD exact -> two-stage (mean) |
+|---|---|---|---|---|---|---|---|
+| conv | 1,232 | 99.971% | 100% | 100% | 1,333 / 6,286 | 100% | 4.7e-4 |
+| prose | 1,124 | 99.979% | 100% | 100% | 1,098 / 2,988 | 100% | 5.1e-4 |
+| struct | 1,258 | 99.968% | 100% | 100% | 1,981 / 12,790 | 100% | 2.5e-5 |
+
+Margins 6 and 8 rescore 5,569-18,649 and 27,962-78,806 rows per column. Neither a least-squares scale for the copy nor a
+per-column correction of the tail's bias lowers the KLD (the tail's mass is unbiased; the cost is its noise).
+
+Quality gate (IQ3_S, 100 chunks, against the Q8_0 base, tiers pinned to `--expert-cache 9000 --peer-slots 7562`, 400 W;
+the gate leaves the PCIe share dynamic, so two runs of one build differ):
+
+| Head | Run | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
+|---|---|---|---|---|---|---|
+| exact Q6_K | 1 | 3.3778 | 0.15355 | 0.03400 | 1.7316 | 87.36% |
+| exact Q6_K | 2 | 3.3728 | 0.15288 | 0.03397 | 1.7082 | 87.18% |
+| two-stage | 1 | 3.3852 | 0.15507 | 0.03484 | 1.7681 | 87.24% |
+| two-stage | 2 | 3.3827 | 0.15472 | 0.03497 | 1.7381 | 87.40% |
+
+The two-stage head raises KLD by about 0.0017 (1.1%) and PPL by 0.2%, more than the 0.0007 between two runs of one build:
+the gate scores the whole softmax, including the approximate tail. Same top-1 is unchanged. Greedy decoding with the tiers
+pinned (`tools/greedy_identity.py`, the three bench prompts, 900 tokens) is token-identical to the exact head.
 
 ## Request logit bias
 
