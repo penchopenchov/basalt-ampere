@@ -226,6 +226,10 @@ if(BUILD_TESTING)
   set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
 endif()
 if(BUILD_TESTING)
+  # the shape check over a synthetic weight table: the canonical shapes pass, one wrong dimension or form fails
+  add_executable(layout_check_test tests/core/layout_check_test.cpp)
+  target_link_libraries(layout_check_test PRIVATE core)
+  add_test(NAME layout_check_test COMMAND layout_check_test)
   # the expert layout text: real models' layouts and the refusals
   add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
   target_link_libraries(expert_layout_test PRIVATE engine)
