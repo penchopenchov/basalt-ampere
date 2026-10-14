@@ -34,6 +34,8 @@ REPEAT_STOP_TOKENS = 256
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # closes the thinking when the model ends its turn inside it
 REASONING_CLOSE = "\n</think>\n\n"
+QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
+KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
 CTX_SLACK = 8               # the engine rejects prompt + max_new + 8 > context
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
 RATE_WINDOW_S = 2.0
@@ -589,7 +591,31 @@ class Service:
             self.status["queued"] += 1
         try:
             # batch slots run requests concurrently, so no fifo
-            with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
+            turn = contextlib.ExitStack()
+            if not getattr(self.engine, "batch", 0):
+                # A request waiting for the single turn sends a keep-alive now and then, so a client with a stream idle
+                # timeout does not abort a healthy queued request; one that left while queued gives its place up.
+                got = False
+                try:
+                    while not got:
+                        got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                        if got:
+                            turn.callback(self.fifo.release)
+                        elif cancel.is_set():
+                            break
+                        else:
+                            yield "ping", None
+                except BaseException:                    # the consumer closed us at a ping: no longer queued
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                    raise
+                if not got:                              # cancelled while queued
+                    with self.status_lock:
+                        self.status["queued"] -= 1
+                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
+                                   "reasoning_tokens": 0}
+                    return
+            with turn:
                 try:
                     with self.status_lock:
                         self.status["queued"] -= 1
@@ -617,9 +643,12 @@ class Service:
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         ended_thinking = False          # the turn ended inside the thinking
                         try:
+                            # a held-back tool argument can leave the stream silent for long: ping after a quiet spell
+                            last_out = time.monotonic()
                             for t in gen:
                                 if t is None:               # heartbeat
                                     last_print = self._progress(last_print, st=st)
+                                    last_out = time.monotonic()
                                     yield "ping", None
                                     continue
                                 n += 1
@@ -645,6 +674,11 @@ class Service:
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
                                     yield "event", ev
+                                if evs:
+                                    last_out = time.monotonic()
+                                elif time.monotonic() - last_out >= KEEPALIVE_S:
+                                    last_out = time.monotonic()
+                                    yield "ping", None
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine
                                     break
