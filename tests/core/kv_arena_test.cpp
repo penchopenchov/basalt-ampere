@@ -84,6 +84,35 @@ int main() {
     if (!a.map(a.max_cells(), err) || a.cells() != a.max_cells()) return fail("map all", err);
     a.close();
     if (a.valid()) return fail("close");
+
+    // a row array with a tail (the indexer's pooled keys: a row per page and two spare rows) and a table filled from
+    // the host (the rope tables) beside a cache array
+    {
+        constexpr uint64_t kRow = 512, kTab = 128;
+        std::vector<uint8_t> table((size_t) (kPages * kTab));
+        for (size_t i = 0; i < table.size(); ++i) table[i] = (uint8_t) (i * 7 + 3);
+        basalt::core::KvArena b;
+        if (!b.open({kPage * 64, kRow, kPage * kTab / 64}, kPages, kPage, err, {0, 2 * kRow, 0})) return fail("open tail", err);
+        b.set_contents(2, table);
+        if (!b.map(1, err) || b.cells() < kPage) return fail("map one page", err);
+        // the first page and the spare rows past it are backed
+        if (!all(b.array(1), 3 * kRow, 0)) return fail("rows with a tail");
+        const int64_t want = 10000;
+        if (!b.map(want, err) || b.cells() < want) return fail("map tail", err);
+        const uint64_t pages = (uint64_t) b.cells() / kPage;
+        if (!all(b.array(1), (pages + 2) * kRow, 0)) return fail("tail rows backed");
+        std::vector<uint8_t> got((size_t) (pages * kPage * kTab / 64));
+        if (cudaMemcpy(got.data(), b.array(2), got.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return fail("read table");
+        for (size_t i = 0; i < got.size(); ++i)
+            if (got[i] != table[i]) return fail("table filled from the host");
+        // given back and mapped again, the table is filled again; the cells count never runs ahead of the tail
+        if (!b.unmap(0, err) || b.cells() != 0 || !b.map(want, err)) return fail("remap", err);
+        if (cudaMemcpy(got.data(), b.array(2), got.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return fail("read table");
+        for (size_t i = 0; i < got.size(); ++i)
+            if (got[i] != table[i]) return fail("table refilled");
+        if (!b.map(b.max_cells(), err) || b.cells() != b.max_cells() || !all(b.array(1), (kPages + 2) * kRow, 0))
+            return fail("map all with a tail", err);
+    }
     std::puts("kv arena: whole pages backed and zeroed on demand, given back past the cut, addresses fixed");
     return 0;
 }

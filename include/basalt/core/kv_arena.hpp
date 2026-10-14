@@ -19,9 +19,15 @@ public:
     KvArena(const KvArena&) = delete;
     KvArena& operator=(const KvArena&) = delete;
 
-    /// Reserves one range per array, `page_bytes[i] * pages` bytes each (rounded up to the granularity).  Nothing is
-    /// backed yet.  False with `err` when the driver offers no virtual memory management.
-    bool open(const std::vector<uint64_t>& page_bytes, int64_t pages, int64_t page_cells, std::string& err);
+    /// Reserves one range per array, `page_bytes[i] * pages + tail_bytes[i]` bytes each (rounded up to the
+    /// granularity).  The tail is a few rows past the last page that an array keeps once it has any page (the
+    /// indexer's spare rows).  Nothing is backed yet.  False with `err` when the driver offers no virtual memory
+    /// management.
+    bool open(const std::vector<uint64_t>& page_bytes, int64_t pages, int64_t page_cells, std::string& err,
+              const std::vector<uint64_t>& tail_bytes = {});
+    /// Array `i` is a table, not a cache: every byte `map` backs is filled from `bytes` (from the same offset)
+    /// instead of zeroed, as far as `bytes` reaches.
+    void set_contents(size_t i, std::vector<uint8_t> bytes);
     void close();
     bool valid() const { return !arrays_.empty(); }
 
@@ -49,7 +55,9 @@ private:
     struct Array {
         uint8_t* base = nullptr;
         uint64_t page_bytes = 0;
+        uint64_t tail_bytes = 0;
         uint64_t reserved = 0;
+        std::vector<uint8_t> contents;
         std::vector<Extent> extents;   // back to back from offset 0
         uint64_t mapped() const { return extents.empty() ? 0 : extents.back().off + extents.back().bytes; }
     };

@@ -5,12 +5,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <utility>
 
 namespace basalt::core {
 
 KvArena::~KvArena() { close(); }
 
-bool KvArena::open(const std::vector<uint64_t>& page_bytes, int64_t pages, int64_t page_cells, std::string& err) {
+bool KvArena::open(const std::vector<uint64_t>& page_bytes, int64_t pages, int64_t page_cells, std::string& err,
+                   const std::vector<uint64_t>& tail_bytes) {
     close();
     if (pages <= 0 || page_cells <= 0 || page_bytes.empty()) {
         err = "KvArena: empty layout";
@@ -23,10 +25,12 @@ bool KvArena::open(const std::vector<uint64_t>& page_bytes, int64_t pages, int64
     }
     pages_ = pages;
     page_cells_ = page_cells;
-    for (const uint64_t pb : page_bytes) {
+    for (size_t i = 0; i < page_bytes.size(); ++i) {
+        const uint64_t pb = page_bytes[i];
         Array a;
         a.page_bytes = pb;
-        a.reserved = (pb * (uint64_t) pages + gran_ - 1) / gran_ * gran_;
+        a.tail_bytes = i < tail_bytes.size() ? tail_bytes[i] : 0;
+        a.reserved = (pb * (uint64_t) pages + a.tail_bytes + gran_ - 1) / gran_ * gran_;
         a.base = vmm::reserve(a.reserved);
         if (a.base == nullptr) {
             err = "KvArena: cannot reserve the address range of a KV pool";
@@ -36,6 +40,10 @@ bool KvArena::open(const std::vector<uint64_t>& page_bytes, int64_t pages, int64
         arrays_.push_back(a);
     }
     return true;
+}
+
+void KvArena::set_contents(size_t i, std::vector<uint8_t> bytes) {
+    if (i < arrays_.size()) arrays_[i].contents = std::move(bytes);
 }
 
 void KvArena::close() {
@@ -51,12 +59,14 @@ void KvArena::close() {
 
 uint64_t KvArena::need(const Array& a, int64_t cells) const {
     const int64_t pages = std::min<int64_t>(pages_, (std::max<int64_t>(cells, 0) + page_cells_ - 1) / page_cells_);
-    return std::min(a.reserved, ((uint64_t) pages * a.page_bytes + gran_ - 1) / gran_ * gran_);
+    if (pages == 0) return 0;
+    return std::min(a.reserved, ((uint64_t) pages * a.page_bytes + a.tail_bytes + gran_ - 1) / gran_ * gran_);
 }
 
 void KvArena::recount() {
     int64_t pages = pages_;
-    for (const Array& a : arrays_) pages = std::min<int64_t>(pages, (int64_t) (a.mapped() / a.page_bytes));
+    for (const Array& a : arrays_)
+        pages = std::min<int64_t>(pages, (int64_t) ((a.mapped() > a.tail_bytes ? a.mapped() - a.tail_bytes : 0) / a.page_bytes));
     cells_ = pages * page_cells_;
 }
 
@@ -91,7 +101,9 @@ bool KvArena::map(int64_t cells, std::string& err) {
             return false;
         }
         a.extents.push_back({at, want - at, h});
-        if (cudaMemset(a.base + at, 0, (size_t) (want - at)) != cudaSuccess) {
+        const uint64_t have = at < a.contents.size() ? std::min<uint64_t>(want - at, a.contents.size() - at) : 0;
+        if (cudaMemset(a.base + at, 0, (size_t) (want - at)) != cudaSuccess ||
+            (have > 0 && cudaMemcpy(a.base + at, a.contents.data() + at, (size_t) have, cudaMemcpyHostToDevice) != cudaSuccess)) {
             recount();
             err = std::string("zeroing new KV pages failed: ") + cudaGetErrorString(cudaGetLastError());
             return false;
