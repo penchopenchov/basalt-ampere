@@ -5,8 +5,9 @@
 #include "quantize.cuh"
 #include <cstdint>
 
-// One thread quantizes 4 consecutive floats; the 8 threads of a 32-value block share one scale.  Row i of the
-// output is row ids[i] of the input (row i without `ids`).
+// One thread quantizes 4 consecutive floats; the 8 threads of a 32-value block share one scale (and, for DS4, the
+// sum of the block's floats).  Row i of the output is row ids[i] of the input (row i without `ids`).
+template <mmq_q8_1_ds_layout ds_layout>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -47,6 +48,17 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
+    float sum = 0.0f;
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+
+        // Calculate sums across vals_per_scale/4 threads.
+#pragma unroll
+        for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
     const float d_inv = 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
@@ -63,12 +75,16 @@ static __global__ void quantize_mmq_q8_1(
     yqs4[iqs/4] = q;
 
     if (iqs % 32 == 0) {
-        y[ib].d4[iqs/32] = d;
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            y[ib].ds4[iqs/32] = make_half2(d, sum);
+        } else {
+            y[ib].d4[iqs/32]  = d;
+        }
     }
 }
 
 void quantize_mmq_q8_1_cuda(
-        const float * x, const int32_t * ids, void * vy,
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_x,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
@@ -78,5 +94,14 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
-    quantize_mmq_q8_1<<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+    switch (mmq_get_q8_1_ds_layout(type_x)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            break;
+    }
 }

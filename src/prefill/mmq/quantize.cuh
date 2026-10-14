@@ -12,8 +12,9 @@
 
 static_assert(MATRIX_ROW_PADDING % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0, "Risk of out-of-bounds access.");
 
-// Quantizes `ne1` rows of `ne0` floats (row i taken from x + ids[i] * s01 when `ids` is given) to block_q8_1_mmq.
+// Quantizes `ne1` rows of `ne0` floats (row i taken from x + ids[i] * s01 when `ids` is given) to block_q8_1_mmq,
+// in the scale layout the weights of `type_x` multiply against.
 void quantize_mmq_q8_1_cuda(
-        const float * x, const int32_t * ids, void * vy,
+        const float * x, const int32_t * ids, void * vy, ggml_type type_x,
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
