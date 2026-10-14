@@ -284,6 +284,8 @@ bool resident_stage_swaps(basalt::core::FileExpertSource& src, basalt::core::Exp
     return true;
 }
 
+constexpr float kRelaxedDraftingDefault = 0.4f;   // --relaxed-drafting without a value
+
 struct Options {
     std::string model;                ///< --model: the .basalt file every loader reads from
     std::string dump_hc8;             ///< --dump-hc8: write the 8-bit hyper-connection copies here, then exit
@@ -474,6 +476,14 @@ struct Options {
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test);
     /// `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
     int spec = 0;
+    /// --relaxed-drafting [P]: under sampling, a draft the target gives probability >= P is kept even when the target's
+    /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
+    /// docs/precision.md.  Solo decode only; a request's relax=P key overrides it.
+    float relaxed_drafting = 0.0f;
+    /// Never relaxed: the added tokens (control and tool tags, ids from relax_special_from on) and every token
+    /// between the tool-call tags, so tool calls are sampled exactly.
+    int64_t relax_special_from = 248044;
+    int64_t relax_call_open = 248058, relax_call_close = 248059;
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).
@@ -740,6 +750,11 @@ void usage() {
                  "                       usually sets 7)\n"
                  "  --spec-min-p P       a draft enters the window only while it and every draft before it have at\n"
                  "                       least probability P under the drafter (default 0 = always N-1 drafts)\n"
+                 "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
+                 "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
+                 "                       (docs/precision.md).  P in (0, 1]; lower is faster and further from exact;\n"
+                 "                       the flag alone = 0.4.  Tool calls, control tokens, logit_bias and greedy\n"
+                 "                       requests stay exact.  Default off (exact)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
@@ -1465,6 +1480,18 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+        else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
+            o.relaxed_drafting = kRelaxedDraftingDefault;
+            if (i + 1 < argc) {
+                char* e = nullptr;
+                const float v = std::strtof(argv[i + 1], &e);
+                if (e != argv[i + 1] && *e == '\0') {
+                    ++i;
+                    if (!(v > 0.0f && v <= 1.0f)) { std::fprintf(stderr, "--relaxed-drafting: P must be in (0, 1]\n"); return 2; }
+                    o.relaxed_drafting = v;
+                }
+            }
+        }
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
@@ -7190,6 +7217,7 @@ int main(int argc, char** argv) {
             // tuning keys (calibration can measure settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed
             int req_ppl = -1, req_ppl_t = 3;
@@ -7218,6 +7246,7 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "relax") req_relax = std::clamp(fv, 0.0f, 1.0f);
                     else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
@@ -8123,6 +8152,13 @@ int main(int argc, char** argv) {
             }
             ver.set_sampling(req_sp);
             if (mtp_on) mtp.set_draft_sampling(req_sp);   // sampled drafts (a no-op without --coupled-draft)
+            // relaxed acceptance: sampled text requests without a logit_bias; never the quality gate
+            const bool relax_on = req_relax > 0.0f && !req_sp.greedy && !req_bias_present && ppl == nullptr;
+            ver.set_draft_probe(relax_on);
+            bool in_call = false;   // inside a tool call (its tags seen last in the prompt or the output): exact
+            for (size_t i = ids.size(); i-- > 0;)
+                if (ids[i] == o.relax_call_open || ids[i] == o.relax_call_close) { in_call = ids[i] == o.relax_call_open; break; }
+            int64_t relaxed_kept = 0;
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
@@ -8377,7 +8413,26 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 int a = 0;
-                while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (relax_on) {
+                    // a draft the target's draw disagrees with is kept when the target gives it probability >= P,
+                    // outside tool calls and never for an added token; the row then emits the draft
+                    bool call = in_call;
+                    while (a < T - 1) {
+                        const int32_t d = window[(size_t) a + 1];
+                        if (d != outv[(size_t) a]) {
+                            if (call || d >= o.relax_special_from || ver.draft_prob(a) < req_relax) break;
+                            outv[(size_t) a] = d;
+                            ++relaxed_kept;
+                        }
+                        if (d == o.relax_call_open) call = true;
+                        else if (d == o.relax_call_close) call = false;
+                        ++a;
+                    }
+                    for (int i = 0; i <= a; ++i)
+                        if (outv[(size_t) i] == o.relax_call_open) in_call = true;
+                        else if (outv[(size_t) i] == o.relax_call_close) in_call = false;
+                } else
+                    while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (ppl != nullptr) {   // every row scored and committed
                     a = T - 1;
                     for (int t = 0; t < T; ++t) {
@@ -8829,6 +8884,9 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (relax_on)
+                std::fprintf(stderr, "basalt serve: relaxed drafting %.2f: %lld of the %lld accepted drafts were kept by it\n",
+                             (double) req_relax, (long long) relaxed_kept, (long long) draft_accepted);
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU to
             // read (--pcie-frac) are in neither count, so that share is said beside it (raising --pcie-frac raises the
             // hit rate while the PCIe reads may make the decode slower)
