@@ -489,6 +489,12 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     }
     return p;
 }
+// A state is elastic when the process asks for it and its K/V is whole in VRAM: the K/V pools, the indexer's pooled
+// keys and the rope tables then live in the state's arena, backed by prefix.  The pooled keys are one row per
+// idx_block cells, so they page with the K/V only when a page holds a whole number of rows.
+bool kv_elastic_state(const QsaShapes& s, const KvPlan& p) {
+    return g_kv_elastic > 0 && p.mode == 0 && s.idx_block > 0 && s.page_size % s.idx_block == 0;
+}
 uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
@@ -510,16 +516,17 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
-    if (!(g_kv_elastic > 0 && p.mode == 0 && ring_cells == 0))   // elastic: the pools live in their own ranges
+    const bool elastic = kv_elastic_state(s, p);   // elastic: pools, pooled keys and rope live in their own ranges
+    if (!elastic)
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
     if (p.mode == 1) n += basalt::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
+    if (!elastic) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;               // pooled
     n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    if (with_rope && !elastic) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;   // cos + sin tables
     n += basalt::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
@@ -550,7 +557,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_arena = nullptr;
-    if (g_kv_elastic > 0 && p.mode == 0 && ring_cells == 0) {
+    std::vector<uint8_t> rope_cos_host, rope_sin_host;   // the rope table, kept to fill the arena as it grows
+    if (kv_elastic_state(s, p)) {
         // the same arrays, each in its own reserved range: per page, the row bytes of each array
         const uint64_t pr = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
@@ -559,14 +567,47 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         else if (st.kv_q4) page_bytes = {pr * q4_row, pr * q4_row};
         else if (st.kv_int8) page_bytes = {code, code, scale, scale};
         else page_bytes = {code * 2, code * 2};
+        const size_t n_kv = page_bytes.size();
+        // then the indexer's pooled keys (one row per idx_block cells, two spare rows past the last block) and, for
+        // the state that owns the rope table, its cos and sin rows
+        const uint64_t row = (uint64_t) s.idx_dim * 4, rope_row = (uint64_t) (s.n_rot / 2) * 4;
+        page_bytes.push_back((uint64_t) (s.page_size / s.idx_block) * row);
+        std::vector<uint64_t> tails(page_bytes.size(), 0);
+        tails.back() = 2 * row;
+        if (share_rope == nullptr) {
+            page_bytes.push_back((uint64_t) s.page_size * rope_row);
+            page_bytes.push_back((uint64_t) s.page_size * rope_row);
+            tails.resize(page_bytes.size(), 0);
+        }
+        // the table is built on the host (as below) and kept by the arena, which fills each page it maps from it
+        if (share_rope == nullptr) {
+            rope_cos_host.resize((size_t) max_cells * rope_row);
+            rope_sin_host.resize((size_t) max_cells * rope_row);
+            basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
+                                              (float*) rope_cos_host.data(), (float*) rope_sin_host.data());
+        }
         KvArena* a = new KvArena();
         std::string err;
-        if (!a->open(page_bytes, pages, s.page_size, err) || !a->map(std::min(g_kv_elastic, max_cells), err)) {
+        if (!a->open(page_bytes, pages, s.page_size, err, tails)) {
+            std::fprintf(stderr, "basalt: elastic KV: %s\n", err.c_str());
+            delete a;
+            return 0;
+        }
+        if (share_rope == nullptr) {
+            a->set_contents(n_kv + 1, std::move(rope_cos_host));
+            a->set_contents(n_kv + 2, std::move(rope_sin_host));
+        }
+        if (!a->map(std::min(g_kv_elastic, max_cells), err)) {
             std::fprintf(stderr, "basalt: elastic KV: %s\n", err.c_str());
             delete a;
             return 0;
         }
         st.kv_arena = a;
+        st.idx_pooled = (float*) a->array(n_kv);
+        if (share_rope == nullptr) {
+            st.cos_tab = (float*) a->array(n_kv + 1);
+            st.sin_tab = (float*) a->array(n_kv + 2);
+        }
         if (st.kv_hybrid) {
             st.k_q = (int8_t*) a->array(0); st.k_scale = (uint16_t*) a->array(1); st.v_q4 = a->array(2);
         } else if (st.kv_q4) {
@@ -611,12 +652,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (st.kv_arena == nullptr) st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
-    } else {
+    } else if (st.kv_arena == nullptr) {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
     }
@@ -667,11 +708,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
     if (share_rope == nullptr) {
-        std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
-        basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
-                                          hc.data(), hs.data());
-        cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+        if (st.kv_arena == nullptr) {   // an elastic state's arena is filled from the table as it maps
+            std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
+            basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
+                                              hc.data(), hs.data());
+            cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+        }
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp)
             basalt::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, basalt::kernels::rope_scaling());
@@ -727,7 +770,10 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     if (st.kv_mode == 1) basalt::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
-    cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    // elastic: the pooled rows of the backed pages and the spare rows past them (mapping more zeroes the rest)
+    const int64_t pooled_rows =
+        st.kv_arena != nullptr ? std::min(st.idx_pooled_rows, st.kv_arena->cells() / s.idx_block + 2) : st.idx_pooled_rows;
+    cudaMemsetAsync(st.idx_pooled, 0, (size_t) pooled_rows * s.idx_dim * 4, cs);
 }
 
 basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
