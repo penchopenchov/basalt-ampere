@@ -334,6 +334,310 @@ __global__ void __launch_bounds__(512) q6k_proxy_final_kernel(const Q6KBlock* __
     px::pick(f, n, n_tiles, map, part, out_id, out_prob);
 }
 
+// ---- the verify head: a 2-bit copy of every row scored on the tensor cores, then exact rescoring near the top
+
+// Copy layout, per tile of 16 rows and quad q of 32-weight groups (groups 4q..4q+3): one uint4 of levels per lane of
+// an m16n8k32 A fragment (word k: group 4q+k), then per row pair (g, g + 8) a uint4 of four half2 scales.  Word k of
+// lane (g, t) holds the levels of rows g and g + 8 at k-offsets 4t..4t+3 and 16+4t..16+4t+3: register r of the
+// fragment is (word >> 2r) & 0x03030303.
+constexpr int VQ = 20;               // group quads per row
+constexpr int VHIST = 1024;          // bins per column of the block-maximum histogram
+constexpr float VBIN = 8.0f;         // bins per logit unit, centred on zero
+constexpr int VCAP = 65536;          // rows rescored per call at most
+constexpr float VDELTA = 4.0f;       // rescored: within this of the column's 64th best (approximate) logit
+constexpr int VKEEP = 64;            // the sampler's widest list
+
+__host__ __device__ inline size_t vtiles(int64_t n) { return (size_t) (n / 16); }
+__host__ __device__ inline size_t vlevels_bytes(int64_t n) { return vtiles(n) * VQ * 32 * 16; }
+
+struct VScratch {   // each kernel's last block leaves its part zeroed for the next call
+    unsigned hist[8][VHIST];
+    float thr[8];
+    unsigned count, done_score, done_rescore;
+};
+
+__device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+}
+
+// One thread per (row, group): the group's dequantized Q6_K values fitted as head_proxy.cuh fits them, its levels
+// or-ed into the zeroed copy.
+__global__ void q6k_vproxy_pack_kernel(const Q6KBlock* __restrict__ q6, int64_t n, uint32_t* __restrict__ wq,
+                                       __half* __restrict__ sc) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * 80) return;
+    const int64_t row = i / 80;
+    const int g = (int) (i % 80);
+    const Q6KBlock* b = q6 + (size_t) row * BPR + g / 8;
+    const float d = __half2float(b->d);
+    float w[32];
+    for (int l = 0; l < 32; ++l) {
+        const int k = (g % 8) * 32 + l;
+        const int h = k / 128, quarter = (k % 128) / 32, ll = k % 32;
+        const int lo = (b->ql[64 * h + ll + 32 * (quarter & 1)] >> (4 * (quarter >> 1))) & 0xF;
+        const int hi = (b->qh[32 * h + ll] >> (2 * quarter)) & 3;
+        w[l] = d * (float) b->scales[8 * h + ll / 16 + 2 * quarter] * (float) ((lo | (hi << 4)) - 32);
+    }
+    float sh;
+    const __half hs = px::fit_group<true>(w, sh);
+    const size_t tile = (size_t) (row >> 4);
+    const int rr = (int) (row & 15), gg = rr & 7, hi8 = rr >> 3, q = g / 4, k = g % 4;
+    for (int t = 0; t < 4; ++t) {
+        uint32_t word = 0u;
+        for (int half = 0; half < 2; ++half)   // registers hi8 (k-offsets 4t..) and 2 + hi8 (16 + 4t..)
+            for (int bb = 0; bb < 4; ++bb)
+                word |= (uint32_t) px::level(w[16 * half + 4 * t + bb], sh) << (8 * bb + 2 * (2 * half + hi8));
+        atomicOr(wq + ((tile * VQ + q) * 32 + gg * 4 + t) * 4 + k, word);
+    }
+    sc[(((tile * VQ + q) * 8 + gg) * 4 + k) * 2 + hi8] = hs;
+}
+
+// Approximate logits of every row into y, persistent blocks of four warps; warp w holds groups 20w..20w+19 of every
+// tile (its column fragments stay in registers) and the block adds the four partial sums in warp order.  Each block
+// adds its per-column maximum to the histogram.
+template <int NC>
+__global__ void __launch_bounds__(128) q6k_vscore_kernel(const uint4* __restrict__ wq, const uint4* __restrict__ sc,
+                                                         const Q81Block* __restrict__ x, float* __restrict__ y,
+                                                         int n_out, VScratch* __restrict__ vs) {
+    __shared__ float4 xf[80][4];   // per group and column pair: the two scales, then -1.5 x scale x sum of q
+    __shared__ float red[4][16][9];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int n_tiles = n_out / 16;
+    int tile = blockIdx.x;
+    uint4 cw[5], cs[5];
+    if (tile < n_tiles) {
+#pragma unroll
+        for (int j = 0; j < 5; ++j) {   // constant data: read before the wait
+            cw[j] = __ldcs(wq + ((size_t) tile * VQ + warp * 5 + j) * 32 + lane);
+            cs[j] = __ldcs(sc + ((size_t) tile * VQ + warp * 5 + j) * 8 + g);
+        }
+    }
+    pdl_wait();
+    for (int i = tid; i < 80 * 8; i += 128) {
+        const int grp = i >> 3, col = i & 7;
+        float dd = 0.0f, xs = 0.0f;
+        if (col < NC) {
+            const Q81Block* b = x + (size_t) col * 80 + grp;
+            const int* q = reinterpret_cast<const int*>(b->qs);
+            int sum = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) sum = DP4A(0x01010101, q[k], sum);
+            dd = __low2float(b->ds);
+            xs = -1.5f * dd * (float) sum;
+        }
+        float* f = reinterpret_cast<float*>(&xf[grp][col >> 1]);
+        f[col & 1] = dd;
+        f[2 + (col & 1)] = xs;
+    }
+    uint32_t bf[20][2];
+#pragma unroll
+    for (int j = 0; j < 20; ++j) {
+        const int grp = warp * 20 + j;
+        if (g < NC) {
+            const int* q = reinterpret_cast<const int*>(x[(size_t) g * 80 + grp].qs);
+            bf[j][0] = (uint32_t) __ldg(q + t);
+            bf[j][1] = (uint32_t) __ldg(q + 4 + t);
+        } else {
+            bf[j][0] = bf[j][1] = 0u;
+        }
+    }
+    __syncthreads();
+    const int orow = tid & 15, ocol = tid >> 4;
+    float vmax = __int_as_float(0xff800000);
+    for (; tile < n_tiles; tile += gridDim.x) {
+        const int nt = tile + gridDim.x;
+        uint4 nw[5], ns[5];
+        if (nt < n_tiles) {
+#pragma unroll
+            for (int j = 0; j < 5; ++j) {
+                nw[j] = __ldcs(wq + ((size_t) nt * VQ + warp * 5 + j) * 32 + lane);
+                ns[j] = __ldcs(sc + ((size_t) nt * VQ + warp * 5 + j) * 8 + g);
+            }
+        }
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int j = 0; j < 5; ++j) {
+            const uint32_t ww[4] = {cw[j].x, cw[j].y, cw[j].z, cw[j].w};
+            const uint32_t ss[4] = {cs[j].x, cs[j].y, cs[j].z, cs[j].w};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int jj = j * 4 + k;
+                const uint32_t a[4] = {ww[k] & 0x03030303u, (ww[k] >> 2) & 0x03030303u, (ww[k] >> 4) & 0x03030303u,
+                                       (ww[k] >> 6) & 0x03030303u};
+                int c[4];
+                mma_s8(c, a, bf[jj][0], bf[jj][1]);
+                const float4 f = xf[warp * 20 + jj][t];
+                const float2 s2 = __half22float2(*reinterpret_cast<const half2*>(&ss[k]));
+                acc[0] += s2.x * fmaf(f.x, (float) c[0], f.z);
+                acc[1] += s2.x * fmaf(f.y, (float) c[1], f.w);
+                acc[2] += s2.y * fmaf(f.x, (float) c[2], f.z);
+                acc[3] += s2.y * fmaf(f.y, (float) c[3], f.w);
+            }
+        }
+        red[warp][g][2 * t] = acc[0];
+        red[warp][g][2 * t + 1] = acc[1];
+        red[warp][g + 8][2 * t] = acc[2];
+        red[warp][g + 8][2 * t + 1] = acc[3];
+        __syncthreads();
+        if (ocol < NC) {
+            const float v = ((red[0][orow][ocol] + red[1][orow][ocol]) + red[2][orow][ocol]) + red[3][orow][ocol];
+            y[(size_t) ocol * n_out + (size_t) tile * 16 + orow] = v;
+            vmax = fmaxf(vmax, v);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < 5; ++j) { cw[j] = nw[j]; cs[j] = ns[j]; }
+    }
+    // the block's column maxima (16 lanes per column) into the histogram
+#pragma unroll
+    for (int o = 8; o; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+    if ((lane & 15) == 0 && ocol < NC && vmax > __int_as_float(0xff800000)) {
+        const int bin = min(VHIST - 1, max(0, (int) floorf(vmax * VBIN) + VHIST / 2));
+        atomicAdd(&vs->hist[ocol][bin], 1u);
+    }
+    // the last block: each column's threshold, the lower edge of the bin holding the 64th largest block maximum
+    // (so at or below the 64th largest logit) less VDELTA; then the histogram is cleared
+    __shared__ bool last;
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        last = atomicAdd(&vs->done_score, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    for (int c = warp; c < NC; c += 4) {
+        unsigned v[VHIST / 32], tot[VHIST / 32];   // lane l of row i: bin 32 i + l
+#pragma unroll
+        for (int i = 0; i < VHIST / 32; ++i) v[i] = __ldcg(&vs->hist[c][i * 32 + lane]);
+#pragma unroll
+        for (int i = 0; i < VHIST / 32; ++i) tot[i] = __reduce_add_sync(0xffffffffu, v[i]);
+        unsigned run = 0, row_v = 0;
+        int row = -1;
+#pragma unroll
+        for (int i = VHIST / 32 - 1; i >= 0; --i)
+            if (row < 0) {
+                if (run + tot[i] >= (unsigned) VKEEP) { row = i; row_v = v[i]; }
+                else run += tot[i];
+            }
+        int bin = -1;
+        if (row >= 0) {
+            unsigned suf = row_v;   // this bin's count and those of the bins above it in the row
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const unsigned u = __shfl_down_sync(0xffffffffu, suf, o);
+                if (lane + o < 32) suf += u;
+            }
+            const unsigned m = __ballot_sync(0xffffffffu, run + suf >= (unsigned) VKEEP);
+            bin = row * 32 + 31 - __clz((int) m);
+        }
+        if (lane == 0)   // fewer than VKEEP maxima, or the lowest bin: every row
+            vs->thr[c] = bin > 0 ? (float) (bin - VHIST / 2) / VBIN - VDELTA : __int_as_float(0xff800000);
+        for (int i = lane; i < VHIST; i += 32) vs->hist[c][i] = 0u;
+    }
+    if (tid == 0) vs->done_score = 0u;
+}
+
+// The (row, column) pairs at or above the column's threshold, listed.
+__global__ void __launch_bounds__(256) q6k_vselect_kernel(const float* __restrict__ y, int n_out, int ncols,
+                                                          VScratch* __restrict__ vs, uint32_t* __restrict__ list) {
+    __shared__ float thr[8];
+    const int tid = threadIdx.x, lane = tid & 31;
+    pdl_wait();
+    if (tid < ncols) thr[tid] = __ldcg(&vs->thr[tid]);
+    __syncthreads();
+    const int n4 = n_out / 4;
+    const int total = ncols * n4;
+    for (int i0 = blockIdx.x * blockDim.x; i0 < total; i0 += gridDim.x * blockDim.x) {
+        const int i = i0 + tid;
+        unsigned m = 0u;
+        int col = 0, r4 = 0;
+        if (i < total) {
+            col = i / n4;
+            r4 = i - col * n4;
+            const float4 v = __ldcg(reinterpret_cast<const float4*>(y + (size_t) col * n_out) + r4);
+            const float th = thr[col];
+            m = (v.x >= th ? 1u : 0u) | (v.y >= th ? 2u : 0u) | (v.z >= th ? 4u : 0u) | (v.w >= th ? 8u : 0u);
+        }
+        const int cnt = __popc(m);
+        int pre = cnt;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, pre, o);
+            if (lane >= o) pre += v;
+        }
+        const int wtot = __shfl_sync(0xffffffffu, pre, 31);
+        if (wtot == 0) continue;
+        unsigned base = 0;
+        if (lane == 31) base = atomicAdd(&vs->count, (unsigned) wtot);
+        base = __shfl_sync(0xffffffffu, base, 31) + (unsigned) (pre - cnt);
+        for (int b = 0; b < 4; ++b)
+            if (m & (1u << b)) {
+                if (base < (unsigned) VCAP) list[base] = ((uint32_t) col << 18) | (uint32_t) (4 * r4 + b);
+                ++base;
+            }
+    }
+}
+
+// The listed rows' exact logits (q6k_rows' bits), a warp per (row, column); the last block clears the count.
+__global__ void __launch_bounds__(512) q6k_vrescore_kernel(const Q6KBlock* __restrict__ w,
+                                                           const Q81Block* __restrict__ x, float* __restrict__ y,
+                                                           int n_out, int ncols, VScratch* __restrict__ vs,
+                                                           const uint32_t* __restrict__ list) {
+    extern __shared__ __align__(16) int2 xv[];
+    __shared__ bool last;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    pdl_wait();
+    for (int i = tid; i < ncols * XBLK * 8; i += blockDim.x) {
+        const int b = i / 8, pos = i % 8;
+        const Q81Block* blk = x + b;
+        const unsigned dsb = __ldg(reinterpret_cast<const unsigned*>(&blk->ds));
+        xv[i] = make_int2(__ldg(reinterpret_cast<const int*>(blk->qs) + pos),
+                          __float_as_int(__low2float(*reinterpret_cast<const half2*>(&dsb))));
+    }
+    __syncthreads();
+    const unsigned n = min(__ldcg(&vs->count), (unsigned) VCAP);
+    for (unsigned c = blockIdx.x * 16 + warp; c < n; c += gridDim.x * 16) {
+        const uint32_t e = __ldcg(list + c);
+        const int row = (int) (e & 0x3ffffu), col = (int) (e >> 18);
+        const float v = q6k_row_one(w + (size_t) row * BPR, xv + (size_t) col * XBLK * 8, lane);
+        if (lane == 0) y[(size_t) col * n_out + row] = v;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        last = atomicAdd(&vs->done_rescore, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (last && tid == 0) { vs->count = 0u; vs->done_rescore = 0u; }
+}
+
+// One grid size for every column count: the blocks' rows, so their maxima and the thresholds, and with them which rows
+// are exact, do not depend on the window's width.
+int vscore_grid(int n_out) {
+    static int grid_max[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
+    if (grid_max[dev] == 0) {
+        int sms = 0, per_sm = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, q6k_vscore_kernel<8>, 128, 0);
+        grid_max[dev] = (sms > 0 ? sms : 1) * (per_sm > 0 ? per_sm : 1);
+    }
+    const int tiles = n_out / 16;
+    return tiles < grid_max[dev] ? tiles : grid_max[dev];
+}
+
+template <int NC>
+void vscore_launch(const void* proxy, const void* x, float* y, int n_out, VScratch* vs, cudaStream_t s) {
+    const unsigned grid = (unsigned) vscore_grid(n_out);
+    const uint4* wq = (const uint4*) proxy;
+    const uint4* sc = (const uint4*) ((const char*) proxy + vlevels_bytes(n_out));
+    launch_pdl(q6k_vscore_kernel<NC>, dim3(grid), dim3(128), 0, s, wq, sc, (const Q81Block*) x, y, n_out, vs);
+}
+
 }  // namespace
 
 bool q6k_head_supported(int n_in, int ncols) { return n_in == BPR * QK && ncols >= 1 && ncols <= 8; }
@@ -422,6 +726,69 @@ bool q6k_proxy_top1(const void* proxy, const void* q6k_rows, const void* x_q8_1,
         std::exit(1);
     }
     return true;
+}
+
+size_t q6k_vproxy_bytes(int64_t n) { return n > 0 && n % 16 == 0 ? vlevels_bytes(n) + vtiles(n) * VQ * 8 * 16 : 0; }
+
+void q6k_vproxy_pack(const void* q6k_rows, int64_t n, void* proxy, void* stream) {
+    if (n <= 0 || n % 16 != 0) {
+        std::fprintf(stderr, "q6k_vproxy_pack: %lld rows (a positive multiple of 16)\n", (long long) n);
+        std::exit(1);
+    }
+    const auto s = (cudaStream_t) stream;
+    cudaMemsetAsync(proxy, 0, vlevels_bytes(n), s);
+    const int64_t total = n * 80;
+    q6k_vproxy_pack_kernel<<<(unsigned) ((total + 127) / 128), 128, 0, s>>>(
+        (const Q6KBlock*) q6k_rows, n, (uint32_t*) proxy, (__half*) ((char*) proxy + vlevels_bytes(n)));
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "q6k_vproxy_pack: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+size_t q6k_vhead_scratch_bytes() { return sizeof(VScratch) + (size_t) VCAP * sizeof(uint32_t); }
+
+bool q6k_vhead_supported(int n_in, int n_out, int ncols) {
+    return n_in == BPR * QK && n_out > 0 && n_out % 16 == 0 && n_out <= (1 << 18) && ncols >= 1 && ncols <= 8;
+}
+
+void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+               void* scratch, void* stream) {
+    if (!q6k_vhead_supported(n_in, n_out, ncols) || !proxy || !weights || !x_q8_1 || !y || !scratch) {
+        std::fprintf(stderr, "q6k_vhead: unsupported shape (n_in %d, n_out %d, ncols %d)\n", n_in, n_out, ncols);
+        std::exit(1);
+    }
+    const auto s = (cudaStream_t) stream;
+    VScratch* vs = (VScratch*) scratch;
+    uint32_t* list = (uint32_t*) ((char*) scratch + sizeof(VScratch));
+    switch (ncols) {
+        case 1: vscore_launch<1>(proxy, x_q8_1, y, n_out, vs, s); break;
+        case 2: vscore_launch<2>(proxy, x_q8_1, y, n_out, vs, s); break;
+        case 3: vscore_launch<3>(proxy, x_q8_1, y, n_out, vs, s); break;
+        case 4: vscore_launch<4>(proxy, x_q8_1, y, n_out, vs, s); break;
+        case 5: vscore_launch<5>(proxy, x_q8_1, y, n_out, vs, s); break;
+        case 6: vscore_launch<6>(proxy, x_q8_1, y, n_out, vs, s); break;
+        case 7: vscore_launch<7>(proxy, x_q8_1, y, n_out, vs, s); break;
+        default: vscore_launch<8>(proxy, x_q8_1, y, n_out, vs, s); break;
+    }
+    static int sms[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
+    if (sms[dev] == 0) {
+        cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
+        cudaFuncSetAttribute(q6k_vrescore_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * XBLK * 8 * (int) sizeof(int2));
+        if (sms[dev] <= 0) sms[dev] = 1;
+    }
+    launch_pdl(q6k_vselect_kernel, dim3((unsigned) sms[dev] * 2), dim3(256), 0, s, (const float*) y, n_out, ncols, vs,
+               list);
+    launch_pdl(q6k_vrescore_kernel, dim3((unsigned) sms[dev]), dim3(512), (size_t) ncols * XBLK * 8 * sizeof(int2), s,
+               (const Q6KBlock*) weights, (const Q81Block*) x_q8_1, y, n_out, ncols, vs, (const uint32_t*) list);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "q6k_vhead: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
 }
 
 }  // namespace basalt::kernels

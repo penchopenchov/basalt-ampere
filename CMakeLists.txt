@@ -569,6 +569,10 @@ add_executable(q6k_head_parity src/kernels/q6k_head_parity.cpp)
 target_include_directories(q6k_head_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(q6k_head_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME q6k_head_parity COMMAND q6k_head_parity 20000 5)
+add_executable(q6k_vhead_parity src/kernels/q6k_vhead_parity.cpp)
+target_include_directories(q6k_vhead_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q6k_vhead_parity PRIVATE kernels ${_gpu_runtime_target})
+add_test(NAME q6k_vhead_parity COMMAND q6k_vhead_parity 20000 5)
 
 # KV streaming: streamed vs resident attention, bitwise (GPU, synthetic, no model).
 add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)

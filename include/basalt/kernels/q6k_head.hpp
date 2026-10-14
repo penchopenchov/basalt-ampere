@@ -30,4 +30,19 @@ void q6k_proxy_pack(const void* q6k_rows, int64_t row0, int64_t n, void* proxy, 
 bool q6k_proxy_top1(const void* proxy, const void* q6k_rows, const void* x_q8_1, int n_rows, int64_t n_cap,
                     const int32_t* map, int* out_id, float* out_prob, void* scratch, void* stream);
 
+/// The verify head's 2-bit copy of all n rows of a Q6_K head (n_in 2560, n a multiple of 16), fitted as the draft
+/// copy (head_proxy.cuh) and laid out for int8 tensor-core scoring; q6k_vproxy_bytes(n) bytes.
+size_t q6k_vproxy_bytes(int64_t n);
+void q6k_vproxy_pack(const void* q6k_rows, int64_t n, void* proxy, void* stream);
+
+/// The two-stage verify head for 1..8 columns: y[j * n_out + r] is row r's approximate logit from the copy, except
+/// for the rows within a margin of column j's 64th largest approximate logit, which are rescored exactly (the bits of
+/// q6k_head_mmvq).  The sampler's top-k list and the argmax come from the exact rows; the other rows keep their
+/// approximate logits, so log-probabilities stay finite.  `scratch`: q6k_vhead_scratch_bytes(), zeroed once before
+/// first use (each call leaves it zeroed).
+size_t q6k_vhead_scratch_bytes();
+bool q6k_vhead_supported(int n_in, int n_out, int ncols);
+void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+               void* scratch, void* stream);
+
 }  // namespace basalt::kernels
