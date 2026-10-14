@@ -419,6 +419,9 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
+    uint32_t* hist = nullptr;                // routed-entry counts per (layer, expert); see route_hist_reset
+    int64_t hist_n = 0, hist_tokens = 0;
+    bool hist_on = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
@@ -1201,6 +1204,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    if (m.hist_on) m.hist_tokens += n;
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
@@ -1693,6 +1697,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    if (m.hist_on) route_count(m.ids, T * K, m.hist + l * m.g->n_expert, (int) m.g->n_expert, m.cs);
                     // the shared expert and its scalar gate
                     if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                     if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
@@ -2452,6 +2457,43 @@ bool Prefill::drain_pipeline(std::string& err) {
     }
 
     return ok;
+}
+
+void Prefill::route_hist_reset() {
+    Impl& m = *impl_;
+    if (m.g == nullptr) return;
+    {
+        const core::OnDevice od(m.device);
+        if (m.hist == nullptr) {
+            m.hist_n = m.g->n_layers * m.g->n_expert;
+            if (cudaMalloc((void**) &m.hist, (size_t) m.hist_n * 4) != cudaSuccess) { m.hist = nullptr; m.hist_on = false; }
+            else m.owned.push_back(m.hist);
+        }
+        if (m.hist != nullptr) {
+            cudaStreamSynchronize(m.cs);
+            cudaMemset(m.hist, 0, (size_t) m.hist_n * 4);
+        }
+        m.hist_tokens = 0;
+        m.hist_on = m.hist != nullptr;
+    }
+    if (next_ != nullptr) next_->route_hist_reset();
+}
+
+bool Prefill::route_hist_take(std::vector<uint32_t>& out, int64_t& tokens) {
+    Impl& m = *impl_;
+    if (!m.hist_on) return false;
+    m.hist_on = false;
+    {
+        const core::OnDevice od(m.device);
+        cudaStreamSynchronize(m.cs);
+        std::vector<uint32_t> h((size_t) m.hist_n);
+        if (cudaMemcpy(h.data(), m.hist, (size_t) m.hist_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+        if (out.size() != h.size()) out.assign(h.size(), 0u);
+        for (size_t i = 0; i < h.size(); ++i) out[i] += h[i];
+        tokens = std::max(tokens, m.hist_tokens);
+    }
+    if (next_ != nullptr) next_->route_hist_take(out, tokens);
+    return true;
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {

@@ -21,6 +21,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace basalt::core { class PeerExperts; }
 namespace basalt::kernels::cpu { class ExpertPool; }
@@ -104,6 +105,13 @@ public:
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
     const PrefillStats& stats() const { return stats_; }
+
+    /// Starts counting, per (layer, expert), the routed entries of the prompt rows this stage and the stages after it
+    /// read, from zero.  Call with the stream idle (between requests).
+    void route_hist_reset();
+    /// Adds the counts since `route_hist_reset` (n_layers x n_expert, each stage fills its own layers) into `out`
+    /// and the prompt tokens they cover into `tokens`, and stops counting.  False when counting was not started.
+    bool route_hist_take(std::vector<uint32_t>& out, int64_t& tokens);
 
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for

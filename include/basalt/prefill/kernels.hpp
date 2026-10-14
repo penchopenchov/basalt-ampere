@@ -51,6 +51,8 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
+/// hist[e] += the number of the `n` routed ids equal to e (ids outside [0, n_expert) are skipped).
+void route_count(const int32_t* ids, int64_t n, uint32_t* hist, int n_expert, void* stream);
 /// Expert blob (the engine pack layout, Q2_0) -> BF16 matrices: gate/up interleaved [1280, 2560], down [2560, 640].
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)

@@ -935,6 +935,16 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
         basalt::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
 }
+__global__ void route_count_kernel(const int32_t* __restrict__ ids, int64_t n, uint32_t* __restrict__ hist, int n_expert) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        const int32_t e = ids[i];
+        if (e >= 0 && e < n_expert) atomicAdd(hist + e, 1u);
+    }
+}
+void route_count(const int32_t* ids, int64_t n, uint32_t* hist, int n_expert, void* stream) {
+    route_count_kernel<<<(unsigned) std::min<int64_t>(64, (n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(ids, n, hist, n_expert);
+    check("route_count");
+}
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);
     check("blob_dequant");
