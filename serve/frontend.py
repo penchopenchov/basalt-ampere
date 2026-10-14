@@ -519,6 +519,7 @@ class OutputParser:
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
+        self.rtail = ""              # last reasoning character sent
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
         self.stream_tools = stream_tools
@@ -661,6 +662,23 @@ class OutputParser:
         self.ss = "done"
         return out
 
+    def _reasoning(self, text: str) -> Event:
+        """A reasoning event for text going out; remembers its last character for the quote check."""
+        self.rtail = text[-1:] or self.rtail
+        return Event("reasoning", text)
+
+    def _quoted_think_end(self, i: int) -> bool | None:
+        """Whether the `</think>` at self.buf[i] is the model quoting the tag while it thinks: written right after a
+        quote or backtick and followed by anything but a line break. None while the character after it has not
+        arrived."""
+        before = self.buf[i - 1] if i else self.rtail
+        if before not in ('"', "'", "`"):
+            return False
+        after = self.buf[i + len(THINK_END):]
+        if not after:
+            return None
+        return after[0] not in "\r\n"
+
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
         best = 0
@@ -679,11 +697,21 @@ class OutputParser:
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END,))
                     if len(self.buf) > keep:
-                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
+                        out.append(self._reasoning(self.buf[:len(self.buf) - keep]))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
+                quoted = self._quoted_think_end(i)
+                if quoted is None:                   # held like a partial tag until the character after it is here
+                    if i:
+                        out.append(self._reasoning(self.buf[:i]))
+                        self.buf = self.buf[i:]
+                    return out
+                if quoted:                           # a quoted tag is reasoning text
+                    out.append(self._reasoning(self.buf[:i + len(THINK_END)]))
+                    self.buf = self.buf[i + len(THINK_END):]
+                    continue
                 if i:
-                    out.append(Event("reasoning", self.buf[:i]))
+                    out.append(self._reasoning(self.buf[:i]))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
                 self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
@@ -750,6 +778,8 @@ class OutputParser:
             self.buf = ""
             self._reset_scan()
             return out
+        if self.state == "reasoning" and self.buf == THINK_END:     # the output ends on a held tag: the thinking's end
+            self.buf, self.state = "", "content"
         if self.buf:
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
