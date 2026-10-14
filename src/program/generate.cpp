@@ -284,7 +284,7 @@ bool resident_stage_swaps(basalt::core::FileExpertSource& src, basalt::core::Exp
     return true;
 }
 
-constexpr float kRelaxedDraftingDefault = 0.4f;   // --relaxed-drafting without a value
+constexpr float kRelaxedDraftingDefault = 0.5f;   // --relaxed-drafting without a value
 
 struct Options {
     std::string model;                ///< --model: the .basalt file every loader reads from
@@ -753,7 +753,7 @@ void usage() {
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
                  "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
                  "                       (docs/precision.md).  P in (0, 1]; lower is faster and further from exact;\n"
-                 "                       the flag alone = 0.4.  Tool calls, control tokens, logit_bias and greedy\n"
+                 "                       the flag alone = 0.5.  Tool calls, control tokens, logit_bias and greedy\n"
                  "                       requests stay exact.  Default off (exact)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
