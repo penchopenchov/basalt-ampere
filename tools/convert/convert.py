@@ -288,6 +288,14 @@ def convert(a) -> None:
     print(f"done: {len(job.rows)} sections, {total / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
 
 
+def warn_unofficial():
+    msg = ("WARNING: packs converted yourself are significantly slower than the official .basalt files. "
+           "Download them from https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt")
+    if sys.stderr.isatty():
+        msg = f"\033[1;31m{msg}\033[0m"
+    print(msg, file=sys.stderr, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf", required=True, action="append", metavar="FILE",
@@ -309,6 +317,7 @@ def main():
     a = ap.parse_args()
     if not a.no_vision and not a.mmproj:
         ap.error("--mmproj is required unless --no-vision")
+    warn_unofficial()
     convert(a)
 
 
