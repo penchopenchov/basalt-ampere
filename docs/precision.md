@@ -8,7 +8,7 @@ tier, 32 GB of system RAM.
 
 ## Summary
 
-- **MTP does not change output.** With the expert tiers pinned, 275 of 275 greedy prompts produced identical tokens on
+- **MTP does not change output** (unless `--relaxed-drafting` is set: [see below](#relaxed-drafting)). With the expert tiers pinned, 275 of 275 greedy prompts produced identical tokens on
   both packs tested, and every full-vocabulary fp32 logit row (62,271 and 60,878) was bit-identical between `--spec 0`
   and `--spec 7`.
 - **KLD matches llama.cpp.** On the same GGUFs against the same base, Basalt and llama.cpp's own `llama-perplexity`
@@ -232,7 +232,97 @@ against the base.
   same for spec 0 and spec 7.
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
 
-## Quality against Q8_0
+## Relaxed drafting
+
+`--relaxed-drafting P` (opt-in; off by default) gives up the guarantee above for sampled requests. In exact mode a draft
+is kept only when it equals the target's own draw at that row (`src/program/generate.cpp`, the acceptance loop after
+`ver.run`). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
+final distribution (top_k, top_p, min_p, temperature and penalties applied). The sampler reports that probability next to
+its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu); the logits and the draws themselves do not change.
+
+**What changes.** The drafts are the draft head's argmax, fixed by the context. At a row where the draft d has
+p(d) ≥ P, the output is d every time instead of a draw from p: that row is greedy. Its total-variation distance from the
+model's distribution is exactly 1 − p(d), and 0 at every other row. Rows after a kept draft are conditioned on it,
+as plain decoding would be. What stays exact: greedy requests (nothing is drawn), requests with `logit_bias`, JSON
+`response_format` (the server sends `relax=0`), the quality gate, `--parallel` batch slots, any drafted added token
+(ids from `<|endoftext|>` on: control tokens, think and tool tags, end of turn), and every token from `<tool_call>` to
+`</tool_call>`, so a tool name and its arguments are sampled exactly.
+
+**Exact mode is unchanged.** With the flag off and the tiers pinned, IQ3_XXS, the three bench prompts greedy plus conv
+and prose at temperature 0.6 and 1.0 with two seeds each (600 tokens): all 11 token streams are identical to the build
+before the flag. With the flag on, the three greedy streams are identical too.
+
+**Distribution cost per token (offline replay).** Real verify windows were logged (per row: the draft, the target's
+draw, the target's final probabilities) for the bench prose and conv prompts (three seeds) and five natural chat
+prompts, at temperature 0.6 and 1.0 (top_p 0.95, top_k 20), on IQ3_S and IQ3_XXS, about 3,500 tokens per cell. The
+replay keeps a draft when the rule would, and averages 1 − p(d) over the relaxed rows per generated token
+(TV/token; 0 for exact). Token gain is the replayed extra tokens per window at the logged window widths; the live
+gain below is larger because the window controller lengthens windows when more drafts are kept.
+
+| Model | Prompts | T | Exact accept | P = 0.5 gain / TV | P = 0.3 gain / TV | P = 0.2 gain / TV |
+|---|---|---|---|---|---|---|
+| IQ3_XXS | prose | 0.6 | 64.1% | +4.3% / 0.026 | +6.9% / 0.042 | +9.2% / 0.052 |
+| IQ3_XXS | natural | 0.6 | 64.5% | +5.3% / 0.030 | +8.4% / 0.050 | +10.7% / 0.063 |
+| IQ3_XXS | prose | 1.0 | 61.6% | +5.6% / 0.035 | +11.1% / 0.064 | +13.9% / 0.080 |
+| IQ3_XXS | natural | 1.0 | 62.9% | +6.6% / 0.043 | +12.1% / 0.073 | +15.2% / 0.089 |
+| IQ3_S | prose | 0.6 | 63.7% | +3.0% / 0.022 | +5.9% / 0.037 | +7.2% / 0.046 |
+| IQ3_S | natural | 0.6 | 64.5% | +4.9% / 0.030 | +8.0% / 0.049 | +9.8% / 0.060 |
+| IQ3_S | prose | 1.0 | 61.1% | +5.1% / 0.035 | +9.3% / 0.061 | +12.4% / 0.079 |
+| IQ3_S | natural | 1.0 | 62.3% | +7.1% / 0.042 | +11.9% / 0.072 | +14.7% / 0.089 |
+
+Every relaxed keep moves 1 − p(d) of probability mass, so tokens gained per unit of TV is nearly the same at every
+threshold: about +1.5% per 0.01 TV/token. Medusa-style typical acceptance (a threshold that falls with the entropy of p)
+was replayed too and lands on the same line; it is not a better trade, so the flag is the plain probability threshold.
+
+**Speed (400 W).** `basalt-bench` (conv and prose at temperature 0.6, struct greedy), the usual serving flags (`--spec 7
+--spec-min-p 0.5 --kv int8 --vram-reserve-mib 500 --resident-experts --peer-exclusive`), each value in three rounds
+interleaved with the others, the cold repetition dropped:
+
+| Model | Fixture | Exact | P = 0.5 | P = 0.3 | P = 0.2 |
+|---|---|---|---|---|---|
+| IQ3_XXS | prose | 348.7 | 366.8 (+5.2%) | 373.8 (+7.2%) | 382.4 (+9.7%) |
+| IQ3_XXS | conv | 383.8 | 421.5 (+9.8%) | 431.4 (+12.4%) | 423.3 (+10.3%) |
+| IQ3_XXS | struct (greedy) | 660.2 | 658.5 | 659.4 | 658.0 |
+| IQ3_S | prose | 323.8 | – | 347.2 (+7.2%) | – |
+| IQ3_S | conv | 354.2 | – | 392.9 (+10.9%) | – |
+
+In one engine session per model, the prose prompt and the five natural prompts, two seeds, the four settings
+interleaved per prompt (decode tok/s, 400 W):
+
+| Model | T | Exact | P = 0.5 | P = 0.3 | P = 0.2 |
+|---|---|---|---|---|---|
+| IQ3_XXS | 1.0 | 332.5 | 366.9 (+10.3%) | 385.5 (+15.9%) | 399.1 (+20.0%) |
+| IQ3_XXS | 0.6 | 351.2 | 370.1 (+5.4%) | 383.1 (+9.1%) | 380.9 (+8.5%) |
+| IQ3_S | 1.0 | 336.3 | 356.8 (+6.1%) | 369.7 (+9.9%) | 392.3 (+16.7%) |
+| IQ3_S | 0.6 | 347.0 | 359.2 (+3.5%) | 370.9 (+6.9%) | 382.4 (+10.2%) |
+
+**Quality.** The teacher-forced KLD gate cannot see this change: it scores logits, and relaxed drafting changes which
+token is emitted, not the logits. So the evidence is the replayed TV above plus sampled tasks. IQ3_S through the server
+(usual serving flags), temperature 1.0, top_p 0.95, top_k 20, thinking off, one seed per item so the settings are
+paired, the four settings in one server session (`relaxed_drafting` per request), 400 W:
+
+| Task | Exact | P = 0.5 | P = 0.3 | P = 0.2 |
+|---|---|---|---|---|
+| gsm8k, 300 items (flexible extract) | 0.947 ± 0.025 | 0.973 (+0.027 ± 0.020) | 0.980 (+0.033 ± 0.022) | 0.977 (+0.030 ± 0.023) |
+| MMLU-Pro, 20 per subject (280) | 0.682 ± 0.055 | 0.714 (+0.032 ± 0.040) | 0.725 (+0.043 ± 0.045) | 0.721 (+0.039 ± 0.046) |
+| Drafts kept by the rule, per generated token | 0 | 3.0% | 5.0% | 5.6% (with the tool requests) |
+
+The ± are 95% intervals (paired difference against exact in brackets). An earlier session in which every arm ran exact
+(the per-request key had not reached the engine) scored gsm8k 0.960 to 0.970 and MMLU-Pro 0.696 to 0.714 across four
+exact runs, with 6 to 9 and 24 to 35 items flipping between runs (the adaptive expert tiers round differently run to
+run): this session's exact arm is at the low end of that spread. No loss is measurable at this size; the relaxed arms
+sit at or above the exact runs, as expected of a change that makes confident rows greedy (a lower effective
+temperature). The cost is diversity, which these tasks do not measure; TV/token above is the direct measure.
+
+Tool calls, IQ3_S, the same sampling, 50 requests over 8 tools (similar names such as `replace_in_file` and
+`read_file`), thinking on for half: exact 53 calls and P = 0.2 52 calls, every name a declared tool, no leaked call
+text, all arguments valid JSON. The engine log shows the rule kept almost no drafts in these requests (the calls
+themselves are exact).
+
+**Choosing P.** `--relaxed-drafting` alone means 0.5: the smallest cost (TV/token 0.03 to 0.04), roughly +5% at
+temperature 0.6 and +6 to 10% at 1.0. 0.3 doubles both the gain and the cost; 0.2 is the aggressive end. Values above
+0.5 keep few drafts (0.7: about +2.5% at TV 0.015).
+
 
 `basalt-bench --quality` (`tools/ppl_gate.py`) scores wikitext-2 (`wiki.test.raw`) in 512-token chunks. The first half
 of each chunk is prefilled and the second half (rows 256 to 510) is scored through the decode path, against a llama.cpp

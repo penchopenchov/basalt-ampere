@@ -151,6 +151,14 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
 - Precedence: command line > config file > built-in defaults. `spec`, `spec-min-p`, `mtp-max-t`, `peer-exclusive` and
   `max-context` are engine flags; they are also server flags on the command line.
 - The API key is command line only (`--api-key`); a config file that sets it is refused.
+- `"relaxed-drafting": 0.3` (or `true` for the default 0.5; `--relaxed-drafting [P]` on the command line) trades
+  exactness for speed under sampling: a draft the model gives probability P or more is kept even when the model's own
+  draw would have been another token. Lower P is faster and further from the model's true sampling distribution; the
+  measured speed and cost per value are in [docs/precision.md](docs/precision.md#relaxed-drafting). Off by default:
+  without it, speculative decoding returns exactly what plain sampling would. Greedy (temperature 0) requests,
+  `logit_bias`, JSON `response_format`, control tokens and everything inside a tool call stay exact. A request can set
+  its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream decoding only; `--parallel` slots
+  stay exact.
 - The startup line `[server] engine: ...` lists the settings that came from the file or the command line; without
   `--config` it says the built-in defaults apply.
 
