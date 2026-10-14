@@ -1270,24 +1270,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
         }
-        // a QSA layer's attention half as one persistent kernel (qsa_full.hpp) where the layer's state is plain INT8 K/V,
-        // resident, and the window is not a batch window; the unfused kernels below run any other layer
-        bool qsa_full_on = false;
-        if (!chain_done && is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ && N == 2560 && n <= kQsaFullMaxT && G == 1 &&
-            native_qsa_enabled() && native_rope_enabled() && qsa_dec_fused_supported(s) &&
-            (dense_tc_mask() & 8) && (dense_tc_mask() & 16) && !(dense_tc_mask() & 32)) {
-            const QsaState& stq = ss.qsa_states[qsa_idx[(size_t) l]];
-            const WeightRef *fq = v.get("attn_q.weight"), *fk = v.get("attn_k.weight"), *fv = v.get("attn_v.weight"),
-                            *fo = v.get("attn_output.weight"), *fik = v.get("indexer.k_proj.weight"),
-                            *fiq = v.get("indexer.q_proj.weight");
-            qsa_full_on = stq.kv_int8 && !stq.kv_rot && !stq.kv_hybrid && !stq.kv_q4 && stq.kv_mode != 1 &&
-                          fq && fk && fv && fo && fik && fiq && fq->native_data && fk->native_data &&
-                          fv->native_data && fo->native_data && qsa_ord < kQsaFullMaxLaunches &&
-                          dense_tc_supported(fq->native_type, (int) N, (int) (NH * 2 * HD), fq->native_data) &&
-                          dense_tc_type_on(fq->native_type) &&
-                          dense_tc_supported(fo->native_type, (int) (NH * HD), (int) N, fo->native_data) &&
-                          dense_tc_type_on(fo->native_type);
-        }
+        // QSA layers keep the separate kernels: the single-kernel attention half (qsa_full.hpp) is slower in the engine
+        const bool qsa_full_on = false;
         bool routed = chain_done;   // the fused read ran the router too
         if (!chain_done) {
             // the read's first kernel follows a combine, copy or wait: a plain launch, except after the device-planned
