@@ -227,6 +227,42 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 }  // namespace
 
+void quantize_q8_K_avx512(const float* x, void* dst, int64_t k) {
+    block_q8_K* y = (block_q8_K*) dst;
+    const int64_t nb = k / QK_K;
+    const __m512i top = _mm512_set1_epi32(127);
+    for (int64_t i = 0; i < nb; ++i, x += QK_K) {
+        __m512 v[QK_K / 16];
+        __m512 am = _mm512_setzero_ps();
+        for (int j = 0; j < QK_K / 16; ++j) {
+            v[j] = _mm512_loadu_ps(x + 16 * j);
+            am = _mm512_max_ps(am, _mm512_abs_ps(v[j]));
+        }
+        const float amax = _mm512_reduce_max_ps(am);
+        if (amax == 0.f) {
+            y[i].d = 0;
+            std::memset(y[i].qs, 0, QK_K);
+            std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
+        }
+        // the signed value of the first element of largest magnitude fixes the scale
+        const __m512 amv = _mm512_set1_ps(amax);
+        float mx = 0.f;
+        for (int j = 0; j < QK_K / 16; ++j) {
+            const __mmask16 m = _mm512_cmp_ps_mask(_mm512_abs_ps(v[j]), amv, _CMP_EQ_OQ);
+            if (m != 0) { mx = x[16 * j + __builtin_ctz((unsigned) m)]; break; }
+        }
+        const float iscale = -127.f / mx;
+        const __m512 is = _mm512_set1_ps(iscale);
+        for (int j = 0; j < QK_K / 16; ++j) {
+            const __m512i q = _mm512_min_epi32(_mm512_cvtps_epi32(_mm512_mul_ps(is, v[j])), top);
+            _mm_storeu_si128((__m128i*) (y[i].qs + 16 * j), _mm512_cvtepi32_epi8(q));
+            y[i].bsums[j] = (int16_t) _mm512_reduce_add_epi32(q);
+        }
+        y[i].d = 1 / iscale;
+    }
+}
+
 bool iq512_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22;
 }

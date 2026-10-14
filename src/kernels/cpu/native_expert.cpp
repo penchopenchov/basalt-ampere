@@ -61,6 +61,11 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    static const bool avx512 = cpu_avx512_ok();
+    if (avx512 && f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
+        quantize_q8_K_avx512(x, dst, f.n_embd);
+        return;
+    }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
