@@ -524,6 +524,7 @@ Verifier::~Verifier() {
     for (auto& kv : commit_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     if (arena_b_) cudaFree(arena_b_);
+    if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (h_segb_) cudaFreeHost(h_segb_);
     if (h_qseg_) cudaFreeHost(h_qseg_);
@@ -640,6 +641,27 @@ bool hc8_dump(const WeightTable& wt, const ModelGeometry& g, const std::vector<s
     if (copies.empty()) { err = "hc8: there are no 8-bit copies to write"; return false; }
     if (!hc8_write(path, copies, err)) return false;
     std::fprintf(stderr, "basalt hc8: wrote %zu copies to %s\n", copies.size(), path.c_str());
+    return true;
+}
+
+bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
+    if (next_ && !next_->set_logit_bias(bias, err)) return false;
+    if (next_) return true;   // an earlier stage: the head, and so the sampling, is on the last one
+    const OnDevice on_device(device_);
+    if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
+        err = "logit_bias: the vocabulary size does not match";
+        return false;
+    }
+    if (bias != logit_bias_host_ && !bias.empty()) {
+        const size_t bytes = bias.size() * sizeof(float);
+        if ((!logit_bias_device_ && cudaMalloc((void**) &logit_bias_device_, bytes) != cudaSuccess) ||
+            cudaMemcpy(logit_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "logit_bias: the upload failed";
+            return false;
+        }
+    }
+    logit_bias_host_ = bias;
+    sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
     return true;
 }
 
@@ -2465,7 +2487,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     // a sampled or penalized request's head sampling queued behind the window now, not after a sync
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr);
+    const bool biased = sampling_.logit_bias != nullptr;
+    const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
     if (early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
@@ -2621,7 +2644,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ++windows;
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
-    if (head_sampling_ && (sampled || hist_d_ != nullptr) && !early_sample) {
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || biased) && !early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);

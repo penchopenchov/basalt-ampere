@@ -576,6 +576,86 @@ int main(int argc, char** argv) {
     int bad = 0;
     const int NV = 512, NT = 4;
 
+    // ---- logit_bias: added to every row before penalties and filters, on the greedy and the sampled path.  Each
+    // case compares against the same sampler over logits the host biased itself, and against a plain host argmax;
+    // a banned token is never picked and a boosted one always is.
+    {
+        const float inf = std::numeric_limits<float>::infinity();
+        std::vector<float> l((size_t) NV * NT), bias((size_t) NV, 0.0f);
+        for (int t = 0; t < NT; ++t)
+            for (int v = 0; v < NV; ++v) l[(size_t) t * NV + v] = float((v * 7 + t * 3) % 17) / 4;
+        l[0] = 50;
+        bias[0] = -inf;
+        bias[7] = 20;
+        bias[16] = -9;
+        std::vector<float> adjusted = l;
+        for (int t = 0; t < NT; ++t)
+            for (int v = 0; v < NV; ++v) adjusted[(size_t) t * NV + v] += bias[(size_t) v];
+        float* db = nullptr;
+        check(cudaMalloc(&db, (size_t) NV * sizeof(float)), "bias malloc");
+        check(cudaMemcpy(db, bias.data(), (size_t) NV * sizeof(float), cudaMemcpyHostToDevice), "bias upload");
+        std::vector<int> hist((size_t) NT * 4, 7);
+        DeviceRows raw(l, NT, hist, 4), expected(adjusted, NT, hist, 4);
+        for (bool greedy : {true, false}) for (bool penalty : {false, true}) {
+            basalt::kernels::SamplerParams p;
+            p.greedy = greedy; p.temperature = greedy ? 0.0f : 0.8f; p.seed = 71; p.top_k = 16;
+            if (penalty) { p.penalty_last_n = 4; p.penalty_freq = 3; p.penalty_repeat = 1.1f; }
+            const auto want = expected.sample(p, nullptr);
+            p.logit_bias = db;
+            const auto got = raw.sample(p, nullptr);
+            if (got != want || std::find(got.begin(), got.end(), 0) != got.end()) {
+                std::printf("logit_bias: greedy=%d penalty=%d differs from the pre-biased input\n", (int) greedy, (int) penalty);
+                ++bad;
+            }
+            p.logit_bias = nullptr;
+            DeviceRows plain(l, NT, hist, 4);
+            if (raw.sample(p, nullptr) != plain.sample(p, nullptr)) { std::printf("logit_bias: absent bias changed the pick\n"); ++bad; }
+        }
+        {   // the host argmax of the biased rows (lowest index on a tie)
+            basalt::kernels::SamplerParams p; p.greedy = true; p.temperature = 0.0f; p.logit_bias = db;
+            DeviceRows no_hist(l, NT, {}, 0);
+            const auto got = no_hist.sample(p, nullptr);
+            for (int t = 0; t < NT; ++t) {
+                int best = 0;
+                for (int v = 1; v < NV; ++v) if (adjusted[(size_t) t * NV + v] > adjusted[(size_t) t * NV + best]) best = v;
+                if (got[(size_t) t] != best) { std::printf("logit_bias: greedy row %d is %d, host argmax %d\n", t, got[(size_t) t], best); ++bad; }
+            }
+        }
+        std::vector<float> unchanged(l.size());
+        check(cudaMemcpy(unchanged.data(), raw.l, l.size() * sizeof(float), cudaMemcpyDeviceToHost), "raw logits");
+        if (unchanged != l) { std::printf("logit_bias: the logits were modified\n"); ++bad; }
+        cudaFree(db);
+        // the engine's vocabulary with one permitted token that has the lowest logit: every setting must pick it;
+        // and one boosted token among zeros
+        const int vocab = 248320, only = 109266;
+        std::vector<float> large((size_t) vocab, 100.0f), bans((size_t) vocab, -inf), boost((size_t) vocab, 0.0f);
+        bans[(size_t) only] = 0;
+        large[(size_t) only] = -50;
+        boost[(size_t) only] = 100;
+        float *dbans = nullptr, *dboost = nullptr;
+        check(cudaMalloc(&dbans, (size_t) vocab * sizeof(float)), "bans malloc");
+        check(cudaMalloc(&dboost, (size_t) vocab * sizeof(float)), "boost malloc");
+        check(cudaMemcpy(dbans, bans.data(), bans.size() * sizeof(float), cudaMemcpyHostToDevice), "bans upload");
+        check(cudaMemcpy(dboost, boost.data(), boost.size() * sizeof(float), cudaMemcpyHostToDevice), "boost upload");
+        std::vector<float> zeros((size_t) vocab);
+        std::mt19937 zr(5); std::normal_distribution<float> zg(0.0f, 1.0f);
+        for (auto& x : zeros) x = zg(zr);
+        DeviceRows many(large, 1, {}, 0), spread(zeros, 1, {}, 0);
+        for (int k : {0, 1, 20, 64}) for (bool greedy : {true, false}) for (float top_p : {1.0f, 0.5f}) for (float min_p : {0.0f, 0.3f}) {
+            basalt::kernels::SamplerParams p;
+            p.greedy = greedy; p.temperature = greedy ? 0.0f : 1.0f; p.top_k = k; p.top_p = top_p; p.min_p = min_p;
+            for (uint64_t seed = 1; seed <= 3; ++seed) {
+                p.seed = seed;
+                p.logit_bias = dbans;
+                if (many.sample(p, nullptr) != std::vector<int>{only}) { std::printf("logit_bias: the only permitted token lost (k=%d greedy=%d)\n", k, (int) greedy); ++bad; }
+                p.logit_bias = dboost;
+                if (spread.sample(p, nullptr) != std::vector<int>{only}) { std::printf("logit_bias: the boosted token lost (k=%d greedy=%d)\n", k, (int) greedy); ++bad; }
+            }
+        }
+        cudaFree(dbans);
+        cudaFree(dboost);
+    }
+
     // ---- fixture 1: plain greedy.  top_k = 0 (disabled), top_p = 1 (disabled), T = 1 -> argmax.
     {
         basalt::kernels::SamplerParams p; p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f; p.greedy = true;
