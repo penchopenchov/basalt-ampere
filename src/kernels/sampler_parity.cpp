@@ -344,6 +344,129 @@ int mirror_pick(const SelList& sel, int k, const basalt::kernels::SamplerParams&
 
 int sampled_k(int top_k, int nv) { return std::min(nv, (top_k > 0 && top_k < 64) ? top_k : 64); }
 
+// The final probability of `q` under the tail over a list (its first `k` entries), in double: top_p, min_p,
+// temperature as mirror_pick runs them; 0 outside the survivors.
+double mirror_prob(const SelList& sel, int k, const basalt::kernels::SamplerParams& p, int q) {
+    int n_keep = k;
+    float mx = sel.logit[0];
+    for (int i = 1; i < k; ++i) mx = std::fmax(mx, sel.logit[(size_t) i]);
+    if (p.top_p < 1.0f) {
+        double sum = 0.0;
+        for (int i = 0; i < k; ++i) sum += std::exp((double) sel.logit[(size_t) i] - (double) mx);
+        double cum = 0.0;
+        int cut = k;
+        for (int i = 0; i < k; ++i) {
+            cum += std::exp((double) sel.logit[(size_t) i] - (double) mx) / sum;
+            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+        }
+        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+        n_keep = cut;
+    }
+    if (p.min_p > 0.0f) {
+        const float thresh = sel.logit[0] + std::log(p.min_p);
+        for (int i = 0; i < n_keep; ++i)
+            if (sel.logit[(size_t) i] < thresh) { n_keep = i; break; }
+    }
+    const float inv_t = 1.0f / p.temperature;   // the scaled logit is a float product, as in the kernel
+    double smx = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < n_keep; ++i) smx = std::fmax(smx, (double) (sel.logit[(size_t) i] * inv_t));
+    double sum = 0.0, pq = 0.0;
+    for (int i = 0; i < n_keep; ++i) {
+        const double e = std::exp((double) (sel.logit[(size_t) i] * inv_t) - smx);
+        sum += e;
+        if (sel.ids[(size_t) i] == q) pq = e;
+    }
+    return n_keep > 0 ? pq / sum : 0.0;
+}
+
+// The probe (sample_tokens_probe): the same picks as sample_tokens, bit for bit; each row's query probability against
+// the double reference; a row's probability the same whatever the window it is in.  Real vocabulary, random rows.
+int probe_parity() {
+    const int NV = 248320;
+    int bad = 0;
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> g(0.0f, 3.0f);
+    struct Case { const char* name; int top_k; float top_p, min_p, temp; };
+    const Case cases[] = {{"top_k 20, top_p .95, temp 0.6", 20, 0.95f, 0.0f, 0.6f},
+                          {"top_k 20, top_p .95, temp 1.0", 20, 0.95f, 0.0f, 1.0f},
+                          {"top_k 64, min_p .05, temp 1.5", 64, 1.0f, 0.05f, 1.5f}};
+    for (int T : {7, 70}) {   // 70 rows: the one-block kernel
+        std::vector<float> l((size_t) NV * T);
+        for (auto& v : l) v = g(rng);
+        for (int t = 0; t < T; t += 2) l[(size_t) t * NV + (size_t) (t * 977) % NV] += 14.0f + (float) t;   // peaked rows
+        float* d_l = nullptr;
+        int *d_o = nullptr, *d_r = nullptr, *d_q = nullptr;
+        float* d_p = nullptr;
+        check(cudaMalloc(&d_l, l.size() * sizeof(float)), "probe logits");
+        check(cudaMalloc(&d_o, (size_t) T * sizeof(int)), "probe out");
+        check(cudaMalloc(&d_r, (size_t) T * sizeof(int)), "probe ref out");
+        check(cudaMalloc(&d_q, (size_t) T * sizeof(int)), "probe query");
+        check(cudaMalloc(&d_p, (size_t) T * sizeof(float)), "probe probs");
+        check(cudaMemcpy(d_l, l.data(), l.size() * sizeof(float), cudaMemcpyHostToDevice), "probe copy");
+        for (const Case& c : cases) {
+            basalt::kernels::SamplerParams p;
+            p.top_k = c.top_k; p.top_p = c.top_p; p.min_p = c.min_p; p.temperature = c.temp; p.seed = 77; p.counter = 1000;
+            const int k = sampled_k(p.top_k, NV);
+            std::vector<SelList> lists;
+            for (int t = 0; t < T; ++t) lists.push_back(mirror_select(l.data() + (size_t) t * NV, NV, {}, p, k));
+            // per row: the top token, the second, the last of the list, and a token outside it, in turn
+            std::vector<int> q((size_t) T);
+            for (int t = 0; t < T; ++t) {
+                const int m = t % 4;
+                q[(size_t) t] = m == 0 ? lists[(size_t) t].ids[0] : m == 1 ? lists[(size_t) t].ids[1]
+                              : m == 2 ? lists[(size_t) t].ids[(size_t) k - 1] : (lists[(size_t) t].ids[0] + 1) % NV;
+                if (m == 3) for (int id : lists[(size_t) t].ids) if (id == q[(size_t) t]) q[(size_t) t] = (q[(size_t) t] + 7) % NV;
+            }
+            const int nq = T - 1;   // as the verifier asks: the last row has no draft
+            check(cudaMemcpy(d_q, q.data(), (size_t) T * sizeof(int), cudaMemcpyHostToDevice), "probe query copy");
+            check(cudaMemset(d_p, 0xFF, (size_t) T * sizeof(float)), "probe fill");
+            basalt::kernels::sample_tokens(d_l, T, NV, nullptr, 0, p, d_r, nullptr);
+            basalt::kernels::sample_tokens_probe(d_l, T, NV, nullptr, 0, p, d_o, d_q, nq, d_p, nullptr);
+            check(cudaDeviceSynchronize(), "probe sync");
+            std::vector<int> ref((size_t) T), got((size_t) T);
+            std::vector<float> pr((size_t) T);
+            check(cudaMemcpy(ref.data(), d_r, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost), "probe back");
+            check(cudaMemcpy(got.data(), d_o, (size_t) T * sizeof(int), cudaMemcpyDeviceToHost), "probe back");
+            check(cudaMemcpy(pr.data(), d_p, (size_t) T * sizeof(float), cudaMemcpyDeviceToHost), "probe back");
+            int pick_diff = 0, untouched = 0;
+            double max_abs = 0.0, max_rel = 0.0;
+            for (int t = 0; t < T; ++t) {
+                if (got[(size_t) t] != ref[(size_t) t]) ++pick_diff;
+                if (t >= nq) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &pr[(size_t) t], 4);
+                    if (bits != 0xFFFFFFFFu) ++untouched;   // a row past n_query is not written
+                    continue;
+                }
+                const double want = mirror_prob(lists[(size_t) t], k, p, q[(size_t) t]);
+                const double e = std::fabs((double) pr[(size_t) t] - want);
+                max_abs = std::max(max_abs, e);
+                if (want > 0.0) max_rel = std::max(max_rel, e / want);
+                if ((want == 0.0) != (pr[(size_t) t] == 0.0f)) ++pick_diff;
+            }
+            // width: each row alone gives the same probability, bit for bit
+            int width_diff = 0;
+            for (int t = 0; t < std::min(nq, 8); ++t) {
+                basalt::kernels::SamplerParams p1 = p;
+                p1.counter = p.counter + (uint64_t) t;
+                basalt::kernels::sample_tokens_probe(d_l + (size_t) t * NV, 1, NV, nullptr, 0, p1, d_o, d_q + t, 1, d_p, nullptr);
+                float one = 0.0f;
+                int pick1 = 0;
+                check(cudaMemcpy(&one, d_p, 4, cudaMemcpyDeviceToHost), "probe width back");
+                check(cudaMemcpy(&pick1, d_o, 4, cudaMemcpyDeviceToHost), "probe width back");
+                if (std::memcmp(&one, &pr[(size_t) t], 4) != 0 || pick1 != ref[(size_t) t]) ++width_diff;
+            }
+            const bool fail = pick_diff > 0 || untouched > 0 || width_diff > 0 || max_abs > 1e-6;
+            std::printf("  probe %2d rows, %-30s picks %s, prob max abs %.2e rel %.2e vs double, width %s%s\n", T, c.name,
+                        pick_diff ? "DIFFER" : "identical", max_abs, max_rel, width_diff ? "DIFFERS" : "identical",
+                        fail ? "  *** WRONG ***" : "");
+            bad += fail ? 1 : 0;
+        }
+        cudaFree(d_l); cudaFree(d_o); cudaFree(d_r); cudaFree(d_q); cudaFree(d_p);
+    }
+    return bad;
+}
+
 // Rows uploaded once and sampled under many parameter sets: `sample` returns the picks of one launch on `stream`
 // (nullptr: the legacy stream), -1 prefilled as in `run`.
 struct DeviceRows {
@@ -421,6 +544,23 @@ void bench_sampled() {
             check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
             std::printf("  bench: n_vocab %d, rows %d, top_k %2d, top_p 0.95: %8.1f us per call\n", NV, T, k,
                         1000.0 * (double) ms / iters);
+            int* d_q = nullptr;
+            float* d_p = nullptr;
+            check(cudaMalloc(&d_q, (size_t) T * sizeof(int)), "bench query");
+            check(cudaMalloc(&d_p, (size_t) T * sizeof(float)), "bench probs");
+            check(cudaMemset(d_q, 0, (size_t) T * sizeof(int)), "bench query fill");
+            check(cudaEventRecord(e0, s), "record");
+            for (int it = 0; it < iters; ++it) {
+                p.counter = (uint64_t) it;
+                basalt::kernels::sample_tokens_probe(d_l, T, NV, nullptr, 0, p, d_o, d_q, T, d_p, s);
+            }
+            check(cudaEventRecord(e1, s), "record");
+            check(cudaEventSynchronize(e1), "bench sync");
+            check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+            std::printf("  bench: the same with the query probe:              %8.1f us per call\n",
+                        1000.0 * (double) ms / iters);
+            cudaFree(d_q);
+            cudaFree(d_p);
             cudaEventDestroy(e0);
             cudaEventDestroy(e1);
         }
@@ -1473,6 +1613,8 @@ int main(int argc, char** argv) {
                     wrong ? "*** WRONG ***" : "matches", wrong, draws);
         bad += wrong;
     }
+
+    bad += probe_parity();
 
     std::printf("\nsampler: %d failures\n", bad);
     if (bad) return 1;

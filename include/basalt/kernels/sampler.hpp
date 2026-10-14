@@ -43,6 +43,12 @@ struct SamplerParams {
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
+// sample_tokens, and on the sampled path also qprob[t] (t < n_query) = the probability of token query[t] under row
+// t's final distribution (the chain's survivors after temperature; 0 outside them).  The picks are sample_tokens'
+// own.  On the greedy path qprob is not written.  `query` and `qprob` are device (or mapped) pointers.
+void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                         const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream);
+
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (needs thread-block clusters): the same token as
 // sample_tokens' one-block argmax.  False (nothing launched) where it
 // cannot run: a device without thread-block clusters.  Device pointers; capturable.

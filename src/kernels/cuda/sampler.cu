@@ -364,9 +364,12 @@ __device__ __forceinline__ void warp_first(float& bv, int& bi) {
 /// /// lane 0 alone runs the two ORDERED sums and the two cumulative scans: the same `exp` of the same argument, the
 /// /// sums in the same order, `cum += e / sum` with the same correctly rounded quotient.  (`n_keep == 0`, reachable
 /// /// only with min_p > 1, which the callers clamp, reads `sel_ids[0]`.)
+/// /// `qprob` (optional): for t < nq, qprob[t] <- the final probability of token query[t] (0 outside the kept list),
+/// /// written after the pick, which it does not touch.
 template <bool kProb = false>
 __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& p, int t,
-                                  int* __restrict__ out, double* ex, float* prob_out = nullptr) {
+                                  int* __restrict__ out, double* ex, float* prob_out = nullptr,
+                                  const int* query = nullptr, int nq = 0, float* qprob = nullptr) {
     const int lane = (int) (threadIdx.x & 31);
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
     int n_keep = k;
@@ -424,6 +427,14 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         }
         out[t] = pick;
         if constexpr (kProb) *prob_out = n_keep > 0 ? (float) ex[pi] : 1.0f;
+        if (qprob != nullptr && t < nq) {
+            const int q = query[t];
+            float pq = 0.0f;
+            for (int i = 0; i < n_keep; ++i)
+                if (sel_ids[i] == q) { pq = (float) ex[i]; break; }
+            if (n_keep == 0 && sel_ids[0] == q) pq = 1.0f;
+            qprob[t] = pq;
+        }
     }
 }
 
@@ -434,7 +445,8 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
 /// /// O(k x n_vocab) per row, then warp 0 runs the tail.  The fallback when the split path cannot run.
 __global__ void __launch_bounds__(1024)
 sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
-                         int history_len, const SamplerParams p, int* __restrict__ out) {
+                         int history_len, const SamplerParams p, int* __restrict__ out,
+                         const int* __restrict__ query, int nq, float* __restrict__ qprob) {
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
 
@@ -502,7 +514,7 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
         prev_i = sel_ids[i];
     }
     if (warp != 0) return;
-    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex, nullptr, query, nq, qprob);
 }
 
 // ---- THE SPLIT top_k.  The one-block kernel keeps a row on ONE SM and walks its logits k times.  Here a warp keeps the
@@ -652,7 +664,7 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
 /// 64 entries, 32 KB) are copied to shared memory, merged into the row's top_k list, and `sampled_tail_warp` picks.
 __global__ void __launch_bounds__(32)
 sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k,
-                           int* __restrict__ out) {
+                           int* __restrict__ out, const int* __restrict__ query, int nq, float* __restrict__ qprob) {
     const int t = blockIdx.x;
     const int lane = (int) threadIdx.x;
     __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
@@ -666,7 +678,7 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
         if (lane == 0) { sel_ids[i] = id < n_vocab ? id : 0; sel_logit[i] = v; }
     });
     __syncwarp();
-    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex, nullptr, query, nq, qprob);
 }
 
 // ---- COUPLED DRAFT SAMPLING (include/basalt/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
@@ -961,7 +973,13 @@ bool sample_greedy_top_prob(const float* logits, int n_tokens, int n_vocab, cons
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream) {
+    sample_tokens_probe(logits, n_tokens, n_vocab, history, history_len, p, out, nullptr, 0, nullptr, stream);
+}
+
+void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                         const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return;
+    if (qprob == nullptr) n_query = 0;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
         std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
                      p.penalty_last_n, (const void*) history, history_len);
@@ -995,10 +1013,10 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                                         (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, k,
                                                                  n_blocks, scratch);
             sampler_split_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(
-                scratch, n_blocks, n_vocab, p, k, out);
+                scratch, n_blocks, n_vocab, p, k, out, query, n_query, qprob);
         } else {
             sampler_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-                logits, n_vocab, history, history_len, p, out);
+                logits, n_vocab, history, history_len, p, out, query, n_query, qprob);
         }
     }
     const cudaError_t e = cudaGetLastError();
