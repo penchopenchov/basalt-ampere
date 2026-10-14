@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 
+from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
 from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
@@ -476,7 +477,7 @@ class ProcessEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        return keys + ProcessEngine.projection_key(sampling)
+        return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
