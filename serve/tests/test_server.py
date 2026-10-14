@@ -1033,6 +1033,13 @@ class SamplingKeys(unittest.TestCase):
         for bad in (-1, True, 2.5, "20"):
             self.assertFalse([k for k in self.keys(temperature=0.7, top_k=bad) if k.startswith("top_k=")], bad)
 
+    def test_relaxed_drafting(self):
+        self.assertIn("relax=0.3", self.keys(temperature=1.0, relaxed_drafting=0.3))
+        self.assertIn("relax=0", self.keys(temperature=1.0, relaxed_drafting=False))
+        self.assertIn("relax=0.0", self.keys(temperature=1.0, relaxed_drafting=0))
+        for bad in (True, 1.5, -0.1, "0.3", None):
+            self.assertFalse([k for k in self.keys(temperature=1.0, relaxed_drafting=bad) if k.startswith("relax")], bad)
+
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))

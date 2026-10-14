@@ -501,6 +501,8 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and tools:
                 raise ValueError("structured response_format with tools is not supported")
+            if validator is not None:
+                req["relaxed_drafting"] = False                # JSON output is sampled exactly
             svc.load()
             req[BIAS_KEY] = checked_bias(req, svc.engine)     # a bad logit_bias is a 400 before streaming
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
@@ -632,6 +634,8 @@ def make_handler(svc: Service):
             if validator is not None and tools:
                 raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
                                      "unsupported_parameter")
+            if validator is not None:
+                req["relaxed_drafting"] = False                # JSON output is sampled exactly
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
             if set(skipped) - noted:
                 print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)

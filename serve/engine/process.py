@@ -477,6 +477,12 @@ class ProcessEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        # relaxed_drafting: this request's --relaxed-drafting threshold, 0 or false for exact sampling
+        rd = sampling.get("relaxed_drafting")
+        if rd is False:
+            keys += " relax=0"
+        elif isinstance(rd, (int, float)) and not isinstance(rd, bool) and 0.0 <= float(rd) <= 1.0:
+            keys += f" relax={float(rd)!r}"
         return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY))
 
     @staticmethod
