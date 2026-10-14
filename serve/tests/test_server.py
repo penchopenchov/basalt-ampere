@@ -1463,6 +1463,7 @@ class StartFailureLog(unittest.TestCase):
         svc = Service.__new__(Service)
         svc.engine, svc.vision, svc.before_load, svc.min_free_vram_mib = eng, None, None, 0
         svc.vram_reserve = None
+        svc.stopping = threading.Event()
         out = io.StringIO()
         with mock.patch.object(Service, "loaded", lambda self: False), \
                 mock.patch.object(Service, "_vision_down", lambda self: False), \
@@ -2594,8 +2595,8 @@ class StatusHandover(unittest.TestCase):
             def __init__(self):
                 self.lock, self.armed = threading.Lock(), False
 
-            def acquire(self, blocking=True):
-                return self.lock.acquire(blocking)
+            def acquire(self, blocking=True, timeout=-1):
+                return self.lock.acquire(blocking, timeout)
 
             def __enter__(self):
                 self.lock.acquire()
