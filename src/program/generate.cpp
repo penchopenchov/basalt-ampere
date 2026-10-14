@@ -2313,6 +2313,10 @@ int main(int argc, char** argv) {
     if (!wt.load(pack_files, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         return fatal_start_error(err);
     }
+    // every tensor's shape and engine form against what the kernels read (skipped rows keep their metadata)
+    if (!basalt::core::check_all(wt, g, err)) {
+        return fatal_start_error(o.model + ": " + err);
+    }
     std::fprintf(stderr, "basalt generate: %llu MiB of weights loaded from %s in %.1f s (%zu tensors "
                          "skipped: served from the source tensors)\n",
                  (unsigned long long) (pool_bytes >> 20), o.model.c_str(), load_s(), skip.size());
