@@ -547,7 +547,7 @@ Verifier::~Verifier() {
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_};
+                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -737,6 +737,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
+              mapped(T * 4 + 16, (void**) &h_q_, (void**) &m_q_) &&
+              mapped(T * 4 + 16, (void**) &h_qp_, (void**) &m_qp_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
@@ -2494,10 +2496,15 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     const bool biased = sampling_.logit_bias != nullptr;
     const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
+    // the draft probe: row t asks for the probability of the window's token t + 1
+    const bool probe = draft_probe_ && head_sampling_ && sampled && T > 1 && le_ >= g.n_layers;
+    if (probe)
+        for (int t = 0; t + 1 < T; ++t) h_q_[t] = tokens[t + 1];
     if (early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
-        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
+                            probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
     }
     (void) cudaStreamQuery(cs_);
     if (post_launch_) { auto f = std::move(post_launch_); post_launch_ = nullptr; f(); }
@@ -2652,7 +2659,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (head_sampling_ && (sampled || hist_d_ != nullptr || biased) && !early_sample) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
-        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        sample_tokens_probe(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, probe ? m_q_ : nullptr,
+                            probe ? T - 1 : 0, probe ? m_qp_ : nullptr, cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
