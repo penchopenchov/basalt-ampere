@@ -85,6 +85,7 @@ Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_
 | Expert combine | fp32, in router rank order, plus shared expert | native_moe.cu:35-50 |
 | Final logits | fp32 `[T][n_vocab]` | verify.hpp:489 |
 | Greedy sampling | fp32 argmax, lowest index wins ties | sampler.cu:79-90 |
+| Request `logit_bias` | Only when a request sends one: fp32 bias added to the fp32 logits before the penalties and filters; -100 is -inf (the token cannot be picked), other values are added as given. Without one the sampler reads the same logits and takes the same code path as before | sampler.cu; logit_bias.hpp |
 | KLD scoring (host) | Log-sum-exp and KLD accumulated in double from the fp32 logits | ppl_gate.hpp:125-154 |
 
 ### Prefill
@@ -123,6 +124,19 @@ by at most 7e-4 of the row's largest output: MMQ's stream-k split and tile width
 rounding can turn a reordered sum into one int8 step. The i-quant MMQ path does the same (6.5e-4, IQ4_XS/IQ4_NL). Quality
 gate, UD-Q4_K_XL, 100 chunks, 400 W, the 256-token prompt half through this path: PPL 3.3297, KLD 0.05653, top-1 92.06%
 against 3.3223, 0.05695, 92.22% with the FP16 path.
+
+## Request logit bias
+
+`logit_bias` (Chat Completions) is applied by the verifier's own sampling, on every row of every window, so a bias is
+part of the distribution speculation must reproduce: the host-side sampling that already follows each window (the same
+one a temperature or a penalty uses) runs with the bias, and a draft is accepted only if it equals that pick. The draft
+head ignores the bias; it only proposes tokens, so a banned token it proposes is rejected, and a biased request
+accepts fewer drafts. A request without a bias takes the unchanged captured greedy sample.
+
+Checked on IQ3_S with the tiers pinned as in the section below: requests with a bias (greedy and seeded, a ban, a
+boost, a mixed map, with and without a presence penalty) return the same text with `--spec 7 --spec-min-p 0.5` as with
+`--spec 0`, and a request with an empty map matches one without the field. A -100 bias never yields the token and
+a +100 bias yields it at every step.
 
 ## Speculative decoding does not change output
 

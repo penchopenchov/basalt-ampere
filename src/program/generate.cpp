@@ -7,6 +7,7 @@
 // on the same ids on both sides.
 
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/logit_bias.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -5899,12 +5900,12 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+            std::printf("INFO logit_bias=%lld context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" BASALT_VERSION "\n",
-                        (long long) o.max_context, o.kv.c_str(),
+                        (long long) n_vocab, (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
                         (long long) slots_all, (long long) mib_all,
@@ -7175,6 +7176,8 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            std::string req_bias_text;   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
+            bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // tuning keys (calibration can measure settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
@@ -7194,7 +7197,8 @@ int main(int argc, char** argv) {
                     if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
-                    if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -7210,6 +7214,13 @@ int main(int argc, char** argv) {
                     else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            std::vector<float> req_bias;
+            if (req_bias_present) {
+                std::string bias_error;
+                if (o.batch > 0) bias_error = "continuous batching is not supported";
+                const bool ok = o.batch <= 0 && basalt::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error);
+                if (!ok) { std::printf("ERR logit_bias: %s\n", bias_error.c_str()); continue; }
             }
             std::string emb_path;
             if (geni && endp != nullptr) {
@@ -8098,6 +8109,10 @@ int main(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
+            if (!ver.set_logit_bias(req_bias, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                continue;
+            }
             ver.set_sampling(req_sp);
             if (mtp_on) mtp.set_draft_sampling(req_sp);   // sampled drafts (a no-op without --coupled-draft)
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));

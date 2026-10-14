@@ -72,6 +72,10 @@ if(BUILD_TESTING)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE artifact)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
+  # the logit_bias protocol key: what parses and what is refused (host only)
+  add_executable(logit_bias_test tests/core/logit_bias_test.cpp)
+  target_include_directories(logit_bias_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME logit_bias_test COMMAND logit_bias_test)
 endif()
 
 # ---- plan ----------------------------------------------------------
