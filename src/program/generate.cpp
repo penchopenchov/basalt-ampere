@@ -246,6 +246,33 @@ std::string vram_free_note() {
 
 using Clock = std::chrono::steady_clock;
 
+// Seeds the adaptive tier's usage counts from the routing of the prompt just read, so the first adaptation rounds
+// of a request already move the experts the new topic uses toward the GPUs.  The earlier usage decays to kSeedKeep and
+// the prompt adds its routed-entry counts scaled to kSeedTokens tokens of usage.  Resident experts are always seeded;
+// of the rest only the kSeedTop with the most prompt entries are (a peer-held one weighs kSeedPeerWeight, since it
+// costs less to leave where it is than a CPU one).
+void seed_usage_from_prompt(std::vector<float>& usage, const std::vector<uint32_t>& hist, int64_t tokens,
+                            const std::vector<int32_t>& host_res, int64_t n_expert, const basalt::core::PeerExperts& peer) {
+    constexpr double kSeedTokens = 64.0;
+    constexpr float kSeedKeep = 0.3f, kSeedPeerWeight = 0.35f;
+    constexpr size_t kSeedTop = 32;
+    if (tokens <= 0 || usage.empty() || hist.size() != usage.size() || host_res.size() != usage.size()) return;
+    std::vector<uint8_t> allow(hist.size(), 1);
+    std::vector<std::pair<float, size_t>> rank;
+    for (size_t i = 0; i < hist.size(); ++i) {
+        if (hist[i] == 0 || host_res[i] >= 0) continue;
+        allow[i] = 0;
+        const bool on_peer = peer.valid() && peer.has((int64_t) i / n_expert, (int64_t) i % n_expert);
+        rank.emplace_back((float) hist[i] * (on_peer ? kSeedPeerWeight : 1.0f), i);
+    }
+    const size_t k = std::min(rank.size(), kSeedTop);
+    std::partial_sort(rank.begin(), rank.begin() + (ptrdiff_t) k, rank.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    for (size_t j = 0; j < k; ++j) allow[rank[j].second] = 1;
+    const float scale = (float) (kSeedTokens / (double) tokens);
+    for (size_t i = 0; i < hist.size(); ++i) usage[i] = usage[i] * kSeedKeep + (allow[i] ? scale * (float) hist[i] : 0.0f);
+}
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
@@ -7409,6 +7436,7 @@ int main(int argc, char** argv) {
             }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
+            if (!drive.d.usage.empty()) sp.route_hist_reset();   // counts this request's prompt rows for the usage seed
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
@@ -8276,6 +8304,12 @@ int main(int argc, char** argv) {
             if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // the windows between prompt chunks swapped it
             int64_t p = n - 1;
             int32_t x = (int32_t) ids[(size_t) (n - 1)];
+            {   // a request decoded here starts its adaptation from the experts its own prompt routed to
+                std::vector<uint32_t> hist;
+                int64_t hist_tokens = 0;
+                if (!drive.d.usage.empty() && sp.route_hist_take(hist, hist_tokens) && (!in_slot || solo_req))
+                    seed_usage_from_prompt(drive.d.usage, hist, hist_tokens, host_res, g.n_expert, peer);
+            }
             std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob((size_t) S, 0.0f);
             basalt::core::DraftCumAdapt cum_adapt;   // this request's draft threshold
