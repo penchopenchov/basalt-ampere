@@ -40,10 +40,10 @@ hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_
 | Norm weights, ssm_a, ssm_dt, conv1d, ssm_norm | F32 | model_sections.py:55-60 |
 | Hyper-connection (hc) matrices (down, up, inject; per layer and for the output head) | Stored BF16 in the pack; decode reads an int8 copy: int8 codes with one fp16 scale per 32 consecutive inputs, scale = f16(absmax/127), codes clamped to ±127 | hc_fused.cu:343, 1168-1186, 1210-1227; verify.cpp:561-572 |
 | Token embedding | GGUF type kept in mapped host memory, one row dequantized to fp32 per token | native_head.hpp:42-45; verify.cpp:948-961 |
-| Output head | A native_mmvq type with dedicated Q5_K and Q6_K kernels; the IQ3 packs use a Q5_K head | verify.cpp:1877-1882 |
+| Output head | A native_mmvq type with dedicated Q5_K and Q6_K kernels; the IQ3_S pack's head is Q6_K | verify.cpp:1877-1882 |
 | MTP drafter dense | Q8_0 for fc_embedding, fc_hidden, q/k/v/o, indexer projection and the shared-expert projections; BF16 for the rest; 1-D tensors F32 | model_sections.py:334-338, 444-470 |
 | MTP drafter experts | Q2_0, all in VRAM | model_sections.py:482-487 |
-| MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset; the leading rows are first scored from a 2-bit copy and the near-best rows rescored exactly, so a draft differs from the exact argmax only in rare cases, and the draft probability is approximate | mtp.cpp, q5k_head.cu |
+| MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset; for a Q5_K or Q6_K head the leading rows are first scored from a 2-bit copy (four levels and an fp16 scale per 32 weights) and the rows within 5 of the best approximate score (at most 64) rescored exactly, so a draft differs from the exact argmax only in rare cases, and the draft probability is approximate: the other rows' terms of its softmax sum come from the 2-bit scores. The Q6_K copy's scale is raised by sqrt(\|w\|²/⟨w, ŵ⟩) per group, since the least-squares copy scores the near-best rows low and inflates the probability; on 1500 real draft-head inputs of the IQ3_S pack the probability's mean error is +0.005 (+0.017 with the least-squares scale) and the pick matches the exact argmax in 99.93% | mtp.cpp, head_proxy.cuh, q5k_head.cu, q6k_head.cu |
 | MTP hc matrices | The same int8 copies | mtp.cpp:218-263 |
 
 The drafter only proposes tokens; verify decides every token, so the drafter's precision affects speed, not output.

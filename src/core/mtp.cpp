@@ -28,6 +28,7 @@
 #include "basalt/kernels/qsa_dec_attn.hpp"
 #include "basalt/kernels/qsa_dec_fused.hpp"
 #include "basalt/kernels/q5k_head.hpp"
+#include "basalt/kernels/q6k_head.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/rope.hpp"
 #include "basalt/kernels/router_top10.hpp"
@@ -659,12 +660,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             std::fprintf(stderr, "basalt mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             n_tier1_ = n_base + n_xcap_;
-            if (head->type() == 13) {   // the 2-bit copy of the leading rows scores them in a third of the bytes
+            if (head->type() == 13 || head->type() == 14) {   // the 2-bit copy of the leading rows: a fraction of the bytes
                 const size_t pb = basalt::kernels::q5k_proxy_bytes(n_tier1_);
                 const size_t sb = basalt::kernels::q5k_proxy_scratch_bytes(n_tier1_);
                 if (cudaMalloc((void**) &proxy_, pb) == cudaSuccess && cudaMalloc(&proxy_scratch_, sb) == cudaSuccess) {
                     cudaMemset(proxy_, 0, pb);
-                    basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
+                    if (head->type() == 13) basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
+                    else basalt::kernels::q6k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
                     cudaDeviceSynchronize();
                     vram_ += pb + sb;
                 } else {
@@ -993,8 +995,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
         // another order: last bits)
         if (!coupled_rec_ && T == 1 && sub && proxy_ != nullptr && nv == n_tier1_ && diag_ == nullptr &&
-            basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
-                                            proxy_scratch_, cs))
+            (head_->type() == 13
+                 ? basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
+                                                   proxy_scratch_, cs)
+                 : basalt::kernels::q6k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
+                                                   proxy_scratch_, cs)))
             return true;
         if (!coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
