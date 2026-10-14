@@ -4589,9 +4589,14 @@ int main(int argc, char** argv) {
             src.set_spares(o.peer_exclusive ? o.adapt_swaps + std::max(o.peer_adapt_swaps, o.adapt_swaps) : o.adapt_swaps);
         // A server also leaves room for what it allocates after this copy, before it is ready (the top-up below takes
         // back whatever that does not use), and for what it takes while serving.
-        const uint64_t late = o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0;
+        // Exchange buffers are reserved after the copy when the adaptive swaps do not use spares; the copy leaves them room.
+        const uint64_t exchange_bytes =
+            (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on)
+                ? (uint64_t) std::min<int64_t>(o.adapt_swaps, 96) * basalt::kernels::cpu::expert_layout().max_blob
+                : 0;
+        const uint64_t late = (o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0) + exchange_bytes;
         uint64_t resident_headroom =
-            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late) : o.resident_headroom;
+            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late) : o.resident_headroom + exchange_bytes;
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
         {
