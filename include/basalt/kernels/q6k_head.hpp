@@ -21,4 +21,13 @@ size_t q6k_head_top1_scratch_bytes();
 bool q6k_head_top1(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, const int32_t* map,
                    int* out_id, float* out_prob, void* scratch, void* stream);
 
+/// The 2-bit copy of q5k_head.hpp packed from Q6_K head rows (n_in 2560, row r at r * 2100 bytes); its size is
+/// q5k_proxy_bytes(n_cap).
+void q6k_proxy_pack(const void* q6k_rows, int64_t row0, int64_t n, void* proxy, int64_t n_cap, void* stream);
+
+/// q5k_proxy_top1 for Q6_K rows: the approximate pass over the 2-bit copy, the near-best rows rescored exactly (the
+/// same bits as q6k_head_top1's logits), the exact best is the pick.  `scratch`: q5k_proxy_scratch_bytes(n_cap).
+bool q6k_proxy_top1(const void* proxy, const void* q6k_rows, const void* x_q8_1, int n_rows, int64_t n_cap,
+                    const int32_t* map, int* out_id, float* out_prob, void* scratch, void* stream);
+
 }  // namespace basalt::kernels

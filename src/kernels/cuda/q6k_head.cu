@@ -3,6 +3,8 @@
 // Built with --use_fast_math like native_mmvq.cu, whose Q6_K x q8_1 dot this repeats.
 #include "basalt/kernels/q6k_head.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/pdl.hpp"
+#include "head_proxy.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -267,6 +269,71 @@ void launch_nc(const void* w, const void* x, float* y, int n_out, cudaStream_t s
     q6k_head_kernel<NC><<<grid, WPB * WARP, smem, s>>>((const Q6KBlock*) w, (const Q81Block*) x, y, n_out);
 }
 
+// ---- the 2-bit copy and the two-stage argmax (head_proxy.cuh)
+
+// One row's logit by one warp, in q6k_rows' order (the same bits as its one-column result).
+__device__ __forceinline__ float q6k_row_one(const Q6KBlock* __restrict__ w, const int2* __restrict__ x, int lane) {
+    constexpr int kb[BPR] = {0, 4, 8, 1, 5, 9, 2, 6, 3, 7};
+    constexpr int vt[BPR] = {0, 0, 0, 1, 1, 1, 2, 2, 3, 3};
+    float p[VT] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int c = 0; c < BPR; ++c) p[vt[c]] += q6_apply(q6_load(w + kb[c], lane), x, kb[c] * (QK / Q8K), lane);
+    float t = p[0];
+#pragma unroll
+    for (int v = 1; v < VT; ++v) t += p[v];
+    return warp_sum(t);
+}
+
+// One thread per 32-weight group: the group's dequantized Q6_K values to the 2-bit copy.
+__global__ void q6k_proxy_pack_kernel(const Q6KBlock* __restrict__ q6, int64_t row0, int64_t n,
+                                      uint4* __restrict__ wq, uint16_t* __restrict__ sc) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * 80) return;
+    const int64_t row = row0 + i / 80;
+    const int g = (int) (i % 80);
+    const Q6KBlock* b = q6 + (size_t) row * BPR + g / 8;
+    const float d = __half2float(b->d);
+    float w[32];
+    for (int l = 0; l < 32; ++l) {
+        const int k = (g % 8) * 32 + l;   // the weight within the block
+        const int h = k / 128, quarter = (k % 128) / 32, ll = k % 32;
+        const int lo = (b->ql[64 * h + ll + 32 * (quarter & 1)] >> (4 * (quarter >> 1))) & 0xF;
+        const int hi = (b->qh[32 * h + ll] >> (2 * quarter)) & 3;
+        w[l] = d * (float) b->scales[8 * h + ll / 16 + 2 * quarter] * (float) ((lo | (hi << 4)) - 32);
+    }
+    px::pack_group<true>(w, row, g, wq, sc);
+}
+
+// One block: the rows near the best approximate score are scored exactly (a warp per row), the exact best is the pick.
+__global__ void __launch_bounds__(512) q6k_proxy_final_kernel(const Q6KBlock* __restrict__ w,
+                                                              const Q81Block* __restrict__ x, int n_tiles,
+                                                              const int32_t* __restrict__ map,
+                                                              const float2* __restrict__ cand,
+                                                              const float2* __restrict__ part, int* __restrict__ out_id,
+                                                              float* __restrict__ out_prob) {
+    __shared__ __align__(16) int2 xe[XBLK * 8];
+    __shared__ px::Final f;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    pdl_wait();
+    if (tid == 0) f.cnt = 0;
+    for (int i = tid; i < XBLK * 8; i += blockDim.x) {
+        const int b = i / 8, pos = i % 8;
+        const Q81Block* blk = x + b;
+        const unsigned dsb = __ldg(reinterpret_cast<const unsigned*>(&blk->ds));
+        xe[i] = make_int2(__ldg(reinterpret_cast<const int*>(blk->qs) + pos),
+                          __float_as_int(__low2float(*reinterpret_cast<const half2*>(&dsb))));
+    }
+    const int n = px::collect(f, n_tiles, map, cand, out_id, out_prob);
+    if (n == 0) return;
+    for (int c = warp; c < n; c += 16) {
+        const float y = q6k_row_one(w + (size_t) f.list[c] * BPR, xe, lane);
+        if (lane == 0) f.ex[c] = y;
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    px::pick(f, n, n_tiles, map, part, out_id, out_prob);
+}
+
 }  // namespace
 
 bool q6k_head_supported(int n_in, int ncols) { return n_in == BPR * QK && ncols >= 1 && ncols <= 8; }
@@ -322,6 +389,39 @@ void q6k_head_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, 
         std::fprintf(stderr, "q6k_head_mmvq: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+
+void q6k_proxy_pack(const void* q6k_rows, int64_t row0, int64_t n, void* proxy, int64_t n_cap, void* stream) {
+    if (n <= 0) return;
+    const int64_t total = n * 80;
+    q6k_proxy_pack_kernel<<<(unsigned) ((total + 127) / 128), 128, 0, (cudaStream_t) stream>>>(
+        (const Q6KBlock*) q6k_rows, row0, n, (uint4*) proxy, px::scales(proxy, n_cap));
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "q6k_proxy_pack: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+bool q6k_proxy_top1(const void* proxy, const void* q6k_rows, const void* x_q8_1, int n_rows, int64_t n_cap,
+                    const int32_t* map, int* out_id, float* out_prob, void* scratch, void* stream) {
+    if (n_rows <= 0 || n_rows > n_cap || !proxy || !q6k_rows || !x_q8_1 || !map || !out_id || !out_prob || !scratch)
+        return false;
+    const int tiles = (int) px::tiles(n_rows);
+    const uint4* wq = (const uint4*) proxy;
+    const uint32_t* sc = (const uint32_t*) px::scales(const_cast<void*>(proxy), n_cap);
+    float2* cand = (float2*) scratch;
+    float2* part = cand + (size_t) px::tiles(n_cap) * px::kPer;
+    launch_pdl(px::score_kernel, dim3((unsigned) tiles), dim3(128), 0, (cudaStream_t) stream, wq, sc,
+               (const px::X81*) x_q8_1, n_rows, map, cand, part);
+    launch_pdl(q6k_proxy_final_kernel, dim3(1), dim3(512), 0, (cudaStream_t) stream, (const Q6KBlock*) q6k_rows,
+               (const Q81Block*) x_q8_1, tiles, map, (const float2*) cand, (const float2*) part, out_id, out_prob);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "q6k_proxy_top1: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
 }
 
 }  // namespace basalt::kernels

@@ -209,6 +209,151 @@ int main(int argc, char** argv) {
                     rr, bad ? "FAIL" : "bitwise", bad, max_rel, 1e3 * t_map / iters, 1e3 * t_plain / iters);
         if (bad || max_rel > 1e-5) fail = 1;
     }
+    // the two-stage argmax (2-bit copy, then exact rescoring of the near-best rows) against the exact argmax, on rows
+    // scaled to logits of a few units' spread; rows without a token are skipped.  The planted rows come from a CPU
+    // dequantization of the Q6_K rows, so a wrong unpacking of the copy shows as misses.
+    {
+        const int rr = std::min(rows, 40525);
+        const int64_t cap = rr + 100;
+        k::native_mmvq(14, w, xq, y0, n_in, rr, 1, s);
+        ck(cudaStreamSynchronize(s), "sync");
+        std::vector<float> l0((size_t) rr);
+        ck(cudaMemcpy(l0.data(), y0, l0.size() * 4, cudaMemcpyDeviceToHost), "l0");
+        double m1 = 0, m2 = 0;
+        for (float v : l0) { m1 += v; m2 += (double) v * v; }
+        const double sd = std::sqrt(m2 / rr - (m1 / rr) * (m1 / rr));
+        const float f = (float) (3.0 / sd);
+        std::vector<uint8_t> hw2(hw.begin(), hw.begin() + (size_t) rr * bpr * blk);
+        for (size_t b = 0; b < (size_t) rr * bpr; ++b) {   // scale d so the logits' spread is 3
+            __half d;
+            std::memcpy(&d, &hw2[b * blk + 208], 2);
+            d = __float2half(__half2float(d) * f);
+            std::memcpy(&hw2[b * blk + 208], &d, 2);
+        }
+        auto dequant = [&](int r, std::vector<float>& out) {   // ggml's Q6_K layout
+            out.assign((size_t) n_in, 0.0f);
+            for (int b = 0; b < bpr; ++b) {
+                const uint8_t* bp = &hw2[((size_t) r * bpr + b) * blk];
+                const uint8_t* ql = bp;
+                const uint8_t* qh = bp + 128;
+                const int8_t* sc = (const int8_t*) (bp + 192);
+                __half dh;
+                std::memcpy(&dh, bp + 208, 2);
+                const float d = __half2float(dh);
+                for (int n = 0; n < 2; ++n)
+                    for (int l = 0; l < 32; ++l) {
+                        const int is = l / 16;
+                        const int q1 = ((ql[64 * n + l] & 0xF) | (((qh[32 * n + l] >> 0) & 3) << 4)) - 32;
+                        const int q2 = ((ql[64 * n + l + 32] & 0xF) | (((qh[32 * n + l] >> 2) & 3) << 4)) - 32;
+                        const int q3 = ((ql[64 * n + l] >> 4) | (((qh[32 * n + l] >> 4) & 3) << 4)) - 32;
+                        const int q4 = ((ql[64 * n + l + 32] >> 4) | (((qh[32 * n + l] >> 6) & 3) << 4)) - 32;
+                        float* y = &out[(size_t) b * 256 + 128 * n];
+                        y[l] = d * sc[8 * n + is] * q1;
+                        y[l + 32] = d * sc[8 * n + is + 2] * q2;
+                        y[l + 64] = d * sc[8 * n + is + 4] * q3;
+                        y[l + 96] = d * sc[8 * n + is + 6] * q4;
+                    }
+            }
+        };
+        void* w2 = nullptr;
+        ck(cudaMalloc(&w2, hw2.size()), "w2");
+        ck(cudaMemcpy(w2, hw2.data(), hw2.size(), cudaMemcpyHostToDevice), "w2 up");
+        void *proxy = nullptr, *scratch = nullptr, *escratch = nullptr;
+        int *d_id = nullptr, *d_map_i = nullptr;
+        float* d_p = nullptr;
+        ck(cudaMalloc(&proxy, k::q5k_proxy_bytes(cap)), "proxy");
+        ck(cudaMemset(proxy, 0, k::q5k_proxy_bytes(cap)), "proxy0");
+        ck(cudaMalloc(&scratch, k::q5k_proxy_scratch_bytes(cap)), "pscratch");
+        ck(cudaMalloc(&escratch, k::q6k_head_top1_scratch_bytes()), "escratch");
+        ck(cudaMemset(escratch, 0, k::q6k_head_top1_scratch_bytes()), "escratch0");
+        ck(cudaMalloc(&d_id, 64), "id"); ck(cudaMalloc(&d_p, 64), "p");
+        std::vector<int32_t> map((size_t) rr);
+        for (int i = 0; i < rr; ++i) map[(size_t) i] = (i % 7 == 3 || i >= rr - 300) ? -1 : 5 * i + 1;
+        ck(cudaMalloc(&d_map_i, map.size() * 4), "map");
+        ck(cudaMemcpy(d_map_i, map.data(), map.size() * 4, cudaMemcpyHostToDevice), "map up");
+        k::q6k_proxy_pack(w2, 0, rr, proxy, cap, s);
+        const int trials = 400;
+        int miss = 0;
+        double max_p_rel = 0, sum_p_rel = 0;
+        float* x1 = nullptr;
+        void* xq1 = nullptr;
+        ck(cudaMalloc(&x1, (size_t) n_in * 4), "x1");
+        ck(cudaMalloc(&xq1, k::native_q8_1_bytes(n_in, 1)), "xq1");
+        std::vector<float> dq;
+        for (int tr = 0; tr < trials; ++tr) {
+            // noise plus two planted rows (the pick and a runner-up a few units behind), as a head's logits have
+            std::vector<float> xh(n_in);
+            for (auto& v : xh) v = 0.8f * nd(rng);
+            for (int pl = 0; pl < 2; ++pl) {
+                int r;
+                do { r = (int) (rng() % (unsigned) rr); } while (map[(size_t) r] < 0);
+                dequant(r, dq);
+                double nn = 0;
+                for (float v : dq) nn += (double) v * v;
+                const double alpha = (pl == 0 ? 20.0 : 16.0 + (double) (rng() % 4)) / nn;
+                for (int i = 0; i < n_in; ++i) xh[(size_t) i] += (float) (alpha * dq[(size_t) i]);
+            }
+            ck(cudaMemcpy(x1, xh.data(), (size_t) n_in * 4, cudaMemcpyHostToDevice), "x1 up");
+            k::native_quantize_q8_1(x1, xq1, n_in, 1, s);
+            k::native_mmvq(14, w2, xq1, y0, n_in, rr, 1, s);
+            if (!k::q6k_proxy_top1(proxy, w2, xq1, rr, cap, d_map_i, d_id, d_p, scratch, s)) { std::printf("proxy refused\n"); fail = 1; break; }
+            ck(cudaStreamSynchronize(s), "sync");
+            std::vector<float> a((size_t) rr);
+            ck(cudaMemcpy(a.data(), y0, a.size() * 4, cudaMemcpyDeviceToHost), "a");
+            int best = -1;
+            for (int i = 0; i < rr; ++i)
+                if (map[(size_t) i] >= 0 && (best < 0 || a[(size_t) i] > a[(size_t) best])) best = i;
+            double sum = 0;
+            for (int i = 0; i < rr; ++i)
+                if (map[(size_t) i] >= 0) sum += std::exp((double) a[(size_t) i] - (double) a[(size_t) best]);
+            int id;
+            float p;
+            ck(cudaMemcpy(&id, d_id, 4, cudaMemcpyDeviceToHost), "id");
+            ck(cudaMemcpy(&p, d_p, 4, cudaMemcpyDeviceToHost), "p");
+            const bool hit = id == map[(size_t) best];
+            miss += !hit;
+            if (hit) {   // the probability of the same token
+                const double rel = std::fabs((double) p * sum - 1.0);
+                max_p_rel = std::max(max_p_rel, rel);
+                sum_p_rel += rel;
+            }
+        }
+        // cold time: the two-stage argmax, the fused exact head, and the plain head + top-prob the draft ran before
+        float t_px = 0, t_ex = 0, t_pl = 0;
+        int *r_id = nullptr;
+        float* r_p = nullptr;
+        ck(cudaMalloc(&r_id, 64), "rid"); ck(cudaMalloc(&r_p, 64), "rp");
+        void* flush = nullptr;
+        ck(cudaMalloc(&flush, 512u << 20), "flush");
+        for (int rep = 0; rep < 2; ++rep) {
+            ck(cudaStreamSynchronize(s), "sync");
+            float tot[3] = {0, 0, 0};
+            for (int it = 0; it < 40; ++it)
+                for (int v = 0; v < 3; ++v) {
+                    ck(cudaMemsetAsync(flush, it, 512u << 20, s), "flush");
+                    cudaEventRecord(e0, s);
+                    if (v == 0) k::q6k_proxy_top1(proxy, w2, xq1, rr, cap, d_map_i, d_id, d_p, scratch, s);
+                    else if (v == 1) k::q6k_head_top1(w2, xq1, y1, n_in, rr, d_map_i, d_id, d_p, escratch, s);
+                    else {
+                        k::native_mmvq(14, w2, xq1, y1, n_in, rr, 1, s);
+                        k::sample_greedy_top_prob(y1, 1, rr, d_map_i, r_id, r_p, s);
+                    }
+                    cudaEventRecord(e1, s);
+                    cudaEventSynchronize(e1);
+                    float ms;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    tot[v] += ms;
+                }
+            t_px = tot[0] / 40;
+            t_ex = tot[1] / 40;
+            t_pl = tot[2] / 40;
+        }
+        cudaFree(flush);
+        std::printf("proxy top1 rows %d: %d of %d picks differ from the exact argmax; probability rel diff max %.2e mean %.2e | "
+                    "cold: two-stage %.1f us, fused exact %.1f us, head + top-prob %.1f us\n",
+                    rr, miss, trials, max_p_rel, sum_p_rel / trials, 1e3 * t_px, 1e3 * t_ex, 1e3 * t_pl);
+        if (miss > trials / 50 || max_p_rel > 1.0) fail = 1;
+    }
     std::printf("%s\n", fail ? "q6k_head_parity: FAIL" : "q6k_head_parity: OK (bitwise)");
     return fail;
 }
