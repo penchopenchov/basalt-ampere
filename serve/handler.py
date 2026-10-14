@@ -695,6 +695,7 @@ def make_handler(svc: Service):
 
 class Server(ThreadingHTTPServer):
     allow_reuse_address = True
+    request_queue_size = 256      # socketserver's backlog of 5 resets some clients of a burst of simultaneous connections
 
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a hang-up needs no stack trace
