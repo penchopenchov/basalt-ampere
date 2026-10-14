@@ -239,7 +239,7 @@ def main() -> int:
             time.sleep(1)                               # a timed wait keeps Ctrl+C deliverable
     except KeyboardInterrupt:
         print("[server] stopping (Ctrl+C again to force)", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
+        closers = [svc.stop, httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None]
         for close in filter(None, closers):
             try:
                 close()

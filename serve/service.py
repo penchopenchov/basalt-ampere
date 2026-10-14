@@ -56,6 +56,7 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
+        self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
         # put a non-default reasoning effort in a system turn before the answer so the cached prefix survives
@@ -122,8 +123,14 @@ class Service:
         except Exception:
             return None
 
+    def stop(self):
+        """Shutdown has begun: a request still in flight no longer restarts the engine."""
+        self.stopping.set()
+
     def ensure_loaded(self):
         """Start the engine if it is not running, after the before_load hook and VRAM check. Caller holds fifo."""
+        if self.stopping.is_set():
+            raise EngineDied("the server is stopping")
         if self.loaded() and not self._vision_down():
             return
         if self.before_load:
@@ -147,6 +154,8 @@ class Service:
             self.vision.restart()
         if self.loaded():
             return
+        if self.stopping.is_set():                      # shutdown began while the hook or the VRAM wait ran
+            raise EngineDied("the server is stopping")
         if getattr(self.engine, "unloaded", False):
             print("[server] loading the model again", flush=True)
         else:
