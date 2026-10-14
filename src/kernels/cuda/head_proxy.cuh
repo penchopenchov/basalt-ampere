@@ -1,5 +1,5 @@
 // src/kernels/cuda/head_proxy.cuh - the 2-bit copy of a draft head's rows (n_in 2560) that the Q5_K and Q6_K heads
-// share: its layout, the packing of one 32-weight group, the approximate scoring pass, and the pick among the rows the
+// share: its layout, the fit and packing of one 32-weight group, the approximate scoring pass, and the pick among the rows the
 // head's own kernel rescored exactly.  Each including file gets its own copy of these kernels.
 #pragma once
 
@@ -32,13 +32,15 @@ struct X81 {
     int8_t qs[32];
 };
 
-// Group g (32 weights, dequantized) of row `row`: four levels with the scale (of a few candidates) that leaves the
-// least squared error.  UNSHRINK: the stored scale is then multiplied by sqrt(|w|^2 / <w, w_hat>); the least-squares
-// copy scores the rows near the best low, which inflates the draft probability, and half the full correction
-// leaves it close to the exact one.
+// The level (0..3) of weight w at quantization step sh.
+__device__ __forceinline__ int level(float w, float sh) { return min(3, max(0, (int) floorf(w / sh + 2.0f))); }
+
+// One 32-weight group's scale: four levels with the scale (of a few candidates) that leaves the least squared error.
+// `sh` gets the step the levels are taken at; the result is the stored scale.  UNSHRINK: the stored scale is then
+// multiplied by sqrt(|w|^2 / <w, w_hat>); the least-squares copy scores the rows near the best low, which inflates
+// the draft probability, and half the full correction leaves it close to the exact one.
 template <bool UNSHRINK = false>
-__device__ __forceinline__ void pack_group(const float* w, int64_t row, int g, uint4* __restrict__ wq,
-                                           uint16_t* __restrict__ sc) {
+__device__ __forceinline__ __half fit_group(const float* w, float& sh_out) {
     float amax = 1e-9f;
     for (int l = 0; l < 32; ++l) amax = fmaxf(amax, fabsf(w[l]));
     float best_s = amax / 1.5f, best_e = INFINITY;
@@ -47,31 +49,37 @@ __device__ __forceinline__ void pack_group(const float* w, int64_t row, int g, u
         const float sh = __half2float(__float2half(s));
         float e = 0.0f;
         for (int l = 0; l < 32; ++l) {
-            const int q = min(3, max(0, (int) floorf(w[l] / sh + 2.0f)));
-            const float r = ((float) q - 1.5f) * sh - w[l];
+            const float r = ((float) level(w[l], sh) - 1.5f) * sh - w[l];
             e += r * r;
         }
         if (e < best_e) { best_e = e; best_s = s; }
     }
     __half hs = __float2half(best_s);
     const float sh = __half2float(hs);
-    const int tile = (int) (row >> 5), lane = (int) (row & 31), w4 = g / 2, h = g & 1;
-    uint32_t words[2] = {0u, 0u};
-    for (int c = 0; c < 2; ++c)
-        for (int ii = 0; ii < 4; ++ii)
-            for (int bb = 0; bb < 4; ++bb) {
-                const int q = min(3, max(0, (int) floorf(w[c * 16 + 4 * ii + bb] / sh + 2.0f)));
-                words[c] |= (uint32_t) q << (8 * bb + 2 * ii);
-            }
+    sh_out = sh;
     if constexpr (UNSHRINK) {
         float ww = 0.0f, wr = 0.0f;
         for (int l = 0; l < 32; ++l) {
-            const float r = ((float) min(3, max(0, (int) floorf(w[l] / sh + 2.0f))) - 1.5f) * sh;
+            const float r = ((float) level(w[l], sh) - 1.5f) * sh;
             ww += w[l] * w[l];
             wr += w[l] * r;
         }
         if (wr > 0.0f) hs = __float2half(sh * sqrtf(ww / wr));
     }
+    return hs;
+}
+
+// Group g (32 weights, dequantized) of row `row` into the copy.
+template <bool UNSHRINK = false>
+__device__ __forceinline__ void pack_group(const float* w, int64_t row, int g, uint4* __restrict__ wq,
+                                           uint16_t* __restrict__ sc) {
+    float sh;
+    const __half hs = fit_group<UNSHRINK>(w, sh);
+    const int tile = (int) (row >> 5), lane = (int) (row & 31), w4 = g / 2, h = g & 1;
+    uint32_t words[2] = {0u, 0u};
+    for (int c = 0; c < 2; ++c)
+        for (int ii = 0; ii < 4; ++ii)
+            for (int bb = 0; bb < 4; ++bb) words[c] |= (uint32_t) level(w[c * 16 + 4 * ii + bb], sh) << (8 * bb + 2 * ii);
     uint32_t* wd = reinterpret_cast<uint32_t*>(wq) + (((size_t) tile * kNw4 + w4) * 32 + lane) * 4 + 2 * h;
     wd[0] = words[0];
     wd[1] = words[1];
