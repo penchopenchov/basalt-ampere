@@ -129,7 +129,11 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # vision markers are special only where the template writes them for an image item
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
+# The tool-call tags are special tokens the tokenizer matches in any text; a quoted one would hand the model the real
+# marker. An assistant message keeps its own, since a client replaying raw call text sends the tokens the model wrote.
+TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", "<tool_response>": "\U000F0E09",
+                     "</tool_response>": "\U000F0E0A"}
+LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # control-token marks start here
 
@@ -167,23 +171,63 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     return False
 
 
+_TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE = "<tool_response>", "</tool_response>"
+
+
+def _keep_tool_result_wrap(content, tags: dict[str, str]):
+    """A user message whose whole text is <tool_response>...</tool_response> (a client that formats a tool result the way
+    the template does) keeps that outer pair as the markers, since the template tells such a turn from a question by
+    exactly that pair; only the text inside is marked. None: not such a message."""
+    o, c = _TOOL_RESULT_OPEN, _TOOL_RESULT_CLOSE
+
+    def wrapped(text: str) -> bool:
+        body = text.strip()
+        return len(body) >= len(o) + len(c) and body.startswith(o) and body.endswith(c)
+
+    def wrap(text: str, first: bool, last: bool) -> str:
+        i = text.index(o) + len(o) if first else 0
+        j = text.rindex(c) if last else len(text)
+        head = _mark(text[:i - len(o)], tags) + o if first else ""
+        tail = c + _mark(text[j + len(c):], tags) if last else ""
+        return head + _mark(text[i:j], tags) + tail
+
+    if isinstance(content, str):
+        return wrap(content, True, True) if wrapped(content) else None
+    if not (isinstance(content, list) and content and all(isinstance(x, dict) and isinstance(x.get("text"), str)
+                                                          for x in content)):
+        return None
+    texts = [x["text"] for x in content]
+    if not wrapped("".join(texts)) or not (texts[0].lstrip().startswith(o) and texts[-1].rstrip().endswith(c)):
+        return None          # the pair is split inside a part: mark it all
+    if len(content) == 1:
+        return [{**content[0], "text": wrap(texts[0], True, True)}]
+    return ([{**content[0], "text": wrap(texts[0], True, False)}] + [_mark_deep(x, tags) for x in content[1:-1]] +
+            [{**content[-1], "text": wrap(texts[-1], False, True)}])
+
+
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
     """(messages, tools, changed) with literal tags in their text swapped for `tags`' marks; unchanged objects come
     back when there are none. An assistant message opening with a whole <think>...</think> block keeps it."""
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
+    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
     for m in messages:
         m = dict(m)
         content = m.get("content")
+        mine = own if m.get("role") == "assistant" else tags
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v, tags)
+                m[k] = _mark_deep(v, mine)
+        if m.get("role") == "user":
+            kept = _keep_tool_result_wrap(content, tags)
+            if kept is not None:
+                m["content"] = kept
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
-            m["content"] = (content[:i] + _mark(content[i:j], tags) + "</think>" +
-                            _mark(content[j + len("</think>"):], tags))
+            m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
+                            _mark(content[j + len("</think>"):], own))
         out.append(m)
     return out, _mark_deep(tools, tags), True
 
