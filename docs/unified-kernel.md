@@ -13,7 +13,7 @@ Decode runs a window of T tokens per verify pass (T = 1 to 4 are covered). For e
 | Fused GDN layer | `fused_layer.cu`, `fused_chain.cuh`, `fused_bound.cuh` | the whole GDN layer: `k_layer<T>` runs the chain, then the experts half, in one launch |
 | QSA attention half | `qsa_full.cu`, `qsa_full_*.cuh` | projections, K/Q post, indexer scores, top-k, attention, gate and output projection of a QSA layer, as one persistent kernel |
 
-Arithmetic and reduction order are the same as the kernels they replace, so outputs are bitwise identical to the separate-kernel path (see `docs/precision.md`). Windows with T >= 5, the experts half of QSA layers, and layers whose gate/up format is not covered keep the separate kernels.
+Arithmetic and reduction order are the same as the kernels they replace, so outputs are bitwise identical to the separate-kernel path (see `docs/precision.md`). Windows with T >= 5, QSA layers (both halves) and layers whose gate/up format is not covered keep the separate kernels. The QSA attention half (`qsa_full`) is kept in the tree and its parity test still runs, but the engine does not launch it: it was slower than the separate kernels.
 
 Build structure:
 
@@ -62,6 +62,26 @@ The GDN attention half is at parity with main in the engine. The loss is in the 
 
 The best build sits at about 54% of the window's byte floor against 61% for main.
 
+## Fix attempts on the top losses
+
+A second pass on the three largest losses against main (expert gate/up, the projections, the output projection, first hc). Each idea was measured with in-kernel stamps in the engine (PROFILE build, conversation fixture, ABAB in one session), then the survivors in a plain-build A/B (4 fresh processes per arm, ABBA, IQ3_S, `--peer-exclusive`, RTX 5090 at 400 W). Development A/Bs, not headline runs.
+
+| idea | engine stamps (us per layer) | plain A/B | kept |
+|---|---|---|---|
+| all of a CTA's gate/up rows into L2 at the release (no pacing) | gate/up +3, down -1.2 | - | no |
+| line prefetches instead of bulk L2 prefetches for gate/up | 0 | - | no |
+| no gate/up or down-slice L2 prefetch in the experts half | gate/up -3.2, down +0.8 | with the next row: conv -0.65% per window, verify T2 -0.3%, T3 +0.3% (noise) | no |
+| projection pair tiles into L2 at kernel entry (evict-first) | pair -6.2 (to its byte floor), hc1 +3, combine +0.6 | see above | no |
+| QSA projection and output weights into L2 at kernel entry | projections +2 to +3.4, output projection -2.5 | - | no |
+| QSA layers back on the separate kernels | - | conv -6.0%, prose -5.0%, structured -7.4% per window against the unified build (measured with the two prefetch rows above, which are neutral) | yes |
+
+- Stamps over-predicted again: the prefetch pair summed to about -4.7 us per GDN layer (-1.7% per window); the plain A/B shows no change.
+- Two CTAs per SM do not fit: the attention half also uses the whole 99 KB arena, and 512 threads at 128 registers fill the register file.
+- Balancing gate/up items across CTAs: the CTAs with one item more finish about 6 us later at T = 3, which bounds the gain at about 1% per window. Not built.
+- The fused layer kernel is about 1.5 MB of SASS and the QSA kernel about 0.55 MB. With cold caches, 18% of the experts half's warp stalls are instruction fetch.
+
+With QSA on the separate kernels the branch is still about 6% slower than main per conversation window and 8% per prose window; structured windows (mostly T >= 5) are level. Windows T = 1 to 4, where the fused GDN layer runs, cost 10 to 12% more than main; T = 5 to 7, which run no fused kernel, cost about 1% more (no tag protocol).
+
 ## Why it is parked
 
 - The standalone harness predicted gains the engine did not show. Auditing twelve claims, the harness-to-engine ratio was typically 0.1 to 0.3. Causes: the harness starts every CTA with the top-10 experts already known, while in the engine they arrive about 7 us after the attention output; the shared expert finishes last in the engine; window arithmetic that ignored the window-width mix (T = 5 to 7 and T = 1 gain nothing); and measurement errors (wrong lock, builds running, per-launch memsets in a hot loop).
@@ -84,4 +104,3 @@ The best build sits at about 54% of the window's byte floor against 61% for main
 - Give the round-2 gate/up items to CTAs with fewer down rows.
 - Per-triple `k_layer` instances (the engine builds the generic one only), and chain-local half-packed fragments to cut spills in the projection pair.
 - A layer-boundary kernel running several layers per launch (spills made it slower in the harness).
-- Route QSA layers back to the separate kernels while keeping the GDN fusion; this recovers the QSA loss with a small change.
