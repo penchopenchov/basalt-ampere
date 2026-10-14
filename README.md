@@ -133,7 +133,9 @@ layer or the output run between two windows. A long prompt therefore does not st
 arrives while no other slot is decoding is read as in the single-stream path.
 
 At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
-example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. Because that memory is
+example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the
+default on one GPU) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
+grow to at `--max-context`. Because that memory is
 taken from the expert cache, the engine warns (`basalt warning: the N batch slots' sessions ... take X GiB of CUDA0
 ...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and
 names the remedies: a smaller `--max-context`, no `--slot-full-context`, fewer `--parallel` slots. If a slot's session

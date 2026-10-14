@@ -3067,11 +3067,15 @@ int main(int argc, char** argv) {
             o.batch = fit;
             for (size_t k = 0; k < bslot_ss.size(); ++k)   // every slot session allocated, solo state included
                 for (int b = 0; b < o.batch; ++b)
+                {
+                    const uint64_t sb = basalt::core::session_bytes(g, slot_cap[(size_t) b], K, k == 0 ? 0 : stages[k - 1]->lb,
+                                                                    k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le);
+                    const basalt::core::SessionState& u = *bslot_ss[k][(size_t) b];
                     basalt::core::LoadProgress::kv(
                         basalt::core::LoadProgress::cuda(k == 0 ? 0 : stages[k - 1]->dev),
-                        basalt::core::session_bytes(g, slot_cap[(size_t) b], K, k == 0 ? 0 : stages[k - 1]->lb,
-                                                    k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le),
-                        slot_cap[(size_t) b], "slot");
+                        sb + basalt::core::session_kv_mapped_bytes(u), slot_cap[(size_t) b], "slot",
+                        sb + basalt::core::session_kv_bytes_for(u, u.max_cells));
+                }
             slot_cap.resize((size_t) fit);
             if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
             // the sessions' VRAM is the expert cache's: say what it costs (the slots carved on CUDA0 may be fewer than
@@ -3092,7 +3096,9 @@ int main(int argc, char** argv) {
     // the drafter's K/V is elastic like the sessions' (MtpDrafter::load keeps it whole with a K/V per batch slot)
     basalt::core::qsa_set_kv_elastic(kv_floor);
     if (!slot0_is_solo)
-        basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(0), solo_kv_bytes, o.max_context);
+        basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(0),
+                                       solo_kv_bytes + basalt::core::session_kv_mapped_bytes(ss), o.max_context, "",
+                                       solo_kv_bytes + basalt::core::session_kv_bytes_for(ss, ss.max_cells));
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts: the driver can
     // refuse the draft weights after mapping tens of GiB of host pages.
     basalt::core::MtpDrafter mtp;

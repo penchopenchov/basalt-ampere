@@ -4,6 +4,7 @@
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
+#include "basalt/core/kv_arena.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/on_device.hpp"
 
@@ -392,7 +393,12 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
                 }
         }
     }
-    LoadProgress::kv(LoadProgress::cuda(device_), draft_kv_bytes, max_cells, "draft");
+    uint64_t draft_kv_max = draft_kv_bytes;
+    if (st_.kv_arena != nullptr) {   // the elastic working K/V: what is backed now, and what the whole context takes
+        draft_kv_bytes += st_.kv_arena->mapped_bytes();
+        draft_kv_max += st_.kv_arena->bytes_for(st_.kv_arena->max_cells());
+    }
+    LoadProgress::kv(LoadProgress::cuda(device_), draft_kv_bytes, max_cells, "draft", draft_kv_max);
 
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;

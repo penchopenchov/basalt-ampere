@@ -109,6 +109,8 @@ void session_release(SessionState& s);
 int64_t session_kv_cells(const SessionState& s);
 uint64_t session_kv_grow_bytes(const SessionState& s, int64_t cells);
 uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells);
+/// The VRAM backing the session's elastic KV now (0 when it is not elastic).
+uint64_t session_kv_mapped_bytes(const SessionState& s);
 bool session_kv_map(SessionState& s, int64_t cells, std::string& err);
 bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts

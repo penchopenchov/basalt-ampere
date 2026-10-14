@@ -166,6 +166,14 @@ uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells) {
     return b;
 }
 
+uint64_t session_kv_mapped_bytes(const SessionState& s) {
+    uint64_t b = 0;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (const KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena) b += a->mapped_bytes();
+    for (const KvArena* a : s.kv_extra) b += a->mapped_bytes();
+    return b;
+}
+
 bool session_kv_map(SessionState& s, int64_t cells, std::string& err) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (KvArena* a = s.qsa_states[s.qsa_ord0 + j].kv_arena)

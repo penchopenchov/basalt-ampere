@@ -7,11 +7,13 @@
 //   basalt load: copy <target> <done> <total>         a phase that copies bytes a counted phase already placed
 //
 // `<target>` is `cuda<N>` (bytes written into that device) or `ram` (experts copied or locked into system RAM).
-//   basalt load: kv [slot|draft ]<target> <bytes> <tokens>
+//   basalt load: kv [slot|draft ]<target> <bytes> <tokens> <max_bytes>
 //                                                     the session state (KV and recurrent state) allocated on a
 //                                                     device for <tokens> of context; an allocation, not a load phase.
 //                                                     No kind: the solo session; `slot`: one batch slot's session;
-//                                                     `draft`: the draft layer's K/V (working copy and slot stores)
+//                                                     `draft`: the draft layer's K/V (working copy and slot stores).
+//                                                     <bytes> is what is backed now, <max_bytes> what the state
+//                                                     takes at <tokens> (larger only when the K/V is elastic).
 // A plan is the sum of the totals of the phases the target will run (a later plan line replaces an earlier one).
 // The total is announced once, from the model file's tables, and counts every byte once: the sum of the phase totals
 // that are not copies.  If a part cannot be placed (the RAM is short and the experts are read from the file instead),
@@ -51,11 +53,13 @@ public:
                      (unsigned long long) bytes);
     }
     /// Reports the session state allocated on a device (not part of any load total).
-    /// `kind` is "" (the solo session), "slot" or "draft".
-    static void kv(const std::string& target, uint64_t bytes, int64_t tokens, const char* kind = "") {
+    /// `kind` is "" (the solo session), "slot" or "draft".  `max_bytes` 0: the state is fully backed.
+    static void kv(const std::string& target, uint64_t bytes, int64_t tokens, const char* kind = "",
+                   uint64_t max_bytes = 0) {
         std::lock_guard<std::mutex> lk(total_mu());
-        std::fprintf(stderr, "basalt load: kv %s%s%s %llu %lld\n", kind, kind[0] ? " " : "", target.c_str(),
-                     (unsigned long long) bytes, (long long) tokens);
+        std::fprintf(stderr, "basalt load: kv %s%s%s %llu %lld %llu\n", kind, kind[0] ? " " : "", target.c_str(),
+                     (unsigned long long) bytes, (long long) tokens,
+                     (unsigned long long) (max_bytes > bytes ? max_bytes : bytes));
     }
     /// Lowers the announced total by bytes that will not be placed after all; a no-op without a total.
     static void skipped(uint64_t bytes) {

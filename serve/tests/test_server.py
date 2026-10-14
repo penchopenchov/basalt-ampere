@@ -1602,9 +1602,10 @@ class LoadProgress(unittest.TestCase):
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
         from serve.engine.progress import LoadBars, load_kv, load_progress
-        self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144, ""))
-        self.assertEqual(load_kv("basalt load: kv slot cuda1 100 5"), ("cuda1", 100, 5, "slot"))
-        self.assertEqual(load_kv("basalt load: kv draft cuda0 100 5"), ("cuda0", 100, 5, "draft"))
+        self.assertEqual(load_kv("basalt load: kv cuda0 4509715660 262144"), ("cuda0", 4509715660, 262144, "", 4509715660))
+        self.assertEqual(load_kv("basalt load: kv slot cuda1 100 5"), ("cuda1", 100, 5, "slot", 100))
+        self.assertEqual(load_kv("basalt load: kv slot cuda1 100 5 900"), ("cuda1", 100, 5, "slot", 900))
+        self.assertEqual(load_kv("basalt load: kv draft cuda0 100 5"), ("cuda0", 100, 5, "draft", 100))
         self.assertIsNone(load_kv("basalt load: kv cuda0 x 1"))
         self.assertIsNone(load_kv("basalt load: kv other cuda0 1 2"))
         self.assertIsNone(load_progress("basalt load: kv cuda0 100 5"))
@@ -1629,6 +1630,17 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(bars.kv_lines(), [
             "[server] kv cache: 12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)",
             "[server] kv cache: 1.0 GiB on cuda3 (1 slot x 1000 tokens)"])
+
+    def test_an_elastic_kv_line_reads_backed_over_most(self):
+        from serve.engine.progress import LoadBars, load_kv
+        bars = LoadBars(io.StringIO(), gpus=[2, 3])
+        bars.set_kv(*load_kv("basalt load: kv cuda0 536870912 262144 4294967296"))
+        bars.set_kv(*load_kv("basalt load: kv draft cuda0 107374182 262144 429496729"))
+        self.assertEqual(bars.kv_lines(), ["[server] kv cache: 0.6 / 4.4 GiB on cuda2 (elastic)"])
+        slots = LoadBars(io.StringIO())
+        slots.set_kv("cuda0", 1 << 29, 262144, "slot", 4 << 30)
+        slots.set_kv("cuda0", 1 << 29, 262144, "slot", 4 << 30)
+        self.assertEqual(slots.kv_lines(), ["[server] kv cache: 1.0 / 8.0 GiB on cuda0 (elastic, 2 slots)"])
 
     def test_a_target_planned_empty_shows_nothing(self):
         from serve.engine.progress import LoadBars
