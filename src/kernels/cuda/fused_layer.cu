@@ -87,6 +87,7 @@ using namespace basalt::kernels;
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include "basalt/kernels/stamp_ring.hpp"
 #include "fused_bound.cuh"
 #include "fused_chain.cuh"
 // the experts half's TU includes iq_kernels.cu, whose anonymous-namespace Fmt / warp_sum collide with dense_tc / hc_fused
