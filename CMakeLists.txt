@@ -769,6 +769,8 @@ if(BUILD_TESTING)
     set_tests_properties(native_expert_parity_${_name} PROPERTIES TIMEOUT 120)
   endforeach()
   add_test(NAME native_expert_parity_q5_1_min COMMAND native_expert_parity --q5_1-min)
+  # the AVX-512 Q8_K activation quantizer bit for bit against ggml's reference
+  add_test(NAME native_expert_parity_q8k_quant COMMAND native_expert_parity --q8k-quant)
   # the BF16 token embedding gathered and dequantized bit for bit
   add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
   # the Q6_K token embedding dequantized against ggml's reference

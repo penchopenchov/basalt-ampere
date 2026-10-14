@@ -574,6 +574,61 @@ int check_q6k_embd(cudaStream_t s) {
     return gather_differ || flat_differ ? 1 : 0;
 }
 
+// The AVX-512 Q8_K activation quantizer against ggml's reference quantizer: every byte of every block equal, on
+// random vectors of the model's width (dense, sparse, tied maxima, all-zero blocks, wide dynamic range).
+int check_q8k_quant() {
+    if (!cpu::cpu_avx512_ok()) { std::printf("q8_K quantizer: no AVX-512 on this CPU, skipped\n"); return 0; }
+    const auto* tr = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const size_t bytes = ggml_row_size(GGML_TYPE_Q8_K, H);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_int_distribution<int> pick(0, 9);
+    std::vector<float> x((size_t) H);
+    std::vector<uint8_t> a(bytes), b(bytes);
+    int bad = 0;
+    const int N = 200000;
+    for (int it = 0; it < N; ++it) {
+        const int kind = it % 6;
+        for (int64_t i = 0; i < H; ++i) {
+            float v = nd(rng);
+            if (kind == 1 && pick(rng) != 0) v = 0.f;                          // sparse
+            if (kind == 2) v = (float) (pick(rng) - 5);                        // ties and equal +-max
+            if (kind == 3) v *= std::exp((float) pick(rng) * 2.f - 9.f);       // wide dynamic range
+            if (kind == 4 && (i / 256) % 3 == 0) v = 0.f;                      // all-zero blocks
+            x[(size_t) i] = v;
+        }
+        std::fill(a.begin(), a.end(), 0xA5);
+        std::fill(b.begin(), b.end(), 0xA5);
+        tr->from_float(x.data(), a.data(), H);
+        cpu::quantize_q8_K_avx512(x.data(), b.data(), H);
+        // ggml leaves the bsums of an all-zero block unwritten; they are zero there
+        const size_t blk = bytes / (H / 256);
+        for (int64_t k = 0; k < H / 256; ++k) {
+            const auto* ya = a.data() + (size_t) k * blk;
+            float d;
+            std::memcpy(&d, ya, 4);
+            if (d == 0.f) std::memset(a.data() + (size_t) k * blk + 4 + 256, 0, 32);
+        }
+        if (std::memcmp(a.data(), b.data(), bytes) != 0) ++bad;
+    }
+    std::vector<uint8_t> o(bytes);
+    for (int i = 0; i < 1000; ++i) {
+        for (int64_t j = 0; j < H; ++j) x[(size_t) j] = nd(rng);
+        cpu::quantize_q8_K_avx512(x.data(), o.data(), H);
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    const int R = 200000;
+    for (int i = 0; i < R; ++i) tr->from_float(x.data(), a.data(), H);
+    auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < R; ++i) cpu::quantize_q8_K_avx512(x.data(), b.data(), H);
+    auto t2 = std::chrono::steady_clock::now();
+    const double ur = std::chrono::duration<double, std::micro>(t1 - t0).count() / R;
+    const double uf = std::chrono::duration<double, std::micro>(t2 - t1).count() / R;
+    std::printf("q8_K quantizer: %d of %d vectors differ from ggml's reference (bitwise)\n", bad, N);
+    std::printf("q8_K quantizer microbench, %lld floats: ggml reference %.3f us, AVX-512 %.3f us (%.1fx)\n", (long long) H, ur, uf, ur / uf);
+    return bad != 0 ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -582,6 +637,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
                              "       native_expert_parity --q5_1-min\n"
+                             "       native_expert_parity --q8k-quant\n"
                              "       native_expert_parity --bf16-embd\n"
                              "       native_expert_parity --q6k-embd\n");
         return 2;
@@ -590,7 +646,9 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     cudaStreamCreate(&s);
     const std::string mode = argv[1];
-    if (mode == "--q5_1-min") {
+    if (mode == "--q8k-quant") {
+        failures += check_q8k_quant();
+    } else if (mode == "--q5_1-min") {
         failures += check_q5_1_min(s);
     } else if (mode == "--bf16-embd") {
         failures += check_bf16_embd(s);
