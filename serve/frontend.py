@@ -524,6 +524,54 @@ def call_end(text: str) -> int:
             return text.find(CALL_END, pos)
 
 
+def tool_choice_of(tool_choice) -> tuple[str, str | None]:
+    """A client's `tool_choice` in any API's shape -> ("auto" | "none" | "required" | "named", name).
+    OpenAI: "auto" / "none" / "required", {"type": "function", "function": {"name": N}} or the flat
+    {"type": "function", "name": N} (Responses, with an optional "namespace"); Anthropic: {"type": "auto" | "any" |
+    "none"} and {"type": "tool", "name": N}.  A value it does not know is a ValueError."""
+    if tool_choice is None:
+        return "auto", None
+    if isinstance(tool_choice, str):
+        if tool_choice in ("auto", "none", "required"):
+            return tool_choice, None
+    elif isinstance(tool_choice, dict):
+        kind = tool_choice.get("type")
+        if kind in ("auto", "none"):
+            return kind, None
+        if kind in ("any", "required"):
+            return "required", None
+        if kind in ("function", "tool", "custom"):
+            fn = tool_choice.get("function")
+            name = (fn.get("name") if isinstance(fn, dict) else None) or tool_choice.get("name")
+            if isinstance(name, str) and name:
+                space = tool_choice.get("namespace")
+                return "named", f"{space}.{name}" if isinstance(space, str) and space else name
+            raise ValueError("tool_choice: a named choice needs the tool's name")
+    raise ValueError(f"tool_choice: unsupported value {json.dumps(tool_choice)[:120]}; use auto, none, required "
+                     "(Anthropic: any) or a named tool")
+
+
+def forced_call(tool_choice, tools: list[dict] | None) -> tuple[list[dict] | None, str | None]:
+    """`tool_choice` -> (the tools to offer, the text that opens the call the reply must make or None).
+    "none" offers no tools.  There is no grammar: the server writes the opening itself, so the model can only go on
+    with a call.  "required" / Anthropic "any": any tool (the only one is named); a named tool: that one.  A forced
+    choice with no tools, or naming a tool the request lacks, is a ValueError."""
+    kind, name = tool_choice_of(tool_choice)
+    if kind == "none":
+        return None, None
+    if kind in ("auto", "none"):
+        return tools, None
+    names = [t.get("name") for t in tools or []]
+    if kind == "required":
+        if not names:
+            raise ValueError("tool_choice: required needs at least one tool in the request")
+        if len(names) == 1:
+            name = names[0]
+    elif name not in names:
+        raise ValueError(f"tool_choice: the request has no tool named {name!r}")
+    return tools, CALL_START + (f"\n<function={name}>\n" if name else "\n<function=")
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>...</function>` -> ToolCall. Values are JSON-decoded when the schema says non-string
     (without a schema: when they parse as JSON objects, arrays, numbers or booleans)."""

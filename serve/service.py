@@ -454,9 +454,13 @@ class Service:
         prompt, plain = unmark_think_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
-        """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context."""
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None):
+        """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context.
+        `force` (frontend.forced_call): the opening of the call the reply must make.  Without thinking it ends the
+        prompt; with thinking, run() writes it once the thinking is over."""
         ids = self.encode_prompt(messages, tools, kwargs)
+        if force and kwargs.get("enable_thinking", True) is False:
+            ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -554,8 +558,9 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...})."""
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+        """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
+        `force`: the opening of the call the reply must make (see prepare)."""
         budget = self.reasoning_budget(sampling) if thinking else None   # opt-in
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
@@ -585,6 +590,10 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        opening = []                                    # without thinking the prompt ends with the forced opening:
+        if force and not thinking:                      # the parser reads it as if the model had written it
+            opening, force = parser.feed(force), None
+        tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (--debug)
@@ -646,11 +655,14 @@ class Service:
                     last_print = time.time()
                     prompt, thought = ids, 0            # reasoning tokens so far
                     closed_early = False                # the thinking was already closed once
+                    for ev in opening:
+                        yield "event", ev
                     while True:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         ended_thinking = False          # the turn ended inside the thinking
+                        opens = False                   # the thinking is over: write the forced call's opening
                         try:
                             # a held-back tool argument can leave the stream silent for long: ping after a quiet spell
                             last_out = time.monotonic()
@@ -678,7 +690,9 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # degenerate output
                                     break
-                                evs = cut(parser.feed(detok.push(t)))
+                                piece = detok.push(t)
+                                tail = (tail + piece)[-2:]
+                                evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
@@ -696,6 +710,12 @@ class Service:
                                     # only at a clean point: no held tag or split character
                                     if thought >= budget and not parser.buf and not detok.pending():
                                         wrap = True
+                                        break
+                                if force:
+                                    if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
+                                        force = None    # the model is writing a call of its own
+                                    elif parser.state == "content" and not parser.buf and not detok.pending():
+                                        opens = True    # at a clean point right after the thinking
                                         break
                         except EngineDied as e:
                             finish = "error"
@@ -720,24 +740,34 @@ class Service:
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
-                        if not (wrap or ended_thinking) or cancel.is_set():
+                        if not (wrap or opens or ended_thinking) or cancel.is_set():
                             break
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
                         # one, so the engine keeps its prefix
                         if ended_thinking:
                             closed_early = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(REASONING_CLOSE + (force or ""), parse_special=True)
+                            force = None
                             if max_new - n - len(extra) < 1:
                                 finish = "stop"
                                 break
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
-                        else:
+                        elif wrap:
                             budget = None
-                            extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+                            extra = self.tok.encode(REASONING_WRAP_UP + (force or ""), parse_special=True)
+                            force = None
                             if max_new - n - len(extra) < 1:
                                 break                   # no room to answer: "length"
                             print(f"[server] thinking budget reached ({thought} tokens), wrapping up",
                                   flush=True)
+                        else:
+                            # the thinking closed itself: the call opens after the blank line the template puts
+                            # before a call
+                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
+                            force = None
+                            extra = self.tok.encode(text, parse_special=True)
+                            if max_new - n - len(extra) < 1:
+                                break                   # no room for the call: "length"
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
