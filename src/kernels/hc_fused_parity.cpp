@@ -469,8 +469,7 @@ int main(int argc, char** argv) {
                                            "ticket", "up-lo", "norm-wr/w-in", "norm-sig/dn-in", "t10-smax", "t10-cand", "t10-rank"};
         // --stamp-reps N: the median over N reads of each phase's min/max over CTAs
         const int reps = stamp_reps;
-        for (int T : {1, 2, 3}) {
-            if (T < t_lo || T > t_hi) continue;
+        for (int T = t_lo; T <= t_hi; ++T) {
             for (int rt = 0; rt < 2; ++rt)
             for (int cold = 0; cold < 2; ++cold) {
                 if (rot && !cold) continue;
