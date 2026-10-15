@@ -590,12 +590,15 @@ __device__ __forceinline__ void sh_gu_pair(int ty, const uint8_t* w, int r, cons
     switch (ty) {
         case 23: sh_gate_row<TM>(w, r, xq, T, o, os, lane); sh_gate_row<TM>(w, r + 1, xq, T, o + 1, os, lane); break;
         case 21: pair_s<21>(w + (size_t) r * rb, rb, idt, 0, T, xq, o, os, grid3s, lane); break;
-        case 12: shx_row<12, TM, N / 256>(w + (size_t) r * rb, N / 256, xq, XQB, T, o, os, lane);
-                 shx_row<12, TM, N / 256>(w + (size_t) (r + 1) * rb, N / 256, xq, XQB, T, o + 1, os, lane); break;
-        case 13: shx_row<13, TM, N / 256>(w + (size_t) r * rb, N / 256, xq, XQB, T, o, os, lane);
-                 shx_row<13, TM, N / 256>(w + (size_t) (r + 1) * rb, N / 256, xq, XQB, T, o + 1, os, lane); break;
-        case 14: shx_row<14, TM, N / 256>(w + (size_t) r * rb, N / 256, xq, XQB, T, o, os, lane);
-                 shx_row<14, TM, N / 256>(w + (size_t) (r + 1) * rb, N / 256, xq, XQB, T, o + 1, os, lane); break;
+        case 12: case 13: case 14:   // the two rows run through one copy of the row code
+#pragma unroll 1
+            for (int h = 0; h < 2; ++h) {
+                const uint8_t* wr = w + (size_t) (r + h) * rb;
+                if (ty == 12) shx_row<12, TM, N / 256>(wr, N / 256, xq, XQB, T, o + h, os, lane);
+                else if (ty == 13) shx_row<13, TM, N / 256>(wr, N / 256, xq, XQB, T, o + h, os, lane);
+                else shx_row<14, TM, N / 256>(wr, N / 256, xq, XQB, T, o + h, os, lane);
+            }
+            break;
     }
 }
 // shared down row r of format ty (640 -> 2560) against h (T columns of HB blocks) -> o[t * os]
@@ -638,7 +641,8 @@ __device__ __forceinline__ float sh_gate_dot(const uint16_t* wi, const float* x,
 // ------------------------------------------------------------ the kernel
 // FUSED: rdy = the chain's hc2-up counter of this layer, rdy_n its full count (every hc2 q8_1 / mixed row written)
 // vrow (FUSED): this CTA's chain logical id, the top-10 row it wrote itself (0: I.ids)
-template <bool FUSED>
+// TT: the widest window the shared expert's per-token loops are compiled for (p.T <= TT)
+template <bool FUSED, int TT = TMX>
 __device__ __forceinline__ void moe_body(const KP& p, const unsigned* rdy = nullptr, unsigned rdy_n = 0, int vrow = 0,
                                           [[maybe_unused]] unsigned long long* srec = nullptr) {
     extern __shared__ __align__(128) char sm_dyn[];
@@ -980,11 +984,9 @@ __device__ __forceinline__ void moe_body(const KP& p, const unsigned* rdy = null
                 if (it < NSH) {
                     if (pp >= SHP) continue;   // a sub-item has SHP pairs; its other unit numbers are empty
                     const int j = it / SHS, q = SHP * (it % SHS) + pp;
-                    if (q < 16) {
-                        sh_gu_pair(LM.sgt, LM.sg, 32 * j + 2 * q, LM.glue ? s.xq2 : s.xq, s.idt, T, gk + 2 * q, 64, s.grid3s, lane);
-                    } else {
-                        sh_gu_pair(LM.sut, LM.su, 32 * j + 2 * (q - 16), LM.glue ? s.xq2 : s.xq, s.idt, T, gk + 32 + 2 * (q - 16), 64, s.grid3s, lane);
-                    }
+                    const bool up = q >= 16;   // one call site for the gate and up rows
+                    const int qr = up ? q - 16 : q;
+                    sh_gu_pair<TT>(up ? LM.sut : LM.sgt, up ? LM.su : LM.sg, 32 * j + 2 * qr, LM.glue ? s.xq2 : s.xq, s.idt, T, gk + (up ? 32 : 0) + 2 * qr, 64, s.grid3s, lane);
                 } else {
                     const int g = (it - NSH) / 20, jj = (it - NSH) % 20;
                     const uint8_t* rowA = (const uint8_t*) s.gptr[g] + (pp < 16 ? 0 : L.up_off) + (size_t) (32 * jj + 2 * (pp & 15)) * L.gu_row;
@@ -1221,9 +1223,11 @@ static double med(std::vector<double> v) { std::sort(v.begin(), v.end()); return
 
 #ifndef FX_NO_MAIN
 // the FUSED instance (k_layer's experts half) with the chain's hc2-up count already full: one record per launch
+// the fused layer kernel's experts half for window width TT, as k_layer<TT> instantiates it
+template <int TT>
 __global__ void __launch_bounds__(CT, 1) k_moef(const __grid_constant__ KP p, const unsigned* rdy) {
     mkb_setlay(p.tag0);
-    moe_body<true>(p, rdy, 1u, 0);
+    moe_body<true, TT>(p, rdy, 1u, 0);
 }
 // activations on the q8_1 rounding edge: per 32-block one value carries the block's amax, the others sit within a few
 // ulp of (k + 0.5) * amax / 127, where IEEE division and div.approx.ftz round x / d to different integers
@@ -1428,7 +1432,8 @@ int moe_parity_run(int T, int iters, const int* synth_sets, int n_synth, const M
     // ================= the persistent kernel
     const size_t smem = sizeof(Sm);
     CK(cudaFuncSetAttribute(k_moe, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
-    CK(cudaFuncSetAttribute(k_moef, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+    const void* k_fused = T == 1 ? (const void*) k_moef<1> : T == 2 ? (const void*) k_moef<2> : T == 3 ? (const void*) k_moef<3> : (const void*) k_moef<4>;
+    CK(cudaFuncSetAttribute(k_fused, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
     const bool fused = opt.fused;
     unsigned* rdy1; CK(cudaMalloc(&rdy1, 4)); { const unsigned one = 1; CK(cudaMemcpy(rdy1, &one, 4, cudaMemcpyHostToDevice)); }
     int occ = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_moe, CT, smem));
@@ -1457,7 +1462,7 @@ int moe_parity_run(int T, int iters, const int* synth_sets, int n_synth, const M
                 q.it1 = hi[i]; q.lay1 = hl[hi[i].layer]; q.tag0 = (unsigned) i + 1u;
                 const unsigned* rp = rdy1;
                 void* fa[] = {&q, &rp};
-                CK(cudaLaunchCooperativeKernel((void*) k_moef, dim3(nsm), dim3(CT), fa, smem, cs));
+                CK(cudaLaunchCooperativeKernel(k_fused, dim3(nsm), dim3(CT), fa, smem, cs));
             }
         } else {
             void* args[] = {&p};

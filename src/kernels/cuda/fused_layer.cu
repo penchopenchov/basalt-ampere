@@ -117,7 +117,7 @@ __global__ void __launch_bounds__(FZ_NSC::CT, 1) k_layer(const __grid_constant__
     unsigned long long* srec = nullptr;   // thread 0's stamp record (profile builds)
     const int vb = FZ_NSC::chain_body<T, FQ, FZ, FO>(pc, srec);
     __syncthreads();
-    MB::moe_body<true>(pm, pc.cnt + (size_t) pc.par * FZ_NSC::NCTR + FZ_NSC::C_H2UP, (unsigned) FZ_NSC::NUP, vb, srec);
+    MB::moe_body<true, T>(pm, pc.cnt + (size_t) pc.par * FZ_NSC::NCTR + FZ_NSC::C_H2UP, (unsigned) FZ_NSC::NUP, vb, srec);
 #ifdef BASALT_PROFILE
     __syncthreads();
     if (srec) srec[::basalt::kernels::stamp::kExit] = FZ_NSC::gtime();
