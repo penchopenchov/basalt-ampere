@@ -407,10 +407,12 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
 
 // native_gu2_kernel's rows with the VRAM plan built in the block (dm_route_kernel's kinds and dm_group for the VRAM
 // tier: an entry is CUDA0's when its id is valid, not repeated within its token and ptab holds its blob).  The blocks
-// are co-resident and loop over native_gu2_kernel's (row block, group row) items, gy group rows, so each plans once.
+// are co-resident and loop over the (row block, group) items, so each plans once.  Two blocks an SM: the row loop
+// keeps its full register budget.
 template<int TG>
-__global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L, float* __restrict__ gate,
-                                                         float* __restrict__ up, block_q8_1* __restrict__ hq, int gy) {
+__global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L,
+                                                            float* __restrict__ gate, float* __restrict__ up,
+                                                            block_q8_1* __restrict__ hq) {
     __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap], s_start[kDmCap + 1], s_tok[kDmCap];
     __shared__ unsigned long long s_p[kDmCap], s_ptr[kDmCap];
@@ -477,15 +479,14 @@ __global__ void __launch_bounds__(256) dm_glue_gu_kernel(DmGlueArgs a, NativeExp
         pdl_trigger();
     }
     const int warp = tid >> 5, lane = tid & 31, nx = (int) (2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS;
-    const int items = nx * min(gy, ng);
+    const int items = nx * ng;   // one (row block, group) item each: every group's rows spread over all blocks
     const auto* xq = (const block_q8_1*) a.xq;
     for (int it = blockIdx.x; it < items; it += nwork) {
-        const int bx = it % nx, by = it / nx;
+        const int bx = it % nx, g = it / nx;
         const int row = bx * GU2_ROWS + 2 * warp;   // rows row, row + 1: both gate or both up
         if (row < 2 * L.n_ff)
-            for (int g = by; g < ng; g += gy)
-                gu2::pair<TG>((const uint8_t*) s_ptr[g], row, s_start[g], s_start[g + 1], s_tok, xq, L, gate, up,
-                              s_grid, lane);
+            gu2::pair<TG>((const uint8_t*) s_ptr[g], row, s_start[g], s_start[g + 1], s_tok, xq, L, gate, up, s_grid,
+                          lane);
     }
 }
 
@@ -1371,10 +1372,10 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     float* up = (float*) ((uint8_t*) scratch + fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const int gy = g_dec_gy > 0 ? std::min(cap, g_dec_gy) : cap;
-    const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * gy;
+    const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * cap;
     auto go = [&](auto kernel, int resident) {
         const int nb = std::max(1, std::min(items, resident)) + (a.ring_on ? 1 : 0);
-        launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, hq, gy);
+        launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, hq);
     };
     switch (L.gu_type) {
         case 16: go(dm_glue_gu_kernel<16>, dm_glue_blocks<16>()); break;
