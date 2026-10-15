@@ -377,7 +377,8 @@ void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
 // own copies of the pool's blobs.  Checks every layer's rows bitwise against native_expert_grouped on the plan the glue
 // wrote, then times the 48 calls in a graph.  The launches cover n_ff 640 and the down formats IQ4_NL / Q2_0
 // (dec_moe_formats_ok); any other shape is refused.
-void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T, int pool, int rounds) {
+void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T, int pool, int rounds,
+                bool mess = false) {
     const int64_t H = 2560;
     if (!k::dec_moe_formats_ok(gu, dt, H, ff)) {
         std::printf("glue %s/%s ff %d: not a shape the glue launches cover  FAIL\n", name_of(gu), name_of(dt), ff);
@@ -393,6 +394,16 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
             std::iota(ord.begin(), ord.end(), 0);
             std::shuffle(ord.begin(), ord.end(), rng);
             for (int j = 0; j < KK; ++j) ids[(size_t) t * KK + j] = ord[j % pool] * 3 + 1;   // expert id e = 3 * blob + 1
+            if (mess) {   // repeats within the token, ids outside the table, ids no blob holds
+                int32_t* r = &ids[(size_t) t * KK];
+                r[2] = r[1];
+                r[5] = r[0];
+                r[6] = NEXP + 3;
+                r[8] = -1;
+                if (t % 2) r[9] = r[3];
+                if (t > 0) r[4] = ids[(size_t) (t - 1) * KK + 4];   // the same id in two tokens
+                if (t % 3 == 2) r[7] = 2;   // not a blob's id
+            }
         }
     }
     int32_t* d_ids = dalloc<int32_t>(ids.size());
@@ -436,7 +447,10 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
             ck(cudaMemcpy(ptr_h.data(), ptab[l], NEXP * 8, cudaMemcpyDeviceToHost), "ptab");
             int nvalid = 0;
             for (int i = 0; i < n; ++i) {
-                if (ptr_h[ids[i]] == 0) continue;
+                if (ids[i] < 0 || ids[i] >= NEXP || ptr_h[ids[i]] == 0) continue;
+                bool again = false;   // a repeat within the token is skipped
+                for (int j = i / KK * KK; j < i; ++j) again |= ids[j] == ids[i];
+                if (again) continue;
                 ++nvalid;
                 size_t g = 0;
                 while (g < gid.size() && gid[g] != ids[i]) ++g;
@@ -531,6 +545,7 @@ int main(int argc, char** argv) {
             for (int gu : {16, 17, 18, 21, 22, 42})
                 for (int dt : {20, 42})
                     for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, gu, dt, 640, T, glue_pool, 20);
+            for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, 21, 20, 640, T, glue_pool, 20, true);   // odd ids
         }
         std::printf("native_grouped_parity: %d failures\n", g_fail);
         return g_fail ? 1 : 0;
