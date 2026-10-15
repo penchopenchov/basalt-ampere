@@ -82,6 +82,28 @@ A second pass on the three largest losses against main (expert gate/up, the proj
 
 With QSA on the separate kernels the branch is still about 6% slower than main per conversation window and 8% per prose window; structured windows (mostly T >= 5) are level. Windows T = 1 to 4, where the fused GDN layer runs, cost 10 to 12% more than main; T = 5 to 7, which run no fused kernel, cost about 1% more (no tag protocol).
 
+## Instruction cache in the experts half
+
+The fused layer kernel was about 1.5 MB of SASS: for `k_layer<3>`, 1.08 MB in the experts half and 0.36 MB in the attention half. Stall reasons were sampled in the engine with CUPTI's continuous PC sampling, which does not serialize kernels; Nsight Compute's kernel replay deadlocks on the tier ring. The sampler slows decode several times over, so its shares are qualitative.
+
+- In the gate/up phase, 20% of warp samples were instruction-fetch stalls (`no_instructions`). In the shared expert's K-quant gate/up code the share was 72 to 81%. That code was inlined four times per format: the gate and up call sites, each with two fully unrolled rows, about 490 KB in all. Each CTA runs it once or twice per layer, so every layer fetches it cold.
+- The routed experts' gate/up code runs many times per layer and stays warm (about 10% `no_instructions`). It waits on its weight loads: 50 to 55% of its samples are long scoreboard.
+
+The fix: the shared gate and up rows go through one call site, the two rows of a pair go through one copy of the row code, and the experts half is compiled per window width (`moe_body<true, T>`), so the shared expert's per-token loops run T iterations. `k_layer<3>` drops to 1.13 MB, with registers and stack unchanged. Outputs stay bitwise: `fused_moe_parity` now runs the per-width instance, and greedy output matches main.
+
+Measured with the RTX 5090 at 400 W, IQ3_S, `--peer-exclusive --relaxed-drafting 0.3`. These are development A/Bs, not headline runs.
+
+| measure | before | after |
+|---|---|---|
+| shared share of gate/up PC samples / its `no_instructions` | 17% / 72% | 8% / 42% |
+| `no_instructions` in all gate/up samples | 20% | 12% |
+| CTA 0's first shared gate/up pair, us (T = 1 / 2 / 3 / 4) | 16.4 / 20.2 / 20.1 / 16.3 | 3.7 / 5.6 / 7.9 / 9.9 |
+| CTA 0's gate/up end after the release, us (T = 1 / 2 / 3 / 4) | 23.7 / 31.0 / 36.3 / 41.8 | 21.9 / 29.2 / 35.5 / 41.3 |
+| ms per window at main's window mix, conv / prose / struct (6 processes per arm, ABBA) | 7.657 / 7.453 / 10.698 | 7.553 / 7.379 / 10.685 |
+| same, against main | +6.3% / +8.9% / +0.6% | +4.9% / +7.8% / +0.4% |
+
+The first shared pair speeds up by 10 to 13 us, but the gate/up phase ends only 0.5 to 2 us earlier per layer. The shared pair overlapped the routed pairs' weight loads, and those loads set the phase's end. The gain per window is about 1%. Compiling the routed rows' entry batching per width as well, which cut `k_layer<3>` to 0.97 MB, added nothing. Folding all the routed batch sizes into one instance with a run-time count made the gate/up loop spill (stack 136 to 200 B) and lost.
+
 ## Why it is parked
 
 - The standalone harness predicted gains the engine did not show. Auditing twelve claims, the harness-to-engine ratio was typically 0.1 to 0.3. Causes: the harness starts every CTA with the top-10 experts already known, while in the engine they arrive about 7 us after the attention output; the shared expert finishes last in the engine; window arithmetic that ignored the window-width mix (T = 5 to 7 and T = 1 gain nothing); and measurement errors (wrong lock, builds running, per-launch memsets in a hot loop).
@@ -96,11 +118,13 @@ With QSA on the separate kernels the branch is still about 6% slower than main p
 - Time with the timing lock, with no builds running, and no per-launch memsets in hot loops. Compare stamp numbers only within one session, ABAB. The same binary read 3.6 us per layer apart across two sessions, so single-microsecond effects do not resolve in the engine A/B.
 - Convert per-layer gains to window gains with the window-width mix (about 0.73 x 36 per layer-microsecond), not x36.
 - A harness must reproduce the engine's start state (late ids, tier wait, shared-expert tail) before its deltas predict anything.
+- Profile in-engine stall reasons with CUPTI continuous PC sampling and map the PCs to source through `nvdisasm -gi` on a `-lineinfo` build, which leaves the SASS unchanged. Code that runs once per layer per SM is fetched cold every layer, so keep it to one small copy.
 - Holding the down weights in registers before the h wait cost 80 B of stack on a 128-register kernel and lost 1.6%; prefetching them to L1 instead added issue work and also lost.
 
 ## Ideas not tried
 
 - Down without the shared-memory h copy: read the late groups' h straight from L2 (tagged layout). Estimate 1 to 2 us per layer on the late groups.
 - Give the round-2 gate/up items to CTAs with fewer down rows.
+- Routed gate/up is bound by load latency. Each warp claims one unit (two rows), waits for it, then claims the next, and the L2 prefetches queue ahead of the demand loads. Staging the units through a TMA ring in shared memory (as main's bulk path does) or issuing the next unit's loads before decoding the current one would overlap them. A loader-side prefetch alone did not help (see the fix attempts above).
 - Per-triple `k_layer` instances (the engine builds the generic one only), and chain-local half-packed fragments to cut spills in the projection pair.
 - A layer-boundary kernel running several layers per launch (spills made it slower in the harness).
