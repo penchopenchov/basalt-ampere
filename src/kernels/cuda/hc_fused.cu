@@ -417,6 +417,9 @@ __device__ void cn_x(const HcFusedArgs& a, int hs, int tid, char* smem, float* p
     constexpr int NV = CN_W / 4 / THREADS + 1;   // float4 per thread and token: tid, then THREADS + tid when in range
     const int c = hs >> 1, lane = tid & 31, warp = tid >> 5;
     float4 r[T][NV], bb[T][NV], g[NV];
+    float ip[T];   // every token's gate input first: no load waits inside the token loop
+#pragma unroll
+    for (int k = 0; k < T; ++k) ip[k] = a.apply ? a.inj_prev[k * HC + c] : 0.0f;
 #pragma unroll
     for (int j = 0; j < NV; ++j) {
         const int e = 4 * (tid + THREADS * j);
@@ -432,7 +435,7 @@ __device__ void cn_x(const HcFusedArgs& a, int hs, int tid, char* smem, float* p
     float4* X = reinterpret_cast<float4*>(smem + CN_XOFF);
 #pragma unroll
     for (int k = 0; k < T; ++k) {
-        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[k * HC + c] / (float) HC) : 0.0f;
+        const float gw = a.apply ? 2.0f * sigmoidf_(ip[k] / (float) HC) : 0.0f;
         float sq = 0.0f;
 #pragma unroll
         for (int j = 0; j < NV; ++j) {
@@ -746,14 +749,16 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
     constexpr int NV = RMAX * TG;            // values per lane per pass (28 at most: two rounds of 16)
     constexpr int ROUNDS = (NV + 15) / 16;
     static_assert(NV <= 32, "two rounds at most");
+    constexpr int TP = (T + TG - 1) / TG * TG;   // the passes' tokens, padded
+    float2 xa[TP][PAIRS];   // every pass's mixed loaded up front: later passes do not wait on loads
+#pragma unroll
+    for (int q = 0; q < TP; ++q)
+#pragma unroll
+        for (int j = 0; j < PAIRS; ++j)
+            xa[q][j] = q < T ? __ldcg(reinterpret_cast<const float2*>(a.mixed + (size_t) q * N) + tid + THREADS * j)
+                             : make_float2(0.f, 0.f);
+#pragma unroll
     for (int k0 = 0; k0 < T; k0 += TG) {
-        float2 x[TG][PAIRS];
-#pragma unroll
-        for (int q = 0; q < TG; ++q)
-#pragma unroll
-            for (int j = 0; j < PAIRS; ++j)
-                x[q][j] = k0 + q < T ? __ldcg(reinterpret_cast<const float2*>(a.mixed + (size_t) (k0 + q) * N) + tid + THREADS * j)
-                                     : make_float2(0.f, 0.f);
         float acc[32];
 #pragma unroll
         for (int e = 0; e < RMAX; ++e) {
@@ -767,8 +772,8 @@ __device__ void hc_router_rows(const HcFusedArgs& a, const uint16_t* wsm, int e0
 #pragma unroll
                 for (int j = 0; j < PAIRS; ++j) {
                     const float w0 = __uint_as_float(wr[j] << 16), w1 = __uint_as_float(wr[j] & 0xffff0000u);
-                    s = fma_ftz(w0, x[q][j].x, s);
-                    s = fma_ftz(w1, x[q][j].y, s);
+                    s = fma_ftz(w0, xa[k0 + q][j].x, s);
+                    s = fma_ftz(w1, xa[k0 + q][j].y, s);
                 }
                 acc[e * TG + q] = s;
             }
