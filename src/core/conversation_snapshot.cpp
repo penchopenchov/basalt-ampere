@@ -1,5 +1,6 @@
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/kernels/kv_q4.hpp"
+#include "basalt/core/kv_arena.hpp"
 #include "conversation_checked.hpp"
 #include <cuda_runtime.h>
 
@@ -106,6 +107,14 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
+// An elastic state backs only a prefix of its cells; a copy past it would fault inside the driver.
+bool backed(const QsaState& st, const Layout& l, std::string& error) {
+    if (!st.kv_arena || st.kv_arena->cells() >= l.cells) return true;
+    error = "conversation snapshot: " + std::to_string((long long) l.cells) + " cells to copy, " +
+            std::to_string((long long) st.kv_arena->cells()) + " backed";
+    return false;
+}
+
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
@@ -145,7 +154,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                           int64_t unchanged_tokens, size_t* reused_bytes) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
-    if (!valid(st, l, upto, error)) return false;
+    if (!valid(st, l, upto, error) || !backed(st, l, error)) return false;
     if (unchanged_tokens < 0 || unchanged_tokens > upto || unchanged_tokens > image.cells) {
         error = "conversation snapshot: invalid unchanged prefix";
         return false;
@@ -200,6 +209,8 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !backed(st, l, error)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)

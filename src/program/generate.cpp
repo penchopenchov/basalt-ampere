@@ -7578,7 +7578,9 @@ int main(int argc, char** argv) {
             // or incoming restore overwrites the positional state it requires.
             // the elastic KV: every cell this request writes is backed before anything (a restore, a slot's copy, the
             // read) writes it
-            if (!kv_fit(*rsp, n + kKvGrowCells, err)) {
+            // (a restore writes the snapshot's whole live K/V, which can be longer than this prompt)
+            if (!kv_fit(*rsp, std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0) + kKvGrowCells,
+                        err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -7624,27 +7626,40 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
+            const auto restore_t0 = Clock::now();
             if (incoming) {
-                const auto t0 = Clock::now();
-                if (basalt::core::conversation_snapshot_restore(*incoming, *rsp, g,
-                        stages.empty() ? mtp_kv : nullptr, err) !=
-                    basalt::core::ConversationRestore::restored) {
-                    // Already prevalidated above: a failure here is fatal, never
-                    // permission to decode from a partially restored session.
-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
-                    return 1;
-                }
-                for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+                // a snapshot that cannot be restored is dropped and the prompt read from the start
+                bool restored = basalt::core::conversation_snapshot_restore(*incoming, *rsp,
+                        g, stages.empty() ? mtp_kv : nullptr, err) == basalt::core::ConversationRestore::restored;
+                int failed_stage = -1;
+                for (size_t i = 0; restored && i < stages.size(); ++i) {   // the later stages' parts
                     const basalt::core::OnDevice on(stages[i]->dev);
                     if (basalt::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
                             i + 1 == stages.size() ? mtp_kv : nullptr, err) !=
                         basalt::core::ConversationRestore::restored) {
-                        std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
-                                    err.c_str());
-                        return 1;
+                        restored = false;
+                        failed_stage = stages[i]->dev;
+                        break;
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
                 }
+                if (!restored) {
+                    std::fprintf(stderr, "basalt serve: conversation cache: restoring a parked conversation failed%s "
+                                 "(%s); reading the prompt from the start\n",
+                                 failed_stage >= 0 ? (" on CUDA" + std::to_string(failed_stage)).c_str() : "",
+                                 err.c_str());
+                    (void) cudaGetLastError();
+                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR restore sync\n"); return 1; }
+                    err.clear();
+                    incoming.reset();
+                    live.clear();
+                    live_imgs.clear();
+                    checks.clear();
+                    resume = 0;
+                    from_live = false;
+                }
+            }
+            if (incoming) {
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
                 if (stages.empty()) {
@@ -7664,7 +7679,7 @@ int main(int argc, char** argv) {
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "basalt serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint",
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count(),
                              conversations.size(), conversations.bytes());
             }
             ckd_finish();
