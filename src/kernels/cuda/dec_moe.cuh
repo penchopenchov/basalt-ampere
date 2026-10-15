@@ -409,15 +409,22 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
 // tier: an entry is CUDA0's when its id is valid, not repeated within its token and ptab holds its blob).  The blocks
 // are co-resident and loop over the (row block, group) items, so each plans once.  Two blocks an SM: the row loop
 // keeps its full register budget.
+//
+// The plan keeps one mask of tokens per expert id (shared atomics, so no pass over the other entries); each entry
+// reads its rank, its group's size and whether it opens the group off that mask.  Group indices and starts come from
+// warp scans and the warp totals.  Entry order, group order and places are those of dm_group_keys.
+constexpr int kDmGlueExperts = 1024;   // expert ids the mask table covers
+constexpr int kDmGlueTokens = 16;      // tokens a mask holds
+
 template<int TG>
 __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, NativeExpertLayout L,
                                                             float* __restrict__ gate, float* __restrict__ up,
                                                             block_q8_1* __restrict__ hq) {
-    __shared__ int32_t s_ids[kDmCap], s_kind[kDmCap], s_first[kDmCap], s_cnt[kDmCap], s_gstart[kDmCap];
-    __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap], s_start[kDmCap + 1], s_tok[kDmCap];
-    __shared__ unsigned long long s_p[kDmCap], s_ptr[kDmCap];
-    __shared__ int32_t s_ng, s_ne;
-    __shared__ alignas(16) int32_t s_key[kDmCap];
+    __shared__ int32_t s_ids[kDmCap], s_start[kDmCap + 1], s_tok[kDmCap];
+    __shared__ unsigned long long s_ptr[kDmCap];
+    __shared__ uint32_t s_tab[kDmGlueExperts];
+    __shared__ int2 s_wtot[4];
+    __shared__ int s_dup;
     __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     const bool lead = blockIdx.x == 0;
@@ -432,53 +439,78 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
         dm_glue_ring(a.ring, a.xq, tid);
         return;
     }
+    for (int i = tid; i < a.n_expert; i += 256) s_tab[i] = 0u;
+    if (tid == 0) s_dup = 0;
     const uint32_t* s_grid = gu2::stage_grid<TG>(s_grid_buf, tid);
     if (tid == 0 && (int) blockIdx.x * 16 < a.n_expert)   // the layer's table into L2
         asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + blockIdx.x * 16));
+    const int tok = tid / a.k, warp = tid >> 5, lane = tid & 31;
+    __syncthreads();   // the masks are zero before any entry marks one
     pdl_wait();
-    // the table entry is read at once, beside the id's validity check
+    // the table entry is read at once; the marking and the barrier hide its latency
     const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
-    const unsigned long long praw = (e0 >= 0 && e0 < a.n_expert) ? a.ptab[e0] : 0ull;
+    const bool inr = e0 >= 0 && e0 < a.n_expert;
+    const unsigned long long praw = inr ? a.ptab[e0] : 0ull;
     if (tid < n) s_ids[tid] = e0;
+    if (inr && (atomicOr(&s_tab[e0], 1u << tok) >> tok & 1u) != 0u) s_dup = 1;   // a repeat within a token
     __syncthreads();
-    int32_t key = -1;
-    if (tid < n) {
-        bool ok = e0 >= 0 && e0 < a.n_expert;
-        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e0;
-        const unsigned long long p = ok ? praw : 0ull;
-        s_p[tid] = p;
-        s_kind[tid] = p != 0ull ? 0 : -1;
-        key = p != 0ull ? e0 : -1;
+    // an entry counts once per token and only when ptab holds its blob (a function of the id: a mask never mixes)
+    bool dup = false;
+    if (s_dup != 0)
+        for (int j = inr ? tok * a.k : tid; j < tid; ++j) dup |= s_ids[j] == e0;
+    const bool valid = inr && praw != 0ull && !dup;
+    const uint32_t bits = inr ? s_tab[e0] : 0u;
+    const uint32_t low = bits & ((1u << tok) - 1u);   // the earlier tokens that route to the expert
+    const bool is_first = valid && low == 0u;
+    const int gcnt = is_first ? __popc(bits) : 0;
+    int cinc = gcnt;
+    unsigned fb = 0u;
+    if (warp < 4) {   // entries are at most kDmCap
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, cinc, d);
+            if (lane >= d) cinc += v;
+        }
+        fb = __ballot_sync(0xffffffffu, is_first);
+        if (lane == 31) s_wtot[warp] = make_int2(__popc(fb), cinc);
     }
-    if (tid < kDmCap) s_key[tid] = key;
     __syncthreads();
-    int first = 0, rank = 0;
-    dm_group_keys(s_key, n, tid, s_first, s_cnt, s_gstart, s_gidx, s_start, &s_ng, &s_ne, first, rank);
-    if (tid < n && s_kind[tid] == 0) {
-        const int pos = s_gstart[first] + rank;
-        s_pos[tid] = pos;
-        s_tok[pos] = tid / a.k;
-        if (s_first[tid]) s_ptr[s_gidx[tid]] = s_p[tid];
+    int g0 = 0, e_off = 0, ng = 0, ne = 0;
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const int2 t = s_wtot[w];
+        if (w < warp) { g0 += t.x; e_off += t.y; }
+        ng += t.x;
+        ne += t.y;
     }
+    if (is_first) {
+        const int gi = g0 + __popc(fb & ((1u << lane) - 1u)), gs = e_off + cinc - gcnt;
+        s_ptr[gi] = praw;
+        s_start[gi] = gs;
+        int r = 0;
+        for (uint32_t m = bits; m != 0u; m &= m - 1u) s_tok[gs + r++] = __ffs(m) - 1;   // the group's tokens in order
+        s_tab[e0] = bits | (uint32_t) gs << 16;   // the group's start, for the lead block's places
+    }
+    if (tid == 0) s_start[ng] = ne;
     __syncthreads();
-    const int ng = s_ng;
     if (lead) {
         DmPlan* P = a.plan;
-        if (tid < n && s_kind[tid] == 0) {
-            P->dst[s_pos[tid]] = tid;
-            P->tok[s_pos[tid]] = tid / a.k;
+        if (valid) {
+            const int pos = (int) (s_tab[e0] >> 16) + __popc(low);
+            P->dst[pos] = tid;
+            P->tok[pos] = tok;
         }
         if (tid < ng) P->ptr[tid] = s_ptr[tid];
         if (tid <= ng) P->start[tid] = s_start[tid];
         if (tid == 0) {
             P->counts[0] = ng;
-            P->counts[1] = s_ne;
+            P->counts[1] = ne;
         }
         __threadfence();
         __syncthreads();
         pdl_trigger();
     }
-    const int warp = tid >> 5, lane = tid & 31, nx = (int) (2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS;
+    const int nx = (int) (2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS;
     const int items = nx * ng;   // one (row block, group) item each: every group's rows spread over all blocks
     const auto* xq = (const block_q8_1*) a.xq;
     for (int it = blockIdx.x; it < items; it += nwork) {
@@ -1362,8 +1394,9 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
 
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scratch, float* out, int cap, void* stream) {
     const DmGlueArgs& a = a_in;
-    if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap) {
-        std::fprintf(stderr, "dec_moe_glue: %d entries, cap %d\n", a.n_tok * a.k, cap);
+    if (a.n_tok * a.k > kDmCap || cap < 1 || cap > kDmCap || a.n_tok > kDmGlueTokens || a.n_expert > kDmGlueExperts) {
+        std::fprintf(stderr, "dec_moe_glue: %d entries, cap %d, %d tokens, %d experts\n", a.n_tok * a.k, cap, a.n_tok,
+                     a.n_expert);
         std::exit(1);
     }
     cudaStream_t s = (cudaStream_t) stream;
