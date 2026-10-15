@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
     const int iters = argc > 2 ? std::atoi(argv[2]) : 50;
     const int n_in = 2560, MT = 8, blk = 176, bpr = n_in / 256;
     const size_t wbytes = (size_t) rows * bpr * blk;
-    std::mt19937 rng(5);
+    std::mt19937 rng(argc > 3 ? (unsigned) std::atoi(argv[3]) : 5u);
     std::vector<uint8_t> hw(wbytes);
     for (size_t i = 0; i < wbytes; i += 4) {
         const uint32_t r = rng();
