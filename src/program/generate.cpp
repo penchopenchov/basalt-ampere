@@ -2313,6 +2313,10 @@ int main(int argc, char** argv) {
     if (!wt.load(pack_files, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         return fatal_start_error(err);
     }
+    // every tensor's shape and engine form against what the kernels read (skipped rows keep their metadata)
+    if (!basalt::core::check_all(wt, g, err)) {
+        return fatal_start_error(o.model + ": " + err);
+    }
     std::fprintf(stderr, "basalt generate: %llu MiB of weights loaded from %s in %.1f s (%zu tensors "
                          "skipped: served from the source tensors)\n",
                  (unsigned long long) (pool_bytes >> 20), o.model.c_str(), load_s(), skip.size());
@@ -6352,7 +6356,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> ids;
             bool cached = false;           ///< idle, and its sessions still hold `ids`
             bool cvec = true;              ///< the control vector setting `ids` were read with
-            bool img = false;              ///< the conversation has pictures (never reused from the slot)
+            std::vector<ImgKey> imgs;      ///< the pictures in `ids`: a later request reuses them only with the same ones
             // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's header): a
             // client's next turn renders the history again WITHOUT this reply's thinking, so it matches the slot's
             // tokens only up to there - the slot's K/V up to it plus this state continue from it
@@ -6911,7 +6915,7 @@ int main(int argc, char** argv) {
                     std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
                                 (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                     sl.active = false;
-                    sl.cached = o.prompt_cache > 0 && !sl.img;   // its sessions hold sl.ids for the next turn
+                    sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
                 } else {
                     sl.x = outb[r0s[sg] + k - 1];
                     sl.p += k;
@@ -7475,8 +7479,9 @@ int main(int argc, char** argv) {
                 checks.clear();
                 live_ok = false;
                 cvec_cached = sb.cvec;
-                if (sb.cached && !sb.img) {
+                if (sb.cached) {
                     live = sb.ids;
+                    live_imgs = sb.imgs;
                     live_ok = o.prompt_cache > 0;
                     checks = std::move(sb.checks);
                     if (batch_spec && !mtp.copy_store(slot_b, mtp.main_store(), (int64_t) live.size(), err)) {
@@ -7500,7 +7505,7 @@ int main(int argc, char** argv) {
             if (slot0_is_solo && !in_slot && !bs.empty() && bs[0].cached && !bs[0].active) {
                 BSlot& s0 = bs[0];
                 live = std::move(s0.ids);
-                live_imgs.clear();
+                live_imgs = std::move(s0.imgs);
                 live_ok = o.prompt_cache > 0;
                 cvec_cached = s0.cvec;
                 for (ConvCheckpoint& c : s0.checks) checks.push_back(std::move(c));
@@ -7527,11 +7532,11 @@ int main(int argc, char** argv) {
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && req_imgs.empty() && !in_slot)
+            if (o.prompt_cache > 0 && !in_slot)
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
-                    if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
+                    if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, sl.imgs)) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
                         slot_ck = nullptr;
@@ -7574,7 +7579,9 @@ int main(int argc, char** argv) {
             // or incoming restore overwrites the positional state it requires.
             // the elastic KV: every cell this request writes is backed before anything (a restore, a slot's copy, the
             // read) writes it
-            if (!kv_fit(*rsp, n + kKvGrowCells, err)) {
+            // (a restore writes the snapshot's whole live K/V, which can be longer than this prompt)
+            if (!kv_fit(*rsp, std::max<int64_t>(n, incoming ? (int64_t) incoming->live.ids.size() : 0) + kKvGrowCells,
+                        err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -7611,7 +7618,7 @@ int main(int argc, char** argv) {
                     } else {
                         live = bs[(size_t) slot_source].ids;
                     }
-                    live_imgs.clear();
+                    live_imgs = slot_ck != nullptr ? slot_ck->imgs : bs[(size_t) slot_source].imgs;
                     resume = slot_tokens;
                     from_live = true;
                     std::fprintf(stderr, "basalt batch: slot %d gave back %lld tokens of this conversation (%s) in "
@@ -7620,27 +7627,40 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
+            const auto restore_t0 = Clock::now();
             if (incoming) {
-                const auto t0 = Clock::now();
-                if (basalt::core::conversation_snapshot_restore(*incoming, *rsp, g,
-                        stages.empty() ? mtp_kv : nullptr, err) !=
-                    basalt::core::ConversationRestore::restored) {
-                    // Already prevalidated above: a failure here is fatal, never
-                    // permission to decode from a partially restored session.
-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
-                    return 1;
-                }
-                for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+                // a snapshot that cannot be restored is dropped and the prompt read from the start
+                bool restored = basalt::core::conversation_snapshot_restore(*incoming, *rsp,
+                        g, stages.empty() ? mtp_kv : nullptr, err) == basalt::core::ConversationRestore::restored;
+                int failed_stage = -1;
+                for (size_t i = 0; restored && i < stages.size(); ++i) {   // the later stages' parts
                     const basalt::core::OnDevice on(stages[i]->dev);
                     if (basalt::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
                             i + 1 == stages.size() ? mtp_kv : nullptr, err) !=
                         basalt::core::ConversationRestore::restored) {
-                        std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
-                                    err.c_str());
-                        return 1;
+                        restored = false;
+                        failed_stage = stages[i]->dev;
+                        break;
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
                 }
+                if (!restored) {
+                    std::fprintf(stderr, "basalt serve: conversation cache: restoring a parked conversation failed%s "
+                                 "(%s); reading the prompt from the start\n",
+                                 failed_stage >= 0 ? (" on CUDA" + std::to_string(failed_stage)).c_str() : "",
+                                 err.c_str());
+                    (void) cudaGetLastError();
+                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR restore sync\n"); return 1; }
+                    err.clear();
+                    incoming.reset();
+                    live.clear();
+                    live_imgs.clear();
+                    checks.clear();
+                    resume = 0;
+                    from_live = false;
+                }
+            }
+            if (incoming) {
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
                 if (stages.empty()) {
@@ -7660,7 +7680,7 @@ int main(int argc, char** argv) {
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "basalt serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint",
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - restore_t0).count(),
                              conversations.size(), conversations.bytes());
             }
             ckd_finish();
@@ -8857,13 +8877,13 @@ int main(int argc, char** argv) {
                     sl.t0 = Clock::now();
                     sl.ids = live;
                     sl.cvec = cvec_cached;
-                    sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
+                    sl.imgs = live_imgs;
                     const ConvCheckpoint* best = nullptr;
                     for (const ConvCheckpoint& c : checks)
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()))
                             best = &c;
-                    if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    if (best != nullptr) sl.checks.push_back(*best);
                     std::fprintf(stderr, "basalt batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
@@ -8882,8 +8902,8 @@ int main(int argc, char** argv) {
                     sb = BSlot{};
                     sb.ids = live;
                     sb.cvec = cvec_cached;
-                    sb.img = !live_imgs.empty();
-                    sb.cached = live_ok && !sb.img && o.prompt_cache > 0;
+                    sb.imgs = live_imgs;
+                    sb.cached = live_ok && o.prompt_cache > 0;
                     if (sb.cached) sb.checks = std::move(checks);
                     if (sb.cached && batch_spec && !mtp.copy_store(mtp.main_store(), slot_b, (int64_t) live.size(), err)) {
                         err.clear();

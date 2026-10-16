@@ -458,7 +458,7 @@ __global__ void q5k_proxy_pack_kernel(const uint8_t* __restrict__ q5, int64_t ro
         const int q = nib | (((b->qh[l] >> j) & 1) << 4);
         w[l] = d * (float) q - mn;
     }
-    px::pack_group(w, row, g, wq, sc);
+    px::pack_group<true>(w, row, g, wq, sc);
 }
 
 // One block: the rows near the best approximate score are scored exactly (a warp per row), the exact best is the pick.

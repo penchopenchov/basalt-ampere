@@ -184,7 +184,7 @@ void gdn_buffers_zero_state(const GdnBuffers& b, const ModelGeometry& g, void* s
 static void st_begin(int64_t layer, int slot, void* stream);
 static void st_end(int64_t layer, int slot, void* stream);
 bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const GdnBuffers& b,               const float* mixed, float* out, void* stream, std::string& err) {    const LayerView v(tables, layer);    const int64_t C = g.ssm_conv_channels;
-// ---- resolve.  Every one of these was shape-checked by `check_layer` at load time, so a miss here is a
+// ---- resolve.  Every one of these was shape-checked by `check_all` at engine start, so a miss here is a
 //      NAME problem and not a geometry one, and the message says which name.
 const WeightRef* w_qkv = v.get("attn_qkv.weight");    const WeightRef* w_gate = v.get("attn_gate.weight");    const WeightRef* w_out = v.get("ssm_out.weight");    const WeightRef* w_alpha = v.get("ssm_alpha.weight");    const WeightRef* w_beta = v.get("ssm_beta.weight");    const WeightRef* w_conv = v.get("ssm_conv1d.weight");    const WeightRef* w_norm = v.get("ssm_norm.weight");    const WeightRef* w_dt = v.get("ssm_dt.bias");    const WeightRef* w_a = v.get("ssm_a");    const char* missing = !w_qkv ? "attn_qkv.weight" : !w_gate ? "attn_gate.weight"                          : !w_out ? "ssm_out.weight" : !w_alpha ? "ssm_alpha.weight"                          : !w_beta ? "ssm_beta.weight" : !w_conv ? "ssm_conv1d.weight"                          : !w_norm ? "ssm_norm.weight" : !w_dt ? "ssm_dt.bias"                          : !w_a ? "ssm_a" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
 // The conv kernel and the two norms are F32 source types, and the loader copied them verbatim - so their
@@ -913,8 +913,8 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
         return false;
     }
 };
-// ---- resolve every tensor by name, and REFUSE rather than reading a null.  `check_layer` has already
-// asserted the shapes at load time; a missing name here is a wiring mistake.
+// ---- resolve every tensor by name, and REFUSE rather than reading a null.  `check_all` has already
+// asserted the shapes at engine start; a missing name here is a wiring mistake.
 struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");    const WeightRef* w_attnq = v.get("attn_q.weight");    const WeightRef* w_attnk = v.get("attn_k.weight");    const WeightRef* w_attnv = v.get("attn_v.weight");    const WeightRef* w_attno = v.get("attn_output.weight");    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");    const WeightRef* w_qn = v.get("attn_q_norm.weight");    const WeightRef* w_kn = v.get("attn_k_norm.weight");    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");    const char* missing = !w_idxk ? "indexer.k_proj.weight" : !w_attnq ? "attn_q.weight"                          : !w_attnk ? "attn_k.weight" : !w_attnv ? "attn_v.weight"                          : !w_attno ? "attn_output.weight" : !w_idxq ? "indexer.q_proj.weight"                          : !w_qn ? "attn_q_norm.weight" : !w_kn ? "attn_k_norm.weight"                          : !w_iqn ? "indexer.q_norm.weight" : !w_ikn ? "indexer.k_norm.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }    if (pos < 0 || pos >= st.max_cells) {        err = "qsa_layer: pos " + std::to_string(pos) + " is outside the state's 0.." +              std::to_string(st.max_cells - 1);        return false;    }
 // THE TWO BF16 PROJECTIONS: the arena holds them re-rounded to 2 B/elem, which is what `bf16_gemv` wants.  Reading one
 // as f32 would walk 2x its length inside the arena without faulting.

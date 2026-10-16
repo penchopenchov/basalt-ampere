@@ -4,6 +4,8 @@
 //
 //     build/native_grouped_parity           the checks (a ctest; needs the GPU)
 //     build/native_grouped_parity --bench   the checks, then v1/new timings of 48 calls in a graph (a window's layers)
+//     build/native_grouped_parity --glue    dec_moe_glue vs native_expert_grouped, every covered format pair, T 1..8
+//                                           (--glue-t/--bench-gu/-down/-ff pick one configuration and time it)
 //     --gu2 also checks the gate/up pair kernel; --bench-gu/-down/-ff/-t/-gy/-phase/-sizes/-ab shape the timings
 //
 // Every gate/up format with every down format; calls of 0..cap groups of 1..T entries each (an empty call is what the
@@ -16,6 +18,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -372,9 +375,16 @@ void bench(cudaStream_t s, std::mt19937& rng, const BenchOptions& bo) {
 // dec_moe_glue (the engine's gate/up + SwiGLU + down launches with the plan built inside) on synthetic experts: T tokens
 // route to top-10 experts drawn from a pool of `pool` (so about `pool` distinct experts a window), 48 layers each with its
 // own copies of the pool's blobs.  Checks every layer's rows bitwise against native_expert_grouped on the plan the glue
-// wrote, then times the 48 calls in a graph.
-void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T, int pool, int rounds) {
+// wrote, then times the 48 calls in a graph.  The launches cover n_ff 640 and the down formats IQ4_NL / Q2_0
+// (dec_moe_formats_ok); any other shape is refused.
+void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T, int pool, int rounds,
+                bool mess = false) {
     const int64_t H = 2560;
+    if (!k::dec_moe_formats_ok(gu, dt, H, ff)) {
+        std::printf("glue %s/%s ff %d: not a shape the glue launches cover  FAIL\n", name_of(gu), name_of(dt), ff);
+        ++g_fail;
+        return;
+    }
     const int KK = 10, NEXP = 256, NL = 48;
     Setup S(gu, dt, H, ff, T, KK, pool, rng, s);
     std::vector<int32_t> ids((size_t) T * KK);
@@ -384,6 +394,16 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
             std::iota(ord.begin(), ord.end(), 0);
             std::shuffle(ord.begin(), ord.end(), rng);
             for (int j = 0; j < KK; ++j) ids[(size_t) t * KK + j] = ord[j % pool] * 3 + 1;   // expert id e = 3 * blob + 1
+            if (mess) {   // repeats within the token, ids outside the table, ids no blob holds
+                int32_t* r = &ids[(size_t) t * KK];
+                r[2] = r[1];
+                r[5] = r[0];
+                r[6] = NEXP + 3;
+                r[8] = -1;
+                if (t % 2) r[9] = r[3];
+                if (t > 0) r[4] = ids[(size_t) (t - 1) * KK + 4];   // the same id in two tokens
+                if (t % 3 == 2) r[7] = 2;   // not a blob's id
+            }
         }
     }
     int32_t* d_ids = dalloc<int32_t>(ids.size());
@@ -427,7 +447,10 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
             ck(cudaMemcpy(ptr_h.data(), ptab[l], NEXP * 8, cudaMemcpyDeviceToHost), "ptab");
             int nvalid = 0;
             for (int i = 0; i < n; ++i) {
-                if (ptr_h[ids[i]] == 0) continue;
+                if (ids[i] < 0 || ids[i] >= NEXP || ptr_h[ids[i]] == 0) continue;
+                bool again = false;   // a repeat within the token is skipped
+                for (int j = i / KK * KK; j < i; ++j) again |= ids[j] == ids[i];
+                if (again) continue;
                 ++nvalid;
                 size_t g = 0;
                 while (g < gid.size() && gid[g] != ids[i]) ++g;
@@ -480,15 +503,17 @@ void glue_bench(cudaStream_t s, std::mt19937& rng, int gu, int dt, int ff, int T
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool do_bench = false, gu2 = false, do_glue = false;
+    bool do_bench = false, gu2 = false, do_glue = false, glue_one = false;
     int glue_t = 3, glue_pool = 22;
     BenchOptions bo;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--glue") { bo.down = 20; bo.ff = 640; }   // the shape the glue launches cover
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto num = [&](int& dst) { if (i + 1 < argc) dst = std::atoi(argv[++i]); };
         if (a == "--bench") do_bench = true;
         else if (a == "--glue") do_glue = true;
-        else if (a == "--glue-t") num(glue_t);
+        else if (a == "--glue-t") { num(glue_t); glue_one = true; }
         else if (a == "--glue-pool") num(glue_pool);
         else if (a == "--exp" && i + 1 < argc) {   // --exp NAME=V
             const std::string kv = argv[++i];
@@ -496,17 +521,17 @@ int main(int argc, char** argv) {
             if (eq != std::string::npos) basalt::core::diagnostics().exp[kv.substr(0, eq)] = std::atof(kv.c_str() + eq + 1);
         }
         else if (a == "--gu2") gu2 = true;   // also check the gate/up pair kernel (2560-value rows only)
-        else if (a == "--bench-gu") num(bo.gu);
-        else if (a == "--bench-down") num(bo.down);
-        else if (a == "--bench-ff") num(bo.ff);
+        else if (a == "--bench-gu") { num(bo.gu); glue_one = true; }
+        else if (a == "--bench-down") { num(bo.down); glue_one = true; }
+        else if (a == "--bench-ff") { num(bo.ff); glue_one = true; }
         else if (a == "--bench-t") num(bo.t);
         else if (a == "--bench-gy") num(bo.gy);
         else if (a == "--bench-phase") num(bo.phase);
         else if (a == "--bench-sizes" && i + 1 < argc) bo.sizes = argv[++i];
         else if (a == "--bench-ab" && i + 1 < argc) bo.ab = argv[++i];
         else {
-            std::printf("usage: native_grouped_parity [--gu2] [--bench [--bench-gu N] [--bench-down N] [--bench-ff N] "
-                        "[--bench-t N] [--bench-gy N] [--bench-phase N] [--bench-sizes LIST] [--bench-ab gu2]]\n");
+            std::printf("usage: native_grouped_parity [--gu2] [--glue [--glue-t N] [--glue-pool N]] [--bench [--bench-gu N] "
+                        "[--bench-down N] [--bench-ff N] [--bench-t N] [--bench-gy N] [--bench-phase N] [--bench-sizes LIST] [--bench-ab gu2]]\n");
             return 2;
         }
     }
@@ -514,7 +539,14 @@ int main(int argc, char** argv) {
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
     if (do_glue) {   // only the engine-shaped glue call: no format sweep
-        glue_bench(s, rng, bo.gu, bo.down, bo.ff, glue_t, glue_pool, 60);
+        if (glue_one) {   // one configuration, as the options give it
+            glue_bench(s, rng, bo.gu, bo.down, bo.ff, glue_t, glue_pool, 60);
+        } else {   // every format pair the launches cover, every window width
+            for (int gu : {16, 17, 18, 21, 22, 42})
+                for (int dt : {20, 42})
+                    for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, gu, dt, 640, T, glue_pool, 20);
+            for (int T = 1; T <= k::kVerifyMaxT; ++T) glue_bench(s, rng, 21, 20, 640, T, glue_pool, 20, true);   // odd ids
+        }
         std::printf("native_grouped_parity: %d failures\n", g_fail);
         return g_fail ? 1 : 0;
     }

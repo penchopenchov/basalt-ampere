@@ -8,7 +8,7 @@
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing:
 Linux with an NVIDIA Blackwell GPU (sm_120). The experts that do not fit in VRAM live in system RAM (and optionally on
 a second GPU used as a peer expert tier), so a large MoE model runs on a single workstation.
-Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt).
+Ready-to-run `.basalt` packs: see [Models](#models).
 
 It is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT), stripped down to that one target. See
 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
@@ -251,6 +251,9 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 `python3 tools/convert/convert.py --help` describes every input.
 
 ## Models
+
+Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt). A pack
+you convert yourself will be significantly slower than the official `.basalt` files.
 
 Quality measured with `basalt-bench --quality`: 20 chunks of wikitext-2 (512 tokens each), scored through the decode
 path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer to Q8_0. How precision is handled and how quality is measured:

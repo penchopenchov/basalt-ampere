@@ -145,6 +145,7 @@ public:
 
 private:
     friend class NativeDense;
+    friend struct WeightTableFixture;   // builds a table row by row for the shape-check test
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
 };

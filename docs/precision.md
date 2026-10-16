@@ -41,12 +41,12 @@ hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_
 | GDN ssm_alpha, ssm_beta; QSA indexer q/k projections | BF16 | model_sections.py:52-53 |
 | Router | BF16, not quantized | model_sections.py:48 |
 | Norm weights, ssm_a, ssm_dt, conv1d, ssm_norm | F32 | model_sections.py:55-60 |
-| Hyper-connection (hc) matrices (down, up, inject; per layer and for the output head) | Stored BF16 in the pack; decode reads an int8 copy: int8 codes with one fp16 scale per 32 consecutive inputs, scale = f16(absmax/127), codes clamped to ±127 | hc_fused.cu:343, 1168-1186, 1210-1227; verify.cpp:561-572 |
+| Hyper-connection (hc) matrices (down, up, inject; per layer and for the output head) | Stored BF16 in the pack; decode reads an int8 copy: int8 codes with one fp16 scale per 32 consecutive inputs, scale = f16(absmax/127), codes clamped to ±127 | hc_fused.cu:343, 1173-1191, 1215-1232; verify.cpp:561-572 |
 | Token embedding | GGUF type kept in mapped host memory, one row dequantized to fp32 per token | native_head.hpp:42-45; verify.cpp:948-961 |
 | Output head | A native_mmvq type with dedicated Q5_K and Q6_K kernels; the IQ3_S pack's head is Q6_K. A Q6_K head runs in two stages in verify: every row is scored from a 2-bit copy (the draft head's fit below: four levels and an fp16 scale per 32 weights, the scale raised by sqrt(\|w\|²/⟨w, ŵ⟩)), on int8 tensor cores; the rows within 4 of a lower bound on the column's 64th-best approximate logit are rescored exactly (the bits of the plain Q6_K kernel), and every other row keeps its approximate logit. The argmax and the sampler's top-64 list come from exact rows; the tail of the softmax is approximate (see [Two-stage verify head](#two-stage-verify-head)). The copy (199 MB for 248,320 rows) is packed at load, before the expert cache is sized | native_head.cpp; verify.cpp (the head); q6k_head.cu (q6k_vhead) |
 | MTP drafter dense | Q8_0 for fc_embedding, fc_hidden, q/k/v/o, indexer projection and the shared-expert projections; BF16 for the rest; 1-D tensors F32 | model_sections.py:334-338, 444-470 |
 | MTP drafter experts | Q2_0, all in VRAM | model_sections.py:482-487 |
-| MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset; for a Q5_K or Q6_K head the leading rows are first scored from a 2-bit copy (four levels and an fp16 scale per 32 weights) and the rows within 5 of the best approximate score (at most 64) rescored exactly, so a draft differs from the exact argmax only in rare cases, and the draft probability is approximate: the other rows' terms of its softmax sum come from the 2-bit scores. The Q6_K copy's scale is raised by sqrt(\|w\|²/⟨w, ŵ⟩) per group, since the least-squares copy scores the near-best rows low and inflates the probability; on 1500 real draft-head inputs of the IQ3_S pack the probability's mean error is +0.005 (+0.017 with the least-squares scale) and the pick matches the exact argmax in 99.93% | mtp.cpp, head_proxy.cuh, q5k_head.cu, q6k_head.cu |
+| MTP draft head | Rows gathered from the main head (same type), optionally a vocabulary subset; for a Q5_K or Q6_K head the leading rows are first scored from a 2-bit copy (four levels and an fp16 scale per 32 weights) and the rows within 5 of the best approximate score (at most 64) rescored exactly, so a draft differs from the exact argmax only in rare cases, and the draft probability is approximate: the other rows' terms of its softmax sum come from the 2-bit scores. The copy's scale (Q5_K and Q6_K alike) is raised by sqrt(\|w\|²/⟨w, ŵ⟩) per group, since the least-squares copy scores the near-best rows low and inflates the probability (on the Q5_K parity test's synthetic head over 12 seeds the probability's mean relative error halves, from 0.028-0.043 to 0.010-0.020, and the worst trial from up to 1.04 to under 0.45); on 1500 real draft-head inputs of the IQ3_S pack the probability's mean error is +0.005 (+0.017 with the least-squares scale) and the pick matches the exact argmax in 99.93% | mtp.cpp, head_proxy.cuh, q5k_head.cu, q6k_head.cu |
 | MTP hc matrices | The same int8 copies | mtp.cpp:218-263 |
 
 The drafter only proposes tokens; verify decides every token, so the drafter's precision affects speed, not output.
@@ -55,9 +55,9 @@ The drafter only proposes tokens; verify decides every token, so the drafter's p
 
 | Matmul | Activation format | Source |
 |---|---|---|
-| hc down and inject (hc read) | fp32, no activation quantization; int8 weights converted exactly, fp32 fmaf per group | hc_fused.cu:343-370, 489 |
-| hc up | fp32 input split into an fp16 high and low part (about 22-bit mantissa), fp16 tensor-core mma with fp32 accumulate, per-group fp16 scale applied in fp32 | hc_fused.cu:632-695 |
-| Router | fp32 times BF16 weight, fp32 FMA | hc_fused.cu:737-780; native_bf16.cu:34-125 |
+| hc down and inject (hc read) | fp32, no activation quantization; int8 weights converted exactly, fp32 fmaf per group | hc_fused.cu:343-370, 492 |
+| hc up | fp32 input split into an fp16 high and low part (about 22-bit mantissa), fp16 tensor-core mma with fp32 accumulate, per-group fp16 scale applied in fp32 | hc_fused.cu:635-698 |
+| Router | fp32 times BF16 weight, fp32 FMA | hc_fused.cu:740-785; native_bf16.cu:34-125 |
 | GDN qkv, QSA q, GDN ssm_out, QSA o | q8_1: int8 codes with an fp16 scale per 32 values, int8 tensor-core dot (dense_tc) | native_mmvq.cu:147-162; dense_tc.hpp:2-12 |
 | GDN z, QSA k/v | z through dense_tc together with qkv when eligible; otherwise native_mmvq (dp4a on q8_1) | dense_tc.cu:1155; verify.cpp:1145-1170 |
 | Routed experts gate/up | q8_1 of the fp32 FFN input; dp4a with exact int32 per block | hc_fused.cu:63-77; iq_kernels.cu:202-228 |
@@ -76,7 +76,7 @@ Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_
 | int8 dot products | Exact int32 per 32-value block, then fp32 scale terms summed in fp32 | dense_tc.cu:60-68, 1007-1010 |
 | Residual stream and hc buffers | fp32 | verify.hpp:468-469; hc_fused.hpp:22-38 |
 | RMSNorm | fp32, eps 1e-6 | verify.cpp:116 |
-| fp16/BF16 accumulators | None; hc up uses fp16 mma inputs with fp32 accumulate | hc_fused.cu:632-695 |
+| fp16/BF16 accumulators | None; hc up uses fp16 mma inputs with fp32 accumulate | hc_fused.cu:635-698 |
 | KV cache (`--kv`) | fp16, int8, q4_0 (alias q4), k8v4 (int8 K, rotated Q4_0 V). Engine default fp16; the sample config in the README uses int8 | generate.cpp:327, 1736-1743; README.md (Settings) |
 | int8 KV layout | int8 codes with an fp16 scale per 64 values (4 per 256-wide head, separate for K and V), scale = f16(amax/127) | kv_q8.hpp:3-5, 26-28; kv_q8.cu:46-52 |
 | Attention | K/V dequantized to fp32; scores in fp32; online softmax per 64-cell chunk in fp32 (`__expf`), fp32 merge; output gate sigmoid, then q8_1 for the o-projection | qsa_dec_attn.cu:114-138, 255-420 |

@@ -94,8 +94,8 @@ void gdn_buffers_zero_state(const GdnBuffers& b, const ModelGeometry& g, void* s
 /// `Mixed` (n_embd f32) through one GDN layer to `out` (n_embd f32).  `state` and `conv_state` are updated.
 ///
 /// `layer` selects the weights; `tables` must outlive the call.  Returns false and fills `err` if a tensor is
-/// missing - which is a wiring mistake here rather than a shape problem, because `check_layer` already
-/// asserted the shapes at load time.
+/// missing - which is a wiring mistake here rather than a shape problem, because `check_all` already
+/// asserted the shapes at engine start.
 bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const GdnBuffers& b,
                const float* mixed, float* out, void* stream, std::string& err);
 
