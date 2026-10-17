@@ -5,7 +5,7 @@
 // chunk sizes around every threshold (the FP4 minimum, the streamed walk, the largest chunk), with and without an
 // expert source, a resident and a streamed KV, and the ring depths.  The expert layout is process-wide, so the layout
 // is the argument: nvfp4 (every layer NVFP4 with a tail: the FP4 path), mixed (NVFP4 and K-quant layers),
-// kquant (Q4_K / Q5_1), iq3 (IQ3_S) and q2 (no native layout).  Needs a CUDA device for the MMQ plan (exit 77 without).
+// kquant (Q4_K / Q5_1) and q2 (no native layout, as in the IQ and Q2_0 packs).  Needs a CUDA device for the MMQ plan (exit 77 without).
 #include "basalt/core/layout.hpp"
 #include "basalt/core/session.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -24,17 +24,16 @@ namespace {
 namespace cpu = basalt::kernels::cpu;
 using basalt::prefill::Prefill;
 
-constexpr int kNvfp4 = 40, kQ4K = 12, kQ51 = 7, kIq3S = 21;
+constexpr int kNvfp4 = 40, kQ4K = 12, kQ51 = 7;
 
 bool load_layout(const std::string& mode, int64_t layers, std::string& err) {
-    if (mode == "q2") return true;   // no layout: the Q2_0 pack's
+    if (mode == "q2") return true;   // no layout: the IQ and Q2_0 packs'
     std::ostringstream t;
     t << "# experts v6: test\n";
     uint64_t off = 0;
     for (int64_t l = 0; l < layers; ++l) {
         int gt = kNvfp4, dt = kNvfp4;
         if (mode == "kquant") { gt = kQ4K; dt = kQ51; }
-        if (mode == "iq3") { gt = kIq3S; dt = kIq3S; }
         if (mode == "mixed" && l % 2 == 1) { gt = kQ4K; dt = kQ51; }
         cpu::NativeFmt f;
         if (!cpu::native_fmt(gt, dt, 2560, 640, f, err)) return false;

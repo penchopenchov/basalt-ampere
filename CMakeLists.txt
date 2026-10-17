@@ -777,7 +777,7 @@ if(BUILD_TESTING)
   # the prompt path's buffer layout against its sizing (no device memory), once per expert layout
   add_executable(prefill_layout_test tests/cuda/prefill_layout_test.cpp)
   target_link_libraries(prefill_layout_test PRIVATE prefill ${_gpu_runtime_target})
-  foreach(_mode nvfp4 mixed kquant iq3 q2)
+  foreach(_mode nvfp4 mixed kquant q2)
     add_test(NAME prefill_layout_${_mode} COMMAND prefill_layout_test ${_mode})
     set_tests_properties(prefill_layout_${_mode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   endforeach()
