@@ -201,6 +201,26 @@ class CheckpointDenseTest(unittest.TestCase):
             C.CheckpointDense(C.Checkpoint(self.d))
 
 
+GDN_CFG = {"text_config": {"linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
+                           "linear_value_head_dim": 128, "indexer_n_heads": 4, "indexer_head_dim": 128}}
+
+
+def small_checkpoint(d: Path, tens: dict, cfg=None) -> None:
+    write_safetensors(d / "model-00001-of-00001.safetensors", tens)
+    (d / "config.json").write_text(json.dumps(cfg or GDN_CFG))
+
+
+class F16OverflowTest(unittest.TestCase):
+    def test_overflowing_conv_weight_is_a_clean_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            x = np.full((2, 1, 4), 2.0 ** 17, np.float32)          # exactly BF16, beyond F16's range
+            small_checkpoint(d, {"model.language_model.layers.0.ple.conv1d.weight": ("BF16", x.shape, bf16(x).tobytes())})
+            dn = C.CheckpointDense(C.Checkpoint(d))
+            with self.assertRaisesRegex(S.ConvertError, "beyond F16"):
+                dn.bytes("blk.0.ple_conv1d.weight")
+
+
 class TruncationTest(unittest.TestCase):
     def test_short_file_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

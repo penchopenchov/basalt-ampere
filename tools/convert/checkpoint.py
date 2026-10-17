@@ -343,7 +343,10 @@ class CheckpointDense:
         if t.type_name == "F32":
             out = x.astype("<f4")
         elif t.type_name == "F16":
-            out = S.f16_values(x, name).astype("<f2")
+            try:
+                out = S.f16_values(x, name).astype("<f2")
+            except ValueError as e:
+                raise S.ConvertError(str(e)) from None
         else:
             u = x.view(np.uint32)
             if np.count_nonzero(u & 0xFFFF):
