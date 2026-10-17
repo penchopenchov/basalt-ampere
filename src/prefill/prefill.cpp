@@ -665,6 +665,8 @@ bool fp4_pack() {
     }();
     return any;
 }
+// A chunk shorter than this leaves most expert tiles nearly empty and the per-expert launches dominate: MMQ is faster.
+constexpr int64_t FP4_MIN_TOKENS = 1024;
 constexpr size_t al256(size_t v) { return (v + 255) & ~(size_t) 255; }
 size_t fp4_x_bytes(size_t rows, int64_t ne) {
     return al256(fp4::a4_bytes((int64_t) rows, N, (int) ne)) + al256(fp4::scale_count((int64_t) rows, (int) ne) * 4) +
@@ -1770,7 +1772,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     // NVFP4 experts: FP4 block-scaled tensor cores, read in place from the blobs
                     const bool fp4_l = use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
-                                       lay.fmt[(size_t) l].tail != 0;
+                                       lay.fmt[(size_t) l].tail != 0 && T >= FP4_MIN_TOKENS;
                     // a prompt peer: MMQ only, whether or not set_peer took it (it can decline), as fused_ring() sized
                     // the ring and the buffers for it
                     const bool no_peer = !core::prompt_peer();
