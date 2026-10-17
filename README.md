@@ -360,8 +360,7 @@ RTX 5090 at 400 W with the 5060 Ti as a peer card, against the same pack with Qw
 
 | test | original layer, tok/s | tuned layer, tok/s | change |
 |---|---:|---:|---:|
-| prose, right after a topic switch | 234.5 | 238.9 | +1.9% |
-| prose, adapted | 239.0 | 245.9 | +2.9% |
+| prose | 234.5 | 238.9 | +1.9% |
 | tokens per verify window, prose | 2.083 | 2.172 | +4.3% |
 
 Conversation and structured output are within noise.
