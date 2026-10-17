@@ -14,7 +14,10 @@ tier, 32 GB of system RAM.
 - **KLD matches llama.cpp.** On the same GGUFs against the same base, Basalt and llama.cpp's own `llama-perplexity`
   agree: IQ3_S 0.15264 vs 0.1526, IQ3_XXS 0.2433 vs 0.2428 at 100 chunks, with the exact head. The two-stage
   verify head of a Q6_K head (IQ3_S) adds about 0.0017 ([see below](#two-stage-verify-head)).
-- **No requantization.** Weights are the GGUF blocks as shipped. The one exception is the hyper-connection matrices,
+- **No requantization**, with one deliberate exception. Weights are the GGUF blocks as shipped (the NVFP4 pack: NVFP4
+  expert blobs, also copied byte for byte). The exception is the official NVIDIA NVFP4 pack, whose dense projections are
+  quantized once from NVIDIA's BF16 weights to Q6_K for speed ([below](#6-bit-dense-projections-nvidia-nvfp4-pack))
+  by Basalt's converter, which also makes its Q8_0 head, token embedding and shared-expert down from BF16. Separately, the hyper-connection matrices,
   which decode reads from an int8 copy with one fp16 scale per 32 inputs. A Q6_K output head is also screened through a
   2-bit copy in verify: the rows near the top are the exact Q6_K logits, the far tail keeps the copy's approximate logits
   ([details](#two-stage-verify-head)).
@@ -35,11 +38,11 @@ hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10, head_
 | Tensor class | Format | Source |
 |---|---|---|
 | Routed experts | GGUF blocks copied byte for byte, no requantization. Gate and up share one type per layer; types are mixed across layers (IQ3_XXS pack: gate/up IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S; down Q2_0 on 30 layers, IQ4_NL on 18. IQ3_S pack: gate/up mostly IQ3_XXS, IQ3_S, IQ2_S, one IQ4_XS; down IQ4_NL on 39, Q2_0 on 9) | README.md (The `.basalt` model file); iq_kernels.cu:541-542; tests/data/native_experts/ |
-| Routed experts, NVFP4 format | NVFP4 (type 40): per 16 weights, 8 bytes of E2M1 codes and one UE4M3 scale; per expert a 16-byte FP32 tail {s_gate, s_up, s_down, 0}. 4.5 bits per weight, all 48 layers | native_experts.txt; iq_kernels.cu (nvfp4_scale_dev) |
-| NVIDIA-checkpoint pack | The experts are NVFP4 (the format above), bit for bit from NVIDIA's checkpoint. The dense tensors come from a GGUF made from the same checkpoint: attention, GDN out, shared experts, head and token embedding Q8_0 (the encodings UD-Q4_K_XL uses for them); router, hyper-connection matrices, indexer, ssm_alpha/beta and the PLE key/value BF16 as stored, so nothing is requantized for the small matrices (the UD-Q4_K_XL-based pack holds the hyper-connection matrices and PLE key/value as Q8_0 round trips). The n-gram table is the checkpoint's FP8 E4M3 codes times its one BF16 scale, re-blocked to Q8_0 (blocks of 32, fp16 scale = absmax/127, ggml's rounding): at most half a Q8_0 step plus the scale's fp16 rounding from the exact FP8 value, against the 4.5-bit IQ4_NL table of the other packs. The expert tensors' `.scale` / `.input_scale` entries in that GGUF are not copied; the experts' tails carry the scales | model_sections.py (PleFp8); test_convert.py (PleFp8Test) |
+| Routed experts, NVFP4 format | NVFP4 (type 40): per 16 weights, 8 bytes of E2M1 codes and one UE4M3 scale; per expert a 16-byte FP32 tail {s_gate, s_up, s_down, 0}. 4.5 bits per weight, all 48 layers | tools/convert/checkpoint.py; native_experts.txt; iq_kernels.cu (nvfp4_scale_dev) |
+| NVIDIA-checkpoint pack (`--checkpoint`) | Built straight from NVIDIA's safetensors. The experts are NVIDIA's NVFP4 codes and UE4M3 scales, bit for bit, moved into Basalt's 64-value blocks; each expert's tail is its three `weight_scale_2` values (the `input_scale` entries are not used). The dense tensors are converted once from BF16: attention, GDN qkv/z/out and the shared experts' gate/up Q6_K (Q8_0 with `--dense-q8-0`), shared-expert down, head and token embedding Q8_0 (ggml's rounding); router, hyper-connection matrices, indexer, ssm_alpha/beta and the PLE key/value BF16 as stored, so nothing is requantized for the small matrices (the UD-Q4_K_XL-based pack holds the hyper-connection matrices and PLE key/value as Q8_0 round trips); norm weights BF16 + 1 in F32 (exact); ssm_a = -exp(A_log) computed in f64 and rounded once to F32 (the dense GGUF the earlier build used differs from that by one F32 ulp in 11 of 1,728 values); the GDN value heads reordered into the GGUF order. The n-gram table is the checkpoint's FP8 E4M3 codes times its one BF16 scale, re-blocked to Q8_0 (blocks of 32, fp16 scale = absmax/127, ggml's rounding): at most half a Q8_0 step plus the scale's fp16 rounding from the exact FP8 value, against the 4.5-bit IQ4_NL table of the other packs | tools/convert/checkpoint.py; convert.py (from_checkpoint); model_sections.py (PleFp8); test_checkpoint.py; test_convert.py (PleFp8Test) |
 | Shared expert gate/up/down | GGUF blocks, any native_mmvq type | native_mmvq.hpp:55-58 |
 | Shared-expert scalar gate | BF16 | model_sections.py:48-51 |
-| QSA q/k/v/o, GDN qkv, z (attn_gate), ssm_out | GGUF blocks (dense_tc takes Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0; native_mmvq otherwise) | dense_tc.cu:1063-1075; dense_tc.hpp:2-12 |
+| QSA q/k/v/o, GDN qkv, z (attn_gate), ssm_out | GGUF blocks (dense_tc takes Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0; native_mmvq otherwise, which is where Q8_0 lands). The official NVIDIA NVFP4 pack stores these (and the shared-expert gate/up) as Q6_K from NVIDIA's BF16 weights, so they take dense_tc ([below](#6-bit-dense-projections-nvidia-nvfp4-pack)) | dense_tc.cu:1063-1075; dense_tc.hpp:2-12 |
 | GDN ssm_alpha, ssm_beta; QSA indexer q/k projections | BF16 | model_sections.py:52-53 |
 | Router | BF16, not quantized | model_sections.py:48 |
 | Norm weights, ssm_a, ssm_dt, conv1d, ssm_norm | F32 | model_sections.py:55-60 |
@@ -148,6 +151,52 @@ by at most 7e-4 of the row's largest output: MMQ's stream-k split and tile width
 rounding can turn a reordered sum into one int8 step. The i-quant MMQ path does the same (6.5e-4, IQ4_XS/IQ4_NL). Quality
 gate, UD-Q4_K_XL, 100 chunks, 400 W, the 256-token prompt half through this path: PPL 3.3297, KLD 0.05653, top-1 92.06%
 against 3.3223, 0.05695, 92.22% with the FP16 path.
+
+## 6-bit dense projections (NVIDIA NVFP4 pack)
+
+The official NVIDIA NVFP4 pack stores its dense projections as Q6_K where the Q8_0 variant stores them as Q8_0. This is
+a weight-format change and the only requantization Basalt makes: `convert.py --checkpoint` (or `--requant-dense-q6k`
+on a pack with Q8_0 projections).
+
+- **What moves:** attention q/k/v/o, GDN qkv, z and out, and the shared experts' gate and up: 252 tensors, 2,948 MiB of
+  dense weights down by 654 MiB. The shared experts' down (640-value rows are not whole 256-value blocks), the head and
+  the token embedding stay Q8_0; the router, hyper-connection matrices, indexer, ssm_alpha/beta and PLE key/value stay
+  BF16; the experts, the PLE table, the drafter and vision are untouched.
+- **Source and rounding:** each tensor is quantized once from NVIDIA's BF16 weight, never from a Q8_0 copy (which
+  would round twice). The GGUF lists the 48 GDN value heads in a different order from the checkpoint; the converter
+  reorders them. `--requant-dense-q6k --checkpoint` compares each BF16 tensor with the pack's Q8_0 copy first (the
+  largest distance is 0.62 Q8_0 steps; it stops above 1.05, which catches a wrong tensor or head order); `--checkpoint`
+  with `--sections-from` reads the BF16 tensors by name and gives the same Q6_K bytes.
+- **Method:** per 256-value block, least-squares scales per 16 values from a signed-max starting grid, 8-bit scales
+  against one fp16 super-scale, values rounded against the scales as stored (ggml's `block_q6_K` layout). The error is
+  about 1.9% of sigma on Gaussian groups, and the converter tests bound it by the 6-bit step.
+- **Why it is faster:** 6-bit dense weights take the tensor-core dense path in decode, while Q8_0 dense weights fall back to
+  the mmvq kernel, and they are about 25% fewer bytes.
+
+Speed, RTX 5090 at 400 W with a 5060 Ti peer card, the two packs alternated in one session (ABBA, 6 fresh processes per
+arm), development measurement; mean over 6:
+
+| test | 8-bit dense tok/s | 6-bit dense tok/s | change | ms per window |
+|---|---:|---:|---:|---|
+| prose | 213.4 | 229.9 | +7.8% | 10.00 to 9.24 |
+| conversation | 251.0 | 265.1 | +5.6% | 10.34 to 9.35 |
+| structured | 420.4 | 463.5 | +10.2% | 15.88 to 14.39 |
+| prefill, 8K and 32K | 3,806 and 7,791 | 3,845 and 7,856 | +1% | |
+
+Draft acceptance is unchanged within the run-to-run spread, so the gain is window time.
+
+Quality, against the Q8_0 reference through the decode path, 100 chunks, 400 W (the Q8_0-dense rows are in the quality table
+below; their reruns spread 0.0005 in KLD):
+
+| dense format | PPL | KLD mean | KLD p99 | same top-1 |
+|---|---:|---:|---:|---:|
+| Q8_0 | 3.287-3.294 | 0.0612-0.0621 | 0.692-0.699 | 91.80-91.87% |
+| Q6_K | 3.3081 | 0.0680 | 0.775 | 91.46% |
+
+The paired per-chunk KLD difference is +0.0063 (95% CI +0.0048 to +0.0077), so the loss is outside the run-to-run noise:
+about 10% of the KLD and 0.4 points of top-1. On long prompts (12 chunks of 4,096 tokens, no Q8_0 reference, so PPL only)
+PPL goes from 2.9547 to 2.9816; paired NLL +0.0091 (95% CI +0.0049 to +0.0132). Q6_K dense runs through dense_tc and
+dense_tc_pair; the same arithmetic applies as for any Q6_K dense tensor (q8_1 activations, int8 tensor-core dot).
 
 ## Two-stage verify head
 
@@ -380,6 +429,7 @@ measurement):
 | UD-Q4_K_XL | 100 | 3.3201 | 0.05656 | 0.01213 | 0.6586 | 92.27% |
 | NVIDIA-checkpoint NVFP4 (dense Q8_0) | 100 | 3.2873 | 0.06167 | 0.01345 | 0.6923 | 91.80% |
 | NVIDIA-checkpoint NVFP4 (dense Q8_0), combined build (f127762) | 100 | 3.2870 | 0.06115 | 0.01365 | 0.6992 | 91.87% |
+| NVIDIA-checkpoint NVFP4, dense Q6_K (official) | 100 | 3.3081 | 0.06799 | | 0.775 | 91.46% |
 | UD-Q4_K_XL | 20 | 2.3223 | 0.0685 | 0.00514 | 0.9928 | 93.02% |
 
 The NVIDIA-checkpoint (dense Q8_0) row was run on one build (daf16b6), T 3, int8 KV, resident experts, 400 W, base PPL 3.28607.
