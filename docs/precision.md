@@ -362,6 +362,19 @@ At 20 chunks (Basalt: the README table; llama.cpp: its running value at chunk 20
 | GSQ-RCO IQ3_XXS | 0.277 / 86.8% | 0.2780 / 86.65% |
 | UD-Q4_K_XL | 0.068 / 93.0% | 0.0579 / 93.96% |
 
+NVFP4 and UD-Q4_K_XL in Basalt only (same harness and base, T 3, kv int8, `--mmap-experts`; a development
+measurement):
+
+| Pack | Chunks | PPL | KLD mean | KLD median | KLD p99 | Same top-1 |
+|---|---|---|---|---|---|---|
+| UD-Q4_K_XL | 100 | 3.3201 | 0.05656 | 0.01213 | 0.6586 | 92.27% |
+| NVIDIA-checkpoint NVFP4 (dense Q8_0) | 100 | 3.2873 | 0.06167 | 0.01345 | 0.6923 | 91.80% |
+| UD-Q4_K_XL | 20 | 2.3223 | 0.0685 | 0.00514 | 0.9928 | 93.02% |
+
+The NVIDIA-checkpoint (dense Q8_0) row was run on one build (daf16b6), T 3, int8 KV, resident experts, 400 W, base PPL 3.28607.
+Against UD-Q4_K_XL it has 0.0051 higher KLD and 0.47 points lower top-1, and a lower PPL (3.2873 against 3.3201), which
+is not a quality signal.
+
 IQ3_S and IQ3_XXS agree between the two engines to within 0.002 KLD and 0.2 points of top-1 at both chunk counts. The
 first 20 chunks read higher than the 100-chunk set (higher KLD and higher top-1 for the IQ3 packs), so the README table,
 which uses 20 chunks, reads higher than the 100-chunk numbers; the 100-chunk numbers are the ones to compare. The one gap
