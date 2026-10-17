@@ -1264,7 +1264,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL + MMQ_SCALES, ok);
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
