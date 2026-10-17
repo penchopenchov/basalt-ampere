@@ -1,21 +1,19 @@
-// prefill_mmq_nvfp4_test - the prompt path's NVFP4 experts through MMQ (moe_mmq.hpp): the NVFP4 tile loader with the
-// per-16-scale int8 dot, the scale tail gathered with each expert and applied in mmq::swiglu, at the real geometry
-// (gate/up 1280 x 2560, down 2560 x 640) on synthetic NVFP4 experts (sub-block scales over 13 binades, UE4M3
-// subnormals included; tails {s_gate, s_up, s_down} in 0.004..0.03), in prefill.cpp's sequence (16-expert groups,
-// q8_1 of the activations, gate/up, SwiGLU, q8_1 of H, down).  Checked against three CPU references:
-//   - `same`: double-precision math on MMQ's own roundings (x and H rounded to int8 per 32 values the way the
-//     quantizer does).  The gate/up product (before the tail and SwiGLU) isolates the loader and the dot: only fp32
-//     accumulation order differs.  Tolerance: RMS 1e-5, worst row 1e-4.  After the down product an H value whose
-//     x/d lands within fp32 rounding of a .5 tie takes the neighbouring int8 code (one step is 1/127 of its 32-value
-//     block's max), so the tolerance there is RMS 2e-4, worst row 1e-2.
-//   - `double`: the unrounded activations.  MMQ's error here is the int8 activation rounding every MMQ format has
-//     (the decode kernels measure 1.2e-2 on the same rounding).  Tolerance: RMS 2.5e-2.
-//   - `fp16`: the FP16 fallback this path replaces (weights times their tail rounded to fp16, activations and H in
-//     fp16, fp32 accumulation).  Tolerance: MMQ vs fp16 RMS at most its own error vs double plus fp16's (the two
-//     roundings are independent), and 2.5e-2.
-// The per-expert gather and the grouped gather must give bitwise equal outputs.  An all-zero token stays exactly 0.
-// Then a microbench line: one layer at a 2048-token chunk (512 experts, top 10) - gathers plus products - in us and
-// TFLOP/s.  --no-bench.  Exit 77 without a CUDA device.
+// prefill_fp4_test - the prompt path's NVFP4 experts on the FP4 block-scaled tensor cores (moe_fp4.hpp) next to the MMQ
+// path they replace, at the real geometry (gate/up 1280 x 2560, down 2560 x 640) on synthetic NVFP4 experts (sub-block
+// scales over 13 binades, UE4M3 subnormals included; tails {s_gate, s_up, s_down} in 0.004..0.03), in prefill.cpp's
+// sequence (16-expert groups, activations to codes, gate/up, SwiGLU, H to codes, down).  Checked against CPU references:
+//   - FP4: the same A4 roundings (token scale amax / (6 * 448), UE4M3 per 16, E2M1 codes) in double: gate/up RMS 1e-5,
+//     down RMS 1e-4; and an output that does not depend on the token's tile or neighbours (bitwise).  The unrounded
+//     activations in double: layer output RMS 0.2 (the W4A4 rounding error itself).  The MMQ output: RMS 0.2.
+//   - MMQ: `same`, double-precision math on MMQ's own int8 roundings (gate/up RMS 1e-5, worst row 1e-4; after the down
+//     product RMS 2e-4, worst row 1e-2); `double` on the unrounded activations (RMS 2.5e-2); the FP16 fallback it
+//     replaced (RMS 2e-2).  The per-expert gather and the grouped gather give bitwise equal outputs; a zero token stays 0.
+// The group path (`fp4::run_group`, what prefill.cpp runs) with GU and H holding only a run's rows must equal the
+// absolute-row sequence bitwise, and so must every split of a group into runs (a row cap from one expert to none),
+// on two routings with hot experts, with nothing written past the run's rows.  Edge activations: zero sub-blocks
+// next to non-zero ones, tokens scaled by 1e-30 and 1e30, one huge sub-block in a tiny token: finite, zero stays zero,
+// and the gate/up product follows the A4 reference.  Then a microbench line (--no-bench skips it).  Exit 77 without
+// a CUDA device.
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
@@ -50,7 +48,8 @@ void ck(cudaError_t e, const char* what) {
 
 struct Dev {
     void* p = nullptr;
-    explicit Dev(size_t n) { ck(cudaMalloc(&p, n), "cudaMalloc"); }
+    size_t bytes = 0;
+    explicit Dev(size_t n) : bytes(n) { ck(cudaMalloc(&p, n), "cudaMalloc"); }
     ~Dev() { cudaFree(p); }
     Dev(const Dev&) = delete;
     Dev& operator=(const Dev&) = delete;
@@ -315,6 +314,224 @@ void run_fp4(F4& f, Bufs& b, const Layer& L, const float* x_dev, const int32_t* 
     }
 }
 
+// The production sequence: `fp4::run_group` over each group of up to 16 experts, GU and H holding only a run's rows,
+// in runs of at most `row_cap` rows.  Buffers past the run rows carry guard bytes that must stay untouched.
+constexpr size_t kGuardRows = 64, kGuardBytes = 4096;
+struct F4Run {
+    int64_t cap_rows;
+    Dev gu, h, a4h, gsh, th;
+    F4Run(int64_t rows)
+        : cap_rows(rows), gu((size_t) (rows + kGuardRows) * 1280 * 4), h((size_t) (rows + kGuardRows) * FF * 4),
+          a4h(fp4::a4_bytes(rows, FF, GROUP) + kGuardBytes), gsh(fp4::scale_count(rows, GROUP) * 4 + kGuardBytes),
+          th(2 * (GROUP + 1) * 4) {}
+};
+bool guard_clear(const void* base, size_t from, size_t to) {
+    std::vector<uint8_t> v(to - from);
+    ck(cudaMemcpy(v.data(), (const uint8_t*) base + from, v.size(), cudaMemcpyDeviceToHost), "guard");
+    for (uint8_t c : v) if (c != 0xff) return false;
+    return true;
+}
+// returns the number of runs; `guards` is cleared when anything wrote past a run's rows
+int run_fp4_group(F4& f, F4Run& r, Bufs& b, const Layer& L, const float* x_dev, const int32_t* src_dev,
+                  const std::vector<const uint8_t*>& blob, int64_t row_cap, bool& guards, cudaStream_t s) {
+    const int64_t rows = (int64_t) L.T * K;
+    const size_t n = L.order.size();
+    ck(cudaMemcpyAsync(b.bounds.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
+    fp4::plan(b.bounds.as<int32_t>(), (int) n, f.tox.as<int32_t>(), s);
+    fp4::quantize(x_dev, src_dev, b.bounds.as<int32_t>(), f.tox.as<int32_t>(), (int) n, f.a4x.p, f.gsx.as<float>(), N, N,
+                  rows, s);
+    ck(cudaMemsetAsync(r.gu.p, 0xff, r.gu.bytes, s), "guard");
+    ck(cudaMemsetAsync(r.h.p, 0xff, r.h.bytes, s), "guard");
+    ck(cudaMemsetAsync(r.a4h.p, 0xff, r.a4h.bytes, s), "guard");
+    ck(cudaMemsetAsync(r.gsh.p, 0xff, r.gsh.bytes, s), "guard");
+    int runs = 0;
+    for (size_t j0 = 0; j0 < n; j0 += GROUP) {
+        const int ngx = (int) std::min<size_t>(GROUP, n - j0);
+        fp4::Group g;
+        g.n = ngx;
+        for (int q = 0; q < ngx; ++q) g.blob[q] = blob[(size_t) L.order[j0 + (size_t) q]];
+        g.bounds_host = L.bh.data() + j0;
+        g.bounds_dev = b.bounds.as<int32_t>() + j0;
+        g.a4x = f.a4x.p; g.gsx = f.gsx.as<float>(); g.tox = f.tox.as<int32_t>() + j0;
+        g.down_off = DOWN_OFF; g.tail_off = TAIL_OFF;
+        g.gu = r.gu.as<float>(); g.h = r.h.as<float>(); g.dm = b.dm.as<float>();
+        g.a4h = r.a4h.p; g.gsh = r.gsh.as<float>(); g.toh = r.th.as<int32_t>(); g.rel = g.toh + (GROUP + 1);
+        g.tails = b.scales();
+        runs += fp4::run_group(g, row_cap, s);
+    }
+    ck(cudaStreamSynchronize(s), "sync group");
+    guards = guard_clear(r.gu.p, (size_t) r.cap_rows * 1280 * 4, r.gu.bytes) &&
+             guard_clear(r.h.p, (size_t) r.cap_rows * FF * 4, r.h.bytes) &&
+             guard_clear(r.a4h.p, fp4::a4_bytes(r.cap_rows, FF, GROUP), r.a4h.bytes) &&
+             guard_clear(r.gsh.p, fp4::scale_count(r.cap_rows, GROUP) * 4, r.gsh.bytes);
+    return runs;
+}
+
+// Every split of a group into runs must give the absolute-row sequence's output bit for bit.
+bool split_equivalence(const char* name, const Layer& L, const float* x_dev, const std::vector<const uint8_t*>& blob,
+                       cudaStream_t s) {
+    const int64_t rows = (int64_t) L.T * K;
+    const size_t n = L.order.size(), groups = (n + GROUP - 1) / GROUP;
+    Dev src_dev((size_t) rows * 4);
+    ck(cudaMemcpy(src_dev.p, L.src.data(), L.src.size() * 4, cudaMemcpyHostToDevice), "src");
+    Bufs b(rows, L.bh.size());
+    F4 f(rows, n);
+    ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+    run_fp4(f, b, L, x_dev, src_dev.as<int32_t>(), blob, s);
+    ck(cudaStreamSynchronize(s), "sync abs");
+    const std::vector<float> ref = download(b.dm, (size_t) rows * N);
+    int64_t maxcnt = 0;
+    for (int32_t c : L.cnt) maxcnt = std::max<int64_t>(maxcnt, c);
+    bool ok = true;
+    int runs_unsplit = 0, runs_small = 0;
+    for (int64_t cap : {(int64_t) 1 << 40, (int64_t) 2 * 64 + 1, (int64_t) 65, maxcnt, (int64_t) 1}) {
+        F4Run r(std::min<int64_t>(rows, std::max(cap, maxcnt)));
+        ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+        bool guards = true;
+        const int runs = run_fp4_group(f, r, b, L, x_dev, src_dev.as<int32_t>(), blob, cap, guards, s);
+        const std::vector<float> y = download(b.dm, (size_t) rows * N);
+        const bool same = std::memcmp(y.data(), ref.data(), ref.size() * 4) == 0;
+        if (cap > rows) runs_unsplit = runs;
+        if (cap == 65) runs_small = runs;
+        std::printf("  %s: cap %lld rows: %d runs over %zu groups, bitwise equal to the absolute-row sequence: %s, guards: %s\n",
+                    name, (long long) std::min<int64_t>(cap, rows), runs, groups, same ? "yes" : "NO", guards ? "clear" : "WRITTEN");
+        ok &= same && guards;
+        if (cap == 1) ok &= runs == (int) n;
+    }
+    ok &= runs_unsplit == (int) groups && runs_small > (int) groups;   // the split really happened, and only when capped
+    return ok;
+}
+
+// Edge activations through the quantizer and the gate/up product (the A4 reference in double), and the whole group path
+// on those without the 1e30 tokens (SwiGLU of a 1e30 gate and up overflows by itself).
+bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::vector<const uint8_t*>& blob,
+                      cudaStream_t s) {
+    constexpr int R = 8;   // tokens: 0 zero, 1 zero sub-blocks between non-zero, 2 first half zero, 3 x 1e-30, 4 x 1e30,
+                           // 5 one 1e30 sub-block in a 1e-30 token, 6 normal, 7 a lone 1e-30 value in a zero token
+    std::mt19937 rng(99);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> x((size_t) R * N);
+    for (float& v : x) v = nd(rng);
+    for (int c = 0; c < N; ++c) {
+        float* t0 = x.data();
+        float* t1 = x.data() + (size_t) N;
+        float* t2 = x.data() + (size_t) 2 * N;
+        float* t3 = x.data() + (size_t) 3 * N;
+        float* t4 = x.data() + (size_t) 4 * N;
+        float* t5 = x.data() + (size_t) 5 * N;
+        float* t7 = x.data() + (size_t) 7 * N;
+        t0[c] = 0.0f;
+        if ((c / 16) % 2 == 1) t1[c] = 0.0f;
+        if (c < N / 2) t2[c] = 0.0f;
+        t3[c] *= 1e-30f;
+        t4[c] *= 1e30f;
+        t5[c] *= (c / 16 == 7) ? 1e30f : 1e-30f;
+        t7[c] = c == 1234 ? 1e-30f : 0.0f;
+    }
+    Dev x_dev((size_t) R * N * 4);
+    ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+    const int32_t bounds[2] = {0, R};
+    Dev bd(8);
+    ck(cudaMemcpy(bd.p, bounds, 8, cudaMemcpyHostToDevice), "bounds");
+    F4 f(R, 1);
+    fp4::plan(bd.as<int32_t>(), 1, f.tox.as<int32_t>(), s);
+    fp4::quantize(x_dev.as<float>(), nullptr, bd.as<int32_t>(), f.tox.as<int32_t>(), 1, f.a4x.p, f.gsx.as<float>(), N, N, R, s);
+    Dev gu((size_t) R * 1280 * 4);
+    ck(cudaMemset(gu.p, 0xff, gu.bytes), "clr");
+    fp4::Product p;
+    p.blob[0] = blob[0];
+    p.w_off = 0; p.w_rows = 1280; p.w_cols = N; p.n = 1;
+    p.a4 = f.a4x.p; p.gs = f.gsx.as<float>(); p.bounds = bd.as<int32_t>(); p.tile_off = f.tox.as<int32_t>();
+    p.dst = gu.as<float>(); p.ld_dst = 1280; p.max_rows = R;
+    fp4::run(p, s);
+    ck(cudaStreamSynchronize(s), "sync edge");
+    const std::vector<float> y = download(gu, (size_t) R * 1280);
+    std::vector<float> w((size_t) 2 * FF * N);
+    const auto* tr = ggml_get_type_traits(GGML_TYPE_NVFP4);
+    for (int r = 0; r < 2 * FF; ++r) tr->to_float(host[0].data() + (size_t) r * GU_ROW, w.data() + (size_t) r * N, N);
+    bool ok = true;
+    std::vector<float> x4(N);
+    for (int t = 0; t < R; ++t) {
+        a4_round(x.data() + (size_t) t * N, x4.data(), N);
+        double e2 = 0, r2 = 0;
+        bool finite = true, zero = true;
+        for (int o = 0; o < 1280; ++o) {
+            double ref = 0;
+            for (int c = 0; c < N; ++c) ref += (double) w[(size_t) o * N + c] * x4[(size_t) c];
+            const float v = y[(size_t) t * 1280 + o];
+            finite &= std::isfinite(v);
+            zero &= v == 0.0f;
+            e2 += ((double) v - ref) * ((double) v - ref);
+            r2 += ref * ref;
+        }
+        const double rel = r2 > 0 ? std::sqrt(e2 / r2) : (e2 > 0 ? 1e30 : 0.0);
+        // a token whose A4 reference is exactly zero must give exactly zero
+        const bool ref_zero = r2 == 0;
+        const bool good = finite && rel <= 1e-4 && (!ref_zero || zero);
+        std::printf("  edge token %d: gate/up vs A4 reference rel rms %.3e, finite %s%s -> %s\n", t, rel, finite ? "yes" : "NO",
+                    ref_zero ? ", reference exactly zero" : "", good ? "ok" : "FAIL");
+        ok &= good;
+    }
+    // the whole path on the tokens without the huge values
+    {
+        const int keep[6] = {0, 1, 2, 3, 6, 7};
+        constexpr int RK = 6;
+        std::vector<float> xk((size_t) RK * N);
+        for (int i = 0; i < RK; ++i) std::memcpy(xk.data() + (size_t) i * N, x.data() + (size_t) keep[i] * N, N * 4);
+        Dev xk_dev(xk.size() * 4);
+        ck(cudaMemcpy(xk_dev.p, xk.data(), xk.size() * 4, cudaMemcpyHostToDevice), "x");
+        Layer L;
+        L.T = RK;
+        L.E = 1;
+        L.cnt = {RK};
+        L.off = {0, RK};
+        L.src.resize(RK);
+        for (int i = 0; i < RK; ++i) L.src[(size_t) i] = i;
+        L.order = {0};
+        L.bh = {0, RK, 0, RK};
+        // rows = T * K in the helpers: this layer has RK rows, so describe it with K = 1 rows by hand
+        Dev src_dev((size_t) RK * 4), bdev(L.bh.size() * 4), dm((size_t) RK * N * 4), tails(64);
+        ck(cudaMemcpy(src_dev.p, L.src.data(), RK * 4, cudaMemcpyHostToDevice), "src");
+        ck(cudaMemcpy(bdev.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice), "bounds");
+        F4 fk(RK, 1);
+        fp4::plan(bdev.as<int32_t>(), 1, fk.tox.as<int32_t>(), s);
+        fp4::quantize(xk_dev.as<float>(), src_dev.as<int32_t>(), bdev.as<int32_t>(), fk.tox.as<int32_t>(), 1, fk.a4x.p,
+                      fk.gsx.as<float>(), N, N, RK, s);
+        F4Run r(RK);
+        ck(cudaMemset(r.gu.p, 0, r.gu.bytes), "clr");
+        ck(cudaMemset(dm.p, 0xff, dm.bytes), "clr");
+        fp4::Group g;
+        g.n = 1;
+        g.blob[0] = blob[0];
+        g.bounds_host = L.bh.data();
+        g.bounds_dev = bdev.as<int32_t>();
+        g.a4x = fk.a4x.p; g.gsx = fk.gsx.as<float>(); g.tox = fk.tox.as<int32_t>();
+        g.down_off = DOWN_OFF; g.tail_off = TAIL_OFF;
+        g.gu = r.gu.as<float>(); g.h = r.h.as<float>(); g.dm = dm.as<float>();
+        g.a4h = r.a4h.p; g.gsh = r.gsh.as<float>(); g.toh = r.th.as<int32_t>(); g.rel = g.toh + (GROUP + 1);
+        g.tails = tails.as<float>();
+        fp4::run_group(g, 1 << 20, s);
+        ck(cudaStreamSynchronize(s), "sync edge path");
+        const std::vector<float> o = download(dm, (size_t) RK * N);
+        for (int i = 0; i < RK; ++i) {
+            bool finite = true, zero = true;
+            double mx = 0;
+            for (int c = 0; c < N; ++c) {
+                const float v = o[(size_t) i * N + c];
+                finite &= std::isfinite(v);
+                zero &= v == 0.0f;
+                mx = std::max(mx, (double) std::fabs(v));
+            }
+            const bool must_zero = keep[i] == 0;   // the all-zero token
+            const bool good = finite && (!must_zero || zero) && (keep[i] != 3 || mx < 1e-20);
+            std::printf("  edge token %d through the whole path: finite %s, max |out| %.3e%s -> %s\n", keep[i],
+                        finite ? "yes" : "NO", mx, must_zero ? " (must be exactly 0)" : "", good ? "ok" : "FAIL");
+            ok &= good;
+        }
+    }
+    return ok;
+}
+
 int parity(cudaStream_t s) {
     constexpr int T = 160, E = 40, ZERO = 33;
     std::mt19937 rng(4040);
@@ -447,8 +664,8 @@ int parity(cudaStream_t s) {
         if (mr > 0) gworst = std::max(gworst, me / mr);
     }
     const double grms = gr2 > 0 ? std::sqrt(ge2 / gr2) : 0;
+    const Err fe = compare(fy, r_dbl, (size_t) rows), fm = compare(fy, y, (size_t) rows);
     {
-        const Err fe = compare(fy, r_dbl, (size_t) rows);
         double e2 = 0, r2 = 0, w = 0;
         for (int64_t p = 0; p < rows; ++p) {
             double me = 0, mr = 0;
@@ -486,6 +703,8 @@ int parity(cudaStream_t s) {
                 indep &= std::memcmp(fy.data() + (size_t) (L.off[(size_t) e] + i) * N,
                                      ry.data() + (size_t) (L.off[(size_t) e] + L.cnt[(size_t) e] - 1 - i) * N, N * 4) == 0;
     }
+    std::printf("  FP4 layer output vs double:  rms %.3e worst row %.3e (tol rms 0.2);  vs MMQ output: rms %.3e (tol 0.2)\n",
+                fe.rms, fe.worst, fm.rms);
     std::printf("  FP4 gate/up vs A4-rounding reference: rms %.3e (tol 1e-5)\n", f4gu);
     std::printf("  FP4 down vs A4-rounding reference:    rms %.3e worst row %.3e (tol rms 1e-4)\n", f4dn.rms, f4dn.worst);
     std::printf("  FP4 output independent of tile position and neighbours (bitwise): %s\n", indep ? "yes" : "NO");
@@ -496,13 +715,17 @@ int parity(cudaStream_t s) {
     std::printf("  gate/up vs same-rounding reference: rms %.3e  worst row %.3e   (tol 1e-5, 1e-4)\n", grms, gworst);
     std::printf("  MMQ vs same-rounding reference: rms %.3e  worst row %.3e   (tol 2e-4, 1e-2)\n", es.rms, es.worst);
     std::printf("  MMQ vs double reference:        rms %.3e  worst row %.3e   (tol rms 2.5e-2)\n", ed.rms, ed.worst);
-    std::printf("  MMQ vs FP16 fallback:           rms %.3e  worst row %.3e   (tol rms %.3e)\n", ef.rms, ef.worst,
-                std::min(2.5e-2, ed.rms + fd.rms));
+    std::printf("  MMQ vs FP16 fallback:           rms %.3e  worst row %.3e   (tol rms 2e-2)\n", ef.rms, ef.worst);
     std::printf("  FP16 fallback vs double:        rms %.3e  worst row %.3e\n", fd.rms, fd.worst);
     std::printf("  grouped gather == per-expert gather (bitwise): %s; zero token exactly 0: %s\n",
                 same_gather ? "yes" : "NO", zero_ok ? "yes" : "NO");
-    const bool ok = grms <= 1e-5 && gworst <= 1e-4 && es.rms <= 2e-4 && es.worst <= 1e-2 && ed.rms <= 2.5e-2 &&
-                    ef.rms <= std::min(2.5e-2, ed.rms + fd.rms) && same_gather && zero_ok &&
+    // the group path, split every way, on this routing and on one with more hot experts
+    Layer Lb = route(T, E, rng, 5);
+    bool split_ok = split_equivalence("routing A (2 hot experts)", L, x_dev.as<float>(), blob, s);
+    split_ok &= split_equivalence("routing B (5 hot experts)", Lb, x_dev.as<float>(), blob, s);
+    const bool edge_ok = edge_activations(host, blob, s);
+    const bool ok = split_ok && edge_ok && fe.rms <= 0.2 && fm.rms <= 0.2 && grms <= 1e-5 && gworst <= 1e-4 && es.rms <= 2e-4 && es.worst <= 1e-2 && ed.rms <= 2.5e-2 &&
+                    ef.rms <= 2e-2 && same_gather && zero_ok &&
                     f4gu <= 1e-5 && f4dn.rms <= 1e-4 && indep;
     std::printf("parity: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

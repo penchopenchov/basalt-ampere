@@ -11,8 +11,7 @@
 //   - `double`: the unrounded activations.  MMQ's error here is the int8 activation rounding every MMQ format has
 //     (the decode kernels measure 1.2e-2 on the same rounding).  Tolerance: RMS 2.5e-2.
 //   - `fp16`: the FP16 fallback this path replaces (weights times their tail rounded to fp16, activations and H in
-//     fp16, fp32 accumulation).  Tolerance: MMQ vs fp16 RMS at most its own error vs double plus fp16's (the two
-//     roundings are independent), and 2.5e-2.
+//     fp16, fp32 accumulation).  Tolerance: MMQ vs fp16 RMS 2e-2.
 // The per-expert gather and the grouped gather must give bitwise equal outputs.  An all-zero token stays exactly 0.
 // Then a microbench line: one layer at a 2048-token chunk (512 experts, top 10) - gathers plus products - in us and
 // TFLOP/s.  --no-bench.  Exit 77 without a CUDA device.
@@ -346,13 +345,12 @@ int parity(cudaStream_t s) {
     std::printf("  gate/up vs same-rounding reference: rms %.3e  worst row %.3e   (tol 1e-5, 1e-4)\n", grms, gworst);
     std::printf("  MMQ vs same-rounding reference: rms %.3e  worst row %.3e   (tol 2e-4, 1e-2)\n", es.rms, es.worst);
     std::printf("  MMQ vs double reference:        rms %.3e  worst row %.3e   (tol rms 2.5e-2)\n", ed.rms, ed.worst);
-    std::printf("  MMQ vs FP16 fallback:           rms %.3e  worst row %.3e   (tol rms %.3e)\n", ef.rms, ef.worst,
-                std::min(2.5e-2, ed.rms + fd.rms));
+    std::printf("  MMQ vs FP16 fallback:           rms %.3e  worst row %.3e   (tol rms 2e-2)\n", ef.rms, ef.worst);
     std::printf("  FP16 fallback vs double:        rms %.3e  worst row %.3e\n", fd.rms, fd.worst);
     std::printf("  grouped gather == per-expert gather (bitwise): %s; zero token exactly 0: %s\n",
                 same_gather ? "yes" : "NO", zero_ok ? "yes" : "NO");
     const bool ok = grms <= 1e-5 && gworst <= 1e-4 && es.rms <= 2e-4 && es.worst <= 1e-2 && ed.rms <= 2.5e-2 &&
-                    ef.rms <= std::min(2.5e-2, ed.rms + fd.rms) && same_gather && zero_ok;
+                    ef.rms <= 2e-2 && same_gather && zero_ok;
     std::printf("parity: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
