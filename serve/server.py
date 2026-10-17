@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line,  # noqa: E402
-                          parse_settings, sampling_defaults_from_config)
+                          parse_settings, sampling_defaults_from_config, sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.flags import flag_index  # noqa: E402
@@ -128,10 +128,9 @@ def main() -> int:
     if not a.mock_engine:
         vision = None
         env = child_env(cfg)
-        sampling_defaults = sampling_defaults_from_config(cfg)
+        sampling_defaults = {**sampling_defaults_from_config(cfg), **a.sampling_launch}
         if sampling_defaults:
-            pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[server] sampling defaults: {pretty}", flush=True)
+            print(sampling_line(sampling_defaults, a.sampling_cli, set(a.sampling_launch) - a.sampling_cli), flush=True)
         lazy = a.lazy
         if lazy and cfg.get("vision"):
             print("[server] warning: lazy loading is text-only, vision off", flush=True)
@@ -167,7 +166,7 @@ def main() -> int:
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
-            "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, {}
+            "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
     # the model's exported template, else the bundled one
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),

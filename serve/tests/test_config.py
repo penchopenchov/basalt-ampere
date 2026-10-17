@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from serve.config import build_parser, check_engine_flags, engine_flags_of, engine_line, load_config_file, parallel_count, parse_settings, server_options, split_engine_extras  # noqa: E402
+from serve.config import build_parser, check_engine_flags, engine_flags_of, engine_line, load_config_file, parallel_count, parse_settings, SAMPLING_KEYS, sampling_defaults_from_config, sampling_line, server_options, split_engine_extras  # noqa: E402
 from serve.engine.flags import flag_value  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
 
@@ -195,6 +195,54 @@ class Precedence(unittest.TestCase):
         self.assertEqual(engine_line([], []), "[server] engine: config sets nothing, built-in defaults")
 
 
+class SamplingOptions(unittest.TestCase):
+    """The sampling keys are server options: consumed here, never passed to the engine."""
+
+    def test_command_line_values(self):
+        a, _, _, cli_words = parse(["--temperature", "0.8", "--top-k", "20", "--top-p=0.95", "--min-p", "0.05",
+                                    "--presence-penalty", "0.5", "--frequency-penalty", "0.1",
+                                    "--repetition-penalty", "1.1", "--penalty-last-n", "128", "--seed", "7"])
+        self.assertEqual(a.sampling_launch, {"temperature": 0.8, "top_k": 20, "top_p": 0.95, "min_p": 0.05,
+                                             "presence_penalty": 0.5, "frequency_penalty": 0.1,
+                                             "repetition_penalty": 1.1, "penalty_last_n": 128, "seed": 7})
+        self.assertIsInstance(a.sampling_launch["top_k"], int)
+        self.assertEqual(cli_words, [])
+
+    def test_none_given_sets_nothing(self):
+        self.assertEqual(parse([])[0].sampling_launch, {})
+
+    def test_config_server_section_and_command_line_wins(self):
+        cfg = {"server": {"temperature": 0.3, "top-k": 10, "min_p": 0.1}}
+        a, _, file_words, cli_words = parse([], cfg)
+        self.assertEqual(a.sampling_launch, {"temperature": 0.3, "top_k": 10, "min_p": 0.1})
+        self.assertEqual((file_words, cli_words), ([], []))
+        a = parse(["--temperature", "0.9"], cfg)[0]
+        self.assertEqual(a.sampling_launch, {"temperature": 0.9, "top_k": 10, "min_p": 0.1})
+        self.assertEqual(a.sampling_cli, {"temperature"})
+
+    def test_under_engine_in_the_config_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "a server option"):
+            parse([], {"engine": {"temperature": 0.5}})
+
+    def test_bad_values(self):
+        for flag, bad in (("--temperature", "-1"), ("--temperature", "hot"), ("--temperature", "nan"),
+                          ("--top-p", "0"), ("--top-p", "1.5"), ("--min-p", "2"), ("--top-k", "0"),
+                          ("--top-k", "65"), ("--top-k", "2.5"), ("--presence-penalty", "-1"),
+                          ("--repetition-penalty", "0"), ("--penalty-last-n", "-1"), ("--seed", "0")):
+            with self.assertRaises(SystemExit, msg=(flag, bad)):
+                parse([flag, bad])
+        with self.assertRaises(SystemExit):
+            parse([], {"server": {"top_k": 100}})
+
+    def test_the_model_file_check_is_the_same(self):
+        with self.assertRaisesRegex(SystemExit, "sampling.top_k=100"):
+            sampling_defaults_from_config({"sampling": {"top_k": 100}})
+
+    def test_startup_line_marks_the_source(self):
+        self.assertEqual(sampling_line({"temperature": 0.8, "top_k": 20, "top_p": 0.9}, {"temperature"}, {"top_k"}),
+                         "[server] sampling defaults: temperature=0.8 (command line), top_k=20 (config), top_p=0.9")
+
+
 class SlotContext(unittest.TestCase):
     """--max-context is shared by the --parallel slots unless --slot-full-context."""
 
@@ -244,6 +292,8 @@ class EveryOption(unittest.TestCase):
             return 7
         if act.type is float:
             return 0.25
+        if act.dest in SAMPLING_KEYS:                      # the model file's checks apply
+            return 0.5 if SAMPLING_KEYS[act.dest][0] is float else 7
         return "/x" if act.dest in ("model", "tokenizer") else "x"
 
     def test_every_server_option_by_both_paths(self):

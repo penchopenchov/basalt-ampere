@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -140,6 +141,8 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
     if a_cli.config:
         file_argv, file_words = load_config_file(a_cli.config, ap)
     a = ap.parse_known_args(file_argv + cli)[0]
+    a.sampling_launch = {k: getattr(a, k) for k in SAMPLING_KEYS if getattr(a, k) is not None}
+    a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
     if a.vision == "":                                     # a bare --vision
         ap.error(VISION_USAGE)
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
@@ -205,6 +208,28 @@ def engine_line(file_words: list[str], cli_words: list[str], config: bool = True
     return f"[server] engine: built-in defaults (no --config): {state}" + (f"; {shown}" if shown else "")
 
 
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _whole(v):
+    return _num(v) and v == int(v)
+
+
+# sampling key -> (converter, test, what is expected); the model file and the launch options share it
+SAMPLING_KEYS = {
+    "temperature": (float, lambda v: _num(v) and v >= 0, "a number >= 0 (0 = greedy)"),
+    "top_p": (float, lambda v: _num(v) and 0 < v <= 1, "0 < top_p <= 1"),
+    "min_p": (float, lambda v: _num(v) and 0 <= v <= 1, "0 <= min_p <= 1"),
+    "top_k": (int, lambda v: _whole(v) and 1 <= v <= 64, "an integer 1..64"),
+    "presence_penalty": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
+    "frequency_penalty": (float, lambda v: _num(v) and v >= 0, "a number >= 0"),
+    "repetition_penalty": (float, lambda v: _num(v) and v > 0, "a number > 0 (1 = off)"),
+    "penalty_last_n": (int, lambda v: _whole(v) and v >= 0, "a non-negative integer"),
+    "seed": (int, lambda v: _whole(v) and v > 0, "a positive integer"),
+}
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The model file's `sampling` block: defaults for fields a request omits (temperature, top_p, top_k, min_p,
     presence/repetition/frequency penalties, penalty_last_n, seed). Request fields win; a bad value refuses to
@@ -213,51 +238,43 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     for key, value in (cfg.get("sampling") or {}).items():
         if value is None:
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
-        if key == "temperature":
-            if not number or value < 0:
-                raise SystemExit(f"[server] error: sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
-            out[key] = float(value)
-        elif key == "top_p":
-            if not number or not 0 < value <= 1:
-                raise SystemExit(f"[server] error: sampling.top_p={value!r}: expected 0 < top_p <= 1")
-            out[key] = float(value)
-        elif key == "min_p":
-            if not number or not 0 <= value <= 1:
-                raise SystemExit(f"[server] error: sampling.min_p={value!r}: expected 0 <= min_p <= 1")
-            out[key] = float(value)
-        elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[server] error: sampling.top_k={value!r}: the sampled path takes an integer 1..64")
-            out[key] = int(value)
-        elif key == "presence_penalty":
-            if not number or value < 0:
-                raise SystemExit(f"[server] error: sampling.presence_penalty={value!r}: expected a number >= 0")
-            out[key] = float(value)
-        elif key == "frequency_penalty":
-            if not number or value < 0:
-                raise SystemExit(f"[server] error: sampling.frequency_penalty={value!r}: expected a number >= 0")
-            out[key] = float(value)
-        elif key == "repetition_penalty":
-            if not number or value <= 0:
-                raise SystemExit(f"[server] error: sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
-            out[key] = float(value)
-        elif key == "penalty_last_n":
-            if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[server] error: sampling.penalty_last_n={value!r}: expected a non-negative integer")
-            out[key] = int(value)
-        elif key == "seed":
-            if not number or value != int(value) or value <= 0:
-                raise SystemExit(f"[server] error: sampling.seed={value!r}: expected a positive integer")
-            out[key] = int(value)
+        if key in SAMPLING_KEYS:
+            convert, ok, expected = SAMPLING_KEYS[key]
+            if not ok(value):
+                raise SystemExit(f"[server] error: sampling.{key}={value!r}: expected {expected}")
+            out[key] = convert(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
-                raise SystemExit(f"[server] error: sampling.experimental_speed_projection={value!r}: expected true or "
+                raise SystemExit(f"[server] error: sampling.{key}={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
             out[key] = value
         else:
             print(f"[server] warning: sampling.{key} is not a known key, ignored", flush=True)
     return out
+
+
+def sampling_option(key: str):
+    """argparse type for the launch option of one sampling key: the model file's check on the typed value."""
+    convert, ok, expected = SAMPLING_KEYS[key]
+
+    def parse(text: str):
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"expected {expected}, not {text!r}") from None
+        if not ok(value):
+            raise argparse.ArgumentTypeError(f"expected {expected}, not {text!r}")
+        return convert(value)
+    return parse
+
+
+def sampling_line(effective: dict, cli: set[str], config: set[str]) -> str:
+    """The startup line for the effective sampling defaults, each marked with where it came from: the keys in
+    `cli` were typed on the command line, those in `config` come from the config file; the rest are the model
+    file's."""
+    mark = lambda k: " (command line)" if k in cli else " (config)" if k in config else ""
+    shown = ", ".join(f"{k}={v}{mark(k)}" for k, v in effective.items())
+    return f"[server] sampling defaults: {shown}"
 
 
 def vision_setting(text: str) -> str:
@@ -332,6 +349,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lazy", action="store_true", help="start the text-only API unloaded; load on first request")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests; the next request loads it again")
+    for key, text in (
+            ("temperature", "0 = greedy; higher is more random"),
+            ("top-p", "nucleus cutoff, 0 < value <= 1 (1 = off)"),
+            ("top-k", "keep the K likeliest tokens, 1..64"),
+            ("min-p", "drop tokens less likely than this times the likeliest, 0..1 (0 = off)"),
+            ("presence-penalty", "flat penalty on a token seen in the window, >= 0"),
+            ("frequency-penalty", "penalty growing with how often a token was seen, >= 0"),
+            ("repetition-penalty", "multiplicative penalty on seen tokens, > 0 (1 = off)"),
+            ("penalty-last-n", "the window the penalties look back over, in tokens"),
+            ("seed", "fix the random draw, a positive integer")):
+        ap.add_argument(f"--{key}", type=sampling_option(key.replace("-", "_")), metavar="N", default=None,
+                        help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503")
     return ap
