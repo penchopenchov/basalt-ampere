@@ -7,6 +7,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <atomic>
 #include <cmath>
 
 #include <cstdio>
@@ -767,18 +768,18 @@ __global__ void __launch_bounds__(THREADS, 2) prompt_attn_i8_kernel(const float*
 
 bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs this on several)
+    static std::atomic<bool> attr[64];   // the shared-memory opt-in is per device (a layer split runs this on several)
     int dev = 0;
     cudaGetDevice(&dev);
     const int bytes = (int) sizeof(Smem3);
     if (dev < 0 || dev >= 64) return false;
-    if (!attr[dev]) {
+    if (!attr[dev].load(std::memory_order_acquire)) {
         if (cudaFuncSetAttribute(prompt_attn_i8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess) {
             cudaGetLastError();
             return false;
         }
-        attr[dev] = true;
+        attr[dev].store(true, std::memory_order_release);
     }
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
@@ -798,18 +799,18 @@ bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
 template <int KV_MODE>
 bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
             const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    static bool attr[64] = {};   // per device, as above
+    static std::atomic<bool> attr[64];   // per device, as above
     int dev = 0;
     cudaGetDevice(&dev);
     const int bytes = (int) sizeof(Smem<KV_MODE>);
     if (dev < 0 || dev >= 64) return false;
-    if (!attr[dev]) {
+    if (!attr[dev].load(std::memory_order_acquire)) {
         if (cudaFuncSetAttribute(prompt_attn_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess) {
             cudaGetLastError();
             return false;
         }
-        attr[dev] = true;
+        attr[dev].store(true, std::memory_order_release);
     }
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {

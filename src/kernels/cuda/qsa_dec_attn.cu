@@ -4,10 +4,12 @@
 #include "basalt/kernels/kv_q8.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
+#include "smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -723,13 +725,12 @@ int kv_mode_of(const QsaAttnPools& p) {
 }
 // the dynamic shared memory opt-in, once per device
 template <int MODE> void opt_in(void (*kernel)(AttnArgs), size_t bytes) {
-    static bool done[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
-    if (!done[dev]) {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes);
-        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-        done[dev] = true;
+    static std::atomic<bool> done[64];
+    const int dev = opt_in_device("qsa_dec_attn");
+    if (!done[dev].load(std::memory_order_acquire)) {
+        opt_in_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes), "qsa_dec_attn");
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);   // a hint
+        done[dev].store(true, std::memory_order_release);
     }
 }
 
@@ -764,13 +765,13 @@ void qsa_dec_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids,
     if (mode == 1 && n_q == 1 && cap >= 8192) {   // the draft layer's wide window (verify's cap is a few thousand cells)
         a.chunk = 0;
         constexpr size_t bytes = sizeof(DSmem);
-        static bool done[64] = {};
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
-        if (!done[dev]) {
-            cudaFuncSetAttribute(draft_attn_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes);
-            cudaFuncSetAttribute(draft_attn_chunk, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-            done[dev] = true;
+        static std::atomic<bool> done[64];
+        const int dev = opt_in_device("draft_attn");
+        if (!done[dev].load(std::memory_order_acquire)) {
+            opt_in_check(cudaFuncSetAttribute(draft_attn_chunk, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes),
+                         "draft_attn");
+            cudaFuncSetAttribute(draft_attn_chunk, cudaFuncAttributePreferredSharedMemoryCarveout, 100);   // a hint
+            done[dev].store(true, std::memory_order_release);
         }
         launch_pdl(draft_attn_chunk, dim3((unsigned) a.n_chunks, (unsigned) s.n_head_kv, 1u), dim3(DTHREADS), bytes, st, a);
     } else if (mode == 1) {

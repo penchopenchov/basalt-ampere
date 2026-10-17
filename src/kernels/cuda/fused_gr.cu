@@ -3,10 +3,12 @@
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
+#include "smem_opt_in.cuh"
 
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -568,53 +570,58 @@ void launch_staged(int depth, const GrMulti& c, dim3 grid, size_t smem, cudaStre
     else launch_pdl(gr_down_staged_kernel<MT>, grid, block, smem, st, c);
 }
 
+// A failed opt-in is fatal on a card that reports one; a card that reports none is sliced by capacity instead.
+template <typename K>
+void gr_opt_in(K kernel, int bytes, int optin) {
+    const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    if (optin > 0) opt_in_check(e, "fused_gr");
+}
+
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
 // stages n_tok * TILEV floats (1280 with a small opt-in, 2560 otherwise), staged two tiles of n_tok * H_TILE.  The shared-memory
 // opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
 int down_chunk(bool staged, int* tile_out) {
-    static bool attr[64] = {};
+    static std::atomic<bool> attr[64];
     static int chunk[64] = {};   // tokens the plain down kernel may carry in one launch on this card
     static int chunk_staged[64] = {};  // the same for staged
     static int tile[64] = {};    // the plain down kernel's TILEV on this card (1280 with a small opt-in, 2560 otherwise)
-    int dev = 0;
-    cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64) {
-        *tile_out = 2560;
-        return kFusedGrMaxT;
-    }
-    if (!attr[dev]) {
-        int optin = 0;
-        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-        // the down kernel stages n_tok*TILEV floats of dynamic shared memory, 80 KB at the full 8 tokens.  A card
-        // whose opt-in is below that (or that reports none) slices the tokens; the down kernel's outputs (lo,
-        // inject_out) are strictly per-token, so the chunk boundaries are safe, and the up kernel below still sees
-        // every token of the batch in one launch.
-        const int tv = 2560;
-        tile[dev] = tv;
-        int want = (int) (kFusedGrMaxT * tv * sizeof(float));
-        if (optin > 0 && want > optin) want = optin;
-        cudaFuncSetAttribute(gr_down_multi_kernel<2560>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-        int want_staged = (int) (2 * kFusedGrMaxT * H_TILE * sizeof(float));
-        if (optin > 0 && want_staged > optin) want_staged = optin;
-        cudaFuncSetAttribute(gr_down_staged_kernel<>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_deep_kernel<kFusedGrMaxT, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_deep_kernel<kFusedGrMaxT, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_deep_kernel<kFusedGrMaxT, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_deep_kernel<kFusedGrMaxT, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaFuncSetAttribute(gr_down_staged_deep_kernel<6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, want_staged);
-        cudaGetLastError();      // drop any error the attempt left behind
-        int per_block = 0;
-        cudaDeviceGetAttribute(&per_block, cudaDevAttrMaxSharedMemoryPerBlock, dev);
-        const int usable = optin > 0 ? optin : per_block;
-        const int capacity = usable / (int) (tv * sizeof(float));
-        chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
-        const int capacity_staged = usable / (int) (2 * H_TILE * sizeof(float));
-        chunk_staged[dev] = capacity_staged < 1 ? 1 : (capacity_staged > kFusedGrMaxT ? kFusedGrMaxT : capacity_staged);
-        attr[dev] = true;
+    const int dev = opt_in_device("fused_gr");
+    if (!attr[dev].load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(opt_in_mutex());
+        if (!attr[dev].load(std::memory_order_relaxed)) {
+            int optin = 0;
+            cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+            // the down kernel stages n_tok*TILEV floats of dynamic shared memory, 80 KB at the full 8 tokens.  A card
+            // whose opt-in is below that (or that reports none) slices the tokens; the down kernel's outputs (lo,
+            // inject_out) are strictly per-token, so the chunk boundaries are safe, and the up kernel below still sees
+            // every token of the batch in one launch.
+            const int tv = 2560;
+            tile[dev] = tv;
+            int want = (int) (kFusedGrMaxT * tv * sizeof(float));
+            if (optin > 0 && want > optin) want = optin;
+            gr_opt_in(gr_down_multi_kernel<2560>, want, optin);
+            int want_staged = (int) (2 * kFusedGrMaxT * H_TILE * sizeof(float));
+            if (optin > 0 && want_staged > optin) want_staged = optin;
+            gr_opt_in(gr_down_staged_kernel<>, want_staged, optin);
+            gr_opt_in(gr_down_staged_deep_kernel<kFusedGrMaxT, 2>, want_staged, optin);
+            gr_opt_in(gr_down_staged_deep_kernel<kFusedGrMaxT, 3>, want_staged, optin);
+            gr_opt_in(gr_down_staged_deep_kernel<kFusedGrMaxT, 4>, want_staged, optin);
+            gr_opt_in(gr_down_staged_deep_kernel<kFusedGrMaxT, 5>, want_staged, optin);
+            gr_opt_in(gr_down_staged_kernel<6>, want_staged, optin);
+            gr_opt_in(gr_down_staged_deep_kernel<6, 2>, want_staged, optin);
+            gr_opt_in(gr_down_staged_deep_kernel<6, 3>, want_staged, optin);
+            gr_opt_in(gr_down_staged_deep_kernel<6, 4>, want_staged, optin);
+            gr_opt_in(gr_down_staged_deep_kernel<6, 5>, want_staged, optin);
+            cudaGetLastError();      // drop any error of a card that reports no opt-in
+            int per_block = 0;
+            cudaDeviceGetAttribute(&per_block, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+            const int usable = optin > 0 ? optin : per_block;
+            const int capacity = usable / (int) (tv * sizeof(float));
+            chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
+            const int capacity_staged = usable / (int) (2 * H_TILE * sizeof(float));
+            chunk_staged[dev] = capacity_staged < 1 ? 1 : (capacity_staged > kFusedGrMaxT ? kFusedGrMaxT : capacity_staged);
+            attr[dev].store(true, std::memory_order_release);
+        }
     }
     *tile_out = tile[dev] ? tile[dev] : 2560;
     return staged ? chunk_staged[dev] : chunk[dev];

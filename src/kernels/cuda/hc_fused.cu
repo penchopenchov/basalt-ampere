@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -1128,7 +1129,8 @@ bool hc_fused_q8_rows_ok() { return true; }
 namespace {
 
 struct DevInfo {
-    bool checked = false, ok = false;
+    std::atomic<bool> checked{false};
+    bool ok = false;
     int sms = 0;
     float* t10 = nullptr;                 // [NE] fixed logits for the top-10's dry run, then [sms][2 * KT] float scratch
     unsigned long long* lg = nullptr;     // [NSLOT][MAXT][NE] tagged router logits (zero: no tag)
@@ -1136,6 +1138,7 @@ struct DevInfo {
 };
 constexpr size_t CN_SLOT = (size_t) CN_PART + CN_SSN;
 DevInfo g_dev[16];
+std::mutex g_dev_mu;
 
 const DevInfo& dev_info() {
     int dev = 0;
@@ -1145,27 +1148,30 @@ const DevInfo& dev_info() {
         return none;
     }
     DevInfo& d = g_dev[dev];
-    if (!d.checked) {
-        int major = 0, sms = 0, optin = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-        d.sms = sms;
-        d.ok = major == 12 && sms - CN_ND >= CN_MIN_NU && optin >= SMEM + 1024 &&
-               cudaMalloc((void**) &d.t10, ((size_t) NE + (size_t) sms * 2 * KT) * 4) == cudaSuccess &&
-               cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess &&
-               cudaMalloc((void**) &d.lg, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&
-               cudaMemset(d.lg, 0, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess;
-        if (d.ok) {   // distinct logits with a few ties, so the dry run takes the usual path
-            std::vector<float> f(NE);
-            for (int e = 0; e < NE; ++e) f[e] = (float) (((e * 389) % NE) / 64.0 - 4.0 + (e % 97 == 0 ? 0.0 : 0.001));
-            d.ok = cudaMemcpy(d.t10, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!d.checked.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(g_dev_mu);
+        if (!d.checked.load(std::memory_order_relaxed)) {
+            int major = 0, sms = 0, optin = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+            d.sms = sms;
+            d.ok = major == 12 && sms - CN_ND >= CN_MIN_NU && optin >= SMEM + 1024 &&
+                   cudaMalloc((void**) &d.t10, ((size_t) NE + (size_t) sms * 2 * KT) * 4) == cudaSuccess &&
+                   cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess &&
+                   cudaMalloc((void**) &d.lg, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&
+                   cudaMemset(d.lg, 0, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess;
+            if (d.ok) {   // distinct logits with a few ties, so the dry run takes the usual path
+                std::vector<float> f(NE);
+                for (int e = 0; e < NE; ++e) f[e] = (float) (((e * 389) % NE) / 64.0 - 4.0 + (e % 97 == 0 ? 0.0 : 0.001));
+                d.ok = cudaMemcpy(d.t10, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+            }
+            for (int t = 0; t < MAXT && d.ok; ++t)
+                d.ok = cudaFuncSetAttribute(kKernels[0][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess &&
+                       cudaFuncSetAttribute(kKernels[1][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
+            cudaGetLastError();
+            d.checked.store(true, std::memory_order_release);
         }
-        for (int t = 0; t < MAXT && d.ok; ++t)
-            d.ok = cudaFuncSetAttribute(kKernels[0][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess &&
-                   cudaFuncSetAttribute(kKernels[1][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
-        cudaGetLastError();
-        d.checked = true;
     }
     return d;
 }

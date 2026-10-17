@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -1041,17 +1042,17 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         }
         if (cc_major[dev] < 8) return false;
     }
-    static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs it on several)
+    static std::atomic<bool> attr[64];   // the shared-memory opt-in is per device (a layer split runs it on several)
     int adev = 0;
     cudaGetDevice(&adev);
     const int bytes = (TC_QT * TC_QS + TC_NB * TC_KS) * (int) sizeof(float);
-    if (!attr[adev]) {
+    if (!attr[adev].load(std::memory_order_acquire)) {
         if (cudaFuncSetAttribute(block_scores_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess) {
             cudaGetLastError();
             return false;
         }
-        attr[adev] = true;
+        attr[adev].store(true, std::memory_order_release);
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t per = (int64_t) TC_NB * TC_ITER;
