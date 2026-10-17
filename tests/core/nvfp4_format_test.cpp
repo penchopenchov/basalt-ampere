@@ -35,8 +35,9 @@ void check(bool ok, const char* what) {
 }
 
 // E4M3 without sign, bias 7: subnormal m/8 * 2^-6, normal (1 + m/8) * 2^(e-7); 0x7F is NaN (decoded as 0, as
-// ggml does). Bit 7 is ignored.
+// ggml does). Bit 7 is ignored, so 0xFF is NaN as well.
 double spec_ue4m3(uint8_t x) {
+    x &= 0x7F;
     const int e = (x >> 3) & 0xF, m = x & 7;
     if (x == 0x7F) return 0.0;
     return e == 0 ? m / 8.0 * std::ldexp(1.0, -6) : (1.0 + m / 8.0) * std::ldexp(1.0, e - 7);
@@ -62,6 +63,18 @@ void exhaustive() {
     for (int x = 0; x < 256; ++x)
         if ((double)basalt::ue4m3_to_fp32_half((uint8_t)x) * 2.0 != spec_ue4m3((uint8_t)x)) ++bad;
     check(bad == 0, "UE4M3 decode differs from the bit-field formula");
+    check(basalt::ue4m3_to_fp32_half(0xFF) == 0.0f && basalt::ue4m3_to_fp32_half(0x7F) == 0.0f, "scale byte 0xFF is not decoded as 0 like 0x7F");
+    const ggml_type_traits* t = ggml_get_type_traits(GGML_TYPE_NVFP4);
+    if (t != nullptr) {
+        uint8_t blk[BLK] = {};
+        float y[64];
+        std::memset(blk + 4, 0x11, 32);
+        for (int s = 0; s < 4; ++s) blk[s] = 0xFF;
+        t->to_float(blk, y, 64);
+        bool zero = true;
+        for (float v : y) zero = zero && v == 0.0f;
+        check(zero, "ggml's row dequantizer decodes scale byte 0xFF as nonzero");
+    }
     bad = 0;
     for (int c = 0; c < 16; ++c)
         if (basalt::kvalues_fp4[c] != spec_e2m1(c) * 2.0) ++bad;

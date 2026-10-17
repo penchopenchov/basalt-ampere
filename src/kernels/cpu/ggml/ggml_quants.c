@@ -1129,8 +1129,10 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
     }
 }
 
-// UE4M3 scale as ggml decodes it: half the value (kvalues_fp4 is doubled), 0x7F (NaN) as 0, bit 7 ignored.
+// UE4M3 scale as ggml decodes it: half the value (kvalues_fp4 is doubled), 0x7F (NaN) as 0, bit 7 ignored (so 0xFF
+// is NaN too, as in the SIMD and CUDA decoders).
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {
+    x &= 0x7F;
     if (x == 0 || x == 0x7F) return 0.0f;
     const int exp = (x >> 3) & 0xF, man = x & 0x7;
     const float raw = exp == 0 ? ldexpf((float) man, -9) : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
