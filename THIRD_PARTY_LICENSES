@@ -110,9 +110,15 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================================
-Infernix (https://github.com/Wallawalla47/Infernix), grouped NVFP4 expert GEMM, in src/prefill/fp4/moe_fp4.cu
-By Ian Ranson and the Infernix contributors. Apache License 2.0.
+Infernix (https://github.com/Wallawalla47/Infernix), Apache License 2.0
+By Ian Ranson and the Infernix contributors.
 ================================================================================
+
+The grouped NVFP4 expert GEMM in src/prefill/fp4/moe_fp4.cu adapts code from Infernix.
+
+The int8 prompt-attention kernel adapts ideas and code from Infernix (src/ops/qsa/qsa_prompt.cu): the
+per-warp 16-cell tiles with one merge, the k-step query ordering, and the exact int8 widening to FP16.
+Licensed under the Apache License, Version 2.0, reproduced below.
 
                                  Apache License
                            Version 2.0, January 2004
