@@ -101,6 +101,52 @@ void q8_round(const float* x, float* y, int n) {
 }
 float f16(float v) { return ggml_fp16_to_fp32(ggml_fp32_to_fp16(v)); }
 
+// the FP4 activation rounding (quantize_kernel in moe_fp4.cu): token scale g = amax / (6 * 448), per 16 values a UE4M3
+// scale of block amax / (6 g), codes rounded to nearest even on x / (scale * g)
+float e4m3_round(float v) {
+    static float tab[127];
+    static bool init = false;
+    if (!init) {
+        for (int c = 0; c < 127; ++c) {
+            const int e = c >> 3, m = c & 7;
+            tab[c] = e == 0 ? std::ldexp((float) m, -9) : std::ldexp(1.0f + m / 8.0f, e - 7);
+        }
+        init = true;
+    }
+    if (!(v > 0.0f)) return 0.0f;
+    if (v >= 448.0f) return 448.0f;
+    int lo = 0, hi = 126;   // the largest code at or below v
+    while (hi > lo) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (tab[mid] <= v) lo = mid; else hi = mid - 1;
+    }
+    if (lo == 126) return tab[lo];
+    const float a = tab[lo], b = tab[lo + 1], mid = 0.5f * (a + b);
+    return v < mid ? a : v > mid ? b : (lo & 1 ? b : a);
+}
+float e2m1_round(float v) {
+    static const float val[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float a = std::fabs(v);
+    int c = 7;
+    for (int i = 0; i < 7; ++i) {
+        const float mid = 0.5f * (val[i] + val[i + 1]);
+        if (a < mid || (a == mid && (i & 1) == 0)) { c = i; break; }   // a tie goes to the even code
+    }
+    return v < 0 ? -val[c] : val[c];
+}
+void a4_round(const float* x, float* y, int n) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) amax = std::max(amax, std::fabs(x[i]));
+    const float g = amax * (1.0f / (6.0f * 448.0f)), inv_g = amax > 0.0f ? 1.0f / g : 0.0f;
+    for (int b = 0; b < n; b += 16) {
+        float bm = 0.0f;
+        for (int j = 0; j < 16; ++j) bm = std::max(bm, std::fabs(x[b + j]));
+        const float sd = e4m3_round(bm * inv_g * (1.0f / 6.0f));
+        const float inv = sd > 0.0f ? 1.0f / (sd * g) : 0.0f;
+        for (int j = 0; j < 16; ++j) y[b + j] = e2m1_round(x[b + j] * inv) * sd * g;
+    }
+}
+
 struct Err {
     double rms = 0, worst = 0;
 };
@@ -316,7 +362,7 @@ int parity(cudaStream_t s) {
 
     // the references, an expert at a time on all cores
     std::vector<float> r_same((size_t) rows * N), r_dbl((size_t) rows * N), r_f16((size_t) rows * N),
-                       r_gu((size_t) rows * 1280);
+                       r_gu((size_t) rows * 1280), r_gu4((size_t) rows * 1280), r_dn4((size_t) rows * N);
     const auto* tr = ggml_get_type_traits(GGML_TYPE_NVFP4);
     parallel(E, [&](int e) {
         if (L.cnt[(size_t) e] == 0) return;
@@ -327,17 +373,18 @@ int parity(cudaStream_t s) {
         std::vector<float> wgu16(wgu.size()), wd16(wd.size());
         for (size_t i = 0; i < wgu.size(); ++i) wgu16[i] = f16(wgu[i] * (i < (size_t) FF * N ? sg : su));
         for (size_t i = 0; i < wd.size(); ++i) wd16[i] = f16(wd[i] * sd);
-        std::vector<float> xr(N), x16(N), h(FF), hr(FF), hd(FF), h16(FF);
+        std::vector<float> xr(N), x16(N), h(FF), hr(FF), hd(FF), h16(FF), x4(N), h4(FF), h4r(FF);
         for (int32_t p = L.off[(size_t) e]; p < L.off[(size_t) e + 1]; ++p) {
             const float* xt = x.data() + (size_t) L.src[(size_t) p] * N;
             q8_round(xt, xr.data(), N);
+            a4_round(xt, x4.data(), N);
             for (int c = 0; c < N; ++c) x16[(size_t) c] = f16(xt[c]);
             for (int k = 0; k < FF; ++k) {
                 const float* wg = wgu.data() + (size_t) k * N;
                 const float* wu = wgu.data() + (size_t) (FF + k) * N;
                 const float* wg16 = wgu16.data() + (size_t) k * N;
                 const float* wu16 = wgu16.data() + (size_t) (FF + k) * N;
-                double g = 0, u = 0, gd = 0, ud = 0, g16 = 0, u16 = 0;
+                double g = 0, u = 0, gd = 0, ud = 0, g16 = 0, u16 = 0, g4 = 0, u4 = 0;
                 for (int c = 0; c < N; ++c) {
                     g += (double) wg[c] * xr[(size_t) c];
                     u += (double) wu[c] * xr[(size_t) c];
@@ -345,15 +392,28 @@ int parity(cudaStream_t s) {
                     ud += (double) wu[c] * xt[c];
                     g16 += (double) wg16[c] * x16[(size_t) c];
                     u16 += (double) wu16[c] * x16[(size_t) c];
+                    g4 += (double) wg[c] * x4[(size_t) c];
+                    u4 += (double) wu[c] * x4[(size_t) c];
                 }
                 r_gu[(size_t) p * 1280 + k] = (float) g;
                 r_gu[(size_t) p * 1280 + FF + k] = (float) u;
+                r_gu4[(size_t) p * 1280 + k] = (float) g4;
+                r_gu4[(size_t) p * 1280 + FF + k] = (float) u4;
+                g4 *= sg; u4 *= su;
+                h4[(size_t) k] = (float) (g4 / (1.0 + std::exp(-g4)) * u4 * sd);
                 g *= sg; u *= su; gd *= sg; ud *= su;
                 h[(size_t) k] = (float) (g / (1.0 + std::exp(-g)) * u * sd);   // MMQ's H carries s_down
                 hd[(size_t) k] = (float) (gd / (1.0 + std::exp(-gd)) * ud);
                 h16[(size_t) k] = f16((float) (g16 / (1.0 + std::exp(-g16)) * u16));
             }
             q8_round(h.data(), hr.data(), FF);
+            a4_round(h4.data(), h4r.data(), FF);
+            for (int o = 0; o < N; ++o) {
+                const float* w = wd.data() + (size_t) o * FF;
+                double a = 0;
+                for (int k = 0; k < FF; ++k) a += (double) w[k] * h4r[(size_t) k];
+                r_dn4[(size_t) p * N + o] = (float) a;
+            }
             float* ys = r_same.data() + (size_t) p * N;
             float* yd = r_dbl.data() + (size_t) p * N;
             float* yf = r_f16.data() + (size_t) p * N;
@@ -402,6 +462,33 @@ int parity(cudaStream_t s) {
         std::printf("  FP4 gate/up vs MMQ-rounding reference: rms %.3e worst row %.3e;  FP4 vs double: rms %.3e worst row %.3e\n",
                     std::sqrt(e2 / r2), w, fe.rms, fe.worst);
     }
+    // the FP4 path against the same A4 roundings in double (only fp32 accumulation order and rounding ties differ),
+    // and its output for a token must not depend on the token's tile or its neighbours: every expert's rows reversed
+    double a2 = 0, b2 = 0;
+    for (size_t i = 0; i < (size_t) rows * 1280; ++i) {
+        const double d = (double) fgu[i] - r_gu4[i];
+        a2 += d * d; b2 += (double) r_gu4[i] * r_gu4[i];
+    }
+    const double f4gu = b2 > 0 ? std::sqrt(a2 / b2) : 0;
+    const Err f4dn = compare(fy, r_dn4, (size_t) rows);
+    bool indep = true;
+    {
+        Layer L2 = L;
+        for (int e = 0; e < E; ++e) std::reverse(L2.src.begin() + L.off[(size_t) e], L2.src.begin() + L.off[(size_t) e + 1]);
+        Dev src2((size_t) rows * 4);
+        ck(cudaMemcpy(src2.p, L2.src.data(), L2.src.size() * 4, cudaMemcpyHostToDevice), "src2");
+        ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+        run_fp4(f4, b, L2, x_dev.as<float>(), src2.as<int32_t>(), blob, s);
+        ck(cudaStreamSynchronize(s), "sync fp4 reversed");
+        const std::vector<float> ry = download(b.dm, (size_t) rows * N);
+        for (int e = 0; e < E; ++e)
+            for (int i = 0; i < L.cnt[(size_t) e]; ++i)
+                indep &= std::memcmp(fy.data() + (size_t) (L.off[(size_t) e] + i) * N,
+                                     ry.data() + (size_t) (L.off[(size_t) e] + L.cnt[(size_t) e] - 1 - i) * N, N * 4) == 0;
+    }
+    std::printf("  FP4 gate/up vs A4-rounding reference: rms %.3e (tol 1e-5)\n", f4gu);
+    std::printf("  FP4 down vs A4-rounding reference:    rms %.3e worst row %.3e (tol rms 1e-4)\n", f4dn.rms, f4dn.worst);
+    std::printf("  FP4 output independent of tile position and neighbours (bitwise): %s\n", indep ? "yes" : "NO");
     bool zero_ok = true;
     for (int64_t p = 0; p < rows; ++p)
         if (L.src[(size_t) p] == ZERO)
@@ -415,7 +502,8 @@ int parity(cudaStream_t s) {
     std::printf("  grouped gather == per-expert gather (bitwise): %s; zero token exactly 0: %s\n",
                 same_gather ? "yes" : "NO", zero_ok ? "yes" : "NO");
     const bool ok = grms <= 1e-5 && gworst <= 1e-4 && es.rms <= 2e-4 && es.worst <= 1e-2 && ed.rms <= 2.5e-2 &&
-                    ef.rms <= std::min(2.5e-2, ed.rms + fd.rms) && same_gather && zero_ok;
+                    ef.rms <= std::min(2.5e-2, ed.rms + fd.rms) && same_gather && zero_ok &&
+                    f4gu <= 1e-5 && f4dn.rms <= 1e-4 && indep;
     std::printf("parity: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
