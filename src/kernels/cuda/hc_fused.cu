@@ -1211,6 +1211,33 @@ std::mutex g_hc8_mu;
 std::unordered_map<const void*, Hc8Copy> g_hc8;
 size_t g_hc8_bytes = 0;
 
+// The copies are carved out of large allocations: one cudaMalloc per matrix rounds each up to the allocator's
+// granularity, which costs a fraction of a MiB per matrix.  Offsets stay 256-byte aligned, as separate allocations are.
+// Copies are never returned, so a chunk is never freed.
+cudaError_t hc8_alloc(void** out, size_t bytes) {
+    constexpr size_t kChunk = (size_t) 32 << 20, kAlign = 256;
+    static char* bases[16] = {};
+    static size_t lefts[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return cudaMalloc(out, bytes);
+    char*& base = bases[dev];
+    size_t& left = lefts[dev];
+    bytes = (bytes + kAlign - 1) / kAlign * kAlign;
+    if (bytes > left) {
+        if (bytes > kChunk / 2) return cudaMalloc(out, bytes);
+        void* p = nullptr;
+        const cudaError_t e = cudaMalloc(&p, kChunk);
+        if (e != cudaSuccess) return e;
+        base = (char*) p;
+        left = kChunk;
+    }
+    *out = base;
+    base += bytes;
+    left -= bytes;
+    return cudaSuccess;
+}
+
 // the copy of the bf16 matrix w (device memory of the current card); false when there is no VRAM for it
 bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
     const int64_t n = (int64_t) rows * cols, groups = n / G8;
@@ -1219,7 +1246,7 @@ bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
     c.rows = rows;
     c.cols = cols;
     c.srow = srow;
-    if (cudaMalloc((void**) &c.q, c.bytes) != cudaSuccess) {
+    if (hc8_alloc((void**) &c.q, c.bytes) != cudaSuccess) {
         cudaGetLastError();
         std::fprintf(stderr, "basalt hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
         return false;
@@ -1292,7 +1319,7 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
     c.cols = cols;
     c.srow = ((cols / G8) + 7) & ~7;
     c.bytes = (size_t) n + (size_t) rows * c.srow * 2;
-    if (cudaMalloc((void**) &c.q, c.bytes) != cudaSuccess) {
+    if (hc8_alloc((void**) &c.q, c.bytes) != cudaSuccess) {
         cudaGetLastError();
         std::fprintf(stderr, "basalt hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
         return nullptr;
@@ -1301,7 +1328,6 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
     if (cudaMemcpy(c.q, q, (size_t) n, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(c.s, s, (size_t) rows * c.srow * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaGetLastError();
-        cudaFree(c.q);
         return nullptr;
     }
     c.owned = w == nullptr;

@@ -42,7 +42,8 @@ struct Pending {
     WeightRef* ref;
     int type;
     uint64_t bytes;
-    DevicePtr data;
+    void* data;       // inside the slab, or the owned allocation below when the slab ran out
+    DevicePtr owned;
 };
 }
 
@@ -103,7 +104,7 @@ bool NativeDense::keep_unquantized_ple_key(const PackFiles& pack, std::set<std::
 
 NativeDense::~NativeDense() {
     if (scratch_) cudaFree(scratch_);
-    for (void* p : weights_) cudaFree(p);
+    for (void* p : allocs_) cudaFree(p);
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -124,6 +125,17 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         int load_dev = 0;
         if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
         LoadProgress progress(LoadProgress::cuda(load_dev), plan_total);
+        // One allocation holds every matrix: separate cudaMalloc calls each round up to the allocator's granularity,
+        // which costs about a MiB per matrix.  Matrices start at 256-byte offsets, as separate allocations do.
+        constexpr uint64_t kAlign = 256;
+        const uint64_t slab_bytes = plan_total + kAlign * 1024;
+        DevicePtr slab;
+        {
+            void* a = nullptr;
+            if (plan_total > 0 && cudaMalloc(&a, slab_bytes) == cudaSuccess) slab.reset(a);
+            else (void) cudaGetLastError();
+        }
+        uint64_t slab_used = 0;
         int max_in = 0;
         uint64_t total = 0;
         uint64_t split_count = 0, split_tensors = 0;
@@ -212,18 +224,25 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = basalt::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
-                void* allocation = nullptr;
-                auto status = cudaMalloc(&allocation, bytes);
-                DevicePtr data(allocation);
-                if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                void* where = nullptr;
+                DevicePtr own;
+                if (slab && slab_used + bytes <= slab_bytes) {
+                    where = (char*) slab.get() + slab_used;
+                    slab_used += (bytes + kAlign - 1) / kAlign * kAlign;
+                } else {
+                    void* allocation = nullptr;
+                    if (cudaMalloc(&allocation, bytes) == cudaSuccess) own.reset(allocation);
+                    where = allocation;
+                }
+                const auto status = where ? cudaMemcpy(where, gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice)
+                                          : cudaErrorMemoryAllocation;
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
                 progress.add(bytes);
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
+                pending.push_back(Pending{&ref, (int) tensor.type, bytes, where, std::move(own)});
             }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
@@ -234,11 +253,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
         for (auto& item : pending) {
-            item.ref->native_data = item.data.get();
+            item.ref->native_data = item.data;
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
-            weights_.push_back(item.data.release());
+            weights_.push_back(item.data);
+            if (item.owned) allocs_.push_back(item.owned.release());
         }
+        if (slab) allocs_.push_back(slab.release());
         scratch_ = scratch.release();
         bytes_ = total;
         progress.finish();
