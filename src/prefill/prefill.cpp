@@ -596,6 +596,13 @@ uint64_t gdn_set_bytes(size_t T) {
     a.take<float>(T * HV, ok); a.take<float>(T * C, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
     return a.used;
 }
+// the hyper-connection's rows kept between halves: the mix weights, the bottleneck, the normed residual and its scales
+uint64_t hc_set_bytes(size_t T) {
+    Alloc a; a.count_only = true; bool ok = true;
+    a.take<float>(T * D, ok); a.take<float>(T * LR, ok); a.take<uint16_t>(T * LR, ok);
+    a.take<uint16_t>(T * D, ok); a.take<float>(T * HC, ok);
+    return a.used;
+}
 uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
                        const basalt::kernels::QsaShapes& s) {
     Alloc a; a.count_only = true; bool ok = true;
@@ -679,9 +686,25 @@ size_t fp4_h_bytes(size_t rows) {
     return al256(fp4::a4_bytes((int64_t) rows, 640, MMQ_GROUP)) + al256(fp4::scale_count((int64_t) rows, MMQ_GROUP) * 4) +
            al256((size_t) 2 * (MMQ_GROUP + 1) * 4);
 }
+// Every layer's experts are NVFP4 on the FP4 path, so a chunk of FP4_MIN_TOKENS or more never runs MMQ.
+bool fp4_every_layer() {
+    static const bool all = [] {
+        const auto& lay = basalt::kernels::cpu::expert_layout();
+        const MmqPlan& mp = mmq_plan();
+        if (!lay.native || lay.fmt.empty() || !mp.any || mp.layer.size() < lay.fmt.size()) return false;
+        for (size_t l = 0; l < lay.fmt.size(); ++l)
+            if (!mp.layer[l] || lay.fmt[l].gu_type != GGML_TYPE_NVFP4 || lay.fmt[l].d_type != GGML_TYPE_NVFP4 ||
+                lay.fmt[l].tail == 0)
+                return false;
+        return true;
+    }();
+    return all;
+}
 MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
     if (!fused) {
-        size_t xq = mmq::q8_bytes((int64_t) (T * K), N), hq = mmq::q8_bytes((int64_t) (T * K), 640);
+        // MMQ's int8 planes are only needed for rows a chunk below FP4_MIN_TOKENS runs; the FP4 planes cover the rest
+        const size_t qt = fp4_every_layer() && (int64_t) T >= FP4_MIN_TOKENS ? (size_t) (FP4_MIN_TOKENS - 1) : T;
+        size_t xq = mmq::q8_bytes((int64_t) (qt * K), N), hq = mmq::q8_bytes((int64_t) (qt * K), 640);
         if (fp4_pack()) { xq = std::max(xq, fp4_x_bytes(T * K, n_expert)); hq = std::max(hq, fp4_h_bytes(T * K)); }
         return {T * K * 1280, T * K * 640, xq, hq};
     }
@@ -845,10 +868,8 @@ bool Prefill::carve(size_t T, void* alloc) {
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     bool ok = true;
-    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
-    m.grs = o.take<float>(T * HC, ok);
-    m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
+    m.R = o.take<float>(T * D, ok);
+    m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * basalt::kernels::kStepCount, ok);
@@ -862,10 +883,20 @@ bool Prefill::carve(size_t T, void* alloc) {
         const bool fz = fused_layout(T, m.src != nullptr);
         const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz)});
+                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz),
+                                          hc_set_bytes(T)});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         m.region = base;
         m.region_bytes = region;
+        {
+            // the hyper-connection's rows are only live between one half's end and the next half's mix, when the
+            // region holds no scratch, and the embedding rows before the first layer's: they sit at its start
+            Alloc h;
+            h.base = base; h.cap = region; h.owned = &m.owned;
+            m.gated = h.take<float>(T * D, ok); m.lo = h.take<float>(T * LR, ok); m.lo16 = h.take<uint16_t>(T * LR, ok);
+            m.xn16 = h.take<uint16_t>(T * D, ok); m.grs = h.take<float>(T * HC, ok);
+            m.emb = m.gated;
+        }
         Alloc a;
         a.base = base; a.cap = region; a.owned = &m.owned;
         m.qkv = (float*) a.take<uint8_t>(gdn_qkv_bytes(T), ok); m.z = a.take<float>(T * ZV, ok); m.ab = a.take<float>(T * 2 * HV, ok);
@@ -1204,11 +1235,9 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
-    // `carve`'s order, buffer for buffer: emb, R, grs, xn16, lo, lo16, gated, inj, mixed, mixed_bf, mixed_h, bo.
-    f(T * N); f(T * D);
-    f(T * HC);
-    o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
+    // `carve`'s order, buffer for buffer: R, inj, mixed, mixed_bf, mixed_h, bo (the hyper-connection rows live in the region).
+    f(T * D);
+    f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     o.take<int32_t>(T * basalt::kernels::kStepCount, ok);
     basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
@@ -1216,7 +1245,8 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     const int64_t cap = basalt::kernels::qsa_selection_width(basalt::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert, fused_layout(T, true))}), ok);
+                                       moe_set_bytes(T, g.n_expert, fused_layout(T, true)),
+                                       hc_set_bytes(T)}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
