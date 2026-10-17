@@ -278,7 +278,7 @@ path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer
 
 The NVFP4 row has no 20-chunk run yet; its 100-chunk numbers are in the NVFP4 section below.
 
-The IQ3_S, IQ3_XXS and Q2_0 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
+The IQ3_S, IQ3_XXS, Q2_0 and NVFP4 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
 raises draft acceptance. Output is unchanged, because verify decides every token. Q4_K_XL and Q8_0 keep the original
 MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's raw bytes, checked against the
 source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`. The tuned layer ships with the
@@ -302,7 +302,7 @@ What the file holds, tensor group by tensor group:
 | Router, hyper-connection matrices, indexer, GDN alpha/beta, PLE key/value | BF16 as stored | NVIDIA's checkpoint |
 | PLE n-gram table | Q8_0: NVIDIA's FP8 codes times their BF16 scale, re-blocked per 32 values | NVIDIA's checkpoint |
 | Norms, GDN state parameters | F32 | NVIDIA's checkpoint |
-| MTP drafter | Basalt's own, quantized from Qwen's BF16 MTP layer (dense Q8_0/BF16, experts Q2_0), not NVIDIA's FP8 drafter | Qwen BF16 |
+| MTP drafter | Basalt's own (dense Q8_0/BF16, experts Q2_0), not NVIDIA's FP8 drafter. The experts are quantized from Qwen's BF16 MTP layer; the dense part is the self-distilled layer the IQ3_S, IQ3_XXS and Q2_0 packs carry, recorded in `meta.mtp.dense` with its SHA-256 | Qwen BF16 (experts), tuned layer file (dense) |
 | Tokenizer, chat template, model metadata | as NVIDIA ships them (the vocabulary is the other packs') | NVIDIA's checkpoint |
 | Vision projector, expert profile | as in the other Basalt packs | Basalt packs |
 
@@ -342,6 +342,29 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --checkpoint nvidia --dense-q8-0 \
     --out Qwen3.8-FN-NVIDIA-NVFP4-Q8.basalt --name "Qwen3.8-Flash-Next NVIDIA-NVFP4"
 ```
+
+`--mtp-dense FILE` replaces the dense part of the drafter copied from the base with the tuned layer. The file is the raw
+bytes of the `mtp/dense` section of an official IQ3_S, IQ3_XXS or Q2_0 pack (for example
+`ModelFile(path).read("mtp/dense")` from `tools/convert/model_file.py`); its size must match the base's section, and the
+converter records its SHA-256 in `meta.mtp.dense` with the tuning `self_distilled`. Add it to either command:
+
+```sh
+python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --checkpoint nvidia \
+    --mtp-dense tuned-mtp-dense.bin \
+    --out Qwen3.8-FN-NVIDIA-NVFP4.basalt --name "Qwen3.8-Flash-Next NVIDIA-NVFP4"
+```
+
+The tuned layer raises draft acceptance and leaves output unchanged (verify decides every token). Measured on an
+RTX 5090 at 400 W with the 5060 Ti as a peer card, against the same pack with Qwen's original layer (ABBA, 3 blocks of
+6 processes per arm; development measurement):
+
+| test | original layer, tok/s | tuned layer, tok/s | change |
+|---|---:|---:|---:|
+| prose, right after a topic switch | 234.5 | 238.9 | +1.9% |
+| prose, adapted | 239.0 | 245.9 | +2.9% |
+| tokens per verify window, prose | 2.083 | 2.172 | +4.3% |
+
+Conversation and structured output are within noise.
 
 The output is about 122 GiB (the 8-bit variant 123 GiB), next to the 124 GiB checkpoint. How NVFP4 is computed on each
 tier: [docs/precision.md](docs/precision.md).
