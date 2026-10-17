@@ -516,7 +516,8 @@ def requant_dense(a) -> None:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sections-from", metavar="PACK.basalt",
-                    help="copy every section but the routed experts from this .basalt (with --checkpoint)")
+                    help="with --checkpoint: the drafter, vision projector and expert profile (and hc8 if it has them) come from "
+                         "this .basalt; everything else from the checkpoint")
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")

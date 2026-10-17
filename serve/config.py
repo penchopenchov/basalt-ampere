@@ -313,7 +313,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with --parallel, give every slot the whole --max-context instead of an equal part: N slots "
                          "cost N times the KV cache")
     ap.add_argument("--config", metavar="FILE",
-                    help="a JSON object of engine flags, e.g. {\"max-context\": 32768, \"spec\": 7, "
+                    help="a JSON file {\"server\": {...}, \"engine\": {...}}: server options and engine flags named "
+                         "without the dashes, e.g. \"engine\": {\"max-context\": 32768, \"spec\": 7, "
                          "\"resident-experts\": true}; a list gives a flag several values; the command line "
                          "wins over it")
     ap.add_argument("--vision", nargs="?", const="", default="off", type=vision_setting, choices=VISION_MODES, metavar="MODE",
@@ -327,7 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=8080, help="the TCP port to listen on (default 8080)")
     ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: the first runs the model, a second is "
                                   "the peer expert tier (\"0,1\"; default: every visible GPU)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
