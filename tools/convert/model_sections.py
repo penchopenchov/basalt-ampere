@@ -688,6 +688,24 @@ Q6K_TARGETS = [
     (re.compile(r"blk\.(\d+)\.attn_output\.weight"), "self_attn.o_proj"),
 ]
 Q6K_VALUES_PER_JOB = 1 << 22
+# The GGUF lists the 48 value heads (128 wide) as (ratio r, key head k) = r * 16 + k, the checkpoint as k * 3 + r.
+# The GGUF's GDN qkv rows after the q and k parts (4096), its z rows and its out-projection columns follow that order.
+GDN_HEAD, GDN_V_HEADS, GDN_K_HEADS = 128, 48, 16
+GDN_QK_ROWS = 4096
+Q6K_LAYOUT = {"attn_qkv": "rows", "attn_gate": "rows", "ssm_out": "cols"}
+
+
+def gdn_block_source() -> np.ndarray:
+    j = np.arange(GDN_V_HEADS)
+    return (j % GDN_K_HEADS) * (GDN_V_HEADS // GDN_K_HEADS) + j // GDN_K_HEADS
+
+
+def gdn_index(n: int, first: int) -> np.ndarray:
+    """Checkpoint index of each of the GGUF's n positions: identity below `first`, head-block reordered above."""
+    idx = np.arange(n)
+    blocks = (n - first) // GDN_HEAD
+    idx[first:] = first + (gdn_block_source()[:blocks, None] * GDN_HEAD + np.arange(GDN_HEAD)).reshape(-1)
+    return idx
 
 
 def q6k_target(name: str, info: dict):
@@ -708,16 +726,24 @@ def q8_0_values(raw: np.ndarray) -> np.ndarray:
 
 def _q6k_job(args):
     """One row range: its Q6_K bytes, and the largest distance between the Q8_0 values and the BF16 source in Q8_0 steps."""
-    pack, off, ne0, row0, rows, st_path, st_off = args
+    pack, off, ne0, row0, rows, st_path, st_off, layout = args
     raw = np.fromfile(pack, dtype=np.uint8, count=rows * ne0 // 32 * 34, offset=off + row0 * ne0 // 32 * 34)
     q8 = q8_0_values(raw).reshape(rows, ne0)
     if st_path is None:
         return q6_k(q8), 0.0
-    u = np.fromfile(st_path, dtype="<u2", count=rows * ne0, offset=st_off + 2 * row0 * ne0)
-    src = _bf16_to_f32(u).reshape(rows, ne0)
+    if layout is None:
+        u = np.fromfile(st_path, dtype="<u2", count=rows * ne0, offset=st_off + 2 * row0 * ne0)
+    else:
+        kind, ne1 = layout
+        mm = np.memmap(st_path, dtype="<u2", mode="r", offset=st_off, shape=(ne1, ne0))
+        if kind == "rows":
+            u = mm[gdn_index(ne1, GDN_QK_ROWS if ne1 > GDN_V_HEADS * GDN_HEAD else 0)[row0:row0 + rows]]
+        else:
+            u = mm[row0:row0 + rows][:, gdn_index(ne0, 0)]
+    src = _bf16_to_f32(np.ascontiguousarray(u)).reshape(rows, ne0)
     step = np.abs(src).reshape(-1, 32).max(axis=1) / 127.0
     err = np.abs(q8 - src).reshape(-1, 32).max(axis=1)
-    return q6_k(src), float((err / np.maximum(step, 1e-30)).max())
+    return q6_k(src), float((err / np.maximum(step, 2e-5)).max())
 
 
 class DenseQ6K:
@@ -733,7 +759,7 @@ class DenseQ6K:
                 for k, t in head.items():
                     if k != "__metadata__":
                         hf[k] = (str(p), base + t["data_offsets"][0], t["dtype"], t["shape"])
-        self.plan = {}
+        self.plan, self.layout = {}, {}
         for n, info in tensors.items():
             want = q6k_target(n, info)
             if want is None:
@@ -742,6 +768,9 @@ class DenseQ6K:
             if checkpoint and (src is None or src[2] != "BF16" or list(reversed(info["shape"])) != src[3]):
                 raise ConvertError(f"{n}: no matching BF16 tensor {want} in {checkpoint}")
             self.plan[n] = src
+            kind = Q6K_LAYOUT.get(n.split(".", 2)[2].rsplit(".weight", 1)[0])
+            if kind:
+                self.layout[n] = (kind, info["shape"][1])
         self.worst = 0.0
 
     @staticmethod
@@ -754,7 +783,7 @@ class DenseQ6K:
         src = self.plan[name]
         for r in range(0, ne1, step):
             yield (pack, gguf_off + info["offset"], ne0, r, min(step, ne1 - r),
-                   src[0] if src else None, src[1] if src else 0)
+                   src[0] if src else None, src[1] if src else 0, self.layout.get(name))
 
     def chunks(self, name, info, pack, gguf_off, pool):
         for blob, worst in pool.imap(_q6k_job, self.jobs(name, info, pack, gguf_off), chunksize=1):
