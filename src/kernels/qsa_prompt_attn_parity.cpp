@@ -7,7 +7,8 @@
 //   1. against FP64, the new kernel's error is no larger than a small multiple of the old kernel's (both FP32 math);
 //      int8 KV takes FP16 q and p (FP32 accumulation) and is bounded at 1.5e-3 of the output scale instead;
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale (int8 KV: 2e-3);
-//   3. a query's output is bitwise the same when it is computed in a different batch at a different position;
+//   3. a query's output is bitwise the same when it is computed in a different batch at a different position (nine
+//      sub-batches: off the tile grid, a batch of one, the chunk's tail);
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "basalt/kernels/qsa.hpp"
@@ -223,18 +224,23 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     cudaEventRecord(e1);
     ck(cudaEventSynchronize(e1), "time");
     cudaEventElapsedTime(&ms_new, e0, e1);
-    // 3. batch independence: queries [5, 5 + m) computed as their own batch
-    const int64_t m = std::min<int64_t>(37, nq - 5);
+    // 3. batch independence: queries [at, at + m) computed as their own batch, at offsets off the kernel's tile
+    // grid, a batch of one, and the chunk's tail
     bool same = true;
-    if (m > 0) {
+    const int64_t subs[][2] = {{5, 37}, {1, 1}, {3, 1}, {7, 13}, {17, 16}, {nq / 2 + 1, 65}, {nq - 7, 7}, {nq - 1, 1}, {0, 129}};
+    for (const auto& sb : subs) {
+        const int64_t at = sb[0], m = std::min<int64_t>(sb[1], nq - at);
+        if (at < 0 || m <= 0) continue;
         float* d_sub = nullptr;
         ck(cudaMalloc(&d_sub, m * NH * HD * 4), "malloc");
-        if (!k::qsa_prompt_attn_batch(d_q + 5 * NH * HD, pl, d_ids + 5 * cap, d_steps + 5 * k::kStepCount, cap, s, d_sub,
+        if (!k::qsa_prompt_attn_batch(d_q + at * NH * HD, pl, d_ids + at * cap, d_steps + at * k::kStepCount, cap, s, d_sub,
                                       m, nullptr))
             std::exit(2);
         std::vector<float> sub((size_t) (m * NH * HD));
         ck(cudaMemcpy(sub.data(), d_sub, sub.size() * 4, cudaMemcpyDeviceToHost), "down");
-        same = std::memcmp(sub.data(), nw.data() + 5 * NH * HD, sub.size() * 4) == 0;
+        const bool eq = std::memcmp(sub.data(), nw.data() + at * NH * HD, sub.size() * 4) == 0;
+        if (!eq) std::printf("  batch of %lld queries from %lld differs from the full chunk\n", (long long) m, (long long) at);
+        same &= eq;
         cudaFree(d_sub);
     }
     const bool ok1 = fmt == 1 ? err_new <= 1.5e-3 * ref_scale : err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
@@ -253,6 +259,11 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
 }  // namespace
 
 int main(int argc, char** argv) {
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
+        std::printf("no CUDA device: skipped\n");
+        return 77;
+    }
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
