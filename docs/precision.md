@@ -126,11 +126,11 @@ below 6,144 tokens the two sessions' KV, and with it their rows, can differ at t
 bit-identical across sessions.
 
 **Expert path by chunk size.** A prompt chunk of fewer than 6,144 tokens stages only the experts its tokens route to and
-runs them on MMQ (the NVFP4 default above), with the CPU pool taking the low-row non-resident ones; a chunk of 6,144 tokens
-or more streams every non-resident expert through the ring and runs the fused kernels. Staging everything costs the same
+runs them on MMQ, or on the FP4 tensor cores for NVFP4 experts from 1,024 tokens (the FP4 row above), with the CPU pool taking the low-row non-resident ones; a chunk of 6,144 tokens
+or more streams every non-resident expert through the ring and runs the fused kernels (NVFP4 has none: it stays on the FP4 tensor cores, or MMQ below 1,024 tokens, so the cutoff there only changes which experts are staged). Staging everything costs the same
 whatever the chunk, so it only pays once most experts are hit anyway. The cutoff used to be 1,024 tokens, so chunks of 1,024
 to 6,143 tokens (a whole prompt of that length on a bare `--prefill auto`) now take the MMQ path where they took the fused
-one: not bitwise identical to the previous build, and the two paths' rounding differs as the tables above describe. The
+one (packs with fused kernels; an NVFP4 pack runs the same FP4 or MMQ products either way): not bitwise identical to the previous build, and the two paths' rounding differs as the tables above describe. The
 quality gate's 256-token prompt half was below both cutoffs, so its numbers do not move. On 12 chunks of 4,096 tokens (2,048-token prompt halves, PPL only), PPL is 2.9581 against 2.9547 for the previous build, a paired per-token NLL difference of +0.0011 +- 0.0011. Greedy 200-token output from a 2,048-token prompt diverges from the previous build at token 122 and stays coherent; from a 4,096-token prompt it is identical (400 W, one 5090). With a peer card without direct
 access the cutoff stays at 2,560 (4,096 with `--peer-exclusive`).
 
@@ -379,11 +379,18 @@ measurement):
 |---|---|---|---|---|---|---|
 | UD-Q4_K_XL | 100 | 3.3201 | 0.05656 | 0.01213 | 0.6586 | 92.27% |
 | NVIDIA-checkpoint NVFP4 (dense Q8_0) | 100 | 3.2873 | 0.06167 | 0.01345 | 0.6923 | 91.80% |
+| NVIDIA-checkpoint NVFP4 (dense Q8_0), combined build (f127762) | 100 | 3.2870 | 0.06115 | 0.01365 | 0.6992 | 91.87% |
 | UD-Q4_K_XL | 20 | 2.3223 | 0.0685 | 0.00514 | 0.9928 | 93.02% |
 
 The NVIDIA-checkpoint (dense Q8_0) row was run on one build (daf16b6), T 3, int8 KV, resident experts, 400 W, base PPL 3.28607.
 Against UD-Q4_K_XL it has 0.0051 higher KLD and 0.47 points lower top-1, and a lower PPL (3.2873 against 3.3201), which
 is not a quality signal.
+
+The combined-build row (f127762: FP4 prompt experts, chunked delta rule, FP16-MMA prompt attention, AVX2 CPU experts, 6,144-token
+stream cutoff) used the same flags as the daf16b6 row, 400 W. The 256-token prompt half is below the 1,024-token FP4 minimum,
+so the gate exercises MMQ prompt experts, and the change from the daf16b6 row (KLD -0.0005, top-1 +0.07 points, PPL -0.0003) is
+inside run noise. Long prompts (2,048-token halves, 12 chunks, PPL only) on the same build: 2.9579 (+-0.0367) against 2.9547 for
+MMQ, paired per-row NLL difference +0.0011 (+-0.0014).
 
 IQ3_S and IQ3_XXS agree between the two engines to within 0.002 KLD and 0.2 points of top-1 at both chunk counts. The
 first 20 chunks read higher than the 100-chunk set (higher KLD and higher top-1 for the IQ3 packs), so the README table,
