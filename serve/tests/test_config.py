@@ -106,7 +106,7 @@ class Precedence(unittest.TestCase):
         a, *_ = parse(["--port", "9100"], {"server": {"port": 9000, "alias": "cfg"}})
         self.assertEqual((a.port, a.alias), (9100, "cfg"))
         a, *_ = parse([], None)
-        self.assertEqual(a.port, 8095)
+        self.assertEqual(a.port, 8080)
 
     def test_repeatable_options_replace(self):
         a, *_ = parse([], {"server": {"cors-origin": ["http://a"]}})

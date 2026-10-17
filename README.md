@@ -105,6 +105,8 @@ bin/basalt serve --config basalt_config.json                     # everything fr
 bin/basalt serve --config basalt_config.json --max-context 32768  # the command line wins
 ```
 
+Every setting, with its type, default and example configs: [docs/configuration.md](docs/configuration.md).
+
 ### Concurrent requests: `--parallel N`
 
 `--parallel N` (1..8, also `"parallel"` in the config's `server` section) serves N requests at once in the

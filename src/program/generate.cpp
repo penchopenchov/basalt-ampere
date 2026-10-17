@@ -791,7 +791,7 @@ void usage() {
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens; auto = the fewest\n"
-                 "                       equal chunks of at most 12288 tokens (16384 with --peer-exclusive), within\n"
+                 "                       equal chunks of at most 16384 tokens, within\n"
                  "                       what the expert cache can lend (with --resident-experts the lent slots the\n"
                  "                       RAM copy backs, else 8192); auto:N (8192, 16384, 32768) sets the ceiling\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"

@@ -270,13 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
     ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
-    ap.add_argument("--spec", type=int, help="tokens per verify window, the drafter's cap (default: the model file's; "
-                                             "0 = no speculation, the drafter is not loaded)")
-    ap.add_argument("--spec-min-p", type=float, help="stop drafting below this draft probability (default: the "
-                                                     "model file's; 0 = always draft to the cap)")
+    ap.add_argument("--spec", type=int, help="tokens per verify window, the drafter's cap (default 0: no speculation, "
+                                             "the drafter is not loaded; the model file does not set it)")
+    ap.add_argument("--spec-min-p", type=float, help="stop drafting below this draft probability (default 0 = "
+                                                     "always draft to the cap; the model file does not set it)")
     ap.add_argument("--mtp-max-t", type=int, help="the drafter's own window cap (default 0 = --spec)")
-    ap.add_argument("--max-context", type=int, help="the longest context the engine allows, in tokens (default: the "
-                                                    "engine's)")
+    ap.add_argument("--max-context", type=int, help="the longest context the engine allows, in tokens (default 4096)")
     ap.add_argument("--parallel", type=parallel_count, metavar="N",
                     help=f"requests served at once, 1..{PARALLEL_MAX} (default 1: one at a time); more requests wait "
                          "their turn. --max-context is shared: each slot holds that divided by N (so 4 slots of 262144 "
@@ -301,7 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
-    ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: the first runs the model, a second is "
                                   "the peer expert tier (\"0,1\"; default: every visible GPU)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),

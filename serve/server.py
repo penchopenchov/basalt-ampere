@@ -3,7 +3,7 @@
     basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
     python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...
     python -m serve.server --config config.json
-    python -m serve.server --mock-engine --port 8095
+    python -m serve.server --mock-engine --port 8080
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel)` -> token ids. ProcessEngine keeps
 one `basalt --serve` process resident; MockEngine is a scripted stand-in for tests. Prompts that do not fit the
