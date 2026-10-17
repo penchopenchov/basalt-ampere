@@ -19,7 +19,6 @@ import json
 import pathlib
 import re
 import struct
-from collections import deque
 
 import numpy as np
 
@@ -122,15 +121,7 @@ def _expert_job(args):
     return b"".join(out)
 
 
-def bounded_imap(pool, fn, jobs, depth: int):
-    """pool.imap with at most `depth` results waiting, so a slow writer never piles them up in memory."""
-    q = deque()
-    for j in jobs:
-        q.append(pool.apply_async(fn, (j,)))
-        if len(q) >= depth:
-            yield q.popleft().get()
-    while q:
-        yield q.popleft().get()
+bounded_imap = S.bounded_imap
 
 
 class CheckpointExperts:

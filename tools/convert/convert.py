@@ -372,7 +372,7 @@ def from_checkpoint(a) -> None:
                     parts.append(Stream(info.expected_bytes(), dense_src.chunks(n, pool)))
                 else:
                     parts.append(dense_src.bytes(n).tobytes())
-            parts.append(Stream(ple.nbytes, ple.chunks()))
+            parts.append(Stream(ple.nbytes, ple.chunks(pool)))
             offs = w.add_parts("gguf", parts, TENSOR_ALIGN)
             job._report("gguf", w.entries[-1][2], time.time() - t)
             names = list(dense_src.tensors) + ["per_layer_token_embd.weight"]

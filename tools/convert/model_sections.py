@@ -15,7 +15,7 @@ import pathlib
 import re
 import struct
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 import os
@@ -614,6 +614,17 @@ def read_safetensors_header(path):
         return json.loads(f.read(n)), 8 + n
 
 
+def bounded_imap(pool, fn, jobs, depth: int):
+    """pool.imap with at most `depth` results waiting, so a slow writer never piles them up in memory."""
+    q = deque()
+    for j in jobs:
+        q.append(pool.apply_async(fn, (j,)))
+        if len(q) >= depth:
+            yield q.popleft().get()
+    while q:
+        yield q.popleft().get()
+
+
 class PleFp8:
     """The PLE n-gram table of a checkpoint that stores it as FP8 shards (`...ngram_embedding.shard_K.weight`) with one
     BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
@@ -651,10 +662,9 @@ class PleFp8:
                 n = min(self.chunk_rows, rows - r)
                 yield (self.path, off + r * PLE_DIM, n, self.scale)
 
-    def chunks(self, workers: int = 24):
-        import multiprocessing
-        with multiprocessing.Pool(workers) as pool:
-            yield from pool.imap(_ple_job, self.jobs(), chunksize=1)
+    def chunks(self, pool, depth: int = 16):
+        """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
+        yield from bounded_imap(pool, _ple_job, self.jobs(), depth)
 
 
 # ------------------------------------------------------------------ Q6_K requantization of the dense projections

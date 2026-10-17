@@ -435,6 +435,27 @@ class PleFp8Test(unittest.TestCase):
             self.assertEqual(len(got), ple.nbytes)
             want = b"".join(S.fp8_rows_to_q8_0(a, ple.scale) for a in shards)
             self.assertEqual(got, want)
+            import multiprocessing
+            with multiprocessing.Pool(2) as pool:
+                self.assertEqual(b"".join(ple.chunks(pool, depth=2)), want)
+
+
+class BoundedImapTest(unittest.TestCase):
+    def test_order_and_depth(self):
+        class Pool:
+            live = peak = 0
+
+            def apply_async(self, fn, args):
+                Pool.live += 1
+                Pool.peak = max(Pool.peak, Pool.live)
+                return self
+
+            def get(self):
+                Pool.live -= 1
+                return 1
+
+        self.assertEqual(sum(S.bounded_imap(Pool(), None, range(20), 3)), 20)
+        self.assertEqual(Pool.peak, 3)
 
 
 class Q6KRequantTest(unittest.TestCase):
