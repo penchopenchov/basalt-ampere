@@ -66,8 +66,9 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 256;           // the arrays; the ring itself is ring_slots()
-// The chunk size from which every expert streams: below it only the routed experts are staged.
-int64_t g_stream_all_min = 1024;
+// The chunk size from which every expert streams: below it only the routed experts are staged.  Staging every
+// non-resident expert costs the same whatever the chunk, so it pays only once most of them are routed anyway.
+int64_t g_stream_all_min = 6144;
 inline int64_t stream_all_min() { return g_stream_all_min; }
 // The streamed ring's slots (one whole expert blob each): the most a layout holds (the same for every pack), and the
 // depth the next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower

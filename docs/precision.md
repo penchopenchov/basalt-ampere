@@ -109,8 +109,8 @@ Prefill and decode are different computations that read and write the same KV an
 | Router | BF16 activation (decode: fp32) | prefill.cpp:1631 |
 | Shared expert | fp16 activation, fp16 SwiGLU | prefill.cpp:1634-1637 |
 | Routed experts | Fused int8 mma kernels, llama.cpp MMQ (q8_1) or dequant-to-fp16 cuBLAS (IQ1_M only). NVFP4 takes the FP4 tensor-core kernels (see the Activations table). The K-quants (Q4_K, Q5_K, Q5_1: UD-Q4_K_XL) run on MMQ with fp16 activation scales and per-32 partial sums taken from the rounded int8 values (llama.cpp sums the floats), so the product is exactly the dequantized weights times the rounded activations | moe_fused_iq.hpp:1-12; moe_mmq.hpp:1-6; mmq/quantize.cu:59-69 |
-| Routed experts on the CPU (chunks below 1,024 tokens) | Non-resident experts with a host copy and at most 8 rows run on the CPU pool with ggml's dot products, as decode's RAM tier does: the activation in the weight type's `vec_dot` format (Q8_K per 256 values for the IQ types, not q8_1 per 32), H quantized to the down type's format. Their rows are written unweighted and the combine weights them like the GPU's. Which experts go is set per layer from the measured CPU and GPU cost per expert, so it can differ from run to run | prefill.cpp:1862-1900,1928-1985,2339-2352 |
 | Attention | int8 KV: q and p rounded to fp16 (q prescaled by a power of two), V scale folded into the fp16 B operand, one fp16 mma, fp32 accumulate, per-warp online softmax merged once at the end. Output within 1.5e-3 of the output scale of an FP64 reference (the previous hi/lo split: 1e-6). fp16 and Q4_0 KV keep the hi/lo split of q and p | qsa_prompt_attn.hpp:1-22 |
+| Routed experts on the CPU (chunks below 6,144 tokens) | Non-resident experts with a host copy and at most 8 rows run on the CPU pool with ggml's dot products, as decode's RAM tier does: the activation in the weight type's `vec_dot` format (Q8_K per 256 values for the IQ types, not q8_1 per 32), H quantized to the down type's format. Their rows are written unweighted and the combine weights them like the GPU's. Which experts go is set per layer from the measured CPU and GPU cost per expert, so it can differ from run to run | prefill.cpp:1862-1900,1928-1985,2339-2352 |
 | Indexer scores | 3xTF32 tensor cores | qsa_select.hpp:36-38 |
 | GDN | Chunked delta rule, 16 tokens per chunk: q/k L2-normalized in fp32 then rounded to BF16; v, gates and the state fp32. K S on TF32 tensor cores, Q S and the state update K^T Delta on BF16 tensor cores (Delta rounded to BF16 for that product only), fp32 accumulate; the within-chunk solve in fp32. A token's output depends on where the 16-token chunk grid falls (about 1e-3 relative). Out-projection input fp16. Against the previous kernel: output relative RMS 2.9e-3. Quality gate, 20 chunks through the decode path against the Q8_0 reference, same pinned tiers: PPL 2.2913 to 2.2916, mean KLD 0.0687 to 0.0706, top-1 agreement 92.98% to 93.31% (previous build to this one) | gdn_chunked.cu |
 
@@ -122,8 +122,17 @@ does not depend on how many tokens share its expert's job (bitwise, every pair).
 the 256-token prompt half through this path: PPL 3.3727, KLD 0.15267, top-1 87.22% against 3.3769, 0.15351, 87.19%
 for the build without it. Prefill with the share is not reproducible bit for bit between runs, because the share follows
 the measured costs. The identity checks below compare logits across engine sessions, so for a prompt whose chunks are
-below 1,024 tokens the two sessions' KV, and with it their rows, can differ at this level, and those checks are no longer
+below 6,144 tokens the two sessions' KV, and with it their rows, can differ at this level, and those checks are no longer
 bit-identical across sessions.
+
+**Expert path by chunk size.** A prompt chunk of fewer than 6,144 tokens stages only the experts its tokens route to and
+runs them on MMQ (the NVFP4 default above), with the CPU pool taking the low-row non-resident ones; a chunk of 6,144 tokens
+or more streams every non-resident expert through the ring and runs the fused kernels. Staging everything costs the same
+whatever the chunk, so it only pays once most experts are hit anyway. The cutoff used to be 1,024 tokens, so chunks of 1,024
+to 6,143 tokens (a whole prompt of that length on a bare `--prefill auto`) now take the MMQ path where they took the fused
+one: not bitwise identical to the previous build, and the two paths' rounding differs as the tables above describe. The
+quality gate's 256-token prompt half was below both cutoffs, so its numbers do not move. On 12 chunks of 4,096 tokens (2,048-token prompt halves, PPL only), PPL is 2.9581 against 2.9547 for the previous build, a paired per-token NLL difference of +0.0011 +- 0.0011. Greedy 200-token output from a 2,048-token prompt diverges from the previous build at token 122 and stays coherent; from a 4,096-token prompt it is identical (400 W, one 5090). With a peer card without direct
+access the cutoff stays at 2,560 (4,096 with `--peer-exclusive`).
 
 **Prompt chunk size.** A bare `--prefill auto` reads a prompt in equal chunks of at most 16384 tokens, or 32768 for packs
 whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding of its K/V, so a prompt longer than 16384
