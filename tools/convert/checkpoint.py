@@ -277,7 +277,7 @@ class CheckpointDense:
     `bytes(name)` the stored bytes of a float tensor and `chunks(name, pool)` the streamed bytes of a quantized one.
     `where` and `bytes` are what model_sections.Dense reads."""
 
-    def __init__(self, ck: Checkpoint, q6k: bool = True):
+    def __init__(self, ck: Checkpoint, q6k: bool = True, require_complete: bool = True):
         tc = ck.text
         self.ck, self.q6k = ck, q6k
         if int(tc["linear_num_key_heads"]) != S.GDN_K_HEADS or int(tc["linear_num_value_heads"]) != S.GDN_V_HEADS \
@@ -318,7 +318,36 @@ class CheckpointDense:
         if unknown:
             raise S.ConvertError("checkpoint tensors with no GGUF counterpart: " + ", ".join(unknown[:8])
                                  + (f" ... and {len(unknown) - 8} more" if len(unknown) > 8 else ""))
+        if require_complete:
+            self._check_complete(tc)
         self.where = {n: (None, t, ck.t[t.src][0]) for n, t in self.tensors.items()}
+
+    def _check_complete(self, tc):
+        """Refuses a checkpoint that lacks a tensor the engine reads (each layer's by its type) or has a layer the
+        config does not."""
+        n_layers, kinds = int(tc["num_hidden_layers"]), tc["layer_types"]
+        for name in self.tensors:
+            m = re.match(r"blk\.(\d+)\.", name)
+            if m and int(m.group(1)) >= n_layers:
+                raise S.ConvertError(f"{self.tensors[name].src}: the config has {n_layers} layers")
+        need = [rule[0] for rule in GLOBAL.values()]
+        ple_layers = {int(m.group(1)) for name in self.tensors for m in [re.match(r"blk\.(\d+)\.ple_", name)] if m}
+        for l in range(n_layers):
+            if kinds[l] not in ("linear_attention", "full_attention"):
+                raise S.ConvertError(f"config.json: layer {l} is {kinds[l]}")
+            for key, rule in LAYER.items():
+                part = key.split(".")[0]
+                if part == "linear_attn" and kinds[l] != "linear_attention" \
+                        or part == "self_attn" and kinds[l] != "full_attention" \
+                        or part == "ple" and l not in ple_layers:
+                    continue
+                need.append(f"blk.{l}.{rule[0]}")
+            if kinds[l] == "full_attention":
+                need += [f"blk.{l}.indexer.q_proj.weight", f"blk.{l}.indexer.k_proj.weight"]
+        missing = [n for n in need if n not in self.tensors]
+        if missing:
+            raise S.ConvertError(f"the checkpoint lacks {len(missing)} tensors the engine reads: " + ", ".join(missing[:8])
+                                 + (f" ... and {len(missing) - 8} more" if len(missing) > 8 else ""))
 
     def _add(self, name, ty, src, how, ne, rows=None):
         if name in self.tensors:

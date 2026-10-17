@@ -146,7 +146,7 @@ class CheckpointDenseTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_names_order_types(self):
-        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True)
+        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
         self.assertEqual(list(dn.tensors), [
             "blk.0.ssm_a", "blk.0.ssm_conv1d.weight", "blk.0.ssm_alpha.weight", "blk.0.attn_gate.weight",
             "blk.0.ssm_norm.weight", "blk.0.ssm_out.weight", "blk.0.hc_attn_norm.weight",
@@ -156,11 +156,11 @@ class CheckpointDenseTest(unittest.TestCase):
         self.assertEqual(ty["blk.0.ffn_down_shexp.weight"], ("Q8_0", [640, 256]))    # 640-value rows: not Q6_K
         self.assertEqual(ty["blk.0.ssm_conv1d.weight"], ("F32", [4, GDN]))
         self.assertEqual(ty["blk.0.indexer.k_proj.weight"], ("BF16", [256, 128]))
-        q8 = C.CheckpointDense(C.Checkpoint(self.d), q6k=False)
+        q8 = C.CheckpointDense(C.Checkpoint(self.d), q6k=False, require_complete=False)
         self.assertEqual(q8.tensors["blk.0.attn_gate.weight"].type_name, "Q8_0")
 
     def test_transforms(self):
-        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True)
+        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
         L, v = self.L, self.v
         heads = S.gdn_block_source()
         f32 = lambda n: dn.bytes(n).view("<f4")
@@ -177,7 +177,7 @@ class CheckpointDenseTest(unittest.TestCase):
 
     def test_quantized_streams(self):
         import multiprocessing
-        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True)
+        dn = C.CheckpointDense(C.Checkpoint(self.d), q6k=True, require_complete=False)
         L, v = self.L, self.v
         with multiprocessing.Pool(2) as pool:
             z = b"".join(dn.chunks("blk.0.attn_gate.weight", pool))
@@ -198,7 +198,7 @@ class CheckpointDenseTest(unittest.TestCase):
         tens[self.L + "linear_attn.new_thing.weight"] = ("BF16", (2,), b"\0" * 4)
         write_safetensors(p, tens)
         with self.assertRaises(S.ConvertError):
-            C.CheckpointDense(C.Checkpoint(self.d))
+            C.CheckpointDense(C.Checkpoint(self.d), require_complete=False)
 
 
 GDN_CFG = {"text_config": {"linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128,
@@ -216,7 +216,7 @@ class F16OverflowTest(unittest.TestCase):
             d = Path(tmp)
             x = np.full((2, 1, 4), 2.0 ** 17, np.float32)          # exactly BF16, beyond F16's range
             small_checkpoint(d, {"model.language_model.layers.0.ple.conv1d.weight": ("BF16", x.shape, bf16(x).tobytes())})
-            dn = C.CheckpointDense(C.Checkpoint(d))
+            dn = C.CheckpointDense(C.Checkpoint(d), require_complete=False)
             with self.assertRaisesRegex(S.ConvertError, "beyond F16"):
                 dn.bytes("blk.0.ple_conv1d.weight")
 
@@ -269,6 +269,68 @@ class UnexpectedTensorTest(unittest.TestCase):
             C.Checkpoint(self.build(other={"lm_head.weight": ("BF16", (2,), bytes(4))}))
         ok = {"model.language_model.layers.0.ple.ple_embedding.layer_multipliers": ("I64", (1,), bytes(8))}
         C.Checkpoint(self.build(other=ok))
+
+
+class CompleteSetTest(unittest.TestCase):
+    """A two-layer checkpoint (linear attention, then full attention with the PLE) with every dense tensor."""
+    CFG = {"text_config": {**GDN_CFG["text_config"], "indexer_n_heads": 1, "indexer_head_dim": 32,
+                           "num_hidden_layers": 2, "layer_types": ["linear_attention", "full_attention"]}}
+
+    @staticmethod
+    def tensors():
+        L = "model.language_model.layers."
+        out = {}
+        for l, kind in enumerate(("linear_attention", "full_attention")):
+            for key, (_, ty, how) in C.LAYER.items():
+                part = key.split(".")[0]
+                if part == "linear_attn" and kind != "linear_attention" or part == "self_attn" and kind != "full_attention" \
+                        or part == "ple" and l != 1:
+                    continue
+                shape = (4, 1, 4) if how in ("conv", "gconv") else (4, 64) if ty in ("MAT", "Q8_0") else (64,)
+                out[f"{L}{l}.{key}"] = ("BF16", shape, bytes(2 * int(np.prod(shape))))
+            if kind == "full_attention":
+                out[f"{L}{l}.{C.INDEXER_QK}"] = ("BF16", (64, 64), bytes(2 * 64 * 64))
+        for k, (_, ty, how) in C.GLOBAL.items():
+            shape = (4, 64) if ty == "Q8_0" else (64,)
+            out[k] = ("BF16", shape, bytes(2 * int(np.prod(shape))))
+        return out
+
+    def build(self, drop=()):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        small_checkpoint(d, {k: v for k, v in self.tensors().items() if k not in drop}, self.CFG)
+        return d
+
+    def test_complete_checkpoint_is_accepted(self):
+        dn = C.CheckpointDense(C.Checkpoint(self.build()))
+        self.assertIn("output.weight", dn.tensors)
+        self.assertIn("blk.0.ssm_a", dn.tensors)
+        self.assertIn("blk.1.attn_q.weight", dn.tensors)
+        self.assertNotIn("blk.0.attn_q.weight", dn.tensors)
+
+    def test_each_missing_tensor_is_refused(self):
+        L = "model.language_model.layers."
+        for gone, want in (("lm_head.weight", "output.weight"),
+                           ("model.language_model.embed_tokens.weight", "token_embd.weight"),
+                           ("model.language_model.hyper_connection_mixer.hc_norm.weight", "output_hc_norm.weight"),
+                           (L + "0.linear_attn.in_proj_qkv.weight", "blk.0.attn_qkv.weight"),
+                           (L + "1.self_attn.q_norm.weight", "blk.1.attn_q_norm.weight"),
+                           (L + "1.self_attn.indexer.index_qk_proj.weight", "blk.1.indexer.k_proj.weight"),
+                           (L + "1.ple.key_proj.weight", "blk.1.ple_key.weight"),
+                           (L + "0.mlp.gate.weight", "blk.0.ffn_gate_inp.weight")):
+            with self.subTest(gone=gone):
+                with self.assertRaisesRegex(S.ConvertError, "lacks \\d+ tensors.*" + want.replace(".", "\\.")):
+                    C.CheckpointDense(C.Checkpoint(self.build(drop=(gone,))))
+
+    def test_layer_beyond_the_config_is_refused(self):
+        d = self.build()
+        p = d / "model-00001-of-00001.safetensors"
+        t = {k: v for k, v in self.tensors().items()}
+        t["model.language_model.layers.2.mlp.gate.weight"] = ("BF16", (64,), bytes(128))
+        write_safetensors(p, t)
+        with self.assertRaisesRegex(S.ConvertError, "2 layers"):
+            C.CheckpointDense(C.Checkpoint(d))
 
 
 class TruncationTest(unittest.TestCase):
