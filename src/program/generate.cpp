@@ -1381,11 +1381,11 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
     // if memory runs out the kernel ends this process first, not the rest of the machine
     if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) { std::fputs("1000", f); std::fclose(f); }
-    // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With lazy
-    // loading, a kernel first used mid-prompt would find no VRAM left for its code and the engine would end ("out of
-    // memory: cudaFuncSetAttribute").
+    // Kernels load on first use: loading every kernel of the engine and of cuBLAS at context creation holds a few
+    // hundred MiB of device memory for code that never runs.  The expert cache's sizing keeps back room for what loads
+    // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load.
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
-        setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+        setenv("CUDA_MODULE_LOADING", "LAZY", 0);
     }
     Options o;
     std::string ppl_base, ppl_out;
@@ -3345,6 +3345,13 @@ int main(int argc, char** argv) {
         // a server allocates its verify windows after the cache is sized: they come out of the reserve too, so the
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;
+        // the kernels that first run after the cache is sized (the prompt path's, the verify windows') load into the
+        // reserve when modules load lazily
+        {
+            const char* ml = std::getenv("CUDA_MODULE_LOADING");
+            constexpr int64_t kLazyKernelsMib = 96;
+            if (ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
+        }
         // the deferred checkpoint copy's spare device buffer is allocated after the cache, so it comes out of the reserve
         if (o.serve && o.prompt_cache > 0 && !multi_gpu) {
             basalt::core::ConversationStateSizes zc;
