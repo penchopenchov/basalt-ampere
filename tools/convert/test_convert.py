@@ -18,7 +18,7 @@ import convert  # noqa: E402
 import ggufq  # noqa: E402
 import model_sections as S  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402
-from model_file import ModelFile  # noqa: E402
+from model_file import ModelFile, ModelWriter  # noqa: E402
 
 N_EXPERT, N_LAYERS = 4, 2
 TOKENS = ["a", "b", "c", "d", "e", "f"]
@@ -435,6 +435,68 @@ class PleFp8Test(unittest.TestCase):
             self.assertEqual(len(got), ple.nbytes)
             want = b"".join(S.fp8_rows_to_q8_0(a, ple.scale) for a in shards)
             self.assertEqual(got, want)
+
+
+class Q6KRequantTest(unittest.TestCase):
+    """Q6_K blocks decode (through the reference dequantizer) to within the 6-bit error of their source, and a pack
+    rewrite changes only the Q8_0 projections it can."""
+
+    def dequant(self, blob: bytes) -> np.ndarray:
+        return ggufq.dequantize(np.frombuffer(blob, dtype=np.uint8), ggufq.GGMLQuantizationType.Q6_K).reshape(-1)
+
+    def test_error_bound(self):
+        rng = np.random.default_rng(3)
+        x = (rng.standard_normal((64, 512)) * 0.02).astype(np.float32)
+        x[3, :256] = 0.0
+        x[4, 7] = 0.5
+        got = S.q6_k(x)
+        self.assertEqual(len(got), 64 * 2 * S.Q6K_BYTES)
+        deq = self.dequant(got).reshape(x.shape)
+        err = deq - x
+        self.assertLess(np.sqrt((err ** 2).mean()), 0.025 * x.std())
+        blk = np.abs(x).reshape(-1, 256).max(axis=1)
+        self.assertTrue((np.abs(err).reshape(-1, 256).max(axis=1) <= blk * 0.035 + 1e-7).all())
+        np.testing.assert_array_equal(deq[3, :256], 0.0)
+
+    def test_from_q8_0_is_within_both_steps(self):
+        rng = np.random.default_rng(4)
+        x = (rng.standard_normal((8, 256)) * 0.05).astype(np.float32)
+        q8 = S.q8_0(x)
+        vals = S.q8_0_values(np.frombuffer(q8, dtype=np.uint8)).reshape(x.shape)
+        self.assertLessEqual(np.abs(vals - x).max(), np.abs(x).max() / 127 * 0.51)
+        deq = self.dequant(S.q6_k(vals)).reshape(x.shape)
+        self.assertLess(np.sqrt(((deq - x) ** 2).mean()), 0.025 * x.std())
+
+    def test_pack_rewrite(self):
+        rng = np.random.default_rng(5)
+        a = (rng.standard_normal((6, 512)) * 0.03).astype(np.float32)       # blk.0.attn_qkv: ne0 512, 6 rows
+        b = (rng.standard_normal((4, 160)) * 0.03).astype(np.float32)       # blk.0.attn_k: rows not whole blocks
+        qa, qb = S.q8_0(a), S.q8_0(b)
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            w = ModelWriter(str(t / "base.basalt"))
+            w.add_bytes("dense", b"d" * 100)
+            offs = w.add_parts("gguf", [qa, qb], 32)
+            w.add_bytes("experts", b"e" * 300)
+            tens = {"blk.0.attn_qkv.weight": {"type": "Q8_0", "type_id": 8, "shape": [512, 6], "bytes": len(qa), "offset": offs[0]},
+                    "blk.0.attn_k.weight": {"type": "Q8_0", "type_id": 8, "shape": [160, 4], "bytes": len(qb), "offset": offs[1]}}
+            w.add_bytes("meta", json.dumps({"tensors": tens}).encode())
+            w.close()
+            out = t / "out.basalt"
+            args = type("A", (), {"out": str(out), "requant_dense_q6k": str(t / "base.basalt"), "checkpoint": None,
+                                  "workers": 2, "force": False})
+            convert.requant_dense(args)
+            m = ModelFile(str(out))
+            meta = json.loads(m.read("meta"))
+            self.assertEqual(m.read("dense"), b"d" * 100)
+            self.assertEqual(m.read("experts"), b"e" * 300)
+            ta, tb = meta["tensors"]["blk.0.attn_qkv.weight"], meta["tensors"]["blk.0.attn_k.weight"]
+            self.assertEqual((ta["type"], ta["type_id"], ta["bytes"]), ("Q6_K", 14, 6 * 2 * S.Q6K_BYTES))
+            self.assertEqual(tb["type"], "Q8_0")
+            g = m.read("gguf")
+            self.assertEqual(g[tb["offset"]:tb["offset"] + tb["bytes"]], qb)
+            deq = self.dequant(g[ta["offset"]:ta["offset"] + ta["bytes"]]).reshape(a.shape)
+            self.assertLess(np.sqrt(((deq - a) ** 2).mean()), 0.03 * a.std())
 
 
 if __name__ == "__main__":

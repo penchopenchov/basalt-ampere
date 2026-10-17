@@ -636,3 +636,129 @@ class PleFp8:
         import multiprocessing
         with multiprocessing.Pool(workers) as pool:
             yield from pool.imap(_ple_job, self.jobs(), chunksize=1)
+
+
+# ------------------------------------------------------------------ Q6_K requantization of the dense projections
+Q6K_BLOCK, Q6K_BYTES = 256, 210
+
+
+def q6_k(x: np.ndarray) -> bytes:
+    """Q6_K blocks of 256 over a float32 array (length a multiple of 256): per 16-value group the least-squares
+    scale from the signed-max starting grid, 8-bit group scales against one fp16 super-scale, values re-rounded
+    against the scales as stored. The layout is ggml block_q6_K."""
+    nb = x.size // Q6K_BLOCK
+    x = np.ascontiguousarray(x, dtype=np.float32).reshape(nb, 16, 16)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mx = np.take_along_axis(x, np.abs(x).argmax(-1)[..., None], -1)[..., 0]
+        start = np.where(mx != 0, -32.0 / np.where(mx == 0, 1, mx), 0.0)
+        l = np.clip(np.rint(x * start[..., None]), -32, 31)
+        den, num = (l * l).sum(-1), (x * l).sum(-1)
+        scale = np.where(den > 0, num / np.where(den == 0, 1, den), 0.0)
+        smax = np.take_along_axis(scale, np.abs(scale).argmax(-1)[..., None], -1)[..., 0]
+        d = smax / 127.0
+        d16 = d.astype(np.float16)
+        sc = np.clip(np.rint(scale / np.where(d == 0, 1, d)[..., None]), -128, 127)
+        eff = d16.astype(np.float32)[..., None] * sc
+        q = np.where(eff[..., None] != 0, np.rint(x / np.where(eff == 0, 1, eff)[..., None]), 0)
+    q = np.clip(q, -32, 31).astype(np.int32) + 32
+    q = q.reshape(nb, 2, 4, 32)
+    ql = np.empty((nb, 2, 64), np.uint8)
+    ql[..., :32] = (q[:, :, 0] & 15) | ((q[:, :, 2] & 15) << 4)
+    ql[..., 32:] = (q[:, :, 1] & 15) | ((q[:, :, 3] & 15) << 4)
+    qh = (q[:, :, 0] >> 4) | ((q[:, :, 1] >> 4) << 2) | ((q[:, :, 2] >> 4) << 4) | ((q[:, :, 3] >> 4) << 6)
+    out = np.empty((nb, Q6K_BYTES), np.uint8)
+    out[:, 0:128] = ql.reshape(nb, 128)
+    out[:, 128:192] = qh.astype(np.uint8).reshape(nb, 64)
+    out[:, 192:208] = sc.astype(np.int8).view(np.uint8).reshape(nb, 16)
+    out[:, 208:210] = d16.view(np.uint8).reshape(nb, 2)
+    return out.tobytes()
+
+
+# Q8_0 dense tensors of a pack that move to Q6_K: GGUF name pattern -> checkpoint name under `layers.N.`.
+Q6K_TARGETS = [
+    (re.compile(r"blk\.(\d+)\.attn_qkv\.weight"), "linear_attn.in_proj_qkv"),
+    (re.compile(r"blk\.(\d+)\.attn_gate\.weight"), "linear_attn.in_proj_z"),
+    (re.compile(r"blk\.(\d+)\.ssm_out\.weight"), "linear_attn.out_proj"),
+    (re.compile(r"blk\.(\d+)\.ffn_gate_shexp\.weight"), "mlp.shared_expert.gate_proj"),
+    (re.compile(r"blk\.(\d+)\.ffn_up_shexp\.weight"), "mlp.shared_expert.up_proj"),
+    (re.compile(r"blk\.(\d+)\.ffn_down_shexp\.weight"), "mlp.shared_expert.down_proj"),
+    (re.compile(r"blk\.(\d+)\.attn_q\.weight"), "self_attn.q_proj"),
+    (re.compile(r"blk\.(\d+)\.attn_k\.weight"), "self_attn.k_proj"),
+    (re.compile(r"blk\.(\d+)\.attn_v\.weight"), "self_attn.v_proj"),
+    (re.compile(r"blk\.(\d+)\.attn_output\.weight"), "self_attn.o_proj"),
+]
+Q6K_VALUES_PER_JOB = 1 << 22
+
+
+def q6k_target(name: str, info: dict):
+    """The checkpoint tensor name for a Q8_0 dense tensor that can move to Q6_K, else None (rows must be whole blocks)."""
+    if info["type"] != "Q8_0" or info["shape"][0] % Q6K_BLOCK:
+        return None
+    for rx, hf in Q6K_TARGETS:
+        m = rx.fullmatch(name)
+        if m:
+            return f"model.language_model.layers.{m.group(1)}.{hf}.weight"
+    return None
+
+
+def q8_0_values(raw: np.ndarray) -> np.ndarray:
+    b = raw.reshape(-1, 34)
+    return b[:, :2].copy().view(np.float16).astype(np.float32) * b[:, 2:].view(np.int8).astype(np.float32)
+
+
+def _q6k_job(args):
+    """One row range: its Q6_K bytes, and the largest distance between the Q8_0 values and the BF16 source in Q8_0 steps."""
+    pack, off, ne0, row0, rows, st_path, st_off = args
+    raw = np.fromfile(pack, dtype=np.uint8, count=rows * ne0 // 32 * 34, offset=off + row0 * ne0 // 32 * 34)
+    q8 = q8_0_values(raw).reshape(rows, ne0)
+    if st_path is None:
+        return q6_k(q8), 0.0
+    u = np.fromfile(st_path, dtype="<u2", count=rows * ne0, offset=st_off + 2 * row0 * ne0)
+    src = _bf16_to_f32(u).reshape(rows, ne0)
+    step = np.abs(src).reshape(-1, 32).max(axis=1) / 127.0
+    err = np.abs(q8 - src).reshape(-1, 32).max(axis=1)
+    return q6_k(src), float((err / np.maximum(step, 1e-30)).max())
+
+
+class DenseQ6K:
+    """Q6_K stand-ins for the Q8_0 dense projections of a pack, quantized from the checkpoint's BF16 tensors when
+    `checkpoint` (a directory of safetensors shards) is given, else from the pack's own Q8_0 values. Each BF16
+    tensor is checked against the pack's Q8_0 copy: a name or layout mismatch shows as a distance above one step."""
+
+    def __init__(self, tensors: dict, checkpoint=None):
+        hf = {}
+        if checkpoint:
+            for p in sorted(pathlib.Path(checkpoint).glob("model-0*.safetensors")):
+                head, base = read_safetensors_header(p)
+                for k, t in head.items():
+                    if k != "__metadata__":
+                        hf[k] = (str(p), base + t["data_offsets"][0], t["dtype"], t["shape"])
+        self.plan = {}
+        for n, info in tensors.items():
+            want = q6k_target(n, info)
+            if want is None:
+                continue
+            src = hf.get(want)
+            if checkpoint and (src is None or src[2] != "BF16" or list(reversed(info["shape"])) != src[3]):
+                raise ConvertError(f"{n}: no matching BF16 tensor {want} in {checkpoint}")
+            self.plan[n] = src
+        self.worst = 0.0
+
+    @staticmethod
+    def nbytes(info: dict) -> int:
+        return info["shape"][0] // Q6K_BLOCK * Q6K_BYTES * info["shape"][1]
+
+    def jobs(self, name, info, pack, gguf_off):
+        ne0, ne1 = info["shape"]
+        step = max(1, Q6K_VALUES_PER_JOB // ne0)
+        src = self.plan[name]
+        for r in range(0, ne1, step):
+            yield (pack, gguf_off + info["offset"], ne0, r, min(step, ne1 - r),
+                   src[0] if src else None, src[1] if src else 0)
+
+    def chunks(self, name, info, pack, gguf_off, pool):
+        for blob, worst in pool.imap(_q6k_job, self.jobs(name, info, pack, gguf_off), chunksize=1):
+            self.worst = max(self.worst, worst)
+            if worst > 1.05:
+                raise ConvertError(f"{name}: the BF16 source is {worst:.2f} Q8_0 steps from the pack's copy")
+            yield blob

@@ -16,6 +16,12 @@ Inputs
                      with neither option the ranking is the plain fill order
   --hc8 FILE         8-bit hyper-connection copies from `--dump-hc8`; without them the engine quantizes at every start
 
+Dense requantization
+    python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
+  Every Q8_0 dense projection whose rows are whole 256-value blocks (GDN qkv/z/out, attention q/k/v/o, the shared
+  experts' gate and up) is written as Q6_K; everything else is copied byte for byte. --checkpoint DIR quantizes from the
+  BF16 shards (each tensor is checked against the Q8_0 copy in PACK); without it the Q8_0 values are requantized.
+
 Options
   --name NAME        the model's name, reported by the server
   --compat-bf16      convert small projections stored in another form to BF16 (round-to-nearest-even, recorded in
@@ -43,7 +49,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))   # for model_file, gguf_reader, tokenizer
 import model_sections as S  # noqa: E402
-from model_file import TENSOR_ALIGN, ModelWriter  # noqa: E402
+from model_file import TENSOR_ALIGN, ModelFile, ModelWriter, Stream  # noqa: E402
 
 FINGERPRINT_BYTES = 64 << 20
 
@@ -296,9 +302,87 @@ def warn_unofficial():
     print(msg, file=sys.stderr, flush=True)
 
 
+def requant_dense(a) -> None:
+    """BASE with its Q8_0 dense projections written as Q6_K; every other section and tensor is copied byte for byte."""
+    import multiprocessing
+    out, src = Path(a.out), Path(a.requant_dense_q6k)
+    partial = Path(str(out) + ".partial")
+    if out.exists() and not a.force:
+        die(f"{out} exists (use --force to overwrite)")
+    if not src.is_file():
+        die(f"missing input: {src}")
+    if a.checkpoint and not Path(a.checkpoint).is_dir():
+        die(f"missing input: {a.checkpoint}")
+    base = ModelFile(str(src))
+    meta = json.loads(base.read("meta"))
+    gguf_off, _ = base.section("gguf")
+    tensors = meta["tensors"]
+    try:
+        plan = S.DenseQ6K(tensors, a.checkpoint)
+    except S.ConvertError as e:
+        die(str(e))
+    if not plan.plan:
+        die(f"{src} has no Q8_0 dense projection to requantize")
+    order = sorted(tensors, key=lambda n: tensors[n]["offset"])
+    if partial.exists():
+        partial.unlink()
+    w = ModelWriter(str(partial))
+    job = Job(w)
+    ok = False
+    try:
+        with multiprocessing.Pool(a.workers) as pool:
+            for name in base.names():
+                if name == "meta":
+                    continue
+                if name != "gguf":
+                    off, size = base.section(name)
+                    job.file(name, src, off, size)
+                    continue
+                t = time.time()
+                parts, sizes = [], {}
+                for n in order:
+                    info = tensors[n]
+                    if n in plan.plan:
+                        sizes[n] = plan.nbytes(info)
+                        parts.append(Stream(sizes[n], plan.chunks(n, info, str(src), gguf_off, pool)))
+                    else:
+                        sizes[n] = info["bytes"]
+                        parts.append((str(src), gguf_off + info["offset"], info["bytes"]))
+                offs = w.add_parts("gguf", parts, TENSOR_ALIGN)
+                job._report("gguf", w.entries[-1][2], time.time() - t)
+            new = {n: dict(tensors[n]) for n in tensors}
+            for n, o in zip(order, offs):
+                new[n]["offset"] = o
+                if n in plan.plan:
+                    new[n].update({"type": "Q6_K", "type_id": 14, "bytes": sizes[n]})
+            meta["tensors"] = new
+            meta["converter"] = {"tool": "tools/convert/convert.py", "git": git_rev()}
+            meta["dense_requant"] = {
+                "from": {"path": src.name, "size": src.stat().st_size,
+                         "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src)},
+                "to": "Q6_K", "source": "checkpoint BF16" if a.checkpoint else "pack Q8_0 values (two roundings)",
+                "tensors": sorted(plan.plan), "max_bf16_to_q8_0_steps": plan.worst,
+                "method": "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale"}
+            job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        w.close()
+        ok = True
+    except S.ConvertError as e:
+        die(str(e))
+    finally:
+        if not ok:
+            try:
+                w.f.close()
+            except OSError:
+                pass
+            partial.unlink(missing_ok=True)
+    os.replace(partial, out)
+    print(f"done: {len(job.rows)} sections, {len(plan.plan)} tensors to Q6_K, {out.stat().st_size / (1 << 30):.3f} GiB,"
+          f" max BF16-to-Q8_0 distance {plan.worst:.3f} steps -> {out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--gguf", required=True, action="append", metavar="FILE",
+    ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
@@ -313,8 +397,19 @@ def main():
     ap.add_argument("--compat-bf16", action="store_true",
                     help="convert small projections stored in another form to BF16 (rounds)")
     ap.add_argument("--no-vision", action="store_true")
+    ap.add_argument("--requant-dense-q6k", metavar="PACK.basalt",
+                    help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
+    ap.add_argument("--checkpoint", metavar="DIR", help="with --requant-dense-q6k: quantize from this checkpoint's BF16 shards")
+    ap.add_argument("--workers", type=int, default=16, help="with --requant-dense-q6k: quantizer processes")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     a = ap.parse_args()
+    if a.requant_dense_q6k:
+        if a.gguf:
+            ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
+        requant_dense(a)
+        return
+    if not a.gguf:
+        ap.error("--gguf is required")
     if not a.no_vision and not a.mmproj:
         ap.error("--mmproj is required unless --no-vision")
     warn_unofficial()
