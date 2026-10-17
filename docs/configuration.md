@@ -34,24 +34,27 @@ There are two kinds of setting:
 - **Server options** belong to the Python server: model path, address, port, slots, vision, logging. On the command line
   they are `--name value`.
 - **Engine flags** belong to the engine binary (`bin/basalt --help`): context, KV format, expert cache, prefill,
-  speculation. The server passes them on. Put them on the command line like any other flag (`--kv int8`); the server
-  recognises them by asking the engine binary which flags it accepts, and stops at startup on one it does not know.
+  speculation. The server passes them on. Put them on the command line like any other flag (`--kv int8`). The server passes
+  them to the engine as typed, in order, and does not interpret their values, so a flag that takes several values
+  works too (`--control-vector-layer-range 4 44`). It asks the engine binary which flags it accepts, and stops at
+  startup on a flag name it does not know.
 
 A config file is one JSON object with two optional blocks:
 
 ```json
 {
   "server": { "model": "model.basalt", "port": 8080 },
-  "engine": { "kv": "int8", "resident-experts": true }
+  "engine": { "kv": "int8", "resident-experts": true, "control-vector-layer-range": [4, 44] }
 }
 ```
 
 - Keys are the flag names without the dashes (`_` works for `-`). Values are strings or numbers; a switch is `true`, and
   `false` leaves it off. A repeatable option (`allowed-host`, `cors-origin`) takes a list.
 - `model` and `tokenizer` paths are relative to the config file.
-- **Precedence:** command line > config file > built-in defaults.
-- Five engine flags are also accepted as server options on the command line: `spec`, `spec-min-p`, `mtp-max-t`,
-  `peer-exclusive` and `max-context`. In a config file they go in the `engine` block; an engine flag in `server`, or a
+- **Precedence:** command line > config file > built-in defaults. The engine receives the config file's flags, then
+  the command line's, and a flag given twice takes its last value.
+- `spec`, `spec-min-p`, `mtp-max-t`, `peer-exclusive` and `max-context` are ordinary engine flags: on the command line
+  they pass through like any other, and in a config file they go in the `engine` block. An engine flag in `server`, or a
   server option in `engine`, stops the server at startup, as does an unknown name.
 - `api-key` cannot be set in a config file; a file that sets it is refused.
 - The built-in defaults are untuned (4096 context, fp16 KV, no speculation, no expert cache). A config file is how
@@ -86,7 +89,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | --- | --- | --- | --- | --- |
 | `gpu` | server | list of GPU numbers, e.g. `"0"` or `"0,1"` | every visible GPU | The cards to use, numbered as `nvidia-smi` numbers them. The first runs the model. A second card becomes the peer expert tier. Set it to keep other cards free or to pick which card is the main one. |
 | `peer-device` | engine | integer | the server sets `1` when two or more cards are visible | A second GPU as an adaptive expert-cache tier: it holds experts and computes their prompt rows. Rarely set by hand; `gpu` does it. Not with `layer-split` or `expert-cache-device1..3`. |
-| `peer-exclusive` | engine, server | switch | off | The peer card's experts live only there, not also in RAM. Uses less RAM, prefill is slower. Needs `resident-experts`. |
+| `peer-exclusive` | engine | switch | off | The peer card's experts live only there, not also in RAM. Uses less RAM, prefill is slower. Needs `resident-experts`. |
 | `peer-reserve-mib` | engine | integer MiB | 600 | VRAM the peer tier leaves free on its card. |
 | `peer-slots` | engine | integer | as many as fit | Expert slots on the peer card. Lower it to leave the card room for something else. |
 | `peer-prefill-rows` | engine | integer | half of chunk x top-k | Prompt rows per layer the peer computes. `0` keeps the prompt path on the main card. |
@@ -97,7 +100,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `max-context` | engine, server | integer tokens | 4096 | The longest context the engine allows. Raise it for long prompts; the KV cache grows with it. With `parallel`, this is shared by the slots. |
+| `max-context` | engine | integer tokens | 4096 | The longest context the engine allows. Raise it for long prompts; the KV cache grows with it. With `parallel`, this is shared by the slots. |
 | `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | KV storage. `int8` halves the VRAM. `q4_0` is 4-bit after a Hadamard rotation, half of `int8` again, slightly lower precision. `k8v4` keeps K in int8 and V in rotated 4-bit (816 B per cell against `int8`'s 1056); not with `kv-resident`. Use `int8` for long contexts; go lower when VRAM is short. See [precision.md](precision.md). |
 | `kv-resident` | engine | integer cells, minimum 20480, or `0` | 0 (all KV in VRAM) | Keep only this many cells of each attention layer's KV in VRAM and the whole K/V in pinned RAM; the freed VRAM goes to expert slots. A context that fits in N cells is not streamed. For very long contexts on a small card. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | the model file's, else `none` | Extend the context past the trained length. Fixed for the run: K in the cache is stored after RoPE. |
@@ -149,9 +152,9 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `spec` | engine, server | integer; `0` or `1` = off | 0 (no speculation, the drafter is not loaded) | The verify window: the last accepted token plus N-1 drafts. The model file does not set it; give it in the config or on the command line (7 is a good start) to turn speculation on. |
-| `spec-min-p` | engine, server | number 0..1 | 0 (always draft to the cap; not set by the model file) | The drafter's cutoff: a draft enters the window only while it, and every draft before it, has at least this probability under the drafter. Higher values draft fewer, surer tokens. This is not the sampling `min_p` below. |
-| `mtp-max-t` | engine, server | integer | 0 (= `spec`) | Cap on the drafter's own window; longer windows then come from `suffix-draft` matches. |
+| `spec` | engine | integer; `0` or `1` = off | 0 (no speculation, the drafter is not loaded) | The verify window: the last accepted token plus N-1 drafts. The model file does not set it; give it in the config or on the command line (7 is a good start) to turn speculation on. |
+| `spec-min-p` | engine | number 0..1 | 0 (always draft to the cap; not set by the model file) | The drafter's cutoff: a draft enters the window only while it, and every draft before it, has at least this probability under the drafter. Higher values draft fewer, surer tokens. This is not the sampling `min_p` below. |
+| `mtp-max-t` | engine | integer | 0 (= `spec`) | Cap on the drafter's own window; longer windows then come from `suffix-draft` matches. |
 | `suffix-draft` | engine | integer tokens | 3 (`0` = drafter only) | Draft from an earlier repeat of the last N or more tokens of context (code edits, quoted text, tool-call JSON) when that is likelier to pay than the drafter. |
 | `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision.md](precision.md#relaxed-drafting). |
 
