@@ -286,7 +286,7 @@ endif()
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
 # ids, so a tokenizer is never on one side of a logit comparison.
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
-add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/gdn_chunked.cu src/prefill/prefill.cpp)
 target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
@@ -408,11 +408,12 @@ add_executable(iq_multi_parity src/kernels/iq_multi_parity.cpp)
 target_include_directories(iq_multi_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(iq_multi_parity PRIVATE kernels ${_gpu_runtime_target})
 add_test(NAME iq_multi_parity COMMAND iq_multi_parity)
-# the prompt path's DeltaNet recurrence: gdn_rec_kh_kernel against gdn_rec_cols_pipe_kernel, bitwise (GPU,
-# synthetic, no model; --bench adds timings).  NVIDIA only: cp.async and the CUDA occupancy API
-add_executable(gdn_rec_parity src/prefill/gdn_rec_parity.cu)
-target_link_libraries(gdn_rec_parity PRIVATE ${_gpu_runtime_target})
-add_test(NAME gdn_rec_parity COMMAND gdn_rec_parity)
+# the prompt path's chunked DeltaNet recurrence against the token-serial kernel before it and a double-precision
+# CPU reference, output and state (GPU, synthetic, no model; --bench adds timings)
+add_executable(gdn_chunk_parity src/prefill/gdn_chunk_parity.cu)
+target_link_libraries(gdn_chunk_parity PRIVATE prefill ${_gpu_runtime_target})
+target_include_directories(gdn_chunk_parity PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity)
 # the hyper-connection reads and prompt-path products on matrices held only as 8-bit copies
 # against the bf16 ones (GPU, synthetic, no model; --bench adds timings)
 add_executable(hc8_parity src/kernels/hc8_parity.cpp)
