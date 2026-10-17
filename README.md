@@ -121,7 +121,8 @@ each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
 solo session of the same length, come out of the expert cache.
 
-On one GPU (not with `--kv-resident` or `--vram-elastic`) the KV cache is elastic: each session backs its first 32768
+With `--max-context` above 32768 the KV cache is elastic (not when the model is split over GPUs with `--layer-split`, a peer
+card is fine, and not with `--kv-resident` or `--vram-elastic`): each session backs its first 32768
 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables and the draft layer's K/V alike), and the
 rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
 those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
@@ -136,7 +137,7 @@ arrives while no other slot is decoding is read as in the single-stream path.
 
 At startup the server prints one `[server] kv cache:` line per device with all the session state placed there, for
 example `12.5 GiB on cuda2 (solo 262144 tokens + 2 slots x 262144 tokens + draft K/V 0.5 GiB)`. With elastic KV (the
-default on one GPU) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
+default for a server whose `--max-context` is above 32768) it reads `0.6 / 4.4 GiB on cuda0 (elastic)`: the memory backed at startup, and what the cache can
 grow to at `--max-context`. Because that memory is
 taken from the expert cache, the engine warns (`basalt warning: the N batch slots' sessions ... take X GiB of CUDA0
 ...`) when it leaves the cache short of the expert set, or at under half of what it would hold without the slots, and
@@ -182,8 +183,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - `--vram-reserve-mib` below 256 is refused at startup: with less VRAM free once everything is loaded, a later
   allocation can make the driver page GPU memory and requests stall.
 - When some experts are read from the SSD (they fit in neither the GPUs nor the RAM copy), the RAM copy leaves a
-  floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus 3.5 GiB plus two layers'
-  experts, which is what one prompt chunk reads from the file. The startup line `RAM floor ...` gives the figures.
+  floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus the larger of 3.5 GiB plus two layers'
+  experts (what one prompt chunk reads from the file) and 4 GiB. The startup line `RAM floor ...` gives the figures.
   When every expert has a place, only the margin is kept, as before.
 - A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the
   model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
@@ -200,16 +201,16 @@ Image input is one server option, `--vision off | on | peer | dynamic | cpu` (co
 `server` section). It is `off` by default. The encoder is Basalt's own and shares its kernels in every mode, so all
 five give bitwise identical embeddings.
 
-| mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W) |
+| mode | where the encoder runs | VRAM cost | fresh-image latency (IQ3_S, 400 W, earlier build) |
 | --- | --- | --- | --- |
 | `off` | no image input | none | |
 | `on` | sidecar `bin/basalt-vision` on the main GPU, always loaded | about 2.2 GiB of the main card's expert cache | TTFT 0.77 s at 1k image tokens, 1.4 s at 3k, 1.8 s at 4k |
-| `peer` | the same sidecar on the second `--gpu` card | about 1.8 GiB of the peer card's cache, none on the main card | 0.86 s, 2.1 s, 2.9 s |
-| `dynamic` | inside the engine, on the main GPU | none at rest (0.87 GiB of pinned RAM) | 0.77 s, 1.45 s, 1.8 s |
+| `peer` | the same sidecar on the second `--gpu` card | part of the peer card's cache, none on the main card | 0.86 s, 2.1 s, 2.9 s |
+| `dynamic` | inside the engine, on the main GPU | none at rest (0.85 GiB of pinned RAM) | 0.77 s, 1.45 s, 1.8 s |
 | `cpu` | sidecar on the CPU | none | about 6 s at 1k, 40 s at 3k, 70 s at 4k |
 
-`dynamic` borrows up to 1.55 GiB of expert-cache slots per image (the prompt path's lend), uploads the weights from the
-pinned copy (about 30 ms), encodes on a side stream, and refills the same slots from RAM (about 60 ms), so the cache is
+`dynamic` borrows expert-cache slots per image (the prompt path's lend), uploads the weights from the
+pinned copy (about 30 ms), encodes on a side stream, and refills the same slots from RAM (about 70 ms), so the cache is
 identical afterwards. Other `--parallel` slots pause for the encode. An image already seen is served from the
 encoder cache in tens of milliseconds in every mode. `peer` on a single GPU warns and loads the encoder on that GPU;
 with two cards, `on` says so at startup and names `peer` as the way to put it on the second card.
@@ -238,9 +239,10 @@ projector, and the default sampling. It carries no engine flags: those come from
   sampling, provenance and license), `tokenizer/*`, `dense`, `experts` and `experts.layout` (the routed
   experts, laid out per layer), `gguf` (every non-expert source tensor), `mtp/*` (the drafter), `profile`, `hc8` and
   `vision/*`. The authoritative description is [include/basalt/core/model_format.hpp](include/basalt/core/model_format.hpp).
-- **No requantization:** tensors are copied byte for byte from the source GGUF. The exceptions are `--compat-bf16`,
+- **Weights as published:** a pack built from a GGUF copies every tensor byte for byte, except with `--compat-bf16`,
   for GGUFs that store the small projections the engine reads as BF16 in another type (it converts them and records
-  that in `meta`), and the official NVFP4 pack's 6-bit dense projections ([below](#nvfp4-pack)).
+  that in `meta`). The NVIDIA NVFP4 pack keeps NVIDIA's NVFP4 experts bit for bit and quantizes its dense tensors once
+  from BF16 ([below](#nvfp4-pack)).
 
 Build one from the source GGUF shards (give shard 1; the others are found beside it):
 
@@ -254,7 +256,8 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 ## Models
 
 Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt). A pack
-you convert yourself will be significantly slower than the official `.basalt` files.
+you convert yourself from a GGUF, without the official files' expert profile, hc8 copies and tuned drafter, will be
+significantly slower than the official `.basalt` files. The NVFP4 file can be rebuilt exactly as [below](#nvfp4-pack).
 
 Quality measured with `basalt-bench --quality`: 20 chunks of wikitext-2 (512 tokens each), scored through the decode
 path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer to Q8_0. How precision is handled and how quality is measured:
@@ -273,6 +276,8 @@ path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer
 | NVIDIA NVFP4, 6-bit dense (official, [below](#nvfp4-pack)) | [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), converted by Basalt's converter | 122.0 GiB | 63.3 GiB | | | |
 | Q8_0 | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 178.3 GiB | 119.5 GiB | 2.282 | reference | |
 
+The NVFP4 row has no 20-chunk run yet; its 100-chunk numbers are in the NVFP4 section below.
+
 The IQ3_S, IQ3_XXS and Q2_0 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
 raises draft acceptance. Output is unchanged, because verify decides every token. Q4_K_XL and Q8_0 keep the original
 MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's raw bytes, checked against the
@@ -285,7 +290,7 @@ The official NVFP4 file is NVIDIA's NVFP4 checkpoint
 ([nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), revision `fc694b54`,
 quantized by NVIDIA Model Optimizer from Qwen's BF16 weights) with one change made for speed: the dense projections are
 stored as 6-bit Q6_K instead of 8-bit Q8_0. 6-bit dense weights take the tensor-core dense path in decode, which Q8_0
-dense weights do not (they fall back to the slower mmvq kernel), and they move about 25% fewer dense bytes.
+dense weights do not (they fall back to the slower mmvq kernel), and they move about 22% fewer dense bytes (654 of 2,948 MiB).
 
 What the file holds, tensor group by tensor group:
 
@@ -306,8 +311,8 @@ and scales into Basalt's blocks without changing a bit, quantizes each dense pro
 of the norm weights into F32, puts the GDN value heads in the order the engine reads them, and writes the metadata and
 tokenizer from NVIDIA's `config.json`, tokenizer files and model card. `meta.checkpoint` records each step.
 
-Measured on an RTX 5090 at 400 W with the 5060 Ti as a peer card, alternating builds, 6 runs of each (development
-measurement):
+Measured on an RTX 5090 at 400 W with the 5060 Ti as a peer card, alternating the two packs on one build (ABBA, 6 fresh
+processes each; development measurement):
 
 | test | 8-bit dense, tok/s | 6-bit dense, tok/s | change |
 |---|---:|---:|---:|
@@ -317,13 +322,14 @@ measurement):
 | prefill | | | +1% |
 
 Quality has a price: against Q8_0 through the decode path (100 chunks, 400 W), 6-bit dense scores PPL 3.3081, mean KLD
-0.0680, p99 KLD 0.775 and 91.46% same top-1, where the 8-bit dense pack scores PPL 3.287-3.294, KLD 0.0612-0.0621 and
+0.0680, p99 KLD 0.775 and 91.46% same top-1 (median KLD 0.0150), where the 8-bit dense pack scores PPL 3.287-3.294, KLD 0.0612-0.0621 and
 91.8-91.9%. The paired KLD difference is +0.0063 (95% CI +0.0048 to +0.0077). On 4,096-token prompts the PPL goes from
 2.9547 to 2.9816. The tables and method are in [docs/precision.md](docs/precision.md).
 
 Build either variant yourself from NVIDIA's checkpoint. The base pack supplies only the drafter, vision projector and
-expert profile, copied byte for byte (the official file takes them from UD-Q4_K_XL), and its vocabulary must be
-NVIDIA's:
+expert profile (and its `hc8` copies if it has any), copied byte for byte. The official file takes them from
+UD-Q4_K_XL, which has no `hc8`, so the engine makes the hyper-connection copies from NVIDIA's weights; use a base
+without `hc8` for the same result. The base's vocabulary must be NVIDIA's:
 
 ```sh
 hf download nvidia/Qwen3.8-Flash-Next-NVFP4 --revision fc694b54 --local-dir nvidia
