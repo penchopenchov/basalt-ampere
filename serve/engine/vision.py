@@ -12,6 +12,8 @@ import urllib.request
 import queue
 from pathlib import Path
 
+from serve.engine.flags import flag_value
+
 # Reads of the encoder's pipe have a timeout: a read that never returns would hold the request turn for good.
 # Generous: a cold model load or a slow encode is not a hang. A silent encoder is killed and the next request
 # starts a fresh one.
@@ -258,8 +260,8 @@ def gpus_in_play(cfg: dict, args: list[str]) -> list[int]:
     """The nvidia-smi numbers of the GPUs the engine uses, its own card first, then the --peer-device card; [0] if none."""
     visible = gpu_list(cfg)
     out = visible[:1] or [0]
-    peer = next((a.split("=", 1)[1] for a in args if a.startswith("--peer-device=")),
-                args[args.index("--peer-device") + 1] if "--peer-device" in args[:-1] else None)
+    peer = next((a.split("=", 1)[1] for a in reversed(args) if a.startswith("--peer-device=")),
+                flag_value(args, "--peer-device"))
     if peer is not None and str(peer).strip().lstrip("-").isdigit() and int(peer) >= 0:
         ordinal = int(peer)
         out = out + [visible[ordinal] if ordinal < len(visible) else ordinal]

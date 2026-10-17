@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
+from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
 from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
@@ -113,12 +114,11 @@ class ProcessEngine:
     def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        self.model_path = flag_value(args, "--native") or flag_value(args, "--pack") or "pack/full"
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
-        self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.max_context = int(flag_value(args, "--max-context") or 4096)
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
         self.slot_drafts = {}
@@ -212,11 +212,11 @@ class ProcessEngine:
         # stdout is pumped on a thread so requests can wait with a timeout
         self.lines: queue.Queue = queue.Queue()
         # the engine reports the slots it actually runs (INFO batch_slots=N), possibly fewer than asked
-        asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
+        asked = next((int(v) for v in (flag_value(args, k) for k in ("--batch", "--slots")) if v), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
             print(f"[server] warning: {asked} parallel requests asked, the engine runs {self.batch or 'one'}", flush=True)
-        groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
+        groups = int(flag_value(args, "--batch-groups") or 1)
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
         # slot order that spreads requests over the groups first: 0, gs, 2gs, .., 1, gs+1, ..
