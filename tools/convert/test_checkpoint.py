@@ -221,6 +221,56 @@ class F16OverflowTest(unittest.TestCase):
                 dn.bytes("blk.0.ple_conv1d.weight")
 
 
+def expert_tensors(l, e, h=128, ff=64):
+    out = {}
+    for r, (rows, cols) in {"gate_proj": (ff, h), "up_proj": (ff, h), "down_proj": (h, ff)}.items():
+        p = f"model.language_model.layers.{l}.mlp.experts.{e}.{r}."
+        out[p + "weight"] = ("U8", (rows, cols // 2), bytes(rows * cols // 2))
+        out[p + "weight_scale"] = ("F8_E4M3", (rows, cols // 16), bytes(rows * cols // 16))
+        out[p + "weight_scale_2"] = ("F32", (), np.float32(1).tobytes())
+        out[p + "input_scale"] = ("F32", (), np.float32(1).tobytes())
+    return out
+
+
+class UnexpectedTensorTest(unittest.TestCase):
+    CFG = {"text_config": {"num_hidden_layers": 1, "num_experts": 2, "hidden_size": 128, "moe_intermediate_size": 64}}
+
+    def build(self, extra=None, other=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        tens = {**expert_tensors(0, 0), **expert_tensors(0, 1), **(extra or {})}
+        small_checkpoint(d, tens, self.CFG)
+        if other:
+            write_safetensors(d / "extra.safetensors", other)
+        return d
+
+    def test_complete_set_is_accepted(self):
+        C.CheckpointExperts(C.Checkpoint(self.build()))
+
+    def test_expert_index_out_of_range(self):
+        d = self.build(expert_tensors(0, 2))
+        with self.assertRaisesRegex(S.ConvertError, "unexpected expert tensor.*experts\\.2\\."):
+            C.CheckpointExperts(C.Checkpoint(d))
+
+    def test_layer_out_of_range(self):
+        d = self.build(expert_tensors(1, 0))
+        with self.assertRaisesRegex(S.ConvertError, "unexpected expert tensor"):
+            C.CheckpointExperts(C.Checkpoint(d))
+
+    def test_extra_expert_tensor(self):
+        k = "model.language_model.layers.0.mlp.experts.0.gate_proj.bias"
+        d = self.build({k: ("BF16", (2,), bytes(4))})
+        with self.assertRaisesRegex(S.ConvertError, "unexpected expert tensor"):
+            C.CheckpointExperts(C.Checkpoint(d))
+
+    def test_tensor_in_a_non_shard_file(self):
+        with self.assertRaisesRegex(S.ConvertError, "extra.safetensors.*dropped"):
+            C.Checkpoint(self.build(other={"lm_head.weight": ("BF16", (2,), bytes(4))}))
+        ok = {"model.language_model.layers.0.ple.ple_embedding.layer_multipliers": ("I64", (1,), bytes(8))}
+        C.Checkpoint(self.build(other=ok))
+
+
 class TruncationTest(unittest.TestCase):
     def test_short_file_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

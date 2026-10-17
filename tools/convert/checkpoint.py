@@ -59,6 +59,9 @@ class Checkpoint:
                 self.t[k] = (p, base + a, v["dtype"], list(v["shape"]), b - a)
                 if p in self.shards:
                     self.order.append(k)
+                elif not SKIP.match(k):
+                    raise S.ConvertError(f"{p.name} is not a model-NNNNN-of-NNNNN shard and holds {k}, which would be "
+                                         "dropped; only the n-gram table, drafter and vision tensors may live there")
 
     def raw(self, name) -> np.ndarray:
         p, off, _, _, n = self.t[name]
@@ -136,6 +139,12 @@ class CheckpointExperts:
         h, ff = int(tc["hidden_size"]), int(tc["moe_intermediate_size"])
         shapes = {"gate_proj": (ff, h), "up_proj": (ff, h), "down_proj": (h, ff)}
         self.blob = 2 * ff * S.nvfp4_row_bytes(h) + h * S.nvfp4_row_bytes(ff) + S.NVFP4_TAIL
+        known = {f"{r}.{k}" for r in self.ROLES for k in ("weight", "weight_scale", "weight_scale_2", "input_scale")}
+        for k in ck.t:
+            m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(.+)", k)
+            if m and (int(m.group(1)) >= self.n_layers or int(m.group(2)) >= self.n_expert or m.group(3) not in known):
+                raise S.ConvertError(f"unexpected expert tensor {k} (the model has {self.n_layers} layers of "
+                                     f"{self.n_expert} experts)")
         self.entries = []
         for l in range(self.n_layers):
             layer = []
