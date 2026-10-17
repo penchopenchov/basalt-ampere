@@ -265,6 +265,17 @@ class ConvertTest(unittest.TestCase):
         for flag in ("--gguf", "--mtp-source", "--mtp-dense", "--mmproj", "--profile-from", "--profile ", "--hc8", "--draft-vocab"):
             self.assertIn(flag, r.stdout)
 
+    def test_checkpoint_path_takes_mtp_dense_only(self):
+        run = lambda *x: subprocess.run([sys.executable, str(Path(convert.__file__)), "--sections-from", str(self.t / "b"),
+                                         "--checkpoint", str(self.t), "--out", str(self.t / "o"), *x],
+                                        capture_output=True, text=True)
+        r = run("--mtp-dense", str(self.t / "missing.bin"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("missing input", r.stderr)
+        r = run("--mtp-source", str(self.t))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--mtp-dense", r.stderr)
+
 
 class DrafterTest(unittest.TestCase):
     """The draft layer's sections at tiny dimensions."""
