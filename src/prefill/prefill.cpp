@@ -700,13 +700,21 @@ bool fp4_every_layer() {
     }();
     return all;
 }
+// Rows of GU and H a group's products hold at once.  The FP4 path indexes them by the group's own rows and splits a
+// group above this cap (an expert has at most T rows); a chunk below FP4_MIN_TOKENS runs MMQ, which indexes them by
+// the layer's absolute row, so the cap also covers that chunk's rows.
+size_t group_rows_cap(size_t T) {
+    if (!(fp4_every_layer() && (int64_t) T >= FP4_MIN_TOKENS)) return T * K;
+    return std::min(T * K, std::max(T, (size_t) (FP4_MIN_TOKENS - 1) * K));
+}
 MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
     if (!fused) {
         // MMQ's int8 planes are only needed for rows a chunk below FP4_MIN_TOKENS runs; the FP4 planes cover the rest
         const size_t qt = fp4_every_layer() && (int64_t) T >= FP4_MIN_TOKENS ? (size_t) (FP4_MIN_TOKENS - 1) : T;
+        const size_t gr = group_rows_cap(T);
         size_t xq = mmq::q8_bytes((int64_t) (qt * K), N), hq = mmq::q8_bytes((int64_t) (qt * K), 640);
-        if (fp4_pack()) { xq = std::max(xq, fp4_x_bytes(T * K, n_expert)); hq = std::max(hq, fp4_h_bytes(T * K)); }
-        return {T * K * 1280, T * K * 640, xq, hq};
+        if (fp4_pack()) { xq = std::max(xq, fp4_x_bytes(T * K, n_expert)); hq = std::max(hq, fp4_h_bytes(gr)); }
+        return {gr * 1280, gr * 640, xq, hq};
     }
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
     return {std::max(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
@@ -729,8 +737,9 @@ Fp4Ptrs fp4_ptrs(void* xq, void* hq, int64_t T, int64_t n_expert) {
     p.tox = (int32_t*) ((uint8_t*) p.gsx + al256(fp4::scale_count((int64_t) rows, (int) ne) * 4));
     uint8_t* h = (uint8_t*) hq;
     p.a4h = h;
-    p.gsh = (float*) (h + al256(fp4::a4_bytes((int64_t) rows, 640, MMQ_GROUP)));
-    p.toh = (int32_t*) ((uint8_t*) p.gsh + al256(fp4::scale_count((int64_t) rows, MMQ_GROUP) * 4));
+    const size_t hrows = group_rows_cap((size_t) T);
+    p.gsh = (float*) (h + al256(fp4::a4_bytes((int64_t) hrows, 640, MMQ_GROUP)));
+    p.toh = (int32_t*) ((uint8_t*) p.gsh + al256(fp4::scale_count((int64_t) hrows, MMQ_GROUP) * 4));
     p.rel = p.toh + (MMQ_GROUP + 1);
     return p;
 }
@@ -2299,32 +2308,49 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const uint8_t* fp4_blob[MMQ_GROUP];
                         size_t fp4_j0 = 0;
                         int fp4_n = 0;
-                        auto fp4_flush = [&]() {
-                            if (fp4_n == 0) return;
+                        // One run of the group's products over experts [i0, i0 + n) of the open group: gate/up, swiglu,
+                        // the int8 H, down.  GU and H hold only this run's rows (their row 0 is the run's first row).
+                        auto fp4_run = [&](const Fp4Ptrs& fp, int i0, int n) {
                             const auto& f = lay.fmt[(size_t) l];
-                            if (gg_nslots > 0) cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
-                            const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
-                            const size_t j0 = fp4_j0, n = order.size();
-                            const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j0 + fp4_n] - r0;
+                            const size_t j0 = fp4_j0 + (size_t) i0;
+                            const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j0 + n] - r0;
                             int64_t maxr = 0;
-                            for (int i = 0; i < fp4_n; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[j0 + i]]);
+                            for (int i = 0; i < n; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[j0 + i]]);
                             fp4::Product gu;
-                            for (int i = 0; i < fp4_n; ++i) gu.blob[i] = fp4_blob[i];
-                            gu.w_off = 0; gu.w_rows = 1280; gu.w_cols = N; gu.n = fp4_n;
+                            for (int i = 0; i < n; ++i) gu.blob[i] = fp4_blob[i0 + i];
+                            gu.w_off = 0; gu.w_rows = 1280; gu.w_cols = N; gu.n = n;
                             gu.a4 = fp.a4x; gu.gs = fp.gsx; gu.bounds = m.bounds_dev + j0; gu.tile_off = fp.tox + j0;
-                            gu.dst = m.GU; gu.ld_dst = 1280; gu.max_rows = maxr;
+                            gu.dst = m.GU - r0 * 1280; gu.ld_dst = 1280; gu.max_rows = maxr;
                             fp4::run(gu, m.cs);
                             float* sc = grp_scales(m.grp_d);
                             fp4::gather_tails(gu, f.bytes - f.tail, sc, m.cs);
-                            fp4::rebase(m.bounds_dev + j0, fp4_n, fp.rel, m.cs);   // this group's own row bounds
-                            mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, false, m.cs, sc, fp.rel, fp4_n);
-                            fp4::plan(fp.rel, fp4_n, fp.toh, m.cs);
-                            fp4::quantize(m.H + r0 * 640, nullptr, fp.rel, fp.toh, fp4_n, fp.a4h, fp.gsh, 640, 640, nr, m.cs);
+                            fp4::rebase(m.bounds_dev + j0, n, fp.rel, m.cs);   // this run's own row bounds
+                            mmq::swiglu(m.GU, m.H, nr, 640, false, m.cs, sc, fp.rel, n);
+                            fp4::plan(fp.rel, n, fp.toh, m.cs);
+                            fp4::quantize(m.H, nullptr, fp.rel, fp.toh, n, fp.a4h, fp.gsh, 640, 640, nr, m.cs);
                             fp4::Product dn = gu;
                             dn.w_off = f.down_off; dn.w_rows = N; dn.w_cols = 640;
                             dn.a4 = fp.a4h; dn.gs = fp.gsh; dn.bounds = fp.rel; dn.tile_off = fp.toh;
                             dn.dst = m.Dm + r0 * N; dn.ld_dst = N;
                             fp4::run(dn, m.cs);
+                        };
+                        auto fp4_flush = [&]() {
+                            if (fp4_n == 0) return;
+                            if (gg_nslots > 0) cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
+                            const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
+                            // runs of consecutive experts of at most the rows GU and H hold
+                            const int64_t cap = (int64_t) group_rows_cap((size_t) m.T);
+                            int i0 = 0;
+                            while (i0 < fp4_n) {
+                                int n = 1;
+                                int64_t rows = m.cnt[(size_t) order[fp4_j0 + (size_t) i0]];
+                                while (i0 + n < fp4_n && rows + m.cnt[(size_t) order[fp4_j0 + (size_t) (i0 + n)]] <= cap) {
+                                    rows += m.cnt[(size_t) order[fp4_j0 + (size_t) (i0 + n)]];
+                                    ++n;
+                                }
+                                fp4_run(fp, i0, n);
+                                i0 += n;
+                            }
                             if (gg_nslots > 0) {   // the blobs are read: give the ring slots back
                                 const int rel_slot = gg_slots[gg_nslots - 1];
                                 cudaEventRecord(m.used[rel_slot], m.cs);
@@ -2332,7 +2358,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gg_nslots = 0;
                             }
                             fp4_n = 0;
-                            (void) n;
                         };
                         auto flush = [&]() {
                             if (fp4_l) { fp4_flush(); return; }
