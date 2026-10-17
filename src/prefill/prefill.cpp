@@ -28,6 +28,8 @@
 #include "basalt/prefill/moe_fused.hpp"
 #include "basalt/prefill/moe_fused_iq.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/ggml/ggml.h"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/prefill/kernels.hpp"
@@ -651,13 +653,58 @@ bool fused_layout(size_t T, bool src) {
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
 struct MoeBufs { size_t gu, h, xq, hq; };
+// An NVFP4 pack's prompt experts run on the FP4 tensor cores: the activation planes, token scales and tile tables sit
+// in Xq (the layer's rows) and Hq (one group's H, a group of up to MMQ_GROUP experts).
+bool fp4_pack() {
+    static const bool any = [] {
+        const auto& lay = basalt::kernels::cpu::expert_layout();
+        if (!lay.native) return false;
+        for (const auto& f : lay.fmt)
+            if (f.gu_type == GGML_TYPE_NVFP4 && f.d_type == GGML_TYPE_NVFP4 && f.tail != 0) return true;
+        return false;
+    }();
+    return any;
+}
+constexpr size_t al256(size_t v) { return (v + 255) & ~(size_t) 255; }
+size_t fp4_x_bytes(size_t rows, int64_t ne) {
+    return al256(fp4::a4_bytes((int64_t) rows, N, (int) ne)) + al256(fp4::scale_count((int64_t) rows, (int) ne) * 4) +
+           al256((size_t) (ne + 1) * 4);
+}
+size_t fp4_h_bytes(size_t rows) {
+    return al256(fp4::a4_bytes((int64_t) rows, 640, MMQ_GROUP)) + al256(fp4::scale_count((int64_t) rows, MMQ_GROUP) * 4) +
+           al256((size_t) 2 * (MMQ_GROUP + 1) * 4);
+}
 MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
-    if (!fused) return {T * K * 1280, T * K * 640, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), 640)};
+    if (!fused) {
+        size_t xq = mmq::q8_bytes((int64_t) (T * K), N), hq = mmq::q8_bytes((int64_t) (T * K), 640);
+        if (fp4_pack()) { xq = std::max(xq, fp4_x_bytes(T * K, n_expert)); hq = std::max(hq, fp4_h_bytes(T * K)); }
+        return {T * K * 1280, T * K * 640, xq, hq};
+    }
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
     return {std::max(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
             std::max(ts * K * 640, (fused::act_bytes((int64_t) (T * K), 640) + 3) / 4),
             std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
             mmq::q8_bytes((int64_t) (ts * K), 640)};
+}
+struct Fp4Ptrs {
+    uint8_t *a4x, *a4h;
+    float *gsx, *gsh;
+    int32_t *tox, *toh, *rel;
+};
+// Where the FP4 path's tables sit in Xq (the layer's activations) and Hq (a group's H), as moe_bufs sized them.
+Fp4Ptrs fp4_ptrs(void* xq, void* hq, int64_t T, int64_t n_expert) {
+    const size_t rows = (size_t) (T * K), ne = (size_t) n_expert;
+    Fp4Ptrs p;
+    uint8_t* x = (uint8_t*) xq;
+    p.a4x = x;
+    p.gsx = (float*) (x + al256(fp4::a4_bytes((int64_t) rows, N, (int) ne)));
+    p.tox = (int32_t*) ((uint8_t*) p.gsx + al256(fp4::scale_count((int64_t) rows, (int) ne) * 4));
+    uint8_t* h = (uint8_t*) hq;
+    p.a4h = h;
+    p.gsh = (float*) (h + al256(fp4::a4_bytes((int64_t) rows, 640, MMQ_GROUP)));
+    p.toh = (int32_t*) ((uint8_t*) p.gsh + al256(fp4::scale_count((int64_t) rows, MMQ_GROUP) * 4));
+    p.rel = p.toh + (MMQ_GROUP + 1);
+    return p;
 }
 uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     const MmqPlan& mp = mmq_plan();
@@ -1721,6 +1768,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+                    // NVFP4 experts: FP4 block-scaled tensor cores, read in place from the blobs
+                    const bool fp4_l = use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
+                                       lay.fmt[(size_t) l].tail != 0;
                     // a prompt peer: MMQ only, whether or not set_peer took it (it can decline), as fused_ring() sized
                     // the ring and the buffers for it
                     const bool no_peer = !core::prompt_peer();
@@ -1992,7 +2042,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         if (use_mmq) {
                             // the layer's activations as q8_1 rows in expert order, straight from `mixed`
-                            mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
+                            if (!fp4_l) mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
                             const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
@@ -2010,6 +2060,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             } else {
                                 cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
                                                 cudaMemcpyHostToDevice, m.cs);
+                            }
+                            if (fp4_l) {   // the activations as FP4 tiles in expert order
+                                const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
+                                fp4::plan(m.bounds_dev, (int) n, fp.tox, m.cs);
+                                fp4::quantize(m.mixed, m.src_dev, m.bounds_dev, fp.tox, (int) n, fp.a4x, fp.gsx, N, N,
+                                              rows_local, m.cs);
                             }
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
@@ -2203,7 +2259,47 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
+                        // the FP4 path's open group: its experts' blobs (read in place until the down product is done)
+                        const uint8_t* fp4_blob[MMQ_GROUP];
+                        size_t fp4_j0 = 0;
+                        int fp4_n = 0;
+                        auto fp4_flush = [&]() {
+                            if (fp4_n == 0) return;
+                            const auto& f = lay.fmt[(size_t) l];
+                            if (gg_nslots > 0) cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
+                            const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
+                            const size_t j0 = fp4_j0, n = order.size();
+                            const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j0 + fp4_n] - r0;
+                            int64_t maxr = 0;
+                            for (int i = 0; i < fp4_n; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[j0 + i]]);
+                            fp4::Product gu;
+                            for (int i = 0; i < fp4_n; ++i) gu.blob[i] = fp4_blob[i];
+                            gu.w_off = 0; gu.w_rows = 1280; gu.w_cols = N; gu.n = fp4_n;
+                            gu.a4 = fp.a4x; gu.gs = fp.gsx; gu.bounds = m.bounds_dev + j0; gu.tile_off = fp.tox + j0;
+                            gu.dst = m.GU; gu.ld_dst = 1280; gu.max_rows = maxr;
+                            fp4::run(gu, m.cs);
+                            float* sc = grp_scales(m.grp_d);
+                            fp4::gather_tails(gu, f.bytes - f.tail, sc, m.cs);
+                            fp4::rebase(m.bounds_dev + j0, fp4_n, fp.rel, m.cs);   // this group's own row bounds
+                            mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, false, m.cs, sc, fp.rel, fp4_n);
+                            fp4::plan(fp.rel, fp4_n, fp.toh, m.cs);
+                            fp4::quantize(m.H + r0 * 640, nullptr, fp.rel, fp.toh, fp4_n, fp.a4h, fp.gsh, 640, 640, nr, m.cs);
+                            fp4::Product dn = gu;
+                            dn.w_off = f.down_off; dn.w_rows = N; dn.w_cols = 640;
+                            dn.a4 = fp.a4h; dn.gs = fp.gsh; dn.bounds = fp.rel; dn.tile_off = fp.toh;
+                            dn.dst = m.Dm + r0 * N; dn.ld_dst = N;
+                            fp4::run(dn, m.cs);
+                            if (gg_nslots > 0) {   // the blobs are read: give the ring slots back
+                                const int rel_slot = gg_slots[gg_nslots - 1];
+                                cudaEventRecord(m.used[rel_slot], m.cs);
+                                for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel_slot;
+                                gg_nslots = 0;
+                            }
+                            fp4_n = 0;
+                            (void) n;
+                        };
                         auto flush = [&]() {
+                            if (fp4_l) { fp4_flush(); return; }
                             if (gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
@@ -2231,6 +2327,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // expert) is released once the blob is read
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                             const int32_t e = order[j];
+                            if (fp4_l) {
+                                if (fp4_n == 0) fp4_j0 = j;
+                                fp4_blob[fp4_n++] = blob_dev;
+                                if (slot >= 0) gg_slots[gg_nslots++] = slot;
+                                // a group at the walk's end of MMQ_GROUP experts; outside the streamed walk the staging
+                                // ring reuses a slot as soon as the next expert starts, so one expert at a time
+                                if (group_gather && j % MMQ_GROUP != MMQ_GROUP - 1 && j + 1 < order.size()) return true;
+                                fp4_flush();
+                                return true;
+                            }
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                                 const size_t q = j % MMQ_GROUP;
