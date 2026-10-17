@@ -3,7 +3,7 @@
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
         [--mtp-source DIR] [--mtp-dense FILE] [--profile FILE | --profile-from TRACE ...] [--draft-vocab FILE] [--hc8 FILE] \\
         [--name NAME] [--compat-bf16] [--no-vision] [--force]
-    python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] \\
+    python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
         [--name NAME] [--workers N] [--force]
 
 Inputs
@@ -11,7 +11,8 @@ Inputs
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
-                     with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp
+                     with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp.
+                     With --sections-from and --checkpoint it replaces the mtp/dense copied from BASE (same size required)
   --draft-vocab FILE the token subset the draft head may propose (int32 ids; needs --mtp-source)
   --profile FILE     an expert profile stored as is (`--expert-profile-save`'s file)
   --profile-from TRACE ...  `--dump-routing` traces: routed experts first, most frequent first, then the rest;
@@ -377,12 +378,25 @@ def from_checkpoint(a) -> None:
             job._report("gguf", w.entries[-1][2], time.time() - t)
             names = list(dense_src.tensors) + ["per_layer_token_embd.weight"]
             tensor_offsets = dict(zip(names, offs))
+            tuned_sha = None
             for name in base.names():
                 if name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8"):
                     off, size = base.section(name)
+                    if name == "mtp/dense" and a.mtp_dense:
+                        tuned = Path(a.mtp_dense)
+                        if tuned.stat().st_size != size:
+                            die(f"{tuned}: {tuned.stat().st_size} bytes, {src}'s mtp/dense is {size}")
+                        h = hashlib.sha256()
+                        with open(tuned, "rb") as f:
+                            for b in iter(lambda: f.read(1 << 24), b""):
+                                h.update(b)
+                        tuned_sha = h.hexdigest()
+                        job.file(name, tuned)
+                        continue
                     job.file(name, src, off, size)
             for name, _, _, digest in w.entries:
                 if name in base.sections and name.startswith(("mtp/", "vision/", "profile", "hc8")) \
+                        and not (name == "mtp/dense" and a.mtp_dense) \
                         and digest != base.sections[name][2]:
                     die(f"section {name}: the copy's SHA-256 differs from {src}'s")
             tens = {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.ne],
@@ -405,6 +419,8 @@ def from_checkpoint(a) -> None:
             }
             for k in ("profile", "hc8", "mtp", "vision"):
                 meta[k] = base_meta.get(k)
+            if tuned_sha:
+                meta["mtp"] = {**meta["mtp"], "dense": {"tuning": "self_distilled", "sha256": tuned_sha}}
             used = sorted({t.how for t in dense_src.tensors.values()})
             meta["checkpoint"] = {
                 "dir": Path(a.checkpoint).name, "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
@@ -549,11 +565,13 @@ def main():
         requant_dense(a)
         return
     if a.sections_from and a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.profile \
+        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab or a.profile \
                 or a.profile_from or a.hc8:
-            ap.error("--checkpoint with --sections-from takes only --out, --name, --dense-q8-0, --workers and --force")
+            ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, --workers and --force")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
+        if a.mtp_dense and not Path(a.mtp_dense).is_file():
+            ap.error(f"missing input: {a.mtp_dense}")
         from_checkpoint(a)
         return
     if a.dense_q8_0:
