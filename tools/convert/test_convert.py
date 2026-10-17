@@ -15,6 +15,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import convert  # noqa: E402
+import ggufq  # noqa: E402
 import model_sections as S  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import ModelFile  # noqa: E402
@@ -382,6 +383,58 @@ class DrafterTest(unittest.TestCase):
                 convert.convert(t.args(mtp_dense=str(f), force=True))
         finally:
             t.tearDown()
+
+
+class PleFp8Test(unittest.TestCase):
+    """The FP8 n-gram table as Q8_0 rows: every code decodes as the plain formula says, and the Q8_0 values stay
+    within about half a step (plus the fp16 scale rounding) of the exact products."""
+
+    @staticmethod
+    def decode(code: int) -> float:
+        sign, e, m = -1.0 if code >> 7 else 1.0, (code >> 3) & 15, code & 7
+        if e == 15 and m == 7:
+            return float("nan")
+        return sign * (m / 8 * 2.0 ** -6 if e == 0 else (1 + m / 8) * 2.0 ** (e - 7))
+
+    def test_table_matches_formula(self):
+        want = np.array([self.decode(c) for c in range(256)], dtype=np.float32)
+        np.testing.assert_array_equal(S.fp8_e4m3_table(), want)
+
+    def test_q8_0_rows(self):
+        rng = np.random.default_rng(1)
+        codes = rng.integers(0, 256, size=(7, S.PLE_DIM), dtype=np.uint8)
+        codes[(codes & 0x7F) == 0x7F] = 0x38
+        scale = 0.0125
+        got = S.fp8_rows_to_q8_0(codes, scale)
+        self.assertEqual(len(got), 7 * S.PLE_DIM // 32 * 34)
+        deq = ggufq.dequantize(np.frombuffer(got, dtype=np.uint8), ggufq.GGMLQuantizationType.Q8_0).reshape(-1, 32)
+        ref = (S.fp8_e4m3_table()[codes] * np.float32(scale)).reshape(-1, 32)
+        step = np.abs(ref).max(axis=1, keepdims=True) / 127.0
+        self.assertTrue((np.abs(deq - ref) <= step * 0.6 + 1e-9).all())
+
+    def test_reads_safetensors_shards(self):
+        rng = np.random.default_rng(2)
+        shards = [rng.integers(0, 0x70, size=(r, S.PLE_DIM), dtype=np.uint8) for r in (3, 5)]
+        stem = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+        scale_bf16 = np.array([0x3C23], dtype="<u2")            # 0.0098...
+        head, data, at = {}, b"", 0
+        for k, arr, dt in [(stem + "weight_scale", scale_bf16, "BF16"), (stem + "shard_0.weight", shards[0], "F8_E4M3"),
+                           (stem + "shard_1.weight", shards[1], "F8_E4M3")]:
+            raw = arr.tobytes()
+            head[k] = {"dtype": dt, "shape": list(arr.shape) if arr.ndim > 1 else [1], "data_offsets": [at, at + len(raw)]}
+            data += raw
+            at += len(raw)
+        hb = json.dumps(head).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.safetensors"
+            path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
+            ple = S.PleFp8(str(path), chunk_rows=4)
+            self.assertEqual(ple.rows, 8)
+            self.assertAlmostEqual(ple.scale, float((np.uint32(0x3C23) << 16).view(np.float32)), places=9)
+            got = b"".join(S._ple_job(j) for j in ple.jobs())
+            self.assertEqual(len(got), ple.nbytes)
+            want = b"".join(S.fp8_rows_to_q8_0(a, ple.scale) for a in shards)
+            self.assertEqual(got, want)
 
 
 if __name__ == "__main__":

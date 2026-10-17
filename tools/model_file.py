@@ -30,6 +30,13 @@ def _align(n: int) -> int:
     return (n + SECTION_ALIGN - 1) // SECTION_ALIGN * SECTION_ALIGN
 
 
+class Stream:
+    """A part of `add_parts` produced on the fly: `size` bytes yielded by the iterable `chunks`."""
+
+    def __init__(self, size: int, chunks):
+        self.size, self.chunks = size, chunks
+
+
 class ModelWriter:
     """Sections are appended in order; the header and table are written by close()."""
 
@@ -86,7 +93,7 @@ class ModelWriter:
         return n
 
     def add_parts(self, name: str, parts, align: int = TENSOR_ALIGN) -> list[int]:
-        """One section of several parts, each at a multiple of `align` (zero padded). A part is bytes or
+        """One section of several parts, each at a multiple of `align` (zero padded). A part is bytes, a Stream or
         (src_path, offset, size); returns each part's offset. The hash covers the whole section."""
         off = self._start(name)
         h = hashlib.sha256()
@@ -105,6 +112,13 @@ class ModelWriter:
             offsets.append(pos)
             if isinstance(part, (bytes, bytearray)):
                 put(bytes(part))
+                continue
+            if isinstance(part, Stream):
+                n0 = pos
+                for b in part.chunks:
+                    put(b)
+                if pos - n0 != part.size:
+                    raise IOError(f"stream part: {pos - n0} bytes, expected {part.size}")
                 continue
             src, o, size = part
             left = size

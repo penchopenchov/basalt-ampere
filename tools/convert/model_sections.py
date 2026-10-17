@@ -558,3 +558,81 @@ def profile_info(blob: bytes, n_layers: int | None = None, n_expert: int | None 
                       "u16 expert) in rank order; then table: n_layer x n_expert x i32 LE, the rank of each "
                       "(layer, expert) or -1",
             "pairs_offset": PROFILE_HEADER.size, "table_offset": PROFILE_HEADER.size + 4 * n}
+
+
+# ------------------------------------------------------------------ the n-gram table from a per-tensor FP8 checkpoint
+PLE_DIM = 160
+
+
+def fp8_e4m3_table() -> np.ndarray:
+    """All 256 E4M3 (finite-only, bias 7) codes as float32; the two NaN codes are NaN."""
+    b = np.arange(256)
+    sign = np.where(b >> 7, -1.0, 1.0)
+    e, m = (b >> 3) & 15, b & 7
+    v = np.where(e == 0, m / 8.0 * 2.0 ** -6, (1 + m / 8.0) * 2.0 ** (e.astype(np.float64) - 7))
+    v = np.where((e == 15) & (m == 7), np.nan, v)
+    return (sign * v).astype(np.float32)
+
+
+def fp8_rows_to_q8_0(raw: np.ndarray, scale: float) -> bytes:
+    """Rows of PLE_DIM FP8 codes times the tensor's scale -> Q8_0 rows (5 blocks of 34 bytes each)."""
+    x = fp8_e4m3_table()[raw.reshape(-1)] * np.float32(scale)
+    if not np.isfinite(x).all():
+        raise ConvertError("the FP8 table holds a non-finite value")
+    return q8_0(x)
+
+
+def _ple_job(args):
+    path, off, rows, scale = args
+    raw = np.fromfile(path, dtype=np.uint8, count=rows * PLE_DIM, offset=off)
+    return fp8_rows_to_q8_0(raw, scale)
+
+
+def read_safetensors_header(path):
+    import json
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        return json.loads(f.read(n)), 8 + n
+
+
+class PleFp8:
+    """The PLE n-gram table of a checkpoint that stores it as FP8 shards (`...ngram_embedding.shard_K.weight`) with one
+    BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
+
+    def __init__(self, path, chunk_rows: int = 65536):
+        self.path, self.chunk_rows = path, chunk_rows
+        head, base = read_safetensors_header(path)
+        scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
+        if len(scales) != 1:
+            raise ConvertError(f"{path}: {len(scales)} ngram_embedding.weight_scale tensors")
+        stem = scales[0][:-len("weight_scale")]
+        sc = head[scales[0]]
+        if sc["dtype"] != "BF16" or sc["shape"] != [1]:
+            raise ConvertError(f"{path}: the PLE scale is not one BF16 value")
+        with open(path, "rb") as f:
+            f.seek(base + sc["data_offsets"][0])
+            u = np.frombuffer(f.read(2), dtype="<u2").astype(np.uint32) << 16
+        self.scale = float(u.view(np.float32)[0])
+        shards = []
+        while f"{stem}shard_{len(shards)}.weight" in head:
+            t = head[f"{stem}shard_{len(shards)}.weight"]
+            if t["dtype"] != "F8_E4M3" or len(t["shape"]) != 2 or t["shape"][1] != PLE_DIM:
+                raise ConvertError(f"{path}: shard {len(shards)} is not FP8 rows of {PLE_DIM}")
+            shards.append((base + t["data_offsets"][0], t["shape"][0]))
+        if not shards:
+            raise ConvertError(f"{path}: no PLE shards")
+        self.shards = shards
+        self.rows = sum(r for _, r in shards)
+        self.row_bytes = PLE_DIM // 32 * 34
+        self.nbytes = self.rows * self.row_bytes
+
+    def jobs(self):
+        for off, rows in self.shards:
+            for r in range(0, rows, self.chunk_rows):
+                n = min(self.chunk_rows, rows - r)
+                yield (self.path, off + r * PLE_DIM, n, self.scale)
+
+    def chunks(self, workers: int = 24):
+        import multiprocessing
+        with multiprocessing.Pool(workers) as pool:
+            yield from pool.imap(_ple_job, self.jobs(), chunksize=1)
