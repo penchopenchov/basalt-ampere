@@ -5,6 +5,9 @@
 // non-zero state as after an earlier chunk.  Checked: the output before the norm and the state after the chunk, for
 // every value head against the old kernel and for three heads against the CPU reference; and the split check (the
 // same tokens in two calls, the second starting off the 16-token grid, against one call).
+// Gates come in two mixes: the regular one (decay per token in e^-0.82..e^-0.02) and an extreme one (a tenth of the value
+// heads at g in [-30, -5], a tenth at g = -1e-6), at T up to 32768 (a whole production chunk in one call); every output
+// and state must be finite.
 //   gdn_chunk_parity [seed]          the checks
 //   gdn_chunk_parity --bench         and the timings at T = 4096, 16384 and 32768 (one layer), old and new alternating
 #include "basalt/prefill/kernels.hpp"
@@ -191,11 +194,16 @@ __global__ void fill_gauss(float* x, int64_t n, float scale, uint64_t seed, floa
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         x[i] = offset + scale * gauss(seed * 0x9E3779B97F4A7C15ULL + (uint64_t) i);
 }
-// gate = log of the decay (mostly near 1, some strong), beta in (0, 1)
-__global__ void fill_gates(float* gate, float* beta, int64_t n, uint64_t seed) {
+// gate = log of the decay, beta in (0, 1).  Mode 0: mostly near 1, some strong.  Mode 1 (extreme): value heads
+// 0, 10, 20, ... decay hard (g in [-30, -5]: the decay of a few tokens underflows a prefix product) and heads 1, 11, 21, ...
+// barely at all (g = -1e-6), the rest as mode 0.
+__global__ void fill_gates(float* gate, float* beta, int64_t n, uint64_t seed, int mode) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
         const float u = uni(seed * 0x9E3779B97F4A7C15ULL + 7 * (uint64_t) i);
+        const int head = (int) (i % HV);
         gate[i] = -0.02f - 0.8f * u * u * u;
+        if (mode == 1 && head % 10 == 0) gate[i] = -5.0f - 25.0f * u;
+        if (mode == 1 && head % 10 == 1) gate[i] = -1e-6f;
         beta[i] = 1.0f / (1.0f + expf(-gauss(seed * 0xD1B54A32D192ED03ULL + (uint64_t) i)));
     }
 }
@@ -213,7 +221,7 @@ template <typename T> std::vector<T> down(const T* d, size_t n) {
 struct Inputs {
     int64_t T = 0;
     float *h = nullptr, *hn = nullptr, *gate = nullptr, *beta = nullptr, *z = nullptr, *gamma = nullptr, *state0 = nullptr;
-    Inputs(int64_t t, uint64_t seed) : T(t) {
+    Inputs(int64_t t, uint64_t seed, int mode = 0) : T(t) {
         h = dalloc<float>((size_t) T * C);
         hn = dalloc<float>((size_t) T * C);
         gate = dalloc<float>((size_t) T * HV);
@@ -224,7 +232,7 @@ struct Inputs {
         fill_gauss<<<4096, 256>>>(h, T * C, 1.0f, seed);
         ck(cudaMemcpy(hn, h, (size_t) T * C * 4, cudaMemcpyDeviceToDevice), "copy");
         gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S>>>(hn, EPS);   // what the old kernel read
-        fill_gates<<<1024, 256>>>(gate, beta, T * HV, seed + 1);
+        fill_gates<<<1024, 256>>>(gate, beta, T * HV, seed + 1, mode);
         fill_gauss<<<4096, 256>>>(z, T * HV * S, 1.0f, seed + 2);
         fill_gauss<<<1, 128>>>(gamma, S, 0.1f, seed + 3, 1.0f);
         fill_gauss<<<1024, 256>>>(state0, (int64_t) S * HV * S, 0.05f, seed + 4);
@@ -312,8 +320,10 @@ void cpu_head(const std::vector<float>& h, const std::vector<float>& gate, const
 // bars: the chunked form rounds q/k and the state update's Delta to BF16 (see docs/precision.md)
 constexpr double kRms = 1e-2, kWorst = 5e-2;
 
-int check(int64_t T, uint64_t seed) {
-    Inputs in(T, seed);
+double g_worst_seen = 0;   // the largest worst-element error any gated comparison reported
+
+int check(int64_t T, uint64_t seed, int mode = 0) {
+    Inputs in(T, seed, mode);
     const size_t st_n = (size_t) S * HV * S, y_n = (size_t) T * HV * S;
     Bufs o(T), n(T);
     run_old(in, o, T);
@@ -324,15 +334,17 @@ int check(int64_t T, uint64_t seed) {
     int fails = 0;
     auto verdict = [&](const Err& e) {
         const bool ok = std::isfinite(e.rms) && e.rms < kRms && e.worst < kWorst;
+        if (std::isfinite(e.worst)) g_worst_seen = std::max(g_worst_seen, e.worst);
         fails += !ok;
         return ok ? "" : " FAIL";
     };
-    std::printf("T=%-6lld new vs old kernel: output rel RMS %.2e worst %.2e%s, state rel RMS %.2e worst %.2e%s\n",
-                (long long) T, ey.rms, ey.worst, verdict(ey), es.rms, es.worst, verdict(es));
+    std::printf("T=%-6lld %s gates: new vs old kernel: output rel RMS %.2e worst %.2e%s, state rel RMS %.2e worst %.2e%s\n",
+                (long long) T, mode ? "extreme" : "regular", ey.rms, ey.worst, verdict(ey), es.rms, es.worst, verdict(es));
     // CPU reference for three heads (one per value-head group)
     const auto h = down(in.h, (size_t) T * C), gate = down(in.gate, (size_t) T * HV), beta = down(in.beta, (size_t) T * HV),
                st0 = down(in.state0, st_n);
-    for (int head : {0, 17, 47}) {
+    const std::vector<int> heads = mode ? std::vector<int>{0, 1, 17, 47} : std::vector<int>{0, 17, 47};
+    for (int head : heads) {
         std::vector<double> ro, rs;
         cpu_head(h, gate, beta, st0, head, T, ro, rs);
         // gather this head's output and state
@@ -427,6 +439,10 @@ int main(int argc, char** argv) {
         for (int64_t T : {4096, 16384, 32768}) bench(T);
     } else {
         for (int64_t T : {1, 5, 16, 17, 100, 1000, 4099}) fails += check(T, seed + (uint64_t) T);
+        // the decay's extremes, and a whole production chunk in one call
+        for (int64_t T : {100, 1000, 4099}) fails += check(T, seed + (uint64_t) T, 1);
+        fails += check(32768, seed + 32768);
+        fails += check(32768, seed + 32769, 1);
         int ndev = 0;
         ck(cudaGetDeviceCount(&ndev), "devices");
         // the launch's shared-memory opt-in is per device: every other device must run it too
@@ -435,7 +451,7 @@ int main(int argc, char** argv) {
             std::printf("device %d\n", d);
             fails += check(1000, seed + 1000);
         }
-        std::printf("gdn_chunk_parity: %d failures\n", fails);
+        std::printf("gdn_chunk_parity: %d failures (worst element seen %.2e, bar %.1e)\n", fails, g_worst_seen, kWorst);
     }
     return fails ? 1 : 0;
 }
