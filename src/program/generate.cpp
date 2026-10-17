@@ -4567,7 +4567,8 @@ int main(int argc, char** argv) {
     // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
     // complement to size it from, so it stays at 8192.
     // The largest chunk a bare `auto` reads a prompt in: past it a chunk's cost per token stops falling.
-    constexpr int64_t kMaxAutoChunk = 16384;
+    // A pass streams every expert blob once, so a pack with bigger blobs amortizes the pass over more tokens.
+    const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
     // The auto scan bisects on the 256-token grid the prompt path works on (`request_chunk` rounds up to it):

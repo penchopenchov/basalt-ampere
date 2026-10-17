@@ -123,6 +123,11 @@ the measured costs. The identity checks below compare logits across engine sessi
 below 1,024 tokens the two sessions' KV, and with it their rows, can differ at this level, and those checks are no longer
 bit-identical across sessions.
 
+**Prompt chunk size.** A bare `--prefill auto` reads a prompt in equal chunks of at most 16384 tokens, or 32768 for packs
+whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding of its K/V, so a prompt longer than 16384
+tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
+256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move.
+
 **K-quant experts on MMQ.** `tests/cuda/prefill_mmq_kq_test.cpp` runs MMQ and the FP16 dequant + cuBLAS path it
 replaced on random zero-centred experts at the model's geometry against a double-precision reference. Relative RMS
 error of the expert outputs, MMQ / FP16 path: 1.08e-2 / 5e-4 with plain activations (Q4_K/Q5_1, Q4_K/Q8_0, Q5_K/Q8_0),
