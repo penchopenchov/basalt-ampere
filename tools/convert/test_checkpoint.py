@@ -201,6 +201,25 @@ class CheckpointDenseTest(unittest.TestCase):
             C.CheckpointDense(C.Checkpoint(self.d))
 
 
+class TruncationTest(unittest.TestCase):
+    def test_short_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "x.safetensors"
+            write_safetensors(p, {"a": ("BF16", (4,), b"\1" * 8), "b": ("F32", (2,), b"\2" * 8)})
+            self.assertEqual(S.read_safetensors_header(p)[0]["b"]["data_offsets"], [8, 16])
+            full = p.read_bytes()
+            for cut in (1, 9):
+                p.write_bytes(full[:-cut])
+                with self.assertRaisesRegex(S.ConvertError, "truncated"):
+                    S.read_safetensors_header(p)
+            p.write_bytes(full[:20])                       # inside the header
+            with self.assertRaisesRegex(S.ConvertError, "truncated"):
+                S.read_safetensors_header(p)
+            p.write_bytes(full[:5])
+            with self.assertRaises(S.ConvertError):
+                S.read_safetensors_header(p)
+
+
 class TokenizerKvTest(unittest.TestCase):
     def test_types_gaps_and_ids(self):
         with tempfile.TemporaryDirectory() as tmp:

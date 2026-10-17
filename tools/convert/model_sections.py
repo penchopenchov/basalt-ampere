@@ -608,10 +608,27 @@ def _ple_job(args):
 
 
 def read_safetensors_header(path):
-    import json
+    """(header, offset of the data) of a safetensors file; refuses a file shorter than its header says."""
+    size = os.path.getsize(path)
     with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        return json.loads(f.read(n)), 8 + n
+        raw = f.read(8)
+        if len(raw) < 8:
+            raise ConvertError(f"{path}: too short for a safetensors header")
+        n = struct.unpack("<Q", raw)[0]
+        if 8 + n > size:
+            raise ConvertError(f"{path}: truncated, the header alone ({n} bytes) is past the end of the file")
+        head = json.loads(f.read(n))
+    end = 0
+    for k, v in head.items():
+        if k == "__metadata__":
+            continue
+        a, b = v["data_offsets"]
+        if not 0 <= a <= b:
+            raise ConvertError(f"{path}: {k} has bad data offsets {a}..{b}")
+        end = max(end, b)
+    if 8 + n + end > size:
+        raise ConvertError(f"{path}: truncated, its header covers {8 + n + end} bytes but the file has {size}")
+    return head, 8 + n
 
 
 def bounded_imap(pool, fn, jobs, depth: int):
