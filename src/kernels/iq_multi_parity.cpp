@@ -379,7 +379,7 @@ float time_ms(cudaStream_t s, int it, const auto& fn) {
 void bench(cudaStream_t s, std::mt19937& rng) {
     std::printf("\n--bench: microseconds per call, old (per-column decode) / new (decode once), idle GPU assumed\n");
     const int n_in = 2560, n_out = 8192, it = 200;
-    for (int t : {16, 17, 18, 21, 22, 29}) {
+    for (int t : {16, 17, 18, 21, 22, 29, 12, 13, 7, 8}) {
         const auto w = random_rows(t, n_out, n_in, rng);
         uint8_t* dw = dalloc<uint8_t>(w.size());
         ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
@@ -428,17 +428,22 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dy);
     }
     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
-    for (int gu : {16, 17, 18, 21, 22, 29, 40}) {   // NVFP4 with its own down format
-        const int dt = gu == 40 ? 40 : 42;
+    // (GB/s: the 16 experts' bytes once per call, at the new kernel's time)
+    for (auto [gu, dt] : {std::pair<int, int>{16, 42}, {17, 42}, {18, 42}, {21, 42}, {22, 42}, {29, 42}, {40, 40},
+                          {12, 7}, {12, 8}, {13, 8}}) {   // NVFP4 with its own down format; UD-Q4_K_XL's pairs
         std::printf("%-8s/%-5s grouped, 16 groups of m entries:", name_of(gu), name_of(dt));
+        std::string gbs;
         for (int m : {1, 2, 3, 4, 8}) {
             Grouped G(gu, dt, 2560, 640, std::vector<int>(16, m), 8, rng);
             float us[2];
             for (int old = 1; old >= 0; --old)
                 us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
             std::printf("  m=%d: %.1f/%.1f", m, us[1], us[0]);
+            char b[32];
+            std::snprintf(b, sizeof b, " %.0f", 16.0 * (double) G.L.bytes / (us[0] * 1e3));
+            gbs += b;
         }
-        std::printf("\n");
+        std::printf("   GB/s (new):%s\n", gbs.c_str());
     }
 }
 
