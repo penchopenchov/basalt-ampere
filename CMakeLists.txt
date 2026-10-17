@@ -172,6 +172,8 @@ if(BUILD_TESTING)
   add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
   target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(qsa_prompt_attn_parity PRIVATE kernels CUDA::cudart)
+  add_test(NAME qsa_prompt_attn_parity COMMAND qsa_prompt_attn_parity 32768 2048 1)
+  set_tests_properties(qsa_prompt_attn_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 # the top-k's active-block bound against
 # the capacity rule, selected ids bitwise
@@ -374,10 +376,14 @@ if(NOT _iq_python STREQUAL "")
   set_tests_properties(iq_parity_fixtures PROPERTIES FIXTURES_SETUP iq_fixture_data SKIP_RETURN_CODE 3)
   add_test(NAME iq_parity COMMAND iq_parity ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
   set_tests_properties(iq_parity PROPERTIES FIXTURES_REQUIRED iq_fixture_data SKIP_RETURN_CODE 3)
+  # the converter's own tests (the checkpoint repack, the pack sections, the requantizers): plain unittest, host only
+  add_test(NAME convert_tests COMMAND ${_iq_python} -m unittest discover -s tools/convert -p "test_*.py"
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(convert_tests PROPERTIES TIMEOUT 300)
 else()
   message(STATUS "basalt tests: no python3 with numpy was found (the configured interpreter and .venv "
-                 "were probed) - the iq_parity fixtures and its test are not registered; the fixtures "
-                 "need python3 with numpy and gguf-py")
+                 "were probed) - the iq_parity fixtures and its test and the converter tests are not registered; "
+                 "they need python3 with numpy and gguf-py")
 endif()
 # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
 # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)
@@ -745,7 +751,7 @@ target_link_libraries(prefill PUBLIC mmq)
 add_library(fp4 STATIC src/prefill/fp4/moe_fp4.cu)
 set_target_properties(fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
 target_include_directories(fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(fp4 PUBLIC ${_gpu_runtime_target})
+target_link_libraries(fp4 PUBLIC mmq ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC fp4)
 if(BUILD_TESTING)
   # the fused int8 experts against a double-precision reference and the MMQ path (exit 77 without int8 tensor cores)
@@ -768,6 +774,13 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_route_count_test PRIVATE prefill ${_gpu_runtime_target})
   add_test(NAME prefill_route_count_test COMMAND prefill_route_count_test)
   set_tests_properties(prefill_route_count_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  # the prompt path's buffer layout against its sizing (no device memory), once per expert layout
+  add_executable(prefill_layout_test tests/cuda/prefill_layout_test.cpp)
+  target_link_libraries(prefill_layout_test PRIVATE prefill ${_gpu_runtime_target})
+  foreach(_mode nvfp4 mixed kquant iq3 q2)
+    add_test(NAME prefill_layout_${_mode} COMMAND prefill_layout_test ${_mode})
+    set_tests_properties(prefill_layout_${_mode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  endforeach()
   # MMQ for the K-quant experts against the FP16 dequant + cuBLAS path and a double-precision reference (--bench: timings)
   add_executable(prefill_mmq_kq_test tests/cuda/prefill_mmq_kq_test.cpp)
   target_link_libraries(prefill_mmq_kq_test PRIVATE prefill mmq kernels ${_gpu_runtime_target})
