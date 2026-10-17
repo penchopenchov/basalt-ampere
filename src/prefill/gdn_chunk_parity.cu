@@ -318,7 +318,7 @@ void cpu_head(const std::vector<float>& h, const std::vector<float>& gate, const
 }
 
 // bars: the chunked form rounds q/k and the state update's Delta to BF16 (see docs/precision.md)
-constexpr double kRms = 1e-2, kWorst = 5e-2;
+constexpr double kRms = 1e-2, kWorst = 1.5e-2;
 
 double g_worst_seen = 0;   // the largest worst-element error any gated comparison reported
 
