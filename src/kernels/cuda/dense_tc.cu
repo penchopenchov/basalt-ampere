@@ -22,6 +22,7 @@
 #include "basalt/ggml/ggml_common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -974,6 +975,24 @@ int sm_count() {
     return n;
 }
 
+// The dynamic shared-memory opt-in of a launch family is applied once per device (a layer split launches these from
+// several threads, one per card). A failed opt-in is fatal: the launch would otherwise fail later as invalid.
+static int opt_in_device(const char* who) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) {
+        std::fprintf(stderr, "%s: device %d out of range\n", who, dev);
+        std::abort();
+    }
+    return dev;
+}
+static void opt_in_check(cudaError_t e, const char* who) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "%s: shared-memory opt-in failed: %s\n", who, cudaGetErrorString(e));
+        std::abort();
+    }
+}
+
 // The live configuration: DEC_DTC2 2 | 4 | 8 | 16 and DEC_PAIR 2 | 4 | 16 (see verify.cpp).
 constexpr int g_v2 = 30;
 constexpr int g_pair = 22;
@@ -981,10 +1000,11 @@ constexpr int g_pair = 22;
 template<int TYPE, int S, int MT, int KS>
 void launch_s(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     const size_t smem = smem_bytes<TYPE, S, MT, KS>();
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(dense_tc_kernel<TYPE, S, MT, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        attr = true;
+    static std::atomic<bool> attr[64];
+    const int dev = opt_in_device("dense_tc");
+    if (!attr[dev].load(std::memory_order_acquire)) {
+        opt_in_check(cudaFuncSetAttribute(dense_tc_kernel<TYPE, S, MT, KS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem), "dense_tc");
+        attr[dev].store(true, std::memory_order_release);
     }
     int occ = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_kernel<TYPE, S, MT, KS>, MT * KS * 128, smem);
@@ -1000,10 +1020,11 @@ void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, in
     const int row_bytes = (n_in / 256) * Fmt<TYPE>::SB;
     const int rs = row_bytes;
     const int smem = 128 + 8 * 16 * kMaxCols * 4 + 2 * 16 * rs;
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(dense_tc_tile_kernel<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
-        attr = true;
+    static std::atomic<bool> attr[64];
+    const int dev = opt_in_device("dense_tc_tile");
+    if (!attr[dev].load(std::memory_order_acquire)) {
+        opt_in_check(cudaFuncSetAttribute(dense_tc_tile_kernel<TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024), "dense_tc_tile");
+        attr[dev].store(true, std::memory_order_release);
     }
     int occ = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, dense_tc_tile_kernel<TYPE>, 256, smem);
@@ -1023,10 +1044,11 @@ bool one_ok(const void* w, int n_in, int n_out) {
 
 template<int TYPE, int NW>
 void launch_one(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(dense_tc_one_kernel<TYPE, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
-        attr = true;
+    static std::atomic<bool> attr[64];
+    const int dev = opt_in_device("dense_tc_one");
+    if (!attr[dev].load(std::memory_order_acquire)) {
+        opt_in_check(cudaFuncSetAttribute(dense_tc_one_kernel<TYPE, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024), "dense_tc_one");
+        attr[dev].store(true, std::memory_order_release);
     }
     launch_pdl(dense_tc_one_kernel<TYPE, NW>, dim3((unsigned) ((n_out + 15) / 16)), dim3(NW * 32),
                (size_t) one_smem_bytes<TYPE, NW>(n_in), s, (const uint8_t*) w, (const uint8_t*) x, y, n_in, n_out,
@@ -1112,13 +1134,15 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
         std::exit(1);
     }
     int smem = 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
-    static bool attr = false;
-    if (!attr) {
+    static std::atomic<bool> attr[64];
+    const int dev = opt_in_device("dense_tc_pair");
+    if (!attr[dev].load(std::memory_order_acquire)) {
         for (auto k : {dense_tc_pair_kernel<false, false, false>, dense_tc_pair_kernel<true, false, false>,
                        dense_tc_pair_kernel<true, true, false>, dense_tc_pair_kernel<false, false, true>,
                        dense_tc_pair_kernel<true, false, true>, dense_tc_pair_kernel<true, true, true>})
-            cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
-        attr = true;
+            opt_in_check(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024),
+                         "dense_tc_pair");
+        attr[dev].store(true, std::memory_order_release);
     }
     const bool lq = t0 == 11 || t0 == 42 || t1 == 11 || t1 == 42;
     // each warp's x fragments in registers across its tiles, and two warp-sum buffers where the block is alone on its
