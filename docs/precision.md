@@ -392,7 +392,9 @@ can regenerate it.
 
 This is not a CPU-tier effect: the 4-chunk Q8_0 result holds whatever share of experts sits on the CPU pool (0.0456 to
 0.0488 at the default placement, 0.0466 with 79% on the CPU). Other causes tested and excluded: KV mode, window width T,
-`--gr-fp32-activations`, dense_tc against native_mmvq (bit-identical), and refitting the hc8 scales.
+`--gr-fp32-activations`, dense_tc against native_mmvq (not bit-identical: dense_tc takes exact int32 dots per 32-value
+block, while mmvq rounds per 8-value quarter block, and the summation orders differ; switching it off made no
+measurable difference to this gap), and refitting the hc8 scales.
 
 ## Reproduce
 
