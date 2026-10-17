@@ -80,6 +80,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `lazy` | switch | off | Start the text-only API unloaded and load the model on the first request. Turns vision off. |
 | `idle-unload` | seconds | off | Unload the model after this long without requests; the next request loads it again. Frees VRAM for other programs. |
 | `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free, otherwise answer 503. Pairs with `lazy` and `idle-unload`. |
+| `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
 | `tokenizer` | path | the model file's | Tokenizer directory; used only with the mock engine. |
 | `config` | path | none | The config file. Command line only. |
 
@@ -198,9 +199,10 @@ plain decoding would give.
 
 ## Sampling
 
-A request carries its own sampling fields. A field the request leaves out takes the model file's `sampling` default
-(below); a field neither sets takes the engine's. Request fields always win. `/props` reports the model file's
-defaults.
+A request carries its own sampling fields. A field the request leaves out takes the launch option of the same name
+(`--temperature`, `--top-p`, ... in the [server options](#server); command line over the config file's `server`
+block), then the model file's `sampling` default (below), then the engine's. Request fields always win. `/props`
+reports the defaults in effect.
 
 | Field | Type, values | What it does |
 | --- | --- | --- |
@@ -236,9 +238,10 @@ meaning:
 | `penalty_last_n` | non-negative integer |
 | `seed` | positive integer |
 
-A bad value stops the server at startup; an unknown key is named in a warning and ignored. The active defaults are
-printed at startup as `[server] sampling defaults: ...`. They live in the file and are set when it is built; the
-config file does not override them, so a client that wants other values sends them in the request.
+A bad value stops the server at startup; an unknown key is named in a warning and ignored. The defaults in effect
+are printed at startup as `[server] sampling defaults: ...`, each marked `(command line)` or `(config)` when a launch
+option set it and unmarked when it comes from the model file. A launch option overrides the model file's value for
+that key; the others stay.
 
 ## Example configurations
 
