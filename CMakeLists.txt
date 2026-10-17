@@ -707,6 +707,7 @@ endforeach()
 # one-pass static linking has no cycle to resolve)
 target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                          src/kernels/cpu/nvfp4_avx512.cpp
+                                         src/kernels/cpu/nvfp4_avx2.cpp
                                          src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
@@ -715,6 +716,7 @@ set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPT
 set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
@@ -848,6 +850,10 @@ if(BUILD_TESTING)
   # the full model; run it by hand)
   add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
   target_link_libraries(dequant_bf16_test PRIVATE kernels artifact ${_gpu_runtime_target})
+
+  # the CPU expert kernels on each instruction set side by side (timing; the parity checks are native_expert_parity)
+  add_executable(avx_bench src/kernels/cpu/avx_bench.cpp)
+  target_link_libraries(avx_bench PRIVATE kernels_cpu)
 
   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
   target_link_libraries(expert_multi_test PRIVATE kernels_cpu)

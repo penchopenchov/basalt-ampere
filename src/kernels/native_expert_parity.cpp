@@ -16,6 +16,7 @@
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 #include "basalt/kernels/cpu/iq_avx2.hpp"
+#include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -440,18 +441,32 @@ int gpu_nvfp4(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const s
 // NVFP4 multi-token AVX-512 kernel against the single-token ggml dot this CPU would otherwise run (gate/up with s_gate,
 // s_up and SwiGLU, down with s_down): bitwise equal for every token count 1..9 (9 crosses the 8-token pass) and for
 // a row range that splits a down row pair; then a single-thread microbench, ggml dot vs the kernel, 1/2/4/8 tokens.
-int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed) {
-    if (!cpu::cpu_avx512_ok()) { std::printf("          nvfp4 multi-token: no AVX-512 on this CPU\n"); return 0; }
+int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, bool avx2) {
+    const char* isa = avx2 ? "avx2" : "avx512";
+    if (!avx2 && !cpu::cpu_avx512_ok()) { std::printf("          nvfp4 multi-token avx512: no AVX-512 on this CPU\n"); return 0; }
+    if (avx2 && !cpu::cpu_avx2_ok()) { std::printf("          nvfp4 multi-token avx2: no AVX2 on this CPU\n"); return 0; }
     constexpr int MT = 9;
     float sc[4];
     std::memcpy(sc, blob.data() + f.bytes - f.tail, sizeof sc);
-    const ggml_vec_dot_t dot = ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4)->vec_dot;
+    const ggml_vec_dot_t dot = (avx2 ? ggml_get_type_traits_cpu_avx2(GGML_TYPE_NVFP4)
+                                      : ggml_get_type_traits_cpu_avx512(GGML_TYPE_NVFP4))->vec_dot;
     std::mt19937 rng(23 + seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<std::vector<uint8_t>> act(MT, std::vector<uint8_t>(f.act_bytes)), hq(MT, std::vector<uint8_t>(f.h_bytes));
     std::vector<float> x(H), h(FF);
     const void* a[MT];
     const void* hp[MT];
+    const void* const* a_ = a;
+    const void* const* hp_ = hp;
+    // the kernel under test: the AVX2 one is called directly, so an AVX-512 CPU checks it too
+    auto new_gu = [&](int nt, float* const* ff, int r0, int r1) {
+        if (avx2) cpu::nvfp4_256_gu_rows(blob.data(), f.gu_row, f.up_off, (int) H, sc[0], sc[1], a_, nt, ff, r0, r1);
+        else cpu::native_gu_rows(f, blob.data(), a_, nt, ff, r0, r1);
+    };
+    auto new_down = [&](int nt, float* const* out, int r0, int r1) {
+        if (avx2) cpu::nvfp4_256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, sc[2], hp_, nt, out, r0, r1);
+        else cpu::native_down_rows(f, blob.data(), hp_, nt, out, r0, r1);
+    };
     for (int t = 0; t < MT; ++t) {
         for (auto& v : x) v = nd(rng) * (t == 4 ? 30.f : 1.f);
         for (auto& v : h) v = 0.05f * nd(rng);
@@ -489,29 +504,29 @@ int check_nvfp4_multi(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob,
     old_down(MT, po0, 0, (int) H);
     for (int nt = 1; nt <= MT; ++nt) {
         for (int t = 0; t < MT; ++t) { std::fill(f1[t].begin(), f1[t].end(), -1.f); std::fill(o1[t].begin(), o1[t].end(), -1.f); }
-        cpu::native_gu_rows(f, blob.data(), a, nt, pf1, 0, 7);   // two calls: a split row range
-        cpu::native_gu_rows(f, blob.data(), a, nt, pf1, 7, (int) FF);
-        cpu::native_down_rows(f, blob.data(), hp, nt, po1, 0, 5);
-        cpu::native_down_rows(f, blob.data(), hp, nt, po1, 5, (int) H);
+        new_gu(nt, pf1, 0, 7);   // two calls: a split row range
+        new_gu(nt, pf1, 7, (int) FF);
+        new_down(nt, po1, 0, 5);
+        new_down(nt, po1, 5, (int) H);
         for (int t = 0; t < nt; ++t) {
             diff += std::memcmp(f0[t].data(), f1[t].data(), FF * 4) != 0;
             diff += std::memcmp(o0[t].data(), o1[t].data(), H * 4) != 0;
             total += 2;
         }
     }
-    std::printf("          nvfp4 multi-token vs ggml dot: %zu token-rowsets, %zu differ  %s\n", total, diff,
+    std::printf("          nvfp4 %s multi-token vs ggml dot: %zu token-rowsets, %zu differ  %s\n", isa, total, diff,
                 diff == 0 ? "bitwise ok" : "FAIL");
     // microbench: one thread, the blob cache-resident across passes
     const int it = 30;
-    std::string line = "          bench: nvfp4 expert 1 thread, us per expert (ggml dot / multi-token):";
+    std::string line = std::string("          bench: nvfp4 ") + isa + " expert 1 thread, us per expert (ggml dot / multi-token):";
     for (int nt : {1, 2, 4, 8}) {
         auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < it; ++i) { old_gu(nt, pf0, 0, (int) FF); old_down(nt, po0, 0, (int) H); }
         const double us0 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
         t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < it; ++i) {
-            cpu::native_gu_rows(f, blob.data(), a, nt, pf1, 0, (int) FF);
-            cpu::native_down_rows(f, blob.data(), hp, nt, po1, 0, (int) H);
+            new_gu(nt, pf1, 0, (int) FF);
+            new_down(nt, po1, 0, (int) H);
         }
         const double us1 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
         char b[128];
@@ -641,7 +656,8 @@ int check_nvfp4_cpu(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, i
                 label.c_str(), f.bytes, sc[0], sc[1], sc[2], e, eq, ok ? "ok" : "FAIL");
     std::printf("          bench: cpu expert 1 token 1 thread %.0f us (%.2f GB/s of weights)\n", us,
                 (double) f.bytes / us * 1e-3);
-    failures += check_nvfp4_multi(f, blob, seed);
+    failures += check_nvfp4_multi(f, blob, seed, false);
+    failures += check_nvfp4_multi(f, blob, seed, true);
     failures += gpu_nvfp4(f, blob, x, G, U, D, sc, ref, got, s);
     return failures + (ok ? 0 : 1);
 }
@@ -1008,8 +1024,9 @@ int check_q6k_embd(cudaStream_t s) {
 
 // The AVX-512 Q8_K activation quantizer against ggml's reference quantizer: every byte of every block equal, on
 // random vectors of the model's width (dense, sparse, tied maxima, all-zero blocks, wide dynamic range).
-int check_q8k_quant() {
-    if (!cpu::cpu_avx512_ok()) { std::printf("q8_K quantizer: no AVX-512 on this CPU, skipped\n"); return 0; }
+// One quantizer against ggml's reference: bitwise on random, sparse, tied, wide-range and all-zero-block vectors, and a
+// per-vector timing line.
+int check_q8k_one(const char* tag, void (*quant)(const float*, void*, int64_t)) {
     const auto* tr = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     const size_t bytes = ggml_row_size(GGML_TYPE_Q8_K, H);
     std::mt19937 rng(7);
@@ -1032,7 +1049,7 @@ int check_q8k_quant() {
         std::fill(a.begin(), a.end(), 0xA5);
         std::fill(b.begin(), b.end(), 0xA5);
         tr->from_float(x.data(), a.data(), H);
-        cpu::quantize_q8_K_avx512(x.data(), b.data(), H);
+        quant(x.data(), b.data(), H);
         // ggml leaves the bsums of an all-zero block unwritten; they are zero there
         const size_t blk = bytes / (H / 256);
         for (int64_t k = 0; k < H / 256; ++k) {
@@ -1046,19 +1063,27 @@ int check_q8k_quant() {
     std::vector<uint8_t> o(bytes);
     for (int i = 0; i < 1000; ++i) {
         for (int64_t j = 0; j < H; ++j) x[(size_t) j] = nd(rng);
-        cpu::quantize_q8_K_avx512(x.data(), o.data(), H);
+        quant(x.data(), o.data(), H);
     }
     auto t0 = std::chrono::steady_clock::now();
     const int R = 200000;
     for (int i = 0; i < R; ++i) tr->from_float(x.data(), a.data(), H);
     auto t1 = std::chrono::steady_clock::now();
-    for (int i = 0; i < R; ++i) cpu::quantize_q8_K_avx512(x.data(), b.data(), H);
+    for (int i = 0; i < R; ++i) quant(x.data(), b.data(), H);
     auto t2 = std::chrono::steady_clock::now();
     const double ur = std::chrono::duration<double, std::micro>(t1 - t0).count() / R;
     const double uf = std::chrono::duration<double, std::micro>(t2 - t1).count() / R;
-    std::printf("q8_K quantizer: %d of %d vectors differ from ggml's reference (bitwise)\n", bad, N);
-    std::printf("q8_K quantizer microbench, %lld floats: ggml reference %.3f us, AVX-512 %.3f us (%.1fx)\n", (long long) H, ur, uf, ur / uf);
+    std::printf("q8_K quantizer %s: %d of %d vectors differ from ggml's reference (bitwise)\n", tag, bad, N);
+    std::printf("q8_K quantizer microbench, %lld floats: ggml reference %.3f us, %s %.3f us (%.1fx)\n", (long long) H, ur, tag, uf, ur / uf);
     return bad != 0 ? 1 : 0;
+}
+
+int check_q8k_quant() {
+    int failures = 0;
+    if (cpu::cpu_avx512_ok()) failures += check_q8k_one("AVX-512", cpu::quantize_q8_K_avx512);
+    else std::printf("q8_K quantizer: no AVX-512 on this CPU, skipped\n");
+    if (cpu::cpu_avx2_ok()) failures += check_q8k_one("AVX-2", cpu::quantize_q8_K_avx2);
+    return failures;
 }
 
 }  // namespace

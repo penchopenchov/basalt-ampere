@@ -7,6 +7,7 @@
 #include "basalt/kernels/cpu/iq_avx2.hpp"
 #include "basalt/kernels/cpu/kq_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
+#include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/ggml/ggml.h"
@@ -72,8 +73,12 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     static const bool avx512 = cpu_avx512_ok();
-    if (avx512 && f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
-        quantize_q8_K_avx512(x, dst, f.n_embd);
+    if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
+        if (avx512) {
+            quantize_q8_K_avx512(x, dst, f.n_embd);
+            return;
+        }
+        quantize_q8_K_avx2(x, dst, f.n_embd);   // the engine runs on AVX2 CPUs at least
         return;
     }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
@@ -114,6 +119,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
         return;
     }
+    // The same on AVX2 CPUs, bitwise equal per token to the AVX2 ggml dot.
+    if (!avx512 && avx2 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
+        nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
@@ -145,6 +155,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     static const bool avx512 = cpu_avx512_ok();
     if (avx512 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
         nvfp4_512_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
+        return;
+    }
+    if (!avx512 && cpu_avx2_ok() && f.d_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
+        nvfp4_256_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
         return;
     }
     for (int r = r0; r < r1; ++r) {
