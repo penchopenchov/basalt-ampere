@@ -161,7 +161,8 @@ the GPUs, so output is not bit-identical from run to run; see [precision.md](pre
 A tuning note: on the NVIDIA NVFP4 pack (6-bit dense) with an RTX 5090 and an RTX 5060 Ti as the peer, both at a 400 W
 power limit, `--adapt-every 1 --adapt-decay 0.85` measured prose right after a topic switch 233.2 to 241.5 tok/s
 (+3.6%), a conversation 264.5 to 275.6 (+4.2%), and structured output 491.4 to 487.0 (neutral), each an ABBA run of 4
-processes per arm. A longer memory (`adapt-decay` 0.97 and up) cost 3 to 6% on prose.
+processes per arm. A longer memory (`adapt-decay` 0.97 and up) looked 3 to 6% slower on prose in single runs (about
+3% run-to-run noise).
 
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
 README's "Memory floors".
