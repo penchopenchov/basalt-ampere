@@ -130,10 +130,32 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `pool-affinity` | engine | `all`, `auto`, `p-cores` | `all` | CPU affinity of the workers. `auto` and `p-cores` suit hybrid CPUs. |
 | `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. `tools/convert/convert.py --profile` reads it. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
+| `adapt-every` | engine | integer | 4 (`0` = static residency) | How many decode windows pass between adaptive rounds. A round moves experts between the tiers (see below). `1` follows the conversation fastest. |
+| `adapt-decay` | engine | number, 0 to 1 | 0.93 on a single card (with or without the peer); 0.7 when the experts are split over several cards | The factor the usage counts are multiplied by after each round. Lower forgets sooner; higher remembers longer. |
+| `adapt-swaps` | engine | integer | 96 (`0` = static residency) | The most experts one round swaps into the main card's tier. |
+| `peer-adapt-swaps` | engine | integer | same as `adapt-swaps` (`0` = the peer's experts stay fixed) | The most experts one round moves on the peer card. |
 | `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. |
 | `vram-segment-mib` | engine | integer MiB | 512 | Segment size for `vram-elastic`. |
 | `expert-cache-device1`, `-device2`, `-device3` | engine | integer or `auto` | off | Fill another GPU with experts directly, as a fixed tier. Not with `peer-device`. Advanced. |
 | `expert-cache-remote-placement` | engine | `stripe`, `layer` | `stripe` | How those cards share the experts. |
+
+### The adaptive tier
+
+The engine counts how often each expert is routed to. After every `adapt-every` decode windows it runs a round: in each
+layer it takes the most-used experts that are not in VRAM and swaps them in for the least-used resident ones, when the
+gain is clear (a candidate needs a count of at least 2 and 1.5 above the expert it replaces), at most `adapt-swaps`
+swaps per round, best gain first. Experts held by the peer card count against a margin of 10 before they move to the
+main card, and the peer takes the next most-used experts the main card does not hold, up to `peer-adapt-swaps`. After
+each round every count is multiplied by `adapt-decay`, so recent routing outweighs old. A count settles at about
+1 / (1 - decay) times the routing per round, so the decay sets how long the tier remembers: 0.93 is roughly the last 14
+rounds, 0.85 the last 7. Copies run on a side stream and land a few windows later; a window can wait for a landing while the tier is adapting. With `adapt-every 0` or `adapt-swaps 0`
+the tiers stay as loaded (`expert-profile-save` then has nothing to learn). Adaptation moves experts between the CPU and
+the GPUs, so output is not bit-identical from run to run; see [precision.md](precision.md).
+
+A tuning note: on the NVIDIA NVFP4 pack (6-bit dense) with an RTX 5090 and an RTX 5060 Ti as the peer, both at a 400 W
+power limit, `--adapt-every 1 --adapt-decay 0.85` measured prose right after a topic switch 233.2 to 241.5 tok/s
+(+3.6%), a conversation 264.5 to 275.6 (+4.2%), and structured output 491.4 to 487.0 (neutral), each an ABBA run of 4
+processes per arm. A longer memory (`adapt-decay` 0.97 and up) cost 3 to 6% on prose.
 
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
 README's "Memory floors".
