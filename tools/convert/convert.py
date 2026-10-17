@@ -3,6 +3,8 @@
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
         [--mtp-source DIR] [--mtp-dense FILE] [--profile FILE | --profile-from TRACE ...] [--draft-vocab FILE] [--hc8 FILE] \\
         [--name NAME] [--compat-bf16] [--no-vision] [--force]
+    python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] \\
+        [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -15,6 +17,17 @@ Inputs
   --profile-from TRACE ...  `--dump-routing` traces: routed experts first, most frequent first, then the rest;
                      with neither option the ranking is the plain fill order
   --hc8 FILE         8-bit hyper-connection copies from `--dump-hc8`; without them the engine quantizes at every start
+
+From an NVFP4 checkpoint (--sections-from with --checkpoint)
+  --checkpoint DIR   NVIDIA Model Optimizer's NVFP4 safetensors (config.json, the model-NNNNN-of-NNNNN shards, the FP8
+                     n-gram table file, tokenizer files, generation_config.json, README.md). The routed experts keep
+                     their E2M1 codes and UE4M3 scales, moved into Basalt's blocks with the FP32 tail {s_gate, s_up,
+                     s_down, 0} from weight_scale_2; the projections are quantized once from BF16 to Q6_K (Q8_0 where
+                     rows are not whole 256-value blocks, and for the output head and token embedding); the other
+                     tensors keep BF16 or become F32/F16 as the engine reads them; the n-gram table is FP8 code x scale
+                     as Q8_0. The GGUF metadata and the tokenizer come from the checkpoint's files.
+  --dense-q8-0       Q8_0 projections instead of Q6_K (the 8-bit dense variant)
+  The drafter, profile and vision sections come from BASE byte for byte; BASE's vocabulary must be the checkpoint's.
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -38,6 +51,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -302,6 +316,125 @@ def warn_unofficial():
     print(msg, file=sys.stderr, flush=True)
 
 
+def from_checkpoint(a) -> None:
+    """The language model straight from an NVFP4 safetensors checkpoint (routed experts moved into Basalt's layout,
+    every other tensor converted once from BF16, the n-gram table from FP8, metadata and tokenizer from the
+    checkpoint's files); drafter, profile and vision are copied from BASE byte for byte."""
+    import multiprocessing
+    import checkpoint as C
+    out, src = Path(a.out), Path(a.sections_from)
+    partial = Path(str(out) + ".partial")
+    if out.exists() and not a.force:
+        die(f"{out} exists (use --force to overwrite)")
+    if not src.is_file():
+        die(f"missing input: {src}")
+    base = ModelFile(str(src))
+    base_meta = json.loads(base.read("meta"))
+    q6k = not a.dense_q8_0
+    try:
+        ck = C.Checkpoint(a.checkpoint)
+        experts = C.CheckpointExperts(ck)
+        dense_src = C.CheckpointDense(ck, q6k)
+        ple_path = C.ple_table(ck)
+        ple = S.PleFp8(str(ple_path))
+        kv = C.model_kv(ck, S.PLE_DIM, 18 if q6k else 7, a.name)
+        dense = S.Dense(dense_src, False)
+    except S.ConvertError as e:
+        die(str(e))
+    old = base.read("experts.layout").decode("utf-8").splitlines()
+    m = re.search(r"\(n_expert (\d+)", old[0])
+    n_layers = sum(1 for x in old if x.strip() and not x.startswith("#"))
+    if not m or int(m.group(1)) != experts.n_expert or n_layers != experts.n_layers:
+        die(f"{src} has {n_layers} layers of {m.group(1) if m else '?'} experts, the checkpoint {experts.n_layers} "
+            f"of {experts.n_expert}")
+    if base_meta.get("gguf_kv", {}).get("tokenizer.ggml.tokens") != kv["tokenizer.ggml.tokens"]:
+        die(f"{src}'s vocabulary differs from the checkpoint's; its drafter and vision sections would not fit")
+    if partial.exists():
+        partial.unlink()
+    w = ModelWriter(str(partial))
+    job = Job(w)
+    ok = False
+    try:
+        with tempfile.TemporaryDirectory() as tmp, multiprocessing.Pool(a.workers) as pool:
+            import tokenizer
+            tokenizer.extract_metadata(kv, Path(tmp))
+            print("writing sections:", flush=True)
+            for p in sorted(q for q in (Path(tmp) / "tokenizer").iterdir() if q.is_file()):
+                job.file(f"tokenizer/{p.name}", p)
+            job.chunks("dense", dense.chunks())
+            job.bytes("dense.index", dense.index_text())
+            job.chunks("experts", experts.chunks(pool))
+            job.bytes("experts.layout", experts.layout_text())
+            t = time.time()
+            parts = []
+            for n, info in dense_src.tensors.items():
+                if info.type_name in ("Q8_0", "Q6_K"):
+                    parts.append(Stream(info.expected_bytes(), dense_src.chunks(n, pool)))
+                else:
+                    parts.append(dense_src.bytes(n).tobytes())
+            parts.append(Stream(ple.nbytes, ple.chunks()))
+            offs = w.add_parts("gguf", parts, TENSOR_ALIGN)
+            job._report("gguf", w.entries[-1][2], time.time() - t)
+            names = list(dense_src.tensors) + ["per_layer_token_embd.weight"]
+            tensor_offsets = dict(zip(names, offs))
+            for name in base.names():
+                if name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8"):
+                    off, size = base.section(name)
+                    job.file(name, src, off, size)
+            for name, _, _, digest in w.entries:
+                if name in base.sections and name.startswith(("mtp/", "vision/", "profile", "hc8")) \
+                        and digest != base.sections[name][2]:
+                    die(f"section {name}: the copy's SHA-256 differs from {src}'s")
+            tens = {n: {"type": t.type_name, "type_id": t.type_id, "shape": [int(d) for d in t.ne],
+                        "bytes": t.expected_bytes(), "offset": tensor_offsets[n]} for n, t in dense_src.tensors.items()}
+            tens["per_layer_token_embd.weight"] = {"type": "Q8_0", "type_id": 8, "shape": [S.PLE_DIM, ple.rows],
+                                                  "bytes": ple.nbytes, "offset": tensor_offsets["per_layer_token_embd.weight"]}
+            ck_files = sorted(set(ck.shards) | {ple_path})
+            meta = {
+                "format": "basalt", "version": 1, "name": a.name or base_meta.get("name"),
+                "converter": {"tool": "tools/convert/convert.py", "git": git_rev()},
+                "sources": [{"path": p.name, "size": p.stat().st_size,
+                             "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck_files],
+                "gguf_kv": kv,
+                "tensors": tens,
+                "conversions": {"compat_bf16": False, "tensors": [{
+                    "name": "per_layer_token_embd.weight", "src_type": "F8_E4M3", "dst_type": "Q8_0",
+                    "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
+                    "scale": ple.scale}]},
+                "sampling": SAMPLING, "license": model_license(kv),
+            }
+            for k in ("profile", "hc8", "mtp", "vision"):
+                meta[k] = base_meta.get(k)
+            used = sorted({t.how for t in dense_src.tensors.values()})
+            meta["checkpoint"] = {
+                "dir": Path(a.checkpoint).name, "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
+                "experts": {"format": "nvfp4", "source": "weight (E2M1 pairs), weight_scale (UE4M3 per 16), "
+                            "weight_scale_2 (FP32); input_scale unused", "repack": "codes and scales unchanged, "
+                            "nibbles moved into 64-value blocks", "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
+                "dense": {"projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",
+                          "q6_k_method": "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale",
+                          "q8_0_method": "ggml reference rounding", "from": "BF16, quantized once",
+                          "transforms": {k: C.METHODS[k] for k in used}},
+                "sections_from": {"path": src.name, "size": src.stat().st_size,
+                                  "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
+                                  "copied": [n for n in base.names() if n.startswith(("mtp/", "vision/")) or
+                                             n in ("profile", "hc8")]}}
+            job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        w.close()
+        ok = True
+    except S.ConvertError as e:
+        die(str(e))
+    finally:
+        if not ok:
+            try:
+                w.f.close()
+            except OSError:
+                pass
+            partial.unlink(missing_ok=True)
+    os.replace(partial, out)
+    print(f"done: {len(job.rows)} sections, {out.stat().st_size / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
+
+
 def requant_dense(a) -> None:
     """BASE with its Q8_0 dense projections written as Q6_K; every other section and tensor is copied byte for byte."""
     import multiprocessing
@@ -382,6 +515,8 @@ def requant_dense(a) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sections-from", metavar="PACK.basalt",
+                    help="copy every section but the routed experts from this .basalt (with --checkpoint)")
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
@@ -393,23 +528,40 @@ def main():
     ap.add_argument("--profile-from", nargs="+", metavar="TRACE",
                     help="routing traces from `basalt generate --dump-routing`: the ranking is built from them")
     ap.add_argument("--hc8", metavar="FILE", help="file written by `basalt generate --model ... --dump-hc8`")
-    ap.add_argument("--name", default="Qwen3.8-Flash-Next IQ3_XXS")
+    ap.add_argument("--name")
     ap.add_argument("--compat-bf16", action="store_true",
                     help="convert small projections stored in another form to BF16 (rounds)")
     ap.add_argument("--no-vision", action="store_true")
     ap.add_argument("--requant-dense-q6k", metavar="PACK.basalt",
                     help="copy PACK with its Q8_0 dense projections requantized to Q6_K")
-    ap.add_argument("--checkpoint", metavar="DIR", help="with --requant-dense-q6k: quantize from this checkpoint's BF16 shards")
-    ap.add_argument("--workers", type=int, default=16, help="with --requant-dense-q6k: quantizer processes")
+    ap.add_argument("--checkpoint", metavar="DIR",
+                    help="an NVFP4 safetensors checkpoint: with --sections-from, the language model is read from it; "
+                         "with --requant-dense-q6k, the BF16 projections")
+    ap.add_argument("--dense-q8-0", action="store_true",
+                    help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
+    ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     a = ap.parse_args()
     if a.requant_dense_q6k:
-        if a.gguf:
+        if a.sections_from or a.gguf or a.dense_q8_0:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
         requant_dense(a)
         return
+    if a.sections_from and a.checkpoint:
+        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.profile \
+                or a.profile_from or a.hc8:
+            ap.error("--checkpoint with --sections-from takes only --out, --name, --dense-q8-0, --workers and --force")
+        if not Path(a.checkpoint).is_dir():
+            ap.error(f"missing input: {a.checkpoint}")
+        from_checkpoint(a)
+        return
+    if a.dense_q8_0:
+        ap.error("--dense-q8-0 needs --checkpoint and --sections-from")
+    if a.sections_from:
+        ap.error("--sections-from needs --checkpoint")
     if not a.gguf:
         ap.error("--gguf is required")
+    a.name = a.name or "Qwen3.8-Flash-Next IQ3_XXS"
     if not a.no_vision and not a.mmproj:
         ap.error("--mmproj is required unless --no-vision")
     warn_unofficial()

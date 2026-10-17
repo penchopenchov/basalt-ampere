@@ -18,6 +18,7 @@ import sys
 from collections import defaultdict
 
 import numpy as np
+import os
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -32,7 +33,7 @@ class ConvertError(Exception):
 FLOAT = {"BF16", "F32", "F16"}
 ROLES = ("gate", "up", "down")
 ALIGN = 64                      # between the tensors of `dense`
-EXPERT_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.weight$")
+EXPERT_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down|gate_up)_exps\.(weight|scale|input_scale)$")
 # the PLE table comes from the `gguf` section, never the dense pool
 NOT_IN_DENSE = {"per_layer_token_embd.weight"}
 
@@ -328,6 +329,24 @@ class Experts:
             arrays = [self.model.bytes(n).reshape(self.n_expert, -1) for n in names]
             for s in range(0, self.n_expert, group):
                 yield np.concatenate([a[s:s + group] for a in arrays], axis=1).tobytes()
+
+
+NVFP4 = 40
+NVFP4_TAIL = 16          # per expert, after down: FP32 {s_gate, s_up, s_down, 0}
+
+
+def nvfp4_row_bytes(n: int) -> int:
+    """Bytes of one NVFP4 row of n values (blocks of 64 in 36 bytes)."""
+    if n % 64:
+        raise ConvertError(f"an NVFP4 row of {n} values is not whole blocks")
+    return n // 64 * 36
+
+
+def nvfp4_layout_text(n_expert: int, total: int, layout) -> bytes:
+    """The v6 `experts.layout`: one `layer gu_type d_type offset blob_bytes` line per layer."""
+    head = ("# experts v6: layer gu_type d_type offset blob_bytes (n_expert %d, total %d); "
+            "an NVFP4 blob ends in FP32 {s_gate, s_up, s_down, 0}\n" % (n_expert, total))
+    return (head + "".join("%d %d %d %d %d\n" % x for x in layout)).encode("utf-8")
 
 
 # ------------------------------------------------------------------ the drafter
