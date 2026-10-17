@@ -8,13 +8,12 @@ import re
 from pathlib import Path
 
 from serve import ROOT
+from serve.engine.flags import flag_index, flag_value
 from serve.engine.vision import VISION_MODES, VISION_USAGE, vision_mode
 
 
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
-# server options that are engine flags (the "engine" section of the config file)
-ENGINE_PASSTHROUGH = ("spec", "spec-min-p", "mtp-max-t", "peer-exclusive", "max-context")
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer")       # relative to the config file
 
@@ -35,30 +34,43 @@ def server_options(ap: argparse.ArgumentParser) -> dict:
             if o.startswith("--") and o[2:] not in ("help", "config")}
 
 
-def split_engine_extras(extras: list[str]) -> dict:
-    """Engine flags among the unknown command-line words: `--flag VALUE`, `--flag=VALUE` or a bare switch;
-    ValueError for a stray word."""
-    out, i = {}, 0
-    while i < len(extras):
-        word = extras[i]
-        if not word.startswith("--") or len(word) < 3:
-            raise ValueError(f"unexpected {word!r}")
+def split_engine_extras(extras: list[str]) -> list[str]:
+    """The unknown command-line words, which go to the engine as typed: it parses its own flags and their values.
+    A `--flag=VALUE` word is split in two, as the engine has no `=` form. ValueError for a leading word that is not
+    a flag."""
+    if extras and not (extras[0].startswith("--") and len(extras[0]) > 2):
+        raise ValueError(f"unexpected {extras[0]!r}")
+    out: list[str] = []
+    for word in extras:
         flag, eq, value = word.partition("=")
-        if eq:
-            out[flag] = value
-        elif i + 1 < len(extras) and not extras[i + 1].startswith("--"):
-            out[flag] = extras[i + 1]
-            i += 1
+        if eq and word.startswith("--") and len(flag) > 2:
+            out += [flag, value]
         else:
-            out[flag] = True
-        i += 1
+            out.append(word)
     return out
 
 
-def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str], dict]:
+def engine_words(key: str, value) -> list[str]:
+    """The engine words for one config entry: a switch is true (the flag) or false (nothing), a string or number is
+    one value, and a list gives one word per item (a flag that takes several values). ValueError otherwise."""
+    flag = "--" + str(key).strip().lower().replace("_", "-").removeprefix("--")
+    if isinstance(value, bool):
+        return [flag] if value else []
+    items = value if isinstance(value, list) else [value]
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, (str, int, float)) or str(item).strip() == "":
+            raise ValueError(f"engine.{key}: expected a string or number, a list of them for several values, "
+                             f"or true/false for a switch, not {value!r}")
+    if not items:
+        raise ValueError(f"engine.{key}: an empty list gives the flag no value")
+    return [flag, *(str(item) for item in items)]
+
+
+def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str], list[str]]:
     """(argv, engine) from a --config JSON file {"server": {...}, "engine": {...}}. `server` options become
-    command-line words so every command-line check applies; `engine` maps flags to values (true: switch, false:
-    off). Paths are relative to the file; ValueError for anything else."""
+    command-line words so every command-line check applies; `engine` maps flags to values and becomes the words
+    for the engine (true: switch, false: off, a list: several values). Paths are relative to the file; ValueError
+    for anything else."""
     try:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
@@ -84,10 +96,8 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         act = known.get(name)
         if name == "engine-bin":
             raise ValueError("server.engine-bin: engine-bin is set by basalt serve")
-        if name in ENGINE_PASSTHROUGH:
-            raise ValueError(f'server.{key}: an engine flag, set it under "engine"')
         if act is None:
-            raise ValueError(f"server.{key}: not a server option")
+            raise ValueError(f'server.{key}: not a server option (engine flags go under "engine")')
         flag = "--" + name
         if name == "vision":                               # a mode; booleans are refused
             try:
@@ -111,80 +121,87 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
             if name in CONFIG_PATHS and item:
                 item = str((here / os.path.expanduser(item)))
             argv += [flag, item]
-    engine = {}
+    engine: list[str] = []
     for key, value in sections["engine"].items():
         flag = "--" + str(key).strip().lower().replace("_", "-").removeprefix("--")
-        if flag[2:] in known and flag[2:] not in ENGINE_PASSTHROUGH:
+        if flag[2:] in known:
             raise ValueError(f'engine.{key}: a server option, set it under "server"')
-        if isinstance(value, bool) or (isinstance(value, (str, int, float)) and str(value).strip() != ""):
-            engine[flag] = value
-        else:
-            raise ValueError(f"engine.{key}: expected a string or number, or true/false for a switch, not {value!r}")
+        engine += engine_words(key, value)
     return argv, engine
 
 
 def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
-    """(args, argv, file_engine, cli_engine): parsed options, their source words and the engine flags from each.
-    Command line > config file > defaults; SystemExit(2) for a bad value, ValueError for a bad config or stray word."""
+    """(args, argv, file_words, cli_words): parsed options, their source words and the engine words from each.
+    The engine reads its flags in order and a later one wins, so file words then command-line words keep
+    command line > config file > defaults; SystemExit(2) for a bad value, ValueError for a bad config or stray word."""
     a_cli, extras = ap.parse_known_args(cli)
-    cli_engine = split_engine_extras(extras)
-    file_argv, file_engine = [], {}
+    cli_words = split_engine_extras(extras)
+    file_argv, file_words = [], []
     if a_cli.config:
-        file_argv, file_engine = load_config_file(a_cli.config, ap)
+        file_argv, file_words = load_config_file(a_cli.config, ap)
     a = ap.parse_known_args(file_argv + cli)[0]
     if a.vision == "":                                     # a bare --vision
         ap.error(VISION_USAGE)
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
         if isinstance(act, argparse._AppendAction) and getattr(a_cli, act.dest) != act.default:
             setattr(a, act.dest, getattr(a_cli, act.dest))
-    for flag, value in (("--spec", a.spec), ("--spec-min-p", a.spec_min_p), ("--mtp-max-t", a.mtp_max_t),
-                        ("--max-context", a.max_context), ("--peer-exclusive", a.peer_exclusive or None)):
-        if value is not None:
-            cli_engine[flag] = value
     if a.parallel and a.parallel > 1:
         for flag in ("--batch", "--slots"):
-            if flag in cli_engine or flag in file_engine:
+            if flag in file_words or flag in cli_words:
                 raise ValueError(f"parallel and engine {flag} both set: use parallel")
-        (cli_engine if a_cli.parallel else file_engine)["--batch"] = a.parallel
+        (cli_words if a_cli.parallel else file_words).extend(["--batch", str(a.parallel)])
         if not a.slot_full_context:
             # --max-context is shared by the slots, as in llama.cpp: each holds an equal part (the solo path, used while
             # a request is alone, has the same length, so a request never outgrows its slot)
-            src = cli_engine if "--max-context" in cli_engine or "--max-context" not in file_engine else file_engine
-            ctx = int(src.get("--max-context", ENGINE_DEFAULT_CONTEXT))
-            src["--max-context"] = max(MIN_SLOT_CONTEXT, ctx // a.parallel)
+            src = cli_words if "--max-context" in cli_words or "--max-context" not in file_words else file_words
+            at = flag_index(src, "--max-context")
+            if at is not None and at + 1 >= len(src):
+                raise ValueError("--max-context needs a value")
+            ctx = int(src[at + 1]) if at is not None else ENGINE_DEFAULT_CONTEXT
+            part = str(max(MIN_SLOT_CONTEXT, ctx // a.parallel))
+            if at is None:
+                src += ["--max-context", part]
+            else:
+                src[at + 1] = part
             a.shared_context = ctx                         # the total, for the startup line
-    return a, file_argv + cli, file_engine, cli_engine
+    return a, file_argv + cli, file_words, cli_words
 
 
-def check_engine_flags(flags: dict, known: set[str] | None, where: str) -> None:
-    """ValueError naming the first flag the engine rejects (unchecked when the binary is unreadable)."""
-    for flag in flags:
-        if known is not None and flag not in known:
-            raise ValueError(f"{where}: {flag} is not an engine flag")
+def check_engine_flags(words: list[str], known: set[str] | None, where: str) -> None:
+    """ValueError naming the first flag (a word starting with `--`) the engine rejects; value words are not names
+    (unchecked when the binary is unreadable)."""
+    for word in words:
+        if known is not None and word.startswith("--") and word not in known:
+            raise ValueError(f"{where}: {word} is not an engine flag")
 
 
-def engine_settings(file_flags: dict, cli_flags: dict) -> tuple[dict, dict]:
-    """(flags, sources): the config file's flags overridden by the command line's, with each one's origin."""
-    flags, sources = {}, {}
-    for src, items in (("config", file_flags), ("cli", cli_flags)):
-        for flag, value in items.items():
-            flags[flag], sources[flag] = value, src
-    return flags, sources
+def engine_groups(words: list[str]) -> list[list[str]]:
+    """`words` as [flag, value, ...] groups, each starting at a word that begins with `--`."""
+    groups: list[list[str]] = []
+    for word in words:
+        if word.startswith("--") or not groups:
+            groups.append([word])
+        else:
+            groups[-1].append(word)
+    return groups
 
 
-def engine_line(flags: dict, sources: dict, config: bool = True, shared: tuple[int, int] | None = None) -> str:
-    """The startup line listing engine settings from --config or the command line; without a config file it says
-    the built-in defaults apply. `shared` is (total, slots) when --max-context was divided among the slots."""
-    def one(f, v):
-        if v is False:
-            return f"no {f} ({sources[f]})"
-        note = f"{sources[f]}: {shared[0]} / {shared[1]} slots" if shared and f == "--max-context" else sources[f]
-        return f"{f}{'' if v is True else f' {v}'} ({note})"
-    shown = ", ".join(one(f, v) for f, v in flags.items())
+def engine_line(file_words: list[str], cli_words: list[str], config: bool = True,
+                shared: tuple[int, int] | None = None) -> str:
+    """The startup line listing the engine words from --config and the command line, each flag with its values and
+    origin; without a config file it says the built-in defaults apply. `shared` is (total, slots) when --max-context
+    was divided among the slots."""
+    groups = [(g, "config") for g in engine_groups(file_words)] + [(g, "cli") for g in engine_groups(cli_words)]
+    last_ctx = max((i for i, (g, _) in enumerate(groups) if g[0] == "--max-context"), default=None)
+    def one(i, g, src):
+        note = f"{src}: {shared[0]} / {shared[1]} slots" if shared and i == last_ctx else src
+        return f"{' '.join(g)} ({note})"
+    shown = ", ".join(one(i, g, src) for i, (g, src) in enumerate(groups))
     if config:
         return f"[server] engine: {shown}" if shown else "[server] engine: config sets nothing, built-in defaults"
-    spec = flags.get("--spec", 0)
-    state = f"spec {'off' if not int(spec) else spec}, {flags.get('--max-context', ENGINE_DEFAULT_CONTEXT)} context"
+    words = file_words + cli_words
+    spec = flag_value(words, "--spec") or 0
+    state = f"spec {'off' if not int(spec) else spec}, {flag_value(words, '--max-context') or ENGINE_DEFAULT_CONTEXT} context"
     return f"[server] engine: built-in defaults (no --config): {state}" + (f"; {shown}" if shown else "")
 
 
@@ -270,12 +287,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model", help="the .basalt model file: the engine, tokenizer, sampling and vision come from it")
     ap.add_argument("--engine-bin", help=argparse.SUPPRESS)      # set by `basalt serve`
     ap.add_argument("--alias", help="the model name the API reports (default: the name stored in the model file)")
-    ap.add_argument("--spec", type=int, help="tokens per verify window, the drafter's cap (default 0: no speculation, "
-                                             "the drafter is not loaded; the model file does not set it)")
-    ap.add_argument("--spec-min-p", type=float, help="stop drafting below this draft probability (default 0 = "
-                                                     "always draft to the cap; the model file does not set it)")
-    ap.add_argument("--mtp-max-t", type=int, help="the drafter's own window cap (default 0 = --spec)")
-    ap.add_argument("--max-context", type=int, help="the longest context the engine allows, in tokens (default 4096)")
     ap.add_argument("--parallel", type=parallel_count, metavar="N",
                     help=f"requests served at once, 1..{PARALLEL_MAX} (default 1: one at a time); more requests wait "
                          "their turn. --max-context is shared: each slot holds that divided by N (so 4 slots of 262144 "
@@ -286,14 +297,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "cost N times the KV cache")
     ap.add_argument("--config", metavar="FILE",
                     help="a JSON object of engine flags, e.g. {\"max-context\": 32768, \"spec\": 7, "
-                         "\"resident-experts\": true}; the server's own flags win over it")
+                         "\"resident-experts\": true}; a list gives a flag several values; the command line "
+                         "wins over it")
     ap.add_argument("--vision", nargs="?", const="", default="off", type=vision_setting, choices=VISION_MODES, metavar="MODE",
                     help="image input: off (default), on (the encoder always on the main GPU, ~2.2 GiB of VRAM), "
                          "peer (always on the second GPU), dynamic (inside the engine: it borrows expert-cache slots "
                          "on the main GPU while it reads an image, no standing VRAM) or cpu (no VRAM, slow); a value is "
                          "required")
-    ap.add_argument("--peer-exclusive", action="store_true",
-                    help="the peer card's experts live only there, not also in RAM: less RAM, slower prefill")
     ap.add_argument("--host", default="127.0.0.1",
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
                          "devices on your network (give --api-key)")

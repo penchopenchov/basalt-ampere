@@ -98,18 +98,19 @@ class Peer(Tmp):
         self.assertIn("vision", cfg)
         self.assertIn("--vision", cfg["args"])
 
-    def test_overrides_replace_or_add(self):
+    def test_engine_words_follow_the_model_as_given(self):
         path = self.build()
         args = modelfile.model_config(path, str(self.engine_bin), gpus=1,
-                                      overrides={"--spec": 0, "--mtp-max-t": 4})["args"]
-        self.assertEqual(args, ["--model", path, "--spec", "0", "--mtp-max-t", "4"])
-        args = modelfile.model_config(path, str(self.engine_bin), gpus=1, overrides={"--spec": 3})["args"]
-        self.assertEqual(args, ["--model", path, "--spec", "3"])
+                                      engine_words=["--spec", "0", "--mtp-max-t", "4", "--peer-exclusive"])["args"]
+        self.assertEqual(args, ["--model", path, "--spec", "0", "--mtp-max-t", "4", "--peer-exclusive"])
+        args = modelfile.model_config(path, str(self.engine_bin), gpus=1,
+                                      engine_words=["--control-vector-layer-range", "4", "44"])["args"]
+        self.assertEqual(args, ["--model", path, "--control-vector-layer-range", "4", "44"])
 
-    def test_switch_override_is_added_once(self):
+    def test_a_given_peer_device_replaces_the_default(self):
         path = self.build()
-        args = modelfile.model_config(path, str(self.engine_bin), gpus=1, overrides={"--peer-exclusive": True})["args"]
-        self.assertEqual(args, ["--model", path, "--peer-exclusive"])
+        args = modelfile.model_config(path, str(self.engine_bin), gpus=2, engine_words=["--peer-device", "-1"])["args"]
+        self.assertEqual(args, ["--model", path, "--peer-device", "-1"])
 
     def test_plain_pack_gives_only_the_model(self):
         path = self.build()

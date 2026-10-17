@@ -99,31 +99,20 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     return {"vision_bin": str(side), "mmproj": str(mmproj), "model": str(vocab)}
 
 
-def with_arg(args: list[str], flag: str, value) -> list[str]:
-    """`args` with `flag value` replaced, or appended when absent; a value of True is a bare switch."""
-    out = list(args)
-    if value is True:
-        return out if flag in out else out + [flag]
-    if flag in out:
-        out[out.index(flag) + 1] = str(value)
-    else:
-        out += [flag, str(value)]
-    return out
-
-
 def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bool | str = False,
-                 overrides: dict | None = None) -> dict:
-    """The engine settings the file implies; `overrides` ({flag: value}) replace its arguments, `vision` (True, "peer"
+                 engine_words: list[str] | None = None) -> dict:
+    """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
+    later flag win), `vision` (True, "peer"
     or "cpu") adds the sidecar and "dynamic" the in-engine encoder (ValueError if it cannot be set up). A second
     visible GPU becomes the peer tier."""
     mf = ModelFile(path)
     meta = json.loads(mf.read("meta"))
     path = os.path.abspath(path)
+    words = list(engine_words or [])
     args = ["--model", path]   # settings come from the engine defaults and the server
-    for flag, value in (overrides or {}).items():
-        args = with_arg(args, flag, value)
-    if "--peer-device" not in args and (gpu_count() if gpus is None else gpus) > 1:
+    if "--peer-device" not in words and (gpu_count() if gpus is None else gpus) > 1:
         args += ["--peer-device", "1"]
+    args += words
     cdir = cache_dir(mf)
     cdir.mkdir(parents=True, exist_ok=True)
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",

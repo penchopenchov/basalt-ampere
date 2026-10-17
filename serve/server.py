@@ -22,10 +22,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
-from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings,  # noqa: E402
+from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line,  # noqa: E402
                           parse_settings, sampling_defaults_from_config)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
+from serve.engine.flags import flag_index  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, child_env, engine_args, gpu_list, gpus_in_play,  # noqa: E402
@@ -91,21 +92,17 @@ def main() -> int:
             check_engine_flags(cli_engine, known, "command line")
         except ValueError as e:
             fail(str(e))
-        flags, sources = engine_settings(file_engine, cli_engine)
         mode = a.vision
         vision_arg = False if a.mock_engine or mode == "off" else mode
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
                 a.model, a.engine_bin, gpus=len(listed) if listed else None, vision=vision_arg,
-                overrides={f: v for f, v in flags.items() if v is not False}).items()
+                engine_words=file_engine + cli_engine).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
-        off = {f for f, v in flags.items() if v is False}
-        if off and cfg.get("args"):
-            cfg["args"] = [x for x in cfg["args"] if x not in off]
         if not a.mock_engine:
-            print(engine_line(flags, sources, bool(a.config),
+            print(engine_line(file_engine, cli_engine, bool(a.config),
                                     (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None), flush=True)
     if a.alias:
         cfg["model_name"] = a.alias
@@ -138,8 +135,7 @@ def main() -> int:
         lazy = a.lazy
         if lazy and cfg.get("vision"):
             print("[server] warning: lazy loading is text-only, vision off", flush=True)
-            if "--vision-mmproj" in cfg["args"]:
-                at = cfg["args"].index("--vision-mmproj")
+            while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
                 del cfg["args"][at:at + 2]
             del cfg["vision"]
         if cfg.get("vision"):

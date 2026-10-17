@@ -12,8 +12,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from serve.engine.modelfile import with_arg  # noqa: E402
-from serve.config import ENGINE_PASSTHROUGH, build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings, load_config_file, parallel_count, parse_settings, server_options, split_engine_extras  # noqa: E402
+from serve.config import build_parser, check_engine_flags, engine_flags_of, engine_line, load_config_file, parallel_count, parse_settings, server_options, split_engine_extras  # noqa: E402
+from serve.engine.flags import flag_value  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -58,7 +58,7 @@ class ConfigFile(unittest.TestCase):
                                                          "resident-experts": True}}), ap)
         self.assertEqual(argv, ["--port", "9000", "--vision", "on", "--allowed-host", "a", "--allowed-host", "b",
                                 "--gpu", "0,1"])
-        self.assertEqual(engine, {"--max-context": 32768, "--kv": "int8", "--resident-experts": True})
+        self.assertEqual(engine, ["--max-context", "32768", "--kv", "int8", "--resident-experts"])
 
     def test_paths_are_relative_to_the_file(self):
         p = conf({"server": {"model": "m/x.basalt", "tokenizer": "tok"}})
@@ -70,7 +70,7 @@ class ConfigFile(unittest.TestCase):
         ap = build_parser()
         for obj, msg in (({"spec": 7}, "not the key"),
                          ({"server": {"nope": 1}}, "not a server option"),
-                         ({"server": {"spec": 7}}, "under \"engine\""),
+                         ({"server": {"spec": 7}}, "not a server option \\(engine flags go under"),
                          ({"server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
                          ({"server": {"vision": "yes"}}, "vision: use one of on, off, peer, dynamic, cpu"),
                          ({"server": {"vision": True}}, "vision: use one of on, off, peer, dynamic, cpu"),
@@ -81,6 +81,10 @@ class ConfigFile(unittest.TestCase):
                          ({"engine": {"model": "x"}}, "a server option"),
                          ({"engine": {"spec": None}}, "expected a string or number"),
                          ({"engine": {"spec": ""}}, "expected a string or number"),
+                         ({"engine": {"control-vector-layer-range": []}}, "empty list"),
+                         ({"engine": {"control-vector-layer-range": [4, [44]]}}, "expected a string or number"),
+                         ({"engine": {"control-vector-layer-range": [4, True]}}, "expected a string or number"),
+                         ({"engine": {"kv": {"a": 1}}}, "expected a string or number"),
                          ({"engine": []}, "must be an object")):
             with self.assertRaisesRegex(ValueError, msg, msg=str(obj)):
                 load_config_file(conf(obj), ap)
@@ -95,8 +99,18 @@ class ConfigFile(unittest.TestCase):
         _, engine = load_config_file(conf({"engine": {"spc": 1}}), build_parser())
         with self.assertRaisesRegex(ValueError, "--spc is not an engine flag"):
             check_engine_flags(engine, known, "--config c.json")
-        check_engine_flags({"--kv": "int8"}, known, "x")
-        check_engine_flags({"--anything": 1}, None, "x")       # no readable binary: unchecked
+        check_engine_flags(["--kv", "int8"], known, "x")
+        check_engine_flags(["--spec", "-1", "--kv", "int8"], known, "x")      # value words are not names
+        check_engine_flags(["--anything", "1"], None, "x")      # no readable binary: unchecked
+        with self.assertRaisesRegex(ValueError, "command line: --kvv is not an engine flag"):
+            check_engine_flags(["--kv", "int8", "--kvv", "1"], known, "command line")
+
+    def test_list_values_become_words(self):
+        _, engine = load_config_file(conf({"engine": {"control-vector-layer-range": [4, 44], "kv": "int8",
+                                                      "resident_experts": True, "no-x": False, "rate": 0.5,
+                                                      "offset": ["-1", -2]}}), build_parser())
+        self.assertEqual(engine, ["--control-vector-layer-range", "4", "44", "--kv", "int8", "--resident-experts",
+                                  "--rate", "0.5", "--offset", "-1", "-2"])
 
 
 class Precedence(unittest.TestCase):
@@ -120,62 +134,104 @@ class Precedence(unittest.TestCase):
         self.assertTrue(parse(["--lazy"], {"server": {"lazy": False}})[0].lazy)
 
     def test_engine_flags(self):
-        _, _, file_engine, cli_engine = parse(["--spec", "5", "--kv", "fp16", "--resident-experts"],
-                                              {"engine": {"spec": 7, "max-context": 32768, "kv": "int8"}})
-        flags, src = engine_settings(file_engine, cli_engine)
-        self.assertEqual(flags, {"--spec": 5, "--max-context": 32768, "--kv": "fp16", "--resident-experts": True})
-        self.assertEqual(src, {"--spec": "cli", "--max-context": "config", "--kv": "cli", "--resident-experts": "cli"})
+        _, _, file_words, cli_words = parse(["--spec", "5", "--kv", "fp16", "--resident-experts"],
+                                            {"engine": {"spec": 7, "max-context": 32768, "kv": "int8"}})
+        self.assertEqual(file_words, ["--spec", "7", "--max-context", "32768", "--kv", "int8"])
+        self.assertEqual(cli_words, ["--spec", "5", "--kv", "fp16", "--resident-experts"])
 
-    def test_switch_in_args(self):
-        base = ["--model", "m"]
-        self.assertEqual(with_arg(base, "--resident-experts", True), base + ["--resident-experts"])
-        self.assertEqual(with_arg(base + ["--kv", "int8"], "--kv", "fp16"), base + ["--kv", "fp16"])
+    def test_the_command_line_wins_over_the_file(self):
+        # the engine reads its words in order and a later flag wins
+        _, _, file_words, cli_words = parse(["--kv", "fp16"], {"engine": {"kv": "int8"}})
+        words = file_words + cli_words
+        self.assertEqual(words, ["--kv", "int8", "--kv", "fp16"])
+        self.assertEqual(flag_value(words, "--kv"), "fp16")
+
+    def test_switches(self):
+        _, _, file_words, cli_words = parse(["--resident-experts"], {"engine": {"on": True, "off": False}})
+        self.assertEqual(file_words, ["--on"])
+        self.assertEqual(cli_words, ["--resident-experts"])
+
+    def test_cli_passes_a_two_value_flag_as_typed(self):
+        _, _, _, cli_words = parse(["--control-vector-layer-range", "4", "44", "--resident-experts"])
+        self.assertEqual(cli_words, ["--control-vector-layer-range", "4", "44", "--resident-experts"])
+        _, _, file_words, cli_words = parse(["--control-vector-layer-range", "1", "2"],
+                                            {"engine": {"control-vector-layer-range": [4, 44]}})
+        self.assertEqual(file_words + cli_words, ["--control-vector-layer-range", "4", "44",
+                                                  "--control-vector-layer-range", "1", "2"])
+
+    def test_negative_value_words(self):
+        _, _, _, cli_words = parse(["--peer-device", "-1", "--x=-2"])
+        self.assertEqual(cli_words, ["--peer-device", "-1", "--x", "-2"])
+        check_engine_flags(cli_words, {"--peer-device", "--x"}, "cli")
 
     def test_extras(self):
         self.assertEqual(split_engine_extras(["--kv", "int8", "--resident-experts", "--seed=3", "--x", "-1"]),
-                         {"--kv": "int8", "--resident-experts": True, "--seed": "3", "--x": "-1"})
-        with self.assertRaises(ValueError):
-            split_engine_extras(["stray"])
+                         ["--kv", "int8", "--resident-experts", "--seed", "3", "--x", "-1"])
+        self.assertEqual(split_engine_extras([]), [])
+        for bad in (["stray"], ["-1", "--x"], ["--"]):
+            with self.assertRaises(ValueError):
+                split_engine_extras(bad)
+
+    def test_former_server_options_are_engine_flags(self):
+        for name in ("spec", "spec-min-p", "mtp-max-t", "max-context", "peer-exclusive"):
+            self.assertNotIn(name, server_options(build_parser()))
+        _, _, _, cli_words = parse(["--spec", "5", "--peer-exclusive", "--max-context=8192"])
+        self.assertEqual(cli_words, ["--spec", "5", "--peer-exclusive", "--max-context", "8192"])
+
+    def test_server_read_flags_are_found_last_wins(self):
+        self.assertEqual(flag_value(["--spec", "3", "--kv", "x", "--spec", "5"], "--spec"), "5")
+        self.assertIsNone(flag_value(["--spec"], "--spec"))
+        self.assertIsNone(flag_value([], "--spec"))
 
     def test_startup_line(self):
-        flags, src = engine_settings({"--max-context": 32768, "--resident-experts": True, "--kv": "int8"}, {"--spec": 7})
-        flags["--kv"] = False
-        self.assertEqual(engine_line(flags, src),
+        self.assertEqual(engine_line(["--max-context", "32768", "--resident-experts", "--kv", "int8",
+                                      "--control-vector-layer-range", "4", "44"], ["--spec", "7"]),
                          "[server] engine: --max-context 32768 (config), --resident-experts (config), "
-                         "no --kv (config), --spec 7 (cli)")
-        self.assertEqual(engine_line({}, {}, config=False),
+                         "--kv int8 (config), --control-vector-layer-range 4 44 (config), --spec 7 (cli)")
+        self.assertEqual(engine_line([], [], config=False),
                          "[server] engine: built-in defaults (no --config): spec off, 4096 context")
-        self.assertEqual(engine_line({"--spec": 7}, {"--spec": "cli"}, config=False),
+        self.assertEqual(engine_line([], ["--spec", "7"], config=False),
                          "[server] engine: built-in defaults (no --config): spec 7, 4096 context; --spec 7 (cli)")
+        self.assertEqual(engine_line([], []), "[server] engine: config sets nothing, built-in defaults")
 
 
 class SlotContext(unittest.TestCase):
     """--max-context is shared by the --parallel slots unless --slot-full-context."""
 
-    def flags(self, cli, cfg=None):
-        _, _, file_engine, cli_engine = parse(cli, cfg)
-        return {**file_engine, **cli_engine}
+    def context(self, cli, cfg=None):
+        _, _, file_words, cli_words = parse(cli, cfg)
+        return int(flag_value(file_words + cli_words, "--max-context"))
 
     def test_each_slot_gets_an_equal_part(self):
-        self.assertEqual(self.flags(["--parallel", "4", "--max-context", "262144"])["--max-context"], 65536)
-        self.assertEqual(self.flags(["--parallel", "2", "--max-context", "262144"])["--max-context"], 131072)
-        self.assertEqual(self.flags(["--max-context", "262144"])["--max-context"], 262144)                  # solo: whole
-        self.assertEqual(self.flags(["--parallel", "4"], {"engine": {"max-context": 8192}})["--max-context"], 2048)
+        self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"]), 65536)
+        self.assertEqual(self.context(["--parallel", "2", "--max-context", "262144"]), 131072)
+        self.assertEqual(self.context(["--max-context", "262144"]), 262144)                  # solo: whole
+        self.assertEqual(self.context(["--parallel", "4"], {"engine": {"max-context": 8192}}), 2048)
+        self.assertEqual(self.context(["--parallel", "4"]), 1024)                            # the default, shared
+        self.assertEqual(self.context(["--parallel", "2", "--max-context", "65536"],
+                                      {"engine": {"max-context": 8192}}), 32768)
+
+    def test_parallel_conflicts_with_batch_and_slots(self):
+        for flag in ("--batch", "--slots"):
+            with self.assertRaisesRegex(ValueError, f"parallel and engine {flag} both set"):
+                parse(["--parallel", "2", flag, "3"])
+            with self.assertRaisesRegex(ValueError, f"parallel and engine {flag} both set"):
+                parse(["--parallel", "2"], {"engine": {flag: 3}})
+        _, _, file_words, cli_words = parse(["--parallel", "2"])
+        self.assertEqual(flag_value(cli_words, "--batch"), "2")
 
     def test_engine_line_shows_the_division(self):
         ap = build_parser()
-        a, _, file_engine, cli_engine = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
-        flags, src = engine_settings(file_engine, cli_engine)
-        line = engine_line(flags, src, False, (a.shared_context, a.parallel))
-        self.assertEqual(flags["--max-context"], 16384)
+        a, _, file_words, cli_words = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
+        line = engine_line(file_words, cli_words, False, (a.shared_context, a.parallel))
+        self.assertEqual(flag_value(cli_words, "--max-context"), "16384")
         self.assertIn("--max-context 16384 (cli: 65536 / 4 slots)", line)
-        self.assertNotIn("slots", engine_line(flags, src, False))
+        self.assertNotIn("slots", engine_line(file_words, cli_words, False))
 
     def test_slot_full_context_keeps_the_whole(self):
-        f = self.flags(["--parallel", "4", "--max-context", "262144", "--slot-full-context"])
-        self.assertEqual(f["--max-context"], 262144)
-        self.assertEqual(self.flags(["--parallel", "4", "--max-context", "262144"],
-                                    {"server": {"slot-full-context": True}})["--max-context"], 262144)
+        self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144", "--slot-full-context"]), 262144)
+        self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"],
+                                      {"server": {"slot-full-context": True}}), 262144)
 
 
 class EveryOption(unittest.TestCase):
@@ -193,7 +249,7 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            if name in ENGINE_PASSTHROUGH or name in ("api-key", "engine-bin"):
+            if name in ("api-key", "engine-bin"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
@@ -211,7 +267,7 @@ class EveryOption(unittest.TestCase):
     def test_every_engine_flag_by_both_paths(self):
         flags = engine_parser_flags()
         self.assertGreater(len(flags), 100)
-        server = set(server_options(build_parser())) - set(ENGINE_PASSTHROUGH)
+        server = set(server_options(build_parser()))
         engine_bin = write("\0".join(flags) + "\0", "fake-engine")
         known = engine_flags_of(engine_bin)
         self.assertEqual(known, set(flags))
@@ -224,15 +280,13 @@ class EveryOption(unittest.TestCase):
                 continue
             cli = [flag, "5"] if takes_value else [flag]
             cfgv = 5 if takes_value else True
-            _, _, _, cli_engine = parse(cli)
-            _, _, file_engine, _ = parse([], {"engine": {flag: cfgv}})
-            self.assertEqual(list(cli_engine), [flag])
-            self.assertEqual(float(cli_engine[flag]) if takes_value else cli_engine[flag], 5.0 if takes_value else True, flag)
-            self.assertEqual(file_engine, {flag: cfgv}, flag)
-            check_engine_flags(cli_engine, known, "cli")
-            check_engine_flags(file_engine, known, "config")
-            args = with_arg(["--model", "m"], flag, {**file_engine, **cli_engine}[flag])
-            self.assertIn(flag, args)
+            _, _, _, cli_words = parse(cli)
+            _, _, file_words, _ = parse([], {"engine": {flag: cfgv}})
+            self.assertEqual(cli_words[:1], [flag], flag)
+            self.assertEqual(cli_words[1:], ["5"] * takes_value, flag)
+            self.assertEqual(file_words, [flag, "5"] if takes_value else [flag], flag)
+            check_engine_flags(cli_words, known, "cli")
+            check_engine_flags(file_words, known, "config")
 
     def test_the_built_engine_accepts_every_flag(self):
         engine_bin = ROOT / "bin/basalt"
