@@ -76,20 +76,40 @@ size_t ndiff_rows(const std::vector<float>& a, const std::vector<float>& b, cons
     return d;
 }
 
-// NX synthetic NVFP4 expert blobs: random nibbles, UE4M3 sub-block scales with exponent 1..4, then the FP32 tail
-// {s_gate, s_up, s_down, 0} in 0.5 .. 2
+// A UE4M3 sub-block scale byte.  Profile 0: exponent 1..4 (small blocks).  Profile 1: exponent 6..14, block values in
+// the hundreds as the packs' are (their tails are 1e-5..1e-4).  Profile 2: profile 1 with the odd bytes mixed in: 0x7F
+// (the NaN code, decoded as 0), the sign bit set (ignored), zero and subnormals.
+uint8_t nvfp4_scale_byte(int prof, std::mt19937& rng) {
+    if (prof == 0) return (uint8_t) (((1 + rng() % 4) << 3) | (rng() & 7));
+    const uint8_t v = (uint8_t) (((6 + rng() % 9) << 3) | (rng() & 7));
+    if (prof == 1) return v;
+    switch (rng() % 8) {
+        case 0: return 0x7F;
+        case 1: return (uint8_t) (v | 0x80);
+        case 2: return 0xFF;
+        case 3: return 0x00;
+        case 4: return (uint8_t) (rng() & 7);   // subnormal
+        default: return v;
+    }
+}
+// The FP32 tail scale: profile 0 in 0.5 .. 2, else log-uniform in 2e-5 .. 2e-4 (what the packs carry).
+float nvfp4_tail_scale(int prof, std::mt19937& rng) {
+    if (prof == 0) return std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
+    return 2e-5f * std::exp(std::uniform_real_distribution<float>(0.0f, std::log(10.0f))(rng));
+}
+// NX synthetic NVFP4 expert blobs: random nibbles, UE4M3 sub-block scales, then the FP32 tail {s_gate, s_up, s_down, 0};
+// expert x takes scale profile x % 3
 std::vector<uint8_t> nvfp4_blobs(const K::NativeExpertLayout& L, int nx, std::mt19937& rng) {
     std::vector<uint8_t> b((size_t) nx * L.bytes);
     std::uniform_int_distribution<int> byte(0, 255);
-    std::uniform_real_distribution<float> u(0.5f, 2.0f);
     constexpr size_t bs = 36;   // block_nvfp4: 4 scale bytes, 32 nibble bytes
     for (int x = 0; x < nx; ++x) {
         uint8_t* p = b.data() + (size_t) x * L.bytes;
         const size_t q = L.bytes - 16;
         for (size_t i = 0; i < q; ++i) p[i] = (uint8_t) byte(rng);
         for (size_t o = 0; o < q; o += bs)
-            for (int j = 0; j < 4; ++j) p[o + j] = (uint8_t) (((1 + byte(rng) % 4) << 3) | (byte(rng) & 7));
-        const float t[4] = {u(rng), u(rng), u(rng), 0.0f};
+            for (int j = 0; j < 4; ++j) p[o + j] = nvfp4_scale_byte(x % 3, rng);
+        const float t[4] = {nvfp4_tail_scale(x % 3, rng), nvfp4_tail_scale(x % 3, rng), nvfp4_tail_scale(x % 3, rng), 0.0f};
         std::memcpy(p + q, t, sizeof t);
     }
     return b;

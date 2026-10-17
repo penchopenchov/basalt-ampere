@@ -14,6 +14,9 @@
 // (3) iq_mmvq's IQ3_S columns on the tensor-core kernel (MMVQ_MMA, turned on here where the device has it)
 //     against the old kernel, bitwise; with MMVQ_MMA=1 in the environment (1) takes it as well.
 //
+// NVFP4 blocks come in three scale profiles (narrow; pack-like block values with 2e-5..2e-4 tails; pack-like with scale
+// bytes 0x7F, 0xFF, bit 7 set, 0 and subnormals), all of which every path must decode alike.
+//
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
 #include "basalt/kernels/f16_bits.hpp"
@@ -73,10 +76,33 @@ const char* name_of(int t) {
     }
 }
 int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
-// NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales in 0.5 .. 2
+// A UE4M3 sub-block scale byte.  Profile 0: exponent 1..4 (small blocks).  Profile 1: exponent 6..14, block values in
+// the hundreds as the packs' are (their tails are 1e-5..1e-4).  Profile 2: profile 1 with the odd bytes mixed in: 0x7F
+// (the NaN code, decoded as 0), the sign bit set (ignored), zero and subnormals.
+uint8_t nvfp4_scale_byte(int prof, std::mt19937& rng) {
+    if (prof == 0) return (uint8_t) (((1 + rng() % 4) << 3) | (rng() & 7));
+    const uint8_t v = (uint8_t) (((6 + rng() % 9) << 3) | (rng() & 7));
+    if (prof == 1) return v;
+    switch (rng() % 8) {
+        case 0: return 0x7F;
+        case 1: return (uint8_t) (v | 0x80);
+        case 2: return 0xFF;
+        case 3: return 0x00;
+        case 4: return (uint8_t) (rng() & 7);   // subnormal
+        default: return v;
+    }
+}
+// The FP32 tail scale: profile 0 in 0.5 .. 2, else log-uniform in 2e-5 .. 2e-4 (what the packs carry).
+float nvfp4_tail_scale(int prof, std::mt19937& rng) {
+    if (prof == 0) return std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
+    return 2e-5f * std::exp(std::uniform_real_distribution<float>(0.0f, std::log(10.0f))(rng));
+}
+// The NVFP4 scale profile of the blob being made (-1: a random one per matrix)
+int g_nv_profile = -1;
+// NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales
 void append_nvfp4_tail(std::vector<uint8_t>& b, std::mt19937& rng) {
-    std::uniform_real_distribution<float> u(0.5f, 2.0f);
-    const float t[4] = {u(rng), u(rng), u(rng), 0.0f};
+    const int prof = g_nv_profile >= 0 ? g_nv_profile : 0;
+    const float t[4] = {nvfp4_tail_scale(prof, rng), nvfp4_tail_scale(prof, rng), nvfp4_tail_scale(prof, rng), 0.0f};
     const uint8_t* p = (const uint8_t*) t;
     b.insert(b.end(), p, p + sizeof t);
 }
@@ -90,8 +116,9 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
         if (t == 40) {
-            // NVFP4: four UE4M3 sub-block scales, exponent 1..4: 2^-7 .. 2^-4 as ggml decodes them
-            for (int j = 0; j < 4; ++j) w[o + j] = (uint8_t) (((1 + byte(rng) % 4) << 3) | (byte(rng) & 7));
+            // NVFP4: four UE4M3 sub-block scales (profiles in nvfp4_scale_byte)
+            const int prof = g_nv_profile >= 0 ? g_nv_profile : (int) (rng() % 3);
+            for (int j = 0; j < 4; ++j) w[o + j] = nvfp4_scale_byte(prof, rng);
         } else if (t == 29) {
             // IQ1_M: the fp16 scale is the top nibbles of the four scale words (bytes 48..55); nibble 3 carries the
             // sign and the exponent's top bits: 0x1 / 0x2 (or 0x9 / 0xA) keeps it in 2^-11 .. 2^-3
@@ -287,10 +314,12 @@ struct Grouped {
         std::vector<unsigned long long> ptr;
         for (int g = 0; g < n_groups; ++g) {
             // one blob per group: gate rows | up rows (format gu, H values) | down rows (format dt, FF values)
+            g_nv_profile = g % 3;   // the narrow, the pack-like, the pack-like with odd scale bytes
             auto b = random_rows(gu, 2 * FF, H, rng);
             const auto d = random_rows(dt, H, FF, rng);
             b.insert(b.end(), d.begin(), d.end());
             if (gu == 40) append_nvfp4_tail(b, rng);
+            g_nv_profile = -1;
             if (b.size() != L.bytes) { std::fprintf(stderr, "blob size %zu != %zu\n", b.size(), L.bytes); std::exit(2); }
             uint8_t* db = dalloc<uint8_t>(b.size());
             ck(cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice), "blob");
