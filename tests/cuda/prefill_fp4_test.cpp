@@ -587,9 +587,18 @@ int main(int argc, char** argv) {
         }
         cudaStream_t s;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
-        const int rc = parity(s);
+        int rc = parity(s);
         if (do_bench) bench(s);
         cudaStreamDestroy(s);
+        // the GEMM launch's shared-memory opt-in is per device: every other device must run it too
+        for (int d = 1; d < ndev && rc == 0; ++d) {
+            ck(cudaSetDevice(d), "set device");
+            std::printf("device %d\n", d);
+            cudaStream_t s2;
+            ck(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking), "stream");
+            rc = parity(s2);
+            cudaStreamDestroy(s2);
+        }
         return rc;
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "prefill_mmq_nvfp4_test: %s\n", ex.what());

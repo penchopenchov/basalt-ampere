@@ -11,6 +11,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -412,10 +413,18 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
         QkChunk* qk = static_cast<QkChunk*>(work);
         Control* ctl = reinterpret_cast<Control*>(qk + (int64_t) HK * chunks);
         gdn_prepare_kernel<<<(unsigned) (HV * chunks), NTH, 0, s>>>(h, gate, beta, eps, (int) T, qk, ctl);
-        static bool attr = false;
-        if (!attr) {
-            cudaFuncSetAttribute(gdn_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(ChunkShared));
-            attr = true;
+        // the shared-memory opt-in is per device (a layer split runs this on several, from different threads)
+        static std::atomic<bool> attr[64];
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev < 0 || dev >= 64) { std::fprintf(stderr, "gdn_recurrence: device %d out of range\n", dev); std::abort(); }
+        if (!attr[dev].load(std::memory_order_acquire)) {
+            if (cudaFuncSetAttribute(gdn_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int) sizeof(ChunkShared)) != cudaSuccess) {
+                std::fprintf(stderr, "gdn_recurrence: shared-memory opt-in failed\n");
+                std::abort();
+            }
+            attr[dev].store(true, std::memory_order_release);
         }
         gdn_chunk_kernel<<<HV * (S / DV), NTH, sizeof(ChunkShared), s>>>(state, h, qk, ctl, y, (int) T);
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, s>>>(z, gamma, eps, y, y16);

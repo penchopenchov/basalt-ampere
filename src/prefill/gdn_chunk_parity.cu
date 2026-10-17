@@ -427,6 +427,14 @@ int main(int argc, char** argv) {
         for (int64_t T : {4096, 16384, 32768}) bench(T);
     } else {
         for (int64_t T : {1, 5, 16, 17, 100, 1000, 4099}) fails += check(T, seed + (uint64_t) T);
+        int ndev = 0;
+        ck(cudaGetDeviceCount(&ndev), "devices");
+        // the launch's shared-memory opt-in is per device: every other device must run it too
+        for (int d = 1; d < ndev; ++d) {
+            ck(cudaSetDevice(d), "set device");
+            std::printf("device %d\n", d);
+            fails += check(1000, seed + 1000);
+        }
         std::printf("gdn_chunk_parity: %d failures\n", fails);
     }
     return fails ? 1 : 0;

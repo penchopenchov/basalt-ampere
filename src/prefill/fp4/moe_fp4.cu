@@ -9,6 +9,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -302,11 +303,15 @@ void run(const Product& p, void* stream) {
     for (int j = 0; j < p.n; ++j) a.blob[j] = p.blob[j];
     a.w_off = p.w_off; a.w_cols = (int) p.w_cols; a.a4 = (const uint8_t*) p.a4; a.gs = p.gs; a.bounds = p.bounds;
     a.tile_off = p.tile_off; a.dst = p.dst; a.ld_dst = p.ld_dst;
-    static const bool configured = [] {
+    // the shared-memory opt-in is per device (a layer split runs this on several, from different threads)
+    static std::atomic<bool> configured[64];
+    int dev = 0;
+    ck(cudaGetDevice(&dev), "device");
+    if (dev < 0 || dev >= 64) ck(cudaErrorInvalidDevice, "device range");
+    if (!configured[dev].load(std::memory_order_acquire)) {
         ck(cudaFuncSetAttribute(gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem), "smem");
-        return true;
-    }();
-    (void) configured;
+        configured[dev].store(true, std::memory_order_release);
+    }
     const dim3 grid((unsigned) (p.w_rows / kRowsPerBlock), (unsigned) ((p.max_rows + kTileTokens - 1) / kTileTokens),
                     (unsigned) p.n);
     gemm_kernel<<<grid, kThreads, kSmem, (cudaStream_t) stream>>>(a);
