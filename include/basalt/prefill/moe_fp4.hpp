@@ -50,4 +50,31 @@ void run(const Product& p, void* stream);
 /// The 16-byte scale tail at `tail_off` of each of p's n blobs to dst[4 j .. 4 j + 3] (the tail swiglu reads).
 void gather_tails(const Product& p, size_t tail_off, float* dst, void* stream);
 
+/// A group of up to kMaxExperts consecutive experts of one layer, as the prompt path runs them: the layer's
+/// activation planes (already rounded to FP4, planned over every expert of the layer) and, per run of the group, the
+/// gate/up product, the tail-scaled SwiGLU, the FP4 rounding of H and the down product.  `gu` and `h` hold one run's
+/// rows only (their row 0 is the run's first row); `dm` is the layer's own output, indexed by absolute row.
+struct Group {
+    int n = 0;
+    const uint8_t* blob[kMaxExperts] = {};
+    const int32_t* bounds_host = nullptr;   ///< n + 1 absolute row bounds, on the host
+    const int32_t* bounds_dev = nullptr;    ///< the same bounds on the device
+    const void* a4x = nullptr;              ///< the layer's activation planes, scales and tile table (this group's first
+    const float* gsx = nullptr;             ///< expert's entry of the table)
+    const int32_t* tox = nullptr;
+    size_t down_off = 0, tail_off = 0;      ///< the down matrix and the 16-byte scale tail inside a blob
+    float *gu = nullptr, *h = nullptr, *dm = nullptr;
+    void* a4h = nullptr;                    ///< a run's H planes, token scales, tile table and relative bounds
+    float* gsh = nullptr;
+    int32_t *toh = nullptr, *rel = nullptr; ///< kMaxExperts + 1 entries each
+    float* tails = nullptr;                 ///< 4 floats per expert of a run: {s_gate, s_up, s_down, 0}
+};
+/// Runs consecutive experts [i0, i0 + n) of the group (n >= 1): rows of `bounds_host` rows [i0, i0 + n].
+void run_experts(const Group& g, int i0, int n, void* stream);
+/// How many experts from i0 form the next run: as many consecutive ones as hold at most `row_cap` rows, and at least
+/// one (an expert's rows are never split).
+int run_length(const Group& g, int i0, int64_t row_cap);
+/// The whole group as runs of at most `row_cap` rows each (GU and H hold a run's rows); returns the number of runs.
+int run_group(const Group& g, int64_t row_cap, void* stream);
+
 }  // namespace basalt::prefill::fp4

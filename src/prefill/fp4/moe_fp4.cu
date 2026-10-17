@@ -4,11 +4,13 @@
 // (src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh, src/ops/common/mma.cuh).
 // Adapted from Infernix (Ian Ranson and contributors), Apache-2.0: see THIRD_PARTY_LICENSES.
 #include "basalt/prefill/moe_fp4.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -316,6 +318,51 @@ void run(const Product& p, void* stream) {
                     (unsigned) p.n);
     gemm_kernel<<<grid, kThreads, kSmem, (cudaStream_t) stream>>>(a);
     ck(cudaGetLastError(), "gemm");
+}
+
+int run_length(const Group& g, int i0, int64_t row_cap) {
+    int n = 1;
+    int64_t rows = g.bounds_host[i0 + 1] - g.bounds_host[i0];
+    while (i0 + n < g.n && rows + (g.bounds_host[i0 + n + 1] - g.bounds_host[i0 + n]) <= row_cap) {
+        rows += g.bounds_host[i0 + n + 1] - g.bounds_host[i0 + n];
+        ++n;
+    }
+    return n;
+}
+
+void run_experts(const Group& g, int i0, int n, void* stream) {
+    constexpr int kN = 2560, kFF = 640;
+    const int32_t* bh = g.bounds_host + i0;
+    const int64_t r0 = bh[0], nr = bh[n] - r0;
+    int64_t maxr = 0;
+    for (int i = 0; i < n; ++i) maxr = std::max<int64_t>(maxr, bh[i + 1] - bh[i]);
+    Product gu;
+    for (int i = 0; i < n; ++i) gu.blob[i] = g.blob[i0 + i];
+    gu.w_off = 0; gu.w_rows = 1280; gu.w_cols = kN; gu.n = n;
+    gu.a4 = g.a4x; gu.gs = g.gsx; gu.bounds = g.bounds_dev + i0; gu.tile_off = g.tox + i0;
+    gu.dst = g.gu - r0 * 1280; gu.ld_dst = 1280; gu.max_rows = maxr;
+    run(gu, stream);
+    gather_tails(gu, g.tail_off, g.tails, stream);
+    rebase(g.bounds_dev + i0, n, g.rel, stream);   // this run's own row bounds
+    mmq::swiglu(g.gu, g.h, nr, kFF, false, stream, g.tails, g.rel, n);
+    plan(g.rel, n, g.toh, stream);
+    quantize(g.h, nullptr, g.rel, g.toh, n, g.a4h, g.gsh, kFF, kFF, nr, stream);
+    Product dn = gu;
+    dn.w_off = g.down_off; dn.w_rows = kN; dn.w_cols = kFF;
+    dn.a4 = g.a4h; dn.gs = g.gsh; dn.bounds = g.rel; dn.tile_off = g.toh;
+    dn.dst = g.dm + r0 * kN; dn.ld_dst = kN;
+    run(dn, stream);
+}
+
+int run_group(const Group& g, int64_t row_cap, void* stream) {
+    int runs = 0;
+    for (int i0 = 0; i0 < g.n;) {
+        const int n = run_length(g, i0, row_cap);
+        run_experts(g, i0, n, stream);
+        i0 += n;
+        ++runs;
+    }
+    return runs;
 }
 
 }  // namespace basalt::prefill::fp4

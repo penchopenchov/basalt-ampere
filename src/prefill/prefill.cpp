@@ -1235,6 +1235,8 @@ void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std
 int Prefill::ring_depth() const { return impl_->ring; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
+namespace { constexpr uint64_t kSizingSlack = 8u << 20; }   // alignment slack of a borrowed region
+
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
     // the same allocation sequence as `init`, counted
     const size_t T = (size_t) chunk;
@@ -1269,7 +1271,28 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f((size_t) basalt::kernels::NG_HC_DIM);
     basalt::kernels::KvHostPools stage;
     take_stage(o, ss, s, stage, ok);
-    return o.used + (8u << 20);   // alignment slack
+    return o.used + kSizingSlack;
+}
+
+bool Prefill::layout_fits(const core::ModelGeometry& g, core::SessionState& ss, int64_t chunk, bool with_source,
+                          uint64_t* used, uint64_t* capacity) {
+    Prefill p;
+    Impl& m = *p.impl_;
+    m.g = &g;
+    m.ss = &ss;
+    m.src = with_source ? reinterpret_cast<core::ExpertSource*>(alignof(std::max_align_t)) : nullptr;   // only tested for null
+    const uint64_t cap = bytes_needed(g, ss, chunk) - kSizingSlack;   // the layout must fit the count itself
+    bool ok = true;
+    Alloc o;
+    o.base = reinterpret_cast<uint8_t*>(uint64_t{1} << 20);   // never dereferenced
+    o.cap = cap;
+    o.owned = &m.owned;
+    o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+    o.take<uint8_t>(GEMM_WS, ok);
+    ok = p.carve((size_t) chunk, &o) && ok;
+    if (used) *used = o.used;
+    if (capacity) *capacity = cap;
+    return ok && o.used <= cap;
 }
 
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
@@ -2308,49 +2331,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const uint8_t* fp4_blob[MMQ_GROUP];
                         size_t fp4_j0 = 0;
                         int fp4_n = 0;
-                        // One run of the group's products over experts [i0, i0 + n) of the open group: gate/up, swiglu,
-                        // the int8 H, down.  GU and H hold only this run's rows (their row 0 is the run's first row).
-                        auto fp4_run = [&](const Fp4Ptrs& fp, int i0, int n) {
-                            const auto& f = lay.fmt[(size_t) l];
-                            const size_t j0 = fp4_j0 + (size_t) i0;
-                            const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j0 + n] - r0;
-                            int64_t maxr = 0;
-                            for (int i = 0; i < n; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[j0 + i]]);
-                            fp4::Product gu;
-                            for (int i = 0; i < n; ++i) gu.blob[i] = fp4_blob[i0 + i];
-                            gu.w_off = 0; gu.w_rows = 1280; gu.w_cols = N; gu.n = n;
-                            gu.a4 = fp.a4x; gu.gs = fp.gsx; gu.bounds = m.bounds_dev + j0; gu.tile_off = fp.tox + j0;
-                            gu.dst = m.GU - r0 * 1280; gu.ld_dst = 1280; gu.max_rows = maxr;
-                            fp4::run(gu, m.cs);
-                            float* sc = grp_scales(m.grp_d);
-                            fp4::gather_tails(gu, f.bytes - f.tail, sc, m.cs);
-                            fp4::rebase(m.bounds_dev + j0, n, fp.rel, m.cs);   // this run's own row bounds
-                            mmq::swiglu(m.GU, m.H, nr, 640, false, m.cs, sc, fp.rel, n);
-                            fp4::plan(fp.rel, n, fp.toh, m.cs);
-                            fp4::quantize(m.H, nullptr, fp.rel, fp.toh, n, fp.a4h, fp.gsh, 640, 640, nr, m.cs);
-                            fp4::Product dn = gu;
-                            dn.w_off = f.down_off; dn.w_rows = N; dn.w_cols = 640;
-                            dn.a4 = fp.a4h; dn.gs = fp.gsh; dn.bounds = fp.rel; dn.tile_off = fp.toh;
-                            dn.dst = m.Dm + r0 * N; dn.ld_dst = N;
-                            fp4::run(dn, m.cs);
-                        };
                         auto fp4_flush = [&]() {
                             if (fp4_n == 0) return;
                             if (gg_nslots > 0) cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
                             const Fp4Ptrs fp = fp4_ptrs(m.Xq, m.Hq, m.T, m.g->n_expert);
-                            // runs of consecutive experts of at most the rows GU and H hold
-                            const int64_t cap = (int64_t) group_rows_cap((size_t) m.T);
-                            int i0 = 0;
-                            while (i0 < fp4_n) {
-                                int n = 1;
-                                int64_t rows = m.cnt[(size_t) order[fp4_j0 + (size_t) i0]];
-                                while (i0 + n < fp4_n && rows + m.cnt[(size_t) order[fp4_j0 + (size_t) (i0 + n)]] <= cap) {
-                                    rows += m.cnt[(size_t) order[fp4_j0 + (size_t) (i0 + n)]];
-                                    ++n;
-                                }
-                                fp4_run(fp, i0, n);
-                                i0 += n;
-                            }
+                            // runs of consecutive experts of at most the rows GU and H hold: GU and H index a run's own
+                            // rows, the layer's Dm and activation planes the absolute ones
+                            fp4::Group fg;
+                            fg.n = fp4_n;
+                            for (int i = 0; i < fp4_n; ++i) fg.blob[i] = fp4_blob[i];
+                            fg.bounds_host = m.bounds_host.data() + fp4_j0;
+                            fg.bounds_dev = m.bounds_dev + fp4_j0;
+                            fg.a4x = fp.a4x; fg.gsx = fp.gsx; fg.tox = fp.tox + fp4_j0;
+                            fg.down_off = lay.fmt[(size_t) l].down_off;
+                            fg.tail_off = lay.fmt[(size_t) l].bytes - lay.fmt[(size_t) l].tail;
+                            fg.gu = m.GU; fg.h = m.H; fg.dm = m.Dm;
+                            fg.a4h = fp.a4h; fg.gsh = fp.gsh; fg.toh = fp.toh; fg.rel = fp.rel;
+                            fg.tails = grp_scales(m.grp_d);
+                            fp4::run_group(fg, (int64_t) group_rows_cap((size_t) m.T), m.cs);
                             if (gg_nslots > 0) {   // the blobs are read: give the ring slots back
                                 const int rel_slot = gg_slots[gg_nslots - 1];
                                 cudaEventRecord(m.used[rel_slot], m.cs);

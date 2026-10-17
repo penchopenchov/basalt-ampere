@@ -97,6 +97,13 @@ public:
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
 
+    /// Lays every buffer of a chunk of `chunk` tokens out over a region of exactly `bytes_needed` bytes without
+    /// touching device memory (the pointers are never dereferenced) and reports the bytes the layout took; false when
+    /// a buffer, or one of the sets that share the scratch region, does not fit.  `with_source`: the layout streams
+    /// experts.  For tests of the sizing.
+    static bool layout_fits(const core::ModelGeometry& g, core::SessionState& ss, int64_t chunk, bool with_source,
+                            uint64_t* used, uint64_t* capacity);
+
     /// The streamed ring's slot count for a chunk of `chunk` tokens.
     static int64_t ring_slots_for(int64_t chunk);
 
