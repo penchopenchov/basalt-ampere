@@ -594,7 +594,7 @@ __device__ __forceinline__ void dm_gu_item(const uint8_t* blob, int e0, int e1, 
 }
 
 // rows per down work item: native_down_multi_kernel's block rows at n_ff == 640
-template<int TD> __host__ __device__ constexpr int dm_down_rows() { return TD == 20 || TD == 40 ? 32 : TD == 42 ? 16 : 8; }
+template<int TD> __host__ __device__ constexpr int dm_down_rows() { return kDown40<TD> ? 32 : TD == 42 ? 16 : 8; }
 
 // The SwiGLU product and its q8_1 blocks for entries [e0, e1) into shared memory (swiglu_q8_1_entries_kernel's values).
 __device__ __forceinline__ void dm_swiglu_q8(const float* __restrict__ gate, const float* __restrict__ up, int e0,
@@ -619,7 +619,7 @@ __device__ __forceinline__ void dm_down_item(const uint8_t* rows, int e0, int e1
     const int nb = (int) (L.n_ff / Fmt<TD>::qk);
     (void) nb;
     [[maybe_unused]] const float sc = expert_out_scale<TD>(blob, L, 2);
-    if constexpr (TD == 20 || TD == 40) {   // K = 40 calls per row: 8 lanes a row
+    if constexpr (kDown40<TD>) {   // K = 40 calls per row: 8 lanes a row
         const int rl = tid >> 3, r = rb * 32 + rl, t = tid & 7;
         if (r >= L.n_embd) return;
         const uint8_t* wr = rows + (size_t) rl * L.d_row;
@@ -872,12 +872,12 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     }
 }
 
-#define DM_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(40)
-#define DM_D_FMTS(X) X(20) X(42) X(40)
+#define DM_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(40) X(12) X(13)
+#define DM_D_FMTS(X) X(20) X(42) X(40) X(7) X(8)
 #define DM_PAIRS(X) \
     X(16, 20) X(17, 20) X(18, 20) X(21, 20) X(22, 20) X(23, 20) X(29, 20) X(42, 20) \
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42) \
-    X(40, 40)
+    X(40, 40) X(12, 7) X(12, 8) X(13, 8)
 
 template<bool Q2 = false>
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
@@ -1447,7 +1447,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     launch_dependent(swiglu_q8_1_entries_pdl_kernel, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
                      (const float*) up, (const int32_t*) P->start, (const int32_t*) P->counts, (int) L.n_ff, hq);
     check("dec_moe_glue/swiglu");
-    const int d_rows = L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8);
+    const int d_rows = kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8);
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
     switch (L.d_type) {
 #define DM_DOWN(T) case T: launch_down<T>(gd, s, P->ptr, P->start, P->counts, P->dst, hq, L, out, true); break;
@@ -1566,8 +1566,14 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
 #undef DM_OK
         default: break;
     }
-    if ((gu_type == 40) != (d_type == 40)) return false;   // NVFP4 is a pair of its own (DM_PAIRS)
-    return gu && d && n_ff == 640 && n_embd % 256 == 0 && !g_old_kernels && !g_grouped_v1;
+    bool pair = false;
+    switch (gu_type * 100 + d_type) {
+#define DM_PAIR_OK(TG, TD) case TG * 100 + TD: pair = true; break;
+        DM_PAIRS(DM_PAIR_OK)
+#undef DM_PAIR_OK
+        default: break;
+    }
+    return pair && gu && d && n_ff == 640 && n_embd % 256 == 0 && !g_old_kernels && !g_grouped_v1;
 }
 
 static const void* dm_peer_fn(bool q2) {
@@ -1646,7 +1652,7 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         const long long nh = (long long) cap * L.n_ff;
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, plan->start, plan->counts,
                                                                                 (int) L.n_ff, hq);
-        const int d_rows = L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8);
+        const int d_rows = kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8);
         const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) cap);
         switch (L.d_type) {
 #define DM_DOWN(T) case T: launch_down<T>(gd, s, plan->ptr, plan->start, plan->counts, plan->dst, hq, L, out); break;

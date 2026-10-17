@@ -635,7 +635,7 @@ __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w
 // order on the same values, so a column of the kernels below is BITWISE equal to the same column of mmvq_kernel /
 // native_gu_kernel / native_down_kernel (iq_multi_parity checks it).
 template<int TY> struct Split;
-// Formats with a Split below take the decode-once kernels; the others (Q4_K, Q5_K, Q5_1, Q8_0: UD-Q4_K_XL) the
+// Formats with a Split below take the decode-once kernels; the others (Q5_0) the
 // per-entry ones, which call Fmt<TY>::dot per column (the launchers test kSplit at compile time, so the multi kernels
 // are never instantiated for a type without a Split).
 template<int TY> inline constexpr bool kSplit = false;
@@ -945,6 +945,135 @@ template<> struct Split<42> {   // Q2_0
     }
 };
 
+// The UD-Q4_K_XL expert formats.  `load` reads the weight side of vec_dot_*_q8_1 (the quantized words, the unpacked
+// scales and mins, the half2 block scales); `apply` takes the activation words and runs the same *_impl_vmmq /
+// float expression on them, so each column is bitwise the per-entry dot's.
+template<> inline constexpr bool kSplit<12> = true;
+template<> struct Split<12> {   // Q4_K
+    struct W { int v[2]; uint16_t aux[2]; half2 dm; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q4_K* bq4_K = (const block_q4_K*) vbq + kbx;
+        W r;
+        const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+        const int* q4 = (const int*) (bq4_K->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        r.v[0] = q4[0];
+        r.v[1] = q4[4];
+        k_scale_min(bq4_K->scales, bq8_offset, r.aux);
+        r.dm = bq4_K->dm;
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int u[2 * QR4_K];
+        float d8[QR4_K];
+        const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+#pragma unroll
+        for (int i = 0; i < QR4_K; ++i) {
+            const block_q8_1* bq8i = bq8_1 + bq8_offset + i;
+            d8[i] = __low2float(bq8i->ds);
+            const int* q8 = (const int*) bq8i->qs + ((iqs / 2) % 4);
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+        }
+        const uint8_t* sc = (const uint8_t*) r.aux;
+        return vec_dot_q4_K_q8_1_impl_vmmq(r.v, u, sc, sc + 2, r.dm, d8);
+    }
+};
+template<> inline constexpr bool kSplit<13> = true;
+template<> struct Split<13> {   // Q5_K
+    struct W { int vl[2]; int vh[2]; uint16_t aux[2]; half2 dm; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q5_K* bq5_K = (const block_q5_K*) vbq + kbx;
+        W r;
+        const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+        const int* ql = (const int*) (bq5_K->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        const int* qh = (const int*) (bq5_K->qh + 4 * ((iqs / 2) % 4));
+        r.vl[0] = ql[0];
+        r.vl[1] = ql[4];
+        r.vh[0] = qh[0] >> bq8_offset;
+        r.vh[1] = qh[4] >> bq8_offset;
+        k_scale_min(bq5_K->scales, bq8_offset, r.aux);
+        r.dm = bq5_K->dm;
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int u[2 * QR5_K];
+        float d8[QR5_K];
+        const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+#pragma unroll
+        for (int i = 0; i < QR5_K; ++i) {
+            const block_q8_1* bq8i = bq8_1 + bq8_offset + i;
+            d8[i] = __low2float(bq8i->ds);
+            const int* q8 = (const int*) bq8i->qs + ((iqs / 2) % 4);
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+        }
+        const uint8_t* sc = (const uint8_t*) r.aux;
+        return vec_dot_q5_K_q8_1_impl_vmmq(r.vl, r.vh, u, sc, sc + 2, r.dm, d8);
+    }
+};
+template<> inline constexpr bool kSplit<7> = true;
+template<> struct Split<7> {   // Q5_1
+    struct W { int lo[VDR_Q5_1], hi[VDR_Q5_1]; float2 dm; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q5_1* bq5_1 = (const block_q5_1*) vbq + kbx;
+        W r;
+#pragma unroll
+        for (int i = 0; i < VDR_Q5_1; ++i) {
+            const int vl = get_int_b4(bq5_1->qs, iqs + i);
+            const int vh = get_int_b4(bq5_1->qh, 0) >> (4 * (iqs + i));
+            int vi0 = (vl >> 0) & 0x0F0F0F0F;
+            vi0 |= (vh << 4) & 0x00000010;
+            vi0 |= (vh << 11) & 0x00001000;
+            vi0 |= (vh << 18) & 0x00100000;
+            vi0 |= (vh << 25) & 0x10000000;
+            int vi1 = (vl >> 4) & 0x0F0F0F0F;
+            vi1 |= (vh >> 12) & 0x00000010;
+            vi1 |= (vh >> 5) & 0x00001000;
+            vi1 |= (vh << 2) & 0x00100000;
+            vi1 |= (vh << 9) & 0x10000000;
+            r.lo[i] = vi0;
+            r.hi[i] = vi1;
+        }
+        r.dm = __half22float2(bq5_1->dm);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi = 0, sumu = 0;
+#pragma unroll
+        for (int i = 0; i < VDR_Q5_1; ++i) {
+            const int u0 = get_int_b4(bq8_1->qs, iqs + i), u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_1);
+            sumi = ggml_cuda_dp4a(r.lo[i], u0, sumi);
+            sumi = ggml_cuda_dp4a(r.hi[i], u1, sumi);
+            sumu = ggml_cuda_dp4a(0x01010101, u1, ggml_cuda_dp4a(0x01010101, u0, sumu));
+        }
+        const float d8 = __low2float(bq8_1->ds);
+        return sumi * (r.dm.x * d8) + sumu * (r.dm.y * d8);
+    }
+};
+template<> inline constexpr bool kSplit<8> = true;
+template<> struct Split<8> {   // Q8_0
+    struct W { int q[VDR_Q8_0]; float d; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
+        W r;
+#pragma unroll
+        for (int i = 0; i < VDR_Q8_0; ++i) r.q[i] = get_int_b2(bq8_0->qs, iqs + i);
+        r.d = __half2float(bq8_0->d);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < VDR_Q8_0; ++i) sumi = ggml_cuda_dp4a(r.q[i], get_int_b4(bq8_1->qs, iqs + i), sumi);
+        const float d8_1 = __low2float(bq8_1->ds);
+        return r.d * d8_1 * ((float) sumi);
+    }
+};
+
 template<> inline constexpr bool kSplit<40> = true;
 template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1 split; the per-expert FP32 scale is the kernels' (tail_scale)
     struct W { int2 v[2]; float d4; };
@@ -969,6 +1098,11 @@ template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1 split; the per-expe
         return __low2float(y->ds) * r.d4 * (float) sumi;
     }
 };
+
+// Down formats whose row is K = 40 calls (n_ff 640): IQ4_NL, Q5_1 (32-value blocks, two calls) and NVFP4 (64-value
+// blocks, four): eight lanes a row.
+template<int TD> inline constexpr bool kDown40 = TD == 20 || TD == 40 || TD == 7;
+__host__ __device__ constexpr bool kDown40Type(int t) { return t == 20 || t == 40 || t == 7; }
 
 // One row against the n <= NC activations x + off[0..n) (n >= 1, warp-uniform; offsets in q8_1 blocks, 32-bit to
 // spare registers), the whole warp.  Per activation this is row_dot: the same calls k, lane-strided the same way,
@@ -1804,7 +1938,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
         }
     }
     if constexpr (DEP) {
-        const int rows = L.n_ff == 640 ? (TD == 20 || TD == 40 ? 32 : TD == 42 ? 16 : 8) : 8;
+        const int rows = L.n_ff == 640 ? (kDown40<TD> ? 32 : TD == 42 ? 16 : 8) : 8;
         const int r0 = blockIdx.x * rows, nr = min(rows, (int) L.n_embd - r0);
         const uint8_t* p = (const uint8_t*) grp_ptr[blockIdx.y] + L.down_off + (size_t) r0 * L.d_row;
         for (int o = threadIdx.x * 128; o < nr * (int) L.d_row; o += 256 * 128)
@@ -1814,7 +1948,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
     }
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
-    if constexpr (TD == 20 || TD == 40) {   // K = 40 calls per row either way: 8 lanes a row
+    if constexpr (kDown40<TD>) {   // K = 40 calls per row either way: 8 lanes a row
         if (hb == 20) {
             const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
             const int t = threadIdx.x & 7;
@@ -2706,7 +2840,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/swiglu");
     }
     if (g_exp_phase == 1) return;
-    const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
+    const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
     switch (L.d_type) {
 #define DOWN_CASE(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, chain); break;

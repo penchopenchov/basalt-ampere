@@ -2,6 +2,7 @@
 //
 //     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]
 //     build/dec_moe_parity --nvfp4 [--bench]     (synthetic NVFP4 experts with their scale tail, no GGUF)
+//     build/dec_moe_parity --kq [--bench]        (synthetic Q4_K / Q5_K gate/up with Q5_1 / Q8_0 down, no GGUF)
 //
 // Per layer (default: one of each gate/up + down format pair):
 //   peer math   the persistent kernel's work items (dec_moe_peer_math_test) vs native_expert_grouped, every card
@@ -90,6 +91,29 @@ std::vector<uint8_t> nvfp4_blobs(const K::NativeExpertLayout& L, int nx, std::mt
             for (int j = 0; j < 4; ++j) p[o + j] = (uint8_t) (((1 + byte(rng) % 4) << 3) | (byte(rng) & 7));
         const float t[4] = {u(rng), u(rng), u(rng), 0.0f};
         std::memcpy(p + q, t, sizeof t);
+    }
+    return b;
+}
+
+// NX synthetic blobs of the UD-Q4_K_XL formats (Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down): random bytes, then finite
+// small fp16 block scales (the first two halves of each block; Q8_0 has one)
+void kq_fix_scales(uint8_t* p, size_t bytes, int type, std::mt19937& rng) {
+    const size_t bs = type == 12 ? 144 : type == 13 ? 176 : type == 7 ? 24 : 34;
+    std::uniform_int_distribution<int> ex(2, 5), man(0, 1023);
+    for (size_t o = 0; o + bs <= bytes; o += bs)
+        for (int j = 0; j < (type == 8 ? 1 : 2); ++j) {
+            const uint16_t h = (uint16_t) ((ex(rng) << 10) | man(rng));
+            std::memcpy(p + o + 2 * j, &h, 2);
+        }
+}
+std::vector<uint8_t> kq_blobs(const K::NativeExpertLayout& L, int nx, std::mt19937& rng) {
+    std::vector<uint8_t> b((size_t) nx * L.bytes);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (auto& v : b) v = (uint8_t) byte(rng);
+    for (int x = 0; x < nx; ++x) {
+        uint8_t* p = b.data() + (size_t) x * L.bytes;
+        kq_fix_scales(p, L.down_off, L.gu_type, rng);
+        kq_fix_scales(p + L.down_off, L.bytes - L.down_off, L.d_type, rng);
     }
     return b;
 }
@@ -427,7 +451,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
         std::fprintf(stderr, "usage: dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N [--stress-dup] [--stress-torn] "
-                     "[--stress-seed N]]\n       dec_moe_parity --nvfp4 [--bench]\n");
+                     "[--stress-seed N]]\n       dec_moe_parity --nvfp4 [--bench]\n       dec_moe_parity --kq [--bench]\n");
         return 2;
     }
     bool bench = false;
@@ -445,9 +469,10 @@ int main(int argc, char** argv) {
         std::string t;
         while (std::getline(ss, t, ',')) layers.push_back(std::atoi(t.c_str()));
     }
-    const bool nvfp4 = std::strcmp(argv[1], "--nvfp4") == 0;
+    const bool nvfp4 = std::strcmp(argv[1], "--nvfp4") == 0, kq = std::strcmp(argv[1], "--kq") == 0;
+    const bool synth = nvfp4 || kq;
     std::unique_ptr<basalt::GgufFile> gguf_p;
-    if (!nvfp4) gguf_p = std::make_unique<basalt::GgufFile>(argv[1]);
+    if (!synth) gguf_p = std::make_unique<basalt::GgufFile>(argv[1]);
     int ndev = 0;
     ck(cudaGetDeviceCount(&ndev), "device count");
     const bool two = ndev >= 2;
@@ -456,7 +481,11 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int, int>> fmt(64, {-1, -1});
     std::vector<int> auto_layers;
     if (nvfp4) { fmt[0] = {40, 40}; auto_layers.push_back(0); layers.clear(); stress_n = 0; }
-    for (int l = 0; !nvfp4 && l < 64; ++l) {
+    if (kq) {
+        fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8};
+        auto_layers = {0, 1, 2}; stress_n = 0;
+    }
+    for (int l = 0; !synth && l < 64; ++l) {
         const basalt::GgufFile& gguf = *gguf_p;
         const auto* g = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
         const auto* d = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
@@ -494,8 +523,9 @@ int main(int argc, char** argv) {
         if (!K::dec_moe_formats_ok(gt, dt, H, FF)) { ++g_fail; continue; }
         // NX distinct experts' blobs; expert id e uses blob e % NX
         constexpr int NX = 48;
-        std::vector<uint8_t> blobs = nvfp4 ? nvfp4_blobs(L, NX, rng) : std::vector<uint8_t>((size_t) NX * L.bytes);
-        for (int x = 0; !nvfp4 && x < NX; ++x) {
+        std::vector<uint8_t> blobs = nvfp4 ? nvfp4_blobs(L, NX, rng) : kq ? kq_blobs(L, NX, rng)
+                                                                    : std::vector<uint8_t>((size_t) NX * L.bytes);
+        for (int x = 0; !synth && x < NX; ++x) {
             const basalt::GgufFile& gguf = *gguf_p;
             const auto* tg = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
             const auto* tu = gguf.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
@@ -842,6 +872,8 @@ int main(int argc, char** argv) {
                 report(what, l, ndiff_rows(a3, b3, rows), rows.size() * H);
                 ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
                 for (int kind : {1, 2, 3}) {
+                    // the TMA kernel stages 8 gate/up or 32 down rows in 11776 bytes: wider rows have no such kernel
+                    if (kind == 1 && (L.gu_row * 8 > 11776 || L.d_row * 32 > 11776)) continue;
                     ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
                     K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_p3, d_vsync, s0, kind, n);
                     ck(cudaStreamSynchronize(s0), "vram kind");
@@ -977,7 +1009,8 @@ int main(int argc, char** argv) {
                 char what[64];
                 std::snprintf(what, sizeof what, "window peer rows (%d entries)", (int) rows.size());
                 report(what, l, ndiff_rows(a, b, rows), rows.size() * H);
-                bool done_ok = h_words[32] == (uint32_t) RINGS;
+                // a window whose last ring sends the peer nothing has no done count to check
+                bool done_ok = rows.empty() || h_words[32] == (uint32_t) RINGS;
                 if (!done_ok) { std::printf("  peer done word %u, want %d\n", h_words[32], RINGS); ++g_fail; }
             }
             ck(cudaSetDevice(0), "dev0");

@@ -65,10 +65,14 @@ const char* name_of(int t) {
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
         case 40: return "NVFP4";
+        case 12: return "Q4_K";
+        case 13: return "Q5_K";
+        case 7: return "Q5_1";
+        case 8: return "Q8_0";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
 // NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales in 0.5 .. 2
 void append_nvfp4_tail(std::vector<uint8_t>& b, std::mt19937& rng) {
     std::uniform_real_distribution<float> u(0.5f, 2.0f);
@@ -93,6 +97,12 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             // sign and the exponent's top bits: 0x1 / 0x2 (or 0x9 / 0xA) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) == 0 ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
+        } else if (t == 12 || t == 13 || t == 7) {
+            // K-quants and Q5_1: two fp16 scales {d, dmin} / {d, m}, small so SwiGLU keeps a finite fp16 q8_1 scale
+            for (int j = 0; j < 2; ++j) {
+                const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | ((2 + byte(rng) % 4) << 10) | man(rng));
+                std::memcpy(&w[o + 2 * j], &h, 2);
+            }
         } else {
             const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));   // 2^-13 .. 2^-6
             std::memcpy(&w[o], &h, 2);
@@ -504,13 +514,17 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 40}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 40, 12, 13, 7, 8}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42}) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
+    }
+    for (auto [gu, dt] : {std::pair<int, int>{12, 7}, {12, 8}, {13, 8}, {13, 7}}) {   // UD-Q4_K_XL's pairs
+        check_grouped(gu, dt, 2560, 640, s, rng);
+        check_grouped(gu, dt, 1024, 512, s, rng);
     }
     check_grouped(40, 40, 2560, 640, s, rng);                               // NVFP4: its own pair, with the scale tail
     check_grouped(40, 40, 1024, 512, s, rng);
