@@ -4737,7 +4737,9 @@ int main(int argc, char** argv) {
                 : 0;
         const uint64_t late = (o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0) + exchange_bytes;
         uint64_t resident_headroom =
-            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late) : o.resident_headroom + exchange_bytes;
+            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late)
+                    : std::max(o.resident_headroom, basalt::platform::ram_margin() + basalt::platform::kLateHostBytes) +
+                          exchange_bytes;   // what loads after the copy, and the buffers, fit beside the margin
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
         {
