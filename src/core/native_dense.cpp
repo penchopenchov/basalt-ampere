@@ -1,4 +1,5 @@
 #include "basalt/core/native_dense.hpp"
+#include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
 #include <cstdlib>
 #include "basalt/core/weights.hpp"
@@ -125,6 +126,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         int load_dev = 0;
         if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
         LoadProgress progress(LoadProgress::cuda(load_dev), plan_total);
+        DirectUploader uploader;   // unbuffered reads, overlapped with the copies
         // One allocation holds every matrix: separate cudaMalloc calls each round up to the allocator's granularity,
         // which costs about a MiB per matrix.  Matrices start at 256-byte offsets, as separate allocations do.
         constexpr uint64_t kAlign = 256;
@@ -197,10 +199,6 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (next != offsets.end() && bytes > *next - tensor.offset) {
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
-                // the uploads below read these: ask for them now so the reads overlap
-                if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
-                    basalt::kernels::native_mmvq_supported(tensor.type))
-                    basalt::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
             }
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
@@ -234,10 +232,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     if (cudaMalloc(&allocation, bytes) == cudaSuccess) own.reset(allocation);
                     where = allocation;
                 }
-                const auto status = where ? cudaMemcpy(where, gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice)
-                                          : cudaErrorMemoryAllocation;
-                if (status != cudaSuccess) {
-                    err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
+                std::string upload_err;
+                if (where == nullptr || !uploader.upload(gguf.path(), gguf.data_start() + tensor.offset, bytes, where, upload_err)) {
+                    err = "native dense upload " + tensor.name + ": " +
+                          (where == nullptr ? std::string("no device memory") : upload_err);
+                    return false;
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;

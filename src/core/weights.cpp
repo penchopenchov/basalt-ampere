@@ -1,5 +1,6 @@
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
 #include "basalt/core/weights.hpp"
+#include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
 
 #include "basalt/kernels/f16_bits.hpp"
@@ -19,7 +20,7 @@
 namespace basalt::core {
 namespace {
 
-constexpr uint64_t CHUNK = 8ull << 20;   // 8 MiB of SOURCE per staging round
+constexpr uint64_t CHUNK = basalt::core::DirectUploader::kChunk;   // SOURCE bytes per staging round
 
 double now_ms() {
     using namespace std::chrono;
@@ -59,13 +60,6 @@ struct Seg {
     uint64_t dst_bytes = 0;
     Conv conv = Conv::Copy;
 };
-
-/// Read `n` bytes at `off`; a failure names what was being read.
-bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
-    if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
-    if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }
-    return true;
-}
 
 /// The index's lines, one at a time (the index is a small text file).
 struct IndexText {
@@ -220,22 +214,19 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     // bytes and every BF16 weight would have been read as 32-bit garbage.  Converted data goes to a host
     // buffer and crosses the bus once.
     //
-    // STAGE_OUT IS TWICE STAGE_IN because a conversion can now GROW: widening an fp16 scale plane to f32
+    // STAGE_OUT IS TWICE THE SIZE OF A READ because a conversion can now GROW: widening an fp16 scale plane to f32
     // doubles it.  Sized at CHUNK it would have written 8 MiB past the end of a pinned allocation for every
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
-    void* stage_in = nullptr;
     void* stage_out = nullptr;
-    if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
+    if (cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
         err = "cudaHostAlloc for the staging buffers failed";
-        if (stage_in) cudaFreeHost(stage_in);
-        if (stage_out) cudaFreeHost(stage_out);
         return false;
     }
 
     uint8_t* dst_base = (uint8_t*) arena_base;
-    std::FILE* cur = nullptr;
+    basalt::core::DirectUploader reader;   // unbuffered reads into pinned staging
     int cur_file = -1;
+    std::string cur_path;
     uint64_t cur_base = 0, cur_size = 0;   // the current file's range: reads are relative to it
     table_.clear();
     report_ = LoadReport{};
@@ -278,27 +269,19 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         if (r.code_bits != 0 && r.dst_bytes == 0) {
             // a row that carries a shape only - the GGUF form must serve it
             err = r.name + ": the model file holds the tensor only in its GGUF form";
-            cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+            cudaFreeHost(stage_out);
             return false;
         }
         if (r.file != cur_file) {
-            if (cur) std::fclose(cur);
-            cur = nullptr;
             cur_file = r.file;
             if (r.file < 0 || r.file > 3 || pack.files[r.file].empty()) {
                 err = r.name + ": the index names file " + std::to_string(r.file) + ", which this pack does not have";
-                cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                cudaFreeHost(stage_out);
                 return false;
             }
             cur_base = pack.files[r.file].offset;
             cur_size = pack.files[r.file].bytes;
-            const std::string& p = pack.files[r.file].path;
-            cur = std::fopen(p.c_str(), "rb");
-            if (!cur) { err = "cannot open " + p; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
-            // ask for this file's remaining rows up front so their reads overlap
-            for (size_t j = row_i; j < rows.size(); ++j)
-                if (rows[j].file == r.file && !skipped[j])
-                    basalt::platform::advise_willneed(fileno(cur), cur_base + rows[j].src_off, rows[j].src_bytes);
+            cur_path = pack.files[r.file].path;
         }
 
         // ---- the segment list: what this tensor's bytes are, plane by plane, in both forms
@@ -360,14 +343,14 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             err = buf;
             bad = true;
         }
-        if (bad) { cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+        if (bad) { cudaFreeHost(stage_out); return false; }
 
         for (int si = 0; si < n_segs; ++si) {
             const Seg& s = segs[si];
             const bool widening = (s.conv == Conv::WidenF16);
             if (widening && (s.src_bytes & 1ull)) {
                 err = r.name + ": an fp16 plane with an odd source byte count";
-                cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                cudaFreeHost(stage_out);
                 return false;
             }
             uint64_t done = 0;
@@ -376,19 +359,20 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                 // WIDENING NEVER SPLITS AN ELEMENT.  CHUNK is even, so a full chunk cannot, but the tail of a
                 // plane whose length is odd would - and half an fp16 is a plausible-looking scale.
                 if (widening && (n & 1ull)) {
-                    if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+                    if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; cudaFreeHost(stage_out); return false; }
                     n -= 1;
                 }
                 if (cur_size != 0 && r.src_off + s.src_off + done + n > cur_size) {
                     err = r.name + ": runs past the end of its section";
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    cudaFreeHost(stage_out);
                     return false;
                 }
-                if (!read_at(cur, cur_base + r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                const uint8_t* src = reader.staged(cur_path, cur_base + r.src_off + s.src_off + done, n, err);
+                if (src == nullptr) {
+                    err = r.name + ": " + err;
+                    cudaFreeHost(stage_out);
                     return false;
                 }
-                const uint8_t* src = (const uint8_t*) stage_in;
                 const void* host_src = src;
                 uint64_t out_bytes = n;
                 uint64_t out_at = s.dst_off + done;
@@ -449,7 +433,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                 if (cudaMemcpy(dst_base + r.dst_off + out_at, host_src, out_bytes, cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
                     err = "cudaMemcpy failed for " + r.name;
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    cudaFreeHost(stage_out);
                     return false;
                 }
                 upload_ms += now_ms() - u0;
@@ -486,8 +470,6 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             report_.bytes_saved += r.src_bytes - r.dst_bytes;
         }
     }
-    if (cur) std::fclose(cur);
-    cudaFreeHost(stage_in);
     cudaFreeHost(stage_out);
     if (progress) progress->finish();
 

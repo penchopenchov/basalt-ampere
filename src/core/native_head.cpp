@@ -1,5 +1,6 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -73,13 +74,11 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         cudaError_t status = cudaMalloc(&weights, bytes);
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, basalt::kernels::native_q8_1_bytes((int) n_in, 1));
-        basalt::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
-        if (status == cudaSuccess)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
-        if (status != cudaSuccess) {
+        std::string upload_err;
+        if (status != cudaSuccess || !DirectUploader().upload(gguf.path(), gguf.data_start() + tensor->offset, bytes, weights, upload_err)) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
-            err = std::string("native head upload: ") + cudaGetErrorString(status);
+            err = std::string("native head upload: ") + (status != cudaSuccess ? cudaGetErrorString(status) : upload_err);
             return false;
         }
         progress.add(bytes);

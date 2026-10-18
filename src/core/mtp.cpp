@@ -5,6 +5,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
 #include "basalt/core/kv_arena.hpp"
+#include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/on_device.hpp"
 
@@ -302,26 +303,13 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             err = "mtp: " + files.experts.path + " is missing or shorter than the draft layer's experts";
             return false;
         }
-        FILE* f = std::fopen(files.experts.path.c_str(), "rb");
-        if (f == nullptr || fseeko(f, (off_t) files.experts.offset, SEEK_SET) != 0) {
-            if (f != nullptr) std::fclose(f);
-            err = "mtp: cannot open " + files.experts.path;
+        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        std::string upload_err;
+        if (!DirectUploader().upload(files.experts.path, files.experts.offset, bytes, experts_, upload_err)) {
+            err = "mtp: cannot read the experts section: " + upload_err;
             return false;
         }
-        struct Closer {
-            FILE* f;
-            ~Closer() { if (f != nullptr) std::fclose(f); }
-        } closer{f};
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-        basalt::platform::advise_willneed(fileno(f), files.experts.offset, bytes);
-        std::vector<uint8_t> chunk(64u << 20);
-        for (uint64_t off = 0; off < bytes;) {
-            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: the experts section is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
-            progress->add(n);
-            off += n;
-        }
+        progress->add(bytes);
         progress->finish();
         vram_ += bytes;
     }
