@@ -2,7 +2,7 @@
 
 Every setting a user can pass to Basalt: the server options, the engine flags, the per-request sampling fields and
 the model file's sampling defaults. For what a setting does to speed, memory and output precision see the
-[README](../README.md) and [precision.md](precision.md).
+[running.md](running.md) and [precision.md](precision.md).
 
 - [How settings are given](#how-settings-are-given)
 - [Server](#server)
@@ -117,7 +117,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 
 A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
 takes more from the expert cache only when a request needs it. It is off when the model is split over GPUs with
-`layer-split` (a peer card is fine) and with `kv-resident` or `vram-elastic`. See the README.
+`layer-split` (a peer card is fine) and with `kv-resident` or `vram-elastic`. See [running.md](running.md#concurrent-requests---parallel-n).
 
 ## Expert cache and memory
 
@@ -166,7 +166,7 @@ processes per arm. A longer memory (`adapt-decay` 0.97 and up) looked 3 to 6% sl
 3% run-to-run noise).
 
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
-README's "Memory floors".
+[running.md](running.md#memory-floors).
 
 ## Prefill
 
@@ -213,7 +213,7 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `vision` | server | `off`, `on`, `peer`, `dynamic`, `cpu` | `off` | Image input; booleans are refused. `on`: encoder sidecar on the main GPU (about 2.2 GiB of expert cache). `peer`: the sidecar on the second `gpu` card. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: README, "Vision". `on` and `peer` need the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
+| `vision` | server | `off`, `on`, `peer`, `dynamic`, `cpu` | `off` | Image input; booleans are refused. `on`: encoder sidecar on the main GPU (about 2.2 GiB of expert cache). `peer`: the sidecar on the second `gpu` card. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running.md](running.md#vision---vision). `on` and `peer` need the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
 
 ## Logging and diagnostics
 
