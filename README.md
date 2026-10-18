@@ -233,6 +233,8 @@ A model is one file. It holds everything the engine, the server and the vision s
 tokenizer and chat template, the MTP drafter, the expert profile, the 8-bit hyper-connection copies, the vision
 projector, and the default sampling. It carries no engine flags: those come from `--config` or the command line.
 
+<p align="center"><img src="docs/assets/basalt-format.png" alt="Inside a .basalt file" width="800"></p>
+
 - **Layout:** a 64 KiB header (magic `BASALTMF`, version, a table of up to 511 named sections, each with its offset,
   size and SHA-256), then the sections, each aligned to 2 MiB so it can be memory-mapped or read with `O_DIRECT`.
 - **Sections:** `meta` (JSON: geometry, the source GGUF metadata, every tensor's type, shape and offset,
@@ -257,8 +259,6 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 
 A `.basalt` file is the pack format described above: one file with the weights, tokenizer, MTP drafter, expert
 profile and vision projector, so a model is a single download.
-
-<p align="center"><img src="docs/assets/basalt-format.png" alt="What is inside a .basalt file" width="640"></p>
 
 Ready-to-run packs, with the quality of each measured against Q8_0, are on
 [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt). A pack you convert yourself from a GGUF,
