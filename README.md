@@ -1,12 +1,7 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
-> **Windows x64 is community-supported**: the same engine, kernels and precision rules, with the
-> Windows-specific code kept in a platform layer (MSVC + CUDA 13). Linux is the supported target and
-> the regression oracle; the Windows tier promises a build on one GPU, not performance. Build steps,
-> the test recipe and the platform caveats are in **[docs/WINDOWS.md](docs/WINDOWS.md)**.
-
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model.
-It runs on Linux with an NVIDIA Blackwell GPU (sm_120); Windows x64 is community-supported.
+It runs on Linux with an NVIDIA Blackwell GPU (sm_120); Windows x64 is [community-supported](docs/WINDOWS.md).
 
 Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
@@ -16,8 +11,6 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 ## Requirements
 
 - Linux x86-64 with AVX2 (AVX-512 is used when present), and an NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
-- Windows x64 builds natively as a community-supported target (MSVC 2022 + CUDA 13, same sm_120 requirement, one GPU);
-  the working toolchain, the build recipe and the test caveats are in [docs/WINDOWS.md](docs/WINDOWS.md).
 - CMake 3.24 or newer, a C++20 compiler, and Python 3.10 or newer.
 - Enough system RAM to hold the experts that do not fit in VRAM.
 
