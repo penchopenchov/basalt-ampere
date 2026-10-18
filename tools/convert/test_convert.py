@@ -87,7 +87,7 @@ class ConvertTest(unittest.TestCase):
         t = self.t
         d = dict(gguf=[str(self.gguf)], mmproj=str(t / "mmproj.gguf"), out=str(t / "out.basalt"), mtp_source=None, mtp_dense=None,
                  draft_vocab=None, profile=None, profile_from=None, hc8=str(t / "hc8.bin"), name="Tiny",
-                 compat_bf16=False, no_vision=False, force=False)
+                 compat_bf16=False, no_vision=False, force=False, sections_from=None)
         d.update(kw)
         return type("A", (), d)()
 
@@ -258,6 +258,76 @@ class ConvertTest(unittest.TestCase):
         (self.t / "dv.bin").write_bytes(np.array([0, 1], dtype="<i4").tobytes())
         with self.assertRaises(SystemExit):
             convert.convert(self.args(draft_vocab=str(self.t / "dv.bin")))
+
+    # ---------------------------------------------------------------- per-layer expert formats
+    def mixed_gguf(self, gu_types):
+        """A GGUF whose layer l has gate/up of gu_types[l] (K-quant blocks, random bytes) and Q8_0 down."""
+        rng = np.random.default_rng(7)
+        blk = {"Q5_K": 176, "Q6_K": 210}
+        g = GGUFWriter()
+        g.add("general.architecture", "qwen")
+        g.add("qwen.block_count", len(gu_types), "u32")
+        g.add("tokenizer.ggml.tokens", TOKENS)
+        g.add_f32("token_embd.weight", self.embd)
+        g.add_f32("per_layer_token_embd.weight", self.ple)
+        raw = {}
+        for l, gt in enumerate(gu_types):
+            g.add_f32(f"blk.{l}.ffn_gate_inp.weight", self.router)
+            for role, t, cols, nb in (("gate", gt, 256, blk[gt]), ("up", gt, 256, blk[gt]), ("down", "Q8_0", 32, 34)):
+                data = rng.bytes(nb * 2 * N_EXPERT)
+                raw[(l, role)] = data
+                g.add_raw(f"blk.{l}.ffn_{role}_exps.weight", [cols, 2, N_EXPERT], t, data)
+        return g.write(self.t / "mixed-00001-of-00001.gguf"), raw
+
+    def test_mixed_k_quant_layers_are_copied_byte_for_byte(self):
+        types = ["Q5_K", "Q6_K", "Q5_K"]
+        path, raw = self.mixed_gguf(types)
+        convert.convert(self.args(gguf=[str(path)]))
+        m = self.model()
+        out, off = m.read("experts"), 0
+        lines = m.read("experts.layout").decode().splitlines()[1:]
+        sizes = {"Q5_K": 176, "Q6_K": 210}
+        for l, gt in enumerate(types):
+            blob = 2 * (2 * sizes[gt]) + 2 * 34
+            self.assertEqual(lines[l], f"{l} {13 if gt == 'Q5_K' else 14} 8 {off} {blob}")
+            for e in range(N_EXPERT):
+                want = b"".join(raw[(l, r)][e * (len(raw[(l, r)]) // N_EXPERT):(e + 1) * (len(raw[(l, r)]) // N_EXPERT)]
+                                for r in ("gate", "up", "down"))
+                self.assertEqual(out[off + e * blob:off + (e + 1) * blob], want, (l, e))
+            off += blob * N_EXPERT
+        self.assertEqual(off, len(out))
+
+    def test_gate_up_type_mismatch_is_refused(self):
+        g = GGUFWriter()
+        rng = np.random.default_rng(1)
+        g.add("general.architecture", "qwen")
+        g.add("qwen.block_count", 1, "u32")
+        g.add("tokenizer.ggml.tokens", TOKENS)
+        g.add_f32("blk.0.ffn_gate_inp.weight", self.router)
+        g.add_raw("blk.0.ffn_gate_exps.weight", [256, 2, N_EXPERT], "Q5_K", rng.bytes(176 * 2 * N_EXPERT))
+        g.add_raw("blk.0.ffn_up_exps.weight", [256, 2, N_EXPERT], "Q6_K", rng.bytes(210 * 2 * N_EXPERT))
+        g.add_raw("blk.0.ffn_down_exps.weight", [32, 2, N_EXPERT], "Q8_0", rng.bytes(34 * 2 * N_EXPERT))
+        bad = g.write(self.t / "bad-00001-of-00001.gguf")
+        with self.assertRaises(SystemExit) as c:
+            convert.convert(self.args(gguf=[str(bad)]))
+        self.assertIn("gate and up differ in type", str(c.exception))
+
+    def test_sections_from_with_gguf(self):
+        convert.convert(self.args(out=str(self.t / "base.basalt")))
+        base = ModelFile(str(self.t / "base.basalt"))
+        path, _ = self.mixed_gguf(["Q6_K", "Q5_K"])
+        convert.convert(self.args(gguf=[str(path)], out=str(self.t / "new.basalt"), sections_from=str(self.t / "base.basalt"),
+                                  mmproj=None, hc8=None, name="Mixed"))
+        m = ModelFile(str(self.t / "new.basalt"))
+        for n in m.names():
+            self.assertTrue(m.verify(n), n)
+        for n in ("profile", "hc8", "vision/mmproj"):
+            self.assertEqual(m.read(n), base.read(n), n)
+        meta = json.loads(m.read("meta"))
+        self.assertEqual(meta["sections_from"]["copied"], [n for n in base.names()
+                                                           if n.startswith(("mtp/", "vision/")) or n in ("profile", "hc8")])
+        self.assertEqual(meta["vision"], json.loads(base.read("meta"))["vision"])
+        self.assertEqual(m.read("experts.layout").decode().splitlines()[1].split()[:3], ["0", "14", "8"])
 
     def test_help(self):
         r = subprocess.run([sys.executable, str(Path(convert.__file__)), "--help"], capture_output=True, text=True)
