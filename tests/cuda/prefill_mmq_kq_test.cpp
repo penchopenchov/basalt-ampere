@@ -1,4 +1,4 @@
-// prefill_mmq_kq_test - llama.cpp's MMQ for the K-quant expert formats (gate/up Q4_K or Q5_K, down Q5_1 or Q8_0: the
+// prefill_mmq_kq_test - llama.cpp's MMQ for the K-quant expert formats (gate/up Q4_K, Q5_K or Q6_K, down Q5_1 or Q8_0: the
 // UD-Q4_K_XL pack's layers) on random native expert blobs at the model's geometry (2560 x 640), against
 //   - a double-precision reference: the weights dequantized by ggml's own to_float, times the FP32 activations, and
 //   - the path these formats took before: each expert dequantized to FP16 (iq_dequant_gu_f16 / iq_dequant_f16), FP16
@@ -68,7 +68,7 @@ struct Geo {
     }
 };
 
-// random blocks with sane fp16 scales: Q4_K/Q5_K {d, dmin} at the block's start, Q5_1 {d, m}, Q8_0 {d}; sized so
+// random blocks with sane fp16 scales: Q6_K (scales and d set below), Q4_K/Q5_K {d, dmin} at the block's start, Q5_1 {d, m}, Q8_0 {d}; sized so
 // the weights' typical magnitude is that of a 4-5 bit expert (a few hundredths), and with the minimum at about the
 // codes' mean times the scale, so the weights are centred on zero as a trained matrix's are
 void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt19937& rng) {
@@ -83,6 +83,16 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
         default: break;
     }
     std::uniform_real_distribution<float> sc(lo, 4.0f * lo);
+    if (t == GGML_TYPE_Q6_K) {   // {ql, qh, int8 scales, d}: scales of both signs, d at the block's end
+        std::uniform_int_distribution<int> s8(-100, 100);
+        std::uniform_real_distribution<float> sd(0.00002f, 0.00008f);
+        for (size_t b = 0; b < nb; ++b) {
+            for (int j = 0; j < 16; ++j) m[b * bs + 192 + j] = (uint8_t) (int8_t) s8(rng);
+            const ggml_fp16_t h = ggml_fp32_to_fp16(sd(rng));
+            std::memcpy(m + b * bs + 208, &h, 2);
+        }
+        return;
+    }
     for (size_t b = 0; b < nb; ++b) {
         const float d = sc(rng);
         const ggml_fp16_t h = ggml_fp32_to_fp16(d);
@@ -292,6 +302,9 @@ void print_err(const char* what, const Err& e) {
                 e.rmax);
 }
 
+// Q6_K gate/up has no dequant-to-FP16 path (MMQ is its only prefill path), so it is checked against the CPU reference alone
+bool has_f16(const Pair& p) { return p.gu != GGML_TYPE_Q6_K; }
+
 // part 1
 void run_pair(const Pair& p, bool outliers, cudaStream_t s) {
     constexpr int T = 256, E = 64;
@@ -325,14 +338,18 @@ void run_pair(const Pair& p, bool outliers, cudaStream_t s) {
     ck(cudaStreamSynchronize(s), "mmq");
     const std::vector<float> y_mmq = download(mb.dm, (size_t) rows * N);
 
+    const bool f16 = has_f16(p);
     basalt::prefill::Gemm gemm;
-    std::string err;
-    if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
-    F16Bufs fb(rows);
-    upload_xs(x, r, fb);
-    run_f16(p, geo, gemm, fb, r, blob, s);
-    ck(cudaStreamSynchronize(s), "f16");
-    const std::vector<float> y_f16 = download(fb.dm, (size_t) rows * N);
+    std::vector<float> y_f16;
+    if (f16) {
+        std::string err;
+        if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
+        F16Bufs fb(rows);
+        upload_xs(x, r, fb);
+        run_f16(p, geo, gemm, fb, r, blob, s);
+        ck(cudaStreamSynchronize(s), "f16");
+        y_f16 = download(fb.dm, (size_t) rows * N);
+    }
 
     // the reference
     std::vector<float> ref((size_t) rows * N);
@@ -367,11 +384,11 @@ void run_pair(const Pair& p, bool outliers, cudaStream_t s) {
     auto pairi = [](size_t i) { return (int64_t) i; };
     auto srow = [&](size_t i) { return (int64_t) r.row_of[i]; };
     const Err em = compare(y_mmq, srow, ref, pairi, (size_t) rows);
-    const Err ef = compare(y_f16, srow, ref, pairi, (size_t) rows);
-    const Err emf = compare(y_mmq, srow, y_f16, srow, (size_t) rows);
     print_err("MMQ vs reference:", em);
-    print_err("FP16 path vs reference:", ef);
-    print_err("MMQ vs FP16 path:", emf);
+    if (f16) {
+        print_err("FP16 path vs reference:", compare(y_f16, srow, ref, pairi, (size_t) rows));
+        print_err("MMQ vs FP16 path:", compare(y_mmq, srow, y_f16, srow, (size_t) rows));
+    }
     const double lim_rms = outliers ? 3e-2 : 2e-2, lim_worst = outliers ? 0.15 : 0.1;
     if (em.rms > lim_rms || em.worst > lim_worst)
         throw std::runtime_error(std::string(p.name) + ": MMQ's error is above the i-quant path's bounds");
@@ -471,9 +488,10 @@ void bench_pair(const Pair& p, cudaStream_t s) {
         ck(cudaMemcpy(blobs.as<uint8_t>() + (size_t) e * stride, h.data(), geo.bytes, cudaMemcpyHostToDevice), "blob");
         blob[(size_t) e] = blobs.as<uint8_t>() + (size_t) e * stride;
     }
+    const bool f16 = has_f16(p);
     basalt::prefill::Gemm gemm;
     std::string err;
-    if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
+    if (f16 && !gemm.init(s, 0, err)) throw std::runtime_error(err);
     mmq::Context ctx;
     const double flop_e = 2.0 * (1280.0 * N + (double) N * FF);   // per row
     const double wbytes = (double) mmq::matrix_bytes(p.gu, 1280, N) + (double) mmq::matrix_bytes(p.d, N, FF);
@@ -492,10 +510,10 @@ void bench_pair(const Pair& p, cudaStream_t s) {
         ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
         ck(cudaMemcpy(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice), "src");
         MmqBufs mb(p, rows, E);
-        F16Bufs fb(rows);
-        upload_xs(x, r, fb);
+        F16Bufs fb(f16 ? rows : 1);
+        if (f16) upload_xs(x, r, fb);
         const int reps = 21;
-        const double t_f16 = time_ms([&] { run_f16(p, geo, gemm, fb, r, blob, s); }, s, reps);
+        const double t_f16 = f16 ? time_ms([&] { run_f16(p, geo, gemm, fb, r, blob, s); }, s, reps) : 0.0;
         const double t_mmq = time_ms([&] {
             run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
         }, s, reps);
@@ -503,6 +521,11 @@ void bench_pair(const Pair& p, cudaStream_t s) {
             run_mmq(p, geo, ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s, true, stride);
         }, s, reps);
         const double fl = flop_e * rows;
+        if (!f16) {
+            std::printf("  %5d  %12s  %12.1f  %12.1f  %8s  %10.1f  %10s\n", R, "-", 1000 * t_mmq / E, 1000 * t_dir / E,
+                        "-", fl / (t_mmq * 1e9), "-");
+            continue;
+        }
         std::printf("  %5d  %12.1f  %12.1f  %12.1f  %7.2fx  %10.1f  %10.1f\n", R, 1000 * t_f16 / E, 1000 * t_mmq / E,
                     1000 * t_dir / E, t_f16 / t_mmq, fl / (t_mmq * 1e9), fl / (t_f16 * 1e9));
     }
@@ -524,7 +547,8 @@ int main(int argc, char** argv) {
         }
         const Pair pairs[] = {{GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, "Q4_K / Q5_1"},
                               {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, "Q4_K / Q8_0"},
-                              {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"}};
+                              {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, "Q5_K / Q8_0"},
+                              {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K / Q8_0"}};
         for (const Pair& p : pairs)
             if (!mmq::fits((int) p.gu, 1280) || !mmq::fits((int) p.d, N))
                 throw std::runtime_error(std::string(p.name) + ": MMQ does not take this pair");
