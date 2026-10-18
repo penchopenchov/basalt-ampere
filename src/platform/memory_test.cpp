@@ -1,5 +1,5 @@
-// src/platform/memory_test.cpp - lock_resident on a 256 MiB region, the RAM floor, the file cache decisions and the
-// read-ahead hint on a mapped file view (CPU only, no GPU, no model; one temp file).
+// src/platform/memory_test.cpp - lock_resident on 256 MiB (or what the locked-memory limit allows), the RAM floor, the
+// file cache decisions and the read-ahead hint on a mapped file view (CPU only, no GPU, no model; one temp file).
 #include "basalt/platform/memory.hpp"
 
 #include "basalt/platform/file.hpp"
@@ -19,6 +19,7 @@
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -185,17 +186,45 @@ int read_ahead_cases() {
     std::filesystem::remove(path, ec);
     return fail;
 }
+// The size lock_resident is exercised with: the full 256 MiB where the locked-memory limit allows it, otherwise half
+// of what the limit leaves. Zero means the limit is too low to lock anything meaningful.
+uint64_t lock_test_bytes(bool& reduced) {
+    const uint64_t want = 256ull << 20;
+    reduced = false;
+#if defined(_WIN32)
+    return want;
+#else
+    struct rlimit rl {};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY) return want;
+    // headroom for locks the process already holds (the engine's own allocations, thread stacks)
+    const uint64_t limit = (uint64_t) rl.rlim_cur;
+    if (limit >= want + (want >> 2)) return want;
+    reduced = true;
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGE_SIZE);
+    const uint64_t half = limit / 2 / page * page;
+    return half >= 16 * page ? half : 0;
+#endif
+}
 }  // namespace
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | ram_floor_cases() | read_ahead_cases();
-    const uint64_t bytes = 256ull << 20;
+    bool reduced = false;
+    const uint64_t bytes = lock_test_bytes(reduced);
+    if (bytes == 0) {
+        std::printf("lock_resident: SKIPPED, the locked-memory limit is too low to lock a region (raise ulimit -l)\n");
+        std::printf("platform_memory_test: %s\n", fail_keeps ? "FAILED" : "OK (lock_resident skipped)");
+        return fail_keeps;
+    }
+    if (reduced)
+        std::printf("lock_resident: the 256 MiB case is SKIPPED, the locked-memory limit is lower; locking %llu KiB instead\n",
+                    (unsigned long long) (bytes >> 10));
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
     std::memset(p, 1, bytes);
     const basalt::platform::LockResult r = basalt::platform::lock_resident(p, bytes);
-    std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
-                r.note.c_str());
+    std::printf("lock_resident: ok=%d locked=%llu KiB of %llu KiB (%s)\n", (int) r.ok,
+                (unsigned long long) (r.locked_bytes >> 10), (unsigned long long) (bytes >> 10), r.note.c_str());
     int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
     basalt::platform::unlock_resident(p, bytes);
     std::free(p);
