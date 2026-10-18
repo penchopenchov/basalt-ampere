@@ -49,6 +49,13 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                          const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream);
 
+// sample_tokens_probe on a chosen implementation of the sampled path's split, for sampler_parity: 0 the two-launch
+// split, 1 the one-launch split with argmax rounds, 2 the one-launch split with bitonic networks (the engine's).  All
+// pick the same token and give the same probabilities, bit for bit.
+void sample_tokens_split(int split, const float* logits, int n_tokens, int n_vocab, const int* history,
+                         int history_len, const SamplerParams& p, int* out, const int* query, int n_query, float* qprob,
+                         void* stream);
+
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (needs thread-block clusters): the same token as
 // sample_tokens' one-block argmax.  False (nothing launched) where it
 // cannot run: a device without thread-block clusters.  Device pointers; capturable.
