@@ -696,7 +696,11 @@ bool FileExpertSource::pin_cache_complement(
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
-        budget = physical > headroom_bytes ? physical - headroom_bytes : 0;
+        // The arena is ordinary 4 KiB pages: their page tables and the driver's per-page records come on top of its
+        // bytes, so the copy leaves room for them as well.
+        const uint64_t page_overhead = physical / 256;
+        const uint64_t reserve = headroom_bytes + page_overhead;
+        budget = physical > reserve ? physical - reserve : 0;
         if (bytes > budget) {
             char message[320];
             std::snprintf(message, sizeof message,
