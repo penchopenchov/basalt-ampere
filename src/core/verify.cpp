@@ -104,6 +104,8 @@ struct DecMoe {
     void* pscr = nullptr;
     unsigned int* parr = nullptr;
     int pblocks = 0;
+    int8_t* rq = nullptr;   ///< the warm-up's predictor: every layer's router in int8, one scale per 32 values (rs)
+    float* rs = nullptr;
     bool pq2 = false;   // a layer's gate/up is Q2_0: the peer kernel's Q2_0 build
     bool peer_live = false;                  ///< a peer window was launched and not yet waited for
     // pinned staging of the residency uploads: the copies take their source from here, so the call does
@@ -143,6 +145,48 @@ struct Bump {
 // The commit graph is two launches, its GDN part from 32 persistent blocks so it trickles beside the draft instead of
 // filling the card
 constexpr int kCommitBlocks = 32;
+
+// The peer warm-up's predictor rows on the current device: every layer's BF16 router [n_expert x n_embd] as int8
+// with one scale per 32 values (a prediction only).  False when a layer's router is not such a table.
+bool warm_router(const WeightTable& wt, const ModelGeometry& g, int8_t** rq, float** rs) {
+    const int64_t N = g.n_embd, NE = g.n_expert, L = g.n_layers, NB = N / 32;
+    if (NE > basalt::kernels::kDmPredExperts || N % 32 != 0) return false;
+    std::vector<uint16_t> src((size_t) (NE * N));
+    std::vector<int8_t> q((size_t) (L * NE * N));
+    std::vector<float> sc((size_t) (L * NE * NB));
+    for (int64_t l = 0; l < L; ++l) {
+        const WeightRef* w = LayerView(wt, l).get("ffn_gate_inp.weight");
+        if (w == nullptr || w->bytes != (uint64_t) (NE * N * 2)) return false;
+        if (cudaMemcpy(src.data(), w->data, (size_t) w->bytes, cudaMemcpyDefault) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        for (int64_t r = 0; r < NE; ++r)
+            for (int64_t b = 0; b < NB; ++b) {
+                float v[32], amax = 0.0f;
+                for (int i = 0; i < 32; ++i) {
+                    const uint32_t u = (uint32_t) src[(size_t) (r * N + b * 32 + i)] << 16;
+                    std::memcpy(&v[i], &u, 4);
+                    amax = std::max(amax, std::fabs(v[i]));
+                }
+                const float d = amax / 127.0f;
+                sc[(size_t) ((l * NE + r) * NB + b)] = d;
+                for (int i = 0; i < 32; ++i)
+                    q[(size_t) ((l * NE + r) * N + b * 32 + i)] = (int8_t) (d > 0.0f ? std::lrintf(v[i] / d) : 0);
+            }
+    }
+    if (cudaMalloc((void**) rq, q.size()) != cudaSuccess || cudaMalloc((void**) rs, sc.size() * 4) != cudaSuccess ||
+        cudaMemcpy(*rq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(*rs, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError();
+        if (*rq) cudaFree(*rq);
+        if (*rs) cudaFree(*rs);
+        *rq = nullptr;
+        *rs = nullptr;
+        return false;
+    }
+    return true;
+}
 
 bool mapped(size_t bytes, void** h, void** d) {
     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
@@ -386,6 +430,8 @@ bool Verifier::dm_init(std::string& err) {
         for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
+        if (!warm_router(*wt_, g, &d->rq, &d->rs))
+            std::fprintf(stderr, "basalt verify: the peer's L2 warm-up is off (a router the predictor does not cover)\n");
     }
     std::fprintf(stderr, "basalt verify: the MoE tail planned on the device%s\n",
                  d->pdev >= 0 ? (", the peer card served by a persistent kernel (" + std::to_string(d->pblocks) +
@@ -482,7 +528,7 @@ void Verifier::dm_free() {
     if (d->pdev >= 0) {
         const OnDevice on(d->pdev);
         if (d->ps) { cudaStreamSynchronize(d->ps); cudaStreamDestroy(d->ps); }
-        for (void* p : {(void*) d->ptab, (void*) d->lay, d->pscr, (void*) d->parr})
+        for (void* p : {(void*) d->ptab, (void*) d->lay, d->pscr, (void*) d->parr, (void*) d->rq, (void*) d->rs})
             if (p) cudaFree(p);
     }
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
@@ -1663,6 +1709,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
+            ra.rows = dm_->rq != nullptr;
             PdlScope pr(false);   // after the router's kernel: a plain launch
             if (glue_on[grp]) {   // the ring's work inside post's gate/up launch
                 glue_ring[grp] = ra;
@@ -2427,6 +2474,7 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
         pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
         pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
+        pa.rq = dm_->rq; pa.rs = dm_->rs;
         if (cudaMemsetAsync(dm_->parr, 0, 64, dm_->ps) != cudaSuccess ||
             !basalt::kernels::dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
             err = "verify: the peer window did not launch";
