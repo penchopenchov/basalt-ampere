@@ -313,6 +313,8 @@ class ConvertTest(unittest.TestCase):
         self.assertIn("gate and up differ in type", str(c.exception))
 
     def test_sections_from_with_gguf(self):
+        import pack_vision
+        self.vision = pack_vision.vision_sections
         convert.convert(self.args(out=str(self.t / "base.basalt")))
         base = ModelFile(str(self.t / "base.basalt"))
         path, _ = self.mixed_gguf(["Q6_K", "Q5_K"])
@@ -324,8 +326,9 @@ class ConvertTest(unittest.TestCase):
         for n in ("profile", "hc8", "vision/mmproj"):
             self.assertEqual(m.read(n), base.read(n), n)
         meta = json.loads(m.read("meta"))
-        self.assertEqual(meta["sections_from"]["copied"], [n for n in base.names()
-                                                           if n.startswith(("mtp/", "vision/")) or n in ("profile", "hc8")])
+        self.assertEqual(meta["sections_from"]["copied"], [n for n in base.names() if n != "vision/text_vocab"
+                                                           and (n.startswith(("mtp/", "vision/")) or n in ("profile", "hc8"))])
+        self.assertEqual(m.read("vision/text_vocab"), pack_vision.vocab_only_gguf(str(path)))
         self.assertEqual(meta["vision"], json.loads(base.read("meta"))["vision"])
         self.assertEqual(m.read("experts.layout").decode().splitlines()[1].split()[:3], ["0", "14", "8"])
 

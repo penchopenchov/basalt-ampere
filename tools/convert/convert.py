@@ -266,12 +266,21 @@ def convert(a) -> None:
             copied = []
             if base is not None:
                 for name in base.names():
-                    if name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8"):
+                    if name != "vision/text_vocab" and (name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8")):
                         off, size = base.section(name)
                         job.file(name, a.sections_from, off, size)
                         if w.entries[-1][3] != base.sections[name][2]:
                             die(f"section {name}: the copys SHA-256 differs from {a.sections_from}s")
                         copied.append(name)
+                if "vision/text_vocab" in base.sections:
+                    import pack_vision
+                    for p in model.paths:
+                        data = pack_vision.vocab_only_gguf(str(p))
+                        if data is not None:
+                            job.bytes("vision/text_vocab", data)
+                            break
+                    else:
+                        die("none of the source GGUF files carries the tokenizer metadata the vision sidecar needs")
             if mtp is not None:
                 job.chunks("mtp/dense", mtp.dense_chunks())
                 job.bytes("mtp/dense.index", mtp.dense_index())
@@ -319,7 +328,7 @@ def convert(a) -> None:
             if base is not None:
                 meta["sections_from"] = {"path": Path(a.sections_from).name, "size": Path(a.sections_from).stat().st_size,
                                          "fingerprint_sha256_first_last_64mib_and_size": fingerprint(Path(a.sections_from)),
-                                         "copied": copied}
+                                         "copied": copied, "regenerated": ["vision/text_vocab"]}
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
         ok = True
