@@ -1,6 +1,8 @@
 // src/vision/mmproj.cpp - see basalt/vision/mmproj.hpp.
 #include "basalt/vision/mmproj.hpp"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include <fcntl.h>
@@ -84,7 +86,8 @@ Value read_value(Cursor& c, uint32_t t) {
 }  // namespace
 
 void Mmproj::release() {
-    if (map_) munmap(map_, size_);
+    if (map_) { if (mapped_) munmap(map_, size_); else std::free(map_); }
+    mapped_ = false;
     map_ = nullptr;
     tensors_.clear();
 }
@@ -97,9 +100,32 @@ bool Mmproj::open(const std::string& path, std::string& err) {
     struct stat st{};
     if (fstat(fd, &st) != 0 || st.st_size < 32) { ::close(fd); err = "cannot read " + path; return false; }
     size_ = (size_t) st.st_size;
-    map_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    // read whole with block-aligned unbuffered reads, so the file cache neither copies nor keeps it; a file system that
+    // refuses them is mapped instead
+    {
+        constexpr size_t kAlign = 4096, kChunk = 16u << 20;
+        const int dfd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+        void* mem = nullptr;
+        if (dfd >= 0 && posix_memalign(&mem, kAlign, (size_t) ((size_ + kAlign - 1) / kAlign * kAlign)) == 0) {
+            size_t got = 0;
+            while (got < size_) {
+                const size_t want = std::min(kChunk, (size_ - got + kAlign - 1) / kAlign * kAlign);
+                const ssize_t r = ::pread(dfd, (uint8_t*) mem + got, want, (off_t) got);
+                if (r <= 0) break;
+                got += (size_t) r;
+            }
+            if (got >= size_) { map_ = mem; mapped_ = false; }
+            else std::free(mem);
+        }
+        if (dfd >= 0) ::close(dfd);
+    }
+    if (map_ == nullptr) {
+        void* m = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m == MAP_FAILED) { ::close(fd); err = "cannot map " + path; return false; }
+        map_ = m;
+        mapped_ = true;
+    }
     ::close(fd);
-    if (map_ == MAP_FAILED) { map_ = nullptr; err = "cannot map " + path; return false; }
     const uint8_t* base = (const uint8_t*) map_;
     Cursor c{base, base + size_};
     if (c.get<uint32_t>() != 0x46554747u) { err = path + " is not a GGUF file"; return false; }

@@ -47,6 +47,7 @@ public:
 
 private:
     void* map_ = nullptr;
+    bool mapped_ = false;   ///< `map_` is a file mapping (else allocated memory the file was read into)
     size_t size_ = 0;
     Hparams hp_;
     std::map<std::string, TensorRef> tensors_;
