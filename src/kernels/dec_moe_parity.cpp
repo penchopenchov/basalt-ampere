@@ -2,7 +2,7 @@
 //
 //     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]
 //     build/dec_moe_parity --nvfp4 [--bench]     (synthetic NVFP4 experts with their scale tail, no GGUF)
-//     build/dec_moe_parity --kq [--bench]        (synthetic Q4_K / Q5_K gate/up with Q5_1 / Q8_0 down, no GGUF)
+//     build/dec_moe_parity --kq [--bench]        (synthetic Q4_K / Q5_K / Q6_K gate/up with Q5_1 / Q8_0 down, no GGUF)
 //
 // Per layer (default: one of each gate/up + down format pair):
 //   peer math   the persistent kernel's work items (dec_moe_peer_math_test) vs native_expert_grouped, every card
@@ -118,13 +118,19 @@ std::vector<uint8_t> nvfp4_blobs(const K::NativeExpertLayout& L, int nx, std::mt
 // NX synthetic blobs of the K-quant and Q8_0 formats (Q4_K / Q5_K / Q8_0 gate/up, Q5_1 / Q8_0 down): random bytes, then finite
 // small fp16 block scales (the first two halves of each block; Q8_0 has one)
 void kq_fix_scales(uint8_t* p, size_t bytes, int type, std::mt19937& rng) {
-    const size_t bs = type == 12 ? 144 : type == 13 ? 176 : type == 7 ? 24 : 34;
+    const size_t bs = type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 7 ? 24 : 34;
     std::uniform_int_distribution<int> ex(2, 5), man(0, 1023);
-    for (size_t o = 0; o + bs <= bytes; o += bs)
+    for (size_t o = 0; o + bs <= bytes; o += bs) {
+        if (type == 14) {   // Q6_K: the fp16 scale ends the block
+            const uint16_t h = (uint16_t) ((ex(rng) << 10) | man(rng));
+            std::memcpy(p + o + 208, &h, 2);
+            continue;
+        }
         for (int j = 0; j < (type == 8 ? 1 : 2); ++j) {
             const uint16_t h = (uint16_t) ((ex(rng) << 10) | man(rng));
             std::memcpy(p + o + 2 * j, &h, 2);
         }
+    }
 }
 std::vector<uint8_t> kq_blobs(const K::NativeExpertLayout& L, int nx, std::mt19937& rng) {
     std::vector<uint8_t> b((size_t) nx * L.bytes);
@@ -502,8 +508,8 @@ int main(int argc, char** argv) {
     std::vector<int> auto_layers;
     if (nvfp4) { fmt[0] = {40, 40}; auto_layers.push_back(0); layers.clear(); stress_n = 0; }
     if (kq) {
-        fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8}; fmt[3] = {8, 8};
-        auto_layers = {0, 1, 2, 3}; stress_n = 0;
+        fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8}; fmt[3] = {8, 8}; fmt[4] = {14, 8};
+        auto_layers = {0, 1, 2, 3, 4}; stress_n = 0;
     }
     for (int l = 0; !synth && l < 64; ++l) {
         const basalt::GgufFile& gguf = *gguf_p;
@@ -921,7 +927,10 @@ int main(int argc, char** argv) {
                                              n, n, d_xq2, dv[0].scr, d_parts, s0);
                 }) - r0;
                 const double uf = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0); }) - r0;
-                const double ut = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 1); }) - r0;
+                // the bulk-copy kernel stages 8 gate/up and 32 down rows: formats with wider rows are not timed (nan)
+                const bool tma_fits = L.gu_row * 8 <= 11776 && L.d_row * 32 <= 11776;
+                const double ut = !tma_fits ? std::nan("") :
+                    time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 1); }) - r0;
                 const double u2 = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 2, n); }) - r0;
                 const double u4 = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 3, n); }) - r0;
                 auto phase = [&](int ph) {
