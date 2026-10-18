@@ -747,12 +747,20 @@ bool FileExpertSource::pin_cache_complement(
     if (bytes == 0 || bytes + spare_bytes > budget) spare_sizes.clear();   // no room: swaps use exchange buffers
     else bytes += spare_bytes;
 
+    // The experts the GPU cache was filled from sit in the file cache and the mapping; give them back first, so the
+    // arena below does not have to reclaim them while the drive is being read.
+    if (bytes > 0) {
+        (void) madvise((void*) base_, (size_t) mapped_bytes_, MADV_DONTNEED);
+        (void) posix_fadvise(fd_, (off_t) file_off_, (off_t) mapped_bytes_, POSIX_FADV_DONTNEED);
+    }
+
     void* arena = nullptr;
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
     bool pinned_ok = false;
     uint64_t locked = 0;
-    uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
+    uint64_t partial_pin = 0;   ///< a registered prefix of the arena (all of it once registered after the read)
+    bool register_after = false;   ///< the arena is registered with the driver after it is filled
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
     auto release = [&]() {
@@ -770,27 +778,17 @@ bool FileExpertSource::pin_cache_complement(
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);
         if (pin) {
-            const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
-                                                         cudaHostAllocMapped | cudaHostAllocPortable);
-            if (allocated == cudaSuccess) {
-                void* alias = nullptr;
-                const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
-                if (aliased == cudaSuccess && alias != nullptr) {
-                    device = (const uint8_t*) alias;
-                    pinned_ok = true;
-                    note = "page-locked and mapped";
-                } else {
-                    note = std::string("no device alias (") + cudaGetErrorString(aliased) + ")";
-                    (void) cudaGetLastError();
-                    (void) cudaFreeHost(arena);
-                    arena = nullptr;
-                }
+            // Ordinary huge-page memory, registered with the driver once it is filled: the reads fault the pages in
+            // while the drive works, instead of the driver zeroing and locking all of it before the first read.
+            constexpr size_t kHuge = 2ull << 20;
+            const size_t padded = ((size_t) bytes + kHuge - 1) / kHuge * kHuge;
+            void* mem = nullptr;
+            if (posix_memalign(&mem, kHuge, padded) == 0 && mem != nullptr) {
+                arena = mem;
+                register_after = true;
             } else {
-                // Refused (the driver's page-locked limit): the same bytes in ordinary memory, locked in the working
-                // set instead, as the arena does - resident either way, only copied by the CPU instead of by DMA.
-                note = std::string("page-locking refused (") + cudaGetErrorString(allocated) + ")";
-                (void) cudaGetLastError();
                 arena = nullptr;
+                note = "no aligned memory for registration";
             }
         }
         if (arena == nullptr) {
@@ -815,7 +813,16 @@ bool FileExpertSource::pin_cache_complement(
         host = (const uint8_t*) arena;
     }
 
-    // Copied layer by layer on a few threads: the page faults of the mapped file are the cost, and they overlap.
+    const double alloc_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count();
+    // Experts are read straight into the arena with unbuffered reads, so the file cache neither copies them nor
+    // evicts anything; ranges that are not block-aligned, or a file system without unbuffered reads, take the mapped copy.
+    constexpr uint64_t kDirectAlign = 4096, kDirectChunk = 16ull << 20;
+    int direct_fd = -1;
+    if (bytes > 0) {
+        const std::string self = "/proc/self/fd/" + std::to_string(fd_);
+        direct_fd = ::open(self.c_str(), O_RDONLY | O_DIRECT);
+    }
+    // Copied layer by layer on a few threads; the layer's contiguous experts are read as one range.
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         err = "FileExpertSource: cannot determine page size for mapped-page release";
@@ -824,6 +831,7 @@ bool FileExpertSource::pin_cache_complement(
     }
     std::atomic<int64_t> next_layer{0}, layers_done{0};
     std::atomic<uint64_t> copied{0};
+    std::atomic<uint64_t> direct_bytes{0};
     // Progress counts the experts the GPU cache does not hold (those it holds, kept here for the prompt path's
     // loan, are already counted by its fill); experts left on the file are not placed at all.
     uint64_t progress_total = 0;
@@ -850,34 +858,87 @@ bool FileExpertSource::pin_cache_complement(
         failed.store(true);
     };
     auto worker = [&]() {
+        uint8_t* stage = nullptr;   // staging for ranges that are not block-aligned
+        struct StageFree { uint8_t*& p; ~StageFree() { std::free(p); } } stage_free{stage};
         for (;;) {
             const int64_t layer = next_layer.fetch_add(1);
             if (layer >= n_layers_ || failed.load()) return;
             const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
-            {   // ask for the layer's blobs before copying them
-                std::vector<std::pair<int32_t, int32_t>> ahead;
-                for (int64_t expert = 0; expert < n_expert_; ++expert)
-                    if (offsets[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != kNoComplement)
-                        ahead.emplace_back((int32_t) layer, (int32_t) expert);
-                (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
-            }
+            bool mapped_used = false;
+            // one run: consecutive experts adjacent in both the file and the arena
+            struct Run { uint64_t file_pos, dst_off, len; int64_t first, count; };
+            std::vector<Run> runs;
             for (int64_t expert = 0; expert < n_expert_; ++expert) {
                 const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
                 const uint64_t offset = offsets[index];
                 if (offset == kNoComplement) continue;
-                if (offset > bytes || blob_bytes > bytes - offset) {
+                if (offset > bytes || blob_bytes > bytes - offset || mapped_blob(layer, expert) == nullptr) {
                     fail("FileExpertSource: invalid blob bounds while building the cache complement");
                     return;
                 }
-                uint8_t* dst = (uint8_t*) host + (size_t) offset;
-                if (!copy_from_files(layer, expert, dst)) {
-                    fail("FileExpertSource: invalid blob bounds while building the cache complement");
-                    return;
+                const uint64_t fpos = file_off_ + layer_offsets_[(size_t) layer] + (uint64_t) expert * blob_bytes;
+                if (!runs.empty() && runs.back().file_pos + runs.back().len == fpos &&
+                    runs.back().dst_off + runs.back().len == offset) {
+                    runs.back().len += blob_bytes;
+                    ++runs.back().count;
+                } else {
+                    runs.push_back(Run{fpos, offset, blob_bytes, expert, 1});
                 }
-                copied.fetch_add(blob_bytes);
-                if (!on_gpu[index]) progress.add(blob_bytes);
             }
-            {   // the layer's pages are not kept in the file cache once copied
+            if (direct_fd < 0 || !basalt::platform::read_ahead_enabled()) {
+                // mapped copy: ask for the layer's blobs before copying them
+                std::vector<std::pair<int32_t, int32_t>> ahead;
+                for (const Run& r : runs)
+                    for (int64_t k = 0; k < r.count; ++k) ahead.emplace_back((int32_t) layer, (int32_t) (r.first + k));
+                (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
+            }
+            for (const Run& r : runs) {
+                uint8_t* dst = (uint8_t*) host + (size_t) r.dst_off;
+                uint64_t done_bytes = 0;
+                if (direct_fd >= 0) {
+                    const bool aligned = r.file_pos % kDirectAlign == 0 && ((uintptr_t) dst) % kDirectAlign == 0 &&
+                                         r.len % kDirectAlign == 0;
+                    if (aligned) {   // straight into the arena
+                        while (done_bytes < r.len) {
+                            const uint64_t n = std::min<uint64_t>(kDirectChunk, r.len - done_bytes);
+                            const ssize_t got = ::pread(direct_fd, dst + done_bytes, (size_t) n,
+                                                        (off_t) (r.file_pos + done_bytes));
+                            if (got <= 0 || (uint64_t) got % kDirectAlign != 0) break;   // the rest takes the mapped copy
+                            done_bytes += (uint64_t) got;
+                        }
+                    } else {   // block-aligned reads into a staging buffer, then the wanted bytes are copied out
+                        if (stage == nullptr) {
+                            void* m = nullptr;
+                            if (posix_memalign(&m, kDirectAlign, kDirectChunk + 2 * kDirectAlign) == 0) stage = (uint8_t*) m;
+                        }
+                        while (stage != nullptr && done_bytes < r.len) {
+                            const uint64_t pos = r.file_pos + done_bytes;
+                            const uint64_t n = std::min<uint64_t>(kDirectChunk, r.len - done_bytes);
+                            const uint64_t a0 = pos - pos % kDirectAlign;
+                            const uint64_t a1 = (pos + n + kDirectAlign - 1) / kDirectAlign * kDirectAlign;
+                            const ssize_t got = ::pread(direct_fd, stage, (size_t) (a1 - a0), (off_t) a0);
+                            if (got <= 0 || (uint64_t) got < pos + n - a0) break;
+                            std::memcpy(dst + done_bytes, stage + (pos - a0), (size_t) n);
+                            done_bytes += n;
+                        }
+                    }
+                    direct_bytes.fetch_add(done_bytes);
+                }
+                // whatever the unbuffered reads did not place, per expert from the mapped file
+                for (int64_t k = done_bytes / blob_bytes; k < r.count; ++k) {
+                    if (!copy_from_files(layer, r.first + k, dst + (size_t) k * (size_t) blob_bytes)) {
+                        fail("FileExpertSource: invalid blob bounds while building the cache complement");
+                        return;
+                    }
+                    mapped_used = true;
+                }
+                for (int64_t k = 0; k < r.count; ++k) {
+                    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) (r.first + k);
+                    copied.fetch_add(blob_bytes);
+                    if (!on_gpu[index]) progress.add(blob_bytes);
+                }
+            }
+            if (mapped_used) {   // the layer's pages are not kept in the file cache once copied
             const uint64_t layer_offset = layer_offsets_[(size_t) layer];
             const uint64_t layer_bytes = blob_bytes * (uint64_t) n_expert_;
             const uint64_t layer_end = layer_offset + layer_bytes;
@@ -911,12 +972,40 @@ bool FileExpertSource::pin_cache_complement(
         for (auto& t : pool) t.join();
     }
     std::fflush(stderr);
+    if (direct_fd >= 0) ::close(direct_fd);
+    const double read_done_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
+    if (register_after && !failed.load()) {
+        constexpr size_t kHuge = 2ull << 20;
+        const size_t padded = ((size_t) bytes + kHuge - 1) / kHuge * kHuge;
+        const cudaError_t reg = cudaHostRegister(arena, padded, cudaHostRegisterMapped | cudaHostRegisterPortable);
+        void* alias = nullptr;
+        if (reg == cudaSuccess && cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
+            device = (const uint8_t*) alias;
+            partial_pin = bytes;   // released through the registered-prefix path
+            lock_off = bytes;
+            note = "page-locked and mapped";
+        } else {
+            if (reg == cudaSuccess) (void) cudaHostUnregister(arena);
+            note = std::string("page-locking refused (") + cudaGetErrorString(reg) + ")";
+            (void) cudaGetLastError();
+            const basalt::platform::LockResult lr = basalt::platform::lock_resident(arena, bytes);
+            locked = lr.locked_bytes;
+            note += "; " + lr.note;
+        }
+    }
     if (failed.load()) {
         err = fail_msg;
         release();
         return false;
     }
     progress.finish();
+    {
+        const double read_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count();
+        std::fprintf(stderr, "FileExpertSource: cache complement: allocation %.1f s, read %.1f s (%.2f GB/s, %.1f%% unbuffered), registration %.1f s\n",
+                     alloc_s, read_done_s, read_done_s > 0 ? (double) copied.load() / 1e9 / read_done_s : 0.0,
+                     copied.load() > 0 ? 100.0 * (double) direct_bytes.load() / (double) copied.load() : 0.0,
+                     read_s - read_done_s);
+    }
 
     complement_arena_ = arena;
     complement_host_ = host;
