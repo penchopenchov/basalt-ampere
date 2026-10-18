@@ -273,10 +273,8 @@ path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer
 | GSQ-RCO IQ3_S | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 81.0 GiB | 46.8 GiB | 2.387 | 0.177 | 89.4% |
 | UD-Q3_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 86.8 GiB | 52.0 GiB | 2.457 | 0.160 | 89.3% |
 | UD-Q4_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 106.7 GiB | 71.7 GiB | 2.321 | 0.068 | 93.0% |
-| NVIDIA NVFP4, 6-bit dense (official, [below](#nvfp4-pack)) | [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), converted by Basalt's converter | 122.0 GiB | 63.3 GiB | | | |
+| NVIDIA NVFP4, 6-bit dense (official, [below](#nvfp4-pack)) | [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | 122.0 GiB | 63.3 GiB | 2.297 | 0.076 | 93.0% |
 | Q8_0 | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 178.3 GiB | 119.5 GiB | 2.282 | reference | |
-
-The NVFP4 row has no 20-chunk run yet; its 100-chunk numbers are in the NVFP4 section below.
 
 The IQ3_S, IQ3_XXS, Q2_0 and NVFP4 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
 raises draft acceptance. Output is unchanged, because verify decides every token. Q4_K_XL and Q8_0 keep the original
