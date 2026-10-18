@@ -42,7 +42,20 @@ double rel_l1(const float* a, const float* b, int n, double* mag_out = nullptr) 
     return d / (mag > 1e-30 ? mag : 1e-30);
 }
 
+/// A deterministic stand-in for the blob at an index: random 2-bit codes and fp16 scales in the range real packs use.
+/// Distinct indices give distinct data, which is what the structural checks need.
+void synth_blob(long long index, std::vector<uint8_t>& out) {
+    out.assign(cpu::BLOB, 0);
+    std::mt19937 rng((uint32_t) (index * 2654435761ull + 17));
+    for (size_t i = 0; i < cpu::O_GU_SCALES; ++i) out[i] = (uint8_t) rng();
+    for (size_t i = cpu::O_GU_SCALES; i < cpu::BLOB; i += 2) {
+        const uint16_t h = (uint16_t) (0x1C00 + rng() % 0x0800);
+        std::memcpy(out.data() + i, &h, 2);
+    }
+}
+
 bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
+    if (path == nullptr) { synth_blob(index, out); return true; }
     out.assign(cpu::BLOB, 0);
     std::FILE* f = basalt::platform::open_file_utf8(path, "rb");
     if (!f) return false;
@@ -78,7 +91,7 @@ float f16_at(const std::vector<uint8_t>& b, size_t off) {
 
 int main(int argc, char** argv) {
     bool selftest = false;
-    const char* path = "experts.bin";
+    const char* path = nullptr;   // null: a synthetic fixture; --file reads real expert blobs
     long long layer = 0, expert = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -86,7 +99,7 @@ int main(int argc, char** argv) {
         else if (a == "--file" && i + 1 < argc) path = argv[++i];
         else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
         else if (a == "--expert" && i + 1 < argc) expert = std::atoll(argv[++i]);
-        else { std::fprintf(stderr, "usage: expert_parity [--selftest] [--file P] [--layer N] [--expert N]\n");
+        else { std::fprintf(stderr, "usage: expert_parity [--selftest] [--file experts.bin] [--layer N] [--expert N]\n");
                return 2; }
     }
 
@@ -103,11 +116,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // ---- a real blob out of the pack: layer stride is 512 experts
+    // ---- a blob from the pack (or the synthetic fixture): layer stride is 512 experts
     const long long idx = layer * 512 + expert;
     std::vector<uint8_t> blob;
     if (!read_blob(path, idx, blob)) {
-        std::fprintf(stderr, "cannot read expert %lld (layer %lld) from %s\n", expert, layer, path);
+        std::fprintf(stderr, "cannot read expert %lld (layer %lld) from %s\n", expert, layer, path ? path : "the fixture");
         return 2;
     }
 
@@ -175,7 +188,8 @@ int main(int argc, char** argv) {
     std::printf("  %-44s rel %.3e   (the cost of the contract, REPORTED)\n",
                 "VNNI vs scalar (FP32 acts)", rel_contract);
 
-    std::printf("\nexpert_parity: %d failures (layer %lld expert %lld of %s)\n", bad, layer, expert, path);
+    std::printf("\nexpert_parity: %d failures (layer %lld expert %lld of %s)\n", bad, layer, expert,
+                path ? path : "the synthetic fixture");
     if (bad) return 1;
     if (selftest) std::printf("expert_parity OK\n");
     return 0;

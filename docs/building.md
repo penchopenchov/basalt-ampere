@@ -16,8 +16,9 @@ Clone, requirements and the build commands are in the [README](../README.md). Th
 The tests are off by default. Configure the README's build with the extra option `-DBUILD_TESTING=ON`, build, then run `ctest --test-dir build`.
 
 The kernel parity tests need the GPU; the file-format, cache and memory unit tests do not. `expert_parity` and `pool_test`
-need local expert data (`experts.bin` in the source directory, not shipped), and `platform_memory_test` needs a locked-memory
-limit raised first (`ulimit -l`); without that, those three fail.
+run on a synthetic expert fixture; pass `--file experts.bin` (the pack's experts section, not shipped) to check real blobs.
+`platform_memory_test` locks 256 MiB when the locked-memory limit (`ulimit -l`) allows it and a smaller region otherwise,
+and says so; it skips the lock case only when the limit is too low to lock anything.
 
 `basalt-bench` reads its pre-tokenized prompts from `data/bench` (token ids for the Qwen3.8-Flash-Next tokenizer: the
 three decode prompts and a prefill filler); run it from the repository root or pass `--fixtures DIR`. `basalt-bench

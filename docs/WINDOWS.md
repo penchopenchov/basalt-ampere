@@ -74,9 +74,8 @@ before any debugging:
   stopped at 0 of 256 MiB (error 1453)`. Those are token-privilege errors, not parity errors, and
   the test passes where the privileges are held.
 
-Two tests need an `experts.bin` fixture in the working directory that is a developer's local file
-and is not in the repository: `expert_parity` and `pool_test` fail with "cannot read expert 0
-(layer 0) from experts.bin" until one is supplied with `--file`.
+`expert_parity` and `pool_test` run on a synthetic expert fixture by default and need no file; `--file experts.bin`
+switches them to real blobs.
 
 The real-weight tools (`ple_q5_parity`, `expert_parity --file`, `pool_test --file`) want a **raw
 GGUF or a raw `experts.bin`**, not a `.basalt` container. Handing them a container makes them

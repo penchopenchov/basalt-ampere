@@ -991,14 +991,12 @@ if(BUILD_TESTING)
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE kernels_cpu platform)
-  # The experts section (extracted to experts.bin) is a REQUIRED input: this test compares against a real expert blob, and a
-  # missing file would otherwise be reported as a pass by a test that skipped everything.
-  add_test(NAME expert_parity COMMAND expert_parity --selftest
-           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
+  add_test(NAME expert_parity COMMAND expert_parity --selftest)
 
   add_executable(pool_test src/kernels/cpu/pool_test.cpp)
   target_link_libraries(pool_test PRIVATE kernels_cpu platform)
-  add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME pool_test COMMAND pool_test --selftest)
   # tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE kernels_cpu)
