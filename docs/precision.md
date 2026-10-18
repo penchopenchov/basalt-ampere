@@ -123,10 +123,10 @@ expert outputs, MMQ / CPU: 1.0e-2 / 1.2e-2 with plain activations (all four form
 3.4e-2 when 0.5% of the activations are 12 times larger (the CPU's Q8_K block is 256 values wide, MMQ's 32). A row's output
 does not depend on how many tokens share its expert's job (bitwise, every pair). Quality gate, IQ3_S, 100 chunks, 400 W,
 the 256-token prompt half through this path: PPL 3.3727, KLD 0.15267, top-1 87.22% against 3.3769, 0.15351, 87.19%
-for the build without it. Prefill with the share is not reproducible bit for bit between runs, because the share follows
-the measured costs. The identity checks below compare logits across engine sessions, so for a prompt whose chunks are
-below 6,144 tokens the two sessions' KV, and with it their rows, can differ at this level, and those checks are no longer
-bit-identical across sessions.
+for the build without it. The share is a fixed 0.6 of the streamed experts, not a timing-driven value, so which experts the CPU computes depends
+only on the routing and the tiers, and prefill is reproducible bit for bit between runs of the same configuration
+(six identical greedy outputs on the NVFP4 pack and on Q4_K_XL). A different tier layout (cache size, peer slots) moves the
+CPU's experts and with them the rounding, so identity checks compare sessions of one configuration.
 
 **Expert path by chunk size.** A prompt chunk of fewer than 6,144 tokens stages only the experts its tokens route to and
 runs them on MMQ, or on the FP4 tensor cores for NVFP4 experts from 1,024 tokens (the FP4 row above), with the CPU pool taking the low-row non-resident ones; a chunk of 6,144 tokens

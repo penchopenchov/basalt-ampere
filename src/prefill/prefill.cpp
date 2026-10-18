@@ -473,11 +473,9 @@ struct Prefill::Impl {
     std::vector<char> cpu_need;
     cudaStream_t cpu_s = nullptr;
     cudaEvent_t cpu_ev_in = nullptr, cpu_ev_x = nullptr, cpu_gev[2] = {};
-    double cpu_c_ms = 0, cpu_g_ms = 0;   // running ms per CPU expert and per GPU expert
-    double cpu_share_now = 0.3;          // the share of the streamed experts; a start value until the first layer is measured
-    bool cpu_pend = false;
-    double pend_cpu_ms = 0;
-    int64_t pend_n_cpu = 0, pend_n_gpu = 0;
+    // The share of the streamed experts the CPU computes. Fixed, not timing-driven: the CPU and the GPU round
+    // differently, so a share that moved with timing would change the output from run to run.
+    double cpu_share_now = 0.6;
     // The grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then the MMQ bounds: kernels
     // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
     // holds (up to `ring` of them), and the GPU idles meanwhile.
@@ -1949,17 +1947,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
-                        if (m.cpu_pend) {   // the last CPU-sharing layer's GPU time is final now: rebalance the share
-                            m.cpu_pend = false;
-                            float g_ms = 0;
-                            if (cudaEventElapsedTime(&g_ms, m.cpu_gev[0], m.cpu_gev[1]) == cudaSuccess) {
-                                constexpr double a = 0.25;
-                                const double c = m.pend_cpu_ms / (double) m.pend_n_cpu, gg = g_ms / (double) m.pend_n_gpu;
-                                m.cpu_c_ms = m.cpu_c_ms > 0 ? m.cpu_c_ms + a * (c - m.cpu_c_ms) : c;
-                                m.cpu_g_ms = m.cpu_g_ms > 0 ? m.cpu_g_ms + a * (gg - m.cpu_g_ms) : gg;
-                                m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
-                            }
-                        }
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
@@ -2527,12 +2514,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (cpu_fut.valid()) {   // CPU share: its rows into Dm's tail
                         cudaEventRecord(m.cpu_gev[1], m.cs);   // after the GPU's expert work
                         if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }
-                        if (n_stream > n_cpu) {
-                            m.cpu_pend = true;
-                            m.pend_cpu_ms = cpu_ms;
-                            m.pend_n_cpu = n_cpu;
-                            m.pend_n_gpu = n_stream - n_cpu;
-                        }
                         cudaMemcpyAsync(m.Dm + (size_t) (T * K - rows_cpu) * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
                                         cudaMemcpyHostToDevice, m.cs);
                         stats_.experts_cpu += n_cpu;
