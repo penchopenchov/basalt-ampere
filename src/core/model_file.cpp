@@ -56,8 +56,42 @@ uint64_t FileRange::size() const {
     return bytes != 0 ? bytes : sz - offset;
 }
 
+namespace {
+
+// A large read without the file cache: block-aligned O_DIRECT reads into an aligned bounce buffer, copied out.  False
+// when the file system or the allocation refuses, and the caller takes the ordinary read.
+bool pread_direct(const std::string& path, void* dst, uint64_t n, uint64_t off) {
+    constexpr uint64_t kAlign = 4096, kChunk = 16ull << 20;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd < 0) return false;
+    void* bounce = nullptr;
+    if (posix_memalign(&bounce, kAlign, std::min<uint64_t>(n, kChunk) + 2 * kAlign) != 0) { ::close(fd); return false; }
+    bool ok = true;
+    for (uint64_t done = 0; ok && done < n;) {
+        const uint64_t pos = off + done, len = std::min<uint64_t>(kChunk, n - done);
+        const uint64_t a0 = pos - pos % kAlign, a1 = (pos + len + kAlign - 1) / kAlign * kAlign;
+        uint64_t got = 0;
+        while (got < pos + len - a0) {
+            const ssize_t r = ::pread(fd, (uint8_t*) bounce + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            got += (uint64_t) r;
+        }
+        ok = got >= pos + len - a0;
+        if (ok) std::memcpy((uint8_t*) dst + done, (uint8_t*) bounce + (pos - a0), (size_t) len);
+        done += len;
+    }
+    std::free(bounce);
+    ::close(fd);
+    return ok;
+}
+
+}  // namespace
+
 bool read_range_at(const FileRange& r, uint64_t off, void* dst, uint64_t n, std::string& err) {
     if (r.bytes != 0 && (off > r.bytes || n > r.bytes - off)) { err = "read past the end of a section of " + r.path; return false; }
+    constexpr uint64_t kDirectMin = 256ull << 10;
+    if (n >= kDirectMin && pread_direct(r.path, dst, n, r.offset + off)) return true;
     const int fd = ::open(r.path.c_str(), O_RDONLY);
     if (fd < 0) { err = "cannot open " + r.path; return false; }
     const bool ok = pread_all(fd, dst, n, r.offset + off);
