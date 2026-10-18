@@ -878,7 +878,9 @@ int main(int argc, char** argv) {
                         K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok,
                                                  n, n, d_xq2, dv[0].scr, d_parts2, s0);
                     });
-                    std::printf("  bench: T=%d route + grouped %.2f us, glue %.2f us\n", T, ur, ug);
+                    const double mb = (double) P.counts[0] * (double) L.bytes / 1e6;   // the VRAM groups' expert bytes
+                    std::printf("  bench: T=%d route + grouped %.2f us, glue %.2f us (%d groups, %.1f MB: %.0f vs %.0f GB/s)\n",
+                                T, ur, ug, P.counts[0], mb, mb * 1e3 / ur, mb * 1e3 / ug);
                 }
                 cudaFree(d_pt); cudaFree(d_p4); cudaFree(d_pub);
             } else {
