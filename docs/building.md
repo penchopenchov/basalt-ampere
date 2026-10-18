@@ -20,6 +20,11 @@ run on a synthetic expert fixture; pass `--file experts.bin` (the pack's experts
 `platform_memory_test` locks 256 MiB when the locked-memory limit (`ulimit -l`) allows it and a smaller region otherwise,
 and says so; it skips the lock case only when the limit is too low to lock anything.
 
+The server tests run with `python -m unittest discover -s serve/tests -t .` after `pip install -r requirements-test.txt`
+(the server's requirements plus `jsonschema`, which the json_schema tests need). Two tokenizer tests read the pack's
+vocabulary and skip without a pack; the same checks run on a synthetic vocabulary in the same file. The test that runs
+the built engine with every flag needs `bin/basalt`.
+
 `basalt-bench` reads its pre-tokenized prompts from `data/bench` (token ids for the Qwen3.8-Flash-Next tokenizer: the
 three decode prompts and a prefill filler); run it from the repository root or pass `--fixtures DIR`. `basalt-bench
 --help` says how the files are made.
