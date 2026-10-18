@@ -35,19 +35,13 @@ class OldDetokenizer:
         return delta
 
 
-@unittest.skipIf(find_tokenizer() is None, "no pack tokenizer here")
 class Detok(unittest.TestCase):
+    """The incremental detokenizer against the whole re-decode, on the pack's tokenizer when there is one and on the
+    synthetic vocabulary otherwise."""
+
     @classmethod
     def setUpClass(cls):
-        import json
-        import tokenizer as ST
-        t = find_tokenizer()
-        vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
-        toks = [None] * len(vocab)
-        for s, i in vocab.items():
-            toks[i] = s
-        cls.tok = ST.Tokenizer(toks, (t / "merges.txt").read_text(encoding="utf-8").split("\n"),
-                               json.loads((t / "token_type.json").read_text()))
+        cls.tok = real_tokenizer() or synthetic_tokenizer()
 
     def same_stream(self, ids):
         """The same text as a whole re-decode, never behind it and never ahead of what the ids decode to."""
