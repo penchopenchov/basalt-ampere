@@ -828,6 +828,7 @@ if(BUILD_TESTING)
     add_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic ${_pair})
     set_tests_properties(native_expert_parity_${_name} PROPERTIES TIMEOUT 120)
   endforeach()
+  add_test(NAME native_expert_parity_cpu_q6_K_q8_0 COMMAND native_expert_parity --cpu-synthetic q6_K/q8_0)
   add_test(NAME native_expert_parity_q5_1_min COMMAND native_expert_parity --q5_1-min)
   # the AVX-512 Q8_K activation quantizer bit for bit against ggml's reference
   add_test(NAME native_expert_parity_q8k_quant COMMAND native_expert_parity --q8k-quant)

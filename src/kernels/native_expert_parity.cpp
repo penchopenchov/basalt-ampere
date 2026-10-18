@@ -966,6 +966,133 @@ int check_bf16_embd(cudaStream_t s) {
     return failures;
 }
 
+// The CPU tier alone on random blobs of one pair (no GPU): each ISA build of the ggml dot against a double
+// reference over the dequantized weights and activations, the multi-row expert against the float expert, and the
+// time of one thread's gate/up rows.
+extern "C" {
+const ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx2(ggml_type type);
+const ggml_type_traits_cpu* ggml_get_type_traits_cpu_avx512(ggml_type type);
+}
+
+int check_cpu_pair(int gu, int dn, int seed) {
+    int failures = 0;
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(gu, dn, H, FF, f, err)) {
+        std::printf("%s/%s: %s\n", ggml_type_name((ggml_type) gu), ggml_type_name((ggml_type) dn), err.c_str());
+        return 1;
+    }
+    const std::vector<uint8_t> blob = synthetic_blob(f, seed);
+    const auto* tg = ggml_get_type_traits((ggml_type) gu);
+    const auto* td = ggml_get_type_traits((ggml_type) dn);
+    std::mt19937 rng(11 + seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x((size_t) NT * H);
+    for (auto& v : x) v = nd(rng);
+    std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
+    const void* a[NT];
+    for (int k = 0; k < NT; ++k) {
+        cpu::native_quant_act(f, x.data() + k * H, act[k].data());
+        a[k] = act[k].data();
+    }
+    // the activations the dot sees (Q8_K), dequantized
+    std::vector<float> xd((size_t) NT * H);
+    for (int k = 0; k < NT; ++k) {
+        if (f.gu_act != GGML_TYPE_Q8_K) {
+            std::printf("  the pair's activation is not Q8_K\n");
+            return 1;
+        }
+        // block_q8_K: float d, int8 qs[256], int16 bsums[16]
+        for (int64_t b = 0; b < H / 256; ++b) {
+            const uint8_t* blk = act[k].data() + b * 292;
+            float d;
+            std::memcpy(&d, blk, 4);
+            for (int i = 0; i < 256; ++i) xd[k * H + b * 256 + i] = d * (float) (int8_t) blk[4 + i];
+        }
+    }
+    std::vector<float> G((size_t) FF * H), U((size_t) FF * H), D((size_t) H * FF);
+    for (int64_t r = 0; r < FF; ++r) {
+        tg->to_float(blob.data() + r * f.gu_row, G.data() + r * H, H);
+        tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
+    }
+    for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+    const struct { const char* name; const ggml_type_traits_cpu* (*get)(ggml_type); bool ok; } isas[] = {
+        {"avx2", ggml_get_type_traits_cpu_avx2, cpu::cpu_avx2_ok()},
+        {"avx512", ggml_get_type_traits_cpu_avx512, cpu::cpu_avx512_ok()}};
+    for (const auto& isa : isas) {
+        if (!isa.ok) continue;
+        const auto* tc = isa.get((ggml_type) gu);
+        if (tc == nullptr || tc->vec_dot == nullptr) {
+            std::printf("          %s: no dot for %s\n", isa.name, ggml_type_name((ggml_type) gu));
+            ++failures;
+            continue;
+        }
+        double worst = 0.0;
+        for (int k = 0; k < NT; ++k)
+            for (int64_t r = 0; r < FF; ++r) {
+                float got = 0.f;
+                tc->vec_dot((int) H, &got, 0, blob.data() + r * f.gu_row, 0, a[k], 0, 1);
+                double want = 0.0, mag = 0.0;
+                for (int64_t i = 0; i < H; ++i) {
+                    const double t = (double) G[r * H + i] * xd[k * H + i];
+                    want += t;
+                    mag += std::fabs(t);
+                }
+                worst = std::max(worst, std::fabs(got - want) / (mag + 1e-30));
+            }
+        std::printf("          %s %s dot vs double reference: worst error / sum|terms| %.2e\n", isa.name,
+                    ggml_type_name((ggml_type) gu), worst);
+        if (worst > 1e-5) {
+            std::printf("          %s %s dot MISMATCH\n", isa.name, ggml_type_name((ggml_type) gu));
+            ++failures;
+        }
+        const int it = 50;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it; ++i)
+            for (int64_t r = 0; r < FF; ++r) {
+                float gg, uu;
+                tc->vec_dot((int) H, &gg, 0, blob.data() + r * f.gu_row, 0, a[0], 0, 1);
+                tc->vec_dot((int) H, &uu, 0, blob.data() + f.up_off + r * f.gu_row, 0, a[0], 0, 1);
+            }
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+        std::printf("          gate+up one token one thread: %s %s %.0f us (%.2f GB/s, weights cache-resident)\n",
+                    isa.name, ggml_type_name((ggml_type) gu), us, 2.0 * f.up_off / us / 1e3);
+    }
+    // the expert through the tier's own entry points against the float expert
+    std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
+    std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
+    std::vector<float> got((size_t) NT * H), ref((size_t) NT * H);
+    float* ffp[NT];
+    const void* hp[NT];
+    float* op[NT];
+    for (int k = 0; k < NT; ++k) ffp[k] = ff[k].data();
+    cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
+    for (int k = 0; k < NT; ++k) {
+        cpu::native_quant_h(f, ff[k].data(), hq[k].data());
+        hp[k] = hq[k].data();
+        op[k] = got.data() + k * H;
+    }
+    cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
+    for (int k = 0; k < NT; ++k) {
+        std::vector<float> h(FF);
+        for (int64_t r = 0; r < FF; ++r) {
+            double g = 0, u = 0;
+            for (int64_t i = 0; i < H; ++i) { g += (double) G[r * H + i] * x[k * H + i]; u += (double) U[r * H + i] * x[k * H + i]; }
+            h[r] = (float) (g / (1.0 + std::exp(-g)) * u);
+        }
+        for (int64_t r = 0; r < H; ++r) {
+            double o = 0;
+            for (int64_t i = 0; i < FF; ++i) o += (double) D[r * FF + i] * h[i];
+            ref[k * H + r] = (float) o;
+        }
+    }
+    const double ec = rel(got, ref);
+    std::printf("  %s/%s cpu expert vs float reference: rel %.2e\n", ggml_type_name((ggml_type) gu),
+                ggml_type_name((ggml_type) dn), ec);
+    if (ec > 3e-2) ++failures;
+    return failures;
+}
+
 // the Q6_K token embedding - iq_embed_rows and iq_dequant_f32 on random blocks against ggml's dequantize_row_q6_K
 int check_q6k_embd(cudaStream_t s) {
     constexpr int kQ6K = 14;
@@ -1093,6 +1220,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
+                             "       native_expert_parity --cpu-synthetic GU/DOWN ...   (CPU tier only, e.g. q6_K/q8_0)\n"
                              "       native_expert_parity --experts experts.bin|MODEL.basalt [layer ...]   (NVFP4)\n"
                              "       native_expert_parity --q5_1-min\n"
                              "       native_expert_parity --q8k-quant\n"
@@ -1115,6 +1243,15 @@ int main(int argc, char** argv) {
         failures += check_bf16_embd(gpu());
     } else if (mode == "--q6k-embd") {
         failures += check_q6k_embd(gpu());
+    } else if (mode == "--cpu-synthetic") {
+        for (int i = 2; i < argc; ++i) {
+            const std::string arg = argv[i];
+            const size_t slash = arg.find('/');
+            const int gu = slash == std::string::npos ? -1 : type_of(arg.substr(0, slash));
+            const int dn = slash == std::string::npos ? -1 : type_of(arg.substr(slash + 1));
+            if (gu < 0 || dn < 0) { std::printf("%s: not GU/DOWN type names\n", arg.c_str()); ++failures; continue; }
+            failures += check_cpu_pair(gu, dn, i);
+        }
     } else if (mode == "--synthetic") {
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];
