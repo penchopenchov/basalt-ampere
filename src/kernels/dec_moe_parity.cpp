@@ -115,7 +115,7 @@ std::vector<uint8_t> nvfp4_blobs(const K::NativeExpertLayout& L, int nx, std::mt
     return b;
 }
 
-// NX synthetic blobs of the UD-Q4_K_XL formats (Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down): random bytes, then finite
+// NX synthetic blobs of the K-quant and Q8_0 formats (Q4_K / Q5_K / Q8_0 gate/up, Q5_1 / Q8_0 down): random bytes, then finite
 // small fp16 block scales (the first two halves of each block; Q8_0 has one)
 void kq_fix_scales(uint8_t* p, size_t bytes, int type, std::mt19937& rng) {
     const size_t bs = type == 12 ? 144 : type == 13 ? 176 : type == 7 ? 24 : 34;
@@ -502,8 +502,8 @@ int main(int argc, char** argv) {
     std::vector<int> auto_layers;
     if (nvfp4) { fmt[0] = {40, 40}; auto_layers.push_back(0); layers.clear(); stress_n = 0; }
     if (kq) {
-        fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8};
-        auto_layers = {0, 1, 2}; stress_n = 0;
+        fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8}; fmt[3] = {8, 8};
+        auto_layers = {0, 1, 2, 3}; stress_n = 0;
     }
     for (int l = 0; !synth && l < 64; ++l) {
         const basalt::GgufFile& gguf = *gguf_p;
