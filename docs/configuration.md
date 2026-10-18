@@ -138,6 +138,7 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
 | `adapt-every` | engine | integer | 4 (`0` = static residency) | How many decode windows pass between adaptive rounds. A round moves experts between the tiers (see below). `1` follows the conversation fastest. |
 | `adapt-decay` | engine | number, 0 to 1 | 0.93 on a single card (with or without the peer); 0.7 when the experts are split over several cards | The factor the usage counts are multiplied by after each round. Lower forgets sooner; higher remembers longer. |
+| `prefill-cpu-share` | engine | number, 0 to 1 | 0.6 (`0` = the GPU streams every expert) | The share of the streamed (not VRAM-resident) experts that the CPU computes while a prompt is read; the GPU streams and computes the rest. The value is fixed, not tuned from timing, so the output is identical from run to run at a given value. A weaker CPU may do better with a lower value. |
 | `adapt-swaps` | engine | integer | 96 (`0` = static residency) | The most experts one round swaps into the main card's tier. |
 | `peer-adapt-swaps` | engine | integer | same as `adapt-swaps` (`0` = the peer's experts stay fixed) | The most experts one round moves on the peer card. |
 | `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. |

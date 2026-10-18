@@ -535,6 +535,7 @@ struct Options {
     int adapt_every = 4;
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
+    double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
     /// A draft enters the verify window only while every draft before it (and itself) has at least this probability
     /// under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
@@ -869,6 +870,9 @@ void usage() {
                  "  --adapt-decay F      factor the routing counts are multiplied by after each round (default\n"
                  "                       0.93 on one GPU with or without the peer, 0.7 with the experts split\n"
                  "                       over several GPUs); lower forgets sooner\n"
+                 "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
+                 "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
+                 "                       from run to run; a weaker CPU may prefer a lower value\n"
                  "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
@@ -1535,6 +1539,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
+        else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
             o.relaxed_drafting = kRelaxedDraftingDefault;
@@ -1983,6 +1988,10 @@ int main(int argc, char** argv) {
         (o.expert_cache_remote[1] > 0 && o.expert_cache_remote[0] == 0) ||
         (o.expert_cache_remote[2] > 0 && o.expert_cache_remote[1] == 0)) {
         std::fprintf(stderr, "basalt generate: invalid sampling or resource parameter\n");
+        return 2;
+    }
+    if (!(o.prefill_cpu_share >= 0.0 && o.prefill_cpu_share <= 1.0)) {
+        std::fprintf(stderr, "basalt generate: --prefill-cpu-share must be a number from 0 to 1\n");
         return 2;
     }
     if (o.vram_reserve_given && o.vram_reserve_mib < kVramStallMib) {
@@ -5054,7 +5063,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-            if (!multi_gpu && o.batch <= 0 && !o.no_pool) sp.set_cpu_pool(&pool);   // the pool is idle while a prompt is read
+            if (!multi_gpu && o.batch <= 0 && !o.no_pool) { sp.set_cpu_pool(&pool); sp.set_cpu_share(o.prefill_cpu_share); }   // the pool is idle while a prompt is read
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
@@ -9085,7 +9094,7 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "basalt generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && o.batch <= 0 && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (!multi_gpu && o.batch <= 0 && !o.no_pool) { prefill.set_cpu_pool(&pool); prefill.set_cpu_share(o.prefill_cpu_share); }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {

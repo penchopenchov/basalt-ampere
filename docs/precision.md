@@ -123,7 +123,7 @@ expert outputs, MMQ / CPU: 1.0e-2 / 1.2e-2 with plain activations (all four form
 3.4e-2 when 0.5% of the activations are 12 times larger (the CPU's Q8_K block is 256 values wide, MMQ's 32). A row's output
 does not depend on how many tokens share its expert's job (bitwise, every pair). Quality gate, IQ3_S, 100 chunks, 400 W,
 the 256-token prompt half through this path: PPL 3.3727, KLD 0.15267, top-1 87.22% against 3.3769, 0.15351, 87.19%
-for the build without it. The share is a fixed 0.6 of the streamed experts, not a timing-driven value, so which experts the CPU computes depends
+for the build without it. The share is a fixed 0.6 of the streamed experts by default (`--prefill-cpu-share`), not a timing-driven value, so which experts the CPU computes depends
 only on the routing and the tiers, and prefill is reproducible bit for bit between runs of the same configuration
 (six identical greedy outputs on the NVFP4 pack and on Q4_K_XL). A different tier layout (cache size, peer slots) moves the
 CPU's experts and with them the rounding, so identity checks compare sessions of one configuration.

@@ -130,9 +130,12 @@ public:
 
     /// The CPU expert pool (idle while a prompt is read). A chunk below stream_all_min() tokens hands it the
     /// non-resident experts with a host copy that few of its tokens route to, instead of streaming them; their rows
-    /// go to the tail of Dm unweighted, like the peer's, and the combine weights them. The share is balanced from the
-    /// measured CPU and GPU cost per expert. Only for a pool no other thread runs meanwhile. Null: every expert on the GPU.
+    /// go to the tail of Dm unweighted, like the peer's, and the combine weights them. The share is set by
+    /// set_cpu_share(). Only for a pool no other thread runs meanwhile. Null: every expert on the GPU.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// The share, 0 to 1 (default 0.6), of the streamed experts the CPU computes; 0 leaves them all to the GPU. Fixed
+    /// for the run, so the output does not depend on timing.
+    void set_cpu_share(double share);
 
     /// Called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its

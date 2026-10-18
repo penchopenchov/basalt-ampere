@@ -1229,6 +1229,7 @@ double g_pinned_share = 1.0;
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0, std::min(share, 1.0)); }
 void Prefill::set_ring_depth(int slots) { g_ring_depth = std::max(STAGE + 1, std::min(slots, kPrefillRing)); }
 int Prefill::ring_depth() const { return impl_->ring; }
 double Prefill::pinned_share() { return g_pinned_share; }
