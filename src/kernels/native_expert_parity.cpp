@@ -1097,7 +1097,7 @@ int check_cpu_pair(int gu, int dn, int seed) {
 int check_q6k_embd(cudaStream_t s) {
     constexpr int kQ6K = 14;
     const int64_t H = 2560, V = 61, NT = 97;
-    if (!basalt::kernels::embed_type_supported(kQ6K) || basalt::kernels::iq_supported(kQ6K) ||
+    if (!basalt::kernels::embed_type_supported(kQ6K) ||
         basalt::kernels::iq_row_bytes(kQ6K, H) != (size_t) (H / 256) * 210) {
         std::printf("q6_K embedding: type support / row bytes wrong\n");
         return 1;

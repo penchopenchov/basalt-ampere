@@ -820,6 +820,7 @@ add_executable(dec_moe_parity src/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(dec_moe_parity PRIVATE kernels artifact ${_gpu_runtime_target})
 add_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic experts: no GGUF needed
+add_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic K-quant experts at the real geometry (Q5_K and Q6_K gate/up, Q8_0 down)
 if(BUILD_TESTING)
   # native expert pairs on synthetic ggml-quantized weights at 2560/640: GPU and CPU experts against the float
   # reference, GPU dequantizers against to_float.
@@ -836,9 +837,6 @@ if(BUILD_TESTING)
   add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
   # the Q6_K token embedding dequantized against ggml's reference
   add_test(NAME native_expert_parity_q6k_embd COMMAND native_expert_parity --q6k-embd)
-  # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
-  add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
-  set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
   # NVFP4 on the CPU tier: AVX2/AVX-512 dots vs plain C, the expert with its tail scales vs a double reference
   add_test(NAME native_expert_parity_nvfp4 COMMAND native_expert_parity --synthetic nvfp4/nvfp4 nvfp4/nvfp4)
   set_tests_properties(native_expert_parity_nvfp4 PROPERTIES TIMEOUT 120)

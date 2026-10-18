@@ -2701,7 +2701,7 @@ bool iq_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
 long iq_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
-bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 14 || t == 30; }   // Q6_K: dequantized here only, no expert kernels
+bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 14 || t == 30; }   // Q6_K: the embedding and the expert gate/up
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
