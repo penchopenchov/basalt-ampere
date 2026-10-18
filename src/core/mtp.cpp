@@ -1275,13 +1275,13 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         CondTail ct{};
         for (int k = 0; k + 1 < steps; ++k) ct.h[k] = hv[k + 1];
         ct.n = steps - 1;
-        ct.cum_th = kDraftCumBase;
+        ct.cum_th = draft_cum_base();
         ctail_ = &ct;
         ctail_done_ = false;
         bool rec = record_round(T, coupled, true, err);
         ctail_ = nullptr;
         if (rec && !ctail_done_)
-            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, kDraftCumBase, m_prob_, 0);
+            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_base(), m_prob_, 0);
         cudaGraph_t g0 = nullptr;
         const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
         ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
@@ -1303,13 +1303,13 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         CondTail ct{};
         ct.h[0] = hv[j + 1];
         ct.n = 1;
-        ct.cum_th = kDraftCumBase;
+        ct.cum_th = draft_cum_base();
         ctail_ = j + 1 < steps ? &ct : nullptr;
         ctail_done_ = false;
         bool rec = record_step(j, coupled, false, err);
         ctail_ = nullptr;
         if (rec && j + 1 < steps && !ctail_done_)
-            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, kDraftCumBase, m_prob_, j);
+            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_base(), m_prob_, j);
         cudaGraph_t captured = nullptr;   // the body itself, owned by the node
         ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
         prev = node;
@@ -1495,7 +1495,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::memcpy(&h_row_[2], &min_p, sizeof(float));   // read by the conditional graph only
-    const float cum_th = cum_th_ >= 0.0f ? cum_th_ : kDraftCumBase;
+    const float cum_th = cum_th_ >= 0.0f ? cum_th_ : draft_cum_base();
     std::memcpy(&h_row_[3], &cum_th, sizeof(float));
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
