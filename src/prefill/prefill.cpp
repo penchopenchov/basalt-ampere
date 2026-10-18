@@ -42,6 +42,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -638,7 +639,15 @@ const MmqPlan& mmq_plan() {
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
             // a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
-            if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) { p.fallback = true; continue; }
+            if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
+                // Q6_K experts never take the FP16 path: a build without their MMQ instance refuses the pack
+                if (gt == 14 || dt == 14) {
+                    std::fprintf(stderr, "prefill: layer %lld has Q6_K experts and no MMQ kernel takes them\n", (long long) l);
+                    std::exit(1);
+                }
+                p.fallback = true;
+                continue;
+            }
             p.layer[(size_t) l] = 1;
             p.any = true;
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
