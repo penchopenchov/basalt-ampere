@@ -31,9 +31,10 @@ void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, vo
                     const float* scale = nullptr);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
 /// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
-/// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
+/// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).  `hot` (optional): a device copy of the
+/// table's first `n_hot` rows, read instead of the table for those ids (the same bytes).
 void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok,
-                   int64_t n_embd, float* out, void* stream);
+                   int64_t n_embd, float* out, void* stream, const void* hot = nullptr, int64_t n_hot = 0);
 /// One expert's gate and up matrices (n_ff rows of n_embd each) into the interleaved fp16 layout the prompt path
 /// uses: row 2r = gate row r, row 2r+1 = up row r.  `scale` (device, NVFP4 only): {s_gate, s_up}, as iq_dequant_f16.
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,

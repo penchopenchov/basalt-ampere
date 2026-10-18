@@ -2318,10 +2318,11 @@ int main(int argc, char** argv) {
         }
         basalt::core::set_native_embed(&native_embed);
         std::fprintf(stderr, "basalt generate: %s experts (largest blob %.2f MB), token embedding "
-                             "%s in mapped host memory (%.0f MiB, %.1f s)\n",
+                             "%s in mapped host memory (%.0f MiB, %.1f s), its first %lld rows in VRAM (%.1f MiB)\n",
                      o.model.c_str(), (double) basalt::kernels::cpu::expert_layout().max_blob / 1e6,
                      basalt::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
-                     std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count(),
+                     (long long) native_embed.hot_rows(), (double) native_embed.hot_bytes() / 1048576.0);
     }
     // Tensors served from the source tensors are not also loaded into the weight arena.
     std::set<std::string> skip;

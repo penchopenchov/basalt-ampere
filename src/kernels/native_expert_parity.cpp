@@ -12,6 +12,7 @@
 // twice, with the kernels that decode a weight part once for all entries and with the per-entry ones: bitwise equal.
 // (d) the GPU dequantizers of the prompt path and the embedding against `to_float` (Q8_0: bit for bit).
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/native_head.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/iq_avx512.hpp"
@@ -1149,6 +1150,88 @@ int check_q6k_embd(cudaStream_t s) {
     return gather_differ || flat_differ ? 1 : 0;
 }
 
+// The Q8_0 token embedding at the model's geometry (2560 x 248,320) in mapped host memory with its first
+// NativeEmbed::kHotRows rows also in VRAM: iq_embed_rows with the hot copy against the same gather without it and
+// against ggml's dequantize_row_q8_0, bit for bit, on ids across the boundary; then the per-call time of each.
+int check_q8_embd_hot(cudaStream_t s) {
+    constexpr int kQ80 = 8;
+    const int64_t H = 2560, V = 248320, NHOT = basalt::core::NativeEmbed::kHotRows, NT = 512;
+    const size_t rb = basalt::kernels::iq_row_bytes(kQ80, H);
+    if (rb != (size_t) (H / 32) * 34) { std::printf("q8_0 embedding: row bytes wrong\n"); return 1; }
+    void* host = nullptr;
+    if (cudaHostAlloc(&host, rb * V, cudaHostAllocMapped) != cudaSuccess) { std::printf("q8_0 embedding: no pinned table\n"); return 1; }
+    auto* table = (uint8_t*) host;
+    std::mt19937 rng(808);
+    for (size_t i = 0; i < rb * V; i += 4) { const uint32_t r = rng(); std::memcpy(table + i, &r, std::min<size_t>(4, rb * V - i)); }
+    for (size_t blk = 0; blk < rb * V / 34; ++blk) {   // d (the first two bytes of a block): a finite half
+        const ggml_fp16_t d = ggml_fp32_to_fp16(((float) (rng() % 2000) - 1000.0f) / 8192.0f);
+        std::memcpy(table + blk * 34, &d, 2);
+    }
+    void* mapped = nullptr;
+    cudaHostGetDevicePointer(&mapped, host, 0);
+    void* hot = nullptr;
+    cudaMalloc(&hot, rb * NHOT);
+    cudaMemcpy(hot, host, rb * NHOT, cudaMemcpyHostToDevice);
+    std::vector<int32_t> tok((size_t) NT);
+    const int32_t edge[] = {0, 1, (int32_t) NHOT - 1, (int32_t) NHOT, (int32_t) NHOT + 1, (int32_t) V - 1};
+    for (int64_t i = 0; i < NT; ++i)
+        tok[(size_t) i] = i < 6 ? edge[i] : (int32_t) (i % 2 ? rng() % NHOT : rng() % V);
+    int32_t* dtok = nullptr;
+    float *da = nullptr, *db = nullptr;
+    cudaMalloc((void**) &dtok, tok.size() * 4);
+    cudaMalloc((void**) &da, (size_t) (NT * H) * 4);
+    cudaMalloc((void**) &db, (size_t) (NT * H) * 4);
+    cudaMemcpy(dtok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice);
+    basalt::kernels::iq_embed_rows(kQ80, mapped, rb, dtok, NT, H, da, s, hot, NHOT);
+    basalt::kernels::iq_embed_rows(kQ80, mapped, rb, dtok, NT, H, db, s);
+    cudaStreamSynchronize(s);
+    std::vector<float> a((size_t) (NT * H)), b(a.size()), ref((size_t) H);
+    cudaMemcpy(a.data(), da, a.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(b.data(), db, b.size() * 4, cudaMemcpyDeviceToHost);
+    const auto* tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    size_t vs_mapped = 0, vs_ref = 0;
+    for (int64_t r = 0; r < NT; ++r) {
+        tq->to_float(table + (size_t) tok[(size_t) r] * rb, ref.data(), H);
+        vs_mapped += std::memcmp(&a[(size_t) (r * H)], &b[(size_t) (r * H)], (size_t) H * 4) != 0;
+        vs_ref += std::memcmp(&a[(size_t) (r * H)], ref.data(), (size_t) H * 4) != 0;
+    }
+    std::printf("q8_0 embedding, %lld hot rows: %lld gathered rows, %zu differ from the mapped-only gather, %zu from ggml\n",
+                (long long) NHOT, (long long) NT, vs_mapped, vs_ref);
+    // per call: fresh ids each call (a hit in L2 would hide the PCIe read), rows 1 and 3
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    const int iters = 400;
+    for (int T : {1, 3}) {
+        for (int mode = 0; mode < 3; ++mode) {   // 0 mapped only, 1 hot copy with hot ids, 2 hot copy with cold ids
+            std::vector<int32_t> ids((size_t) (iters * T));
+            for (auto& v : ids) v = (int32_t) (mode == 1 ? rng() % NHOT : NHOT + rng() % (V - NHOT));
+            int32_t* dids = nullptr;
+            cudaMalloc((void**) &dids, ids.size() * 4);
+            cudaMemcpy(dids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice);
+            const void* h = mode == 0 ? nullptr : hot;
+            for (int it = 0; it < 20; ++it) basalt::kernels::iq_embed_rows(kQ80, mapped, rb, dids + it * T, T, H, da, s, h, NHOT);
+            cudaEventRecord(e0, s);
+            for (int it = 0; it < iters; ++it)
+                basalt::kernels::iq_embed_rows(kQ80, mapped, rb, dids + it * T, T, H, da, s, h, NHOT);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double us = 1000.0 * ms / iters;
+            std::printf("  bench: embed rows %d, %-24s %6.2f us per call, %5.2f GB/s\n", T,
+                        mode == 0 ? "mapped" : mode == 1 ? "hot copy, hot ids" : "hot copy, cold ids", us,
+                        (double) (T * rb) / (us * 1e3));
+            cudaFree(dids);
+        }
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaFree(hot); cudaFree(dtok); cudaFree(da); cudaFree(db);
+    cudaFreeHost(host);
+    return vs_mapped || vs_ref ? 1 : 0;
+}
+
 // The AVX-512 Q8_K activation quantizer against ggml's reference quantizer: every byte of every block equal, on
 // random vectors of the model's width (dense, sparse, tied maxima, all-zero blocks, wide dynamic range).
 // One quantizer against ggml's reference: bitwise on random, sparse, tied, wide-range and all-zero-block vectors, and a
@@ -1225,7 +1308,8 @@ int main(int argc, char** argv) {
                              "       native_expert_parity --q5_1-min\n"
                              "       native_expert_parity --q8k-quant\n"
                              "       native_expert_parity --bf16-embd\n"
-                             "       native_expert_parity --q6k-embd\n");
+                             "       native_expert_parity --q6k-embd\n"
+                             "       native_expert_parity --q8-embd-hot\n");
         return 2;
     }
     int failures = 0;
@@ -1243,6 +1327,8 @@ int main(int argc, char** argv) {
         failures += check_bf16_embd(gpu());
     } else if (mode == "--q6k-embd") {
         failures += check_q6k_embd(gpu());
+    } else if (mode == "--q8-embd-hot") {
+        failures += check_q8_embd_hot(gpu());
     } else if (mode == "--cpu-synthetic") {
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];

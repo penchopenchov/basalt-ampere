@@ -951,6 +951,8 @@ if(BUILD_TESTING)
   add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
   # the Q6_K token embedding dequantized against ggml's reference
   add_test(NAME native_expert_parity_q6k_embd COMMAND native_expert_parity --q6k-embd)
+  # the Q8_0 token embedding with its hot rows in VRAM, bit for bit against the mapped-only gather and ggml's reference
+  add_test(NAME native_expert_parity_q8_embd_hot COMMAND native_expert_parity --q8-embd-hot)
   # NVFP4 on the CPU tier: AVX2/AVX-512 dots vs plain C, the expert with its tail scales vs a double reference
   add_test(NAME native_expert_parity_nvfp4 COMMAND native_expert_parity --synthetic nvfp4/nvfp4 nvfp4/nvfp4)
   set_tests_properties(native_expert_parity_nvfp4 PROPERTIES TIMEOUT 120)

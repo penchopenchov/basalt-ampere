@@ -44,8 +44,10 @@ private:
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
-/// is read over PCIe per token, so the table costs no VRAM.  `embed_row`, the verify window and the MTP drafter
-/// use it instead of the canonical table when it is set (`set_native_embed`).
+/// is read over PCIe per token.  The rows of the lowest ids (the byte-level BPE gives the most frequent tokens the
+/// lowest ids) also have a VRAM copy, `kHotRows` of them, which the gathers read instead: it is allocated before the
+/// expert cache is sized, so it comes out of that cache.  `embed_row`, the verify window and the MTP drafter use it
+/// instead of the canonical table when it is set (`set_native_embed`).
 class NativeEmbed {
 public:
     NativeEmbed() = default;
@@ -59,10 +61,16 @@ public:
     void gather_one(int64_t token, float* out, void* stream) const;
     uint64_t bytes() const { return bytes_; }
     int type() const { return type_; }
+    /// Rows with a VRAM copy (0: none), and its bytes.
+    int64_t hot_rows() const { return n_hot_; }
+    uint64_t hot_bytes() const { return (uint64_t) n_hot_ * row_; }
+    static constexpr int64_t kHotRows = 8192;
 
 private:
     void* host_ = nullptr;
     const void* dev_ = nullptr;
+    void* hot_ = nullptr;
+    int64_t n_hot_ = 0;
     uint64_t bytes_ = 0;
     size_t row_ = 0;
     int64_t n_embd_ = 0, n_vocab_ = 0;

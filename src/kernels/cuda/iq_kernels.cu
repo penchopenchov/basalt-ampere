@@ -2755,21 +2755,24 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
 }
 
 namespace {
-__global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, size_t row_bytes,
-                                  const int32_t* __restrict__ tokens, int64_t n_embd, float* __restrict__ y) {
+__global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, const uint8_t* __restrict__ hot,
+                                  int64_t n_hot, size_t row_bytes, const int32_t* __restrict__ tokens, int64_t n_embd,
+                                  float* __restrict__ y) {
     const int t = blockIdx.y;
     const int64_t b = blockIdx.x;
-    const uint8_t* row = table + (size_t) tokens[t] * row_bytes;
+    const int32_t tok = tokens[t];
+    const uint8_t* row = (tok < n_hot ? hot : table) + (size_t) tok * row_bytes;
     dq_dispatch<float>(ty, row, b, y + (size_t) t * n_embd + b * QK_K, threadIdx.x);
 }
 }  // namespace
 
 void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
-                   float* out, void* stream) {
+                   float* out, void* stream, const void* hot, int64_t n_hot) {
     if (n_tok <= 0) return;
     if (n_embd % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    if (hot == nullptr) n_hot = 0;
     embed_rows_kernel<<<dim3((unsigned) (n_embd / 256), (unsigned) n_tok), 32, 0, (cudaStream_t) stream>>>(
-        t, (const uint8_t*) table, row_bytes, tokens, n_embd, out);
+        t, (const uint8_t*) table, (const uint8_t*) hot, n_hot, row_bytes, tokens, n_embd, out);
     check("iq_embed_rows");
 }
 
