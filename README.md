@@ -255,74 +255,27 @@ python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPRO
 
 ## Models
 
-Ready-to-run `.basalt` packs are on [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt). A pack
-you convert yourself from a GGUF, without the official files' expert profile, hc8 copies and tuned drafter, will be
-significantly slower than the official `.basalt` files. The NVFP4 file can be rebuilt exactly as [below](#nvfp4-pack).
+A `.basalt` file is the pack format described above: one file with the weights, tokenizer, MTP drafter, expert
+profile and vision projector, so a model is a single download.
 
-Quality measured with `basalt-bench --quality`: 20 chunks of wikitext-2 (512 tokens each), scored through the decode
-path against the Q8_0 reference. Lower KLD and higher top-1 agreement are closer to Q8_0. How precision is handled and how quality is measured:
-[docs/precision.md](docs/precision.md).
+<p align="center"><img src="docs/assets/basalt-format.png" alt="What is inside a .basalt file" width="640"></p>
 
-| model | source | file | experts | PPL | KLD mean | same top-1 |
-|---|---|---:|---:|---:|---:|---:|
-| GSQ-RCO-Coder IQ1_M (256 experts) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) | 57.4 GiB | 23.4 GiB | | 1.03 | 69% |
-| GSQ-RCO Q2_0 | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 64.9 GiB | 31.6 GiB | 2.971 | 0.486 | 80.6% |
-| GSQ-RCO IQ3_XXS | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 74.4 GiB | 40.0 GiB | 2.535 | 0.277 | 86.8% |
-| UD-Q2_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 76.5 GiB | 42.9 GiB | 2.755 | 0.323 | 84.3% |
-| UD-IQ3_XXS | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 79.4 GiB | 45.3 GiB | 2.564 | 0.244 | 87.0% |
-| GSQ-RCO IQ3_S | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 81.0 GiB | 46.8 GiB | 2.387 | 0.177 | 89.4% |
-| UD-Q3_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 86.8 GiB | 52.0 GiB | 2.457 | 0.160 | 89.3% |
-| UD-Q4_K_XL | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 106.7 GiB | 71.7 GiB | 2.321 | 0.068 | 93.0% |
-| NVIDIA NVFP4, 6-bit dense (official, [below](#nvfp4-pack)) | [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | 122.0 GiB | 63.3 GiB | 2.297 | 0.076 | 93.0% |
-| Q8_0 | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 178.3 GiB | 119.5 GiB | 2.282 | reference | |
-
-The IQ3_S, IQ3_XXS, Q2_0 and NVFP4 packs carry an MTP layer fine-tuned on the model's own output (self-distillation), which
-raises draft acceptance. Output is unchanged, because verify decides every token. Q4_K_XL and Q8_0 keep the original
-MTP layer. `--mtp-dense FILE` embeds that tuned layer (the `mtp/dense` section's raw bytes, checked against the
-source layout) and records it as self-distilled, with its SHA-256, in `meta.mtp`. The tuned layer ships with the
-packs, inside the model file; the converter input is only needed to build a pack yourself.
+Ready-to-run packs, with the quality of each measured against Q8_0, are on
+[Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt). A pack you convert yourself from a GGUF,
+without the official files' expert profile, hc8 copies and tuned drafter, will be significantly slower than the
+official `.basalt` files. How precision is handled and how quality is measured: [docs/precision.md](docs/precision.md).
 
 ### NVFP4 pack
 
 The official NVFP4 file is NVIDIA's NVFP4 checkpoint
-([nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), revision `fc694b54`,
-quantized by NVIDIA Model Optimizer from Qwen's BF16 weights) with one change made for speed: the dense projections are
-stored as 6-bit Q6_K instead of 8-bit Q8_0. 6-bit dense weights take the tensor-core dense path in decode, which Q8_0
-dense weights do not (they fall back to the slower mmvq kernel), and they move about 22% fewer dense bytes (654 of 2,948 MiB).
-
-What the file holds, tensor group by tensor group:
-
-| part | format | source |
-|---|---|---|
-| Routed experts, all 48 layers | NVFP4 (E2M1 codes, UE4M3 block scale per 16 weights, FP32 per-expert scales), bit for bit as NVIDIA published them; nothing requantized | NVIDIA's checkpoint, moved into Basalt's expert layout |
-| Attention q/k/v/o, GDN qkv / z / out, shared-expert gate and up (252 tensors) | **Q6_K**, quantized once from NVIDIA's BF16 weights (not from a Q8_0 copy, so there is no double rounding) | NVIDIA's checkpoint |
-| Shared-expert down (its rows are not whole 256-value blocks), output head, token embedding | Q8_0 | NVIDIA's BF16 weights, Q8_0 |
-| Router, hyper-connection matrices, indexer, GDN alpha/beta, PLE key/value | BF16 as stored | NVIDIA's checkpoint |
-| PLE n-gram table | Q8_0: NVIDIA's FP8 codes times their BF16 scale, re-blocked per 32 values | NVIDIA's checkpoint |
-| Norms, GDN state parameters | F32 | NVIDIA's checkpoint |
-| MTP drafter | Basalt's own (dense Q8_0/BF16, experts Q2_0), not NVIDIA's FP8 drafter. The experts are quantized from Qwen's BF16 MTP layer; the dense part is the self-distilled layer the IQ3_S, IQ3_XXS and Q2_0 packs carry, recorded in `meta.mtp.dense` with its SHA-256 | Qwen BF16 (experts), tuned layer file (dense) |
-| Tokenizer, chat template, model metadata | as NVIDIA ships them (the vocabulary is the other packs') | NVIDIA's checkpoint |
-| Vision projector, expert profile | as in the other Basalt packs | Basalt packs |
+([nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), revision `fc694b54`)
+with the dense projections stored as 6-bit Q6_K instead of 8-bit Q8_0, which takes the tensor-core dense path in
+decode. The per-tensor breakdown and its quality are on the Hugging Face card.
 
 Basalt's converter reads NVIDIA's safetensors directly (`convert.py --checkpoint`). It moves each expert's NVFP4 codes
 and scales into Basalt's blocks without changing a bit, quantizes each dense projection once from BF16, folds the "+1"
 of the norm weights into F32, puts the GDN value heads in the order the engine reads them, and writes the metadata and
 tokenizer from NVIDIA's `config.json`, tokenizer files and model card. `meta.checkpoint` records each step.
-
-Measured on an RTX 5090 at 400 W with the 5060 Ti as a peer card, alternating the two packs on one build (ABBA, 6 fresh
-processes each; development measurement):
-
-| test | 8-bit dense, tok/s | 6-bit dense, tok/s | change |
-|---|---:|---:|---:|
-| prose | 213.4 | 229.9 | +7.8% |
-| conversation | 251.0 | 265.1 | +5.6% |
-| structured | 420.4 | 463.5 | +10.2% |
-| prefill | | | +1% |
-
-Quality has a price: against Q8_0 through the decode path (100 chunks, 400 W), 6-bit dense scores PPL 3.3081, mean KLD
-0.0680, p99 KLD 0.775 and 91.46% same top-1 (median KLD 0.0150), where the 8-bit dense pack scores PPL 3.287-3.294, KLD 0.0612-0.0621 and
-91.8-91.9%. The paired KLD difference is +0.0063 (95% CI +0.0048 to +0.0077). On 4,096-token prompts the PPL goes from
-2.9547 to 2.9816. The tables and method are in [docs/precision.md](docs/precision.md).
 
 Build either variant yourself from NVIDIA's checkpoint. The base pack supplies only the drafter, vision projector and
 expert profile (and its `hc8` copies if it has any), copied byte for byte. The official file takes them from
@@ -341,7 +294,7 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
     --out Qwen3.8-FN-NVIDIA-NVFP4-Q8.basalt --name "Qwen3.8-Flash-Next NVIDIA-NVFP4"
 ```
 
-`--mtp-dense FILE` replaces the dense part of the drafter copied from the base with the tuned layer. The file is the raw
+`--mtp-dense FILE` replaces the dense part of the drafter copied from the base with a tuned layer. The file is the raw
 bytes of the `mtp/dense` section of an official IQ3_S, IQ3_XXS or Q2_0 pack (for example
 `ModelFile(path).read("mtp/dense")` from `tools/convert/model_file.py`); its size must match the base's section, and the
 converter records its SHA-256 in `meta.mtp.dense` with the tuning `self_distilled`. Add it to either command:
@@ -352,19 +305,8 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
     --out Qwen3.8-FN-NVIDIA-NVFP4.basalt --name "Qwen3.8-Flash-Next NVIDIA-NVFP4"
 ```
 
-The tuned layer raises draft acceptance and leaves output unchanged (verify decides every token). Measured on an
-RTX 5090 at 400 W with the 5060 Ti as a peer card, against the same pack with Qwen's original layer (ABBA, 3 blocks of
-6 processes per arm; development measurement):
-
-| test | original layer, tok/s | tuned layer, tok/s | change |
-|---|---:|---:|---:|
-| prose | 234.5 | 238.9 | +1.9% |
-| tokens per verify window, prose | 2.083 | 2.172 | +4.3% |
-
-Conversation and structured output are within noise.
-
-The output is about 122 GiB (the 8-bit variant 123 GiB), next to the 124 GiB checkpoint. How NVFP4 is computed on each
-tier: [docs/precision.md](docs/precision.md).
+The output is about 122 GiB (the 8-bit variant 123 GiB). How NVFP4 is computed on each tier:
+[docs/precision.md](docs/precision.md).
 
 The model files are derived from Qwen3.8-Flash-Next and are distributed under the
 [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT
