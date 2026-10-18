@@ -3,11 +3,14 @@
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
         [--mtp-source DIR] [--mtp-dense FILE] [--profile FILE | --profile-from TRACE ...] [--draft-vocab FILE] [--hc8 FILE] \\
         [--name NAME] [--compat-bf16] [--no-vision] [--force]
+    python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --sections-from BASE.basalt --out MODEL.basalt [--name NAME] [--force]
     python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
         [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
+  --sections-from BASE.basalt  with --gguf: the drafter, profile, hc8 and vision sections are copied from BASE byte for
+                     byte (BASE's vocabulary must be the GGUF's); replaces --mmproj, --mtp-*, --draft-vocab, --profile*, --hc8
   --mmproj FILE      the vision projector GGUF (required unless --no-vision)
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
@@ -183,9 +186,16 @@ def convert(a) -> None:
     partial = Path(str(out) + ".partial")
     if out.exists() and not a.force:
         die(f"{out} exists (use --force to overwrite)")
+    base = None
+    if a.sections_from:
+        base = ModelFile(a.sections_from) if Path(a.sections_from).is_file() else die(f"missing input: {a.sections_from}")
+        if a.mtp_source or a.mtp_dense or a.draft_vocab or a.profile or a.profile_from or a.hc8 or a.mmproj or a.no_vision:
+            die("--sections-from supplies the drafter, profile, hc8 and vision sections; do not combine it with "
+                "--mtp-source, --mtp-dense, --draft-vocab, --profile, --profile-from, --hc8, --mmproj or --no-vision")
+        base_meta = json.loads(base.read("meta"))
     mmproj = Path(a.mmproj) if a.mmproj else None
     side = [Path(x) for x in (a.hc8, a.draft_vocab, a.profile, a.mtp_dense) if x] + [Path(t) for t in (a.profile_from or [])]
-    if not a.no_vision:
+    if not a.no_vision and base is None:
         side.append(mmproj if mmproj else Path("<--mmproj>"))
     for p in side:
         if not p.is_file():
@@ -206,7 +216,11 @@ def convert(a) -> None:
         mtp = S.Mtp(a.mtp_source, a.mtp_dense) if a.mtp_source else None
         n_vocab = len(kv.get("tokenizer.ggml.tokens") or []) or None
         draft_vocab = S.draft_vocab_bytes(a.draft_vocab, n_vocab) if a.draft_vocab else None
-        if a.profile:
+        if base is not None:
+            if base_meta.get("gguf_kv", {}).get("tokenizer.ggml.tokens") != kv.get("tokenizer.ggml.tokens"):
+                die(f"{a.sections_from}s vocabulary differs from the GGUFs; its drafter and vision sections would not fit")
+            profile_blob = base.read("profile")
+        elif a.profile:
             profile_blob = Path(a.profile).read_bytes()
         else:
             freq = {}
@@ -222,7 +236,7 @@ def convert(a) -> None:
         die(str(e))
 
     vision_extra = []
-    if not a.no_vision:
+    if not a.no_vision and base is None:
         fn = load_vision_helper()
         if fn is None:
             print("note: pack_vision.py (vision_sections) not found; only vision/mmproj is written")
@@ -249,17 +263,27 @@ def convert(a) -> None:
             offs = w.add_parts("gguf", [(src, off, size) for _, src, off, size, _ in tensors], TENSOR_ALIGN)
             job._report("gguf", w.entries[-1][2], time.time() - t)
             tensor_offsets = dict(zip((x[0] for x in tensors), offs))
+            copied = []
+            if base is not None:
+                for name in base.names():
+                    if name.startswith(("mtp/", "vision/")) or name in ("profile", "hc8"):
+                        off, size = base.section(name)
+                        job.file(name, a.sections_from, off, size)
+                        if w.entries[-1][3] != base.sections[name][2]:
+                            die(f"section {name}: the copys SHA-256 differs from {a.sections_from}s")
+                        copied.append(name)
             if mtp is not None:
                 job.chunks("mtp/dense", mtp.dense_chunks())
                 job.bytes("mtp/dense.index", mtp.dense_index())
                 job.chunks("mtp/experts", mtp.expert_chunks())
                 if draft_vocab is not None:
                     job.bytes("mtp/draft_vocab", draft_vocab)
-            job.bytes("profile", profile_blob)
+            if base is None:
+                job.bytes("profile", profile_blob)
             if a.hc8:
                 job.file("hc8", a.hc8)
             written = {e[0] for e in w.entries}
-            if not a.no_vision:
+            if not a.no_vision and base is None:
                 job.file("vision/mmproj", mmproj)
                 for name, data, src, off, size in vision_extra:
                     if name in written or name == "vision/mmproj":
@@ -272,7 +296,7 @@ def convert(a) -> None:
 
             sources = [{"path": p.name, "size": p.stat().st_size,
                         "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)}
-                       for p in model.paths + ([mmproj] if not a.no_vision else [])]
+                       for p in model.paths + ([mmproj] if not a.no_vision and base is None else [])]
             meta = {
                 "format": "basalt", "version": 1, "name": a.name,
                 "converter": {"tool": "tools/convert/convert.py", "git": git_rev()},
@@ -284,14 +308,18 @@ def convert(a) -> None:
                 "conversions": {"compat_bf16": a.compat_bf16, "tensors": dense.records},
                 "sampling": SAMPLING, "license": model_license(kv),
                 "profile": prof,
-                "hc8": {"bytes": Path(a.hc8).stat().st_size} if a.hc8 else None,
-                "mtp": None if mtp is None else {"source_sha256": mtp.source_sha256(),
+                "hc8": base_meta.get("hc8") if base is not None else {"bytes": Path(a.hc8).stat().st_size} if a.hc8 else None,
+                "mtp": base_meta.get("mtp") if base is not None else None if mtp is None else {"source_sha256": mtp.source_sha256(),
                                                   "expert_format": "q2_0", "draft_vocab": draft_vocab is not None,
                                                   "dense": ({"tuning": "self_distilled", "sha256": mtp.tuned_sha256}
                                                             if mtp.tuned else {"tuning": None})},
-                "vision": None if a.no_vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
+                "vision": base_meta.get("vision") if base is not None else None if a.no_vision else {"mmproj": "vision/mmproj", "mmproj_bytes": mmproj.stat().st_size,
                                                     "extra": [v[0] for v in vision_extra]},
             }
+            if base is not None:
+                meta["sections_from"] = {"path": Path(a.sections_from).name, "size": Path(a.sections_from).stat().st_size,
+                                         "fingerprint_sha256_first_last_64mib_and_size": fingerprint(Path(a.sections_from)),
+                                         "copied": copied}
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
         ok = True
@@ -576,12 +604,11 @@ def main():
         return
     if a.dense_q8_0:
         ap.error("--dense-q8-0 needs --checkpoint and --sections-from")
-    if a.sections_from:
-        ap.error("--sections-from needs --checkpoint")
     if not a.gguf:
         ap.error("--gguf is required")
-    a.name = a.name or "Qwen3.8-Flash-Next IQ3_XXS"
-    if not a.no_vision and not a.mmproj:
+    a.name = a.name or ("Qwen3.8-Flash-Next " + Path(a.gguf[0]).name.split("Next-")[-1].split("-0000")[0] if a.sections_from
+                        else "Qwen3.8-Flash-Next IQ3_XXS")
+    if not a.no_vision and not a.mmproj and not a.sections_from:
         ap.error("--mmproj is required unless --no-vision")
     warn_unofficial()
     convert(a)
