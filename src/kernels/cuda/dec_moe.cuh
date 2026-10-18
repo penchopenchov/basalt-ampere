@@ -539,6 +539,19 @@ template<int TG> int dm_glue_blocks() {
     return b[dev];
 }
 
+// dm_glue_gu_kernel for gate/up formats without gu2 row pairs (NVFP4): the same VRAM plan built in the block, then
+// native_gu_multi_kernel's block rows (dm_gu_item, the same calls in the same order) as the items.  Four blocks an SM
+// on every SM: the row loop is latency-bound and needs the occupancy more than the registers.  The items are handed
+// out by a counter as blocks free up, so the blocks finish together.  The ring's block is block 1, so it is resident
+// from the start.
+// dm_glue_gu1_kernel's item counter and finished-block count (one gate/up launch at a time on a device)
+__device__ unsigned int g_dm_glue1_work[2];
+
+template<int TG>
+__global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, NativeExpertLayout L,
+                                                             float* __restrict__ gate, float* __restrict__ up,
+                                                             block_q8_1* __restrict__ hq);
+
 // ---------------------------------------------------------------- the grouped rows, one work item at a time
 // native_gu_multi_kernel's body for block row `rb` of one group (entries [e0, e1)): the same calls in the same order.
 // gate/up row `row` (0 .. 2 n_ff: gate rows, then up rows) at `wr`, for entries [e0, e1)
@@ -591,6 +604,138 @@ __device__ __forceinline__ void dm_gu_item(const uint8_t* blob, int e0, int e1, 
     // gate and up rows are contiguous in the blob: row `row` is at row * gu_row
     dm_gu_row<TG, STAGE_GRID>(blob + (size_t) row * L.gu_row, row, e0, e1, ent_tok, xq, L, gate, up, s_grid, lane,
                               (unsigned long long) blob);
+}
+
+template<int TG>
+__global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, NativeExpertLayout L,
+                                                             float* __restrict__ gate, float* __restrict__ up,
+                                                             block_q8_1* __restrict__ hq) {
+    (void) hq;
+    __shared__ int32_t s_ids[kDmCap], s_start[kDmCap + 1], s_tok[kDmCap];
+    __shared__ unsigned long long s_ptr[kDmCap];
+    __shared__ uint32_t s_tab[kDmGlueExperts];
+    __shared__ int2 s_wtot[4];
+    __shared__ int s_dup;
+    const int tid = threadIdx.x, n = a.n_tok * a.k;
+    const bool lead = blockIdx.x == 0;
+    if (!lead) pdl_trigger();
+    const int nwork = (int) gridDim.x - (a.ring_on ? 1 : 0);
+    if (a.ring_on && blockIdx.x == 1) {   // the ring's block
+        if (tid < 32 && tid * 32 < a.n_expert) {   // the layer's residency rows into L2
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res0 + tid * 32));
+            if (a.ring.res1 != nullptr) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res1 + tid * 32));
+        }
+        pdl_wait();
+        dm_glue_ring(a.ring, a.xq, tid);
+        return;
+    }
+    const int wb = (int) blockIdx.x - (a.ring_on && blockIdx.x > 1 ? 1 : 0);   // the block's place among the workers
+    for (int i = tid; i < a.n_expert; i += 256) s_tab[i] = 0u;
+    if (tid == 0) s_dup = 0;
+    if (tid == 0 && wb * 16 < a.n_expert)   // the layer's table into L2
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptab + wb * 16));
+    const int tok = tid / a.k, warp = tid >> 5, lane = tid & 31;
+    __syncthreads();
+    pdl_wait();
+    const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
+    const bool inr = e0 >= 0 && e0 < a.n_expert;
+    const unsigned long long praw = inr ? a.ptab[e0] : 0ull;
+    if (tid < n) s_ids[tid] = e0;
+    if (inr && (atomicOr(&s_tab[e0], 1u << tok) >> tok & 1u) != 0u) s_dup = 1;
+    __syncthreads();
+    bool dup = false;
+    if (s_dup != 0)
+        for (int j = inr ? tok * a.k : tid; j < tid; ++j) dup |= s_ids[j] == e0;
+    const bool valid = inr && praw != 0ull && !dup;
+    const uint32_t bits = inr ? s_tab[e0] : 0u;
+    const uint32_t low = bits & ((1u << tok) - 1u);
+    const bool is_first = valid && low == 0u;
+    const int gcnt = is_first ? __popc(bits) : 0;
+    int cinc = gcnt;
+    unsigned fb = 0u;
+    if (warp < 4) {
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, cinc, d);
+            if (lane >= d) cinc += v;
+        }
+        fb = __ballot_sync(0xffffffffu, is_first);
+        if (lane == 31) s_wtot[warp] = make_int2(__popc(fb), cinc);
+    }
+    __syncthreads();
+    int g0 = 0, e_off = 0, ng = 0, ne = 0;
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const int2 t = s_wtot[w];
+        if (w < warp) { g0 += t.x; e_off += t.y; }
+        ng += t.x;
+        ne += t.y;
+    }
+    if (is_first) {
+        const int gi = g0 + __popc(fb & ((1u << lane) - 1u)), gs = e_off + cinc - gcnt;
+        s_ptr[gi] = praw;
+        s_start[gi] = gs;
+        int r = 0;
+        for (uint32_t m = bits; m != 0u; m &= m - 1u) s_tok[gs + r++] = __ffs(m) - 1;
+        s_tab[e0] = bits | (uint32_t) gs << 16;
+    }
+    if (tid == 0) s_start[ng] = ne;
+    __syncthreads();
+    if (lead) {
+        DmPlan* P = a.plan;
+        if (valid) {
+            const int pos = (int) (s_tab[e0] >> 16) + __popc(low);
+            P->dst[pos] = tid;
+            P->tok[pos] = tok;
+        }
+        if (tid < ng) P->ptr[tid] = s_ptr[tid];
+        if (tid <= ng) P->start[tid] = s_start[tid];
+        if (tid == 0) {
+            P->counts[0] = ng;
+            P->counts[1] = ne;
+        }
+        __threadfence();
+        __syncthreads();
+        pdl_trigger();
+    }
+    const int nx = (int) (2 * L.n_ff + GU_ROWS - 1) / GU_ROWS;
+    const int items = nx * ng;   // one (row block, group) item each
+    const auto* xq = (const block_q8_1*) a.xq;
+    // the first item is the block's own, the rest are taken off the launch's counter as blocks free up; the
+    // last block to finish zeroes the counters for the next launch
+    __shared__ int s_next[2];
+    int it = wb;
+    for (int i = 0; it < items; ++i) {
+        if (tid == 0) s_next[i & 1] = nwork + (int) atomicAdd(&g_dm_glue1_work[0], 1u);
+        const int bx = it % nx, g = it / nx;
+        dm_gu_item<TG, false>((const uint8_t*) s_ptr[g], s_start[g], s_start[g + 1], s_tok, xq, L, bx, gate, up, nullptr,
+                              warp, lane);
+        __syncthreads();
+        it = s_next[i & 1];
+    }
+    if (tid == 0) {
+        __threadfence();
+        if (atomicAdd(&g_dm_glue1_work[1], 1u) == (unsigned) nwork - 1u) {
+            g_dm_glue1_work[0] = 0u;
+            g_dm_glue1_work[1] = 0u;
+        }
+    }
+}
+
+template<int TG> int dm_glue1_blocks() {
+    static int b[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
+    if (b[dev] == 0) {
+        int sms = 0, per = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, dm_glue_gu1_kernel<TG>, 256, 0) != cudaSuccess) {
+            cudaGetLastError();
+            return 0;
+        }
+        b[dev] = std::max(1, sms * per);
+    }
+    return b[dev];
 }
 
 // rows per down work item: native_down_multi_kernel's block rows at n_ff == 640
@@ -1410,7 +1555,8 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L) {
 #undef DM_OK
         default: break;
     }
-    return tg && td && gu2_usable(L) && L.n_ff == 640 && g_gu2 >= 2 && !g_old_kernels && !g_grouped_v1 &&
+    const bool t1 = L.gu_type == 40;   // NVFP4 gate/up: dm_glue_gu1_kernel
+    return (tg || t1) && td && (t1 || gu2_usable(L)) && L.n_ff == 640 && g_gu2 >= 2 && !g_old_kernels && !g_grouped_v1 &&
            g_exp_phase == 0;
 }
 
@@ -1427,12 +1573,14 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     float* up = (float*) ((uint8_t*) scratch + fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const int gy = g_dec_gy > 0 ? std::min(cap, g_dec_gy) : cap;
-    const int items = (int) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS) * cap;
+    const int ir = L.gu_type == 40 ? GU_ROWS : GU2_ROWS;   // rows an item: dm_glue_gu1_kernel's, dm_glue_gu_kernel's
+    const int items = (int) ((2 * L.n_ff + ir - 1) / ir) * cap;
     auto go = [&](auto kernel, int resident) {
         const int nb = std::max(1, std::min(items, resident)) + (a.ring_on ? 1 : 0);
         launch_dependent(kernel, dim3((unsigned) nb), s, a, L, gate, up, hq);
     };
     switch (L.gu_type) {
+        case 40: go(dm_glue_gu1_kernel<40>, dm_glue1_blocks<40>()); break;
         case 16: go(dm_glue_gu_kernel<16>, dm_glue_blocks<16>()); break;
         case 17: go(dm_glue_gu_kernel<17>, dm_glue_blocks<17>()); break;
         case 18: go(dm_glue_gu_kernel<18>, dm_glue_blocks<18>()); break;
