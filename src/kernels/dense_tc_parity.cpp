@@ -60,6 +60,13 @@ const Case CASES[] = {
     {"q Q2_0", 42, 2560, 12288, 18, {0, -1}},
     {"tail Q3_K", 11, 1536, 999, 110, {108, -1}},
     {"tail Q2_0", 42, 1024, 1000, 18, {0, -1}},
+    {"qkv Q8_0", 8, 2560, 10240, 34, {0, -1}},
+    {"z Q8_0", 8, 2560, 6144, 34, {0, -1}},
+    {"out Q8_0", 8, 6144, 2560, 34, {0, -1}},
+    {"q Q8_0", 8, 2560, 12288, 34, {0, -1}},
+    {"kv Q8_0", 8, 2560, 512, 34, {0, -1}},
+    {"tail Q8_0", 8, 1024, 1000, 34, {0, -1}},
+    {"tail2 Q8_0", 8, 1536, 999, 34, {0, -1}},
 };
 
 uint16_t sane_half(std::mt19937& rng) {
@@ -85,6 +92,34 @@ std::vector<uint8_t> make_weights(const Case& c, std::mt19937& rng) {
                 std::memcpy(&w[k * (std::size_t) c.block_bytes + (std::size_t) at], &h, 2);
             }
     return w;
+}
+
+// float64 reference for Q8_0: sum over blocks of d_w * d_x * (exact integer dot), from the same q8_1 columns
+std::vector<double> cpu_q8_0(const Case& c, const std::vector<uint8_t>& w, const std::vector<uint8_t>& xq, int cols) {
+    const int nb = c.n_in / 32;
+    const std::size_t qcol = (std::size_t) nb * 36;
+    auto h2f = [](uint16_t h) {
+        const int e = (h >> 10) & 31, m = h & 1023;
+        const double v = e == 0 ? std::ldexp((double) m, -24) : std::ldexp((double) (1024 + m), e - 25);
+        return (h >> 15) ? -v : v;
+    };
+    std::vector<double> y((std::size_t) cols * c.n_out);
+    for (int j = 0; j < cols; ++j)
+        for (int r = 0; r < c.n_out; ++r) {
+            double sum = 0;
+            for (int b = 0; b < nb; ++b) {
+                const uint8_t* wb = &w[((std::size_t) r * nb + b) * 34];
+                const uint8_t* xb = &xq[j * qcol + (std::size_t) b * 36];
+                uint16_t dwh, dxh;
+                std::memcpy(&dwh, wb, 2);
+                std::memcpy(&dxh, xb, 2);
+                long dot = 0;
+                for (int k = 0; k < 32; ++k) dot += (long) (int8_t) wb[2 + k] * (int8_t) xb[4 + k];
+                sum += h2f(dwh) * h2f(dxh) * (double) dot;
+            }
+            y[(std::size_t) j * c.n_out + r] = sum;
+        }
+    return y;
 }
 
 bool parity(const Case& c, cudaStream_t s) {
@@ -134,7 +169,30 @@ bool parity(const Case& c, cudaStream_t s) {
         sr += (double) ref[i] * ref[i];
     }
     const double rms = std::sqrt(sd / std::max(sr, 1e-300));
-    const bool ok = bits == 0 && nonfinite == 0 && rms < 1e-3;
+    bool ok = bits == 0 && nonfinite == 0 && rms < 1e-3;
+    if (c.type == 8) {   // against float64, for every T's columns; native_mmvq's own error alongside
+        std::vector<uint8_t> xh(qcol * TM);
+        cudaMemcpy(xh.data(), xq, xh.size(), cudaMemcpyDeviceToHost);
+        const std::vector<double> ex = cpu_q8_0(c, w, xh, TM);
+        double dd = 0, dn = 0, rr = 0, mx = 0;
+        for (std::size_t i = 0; i < ex.size(); ++i) {
+            dd += (g8[i] - ex[i]) * (g8[i] - ex[i]);
+            dn += (ref[i] - ex[i]) * (ref[i] - ex[i]);
+            rr += ex[i] * ex[i];
+            mx = std::max(mx, std::fabs(ex[i]));
+        }
+        const double rd = std::sqrt(dd / std::max(rr, 1e-300)), rn = std::sqrt(dn / std::max(rr, 1e-300));
+        double tmax = 0;   // every T's column j against float64 too
+        for (int T = 1; T <= TM; ++T)
+            for (int j = 0; j < T; ++j)
+                for (int r = 0; r < c.n_out; ++r)
+                    tmax = std::max(tmax, std::fabs(got[((std::size_t) T * TM + j) * c.n_out + r] -
+                                                    ex[(std::size_t) j * c.n_out + r]));
+        const bool k = rd < 1e-5 && tmax < 1e-4 * mx;
+        std::printf("   %s float64: dense_tc rms %.3e  native_mmvq rms %.3e  worst |d| over all T %.3e  %s\n", c.name, rd,
+                    rn, tmax, k ? "PASS" : "FAIL");
+        ok = ok && k;
+    }
     std::printf("%-12s %5d x %5d  T-columns bitwise: %s (%lld diff, %lld nonfinite)  vs native: max|d|/max|ref| "
                 "%.3e  rms %.3e  %s\n",
                 c.name, c.n_in, c.n_out, bits == 0 ? "yes" : "NO", bits, nonfinite, maxd / std::max(maxr, 1e-30), rms,
@@ -302,7 +360,7 @@ void bench(cudaStream_t s, const char* pick, bool warm) {
 
 // --bench-pair: dense_tc_pair of qkv + z against dense_tc qkv then native z, L2-cold (--bench-warm: L2-warm)
 void bench_pair(cudaStream_t s, bool warm) {
-    const int pairs[][2] = {{0, 6}, {1, 5}, {3, 5}, {0, 4}, {1, 6}, {3, 6}};
+    const int pairs[][2] = {{0, 6}, {1, 5}, {3, 5}, {0, 4}, {1, 6}, {3, 6}, {25, 26}};
     std::printf("\npair bench: us per call (median of 7 graph replays)\n");
     for (const auto& pr : pairs) {
         const Case &a = CASES[pr[0]], &b = CASES[pr[1]];
@@ -384,7 +442,7 @@ int main(int argc, char** argv) {
             for (const Case& c : CASES)
                 if (c.type != 21 || c.n_in % 2048 == 0) ok = parity(c, s) && ok;
         const int pairs[][2] = {{0, 6}, {1, 5}, {2, 4}, {3, 6}, {0, 5}, {16, 17}, {3, 17}, {20, 21}, {16, 21}, {1, 17},
-                                {20, 17}};
+                                {20, 17}, {25, 26}, {25, 4}, {0, 26}};
         for (const auto& pr : pairs) ok = pair_parity(CASES[pr[0]], CASES[pr[1]], s) && ok;
     }
     if (run_bench) {

@@ -3,7 +3,7 @@
 // A tile is 16 MT rows; its 512-value chunks (two super-blocks of each row) are one ring slot each.  Warp w of a
 // tile takes m-tile (w / 4) % MT (16 rows) and half super-block w % 4 of every chunk (4 blocks of 32 values, whose
 // weight words it loads once: Q6_K and Q5_K share their high bits, Q4_K / Q5_K pairs share their bytes).  One mma per
-// block (two for Q6_K's 16-value scales) gives the exact integer dots of 16 rows x 8 columns, and each lane adds its
+// block (two for Q6_K's 16-value scales; Q8_0's codes are the A operand as stored) gives the exact integer dots of 16 rows x 8 columns, and each lane adds its
 // four (row, column) terms in a fixed order: blocks in ascending order within the half super-block, chunks in order.
 // The four warps of an m-tile are then added in order.  The result does not depend on MT.  KS = 2: the chunk is 1024
 // values and warp group w / (4 MT) takes its half; the groups' sums are added in order after their own.
@@ -34,6 +34,7 @@ constexpr int kMaxCols = 8;
 constexpr int kQ81 = 36;   // bytes of a q8_1 block: half2 (d, d * sum), 32 codes
 
 template<int TYPE> struct Fmt;
+template<> struct Fmt<8> { static constexpr int SB = 272; };   // eight 34-byte Q8_0 blocks
 template<> struct Fmt<12> { static constexpr int SB = 144; };
 template<> struct Fmt<13> { static constexpr int SB = 176; };
 template<> struct Fmt<14> { static constexpr int SB = 210; };
@@ -233,6 +234,24 @@ __device__ __forceinline__ void half_sb_terms(float (&acc)[4], const uint8_t* co
         }
 #pragma unroll
         for (int q = 0; q < 4; ++q) acc[q] += dd[q >> 1] * part[q];
+    } else if constexpr (TYPE == 8) {   // Q8_0: d, qs[32] per block; 2-byte aligned (the odd blocks' codes 4-byte)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int j = 4 * n + i;
+            uint32_t lo[2], hi[2];
+            float dw[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {   // values 4t.. and 16 + 4t.. of block j
+                const uint8_t* bp = p[h] + 34 * j;
+                dw[h] = __half2float(*reinterpret_cast<const __half*>(bp));
+                lo[h] = (i & 1) ? ld32(bp + 2 + 4 * t) : ld32_b2(bp + 2 + 4 * t);
+                hi[h] = (i & 1) ? ld32(bp + 18 + 4 * t) : ld32_b2(bp + 18 + 4 * t);
+            }
+            int d[4];
+            mma_k32(d, lo[0], lo[1], hi[0], hi[1], x.b0[i], x.b1[i]);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[q] += x.d8[i][q & 1] * (dw[q >> 1] * (float) d[q]);
+        }
     } else if constexpr (TYPE == 42) {   // Q2_0: four blocks of d, qs[16] (value v: 2 bits at 2 (v % 4) of byte v / 4,
                                          // code - 1); 2-byte aligned
 #pragma unroll
@@ -712,9 +731,9 @@ struct PairMat {
 __host__ __device__ constexpr int sb_bytes(int type) {
     return type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 21 ? 110 : 136;
 }
-// with Q3_K and Q2_0 (dense_tc_pair_kernel's LQ build)
+// with Q3_K, Q2_0 and Q8_0 (dense_tc_pair_kernel's LQ build)
 __host__ __device__ constexpr int sb_bytes_lq(int type) {
-    return type == 11 ? 110 : type == 42 ? 72 : sb_bytes(type);
+    return type == 11 ? 110 : type == 42 ? 72 : type == 8 ? 272 : sb_bytes(type);
 }
 template<bool LQ>
 __host__ __device__ constexpr int pair_sb(int type) {
@@ -876,6 +895,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                 case 21: pair_terms_xr<21>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
                 case 11: pair_terms_xr<11>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
                 case 42: pair_terms_xr<42>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
+                case 8: pair_terms_xr<8>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
                 default: pair_terms_xr<23>(acc, rowA, rowB, wp, hb, n, t, nchunk, xs, grid); break;
             }
         } else if constexpr (XR) {
@@ -894,6 +914,7 @@ __device__ __forceinline__ void dense_tc_pair_block(int blk, int nblk, uint8_t* 
                 case 21: pair_terms<21>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
                 case 11: pair_terms<11>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
                 case 42: pair_terms<42>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
+                case 8: pair_terms<8>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
                 default: pair_terms<23>(acc, rowA, rowB, wp, hb, n, g, t, x, nb32, nchunk, ncols, grid); break;
             }
         } else {
@@ -1083,7 +1104,7 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
 }  // namespace
 
 bool dense_tc_supported(int t, int n_in) noexcept {
-    return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42);
+    return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42 || t == 8);
 }
 
 bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
@@ -1092,8 +1113,8 @@ bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
 }
 
 bool dense_tc_type_on(int t) noexcept {
-    constexpr int m = 127;   // Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0
-    return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : t == 21 ? 16 : t == 11 ? 32 : t == 42 ? 64 : 0)) != 0;
+    constexpr int m = 255;   // Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0, Q8_0
+    return (m & (t == 12 ? 1 : t == 13 ? 2 : t == 14 ? 4 : t == 23 ? 8 : t == 21 ? 16 : t == 11 ? 32 : t == 42 ? 64 : t == 8 ? 128 : 0)) != 0;
 }
 
 void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -1110,6 +1131,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
         case 21: launch<21>(w, x, y, n_in, n_out, ncols, s); break;
         case 11: launch<11>(w, x, y, n_in, n_out, ncols, s); break;
         case 42: launch<42>(w, x, y, n_in, n_out, ncols, s); break;
+        case 8: launch<8>(w, x, y, n_in, n_out, ncols, s); break;
         default: launch<23>(w, x, y, n_in, n_out, ncols, s); break;
     }
     const cudaError_t e = cudaGetLastError();
@@ -1120,7 +1142,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
 }
 
 bool dense_tc_pair_supported(int t0, int t1, int n_in) noexcept {
-    auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 11 || t == 42; };
+    auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 11 || t == 42 || t == 8; };
     if (!ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
     const int tb = 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));
     return 128 + 8 * 16 * kMaxCols * 4 + 2048 + 2 * tb <= 99 * 1024;
@@ -1144,7 +1166,7 @@ void dense_tc_pair(int t0, const void* w0, float* y0, int n_out0, int t1, const 
                          "dense_tc_pair");
         attr[dev].store(true, std::memory_order_release);
     }
-    const bool lq = t0 == 11 || t0 == 42 || t1 == 11 || t1 == 42;
+    const bool lq = t0 == 11 || t0 == 42 || t0 == 8 || t1 == 11 || t1 == 42 || t1 == 8;
     // each warp's x fragments in registers across its tiles, and two warp-sum buffers where the block is alone on its
     // SM either way
     const bool xr = (g_pair & 2) && n_in <= 3072;
