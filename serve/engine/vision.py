@@ -154,9 +154,13 @@ class Vision:
         try:
             encoded = self._encode_pinned(sources, pins)
             combined = self.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for path, _, _ in encoded:
-                    f.write(path.read_bytes())
+            try:
+                with open(combined, "wb") as f:
+                    for path, _, _ in encoded:
+                        f.write(path.read_bytes())
+            except BaseException:                       # no partial file is left behind
+                combined.unlink(missing_ok=True)
+                raise
             return combined, [n for _, n, _ in encoded]
         finally:
             with self.lock:

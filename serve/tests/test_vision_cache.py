@@ -144,5 +144,21 @@ class VisionCache(unittest.TestCase):
             self.assertEqual(v.pinned, {})
             self.assertLessEqual(len(v.cache), 64)
 
+
+    def test_a_failed_write_leaves_no_combined_file(self):
+        for v in self.each_path():
+            encode_pinned = v._encode_pinned
+
+            def vanishing(sources, pins):
+                encoded = encode_pinned(sources, pins)
+                encoded[-1][0].unlink()                 # a cached file gone before the copy
+                return encoded
+            v._encode_pinned = vanishing
+            with self.assertRaises(FileNotFoundError):
+                v.encode(["a", "b"])
+            self.assertEqual(list(v.dir.glob("req-*.sve")), [])
+            self.assertEqual(v.pinned, {})
+
+
 if __name__ == "__main__":
     unittest.main()
