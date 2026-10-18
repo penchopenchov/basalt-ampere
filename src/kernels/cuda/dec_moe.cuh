@@ -252,7 +252,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         void* xq = plan ? a.xq : a.xq_pub;
         if (i < nv) {   // n_embd is a multiple of 256: whole warps
             const float xi = a.x[i];
-            if (plan || s_npeer > 0) q8_1_store(xi, (block_q8_1*) xq, i);
+            if (plan || s_npeer > 0 || a.rows) q8_1_store(xi, (block_q8_1*) xq, i);
             if (pub && s_ncpu > 0) a.x_m[i] = xi;
         }
         if (plan && a.sh_gw != nullptr) {   // the shared expert's gate: this block's 256 products, warps summed in order
@@ -269,7 +269,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
                 a.sh_part[blockIdx.x - 1] = gs;
             }
         }
-        if (pub && s_npeer > 0) {
+        if (pub && (s_npeer > 0 || a.rows)) {
             __syncthreads();
             // this block's 8 q8_1 blocks (288 bytes) to mapped memory, 16 bytes per thread
             const long long b0 = (long long) (blockIdx.x - 1) * (kDmThreads / 32);
@@ -290,7 +290,8 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
             if (a.stats != nullptr) a.stats[0] = dm_clock();
             __threadfence_system();
             // the peer's word: the ring, the tokens and whether it has entries (it fetches nothing otherwise)
-            *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (s_npeer > 0 ? 1u << 28 : 0u);
+            *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (s_npeer > 0 ? 1u << 28 : 0u) |
+                                                 (a.rows ? 1u << 29 : 0u);
             *(volatile uint32_t*) a.host_seq_m = a.ring;
             __threadfence_system();
         }
@@ -387,7 +388,7 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
             a.plan->counts[3] = r_ncpu;
         }
     }
-    if (r_npeer > 0) {   // the q8_1 rows, 16 bytes at a time (a row is n_embd / 32 blocks of 36 bytes)
+    if (r_npeer > 0 || a.rows) {   // the q8_1 rows, 16 bytes at a time (a row is n_embd / 32 blocks of 36 bytes)
         for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
     }
     if (r_ncpu > 0) {
@@ -399,7 +400,8 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
     if (tid == 0) {
         if (a.stats != nullptr) a.stats[0] = dm_clock();
         __threadfence_system();
-        *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_npeer > 0 ? 1u << 28 : 0u);
+        *(volatile uint32_t*) a.peer_seq_m = a.ring | (uint32_t) a.n_tok << 16 | (r_npeer > 0 ? 1u << 28 : 0u) |
+                                             (a.rows ? 1u << 29 : 0u);
         *(volatile uint32_t*) a.host_seq_m = a.ring;
         __threadfence_system();
     }
@@ -1080,6 +1082,168 @@ __device__ __forceinline__ bool dm_grid_sync(const DmWatch& w, unsigned int* bar
     return *s_ok != 0;
 }
 
+// The peer's warm-up words (DmPeerArgs::arrive, zeroed per launch): the ring whose doorbell block 0 has seen, the
+// predictor's arrivals, the ring whose expert list is ready, its length, a sink for the touch loads.
+constexpr int kDmWarmGo = 3, kDmWarmArr = 4, kDmWarmRing = 5, kDmWarmN = 6, kDmWarmSink = 7;
+constexpr int kDmWarmTok = 5;   // tokens of a ring the predictor reads
+
+__device__ __forceinline__ unsigned int dm_ld(const unsigned int* p) { return *(const volatile unsigned int*) p; }
+
+// Between ring `next - 1` (rows xq of n_tok tokens, layer `layer`) and ring `next` (layer + 1), on blocks 1..nb-1
+// while block 0 waits for the next doorbell, once every block has left the ring: the router of layer + 1 on these
+// rows (int8 rows, a prediction only), every token's top k, the predicted experts the peer holds rank by rank (logits,
+// list: the scratch past the counters), then one plain-load pass over those blobs so the next ring's expert reads find
+// them in the L2.  Each part is skipped or cut short once the doorbell is in (kDmWarmGo).  Writes nothing the rings
+// read.  Not inlined: the rings' expert loop keeps its own register allocation.
+__device__ __noinline__ void dm_warm(const DmPeerArgs& a, DmShared& sm, const block_q8_1* xq, int n_tok, int layer,
+                                     uint32_t next, float* logits, unsigned long long* list, unsigned int ring_arrivals) {
+    __shared__ int32_t s_last, s_go;   // block-uniform decisions (go moves while the block reads it)
+    __shared__ unsigned int s_n;
+    unsigned int* go = a.arrive + kDmWarmGo;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    constexpr int WB = kDmThreads / 32;
+    const int nw = (int) (gridDim.x - 1) * WB, gw = (int) (blockIdx.x - 1) * WB + warp;
+    const int ne = a.n_expert, nblk = a.n_embd / 32, l1 = layer + 1;
+    const bool on = n_tok > 0 && ne <= kDmPredExperts && a.k <= 32 && n_tok * a.k <= kDmCap;
+    if (tid == 0) {
+        if (on && ring_arrivals != 0u)   // the router pass waits until every block has left the ring
+            while (dm_ld(a.arrive) < ring_arrivals && dm_ld(go) < next && dm_ld(a.arrive + 2) == 0u) __nanosleep(100);
+        s_go = dm_ld(go) >= next;
+    }
+    __syncthreads();
+    // the predictor reads at most kDmWarmTok tokens' rows, staged in the block's shared memory (int8 values and the
+    // block scales) over the rings' grid, SwiGLU and output buffers
+    constexpr int kSx = (int) (sizeof(sm.grid) + sizeof(sm.hq) + sizeof(sm.out));
+    const int pt = min(min(n_tok, kDmWarmTok), kSx / (a.n_embd + nblk * 4));
+    if (on && (int) (blockIdx.x - 1) * WB < ne && !s_go) {
+        int8_t* sx = (int8_t*) sm.grid;
+        float* sd = (float*) (sx + (size_t) pt * a.n_embd);
+        for (int i = tid; i < pt * nblk; i += kDmThreads) {
+            const int* xb = (const int*) (xq + i);   // tokens' rows back to back, nblk blocks each
+            sd[i] = __half2float(__ushort_as_half((unsigned short) (__ldcg(xb) & 0xffff)));
+            int* d = (int*) (sx + (size_t) i * 32);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) d[j] = __ldcg(xb + 1 + j);
+        }
+        __syncthreads();
+        const int8_t* rq = a.rq + (size_t) l1 * ne * a.n_embd;
+        const float* rs = a.rs + (size_t) l1 * ne * nblk;
+        const int nc = a.n_embd / 16;   // 16-value chunks a row
+        for (int e = gw; e < ne; e += nw) {
+            float acc[kDmWarmTok];
+#pragma unroll
+            for (int t = 0; t < kDmWarmTok; ++t) acc[t] = 0.0f;
+            const int4* wr = (const int4*) (rq + (size_t) e * a.n_embd);
+            for (int c = lane; c < nc; c += 32) {
+                const int4 w = __ldcs(wr + c);
+                const float sw = __ldcs(rs + (size_t) e * nblk + c / 2);
+#pragma unroll
+                for (int t = 0; t < kDmWarmTok; ++t) {
+                    if (t < pt) {
+                        const int4 xv = ((const int4*) (sx + (size_t) t * a.n_embd))[c];
+                        int si = __dp4a(w.x, xv.x, 0);
+                        si = __dp4a(w.y, xv.y, si); si = __dp4a(w.z, xv.z, si); si = __dp4a(w.w, xv.w, si);
+                        acc[t] += sw * sd[t * nblk + c / 2] * (float) si;
+                    }
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < kDmWarmTok; ++t) {
+                if (t < pt) {
+                    const float v = warp_sum(acc[t]);
+                    if (lane == 0) logits[t * kDmPredExperts + e] = v;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        s_last = atomicAdd(a.arrive + kDmWarmArr, 1u) + 1u == (next - 1u) * (gridDim.x - 1);   // once a ring
+        __threadfence();
+        s_go = dm_ld(go) >= next;
+    }
+    __syncthreads();
+    if (s_last && on && !s_go) {   // the last to arrive: the list
+        int32_t* first = (int32_t*) sm.grid;   // restaged by the next ring's experts
+        for (int i = tid; i < kDmPredExperts; i += kDmThreads) first[i] = INT32_MAX;
+        const int k = a.k, n = pt * k;
+        if (warp < pt) {
+            float v[kDmPredExperts / 32];
+#pragma unroll
+            for (int i = 0; i < kDmPredExperts / 32; ++i) {
+                const int e = lane + i * 32;
+                v[i] = e < ne ? __ldcg(logits + warp * kDmPredExperts + e) : -INFINITY;
+            }
+            for (int r = 0; r < k; ++r) {
+                float best = v[0];
+                int ex = lane;
+#pragma unroll
+                for (int i = 1; i < kDmPredExperts / 32; ++i)
+                    if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
+#pragma unroll
+                for (int m = 16; m; m >>= 1) {
+                    const float ob = __shfl_xor_sync(0xffffffffu, best, m);
+                    const int oe = __shfl_xor_sync(0xffffffffu, ex, m);
+                    if (ob > best || (ob == best && oe < ex)) { best = ob; ex = oe; }
+                }
+#pragma unroll
+                for (int i = 0; i < kDmPredExperts / 32; ++i)
+                    if (ex == lane + i * 32) v[i] = -INFINITY;
+                if (lane == 0) sm.ids[r * pt + warp] = ex;   // rank by rank across the tokens
+            }
+        }
+        __syncthreads();
+        if (tid < n) atomicMin(first + sm.ids[tid], tid);
+        __syncthreads();
+        if (tid < n) {
+            const int e = sm.ids[tid];
+            const unsigned long long p = first[e] == tid ? a.ptr[(size_t) l1 * ne + e] : 0ull;
+            sm.gptr[tid] = p;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            unsigned int base = 0;
+            for (int c = 0; c < n; c += 32) {
+                const int i = c + lane;
+                const unsigned long long p = i < n ? sm.gptr[i] : 0ull;
+                const unsigned int bal = __ballot_sync(0xffffffffu, p != 0ull);
+                if (p != 0ull) list[base + __popc(bal & ((1u << lane) - 1u))] = p;
+                base += __popc(bal);
+            }
+            __syncwarp();   // the lanes' list entries before the ring word
+            if (lane == 0) {
+                a.arrive[kDmWarmN] = base;
+                __threadfence();
+                atomicMax(a.arrive + kDmWarmRing, next);
+            }
+        }
+    }
+    // the touch: wait for the list or the doorbell
+    if (tid == 0) {
+        unsigned int spins = 0;
+        while (dm_ld(a.arrive + kDmWarmRing) < next && dm_ld(go) < next) {
+            __nanosleep(64);
+            if ((++spins & 63u) == 0u && dm_ld(a.arrive + 2) != 0u) break;
+        }
+        __threadfence();
+        s_n = dm_ld(go) < next && dm_ld(a.arrive + kDmWarmRing) >= next ? dm_ld(a.arrive + kDmWarmN) : 0u;
+    }
+    __syncthreads();
+    const unsigned int nh = s_n;
+    if (nh == 0u) return;
+    const unsigned int per = (unsigned int) (a.lay[l1].bytes / 16);   // 16-byte units a blob
+    const unsigned int total = nh * per;
+    unsigned int x = 0;
+    for (unsigned int u = (unsigned int) gw * 32u + (unsigned int) lane; u < total; u += (unsigned int) nw * 32u) {
+        const unsigned int j = u / per;
+        const uint4 q = __ldcg((const uint4*) __ldcg(list + j) + (u - j * per));
+        x ^= q.x ^ q.w;
+        if (dm_ld(go) >= next) break;
+    }
+    if (x == 0x9e3779b9u) a.arrive[kDmWarmSink] = x;
+}
+
 // The peer window.  Per ring: block 0 waits for CUDA0's doorbell and copies the ring's header and q8_1 rows to the
 // device (only block 0 reads host memory); a grid barrier; every block groups the peer's entries (the same lists) and
 // runs its work items with the rows written straight to mapped memory; the last block to finish raises `done`.
@@ -1095,10 +1259,17 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     const int nb = gridDim.x;
     float* gate = (float*) a.scratch;
     float* up = gate + (size_t) kDmCap * a.n_ff;
-    block_q8_1* xq = (block_q8_1*) (up + (size_t) kDmCap * a.n_ff);
-    DmRing* hdr = (DmRing*) (xq + (size_t) kVerifyMaxT * (a.n_embd / 32));
+    block_q8_1* xq0 = (block_q8_1*) (up + (size_t) kDmCap * a.n_ff);
+    DmRing* hdr = (DmRing*) (xq0 + (size_t) kVerifyMaxT * (a.n_embd / 32));
     unsigned int* done = (unsigned int*) (hdr + 1);
-    // a.arrive (zeroed before every launch): [0] ring arrivals, [1] the grid barrier, [2] the abort word
+    float* wlog = (float*) (done + kDmCap + 4);
+    unsigned long long* wlist = (unsigned long long*) (wlog + kVerifyMaxT * kDmPredExperts);
+    // with the warm-up the rings alternate two row buffers: the router pass may still read a ring's rows while
+    // block 0 fetches the next ring's
+    block_q8_1* xq2 = (block_q8_1*) (wlist + kDmCap);
+    const bool warm = a.rq != nullptr && a.rs != nullptr && nb > 1;
+    // a.arrive (zeroed before every launch): [0] ring arrivals, [1] the grid barrier, [2] the abort word, [3, 8) the
+    // warm-up's words
     unsigned int* bar = a.arrive + 1;
     unsigned int* abort = a.arrive + 2;
     unsigned int served = 0, bars = 0;
@@ -1117,6 +1288,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
     };
     for (int s = 0; s < a.steps; ++s) {
         const uint32_t ring = (uint32_t) s + 1u;
+        block_q8_1* xq = warm && (s & 1) ? xq2 : xq0;
         w.ring = ring; w.layer = -1; w.n_tok = 0; w.n = 0;
         if (blockIdx.x == 0) {
             if (tid == 0) {
@@ -1125,13 +1297,15 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                     while (((v = *a.seq_m) & 0xffffu) < ring) spin_pause();
                 __threadfence_system();
                 s_seq = v;
+                if (warm && s > 0)   // the warm-up stops
+                    atomicMax(a.arrive + kDmWarmGo, v == 0xffffffffu ? 0xffffffffu : ring);
             }
             __syncthreads();
             stamp(s, 0);
             const uint32_t v = s_seq;
             if (v == 0xffffffffu) {
                 if (tid == 0) hdr->n_tok = -1;
-            } else if ((v >> 28) & 1u) {         // the header and the ring's q8_1 rows, in one pass
+            } else if ((v >> 28) & 3u) {         // the header and the ring's q8_1 rows, in one pass
                 const int nt = (int) ((v >> 16) & 0xffu);
                 const uint4* src = (const uint4*) (a.rings_m + s);
                 const uint4* xs = (const uint4*) (a.xq_m + (size_t) s * a.xq_stride);
@@ -1150,8 +1324,11 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
         stamp(s, 1);
         if (hdr->n_tok < 0) return;              // released: the window is being abandoned
+        const bool warm_next = warm && s + 1 < a.steps && blockIdx.x != 0;
+        const int w_tok = min(hdr->n_tok, kVerifyMaxT), w_layer = hdr->layer;
         if (hdr->n_peer == 0) {                  // block 0 rewrites the header next ring
             if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+            if (warm_next) dm_warm(a, sm, xq, w_tok, w_layer, ring + 1u, wlog, wlist, 0u);
             continue;
         }
         const int n_tok = min(hdr->n_tok, kVerifyMaxT), layer = hdr->layer, n = n_tok * a.k;
@@ -1194,6 +1371,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 a.stamps_m[s * 8 + 4] = t;
             }
         }
+        if (warm_next) dm_warm(a, sm, xq, w_tok, w_layer, ring + 1u, wlog, wlist, served * (unsigned int) nb);
     }
 }
 
@@ -1684,7 +1862,8 @@ std::string dec_moe_stats_text(const unsigned long long* w, double windows) {
 
 size_t dec_moe_peer_scratch_bytes(int n_embd, int n_ff) {
     return (size_t) kDmCap * n_ff * 2 * sizeof(float) + (size_t) kVerifyMaxT * (n_embd / 32) * sizeof(block_q8_1) +
-           sizeof(DmRing) + (kDmCap + 1) * sizeof(unsigned int) + 256;
+           sizeof(DmRing) + (kDmCap + 4) * sizeof(unsigned int) + (size_t) kVerifyMaxT * kDmPredExperts * sizeof(float) +
+           kDmCap * sizeof(unsigned long long) + (size_t) kVerifyMaxT * (n_embd / 32) * sizeof(block_q8_1) + 256;
 }
 
 std::string dec_moe_peer_diag(const uint32_t* d) {
