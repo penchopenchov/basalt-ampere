@@ -540,10 +540,10 @@ template<int TG> int dm_glue_blocks() {
 }
 
 // dm_glue_gu_kernel for gate/up formats without gu2 row pairs (NVFP4): the same VRAM plan built in the block, then
-// native_gu_multi_kernel's block rows (dm_gu_item, the same calls in the same order) as the items.  Four blocks an SM
-// on every SM: the row loop is latency-bound and needs the occupancy more than the registers.  The items are handed
-// out by a counter as blocks free up, so the blocks finish together.  The ring's block is block 1, so it is resident
-// from the start.
+// native_gu_multi_kernel's block rows (dm_gu_item, the same calls in the same order) as the items.  Four blocks an SM:
+// the row loop is latency-bound and needs the occupancy more than the registers.  The blocks stay resident until the
+// items run out, so an eighth of the SMs is left to the side streams (the shared expert); the items are handed out by
+// a counter as blocks free up, so the blocks finish together.  The ring's block is block 1, resident from the start.
 // dm_glue_gu1_kernel's item counter and finished-block count (one gate/up launch at a time on a device)
 __device__ unsigned int g_dm_glue1_work[2];
 
@@ -733,7 +733,7 @@ template<int TG> int dm_glue1_blocks() {
             cudaGetLastError();
             return 0;
         }
-        b[dev] = std::max(1, sms * per);
+        b[dev] = std::max(1, (sms - sms / 8) * per);   // as dm_glue_blocks: the side streams keep an eighth
     }
     return b[dev];
 }
