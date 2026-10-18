@@ -33,6 +33,8 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
@@ -2081,6 +2083,34 @@ int main(int argc, char** argv) {
                               f.gu_type, f.d_type);
                 return fatal_start_error(msg);
             }
+            // Q6_K experts run on the fast kernels only (decode-once grouped / device-planned tail, MMQ prefill, CPU
+            // dot): a pair or shape outside them is refused rather than routed to a general path.
+            if ((f.gu_type == 14 || f.d_type == 14) &&
+                (!basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff) ||
+                 !basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) || !basalt::prefill::mmq::fits(f.d_type, f.n_embd))) {
+                char msg[224];
+                std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s: Q6_K experts have fast kernels only "
+                                               "for the covered pairs and shapes",
+                              (long long) l, basalt::ggml_type_name((uint32_t) f.gu_type),
+                              basalt::ggml_type_name((uint32_t) f.d_type));
+                return fatal_start_error(msg);
+            }
+        }
+        // one line per run of layers with the same formats: the kernels each decode and prefill path uses
+        for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size();) {
+            const auto& f = lay.fmt[(size_t) l];
+            int64_t e = l;
+            while (e + 1 < (int64_t) lay.fmt.size() && lay.fmt[(size_t) e + 1].gu_type == f.gu_type &&
+                   lay.fmt[(size_t) e + 1].d_type == f.d_type)
+                ++e;
+            std::fprintf(stderr, "basalt generate: experts %s/%s, layers %lld-%lld: decode %s, prefill %s, CPU tier dot\n",
+                         basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
+                         (long long) l, (long long) e,
+                         basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                             ? "device-planned tail + grouped kernels" : "grouped kernels",
+                         basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) && basalt::prefill::mmq::fits(f.d_type, f.n_embd)
+                             ? "MMQ" : "dequant GEMM");
+            l = e + 1;
         }
     }
     // Only CUDA1's context is created here, before the large allocations: the later helpers' come after the arena.
