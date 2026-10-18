@@ -181,7 +181,21 @@ public:
     virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
         (void) pairs; (void) n; return false;
     }
+
+    /// Reader threads `read_blobs` runs; a sink is told which one it is called on.
+    static constexpr int kBlobReaders = 6;
+    /// Receives pair `index`'s blob from reader `worker`; the bytes are valid only during the call.
+    using BlobSink = std::function<bool(int64_t index, int worker, const uint8_t* blob, std::string& err)>;
+    /// Hands every pair's blob to `sink`, from up to `kBlobReaders` threads.  The default reads one blob after another
+    /// through `blob()`, asking the OS for the following ones ahead.
+    virtual bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err);
 };
+
+/// Copies the pairs' blobs into the cache's slots (`slots[i]` for `pairs[i]`) on `device`, reading through
+/// `src.read_blobs` and overlapping the reads with the host-to-device copies.  `on_bytes` is told each blob's size as
+/// it lands (from several threads).  The copies are complete when this returns.
+bool fill_cache_slots(ExpertSource& src, ExpertCache& cache, int device, const std::pair<int32_t, int32_t>* pairs,
+                      const int32_t* slots, int64_t n, const std::function<void(uint64_t)>& on_bytes, std::string& err);
 
 /// What the GPU computes in a verify window's layer, written by the pool (mapped host memory) right after the ring
 /// and published before the CPU starts its own share.  Groups of entries that share a blob; the blob is a VRAM slot or
@@ -491,6 +505,9 @@ public:
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    /// Each blob read from the file with block-aligned unbuffered reads into small pinned staging buffers; a blob that
+    /// cannot be read that way, or a file system without unbuffered reads, takes the mapped copy.
+    bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err) override;
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.

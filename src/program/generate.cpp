@@ -3737,14 +3737,6 @@ int main(int argc, char** argv) {
         const bool per_layer = xcache.per_layer_admission();
         const int64_t want = per_layer ? (int64_t) profile.size()
                                        : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        // mapped reads: advise the next `fill_ahead` pairs so their reads overlap
-        int64_t fill_ahead = 0;
-        if (!per_layer && srcp == &src) {
-            fill_ahead = 256;
-            if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
-            std::fprintf(stderr, "basalt generate: the profile fill asks for %lld pairs ahead\n",
-                         (long long) fill_ahead);
-        }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
         uint64_t fill_total = 0;
@@ -3760,24 +3752,26 @@ int main(int argc, char** argv) {
             }
         }
         basalt::core::LoadProgress fill_progress(basalt::core::LoadProgress::cuda(0), fill_total, srcp != &src);
+        // the slots are handed out in profile order, then the blobs are read and copied together
+        std::vector<std::pair<int32_t, int32_t>> fill_pairs;
+        std::vector<int32_t> fill_slots;
         for (int64_t i = 0; i < want; ++i) {
-            if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == basalt::core::kNotResident) {
                 if (per_layer) continue;
                 break;
             }
-            const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
-                std::fprintf(stderr, "basalt generate: the profile fill failed at pair %lld: %s\n",
-                             (long long) i, err.c_str());
-                return 1;
-            }
+            fill_pairs.push_back(profile[(size_t) i]);
+            fill_slots.push_back(slot);
             fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
-            fill_progress.add(basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first));
-            ++prefilled;
         }
+        if (!basalt::core::fill_cache_slots(*srcp, xcache, 0, fill_pairs.data(), fill_slots.data(),
+                                            (int64_t) fill_pairs.size(),
+                                            [&](uint64_t bytes) { fill_progress.add(bytes); }, err)) {
+            std::fprintf(stderr, "basalt generate: the profile fill failed: %s\n", err.c_str());
+            return 1;
+        }
+        prefilled += (int64_t) fill_pairs.size();
         fill_progress.finish();
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
@@ -3826,18 +3820,21 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < st.profile.size() && (int64_t) i < st.cache.slots(); ++i)
             stage_fill_total += lay.blob_bytes(st.profile[i].first);
         basalt::core::LoadProgress stage_progress(basalt::core::LoadProgress::cuda(st.dev), stage_fill_total);
+        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
+        std::vector<int32_t> stage_slots;
         for (const auto& pr : st.profile) {
             if (filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == basalt::core::kNotResident) break;
-            const uint8_t* b = srcp->blob(pr.first, pr.second);
-            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
-                std::fprintf(stderr, "basalt generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
-                             st.dev, (long long) filled, err.c_str());
-                return 1;
-            }
-            stage_progress.add(lay.blob_bytes(pr.first));
+            stage_pairs.push_back(pr);
+            stage_slots.push_back(slot);
             ++filled;
+        }
+        if (!basalt::core::fill_cache_slots(*srcp, st.cache, st.dev, stage_pairs.data(), stage_slots.data(),
+                                            (int64_t) stage_pairs.size(),
+                                            [&](uint64_t bytes) { stage_progress.add(bytes); }, err)) {
+            std::fprintf(stderr, "basalt generate: layer split, CUDA%d profile fill failed: %s\n", st.dev, err.c_str());
+            return 1;
         }
         stage_progress.finish();
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),

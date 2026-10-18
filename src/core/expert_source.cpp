@@ -518,6 +518,134 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     return true;
 }
 
+bool ExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink,
+                              std::string& err) {
+    constexpr int64_t kAhead = 256;
+    const bool advise = advise_pairs(pairs, std::min<int64_t>(kAhead, n));
+    for (int64_t i = 0; i < n; ++i) {
+        if (advise && i + kAhead < n) (void) advise_pairs(pairs + i + kAhead, 1);
+        const uint8_t* b = blob(pairs[i].first, pairs[i].second);
+        if (b == nullptr) {
+            err = "expert blob " + std::to_string(pairs[i].first) + "/" + std::to_string(pairs[i].second) +
+                  " is not readable";
+            return false;
+        }
+        if (!sink(i, 0, b, err)) return false;
+    }
+    return true;
+}
+
+bool FileExpertSource::read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink,
+                                  std::string& err) {
+    constexpr uint64_t kAlign = 4096;
+    int dfd = -1;
+    if (n > 0 && !complement_ready_ && base_ != nullptr && fd_ >= 0) {
+        const std::string self = "/proc/self/fd/" + std::to_string(fd_);
+        dfd = ::open(self.c_str(), O_RDONLY | O_DIRECT);
+    }
+    uint64_t max_blob = 0;
+    for (int64_t i = 0; dfd >= 0 && i < n; ++i) {
+        const int64_t l = pairs[i].first;
+        if (l < 0 || l >= n_layers_) { ::close(dfd); dfd = -1; break; }
+        max_blob = std::max(max_blob, layer_blob_bytes_[(size_t) l]);
+    }
+    // one staging buffer per reader: the blob's block-aligned span, pinned so the copy to a GPU runs at link speed
+    const int readers = (int) std::max<int64_t>(1, std::min<int64_t>(kBlobReaders, n));
+    const size_t stage_bytes = (size_t) ((max_blob + 2 * kAlign + kAlign - 1) / kAlign * kAlign);
+    std::vector<uint8_t*> stage((size_t) readers, nullptr);
+    struct Free {
+        std::vector<uint8_t*>& v;
+        int& fd;
+        ~Free() {
+            for (uint8_t* p : v) if (p) cudaFreeHost(p);
+            if (fd >= 0) ::close(fd);
+        }
+    } cleanup{stage, dfd};
+    for (int w = 0; dfd >= 0 && w < readers; ++w) {
+        void* m = nullptr;
+        if (cudaHostAlloc(&m, stage_bytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ::close(dfd);
+            dfd = -1;
+            break;
+        }
+        stage[(size_t) w] = (uint8_t*) m;
+    }
+    if (dfd < 0) return ExpertSource::read_blobs(pairs, n, sink, err);
+
+    std::atomic<int64_t> next{0};
+    std::atomic<bool> failed{false};
+    std::mutex fail_mu;
+    std::string fail_msg;
+    auto worker = [&](int w) {
+        for (;;) {
+            const int64_t i = next.fetch_add(1);
+            if (i >= n || failed.load()) return;
+            const int64_t l = pairs[i].first, e = pairs[i].second;
+            const uint8_t* mapped = mapped_blob(l, e);
+            std::string msg;
+            if (mapped == nullptr) {
+                msg = "expert blob " + std::to_string(l) + "/" + std::to_string(e) + " is out of range";
+            } else {
+                const uint64_t bytes = layer_blob_bytes_[(size_t) l];
+                const uint64_t pos = file_off_ + (uint64_t) (mapped - base_);
+                const uint64_t a0 = pos - pos % kAlign;
+                const uint64_t a1 = (pos + bytes + kAlign - 1) / kAlign * kAlign;
+                const ssize_t got = ::pread(dfd, stage[(size_t) w], (size_t) (a1 - a0), (off_t) a0);
+                const uint8_t* data = got > 0 && (uint64_t) got >= pos + bytes - a0 ? stage[(size_t) w] + (pos - a0)
+                                                                                    : mapped;   // short read: mapped copy
+                if (sink(i, w, data, msg)) continue;
+            }
+            std::lock_guard<std::mutex> lock(fail_mu);
+            if (fail_msg.empty()) fail_msg = msg;
+            failed.store(true);
+            return;
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int w = 1; w < readers; ++w) pool.emplace_back(worker, w);
+    worker(0);
+    for (auto& t : pool) t.join();
+    if (failed.load()) {
+        err = fail_msg;
+        return false;
+    }
+    return true;
+}
+
+bool fill_cache_slots(ExpertSource& src, ExpertCache& cache, int device, const std::pair<int32_t, int32_t>* pairs,
+                      const int32_t* slots, int64_t n, const std::function<void(uint64_t)>& on_bytes, std::string& err) {
+    std::vector<cudaStream_t> streams((size_t) ExpertSource::kBlobReaders, nullptr);
+    struct Destroy {
+        std::vector<cudaStream_t>& v;
+        ~Destroy() { for (cudaStream_t s : v) if (s) cudaStreamDestroy(s); }
+    } destroy{streams};
+    int prev = 0;
+    cudaGetDevice(&prev);
+    if (cudaSetDevice(device) != cudaSuccess) { err = "cannot select the device for the cache fill"; return false; }
+    // the cache's arena was zeroed on the legacy stream, which the non-blocking streams below are not ordered against
+    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    for (cudaStream_t& s : streams)
+        ok = ok && cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess;
+    if (!ok) {
+        err = "cannot create the streams for the cache fill";
+        cudaSetDevice(prev);
+        return false;
+    }
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    const bool done = src.read_blobs(pairs, n, [&](int64_t i, int w, const uint8_t* blob, std::string& e) {
+        if (cudaSetDevice(device) != cudaSuccess) { e = "cannot select the device for the cache fill"; return false; }
+        const int64_t bytes = (int64_t) lay.blob_bytes(pairs[i].first);
+        if (!cache.fill_slot(slots[i], blob, streams[(size_t) w], e, bytes)) return false;
+        const cudaError_t sync = cudaStreamSynchronize(streams[(size_t) w]);   // the staging buffer is reused next
+        if (sync != cudaSuccess) { e = std::string("cache fill: ") + cudaGetErrorString(sync); return false; }
+        if (on_bytes) on_bytes((uint64_t) bytes);
+        return true;
+    }, err);
+    cudaSetDevice(prev);
+    return done;
+}
+
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
     if (base_ == nullptr || !basalt::platform::read_ahead_enabled()) return false;
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {

@@ -188,25 +188,27 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     // open() zeroes the arena with cudaMemset on the legacy stream, which is not ordered against the non-blocking
     // refill stream: wait for it, or the zeroing can land on top of the fills
     if (!ck(cudaDeviceSynchronize(), "arena zeroing", err)) { close(); return false; }
-    // mapped reads: advise the next kAhead pairs so their reads overlap
-    constexpr size_t kAhead = 256;
-    const bool advise = src.advise_pairs(pick.data(), (int64_t) std::min(kAhead, pick.size()));
     uint64_t fill_total = 0;
     for (const auto& pr : pick) fill_total += lay.blob_bytes(pr.first);
     LoadProgress::plan(LoadProgress::cuda(device), fill_total, !exclusive);
     LoadProgress progress(LoadProgress::cuda(device), fill_total, !exclusive);
+    std::vector<int32_t> pick_slots(pick.size());
     for (size_t i = 0; i < pick.size(); ++i) {
         const auto& pr = pick[i];
-        if (advise && i + kAhead < pick.size()) (void) src.advise_pairs(&pick[i + kAhead], 1);
         const int32_t slot = cache_.admit(pr.first, pr.second);
-        const uint8_t* b = src.blob(pr.first, pr.second);
-        if (slot < 0 || b == nullptr || !cache_.fill_slot(slot, b, refill_, err, (int64_t) lay.blob_bytes(pr.first))) {
-            err = "peer experts: fill failed: " + err;
+        if (slot < 0) {
+            err = "peer experts: fill failed: no slot";
             close();
             return false;
         }
+        pick_slots[i] = slot;
         res_[(size_t) (pr.first * n_expert + pr.second)] = slot;
-        progress.add(lay.blob_bytes(pr.first));
+    }
+    if (!fill_cache_slots(src, cache_, device, pick.data(), pick_slots.data(), (int64_t) pick.size(),
+                          [&](uint64_t bytes) { progress.add(bytes); }, err)) {
+        err = "peer experts: fill failed: " + err;
+        close();
+        return false;
     }
     if (!ck(cudaStreamSynchronize(refill_), "fill", err)) { close(); return false; }
     progress.finish();
