@@ -782,8 +782,9 @@ bool FileExpertSource::pin_cache_complement(
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);
         if (pin) {
-            // Ordinary huge-page memory, registered with the driver once it is filled: the reads fault the pages in
-            // while the drive works, instead of the driver zeroing and locking all of it before the first read.
+            // Ordinary memory, aligned and padded to 2 MiB (whole large pages, so the registered range ends on a page
+            // boundary), registered with the driver once it is filled: the reads fault the pages in while the drive
+            // works, instead of the driver zeroing and locking all of it before the first read.
             constexpr size_t kHuge = 2ull << 20;
             const size_t padded = ((size_t) bytes + kHuge - 1) / kHuge * kHuge;
             void* mem = nullptr;
