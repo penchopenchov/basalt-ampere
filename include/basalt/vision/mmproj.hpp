@@ -33,10 +33,10 @@ public:
     Mmproj(const Mmproj&) = delete;
     Mmproj& operator=(const Mmproj&) = delete;
 
-    /// Maps `path`, parses the header and checks it is the expected projector.  False with `err` otherwise.
+    /// Reads `path` (mapped when the file system refuses unbuffered reads), parses the header and checks it is the expected projector.  False with `err` otherwise.
     bool open(const std::string& path, std::string& err);
 
-    /// Unmaps the file: tensor pointers are invalid afterwards, hp() stays.  For callers that copied the weights.
+    /// Drops the file's bytes: tensor pointers are invalid afterwards, hp() stays.  For callers that copied the weights.
     void release();
 
     const Hparams& hp() const { return hp_; }
