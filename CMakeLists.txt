@@ -823,7 +823,7 @@ add_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic
 if(BUILD_TESTING)
   # native expert pairs on synthetic ggml-quantized weights at 2560/640: GPU and CPU experts against the float
   # reference, GPU dequantizers against to_float.
-  foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0)
+  foreach(_pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q6_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0)
     string(REPLACE "/" "_" _name "${_pair}")
     add_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic ${_pair})
     set_tests_properties(native_expert_parity_${_name} PROPERTIES TIMEOUT 120)

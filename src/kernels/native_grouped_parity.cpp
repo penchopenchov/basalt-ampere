@@ -66,6 +66,7 @@ const char* name_of(int t) {
         case 42: return "Q2_0";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
+        case 14: return "Q6_K";
         case 7: return "Q5_1";
         case 8: return "Q8_0";
         case 40: return "NVFP4";
@@ -97,6 +98,10 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             // exponent's top bits in the last: 0x1 / 0x2 there (0x9 / 0xA negative) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
+        } else if (t == 14) {
+            // Q6_K: the fp16 scale ends the block (offset 208); the codes and the int8 sub-scales stay random
+            const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | ((1 + ex(rng) % 4) << 10) | man(rng));
+            std::memcpy(&w[o + 208], &h, 2);
         } else {   // the other formats start their block with the fp16 scale: 2^-13 .. 2^-6
             // (Q4_K / Q5_K: 2^-14 .. 2^-11, their 6-bit sub-scales multiply it by up to 63)
             const int e = (t == 12 || t == 13) ? 1 + ex(rng) % 4 : ex(rng);
@@ -563,8 +568,9 @@ int main(int argc, char** argv) {
         std::printf("native_grouped_parity: %d failures\n", g_fail);
         return g_fail ? 1 : 0;
     }
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 8})        // GU_FMTS
+    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 8})        // GU_FMTS
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
+    check(14, 8, 2560, 640, s, rng);                                    // Q6_K gate/up, a model's shape
     check(40, 40, 512, 256, s, rng);                                    // NVFP4: its own pair, with the scale tail
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(40, 40, 2560, 640, s, rng);

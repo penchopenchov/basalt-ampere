@@ -588,7 +588,7 @@ __device__ __forceinline__ void tail_scale(float (&s)[NC], float sc) {
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8) X(40)
+#define GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(8) X(40)
 #define D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8) X(40)
 #define MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(40)
 
@@ -1011,6 +1011,38 @@ template<> struct Split<13> {   // Q5_K
         }
         const uint8_t* sc = (const uint8_t*) r.aux;
         return vec_dot_q5_K_q8_1_impl_vmmq(r.vl, r.vh, u, sc, sc + 2, r.dm, d8);
+    }
+};
+template<> inline constexpr bool kSplit<14> = true;
+template<> struct Split<14> {   // Q6_K: vec_dot_q6_K_q8_1 with the weight side loaded apart from the activation side
+    struct W { int vl, vh; int sc[QR6_K]; float d; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q6_K* bq6 = (const block_q6_K*) vbq + kbx;
+        W r;
+        const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+        const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+        r.vl = get_int_b2(bq6->ql, iqs);
+        r.vh = get_int_b2(bq6->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+        const int8_t* scales = bq6->scales + scale_offset;
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) r.sc[i] = scales[4 * i];
+        r.d = __half2float(bq6->d);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            const int u = get_int_b4(bq8_1[bq8_offset + 2 * i].qs, iqs % QI8_1);
+            const float d8 = __low2float(bq8_1[bq8_offset + 2 * i].ds);
+            const int vil = (r.vl >> (4 * i)) & 0x0F0F0F0F;
+            const int vih = ((r.vh >> (4 * i)) << 4) & 0x30303030;
+            const int vi = __vsubss4((vil | vih), 0x20202020);
+            sumf += d8 * (ggml_cuda_dp4a(vi, u, 0) * r.sc[i]);
+        }
+        return r.d * sumf;
     }
 };
 template<> inline constexpr bool kSplit<7> = true;
@@ -2477,7 +2509,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 6 || t == 8 || t == 40;
+           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 8 || t == 40;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
