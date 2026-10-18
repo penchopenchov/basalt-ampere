@@ -732,3 +732,58 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 }
+
+// Q6_K: the 6-bit codes (minus 32) as signed int8 in value order, and one float scale (d times the int8 sub-scale)
+// per 16 values, in the layout ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma reads.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q6_K(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+
+    static_assert(MMQ_ITER_K == QK_K && warp_size == 32, "one block per tile row, one warp per row");
+
+    // A thread: half h of the block, 4 consecutive positions l of 32, and one of the two ql/qh bit pairs pr.
+    const int l4 = threadIdx.x % 8;
+    const int h  = (threadIdx.x / 8) % 2;
+    const int pr = threadIdx.x / 16;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q6_K * bxi = (const block_q6_K *) x + kbx0 + i*stride;
+
+        const int ql = get_int_b2(bxi->ql, h*16 + pr*8 + l4);
+        const int qh = get_int_b2(bxi->qh, h*8 + l4);
+
+        // Positions 128h + 32s + l: ql's low nibble (s = pr) or high nibble (s = 2 + pr), qh bits 2s..2s+1.
+        const int lo = (ql & 0x0F0F0F0F)        | (((qh >> (2*pr))     << 4) & 0x30303030);
+        const int hi = ((ql >> 4) & 0x0F0F0F0F) | (((qh >> (4 + 2*pr)) << 4) & 0x30303030);
+
+        x_qs[i*sram_stride + h*32 + pr*8      + l4] = __vsubss4(lo, 0x20202020);
+        x_qs[i*sram_stride + h*32 + pr*8 + 16 + l4] = __vsubss4(hi, 0x20202020);
+    }
+
+    constexpr int rows_per_warp = warp_size / 16;
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
+        int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/16;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q6_K * bxi = (const block_q6_K *) x + kbx0 + i*stride;
+
+        x_df[i*sram_stride + threadIdx.x % 16] = __half2float(bxi->d) * bxi->scales[threadIdx.x % 16];
+    }
+}
