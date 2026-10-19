@@ -474,6 +474,18 @@ private:
     cudaEvent_t fence_ev_ = nullptr;      // dm_fence
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
+    // The async commit's own stream, after an event on cs_.  The next window's first node (the finisher) takes what the
+    // commit has not claimed and returns once it is complete; h_pend_ is the epoch whose begin kernel has run.
+    cudaStream_t cm_ = nullptr;
+    cudaEvent_t ev_commit_go_ = nullptr;
+    basalt::kernels::CommitCtl* commit_ctl_ = nullptr;
+    uint32_t* h_pend_ = nullptr; uint32_t* m_pend_ = nullptr;   // the epoch the commit's begin kernel last started
+    uint32_t commit_epoch_ = 0;
+    int fin_blocks_ = 0;
+    bool finisher_on() const;                        ///< solo windows start with the finisher
+    bool commit_begun() const;                       ///< the begin kernel of the last async commit has run
+    void order_after_commit();                       ///< a launch on cs_ outside the solo windows follows the async commit
+    basalt::kernels::GdnCommitLayers commit_gdn_args() const;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
