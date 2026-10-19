@@ -33,6 +33,8 @@ constexpr int kMidStampCtas = 170, kMidStampPts = 24;
 void mid_chain_init();
 /// The current device and these arguments run the kernel (device, row count, projection types, alignment).
 bool mid_chain_supported(const MidChainArgs& a);
+// the pair ring's slot count for a type triple (always even)
+int mid_chain_ring_slots(int type_q, int type_z, int type_o);
 /// Enqueue the layer's middle on `stream`.  Aborts on invalid arguments.
 void mid_chain(const MidChainArgs& a, void* stream);
 

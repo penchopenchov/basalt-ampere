@@ -31,6 +31,9 @@ __host__ __device__ constexpr Geo make_geo(int tq, int tz, int to) {
     g.tbq = 16 * (P_NIN / 256) * sb_bytes(tq); g.tbz = 16 * (P_NIN / 256) * sb_bytes(tz);
     g.slotb = g.tbq > g.tbz ? g.tbq : g.tbz;
     g.ns = OFF_PRED / g.slotb < P_SLOTS ? OFF_PRED / g.slotb : P_SLOTS;
+    // the two tile groups take alternate tiles: an odd ring would give a slot its consecutive tiles from different groups,
+    // and one group's mbarrier wait for the slot's second use would pass before the first use's data arrived
+    if (g.ns & 1) --g.ns;
     g.orb = (O_NIN / 256) * sb_bytes(to); g.ors = one_row_stride(g.orb);
     g.ored = (16 * g.ors + 127) & ~127; g.ox = g.ored + O_REDB;
     return g;

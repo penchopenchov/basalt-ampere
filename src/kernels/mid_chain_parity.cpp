@@ -226,6 +226,12 @@ int main(int argc, char** argv) {
     CK(cudaStreamCreate(&s));
     int bad = 0;
 
+    // the pair ring alternates its tiles between two groups: its slot count is even for every type triple
+    for (int q : {12, 13, 14, 21, 23}) for (int z : {12, 13, 14, 21, 23}) for (int o : {12, 13, 14, 21, 23}) {
+        const int ns = K::mid_chain_ring_slots(q, z, o);
+        if (ns < 2 || (ns & 1)) { std::printf("types %d/%d/%d: ring of %d slots\n", q, z, o, ns); ++bad; }
+    }
+
     // the type triples (qkv, z, out) of the GDN layers of the packs, plus the one the kernel was first built for
     const std::vector<std::array<int, 3>> triples = {{14, 14, 14}, {23, 21, 12}, {14, 12, 14}, {13, 14, 14}, {12, 12, 14}, {14, 21, 23},
                                                      {23, 23, 14}, {13, 13, 13}, {12, 21, 21}, {14, 23, 12}, {23, 14, 13}, {13, 23, 14},

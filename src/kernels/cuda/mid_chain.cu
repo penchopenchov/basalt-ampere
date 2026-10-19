@@ -500,6 +500,8 @@ void mid_chain_init() {
     }
 }
 
+int mid_chain_ring_slots(int type_q, int type_z, int type_o) { return make_geo(type_q, type_z, type_o).ns; }
+
 bool mid_chain_supported(const MidChainArgs& a) {
     const MidDev& d = mid_dev();
     return d.ok && a.T >= 1 && a.T <= kMidChainMaxT && type_ok(a.type_q) && type_ok(a.type_z) && type_ok(a.type_o) &&
