@@ -15,10 +15,6 @@ endif()
 
 option(BUILD_TESTING "Build the tests and parity programs" OFF)
 option(WERROR "Treat compiler warnings as errors" OFF)
-option(BASALT_PROFILE "Compile the in-kernel phase stamps (BASALT_STAMP_FILE) into the persistent kernels" OFF)
-if(BASALT_PROFILE)
-  add_compile_definitions(BASALT_PROFILE=1)
-endif()
 if(BUILD_TESTING)
   enable_testing()
 endif()
@@ -245,19 +241,14 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/dequant_bf16.cu
                         src/kernels/cuda/qsa_select.cu
                         src/kernels/cuda/verify_kernels.cu
-                        src/kernels/stamp_ring.cpp
-                        src/kernels/cuda/attn_chain.cu
+                        src/kernels/cuda/dec_gdn_rec.cu
+                        src/kernels/cuda/dense_tc.cu
                         src/kernels/cuda/mid_chain.cu
-                        src/kernels/cuda/fused_layer.cu
-                        src/kernels/cuda/fused_layer_t2.cu
-                        src/kernels/cuda/fused_layer_t3.cu
-                        src/kernels/cuda/fused_layer_t4.cu
-                        src/kernels/cuda/qsa_full.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
-target_sources(kernels PRIVATE src/kernels/cuda/hc8_gr.cu)
+target_sources(kernels PRIVATE src/kernels/cuda/hc_fused.cu src/kernels/cuda/hc8_gr.cu)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
 if(BUILD_TESTING)
   add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
@@ -554,13 +545,6 @@ add_executable(shared_expert_parity src/kernels/shared_expert_parity.cpp)
 target_include_directories(shared_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(shared_expert_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
-# the fused layer's experts half against today's launch sequence, bitwise, every IQ3_S shared-expert format triple
-# (GPU, synthetic, no model)
-add_executable(fused_moe_parity src/kernels/fused_moe_parity.cu)
-target_include_directories(fused_moe_parity PRIVATE src src/kernels/cuda ${_gpu_include_directories})
-target_link_libraries(fused_moe_parity PRIVATE kernels CUDA::cuda_driver ${_gpu_runtime_target})
-basalt_gpu_test(NAME fused_moe_parity COMMAND fused_moe_parity)
-set_tests_properties(fused_moe_parity PROPERTIES SKIP_RETURN_CODE 77)
 
 # the MoE half of a decode layer: the engine's launch sequence against the persistent experts kernel (GPU, synthetic)
 add_executable(pk_moe_bench src/kernels/pk_moe_bench.cpp)
@@ -570,21 +554,11 @@ target_link_libraries(pk_moe_bench PRIVATE kernels ${_gpu_runtime_target})
 add_executable(hc_fused_parity src/kernels/hc_fused_parity.cpp)
 target_include_directories(hc_fused_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(hc_fused_parity PRIVATE kernels ${_gpu_runtime_target})
-add_executable(attn_chain_parity src/kernels/attn_chain_parity.cpp)
-target_include_directories(attn_chain_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(attn_chain_parity PRIVATE kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME attn_chain_parity COMMAND attn_chain_parity 20)
-set_tests_properties(attn_chain_parity PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(mid_chain_parity src/kernels/mid_chain_parity.cpp)
 target_include_directories(mid_chain_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(mid_chain_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mid_chain_parity COMMAND mid_chain_parity 20)
 set_tests_properties(mid_chain_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
-add_executable(qsa_full_parity src/kernels/qsa_full_parity.cpp)
-target_include_directories(qsa_full_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(qsa_full_parity PRIVATE kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME qsa_full_parity COMMAND qsa_full_parity 20)
-set_tests_properties(qsa_full_parity PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(gr_parity src/kernels/gr_parity.cpp)
 target_include_directories(gr_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(gr_parity PRIVATE kernels ${_gpu_runtime_target})
