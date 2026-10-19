@@ -49,6 +49,9 @@ std::optional<std::string> capture_output(const std::vector<std::string>& argv, 
     }
 #if defined(_WIN32)
     cmd += include_stderr ? " 2>&1" : " 2>nul";
+    // cmd.exe drops the first and last quote of a command line that holds more than one quoted word or a redirection,
+    // so the whole line is wrapped in one more pair
+    cmd = "\"" + cmd + "\"";
     std::FILE* pf = _popen(cmd.c_str(), "r");
 #else
     cmd += include_stderr ? " 2>&1" : " 2>/dev/null";
