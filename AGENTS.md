@@ -10,7 +10,6 @@ Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts
 - **Platform code:** engine code never names an OS or a compiler. No `_WIN32`, `_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS calls (mmap, pread, pthread, fork/exec, dlopen, /proc, /sys) outside `src/platform/` and `include/basalt/platform/`. A missing seam is added there with a Linux and a Windows body; the Linux body is the code you would have written anyway. `tools/check_platform_boundary.sh` enforces it.
 - **Code comments:** brief and stateless. Say what the code does and why. No hardware names, measured numbers, dates or history in comments.
 - **Don't push or publish anywhere** (GitHub, HF, any remote) without the maintainer's approval.
-- **Never expose a server beyond 127.0.0.1 without `--api-key`.**
 - **Don't write tools nobody asked for.**
 - **Linux and Windows are both supported; Linux is where we test, and CI compiles and CPU-tests Windows.** Changes must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`); see `CONTRIBUTING.md` and `docs/platforms.md`.
 - **Headline benchmark numbers come from the maintainer's own runs.** Agent benches are development A/Bs only. Label every number with its GPU power limit.
