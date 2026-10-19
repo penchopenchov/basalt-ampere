@@ -10,9 +10,7 @@
 #include <string>
 #include <thread>
 #if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "basalt/platform/win.hpp"
 #include <malloc.h>   // _aligned_malloc, _aligned_free
 #else
 #include <fcntl.h>

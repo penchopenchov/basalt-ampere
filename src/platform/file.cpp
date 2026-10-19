@@ -8,9 +8,7 @@
 #include <string>
 
 #if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "basalt/platform/win.hpp"
 #include <direct.h>   // _wchdir, _wfullpath
 #include <fcntl.h>    // _O_RDONLY, _O_BINARY
 #include <io.h>       // _wopen, _waccess, _close, _fileno, _get_osfhandle
