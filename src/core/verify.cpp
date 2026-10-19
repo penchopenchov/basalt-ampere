@@ -6,6 +6,7 @@
 
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -143,7 +144,7 @@ using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 // layer `c.layer`'s router rows [e0, e1) on the job's tokens
-__attribute__((target("avx2,fma,f16c"))) void warm_logits(CpuWarm& c, int e0, int e1, const std::atomic<bool>& stop) {
+BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const std::atomic<bool>& stop) {
     const int NB = c.n_embd / 32, pt = c.n_tok;
     const int8_t* R = c.rq.data() + (size_t) c.layer * c.n_expert * c.n_embd;
     const float* S = c.rs.data() + (size_t) c.layer * c.n_expert * NB;

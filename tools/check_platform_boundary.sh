@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 allow=tools/platform_boundary.allow
-pattern='_WIN32|_MSC_VER|__linux__|__unix__|windows\.h|sys/mman\.h|unistd\.h|sys/stat\.h|\bmmap\(|\bmunmap\(|madvise|posix_fadvise|sched_setaffinity|pthread_|VirtualAlloc|CreateFileW?\b|__builtin_(ctz|ia32|cpu_supports)|\bdlopen\(|\bwaitpid\(|"/proc/|"/sys/'
+pattern='_WIN32|_MSC_VER|__linux__|__unix__|windows\.h|sys/mman\.h|unistd\.h|sys/stat\.h|\bmmap\(|\bmunmap\(|madvise|posix_fadvise|sched_setaffinity|pthread_|VirtualAlloc|CreateFileW?\b|__builtin_(ctz|ia32|cpu_supports)|__attribute__\(\(target|\bdlopen\(|\bwaitpid\(|"/proc/|"/sys/'
 
 declare -A allowed
 while read -r count path; do
