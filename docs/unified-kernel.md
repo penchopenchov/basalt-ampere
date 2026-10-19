@@ -1,130 +1,54 @@
-# Unified kernel (parked)
+# Unified kernel
 
-This branch holds the unified kernel: one persistent CUDA kernel per decoder layer in place of the per-step kernel sequence. It is parked, not merged. On the same box and session it decodes slower than main, so main keeps the separate kernels. The design is kept here for a later attempt.
+Two pieces of the unified-kernel work are in the engine; the full-layer kernel it started from was retired.
 
-## What it is
+## What runs
 
-Decode runs a window of T tokens per verify pass (T = 1 to 4 are covered). For each layer the engine normally launches a sequence of kernels: hc1, the attention projections, the recurrence, the output projection, hc2 + router + top-10, expert plan and gate/up, SwiGLU, down, the shared expert, the peer and CPU wait, and the combine. The unified kernel runs the same steps inside one launch, with cross-CTA hand-offs by release/acquire counters instead of kernel boundaries.
-
-| Piece | Source | What it replaces |
+| Piece | Source | What it does |
 |---|---|---|
-| Attention chain | `attn_chain.cu`, `attn_chain_kernel.cuh`, `attn_chain_bound.cuh` | hc1, qkv+z pair, recurrence, output projection, hc2 + router + top-10 of a GDN layer |
-| Experts half | `fused_moe.cuh` | expert plan, gate/up + SwiGLU, down, shared expert, peer and CPU wait, combine; it also publishes the tier ring and waits for the tiers itself |
-| Fused GDN layer | `fused_layer.cu`, `fused_chain.cuh`, `fused_bound.cuh` | the whole GDN layer: `k_layer<T>` runs the chain, then the experts half, in one launch |
-| QSA attention half | `qsa_full.cu`, `qsa_full_*.cuh` | projections, K/Q post, indexer scores, top-k, attention, gate and output projection of a QSA layer, as one persistent kernel |
+| Mid chain (`k_mid`) | `mid_chain.cu`, `attn_chain_kernel.cuh`, `attn_chain_bound.cuh` | A GDN layer's middle in one persistent launch: the qkv + z projection pair, the recurrence and the output projection. It runs between the layer's two hyper-connection reads, which stay `hc_fused_read`. |
+| Commit finisher | `verify_kernels.cu` | The GDN commit claims its items from a counter on its own stream; the next window starts with a finisher that takes what is left. |
 
-Arithmetic and reduction order are the same as the kernels they replace, so outputs are bitwise identical to the separate-kernel path (see `docs/precision.md`). Windows with T >= 5, QSA layers (both halves) and layers whose gate/up format is not covered keep the separate kernels. The QSA attention half (`qsa_full`) is kept in the tree and its parity test still runs, but the engine does not launch it: it was slower than the separate kernels.
-
-Build structure:
-
-- `attn_chain.cu` and `qsa_full.cu` are translation units built without fast math, like the stage code they include.
-- `fused_layer_t2.cu` .. `fused_layer_t4.cu` and `fused_layer.cu` are one translation unit per window width, so changing one width rebuilds one unit. The host side stays in `attn_chain.cu` and is reached through `chain_shared.hpp`.
-- `BASALT_PROFILE` (CMake option, off by default) compiles in-kernel phase stamps (`stamp_ring.*`, `BASALT_STAMP_FILE` at run time). Without it the stamps compile to nothing.
+- The mid chain runs for windows of one to four rows, on every pack whose GDN projection triple (qkv, z, out) `mid_chain_supported` accepts. Types accepted for each of the three: Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_XS. `(14, 14, 14)` and `(23, 21, 12)` have specialised instances; any other combination of those types uses the generic one. A pack with Q8_0 or another type in a GDN projection keeps the three separate kernels.
+- QSA layers, windows of five or more rows, batched windows and profiled runs keep the separate kernels.
+- Arithmetic and reduction order are those of the kernels it replaces: bitwise identical output and state, no numerics change.
+- The kernel needs every CTA resident, so it is a programmatic dependent of the first read and the second read is its dependent. The attention-chain header keeps the phase code (pair, recurrence, output) and the bounded waits (`attn_chain_bound.cuh` traps instead of hanging).
+- `dense_tc.cu`, `dec_gdn_rec.cu` and `hc_fused.cu` carry `FZ_DEV_ONLY` guards so `mid_chain.cu` includes their device code without their host side. The translation unit is built without fast math.
 
 ## Tests
 
-- `attn_chain_parity`: the attention chain against the kernels it replaces, bit for bit, plus window-width independence of a token's output.
-- `qsa_full_parity`: the QSA half against the kernel sequence, bitwise, and the attention against a double-precision CPU reference.
-- `fused_moe_parity`: the experts half against the launch sequence it replaces, bitwise, T = 1..4, every IQ3_S shared-expert format triple.
+- `mid_chain_parity`: the kernel against `dense_tc_pair`, `dec_gdn_rec` and `dense_tc` in sequence, bitwise, every type triple, windows of one to four rows; it prints the phase ledger and has a microbench.
+- `dec_commit_parity` and `dec_commit_finisher` (`--finisher`): the finisher run before, during and after the commit, with a microbench.
 
-Greedy output is identical to main end to end (conversation, structured and prose prompts of 400 tokens, and 16k to 36k token prompts).
+## What was retired
 
-## Results
+The branch first fused a whole layer into one kernel: the attention chain, the experts half (plan, gate/up, SwiGLU, down, shared expert, tier wait, combine) and a QSA attention half. Outputs were bitwise identical to the separate kernels, but it decoded slower than the separate kernels, so only the GDN middle and the finisher stayed.
 
-Setup for every number: IQ3_S pack, `--peer-exclusive`, prose fixture, speculation 7, RTX 5090 at 400 W. Numbers are from agent development A/Bs, not headline runs.
+Same session, IQ3_S pack, `--peer-exclusive`, prose fixture, speculation 7, GPU at 400 W (agent development A/Bs):
 
-Best verified unified build against main, same session, interleaved:
-
-| build | window | tokens/s | passes/s |
-|---|---|---|---|
-| main | 6.675 ms | 324.6 | 149.8 |
-| unified kernel (this branch) | 7.541 ms | 288.2 | 132.6 |
-
-That is +13.0% per window and -11.2% tokens/s against main. An earlier unified build, first measured against main in the same way, was 278 against 319 tokens/s.
-
-Where it wins and loses, per step, at T = 3 (stamp basis, microseconds per layer, scaled to the plain-run basis):
-
-| step | main | unified | difference |
-|---|---|---|---|
-| GDN recurrence | 8.5 | 2.7 | -5.8 (hidden under the projection pair) |
-| GDN output projection | 8.6 | 6.7 | -1.9 |
-| GDN SwiGLU, down, tier wait, shared expert, combine | 23.9 | 13.3 | -10.6 |
-| GDN hc1 | 10.4 | 12.0 | +1.6 |
-| GDN qkv+z pair | 18.6 | 24.0 | +5.4 |
-| GDN plan + gate/up (to the end of gate/up) | 20.7 | 42.1 | +21.4 |
-| GDN layer total | 103.6 | 114.9 | +11.3 |
-| QSA projections | 17.8 | 31.2 | +13.4 |
-| QSA output projection | 5.9 | 16.8 | +11.0 |
-| QSA hc2 + router + top-10 | 12.6 | 18.5 | +5.9 |
-| QSA layer total | 109.1 | 144.3 | +35.2 |
-
-The GDN attention half is at parity with main in the engine. The loss is in the experts half (about 11 us per GDN layer) and the QSA attention half (about 35 us per QSA layer). Per window that is roughly +0.4 ms from the GDN experts half and +0.4 ms from the QSA half. Head, draft, commit and host time are unchanged.
-
-The best build sits at about 54% of the window's byte floor against 61% for main.
-
-## Fix attempts on the top losses
-
-A second pass on the three largest losses against main (expert gate/up, the projections, the output projection, first hc). Each idea was measured with in-kernel stamps in the engine (PROFILE build, conversation fixture, ABAB in one session), then the survivors in a plain-build A/B (4 fresh processes per arm, ABBA, IQ3_S, `--peer-exclusive`, RTX 5090 at 400 W). Development A/Bs, not headline runs.
-
-| idea | engine stamps (us per layer) | plain A/B | kept |
-|---|---|---|---|
-| all of a CTA's gate/up rows into L2 at the release (no pacing) | gate/up +3, down -1.2 | - | no |
-| line prefetches instead of bulk L2 prefetches for gate/up | 0 | - | no |
-| no gate/up or down-slice L2 prefetch in the experts half | gate/up -3.2, down +0.8 | with the next row: conv -0.65% per window, verify T2 -0.3%, T3 +0.3% (noise) | no |
-| projection pair tiles into L2 at kernel entry (evict-first) | pair -6.2 (to its byte floor), hc1 +3, combine +0.6 | see above | no |
-| QSA projection and output weights into L2 at kernel entry | projections +2 to +3.4, output projection -2.5 | - | no |
-| QSA layers back on the separate kernels | - | conv -6.0%, prose -5.0%, structured -7.4% per window against the unified build (measured with the two prefetch rows above, which are neutral) | yes |
-
-- Stamps over-predicted again: the prefetch pair summed to about -4.7 us per GDN layer (-1.7% per window); the plain A/B shows no change.
-- Two CTAs per SM do not fit: the attention half also uses the whole 99 KB arena, and 512 threads at 128 registers fill the register file.
-- Balancing gate/up items across CTAs: the CTAs with one item more finish about 6 us later at T = 3, which bounds the gain at about 1% per window. Not built.
-- The fused layer kernel is about 1.5 MB of SASS and the QSA kernel about 0.55 MB. With cold caches, 18% of the experts half's warp stalls are instruction fetch.
-
-With QSA on the separate kernels the branch is still about 6% slower than main per conversation window and 8% per prose window; structured windows (mostly T >= 5) are level. Windows T = 1 to 4, where the fused GDN layer runs, cost 10 to 12% more than main; T = 5 to 7, which run no fused kernel, cost about 1% more (no tag protocol).
-
-## Instruction cache in the experts half
-
-The fused layer kernel was about 1.5 MB of SASS: for `k_layer<3>`, 1.08 MB in the experts half and 0.36 MB in the attention half. Stall reasons were sampled in the engine with CUPTI's continuous PC sampling, which does not serialize kernels; Nsight Compute's kernel replay deadlocks on the tier ring. The sampler slows decode several times over, so its shares are qualitative.
-
-- In the gate/up phase, 20% of warp samples were instruction-fetch stalls (`no_instructions`). In the shared expert's K-quant gate/up code the share was 72 to 81%. That code was inlined four times per format: the gate and up call sites, each with two fully unrolled rows, about 490 KB in all. Each CTA runs it once or twice per layer, so every layer fetches it cold.
-- The routed experts' gate/up code runs many times per layer and stays warm (about 10% `no_instructions`). It waits on its weight loads: 50 to 55% of its samples are long scoreboard.
-
-The fix: the shared gate and up rows go through one call site, the two rows of a pair go through one copy of the row code, and the experts half is compiled per window width (`moe_body<true, T>`), so the shared expert's per-token loops run T iterations. `k_layer<3>` drops to 1.13 MB, with registers and stack unchanged. Outputs stay bitwise: `fused_moe_parity` now runs the per-width instance, and greedy output matches main.
-
-Measured with the RTX 5090 at 400 W, IQ3_S, `--peer-exclusive --relaxed-drafting 0.3`. These are development A/Bs, not headline runs.
-
-| measure | before | after |
+| build | window (ms) | tokens/s |
 |---|---|---|
-| shared share of gate/up PC samples / its `no_instructions` | 17% / 72% | 8% / 42% |
-| `no_instructions` in all gate/up samples | 20% | 12% |
-| CTA 0's first shared gate/up pair, us (T = 1 / 2 / 3 / 4) | 16.4 / 20.2 / 20.1 / 16.3 | 3.7 / 5.6 / 7.9 / 9.9 |
-| CTA 0's gate/up end after the release, us (T = 1 / 2 / 3 / 4) | 23.7 / 31.0 / 36.3 / 41.8 | 21.9 / 29.2 / 35.5 / 41.3 |
-| ms per window at main's window mix, conv / prose / struct (6 processes per arm, ABBA) | 7.657 / 7.453 / 10.698 | 7.553 / 7.379 / 10.685 |
-| same, against main | +6.3% / +8.9% / +0.6% | +4.9% / +7.8% / +0.4% |
+| separate kernels | 6.675 | 324.6 |
+| full-layer kernel | 7.541 | 288.2 |
 
-The first shared pair speeds up by 10 to 13 us, but the gate/up phase ends only 0.5 to 2 us earlier per layer. The shared pair overlapped the routed pairs' weight loads, and those loads set the phase's end. The gain per window is about 1%. Compiling the routed rows' entry batching per width as well, which cut `k_layer<3>` to 0.97 MB, added nothing. Folding all the routed batch sizes into one instance with a run-time count made the gate/up loop spill (stack 136 to 200 B) and lost.
+Per GDN layer at T = 3 the attention half was level with the separate kernels; the experts half lost about 11 us (plan + gate/up +21 us, the rest of the half -11 us). The QSA half lost about 35 us per layer (projections +13, output projection +11, hc2 + router +6). Per window that is about +0.4 ms from each.
 
-## Why it is parked
+Why it lost:
 
-- The standalone harness predicted gains the engine did not show. Auditing twelve claims, the harness-to-engine ratio was typically 0.1 to 0.3. Causes: the harness starts every CTA with the top-10 experts already known, while in the engine they arrive about 7 us after the attention output; the shared expert finishes last in the engine; window arithmetic that ignored the window-width mix (T = 5 to 7 and T = 1 gain nothing); and measurement errors (wrong lock, builds running, per-launch memsets in a hot loop).
-- The experts half is bound by cross-CTA dependency latency (gate/up round 2, then the h rows published, then down), not by DRAM bandwidth. At T = 3 it spends about 57.6 us against a roughly 30 us byte floor.
-- The QSA half serializes projections that main overlaps with side kernels, adds grid barriers, and runs the output projection after the last barrier on fewer CTAs than main's overlapped launch.
-- Every remaining down-phase lever measured at 1% or less per window. The gap to main (13%) is larger than all of them together. Closing it needs a design decision, not more tuning of this layout.
+- The experts half is bound by cross-CTA dependency latency (gate/up round 2, then the h rows, then down), not by DRAM: about 58 us at T = 3 against a byte floor of about 30 us.
+- The QSA half serialises projections that the separate kernels overlap with side kernels and adds grid barriers.
+- Two CTAs per SM do not fit (99 KB arena, 512 threads at 128 registers).
+- The layer kernel was about 1.5 MB of SASS; gate/up warps stalled on instruction fetch (20% of PC samples). Compiling per window width cut it to 1.13 MB and about 1% per window, with no change in the gate/up phase's end.
+- Windows of one and five to seven rows gained nothing, and the fused layer needed the tag protocol off, which cost about 1% on windows of five to seven rows.
+- The standalone harness predicted gains the engine did not show (ratio 0.1 to 0.3): it started every CTA with the experts known, while in the engine they arrive about 7 us after the attention output.
+
+Persistent QSA attention and the in-kernel phase stamps (`BASALT_PROFILE`) went with it.
 
 ## Lessons
 
-- Check register spills on the real engine binary (`cuobjdump --dump-resource-usage`), one change at a time. `nvcc --split-compile` on the kernel units made the layer kernel spill about four times more (stack 576 B against 136 B) and cost about 9% tokens/s; the extra spills were first blamed on the arch target and instance count. Never use it on these units. Per-window-width translation units give fast rebuilds with identical SASS.
-- A kernel that does not fit its dynamic shared memory silently falls back; confirm the fused path actually runs before timing it.
-- Time with the timing lock, with no builds running, and no per-launch memsets in hot loops. Compare stamp numbers only within one session, ABAB. The same binary read 3.6 us per layer apart across two sessions, so single-microsecond effects do not resolve in the engine A/B.
-- Convert per-layer gains to window gains with the window-width mix (about 0.73 x 36 per layer-microsecond), not x36.
+- Check register spills on the real engine binary (`cuobjdump --dump-resource-usage`). `nvcc --split-compile` on these units made the layer kernel spill about four times more and cost about 9% tokens/s. Never use it here.
+- A kernel that does not fit its dynamic shared memory silently falls back; confirm the fused path runs before timing it.
+- Time with the GPU lock held, no builds running and no per-launch memsets in hot loops; compare stamp numbers only inside one session, ABAB.
+- Convert per-layer gains to window gains with the window-width mix (about 0.73 x 36 per layer-microsecond).
 - A harness must reproduce the engine's start state (late ids, tier wait, shared-expert tail) before its deltas predict anything.
-- Profile in-engine stall reasons with CUPTI continuous PC sampling and map the PCs to source through `nvdisasm -gi` on a `-lineinfo` build, which leaves the SASS unchanged. Code that runs once per layer per SM is fetched cold every layer, so keep it to one small copy.
-- Holding the down weights in registers before the h wait cost 80 B of stack on a 128-register kernel and lost 1.6%; prefetching them to L1 instead added issue work and also lost.
-
-## Ideas not tried
-
-- Down without the shared-memory h copy: read the late groups' h straight from L2 (tagged layout). Estimate 1 to 2 us per layer on the late groups.
-- Give the round-2 gate/up items to CTAs with fewer down rows.
-- Routed gate/up is bound by load latency. Each warp claims one unit (two rows), waits for it, then claims the next, and the L2 prefetches queue ahead of the demand loads. Staging the units through a TMA ring in shared memory (as main's bulk path does) or issuing the next unit's loads before decoding the current one would overlap them. A loader-side prefetch alone did not help (see the fix attempts above).
-- Per-triple `k_layer` instances (the engine builds the generic one only), and chain-local half-packed fragments to cut spills in the projection pair.
-- A layer-boundary kernel running several layers per launch (spills made it slower in the harness).
+- Profile stall reasons with CUPTI continuous PC sampling, mapped to source through `nvdisasm -gi` on a `-lineinfo` build.
