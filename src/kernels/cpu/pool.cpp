@@ -397,6 +397,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
 ExpertPool::~ExpertPool() {
     const ExpertPool* self = this;
     g_diag_pool.compare_exchange_strong(self, nullptr);
+    idle_stop();
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();
@@ -542,7 +543,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
-        if (mode_ == 0) {
+        if (mode_ == 7) {
+            idle_fn_(idle_ctx_, (int) i, n_, idle_halt_);
+        } else if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
         } else if (mode_ == 1) {
@@ -614,7 +617,41 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
+void ExpertPool::idle_start(IdleFn fn, void* ctx) {
+    if (n_ == 1 || fn == nullptr) return;
+    idle_stop();
+    wait_parked("before idle work");
+    idle_fn_ = fn;
+    idle_ctx_ = ctx;
+    idle_halt_.store(false, std::memory_order_relaxed);
+    mode_ = 7;
+    njobs_ = n_;
+    begin_batch(n_);   // the host does not drain it
+    idle_live_ = true;
+}
+
+void ExpertPool::idle_stop() {
+    if (!idle_live_) return;
+    idle_halt_.store(true, std::memory_order_release);
+    // no job of the idle batch can be claimed from here on (a late sleeper's claim fails), and the claimed ones end
+    // before the next batch resets `done`
+    uint64_t h = head_.load(std::memory_order_acquire);
+    uint32_t claimed = 0;
+    for (;;) {
+        const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
+        claimed = i < n ? i : n;
+        if (i >= n || head_.compare_exchange_weak(h, (h & ~(uint64_t) 0xffffu) | n, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire))
+            break;
+    }
+    wait_done((int) claimed);
+    wait_parked("after idle work");
+    idle_live_ = false;
+    mode_ = 0;
+}
+
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    idle_stop();
     wait_parked("before a phase");
     mode_ = mode;
     njobs_ = n_tasks;
@@ -723,6 +760,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     //
     // THE THREE PHASES ARE TIMED SEPARATELY.  They were one number, which cannot distinguish a pool that is
     // slow at the WORK from one that is slow at the SYNCHRONISATION - and those need opposite fixes.
+    idle_stop();
     const auto t_a = std::chrono::steady_clock::now();
     wait_parked("before a batch");
     const auto t_b = std::chrono::steady_clock::now();

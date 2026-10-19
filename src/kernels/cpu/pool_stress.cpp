@@ -4,8 +4,10 @@
 // of a request, and the next tiny batch (one or two experts) is often finished by the host and the awake workers
 // before a sleeper has even woken.  That late wake-up is what the park/claim protocol has to survive.  This drives
 // hundreds of thousands of such batches - 0-4 jobs, run() and run_split(), with pauses long enough for the workers
-// to sleep - and checks that every batch returns, with every job's output written.  A watchdog thread turns a
-// hang into a failure instead of a frozen test.
+// to sleep - and checks that every batch returns, with every job's output written and equal to a first run's.  Idle
+// work (idle_start) runs between half of the batches, with a barrier across the workers like the warm-up's, and must
+// never be running once a batch or idle_stop has returned.  A watchdog thread turns a hang into a failure instead of a
+// frozen test.
 //
 //   pool_stress [seconds]        (default 20)
 #include "basalt/kernels/cpu/pool.hpp"
@@ -45,6 +47,25 @@ int main(int argc, char** argv) {
 
     cpu::ExpertPool pool;
     std::printf("pool_stress: %d workers + host, %.0f s\n", pool.workers(), seconds);
+    pool.run(jobs.data(), NJ);
+    const std::vector<float> ref = out;
+
+    // the idle work: every worker index arrives at a barrier, then spins until stopped
+    struct Idle {
+        std::atomic<int> active{0}, arrive{0};
+        std::atomic<long long> runs{0};
+    } idle;
+    auto idle_fn = [](void* ctx, int w, int W, const std::atomic<bool>& stop) {
+        Idle& d = *(Idle*) ctx;
+        (void) w;
+        d.active.fetch_add(1);
+        d.runs.fetch_add(1);
+        d.arrive.fetch_add(1);
+        while (d.arrive.load() < W && !stop.load()) {}
+        while (!stop.load()) {}
+        d.active.fetch_sub(1);
+    };
+    long long overlaps = 0, wrong = 0;
 
     // the watchdog: a batch that does not return within 10 s is a hang
     std::atomic<long long> beat{0};
@@ -77,20 +98,35 @@ int main(int argc, char** argv) {
         } else if (rng() % 4 == 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(rng() % 300));
         }
+        if (rng() % 2) {
+            idle.arrive.store(0);
+            pool.idle_start(idle_fn, &idle);
+            if (rng() % 3 == 0) std::this_thread::sleep_for(std::chrono::microseconds(rng() % 200));
+            if (rng() % 4 == 0) {
+                pool.idle_stop();
+                if (idle.active.load() != 0) ++overlaps;
+            }
+        }
         const int n = (int) (rng() % (NJ + 1));
         for (int e = 0; e < n; ++e) std::fill(jobs[(size_t) e].out, jobs[(size_t) e].out + cpu::H, SENTINEL);
         if (rng() % 2) pool.run(jobs.data(), n);
         else pool.run_split(jobs.data(), n);
-        for (int e = 0; e < n; ++e)
+        if (n > 0 && idle.active.load() != 0) ++overlaps;
+        for (int e = 0; e < n; ++e) {
             if (jobs[(size_t) e].out[0] == SENTINEL || jobs[(size_t) e].out[cpu::H - 1] == SENTINEL) ++missed;
+            else if (std::memcmp(jobs[(size_t) e].out, ref.data() + (size_t) e * cpu::H, cpu::H * sizeof(float)) != 0) ++wrong;
+        }
         beat.fetch_add(1);
         ++batches;
     }
+    pool.idle_stop();
+    if (idle.active.load() != 0) ++overlaps;
     finished.store(true);
     dog.join();
-    std::printf("pool_stress: %lld batches (%lld after the workers slept), %lld jobs not run\n", batches, sleeps,
-                missed);
-    if (missed) {
+    std::printf("pool_stress: %lld batches (%lld after the workers slept), %lld jobs not run, %lld outputs not equal "
+                "to the first run's, %lld idle jobs run, %lld still running after a batch or a stop\n",
+                batches, sleeps, missed, wrong, idle.runs.load(), overlaps);
+    if (missed || wrong || overlaps) {
         std::printf("pool_stress: FAILED\n");
         return 1;
     }

@@ -160,6 +160,13 @@ public:
     /// the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
+    /// Work for the parked workers between batches (not the host thread): `fn(ctx, worker, workers, stop)` runs once
+    /// per worker index and must return soon after `stop` reads true.  Returns at once.  The next batch, `idle_stop`
+    /// or the destructor raises `stop` and waits for the workers to park, so the work never overlaps a batch; it must
+    /// not write anything a batch reads.
+    using IdleFn = void (*)(void* ctx, int worker, int workers, const std::atomic<bool>& stop);
+    void idle_start(IdleFn fn, void* ctx);
+    void idle_stop();
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -244,6 +251,11 @@ private:
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
+    // idle work (mode 7): one job per worker index
+    IdleFn idle_fn_ = nullptr;
+    void* idle_ctx_ = nullptr;
+    bool idle_live_ = false;
+    alignas(64) std::atomic<bool> idle_halt_{false};
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
     int parts_a_ = 1, parts_b_ = 1;
