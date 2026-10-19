@@ -49,18 +49,6 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     return x32;
 }
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
-// Expert weight loads: each byte is read once per window, so the lines are allocated evict-first in L2 (and L1) and
-// leave the resident data (code, activations) alone.  The same values as the plain loads.
-__device__ __forceinline__ int wget_b2(const void* x, const int& i32) {
-    const unsigned short* x16 = (const unsigned short*) x;
-    int x32 = (int) __ldcs(x16 + 2 * i32 + 0);
-    x32 |= (int) __ldcs(x16 + 2 * i32 + 1) << 16;
-    return x32;
-}
-__device__ __forceinline__ int wget_b4(const void* x, const int& i32) { return __ldcs((const int*) x + i32); }
-__device__ __forceinline__ int wld_u16(const void* p) { return (int) __ldcs((const unsigned short*) p); }
-__device__ __forceinline__ int wld8(const void* p) { return (int) __ldcs((const unsigned char*) p); }
-__device__ __forceinline__ float wld_h2f(const void* p) { return __half2float(__ushort_as_half(__ldcs((const unsigned short*) p))); }
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
@@ -807,10 +795,10 @@ template<> struct Split<21> {   // IQ3_S
     template<bool STAGE_GRID = false>
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
         const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
-        const int2 qs_packed = make_int2(wget_b2(bq3->qs, iqs + 0), wget_b2(bq3->qs, iqs + 1));
+        const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
         const uint8_t* qs = (const uint8_t*) &qs_packed;
-        const int qh = wld8(bq3->qh + iqs / 2);
-        const int signs_packed_32 = wget_b2(bq3->signs, iqs / 2);
+        const int qh = bq3->qh[iqs / 2];
+        const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
         const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
         W r;
 #pragma unroll
@@ -822,8 +810,8 @@ template<> struct Split<21> {   // IQ3_S
             r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
             r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
         }
-        r.ls = 1 + 2 * ((wld8(bq3->scales + iqs / 4) >> ((iqs << 1) & 0x04)) & 0x0F);
-        r.dw = wld_h2f(&bq3->d);
+        r.ls = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+        r.dw = __half2float(bq3->d);
         return r;
     }
     __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
@@ -890,8 +878,8 @@ template<> struct Split<20> {   // IQ4_NL
         const block_iq4_nl* bq4 = (const block_iq4_nl*) vbq + kbx;
         W r;
 #pragma unroll
-        for (int l = 0; l < 2; ++l) r.v[l] = get_int_from_table_16(wget_b2(bq4->qs, iqs + l), kvalues_iq4nl);
-        r.dw = wld_h2f(&bq4->d);
+        for (int l = 0; l < 2; ++l) r.v[l] = get_int_from_table_16(get_int_b2(bq4->qs, iqs + l), kvalues_iq4nl);
+        r.dw = __half2float(bq4->d);
         return r;
     }
     __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
@@ -914,9 +902,9 @@ template<> struct Split<23> {   // IQ4_XS
         const block_iq4_xs* bq4 = (const block_iq4_xs*) vbq + kbx;
         W r;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) r.v[j] = get_int_from_table_16(wget_b4(bq4->qs, iqs + j), kvalues_iq4nl);
-        r.ls = ((wld8(bq4->scales_l + iqs / 8) >> (iqs & 0x04)) & 0x0F) | (((wld_u16(&bq4->scales_h) >> (iqs / 2)) & 0x03) << 4);
-        r.dw = wld_h2f(&bq4->d);
+        for (int j = 0; j < 4; ++j) r.v[j] = get_int_from_table_16(get_int_b4(bq4->qs, iqs + j), kvalues_iq4nl);
+        r.ls = ((bq4->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs / 2)) & 0x03) << 4);
+        r.dw = __half2float(bq4->d);
         return r;
     }
     __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
