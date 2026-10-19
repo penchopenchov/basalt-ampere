@@ -166,7 +166,8 @@ target_link_libraries(basalt-plan PRIVATE plan)
 add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp
   src/platform/mapped_file.cpp src/platform/cpu.cpp src/platform/system.cpp src/platform/dynlib.cpp)
 target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(platform PUBLIC warnings)
+# dlopen (DynLib) lives in libdl before glibc 2.34
+target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
