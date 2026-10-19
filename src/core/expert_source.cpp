@@ -8,6 +8,7 @@
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/s2_expert_grouped.hpp"
@@ -223,21 +224,21 @@ bool read_cgroup_v1_memory_stat(const std::filesystem::path& path, uint64_t usag
 
 namespace detail {
 
-bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
-                           const std::string& cgroup_root) {
+bool host_available_memory(HostMemory& m, const std::string& meminfo_arg, const std::string& self_cgroup_arg,
+                           const std::string& cgroup_root_arg) {
     m = HostMemory{};
-#if defined(_WIN32)
-    // No /proc/meminfo and no cgroup hierarchy here: the OS reading is the whole answer, and there is no container
-    // limit tighter than it.
-    (void) meminfo;
-    (void) self_cgroup;
-    (void) cgroup_root;
-    const uint64_t avail = basalt::platform::available_memory();
-    if (avail == 0) return false;
-    m.available = avail;
-    m.cgroup_limit = ~0ull;
-    return true;
-#else
+    const std::string meminfo = meminfo_arg.empty() ? basalt::platform::meminfo_path() : meminfo_arg;
+    const std::string self_cgroup = self_cgroup_arg.empty() ? basalt::platform::self_cgroup_path() : self_cgroup_arg;
+    const std::string cgroup_root = cgroup_root_arg.empty() ? basalt::platform::cgroup_root() : cgroup_root_arg;
+    if (meminfo.empty()) {
+        // No memory accounting files and no cgroup hierarchy here: the OS reading is the whole answer, and there is
+        // no container limit tighter than it.
+        const uint64_t avail = basalt::platform::available_memory();
+        if (avail == 0) return false;
+        m.available = avail;
+        m.cgroup_limit = ~0ull;
+        return true;
+    }
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
     std::ifstream info(meminfo);
     std::string line;
@@ -323,7 +324,6 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     }
     m.available = bytes;
     return true;
-#endif
 }
 
 }  // namespace detail

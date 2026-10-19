@@ -74,15 +74,15 @@ struct HostMemory {
     uint64_t cgroup_limit = ~uint64_t{0};
 };
 
-/// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
-/// defaults are the real files).  A v1 memory controller line wins over the unified line (the hybrid layout): v1 reads
+/// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; an
+/// empty one is the system's own file, see platform::meminfo_path - and on a system with none, the OS's available-RAM
+/// reading is the whole answer and no container limit is tighter than it).  A v1 memory controller line wins over the unified line (the hybrid layout): v1 reads
 /// `<root>/memory/<path>` (memory.limit_in_bytes - memory.usage_in_bytes, clean inactive file cache counted as free),
 /// v2 reads `<root>/<path>` (memory.max, memory.current, memory.stat).  A group not visible here is read at the mount's
 /// root (a container's own namespace); groups without a readable limit add none; no cgroup file or line is MemAvailable
 /// alone.  False when MemAvailable is missing or a visible v2 limit or its memory.stat is malformed.
-bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",
-                           const std::string& self_cgroup = "/proc/self/cgroup",
-                           const std::string& cgroup_root = "/sys/fs/cgroup");
+bool host_available_memory(HostMemory& m, const std::string& meminfo = "", const std::string& self_cgroup = "",
+                           const std::string& cgroup_root = "");
 
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.

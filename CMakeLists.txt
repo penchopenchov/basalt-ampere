@@ -164,7 +164,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 # Host-only: no CUDA runtime, which is why the header-only `artifact` target, the vision library, the bench and the
 # standalone test programs can all link it.
 add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp
-  src/platform/mapped_file.cpp src/platform/cpu.cpp)
+  src/platform/mapped_file.cpp src/platform/cpu.cpp src/platform/system.cpp src/platform/dynlib.cpp)
 target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(platform PUBLIC warnings)
 
@@ -744,7 +744,7 @@ set_tests_properties(mapped_file_test PROPERTIES TIMEOUT 60)
 
 # the platform seams below the engine: thread placement and topology, the compiler helpers, large host regions, the
 # piped child, the system questions and the dynamic loader (CPU only, both platforms).
-foreach(_t cpu_test compiler_test region_test)
+foreach(_t cpu_test compiler_test region_test system_test)
   add_executable(platform_${_t} tests/platform/${_t}.cpp)
   target_link_libraries(platform_${_t} PRIVATE platform Threads::Threads)
   target_include_directories(platform_${_t} PRIVATE include)

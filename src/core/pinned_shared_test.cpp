@@ -1,21 +1,19 @@
 // Selftest for the optional MAP_SHARED backing of PinnedArena.
 #include "basalt/core/pinned.hpp"
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/system.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 int main() {
-    char path[] = "/tmp/basalt-shared-arena-XXXXXX";
-    const int fd = mkstemp(path);
-    if (fd < 0) {
-        std::perror("mkstemp");
-        return 2;
-    }
-    close(fd);
+    // the arena file is made by the arena itself: a path that does not exist yet is the fresh case
+    const std::string path_str = basalt::platform::temp_dir() + "/basalt-shared-arena-" +
+                                 std::to_string(basalt::platform::process_id());
+    const char* path = path_str.c_str();
+    std::remove(path);
 
     int fail = 0;
     const uint64_t bytes = 64u << 10;
@@ -52,8 +50,8 @@ int main() {
         }
     }
 
-    if (unlink(path) != 0) {
-        std::perror("unlink");
+    if (std::remove(path) != 0) {
+        std::perror("remove");
         fail = 1;
     }
     std::printf("pinned_shared_test: %s\n", fail ? "FAILED" : "OK");

@@ -1,6 +1,8 @@
 // src/kernels/cpu/cpu_quota.cpp - the CPU quota of the process's cgroup.  See cpu_quota.hpp.
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 
+#include "basalt/platform/system.hpp"
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -36,7 +38,10 @@ double tightest(const fs::path& top, const fs::path& start, Read read) {
 
 }  // namespace
 
-double cgroup_cpu_quota(const std::string& self_cgroup, const std::string& cgroup_root) {
+double cgroup_cpu_quota(const std::string& self_cgroup_arg, const std::string& cgroup_root_arg) {
+    const std::string self_cgroup = self_cgroup_arg.empty() ? platform::self_cgroup_path() : self_cgroup_arg;
+    const std::string cgroup_root = cgroup_root_arg.empty() ? platform::cgroup_root() : cgroup_root_arg;
+    if (self_cgroup.empty() || cgroup_root.empty()) return 0.0;
     const fs::path root(cgroup_root);
     std::string v2_path, v1_path;
     bool v2 = false;

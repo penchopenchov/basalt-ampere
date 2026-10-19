@@ -123,7 +123,7 @@ struct PleIoOptions {
     double keepalive_window_s = 60;
 };
 
-/// The PLE table.  Held by pointer-to-impl so this header does not drag `<windows.h>` into every
+/// The PLE table.  Held by pointer-to-impl so this header does not drag the file reader and the I/O ring into every
 /// translation unit that wants the hash.
 class PleTable {
 public:

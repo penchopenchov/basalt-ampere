@@ -23,6 +23,7 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/process.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -72,20 +73,6 @@
 #include "basalt/vision/encoder_cuda.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "basalt/vision/preprocess.hpp"
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <intrin.h>   // _mm_pause
-#include <io.h>       // _fileno, _setmode
-#include <fcntl.h>    // _O_BINARY
-#else
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
-#endif
 #include <cerrno>
 #include <cstddef>   // std::ptrdiff_t
 
@@ -97,11 +84,6 @@
 #include <iostream>
 #include <future>
 #include <thread>
-#if !defined(_WIN32)
-#include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
-#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -634,15 +616,7 @@ int serve_subcommand(int argc, char** argv) {
     const std::string exe = basalt::platform::module_path();
     if (exe.empty()) { std::fprintf(stderr, "basalt serve: cannot find this binary\n"); return 1; }
     const std::string src_dir = BASALT_SOURCE_DIR;
-    if (python.empty()) {
-#if defined(_WIN32)
-        const std::string venv = src_dir + "/.venv/Scripts/python.exe";
-        python = basalt::platform::path_executable(venv) ? venv : "python";
-#else
-        const std::string venv = src_dir + "/.venv/bin/python";
-        python = basalt::platform::path_executable(venv) ? venv : "python3";
-#endif
-    }
+    if (python.empty()) python = basalt::platform::python_interpreter(src_dir);
     if (basalt::platform::set_working_dir(src_dir) != 0) {
         std::fprintf(stderr, "basalt serve: cannot enter the source tree %s\n", src_dir.c_str());
         return 1;
@@ -1036,30 +1010,12 @@ struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard
 };
 MemSample mem_sample() {
+    const basalt::platform::ProcessMemory p = basalt::platform::process_memory();
     MemSample m;
-    if (std::FILE* f = std::fopen("/proc/self/stat", "r")) {
-        char buf[4096];
-        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
-        buf[n] = 0;
-        std::fclose(f);
-        const char* s = std::strrchr(buf, ')');   // fields after the command name: 3 state ... 12 majflt
-        for (int field = 2; s && field < 12; ++field) s = std::strchr(s + 1, ' ');
-        if (s) m.faults = std::strtoull(s + 1, nullptr, 10);
-    }
-    auto kb = [](const char* path, const char* key) -> unsigned long long {
-        unsigned long long v = 0;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            char line[256];
-            const size_t kl = std::strlen(key);
-            while (std::fgets(line, sizeof line, f))
-                if (std::strncmp(line, key, kl) == 0) { v = std::strtoull(line + kl, nullptr, 10); break; }
-            std::fclose(f);
-        }
-        return v;
-    };
-    m.rss_mib = kb("/proc/self/status", "VmRSS:") >> 10;
-    m.commit_mib = kb("/proc/self/status", "VmSwap:") >> 10;
-    m.avail_mib = kb("/proc/meminfo", "MemAvailable:") >> 10;
+    m.faults = p.faults;
+    m.rss_mib = p.rss_mib;
+    m.avail_mib = p.avail_mib;
+    m.commit_mib = p.commit_mib;
     return m;
 }
 
@@ -1071,60 +1027,17 @@ std::string stage_text() {
     return s;
 }
 
-// whether `path` is on a rotational disk (1), not (0) or unknown (-1), from sysfs; `dev` is the disk's name
-int on_rotational_disk(const std::string& path, std::string& dev) {
-#if defined(_WIN32)
-    (void) path; (void) dev;
-    return -1;   // sysfs names the queue here; unknown means the caller does not warn
-#else
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0) return -1;
-    char sys[64];
-    std::snprintf(sys, sizeof sys, "/sys/dev/block/%u:%u", (unsigned) major(st.st_dev), (unsigned) minor(st.st_dev));
-    std::error_code ec;
-    std::filesystem::path p = std::filesystem::canonical(sys, ec);
-    for (int up = 0; !ec && up < 2; ++up, p = p.parent_path()) {   // a partition has its disk's queue
-        std::ifstream q(p / "queue" / "rotational");
-        int r = -1;
-        if (q >> r) {
-            dev = p.filename().string();
-            return r;
-        }
-    }
-    return -1;
-#endif
-}
-
 // the engine's threads in uninterruptible sleep (state D - almost always waiting for the disk), and where
 // (wchan): many threads in blk_io_schedule is a disk that cannot keep up, not a deadlock in the engine
 void disk_wait_threads(std::FILE* f) {
-#if defined(_WIN32)
-    (void) f;   // state D and wchan are /proc readings; there is no per-thread wait address to list here
-#else
-    std::map<std::string, int> where;
-    int waiting = 0, threads = 0;
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec)) {
-        ++threads;
-        std::ifstream st(e.path() / "stat");
-        std::string line;
-        std::getline(st, line);
-        const size_t rp = line.rfind(')');
-        if (rp == std::string::npos || rp + 2 >= line.size() || line[rp + 2] != 'D') continue;
-        ++waiting;
-        std::ifstream w(e.path() / "wchan");
-        std::string wc;
-        std::getline(w, wc);
-        ++where[wc.empty() || wc == "0" ? "?" : wc];
-    }
-    if (threads == 0) return;
+    const basalt::platform::ThreadWaits w = basalt::platform::threads_in_disk_wait();
+    if (w.threads == 0) return;
     std::string list;
-    for (const auto& [name, n] : where) list += (list.empty() ? " (" : ", ") + name + " x" + std::to_string(n);
+    for (const auto& [name, n] : w.where) list += (list.empty() ? " (" : ", ") + name + " x" + std::to_string(n);
     if (!list.empty()) list += ")";
-    std::fprintf(f, "  threads waiting on the disk (state D): %d of %d%s%s\n", waiting, threads, list.c_str(),
-                 waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
+    std::fprintf(f, "  threads waiting on the disk (state D): %d of %d%s%s\n", w.waiting, w.threads, list.c_str(),
+                 w.waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
                                "direct (--ple-io ram), or a drive too slow for the reads asked of it" : "");
-#endif
 }
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
@@ -1374,7 +1287,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
     // if memory runs out the kernel ends this process first, not the rest of the machine
-    if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) { std::fputs("1000", f); std::fclose(f); }
+    basalt::platform::prefer_oom_victim();
     // Kernels load on first use: loading every kernel of the engine and of cuBLAS at context creation holds a few
     // hundred MiB of device memory for code that never runs.  The expert cache's sizing keeps back room for what loads
     // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load.
@@ -1678,15 +1591,13 @@ int main(int argc, char** argv) {
     // The peer tier holds experts on a second GPU and moves them between the two over direct GPU-to-GPU access, which
     // a process here is not given.  Refused with the options, before the model opens or a device context exists: a
     // tier sized and then filled would fail partway through the load.
-#if defined(_WIN32)
-    if (o.peer_device >= 1) {
+    if (o.peer_device >= 1 && !basalt::platform::gpu_peer_access()) {
         std::fprintf(stderr, "basalt generate: --peer-device is not available here: this platform gives a process no "
                              "GPU-to-GPU access between its devices, so a second GPU cannot hold an expert tier; keep "
                              "the experts on one GPU (--expert-cache, --resident-experts) and run without "
                              "--peer-device\n");
         return 2;
     }
-#endif
     // ---- where every loader reads from: the sections of the .basalt file
     if (o.model.empty()) {
         std::fprintf(stderr, "basalt generate: --model FILE.basalt is required\n");
@@ -1695,16 +1606,8 @@ int main(int argc, char** argv) {
     }
     // a load that exhausts the RAM ends here instead of swapping the machine to a halt; stopped at READY
     if (o.serve) basalt::platform::start_memory_watchdog(1ull << 30);
-#if defined(_WIN32)
-    // The CRT puts the three standard descriptors in text mode, which turns each "\n" the serve protocol writes
-    // into "\r\n" and folds a "\r\n" in a request to "\n" behind the reader's back. The pipes carry bytes, so the
-    // protocol's newlines are the engine's own. Console output keeps its text mode: it needs the CR.
-    if (o.serve) {
-        _setmode(_fileno(stdin), _O_BINARY);
-        _setmode(_fileno(stdout), _O_BINARY);
-        _setmode(_fileno(stderr), _O_BINARY);
-    }
-#endif
+    // the serve protocol's pipes carry bytes, so its newlines are the engine's own
+    if (o.serve) basalt::platform::set_stdio_binary();
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
     {
@@ -2591,7 +2494,7 @@ int main(int argc, char** argv) {
             // --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational disk can take
             // longer than the stall watchdog's limit for one prompt chunk's rows.  Recommended, not forced.
             std::string dev;
-            if (on_rotational_disk(o.model, dev) == 1)
+            if (basalt::platform::disk_rotational(o.model, dev) == 1)
                 std::fprintf(stderr, "basalt generate: WARNING: the n-gram table (%s) is on a rotational disk (%s): "
                                      "--ple-io direct reads it at random and can stall a prompt for minutes. "
                                      "--ple-io ram (it then needs RAM for the table) or the model on an SSD is "
