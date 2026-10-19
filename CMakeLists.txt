@@ -522,6 +522,7 @@ add_executable(dec_commit_parity src/kernels/dec_commit_parity.cpp)
 target_include_directories(dec_commit_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(dec_commit_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dec_commit_parity COMMAND dec_commit_parity)
+basalt_gpu_test(NAME dec_commit_finisher COMMAND dec_commit_parity --finisher)
 # the IQ kernels that decode a weight part once for every column/entry, bitwise vs the per-column ones
 # (GPU, synthetic, no model; --bench adds old/new timings)
 add_executable(iq_multi_parity src/kernels/iq_multi_parity.cpp)

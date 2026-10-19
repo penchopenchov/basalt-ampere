@@ -1,19 +1,28 @@
 // src/kernels/dec_commit_parity.cpp - DEC_COMMIT's two launches against the commit graph's per-layer calls.
 //
-//     build/dec_commit_parity [--bench]
+//     build/dec_commit_parity [--bench | --finisher [--bench]]
 //
 // GDN: gdn_commit_layers against gdn_conv_commit + gdn_step_norm_multi (state-only commit) per layer; QSA:
 // native_qsa_indexer_commit_layers against the tail restore + n_tok native_qsa_indexer_append calls per layer.
 // Every state, conv history and indexer buffer must match bit for bit for n_keep = 0..7 at the model's geometry.
 // Inputs random normal.  --bench: both as CUDA graphs over a window's layers (36 GDN, 12 QSA), in microseconds; the
 // grid-stride GDN form per block count, alone and beside a chain of small copies on another stream.
+// --finisher: the commit with its items claimed from a counter (begin kernel, indexer + PLE commits, GDN kernel on one
+// stream) against the per-layer calls, with the finisher (the first node of the next window) on another stream before,
+// during and after it: what the finisher's stream sees when it returns - every GDN state, conv history, indexer buffer
+// and PLE history - must match bit for bit, for n_keep 1..8, over 200 epochs of both counter sets, and with nothing
+// pending it touches nothing.  With --bench: the finisher's cost with nothing pending and its drain of what is left.
 #include "basalt/kernels/native_qsa_indexer.hpp"
 #include "basalt/kernels/qsa.hpp"
 #include "basalt/kernels/rope_scaling.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
+#include "basalt/kernels/ngram.hpp"
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,7 +35,7 @@ using namespace basalt::kernels;
 
 namespace {
 
-constexpr int S = 128, HK = 16, HV = 48, C = 2 * HK * S + HV * S, MT = 7, ID = 128, R = 4, CELLS = 4096;
+constexpr int S = 128, HK = 16, HV = 48, C = 2 * HK * S + HV * S, MT = 8, ID = 128, R = 4, CELLS = 4096;
 constexpr size_t GDN_FLOATS = (size_t) S * HV * S + (size_t) C * 3, TS = (size_t) (R - 1) * ID;
 constexpr float EPS = 1e-6f;
 
@@ -355,13 +364,349 @@ void contention(cudaStream_t s) {
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// the finisher
+
+constexpr int FIN_BLOCKS = 170;
+constexpr int64_t HS = (int64_t) basalt::kernels::NG_HIST * basalt::kernels::NG_HC_DIM;
+
+template<typename T> T* mapped(size_t n, T** dev) {
+    void* h = nullptr;
+    CK(cudaHostAlloc(&h, n * sizeof(T), cudaHostAllocMapped));
+    std::memset(h, 0, n * sizeof(T));
+    CK(cudaHostGetDevicePointer((void**) dev, h, 0));
+    return (T*) h;
+}
+
+struct Rig {
+    Gdn g;
+    Qsa q;
+    int32_t* commit = nullptr;
+    CommitCtl* ctl = nullptr;
+    uint32_t *h_begun = nullptr, *d_begun = nullptr;   // written by the begin kernel
+    int32_t *h_epoch = nullptr, *d_epoch = nullptr;
+    float *ple_snap = nullptr, *ple_hist = nullptr, *ple_snap_out = nullptr, *state_out = nullptr;
+    char* q_out = nullptr;
+    size_t q_bytes = 0;
+    uint32_t epoch = 0;
+    uint32_t *h_gate = nullptr, *d_gate = nullptr;   // raised by the host to let the finisher's stream go on
+    uint32_t gate_n = 0;
+    std::vector<uint8_t> q0;
+    cudaStream_t sc, sf;
+    cudaEvent_t ev;
+};
+
+GdnCommitLayers rig_args(const Rig& r, const int32_t* keep) {
+    GdnCommitLayers a;
+    a.state = r.g.state; a.h = r.g.h; a.qkv = r.g.qkv; a.gate = r.g.gate; a.beta = r.g.beta;
+    a.state_stride = GDN_FLOATS; a.h_stride = (size_t) MT * C; a.gb_stride = (size_t) MT * HV;
+    a.C = C; a.h_k = HK; a.h_v = HV; a.n_layers = r.g.nl; a.n_keep = keep;
+    return a;
+}
+
+// the commit graph's order: begin, indexer, PLE, then the GDN kernel
+void rig_begin(Rig& r, uint32_t e) {
+    r.h_epoch[0] = (int32_t) e;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    gdn_commit_begin(r.ctl, r.d_epoch, r.d_begun, r.sc);
+}
+void rig_rest(Rig& r) {
+    native_qsa_indexer_commit_layers(r.q.a, qsa_real_shapes(), RopeScaling{}, r.sc);
+    copy_indexed(r.ple_hist, r.ple_snap, HS, r.commit + 1, HS, r.sc);
+    gdn_commit_layers_dyn(rig_args(r, r.commit), r.ctl, r.sc, 32);
+}
+void rig_commit(Rig& r, uint32_t e) { rig_begin(r, e); rig_rest(r); }
+// the host's check before it launches a window: the begin kernel of the epoch has run
+void wait_begun(const volatile uint32_t* begun, uint32_t e) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (*begun != e) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) { std::printf("begin kernel never ran\n"); std::exit(1); }
+    }
+}
+void rig_finish(Rig& r) { gdn_commit_finish(rig_args(r, r.commit), r.ctl, r.sf, FIN_BLOCKS); }
+// what the finisher's stream sees when the finisher has returned
+void rig_snapshot(Rig& r) {
+    CK(cudaMemcpyAsync(r.state_out, r.g.state, r.g.nl * GDN_FLOATS * 4, cudaMemcpyDeviceToDevice, r.sf));
+    CK(cudaMemcpyAsync(r.ple_snap_out, r.ple_hist, HS * 4, cudaMemcpyDeviceToDevice, r.sf));
+    size_t o = 0;
+    for (int l = 0; l < r.q.a.n_layers; ++l) {
+        const QsaCommitLayer& L = r.q.a.layer[l];
+        CK(cudaMemcpyAsync(r.q_out + o, L.tail, TS * 4, cudaMemcpyDeviceToDevice, r.sf)); o += TS * 4;
+        CK(cudaMemcpyAsync(r.q_out + o, L.dead, ID * 4, cudaMemcpyDeviceToDevice, r.sf)); o += ID * 4;
+        CK(cudaMemcpyAsync(r.q_out + o, L.pooled, r.q.pooled_n * 4, cudaMemcpyDeviceToDevice, r.sf)); o += r.q.pooled_n * 4;
+        CK(cudaMemcpyAsync(r.q_out + o, L.block_pos, 4, cudaMemcpyDeviceToDevice, r.sf)); o += 4;
+    }
+}
+
+struct Ref {
+    std::vector<uint8_t> state, q, ple;
+};
+
+void rig_init(Rig& r, std::mt19937& rng) {
+    CK(cudaStreamCreateWithFlags(&r.sc, cudaStreamNonBlocking));
+    CK(cudaStreamCreateWithFlags(&r.sf, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&r.ev, cudaEventDisableTiming));
+    CK(cudaMalloc(&r.commit, (2 + MT) * 4));
+    r.g = make_gdn(rng, 36);
+    r.q = make_qsa(rng, 12, r.commit + 2);
+    CK(cudaMalloc(&r.ctl, sizeof(CommitCtl)));
+    CK(cudaMemset(r.ctl, 0, sizeof(CommitCtl)));
+    r.h_begun = mapped<uint32_t>(32, &r.d_begun);
+    r.h_epoch = mapped<int32_t>(32, &r.d_epoch);
+    r.h_gate = mapped<uint32_t>(32, &r.d_gate);
+    r.ple_snap = dev_rand<float>(rng, (size_t) MT * HS, 1.0f);
+    CK(cudaMalloc(&r.ple_hist, HS * 4));
+    CK(cudaMalloc(&r.ple_snap_out, HS * 4));
+    CK(cudaMalloc(&r.state_out, r.g.nl * GDN_FLOATS * 4));
+    r.q_bytes = (size_t) r.q.a.n_layers * ((TS + ID + r.q.pooled_n + 1) * 4);
+    CK(cudaMalloc(&r.q_out, r.q_bytes));
+    r.q0 = qsa_snapshot(r.q);
+    // every kernel loaded before one waits on another that has not launched yet
+    set_commit(r.commit, 1, 10);
+    const uint32_t e = ++r.epoch;
+    rig_commit(r, e);
+    CK(cudaStreamSynchronize(r.sc));
+    rig_finish(r);
+    wait_flag_ge(r.d_gate, 0, r.sf);
+    CK(cudaDeviceSynchronize());
+}
+
+bool finisher_tests(cudaStream_t) {
+    std::mt19937 rng(23);
+    Rig r;
+    rig_init(r, rng);
+    const std::vector<uint8_t> ple0 = host(r.ple_hist, HS * 4);
+
+    // the references: today's per-layer calls, per n_keep
+    Ref refs[MT + 1];
+    for (int n_keep = 1; n_keep <= MT; ++n_keep) {
+        set_commit(r.commit, n_keep, 37 + n_keep);
+        CK(cudaMemcpy(r.g.state, r.g.state0, r.g.nl * GDN_FLOATS * 4, cudaMemcpyDeviceToDevice));
+        qsa_restore(r.q, r.q0);
+        CK(cudaDeviceSynchronize());
+        gdn_ref(r.g, r.commit, r.sc);
+        qsa_ref(r.q, r.sc);
+        CK(cudaStreamSynchronize(r.sc));
+        refs[n_keep].state = host(r.g.state, r.g.nl * GDN_FLOATS * 4);
+        refs[n_keep].q = qsa_snapshot(r.q);
+        refs[n_keep].ple = host(r.ple_snap + (size_t) (n_keep - 1) * HS, HS * 4);
+    }
+    bool ok = true;
+    // variants: 0 the finisher launched before the commit's work (after its begin kernel), 1-3 launched a host delay
+    // later (the commit is part way), 4 after the commit
+    const int delays[3] = {40, 120, 300};   // microseconds
+    auto run_one = [&](int n_keep, int variant) {
+        set_commit(r.commit, n_keep, 37 + n_keep);
+        CK(cudaMemcpy(r.g.state, r.g.state0, r.g.nl * GDN_FLOATS * 4, cudaMemcpyDeviceToDevice));
+        qsa_restore(r.q, r.q0);
+        CK(cudaMemcpy(r.ple_hist, ple0.data(), HS * 4, cudaMemcpyHostToDevice));
+        CK(cudaDeviceSynchronize());
+        const uint32_t e = ++r.epoch;
+        rig_begin(r, e);
+        wait_begun(r.h_begun, e);
+        if (variant == 0) { rig_finish(r); rig_snapshot(r); rig_rest(r); }
+        else if (variant <= 3) {
+            rig_rest(r);
+            std::this_thread::sleep_for(std::chrono::microseconds(delays[variant - 1]));
+            rig_finish(r);
+            rig_snapshot(r);
+        } else { rig_rest(r); CK(cudaStreamSynchronize(r.sc)); rig_finish(r); rig_snapshot(r); }
+        CK(cudaStreamSynchronize(r.sf));
+        CK(cudaStreamSynchronize(r.sc));
+        const Ref& f = refs[n_keep];
+        bool good = host(r.state_out, r.g.nl * GDN_FLOATS * 4) == f.state && host(r.q_out, r.q_bytes) == f.q &&
+                    host(r.ple_snap_out, HS * 4) == f.ple;
+        // and what is left after both have ended
+        good = good && host(r.g.state, r.g.nl * GDN_FLOATS * 4) == f.state;
+        if (!good) std::printf("  finisher n_keep=%d variant=%d epoch=%u: state differs\n", n_keep, variant, e);
+        return good;
+    };
+    for (int n_keep = 1; n_keep <= MT; ++n_keep)
+        for (int v = 0; v < 5; ++v) ok = run_one(n_keep, v) && ok;
+    std::printf("finisher parity (n_keep 1..%d x before / during x3 / after, 36 GDN + 12 QSA layers): %s\n", MT,
+                ok ? "BITWISE" : "FAILED");
+
+    // 200 epochs: both counter sets alternate, the variant and n_keep vary
+    bool ok200 = true;
+    std::uniform_int_distribution<int> nk(1, MT), vr(0, 4);
+    for (int k = 0; k < 200; ++k) ok200 = run_one(nk(rng), vr(rng)) && ok200;
+    std::printf("finisher 200 epochs (both counter sets, mixed timing): %s\n", ok200 ? "BITWISE" : "FAILED");
+    ok = ok && ok200;
+
+    // nothing pending: the finisher touches nothing, whatever the counters hold
+    {
+        const std::vector<uint8_t> ctl0 = host(r.ctl, sizeof(CommitCtl));
+        CK(cudaMemcpy(r.g.state, r.g.state0, r.g.nl * GDN_FLOATS * 4, cudaMemcpyDeviceToDevice));
+        qsa_restore(r.q, r.q0);
+        CK(cudaDeviceSynchronize());
+        rig_finish(r);
+        rig_snapshot(r);
+        CK(cudaStreamSynchronize(r.sf));
+        const bool same = host(r.state_out, r.g.nl * GDN_FLOATS * 4) == host(r.g.state0, r.g.nl * GDN_FLOATS * 4) &&
+                          host(r.q_out, r.q_bytes) == r.q0 && host(r.ctl, sizeof(CommitCtl)) == ctl0;
+        std::printf("finisher with nothing pending touches nothing: %s\n", same ? "OK" : "FAILED");
+        ok = ok && same;
+    }
+
+    // the engine's pattern without a host sync: commit e after the finisher of e - 1, the state carried over; the GDN
+    // state after 200 epochs against the per-layer calls applied in the same order
+    {
+        constexpr int N = 200;
+        std::vector<int32_t*> cm(N + 1);
+        std::vector<cudaEvent_t> fin(N + 1);
+        int32_t* d_ep_arr = nullptr;
+        int32_t* h_ep_arr = mapped<int32_t>(N + 1, &d_ep_arr);
+        uint32_t* d_begun_arr = nullptr;
+        uint32_t* h_begun_arr = mapped<uint32_t>(N + 1, &d_begun_arr);
+        CK(cudaMemcpy(r.g.state, r.g.state0, r.g.nl * GDN_FLOATS * 4, cudaMemcpyDeviceToDevice));
+        Gdn gref = r.g;
+        CK(cudaMalloc(&gref.state, r.g.nl * GDN_FLOATS * 4));
+        CK(cudaMemcpy(gref.state, r.g.state0, r.g.nl * GDN_FLOATS * 4, cudaMemcpyDeviceToDevice));
+        CK(cudaDeviceSynchronize());
+        std::uniform_int_distribution<int> dl(0, 150);
+        const uint32_t e0 = r.epoch;
+        std::vector<int> keeps(N + 1);
+        for (int k = 1; k <= N; ++k) {
+            keeps[k] = nk(rng);
+            CK(cudaMalloc(&cm[k], (2 + MT) * 4));
+            set_commit(cm[k], keeps[k], 500 + k);
+            CK(cudaEventCreateWithFlags(&fin[k], cudaEventDisableTiming));
+            h_ep_arr[k] = (int32_t) (e0 + k);
+        }
+        CK(cudaDeviceSynchronize());
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for (int k = 1; k <= N; ++k) {
+            if (k > 1) CK(cudaStreamWaitEvent(r.sc, fin[k - 1], 0));
+            gdn_commit_begin(r.ctl, d_ep_arr + k, d_begun_arr + k, r.sc);
+            copy_indexed(r.ple_hist, r.ple_snap, HS, cm[k] + 1, HS, r.sc);
+            gdn_commit_layers_dyn(rig_args(r, cm[k]), r.ctl, r.sc, 32);
+            wait_begun(h_begun_arr + k, e0 + k);
+            std::this_thread::sleep_for(std::chrono::microseconds(dl(rng)));   // against the commit's progress
+            gdn_commit_finish(rig_args(r, cm[k]), r.ctl, r.sf, FIN_BLOCKS);
+            CK(cudaEventRecord(fin[k], r.sf));
+        }
+        CK(cudaDeviceSynchronize());
+        for (int k = 1; k <= N; ++k) {
+            gdn_ref(gref, cm[k], r.sc);
+            CK(cudaStreamSynchronize(r.sc));
+        }
+        const bool same = host(r.g.state, r.g.nl * GDN_FLOATS * 4) == host(gref.state, r.g.nl * GDN_FLOATS * 4);
+        std::printf("finisher chain (200 epochs, no host sync, state carried): %s\n", same ? "BITWISE" : "FAILED");
+        ok = ok && same;
+    }
+    return ok;
+}
+
+// us per node of a chain of `n` nodes captured from `fn`, over graph replays
+template<typename F> double chain_us(cudaStream_t s, int n, F fn) {
+    cudaGraph_t gr;
+    cudaGraphExec_t ge;
+    CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+    for (int i = 0; i < n; ++i) fn();
+    CK(cudaStreamEndCapture(s, &gr));
+    CK(cudaGraphInstantiate(&ge, gr, 0));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    for (int w = 0; w < 5; ++w) CK(cudaGraphLaunch(ge, s));
+    constexpr int REPS = 50;
+    CK(cudaEventRecord(e0, s));
+    for (int r = 0; r < REPS; ++r) CK(cudaGraphLaunch(ge, s));
+    CK(cudaEventRecord(e1, s));
+    CK(cudaEventSynchronize(e1));
+    float ms = 0;
+    CK(cudaEventElapsedTime(&ms, e0, e1));
+    CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(gr));
+    return ms * 1000.0 / REPS / n;
+}
+
+void finisher_bench(cudaStream_t) {
+    std::mt19937 rng(29);
+    Rig r;
+    rig_init(r, rng);
+    unsigned long long* stamp = nullptr;
+    CK(cudaMalloc(&stamp, 64 * 8));
+    gpu_stamp(stamp, 0, r.sf);
+    CK(cudaStreamSynchronize(r.sf));
+    const GdnCommitLayers a = rig_args(r, r.commit);
+    set_commit(r.commit, 3, 100);
+    CK(cudaDeviceSynchronize());
+    const double base = chain_us(r.sf, 50, [&] { gpu_stamp(stamp, 0, r.sf); });
+    const double fm = chain_us(r.sf, 50, [&] { gdn_commit_finish(a, r.ctl, r.sf, FIN_BLOCKS); });
+    std::printf("finisher, nothing pending, per node in a graph chain: %.2f us (a one-thread kernel: %.2f us)\n", fm, base);
+    // the same node between two small kernels, against the two alone
+    const double two = chain_us(r.sf, 50, [&] { gpu_stamp(stamp, 0, r.sf); gpu_stamp(stamp, 1, r.sf); });
+    const double three = chain_us(r.sf, 50, [&] { gpu_stamp(stamp, 0, r.sf); gdn_commit_finish(a, r.ctl, r.sf, FIN_BLOCKS); gpu_stamp(stamp, 1, r.sf); });
+    std::printf("  inserted between two one-thread kernels: +%.2f us per window\n", three - two);
+
+    // the drain: the counters say `left` of the items are not claimed yet; time the finisher alone
+    const int conv_blocks = (C + 127) / 128;
+    const int per_layer = HV * (S / 32) + conv_blocks, total = per_layer * 36;
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    for (int n_keep : {2, 4}) {
+        set_commit(r.commit, n_keep, 100);
+        for (double left : {1.0, 0.75, 0.5, 0.25, 0.05}) {
+            double sum = 0;
+            constexpr int REPS = 20;
+            for (int rep = 0; rep < REPS + 3; ++rep) {
+                const uint32_t e = ++r.epoch;
+                const uint32_t k0 = (uint32_t) (total * (1.0 - left));
+                uint32_t w[10 * 32] = {};
+                CK(cudaMemcpy(w, r.ctl, sizeof w, cudaMemcpyDeviceToHost));
+                const int set = e & 1;
+                w[(set * 4 + 0) * 32] = k0; w[(set * 4 + 1) * 32] = k0; w[(set * 4 + 2) * 32] = e; w[(set * 4 + 3) * 32] = e;
+                w[8 * 32] = e; w[9 * 32] = e - 1;
+                CK(cudaMemcpy(r.ctl, w, sizeof w, cudaMemcpyHostToDevice));
+                CK(cudaDeviceSynchronize());
+                CK(cudaEventRecord(e0, r.sf));
+                gdn_commit_finish(a, r.ctl, r.sf, FIN_BLOCKS);
+                CK(cudaEventRecord(e1, r.sf));
+                CK(cudaEventSynchronize(e1));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                if (rep >= 3) sum += ms * 1000.0;
+            }
+            const double us = sum / REPS;
+            const double mb = left * 2.0 * 36 * (double) S * HV * S * 4 / 1e6;
+            std::printf("  drain n_keep=%d, %3.0f%% left: %7.1f us  (%.0f MB of state traffic: %.0f GB/s)\n", n_keep,
+                        left * 100, us, mb, mb * 1e-3 / (us * 1e-6));
+        }
+    }
+    // the whole commit: the static 32-block kernel against the claimed one
+    set_commit(r.commit, 3, 100);
+    for (int pass = 0; pass < 2; ++pass) {
+        double sum = 0;
+        constexpr int REPS = 30;
+        for (int rep = 0; rep < REPS + 3; ++rep) {
+            const uint32_t e = ++r.epoch;
+            r.h_epoch[0] = (int32_t) e;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            CK(cudaDeviceSynchronize());
+            gdn_commit_begin(r.ctl, r.d_epoch, r.d_begun, r.sc);
+            CK(cudaEventRecord(e0, r.sc));
+            if (pass == 0) gdn_commit_layers(a, r.sc, 32); else gdn_commit_layers_dyn(a, r.ctl, r.sc, 32);
+            CK(cudaEventRecord(e1, r.sc));
+            CK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            if (rep >= 3) sum += ms * 1000.0;
+        }
+        std::printf("  GDN commit, 32 blocks, %s items: %.1f us\n", pass == 0 ? "static" : "claimed", sum / REPS);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    const bool ok = parity(s);
+    bool ok = parity(s);
     if (mode == "--bench") { bench(s); bench_seg(s); contention(s); }
+    if (mode == "--finisher") {
+        ok = finisher_tests(s) && ok;
+        if (argc > 2 && std::string(argv[2]) == "--bench") finisher_bench(s);
+    }
     return ok ? 0 : 1;
 }
