@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <vector>
 
-namespace basalt::kernels::cpu::detail {
+namespace basalt::platform::detail {
 
 // Hard affinity is only for pool-owned threads, which terminate with the pool. A caller's implicit all-group
 // affinity cannot be recovered from PreviousGroupAffinity, so the host thread uses CPU Sets below instead.
@@ -57,5 +57,5 @@ inline bool cpu_set_for_core(int core, ULONG& id) {
     return false;
 }
 
-}  // namespace basalt::kernels::cpu::detail
+}  // namespace basalt::platform::detail
 #endif

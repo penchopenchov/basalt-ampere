@@ -13,6 +13,7 @@
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
 #include "basalt/ggml/ggml_common.h"
+#include "basalt/platform/compiler.hpp"
 
 #include <immintrin.h>
 
@@ -29,15 +30,7 @@ inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); retur
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 
 // the index of the lowest set bit of a nonzero mask: the compiler's own scan
-inline int lowest_bit(unsigned m) {
-#if defined(_MSC_VER)
-    unsigned long i = 0;
-    _BitScanForward(&i, m);
-    return (int) i;
-#else
-    return __builtin_ctz(m);
-#endif
-}
+inline int lowest_bit(unsigned m) { return platform::ctz32(m); }
 
 // software prefetch distance in bytes: the rows are streamed from DRAM, so ask for them a few blocks ahead
 constexpr int prefetch_ahead = 2048;

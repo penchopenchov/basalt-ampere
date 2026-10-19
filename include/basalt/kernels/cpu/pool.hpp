@@ -28,6 +28,7 @@
 
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
+#include "basalt/platform/cpu.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -64,22 +65,10 @@ struct ExpertJobMulti {
 
 /// How worker threads are allocated across physical/logical CPU cores.  `All` uses every core and is the default; the
 /// hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
-enum class PoolAffinity {
-    Auto,      ///< Hybrid: prioritize physical P-cores, then SMT, then E-cores (defaults to P-core count)
-    PCores,    ///< Restrict workers strictly to Performance cores and their SMT siblings
-    All,       ///< The default: one worker per physical core in the OS's order, without hybrid distinction
-};
+using PoolAffinity = platform::CpuAffinity;
+using CpuTopology = platform::CpuTopology;
 
-struct CpuTopology {
-    bool is_hybrid = false;
-    int p_cores = 0;                ///< Physical performance cores
-    int p_threads = 0;              ///< Total logical threads on performance cores
-    int e_cores = 0;                ///< Efficient cores
-    std::vector<int> worker_cores;   // Ordered CPU IDs
-    int host_core = -1;             ///< Logical core reserved for host thread
-};
-
-CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
+using platform::detect_cpu_topology;
 
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another worker:
 /// `hardware_concurrency()/2` workers on logical processors 0..N/2 could put every worker on a sibling pair and halve
@@ -95,17 +84,9 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 /// this is it: the host loop calls this on entry and restores on exit.  An unpinned spinning host is free to land on a
 /// worker's core or its SMT sibling, which costs the pool bandwidth.
 ///
-/// The previous host placement. `valid` is false when querying or setting placement failed.  The complete,
-/// dynamically sized native placement is stored, including CPU IDs above 63: Linux keeps the CPU mask, Windows the
-/// selected CPU Set IDs (unsigned long, so this header stays free of windows.h).
-struct ThreadAffinity {
-#if defined(_WIN32)
-    std::vector<unsigned long> cpu_sets;
-#else
-    std::vector<unsigned long> mask;
-#endif
-    bool valid = false;
-};
+/// The previous host placement (see platform::ThreadPlacement): the complete, dynamically sized native placement,
+/// including CPU IDs above 63.
+using ThreadAffinity = platform::ThreadPlacement;
 
 /// Selects one encoded processor for the caller.
 /// Restore on the same calling thread. Pool-owned workers use hard group affinity instead.

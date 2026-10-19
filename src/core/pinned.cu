@@ -55,10 +55,6 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                                           mapping_bytes);
     backing = region_backing == basalt::platform::RegionBacking::LargePages ? PageBacking::LargePages
                                                                              : PageBacking::NormalPages;
-    if (base != nullptr && mapping_base == nullptr) {
-        mapping_base = base;
-        mapping_bytes = bytes;
-    }
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.

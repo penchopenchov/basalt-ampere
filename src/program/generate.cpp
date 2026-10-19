@@ -18,6 +18,8 @@
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/pinned.hpp"
+#include "basalt/platform/compiler.hpp"
+#include "basalt/platform/cpu.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/process.hpp"
@@ -156,66 +158,16 @@ public:
         if (!busy_) return;
         // the caller has nothing else to do: poll rather than sleep, so the job's end is seen at once
         for (unsigned spins = 0; !done_.load(std::memory_order_acquire); ++spins) {
-            if (spins < 20000) cpu_relax();
+            if (spins < 20000) basalt::platform::cpu_relax();
             else std::this_thread::yield();
         }
         busy_ = false;
     }
 private:
-    static void cpu_relax() {
-#if defined(__x86_64__)
-        __builtin_ia32_pause();
-#elif defined(_M_X64) || defined(_M_IX86)
-        _mm_pause();   // a spin without this holds the core from its SMT sibling
-#endif
-    }
-    // The decode loop's thread is pinned to one core, which it spins on; a thread it starts inherits that pin and
-    // would wait for the spinner to yield.  The worker takes the core's SMT sibling instead: the core is awake, so the
-    // worker starts at once, and the loop's thread is not preempted.  That inheritance follows the placement a thread
-    // starts with: a host confined by a CPU Set instead leaves the new thread on the process's own assignment, so it
-    // never starts on the host core and there is no core to leave.
-#if !defined(_WIN32)
-    static void leave_host_core() {
-        const int n = (int) sysconf(_SC_NPROCESSORS_CONF);
-        if (n <= 0) return;
-        cpu_set_t* own = CPU_ALLOC(n);
-        cpu_set_t* sib = CPU_ALLOC(n);
-        if (own != nullptr && sib != nullptr) {
-            const size_t bytes = CPU_ALLOC_SIZE(n);
-            CPU_ZERO_S(bytes, own);
-            CPU_ZERO_S(bytes, sib);
-            if (pthread_getaffinity_np(pthread_self(), bytes, own) == 0 && CPU_COUNT_S(bytes, own) == 1) {
-                int host = 0;
-                while (host < n && !CPU_ISSET_S(host, bytes, own)) ++host;
-                char path[96];
-                std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", host);
-                if (std::FILE* f = std::fopen(path, "r")) {
-                    char line[128] = {};
-                    if (std::fgets(line, sizeof line, f) != nullptr) {
-                        for (const char* q = line; *q != '\0';) {   // "0,16" or "0-1"
-                            char* end = nullptr;
-                            const long lo = std::strtol(q, &end, 10);
-                            if (end == q) break;
-                            long hi = lo;
-                            if (*end == '-') { q = end + 1; hi = std::strtol(q, &end, 10); }
-                            for (long c = lo; c <= hi && c < n; ++c)
-                                if (c != host) CPU_SET_S((int) c, bytes, sib);
-                            q = *end != '\0' ? end + 1 : end;
-                        }
-                    }
-                    std::fclose(f);
-                }
-                if (CPU_COUNT_S(bytes, sib) > 0) (void) pthread_setaffinity_np(pthread_self(), bytes, sib);
-            }
-        }
-        if (own != nullptr) CPU_FREE(own);
-        if (sib != nullptr) CPU_FREE(sib);
-    }
-#endif
     void loop() {
-#if !defined(_WIN32)
-        leave_host_core();
-#endif
+        // the decode loop's thread is pinned to one core, which it spins on, and a thread it starts would inherit
+        // that pin
+        basalt::platform::leave_host_core();
         std::unique_lock<std::mutex> lk(m_);
         for (;;) {
             cv_.wait(lk, [this] { return has_ || stop_; });

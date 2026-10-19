@@ -164,7 +164,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 # Host-only: no CUDA runtime, which is why the header-only `artifact` target, the vision library, the bench and the
 # standalone test programs can all link it.
 add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp
-  src/platform/mapped_file.cpp)
+  src/platform/mapped_file.cpp src/platform/cpu.cpp)
 target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(platform PUBLIC warnings)
 
@@ -742,6 +742,17 @@ basalt_embed_manifest(mapped_file_test)
 add_test(NAME mapped_file_test COMMAND mapped_file_test)
 set_tests_properties(mapped_file_test PROPERTIES TIMEOUT 60)
 
+# the platform seams below the engine: thread placement and topology, the compiler helpers, large host regions, the
+# piped child, the system questions and the dynamic loader (CPU only, both platforms).
+foreach(_t cpu_test compiler_test region_test)
+  add_executable(platform_${_t} tests/platform/${_t}.cpp)
+  target_link_libraries(platform_${_t} PRIVATE platform Threads::Threads)
+  target_include_directories(platform_${_t} PRIVATE include)
+  basalt_embed_manifest(platform_${_t})
+  add_test(NAME platform_${_t} COMMAND platform_${_t})
+  set_tests_properties(platform_${_t} PROPERTIES TIMEOUT 120)
+endforeach()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
   target_link_libraries(pinned_shared_test PRIVATE core ${_gpu_runtime_target})
@@ -810,7 +821,7 @@ set_source_files_properties(src/kernels/cpu/expert.cpp
                             PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 find_package(Threads REQUIRED)
-target_link_libraries(kernels_cpu PUBLIC Threads::Threads)
+target_link_libraries(kernels_cpu PUBLIC Threads::Threads platform)
 
 # ---- ggml, extracted ----
 #
@@ -994,8 +1005,9 @@ if(BUILD_TESTING)
   if(NOT WIN32)
     add_executable(cpu_quota_test src/kernels/cpu/cpu_quota_test.cpp)
     target_link_libraries(cpu_quota_test PRIVATE kernels_cpu)
-    basalt_cpu_test(NAME cpu_quota_test COMMAND cpu_quota_test)
-    add_executable(pool_affinity_test src/kernels/cpu/pool_affinity_linux_test.cpp)
+    add_test(NAME cpu_quota_test COMMAND cpu_quota_test)
+    add_executable(pool_affinity_test tests/platform/affinity_linux_test.cpp)
+    target_include_directories(pool_affinity_test PRIVATE src/platform)
     target_link_libraries(pool_affinity_test PRIVATE kernels_cpu)
     basalt_cpu_test(NAME pool_affinity_test COMMAND pool_affinity_test)
   endif()

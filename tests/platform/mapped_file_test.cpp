@@ -116,7 +116,7 @@ int main() {
             std::fclose(f);
             MapOptions o;
             o.offset = 4ull << 30;
-            o.bytes = 16384;
+            o.bytes = 8196;
             auto m = MappedFile::open_ro(big, &err, o);
             check(m.has_value() && m->file_size() == at + 4 && std::memcmp(m->data() + 8192, mark, 4) == 0,
                   "section at a 64-bit offset");

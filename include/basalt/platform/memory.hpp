@@ -45,8 +45,8 @@ enum class RegionBacking { LargePages, NormalPages };
 /// bytes are zero-filled and committed (Windows) or demand-faulted (Linux). A non-empty `shared_file` instead maps one
 /// file whose first 4 KiB identify the pack (`shared_hash`, which must not be 0) and whose remaining bytes are the
 /// region - Linux only, meant for tmpfs; elsewhere it fails with a note. `mapping_base` and `mapping_bytes` are what
-/// `free_region` releases (the region itself unless the file header precedes it; both unset on failure). nullptr on
-/// failure.
+/// `free_region` releases: the region itself, or the file mapping that its header precedes; both are 0 when nothing
+/// was allocated. nullptr on failure.
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
                    uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes);
 /// Releases what `alloc_region` returned through `mapping_base` and `mapping_bytes`. A null is fine.

@@ -6,9 +6,7 @@
 #include <cstring>
 #include <thread>
 
-#if defined(_MSC_VER)
-#include <immintrin.h>
-#endif
+#include "basalt/platform/compiler.hpp"
 
 #include "gemm_cpu.hpp"
 
@@ -16,15 +14,7 @@ namespace basalt::vision {
 
 namespace {
 
-// The fp32 -> half -> fp32 round trip the reference quantizes with. Where the compiler has a half type it does the
-// conversion; MSVC has none, and its F16C intrinsic pair is the same instruction with the same rounding.
-#if defined(_MSC_VER)
-float f16_round(float x) {
-    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtps_ph(_mm_set_ss(x), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
-}
-#else
-float f16_round(float x) { return (float) (_Float16) x; }
-#endif
+float f16_round(float x) { return platform::f16_round(x); }
 
 void parallel_for(int threads, int n, const std::function<void(int, int)>& fn) {
     threads = std::max(1, std::min(threads, n));

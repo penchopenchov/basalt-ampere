@@ -390,8 +390,8 @@ std::string commit_headroom_note() {
 }  // namespace
 
 
-void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
-                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
+                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
     if (!shared_file.empty()) {
@@ -491,8 +491,8 @@ struct SharedArenaHeader {
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 }  // namespace
 
-void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
-                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
+                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
     if (!shared_file.empty()) {
@@ -634,5 +634,16 @@ void free_region(void* p, uint64_t bytes) {
 
 bool pin_budget(uint64_t&, std::string&) { return false; }   // no OS-side budget below the driver's own limit
 #endif
+
+void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
+                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+    void* p = alloc_region_raw(bytes, got, note, shared_file, shared_hash, mapping_base, mapping_bytes);
+    if (p != nullptr && mapping_base == nullptr) {   // not a file mapping: the region is what gets released
+        mapping_base = p;
+        mapping_bytes = bytes;
+    }
+    return p;
+}
+
 
 }  // namespace basalt::platform

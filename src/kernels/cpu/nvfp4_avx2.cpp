@@ -13,6 +13,7 @@
 
 #include <immintrin.h>
 
+#include <bit>
 #include <cmath>
 #include <cstring>
 
@@ -28,7 +29,7 @@ struct ScaleLut {
             const uint32_t e = x >> 3, m = x & 7;
             if (x == 0 || x == 0x7F) v[x] = 0.0f;
             else if (e == 0) v[x] = (float) m * (1.0f / 1024.0f);
-            else v[x] = __builtin_bit_cast(float, ((e + 119) << 23) | (m << 20));
+            else v[x] = std::bit_cast<float>((uint32_t) (((e + 119) << 23) | (m << 20)));
         }
     }
 };
