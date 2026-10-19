@@ -37,6 +37,8 @@ struct FusedLayerArgs {
 /// Allocate the kernel's scratch (outside a stream capture, once).  False when the device cannot run it; the reason is printed.
 bool fused_layer_init();
 bool fused_layer_supported(const FusedLayerArgs& a);
+// whether the experts half has kernels for a layer's gate/up and down expert formats
+bool fused_layer_experts_ok(int gu_type, int d_type);
 /// Enqueue the layer.  Exits on invalid arguments.
 void fused_layer(const FusedLayerArgs& a, void* stream);
 /// The kernel's recorded wait failures, one line (empty when none); for the engine's error path.

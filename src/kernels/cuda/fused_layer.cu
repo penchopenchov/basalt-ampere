@@ -262,6 +262,8 @@ bool fused_layer_init() {
     return d.ok;
 }
 
+bool fused_layer_experts_ok(int gu_type, int d_type) { return gu_type_ok(gu_type) && d_type_ok(d_type); }
+
 bool fused_layer_supported(const FusedLayerArgs& a) {
     const FusedDev& d = fz_dev();
     const AttnChainArgs& c = a.chain;

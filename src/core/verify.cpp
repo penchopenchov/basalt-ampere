@@ -1434,7 +1434,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     fz.host_seq_m = m_seq_; fz.peer_seq_m = dm_->m_w; fz.abort_m = dm_->m_w + 32;
                     fz_try = basalt::kernels::fused_layer_supported(fz);
                     if (!fz_try) {
-                        const bool covered_shape = (fz.sgt == 12 || fz.sgt == 13 || fz.sgt == 14 || fz.sgt == 23 || fz.sgt == 21) &&
+                        const bool covered_shape = basalt::kernels::fused_layer_experts_ok(f.gu_type, f.d_type) &&
+                                               (fz.sgt == 12 || fz.sgt == 13 || fz.sgt == 14 || fz.sgt == 23 || fz.sgt == 21) &&
                                                (fz.sdt == 20 || fz.sdt == 8);
                         if (covered_shape) {   // a covered shape that the kernel then refuses is an error, not a silent fallback
                             std::fprintf(stderr, "verify: FATAL: fused layer %d refused (gu %d d %d shared %d/%d/%d)\n", (int) l, f.gu_type,
