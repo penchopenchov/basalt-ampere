@@ -150,6 +150,10 @@ FusedDev& fz_dev() {
 }
 constexpr int kCtas = FZ_NSC::R_CTA0 + FZ_NSC::R_HV;
 bool fz_type_ok(int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23; }
+// the experts half's kernels: gate/up types its pair switch has, down types its two down paths (the engine's other
+// expert formats keep the separate kernels)
+bool gu_type_ok(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23; }
+bool d_type_ok(int t) { return t == 20 || t == 42; }
 bool sh_type_ok(int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23; }
 #endif
 using FzFn = void (*)(FZ_NSC::KP, MB::KP);
@@ -267,6 +271,7 @@ bool fused_layer_supported(const FusedLayerArgs& a) {
            ((uintptr_t) c.rec.state & 15) == 0 && ((uintptr_t) c.h1.xq & 3) == 0 && a.ptab != nullptr && a.sg && a.su && a.sd &&
            a.sgi && a.bo && a.ring_m && a.peer_rows && a.cpu_rows && a.peer_done && a.cpu_done && a.ring_m && a.x_m && a.xq_m &&
            a.host_seq_m && a.peer_seq_m && sh_type_ok(a.sgt) && sh_type_ok(a.sut) && (a.sdt == 20 || a.sdt == 8) &&
+           gu_type_ok(a.gu_type) && d_type_ok(a.d_type) &&
            native_expert_layout(a.gu_type, a.d_type, N, MB::NFF).bytes > 0 && dec_moe_glue_ok(native_expert_layout(a.gu_type, a.d_type, N, MB::NFF)) &&
            a.ord >= 0 && a.ord < kFusedMaxLaunches;
 }
