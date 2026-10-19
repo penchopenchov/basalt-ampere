@@ -4,7 +4,7 @@
 #ifndef MKB_NS
 #define MKB_NS 2000000000u
 #endif
-__device__ __noinline__ __attribute__((noreturn)) void mkb_hang(int code, int line) {   // out of line, never returns
+[[noreturn]] __device__ __noinline__ void mkb_hang(int code, int line) {   // out of line, never returns
     printf("attn_chain: wait timed out (kind %d, line %d) cta %d thread %d\n", code, line, (int) blockIdx.x, (int) threadIdx.x);
     asm volatile("membar.sys;\ntrap;" ::: "memory");
     while (true) {}
