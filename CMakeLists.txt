@@ -476,7 +476,7 @@ if(NOT _iq_python STREQUAL "")
                    --out ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
   # exit 3: numpy or the vendored gguf-py is missing (a trimmed checkout) - a skip, not a failure
   set_tests_properties(iq_parity_fixtures PROPERTIES FIXTURES_SETUP iq_fixture_data SKIP_RETURN_CODE 3)
-  basalt_cpu_test(NAME iq_parity COMMAND iq_parity ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
+  basalt_gpu_test(NAME iq_parity COMMAND iq_parity ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
   set_tests_properties(iq_parity PROPERTIES FIXTURES_REQUIRED iq_fixture_data SKIP_RETURN_CODE 3)
   # the converter's own tests (the checkpoint repack, the pack sections, the requantizers): plain unittest, host only
   basalt_cpu_test(NAME convert_tests COMMAND ${_iq_python} -m unittest discover -s tools/convert -p "test_*.py"
