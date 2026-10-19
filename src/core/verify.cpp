@@ -557,7 +557,14 @@ bool Verifier::dm_init(std::string& err) {
              cudaMalloc(&d->pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
-        d->tag = false;   // no tag protocol: every combine waits for the peer window
+        // the tag protocol is off only when a fused layer can run: its combine waits for the peer window instead
+        bool any_fused = false;
+        if (fused_ok_)
+            for (int64_t l = lb_; l < le_; ++l) {
+                const auto& f = lay.fmt[(size_t) l];
+                any_fused |= basalt::kernels::fused_layer_experts_ok(f.gu_type, f.d_type);
+            }
+        d->tag = !any_fused;
         d->rows_words = (size_t) (T * K * N);
         for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
