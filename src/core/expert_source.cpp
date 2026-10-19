@@ -1488,6 +1488,14 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     return result;
 }
 
+const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) const {
+    if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (complement_offsets_[index] != kNoComplement)
+        return host_at(complement_offsets_[index], layer_blob_bytes_[(size_t) layer]);
+    return !override_.empty() ? override_[index] : nullptr;
+}
+
 // A helper thread issues the read-ahead so the caller never waits on the kernel.  The queue is bounded; a request
 // that does not fit is dropped (the pages are then read on first touch, as without the advice).
 struct FileExpertSource::AdviseWorker {
@@ -2314,6 +2322,12 @@ const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) co
     // one registration slice per layer
     if ((size_t) layer >= dev_slice_.size()) return nullptr;
     return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
+}
+
+const uint8_t* ArenaExpertSource::resident_blob(int64_t layer, int64_t expert) const {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_ || layer * n_expert_ + expert >= blobs_)
+        return nullptr;
+    return base_ + basalt::kernels::cpu::expert_layout().blob_offset(layer, expert);
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {

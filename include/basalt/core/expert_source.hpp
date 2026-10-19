@@ -149,6 +149,10 @@ public:
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
 
+    /// The blob of `(layer, expert)` when it sits in RAM already (no read, no count), else null.  Valid during a verify
+    /// window: the places move only between windows.
+    virtual const uint8_t* resident_blob(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+
     /// Whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an asynchronous host-to-device
     /// copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
@@ -499,6 +503,7 @@ public:
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    const uint8_t* resident_blob(int64_t layer, int64_t expert) const override;
     void advise_cpu(int64_t layer, const int32_t* ids, int64_t n) const override;
     bool pinned(int64_t layer, int64_t expert) const override;
     bool file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const override;
@@ -592,6 +597,7 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    const uint8_t* resident_blob(int64_t layer, int64_t expert) const override;
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
