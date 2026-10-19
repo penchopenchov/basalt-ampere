@@ -1,5 +1,6 @@
 #include "basalt/core/native_head.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -73,13 +74,11 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         cudaError_t status = cudaMalloc(&weights, bytes);
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, basalt::kernels::native_q8_1_bytes((int) n_in, 1));
-        basalt::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
-        if (status == cudaSuccess)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
-        if (status != cudaSuccess) {
+        std::string upload_err;
+        if (status != cudaSuccess || !DirectUploader().upload(gguf.path(), gguf.data_start() + tensor->offset, bytes, weights, upload_err)) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
-            err = std::string("native head upload: ") + cudaGetErrorString(status);
+            err = std::string("native head upload: ") + (status != cudaSuccess ? cudaGetErrorString(status) : upload_err);
             return false;
         }
         progress.add(bytes);
@@ -144,6 +143,7 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
+    if (hot_) cudaFree(hot_);
     if (host_) cudaFreeHost(host_);
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
 }
@@ -197,6 +197,16 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                 return false;
             }
             dev_ = d;
+            // the hot rows: without the VRAM for them every row stays on the mapped path
+            const int64_t n_hot = kHotRows < n_vocab ? kHotRows : n_vocab;
+            if (cudaMalloc(&hot_, (size_t) n_hot * row_) == cudaSuccess &&
+                cudaMemcpy(hot_, host_, (size_t) n_hot * row_, cudaMemcpyHostToDevice) == cudaSuccess) {
+                n_hot_ = n_hot;
+            } else {
+                if (hot_) cudaFree(hot_);
+                hot_ = nullptr;
+                cudaGetLastError();
+            }
         }
         type_ = (int) t->type;
         n_embd_ = n_embd;
@@ -209,11 +219,12 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
 }
 
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
-    basalt::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream);
+    basalt::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream, hot_, n_hot_);
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    basalt::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    const uint8_t* table = (const uint8_t*) (token < n_hot_ ? hot_ : dev_);
+    basalt::kernels::iq_dequant_f32(type_, table + (size_t) token * row_, n_embd_, out, stream);
 }
 
 }  // namespace basalt::core

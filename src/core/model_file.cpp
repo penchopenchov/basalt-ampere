@@ -3,10 +3,8 @@
 #include "basalt/core/model_file.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -14,61 +12,71 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace basalt::core {
 
 // ================================ byte ranges ================================
 
-namespace {
-
-bool file_size_of(const std::string& path, uint64_t& size) {
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) return false;
-    size = (uint64_t) st.st_size;
-    return true;
-}
-
-bool pread_all(int fd, void* dst, uint64_t n, uint64_t off) {
-    uint8_t* p = (uint8_t*) dst;
-    while (n > 0) {
-        const size_t want = (size_t) std::min<uint64_t>(n, 1ull << 30);
-        const ssize_t got = ::pread(fd, p, want, (off_t) off);
-        if (got < 0 && errno == EINTR) continue;
-        if (got <= 0) return false;
-        p += got;
-        off += (uint64_t) got;
-        n -= (uint64_t) got;
-    }
-    return true;
-}
-
-}  // namespace
-
 bool FileRange::exists() const {
     uint64_t sz = 0;
-    if (path.empty() || !file_size_of(path, sz)) return false;
+    if (path.empty() || !platform::file_size(path, sz)) return false;
     return offset <= sz && (bytes == 0 || bytes <= sz - offset);
 }
 
 uint64_t FileRange::size() const {
     uint64_t sz = 0;
-    if (path.empty() || !file_size_of(path, sz) || offset > sz) return 0;
+    if (path.empty() || !platform::file_size(path, sz) || offset > sz) return 0;
     return bytes != 0 ? bytes : sz - offset;
 }
 
+namespace {
+
+// A large read without the file cache: block-aligned unbuffered reads into an aligned bounce buffer, copied out.
+// False when the file system, the platform or the allocation refuses, and the caller takes the ordinary read.
+bool pread_direct(const std::string& path, void* dst, uint64_t n, uint64_t off) {
+    constexpr uint64_t kAlign = 4096, kChunk = 16ull << 20;
+    const int fd = platform::open_unbuffered(path);
+    if (fd < 0) return false;
+    void* bounce = basalt::platform::alloc_aligned((size_t) (std::min<uint64_t>(n, kChunk) + 2 * kAlign), kAlign);
+    if (bounce == nullptr) { platform::close_fd(fd); return false; }
+    bool ok = true;
+    for (uint64_t done = 0; ok && done < n;) {
+        const uint64_t pos = off + done, len = std::min<uint64_t>(kChunk, n - done);
+        const uint64_t a0 = pos - pos % kAlign, a1 = (pos + len + kAlign - 1) / kAlign * kAlign;
+        uint64_t got = 0;
+        while (got < pos + len - a0) {
+            const int64_t r = platform::pread(fd, (uint8_t*) bounce + got, (size_t) (a1 - a0 - got), a0 + got);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) break;
+            got += (uint64_t) r;
+        }
+        ok = got >= pos + len - a0;
+        if (ok) std::memcpy((uint8_t*) dst + done, (uint8_t*) bounce + (pos - a0), (size_t) len);
+        done += len;
+    }
+    basalt::platform::free_aligned(bounce);
+    platform::close_fd(fd);
+    return ok;
+}
+
+}  // namespace
+
 bool read_range_at(const FileRange& r, uint64_t off, void* dst, uint64_t n, std::string& err) {
     if (r.bytes != 0 && (off > r.bytes || n > r.bytes - off)) { err = "read past the end of a section of " + r.path; return false; }
-    const int fd = ::open(r.path.c_str(), O_RDONLY);
+    constexpr uint64_t kDirectMin = 256ull << 10;
+    if (n >= kDirectMin && pread_direct(r.path, dst, n, r.offset + off)) return true;
+    const int fd = platform::open_fd_utf8(r.path);
     if (fd < 0) { err = "cannot open " + r.path; return false; }
-    const bool ok = pread_all(fd, dst, n, r.offset + off);
-    ::close(fd);
+    const bool ok = platform::pread_all(fd, dst, n, r.offset + off);
+    platform::close_fd(fd);
     if (!ok) err = "short read from " + r.path;
     return ok;
 }
 
 bool read_range(const FileRange& r, std::vector<uint8_t>& out, std::string& err) {
     uint64_t sz = 0;
-    if (r.path.empty() || !file_size_of(r.path, sz)) { err = "cannot open " + r.path; return false; }
+    if (r.path.empty() || !platform::file_size(r.path, sz)) { err = "cannot open " + r.path; return false; }
     if (r.offset > sz || (r.bytes != 0 && r.bytes > sz - r.offset)) {
         err = r.path + ": the section runs past the end of the file";
         return false;
@@ -266,14 +274,14 @@ bool ModelFile::open(const std::string& path, std::string& err) {
     meta_ = Json{};
     meta_loaded_ = false;
     uint64_t actual = 0;
-    if (!file_size_of(path, actual)) { err = "cannot open " + path; return false; }
+    if (!platform::file_size(path, actual)) { err = "cannot open " + path; return false; }
     if (actual < kHeaderBytes) { err = path + ": not a .basalt model file (too short)"; return false; }
     std::vector<uint8_t> head((size_t) kHeaderBytes);
     {
-        const int fd = ::open(path.c_str(), O_RDONLY);
+        const int fd = platform::open_fd_utf8(path);
         if (fd < 0) { err = "cannot open " + path; return false; }
-        const bool ok = pread_all(fd, head.data(), kHeaderBytes, 0);
-        ::close(fd);
+        const bool ok = platform::pread_all(fd, head.data(), kHeaderBytes, 0);
+        platform::close_fd(fd);
         if (!ok) { err = "cannot read the header of " + path; return false; }
     }
     FileHeader h;
@@ -457,7 +465,7 @@ bool hc8_write(const std::string& path, const std::vector<Hc8Copy>& copies, std:
     h.version = 1;
     h.n_entries = (uint32_t) copies.size();
     const std::string tmp = path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    std::FILE* f = platform::open_file_utf8(tmp, "wb");
     if (f == nullptr) { err = "hc8: cannot create " + tmp; return false; }
     bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
               (entries.empty() || std::fwrite(entries.data(), sizeof(Hc8Entry), entries.size(), f) == entries.size());

@@ -61,6 +61,6 @@ const ExpertLayout& expert_layout();
 /// `layer gu_type d_type offset blob_bytes`; further columns are ignored).  A newer version is refused.
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err);
 /// The newest layout version this engine reads.
-inline constexpr int kExpertLayoutVersion = 5;
+inline constexpr int kExpertLayoutVersion = 6;   // v6: NVFP4 blobs end in a 16-byte scale tail
 
 }  // namespace basalt::kernels::cpu

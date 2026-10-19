@@ -42,7 +42,8 @@ public:
     size_t tensor_count() const { return weights_.size(); }
 
 private:
-    std::vector<void*> weights_;
+    std::vector<void*> weights_;   // each matrix
+    std::vector<void*> allocs_;    // the device allocations holding them
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
 };

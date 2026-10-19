@@ -15,9 +15,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import convert  # noqa: E402
+import ggufq  # noqa: E402
 import model_sections as S  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402
-from model_file import ModelFile  # noqa: E402
+from model_file import ModelFile, ModelWriter  # noqa: E402
 
 N_EXPERT, N_LAYERS = 4, 2
 TOKENS = ["a", "b", "c", "d", "e", "f"]
@@ -86,7 +87,7 @@ class ConvertTest(unittest.TestCase):
         t = self.t
         d = dict(gguf=[str(self.gguf)], mmproj=str(t / "mmproj.gguf"), out=str(t / "out.basalt"), mtp_source=None, mtp_dense=None,
                  draft_vocab=None, profile=None, profile_from=None, hc8=str(t / "hc8.bin"), name="Tiny",
-                 compat_bf16=False, no_vision=False, force=False)
+                 compat_bf16=False, no_vision=False, force=False, sections_from=None)
         d.update(kw)
         return type("A", (), d)()
 
@@ -258,11 +259,95 @@ class ConvertTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             convert.convert(self.args(draft_vocab=str(self.t / "dv.bin")))
 
+    # ---------------------------------------------------------------- per-layer expert formats
+    def mixed_gguf(self, gu_types):
+        """A GGUF whose layer l has gate/up of gu_types[l] (K-quant blocks, random bytes) and Q8_0 down."""
+        rng = np.random.default_rng(7)
+        blk = {"Q5_K": 176, "Q6_K": 210}
+        g = GGUFWriter()
+        g.add("general.architecture", "qwen")
+        g.add("qwen.block_count", len(gu_types), "u32")
+        g.add("tokenizer.ggml.tokens", TOKENS)
+        g.add_f32("token_embd.weight", self.embd)
+        g.add_f32("per_layer_token_embd.weight", self.ple)
+        raw = {}
+        for l, gt in enumerate(gu_types):
+            g.add_f32(f"blk.{l}.ffn_gate_inp.weight", self.router)
+            for role, t, cols, nb in (("gate", gt, 256, blk[gt]), ("up", gt, 256, blk[gt]), ("down", "Q8_0", 32, 34)):
+                data = rng.bytes(nb * 2 * N_EXPERT)
+                raw[(l, role)] = data
+                g.add_raw(f"blk.{l}.ffn_{role}_exps.weight", [cols, 2, N_EXPERT], t, data)
+        return g.write(self.t / "mixed-00001-of-00001.gguf"), raw
+
+    def test_mixed_k_quant_layers_are_copied_byte_for_byte(self):
+        types = ["Q5_K", "Q6_K", "Q5_K"]
+        path, raw = self.mixed_gguf(types)
+        convert.convert(self.args(gguf=[str(path)]))
+        m = self.model()
+        out, off = m.read("experts"), 0
+        lines = m.read("experts.layout").decode().splitlines()[1:]
+        sizes = {"Q5_K": 176, "Q6_K": 210}
+        for l, gt in enumerate(types):
+            blob = 2 * (2 * sizes[gt]) + 2 * 34
+            self.assertEqual(lines[l], f"{l} {13 if gt == 'Q5_K' else 14} 8 {off} {blob}")
+            for e in range(N_EXPERT):
+                want = b"".join(raw[(l, r)][e * (len(raw[(l, r)]) // N_EXPERT):(e + 1) * (len(raw[(l, r)]) // N_EXPERT)]
+                                for r in ("gate", "up", "down"))
+                self.assertEqual(out[off + e * blob:off + (e + 1) * blob], want, (l, e))
+            off += blob * N_EXPERT
+        self.assertEqual(off, len(out))
+
+    def test_gate_up_type_mismatch_is_refused(self):
+        g = GGUFWriter()
+        rng = np.random.default_rng(1)
+        g.add("general.architecture", "qwen")
+        g.add("qwen.block_count", 1, "u32")
+        g.add("tokenizer.ggml.tokens", TOKENS)
+        g.add_f32("blk.0.ffn_gate_inp.weight", self.router)
+        g.add_raw("blk.0.ffn_gate_exps.weight", [256, 2, N_EXPERT], "Q5_K", rng.bytes(176 * 2 * N_EXPERT))
+        g.add_raw("blk.0.ffn_up_exps.weight", [256, 2, N_EXPERT], "Q6_K", rng.bytes(210 * 2 * N_EXPERT))
+        g.add_raw("blk.0.ffn_down_exps.weight", [32, 2, N_EXPERT], "Q8_0", rng.bytes(34 * 2 * N_EXPERT))
+        bad = g.write(self.t / "bad-00001-of-00001.gguf")
+        with self.assertRaises(SystemExit) as c:
+            convert.convert(self.args(gguf=[str(bad)]))
+        self.assertIn("gate and up differ in type", str(c.exception))
+
+    def test_sections_from_with_gguf(self):
+        import pack_vision
+        self.vision = pack_vision.vision_sections
+        convert.convert(self.args(out=str(self.t / "base.basalt")))
+        base = ModelFile(str(self.t / "base.basalt"))
+        path, _ = self.mixed_gguf(["Q6_K", "Q5_K"])
+        convert.convert(self.args(gguf=[str(path)], out=str(self.t / "new.basalt"), sections_from=str(self.t / "base.basalt"),
+                                  mmproj=None, hc8=None, name="Mixed"))
+        m = ModelFile(str(self.t / "new.basalt"))
+        for n in m.names():
+            self.assertTrue(m.verify(n), n)
+        for n in ("profile", "hc8", "vision/mmproj"):
+            self.assertEqual(m.read(n), base.read(n), n)
+        meta = json.loads(m.read("meta"))
+        self.assertEqual(meta["sections_from"]["copied"], [n for n in base.names() if n != "vision/text_vocab"
+                                                           and (n.startswith(("mtp/", "vision/")) or n in ("profile", "hc8"))])
+        self.assertEqual(m.read("vision/text_vocab"), pack_vision.vocab_only_gguf(str(path)))
+        self.assertEqual(meta["vision"], json.loads(base.read("meta"))["vision"])
+        self.assertEqual(m.read("experts.layout").decode().splitlines()[1].split()[:3], ["0", "14", "8"])
+
     def test_help(self):
         r = subprocess.run([sys.executable, str(Path(convert.__file__)), "--help"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0)
         for flag in ("--gguf", "--mtp-source", "--mtp-dense", "--mmproj", "--profile-from", "--profile ", "--hc8", "--draft-vocab"):
             self.assertIn(flag, r.stdout)
+
+    def test_checkpoint_path_takes_mtp_dense_only(self):
+        run = lambda *x: subprocess.run([sys.executable, str(Path(convert.__file__)), "--sections-from", str(self.t / "b"),
+                                         "--checkpoint", str(self.t), "--out", str(self.t / "o"), *x],
+                                        capture_output=True, text=True)
+        r = run("--mtp-dense", str(self.t / "missing.bin"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("missing input", r.stderr)
+        r = run("--mtp-source", str(self.t))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--mtp-dense", r.stderr)
 
 
 class DrafterTest(unittest.TestCase):
@@ -382,6 +467,151 @@ class DrafterTest(unittest.TestCase):
                 convert.convert(t.args(mtp_dense=str(f), force=True))
         finally:
             t.tearDown()
+
+
+class PleFp8Test(unittest.TestCase):
+    """The FP8 n-gram table as Q8_0 rows: every code decodes as the plain formula says, and the Q8_0 values stay
+    within about half a step (plus the fp16 scale rounding) of the exact products."""
+
+    @staticmethod
+    def decode(code: int) -> float:
+        sign, e, m = -1.0 if code >> 7 else 1.0, (code >> 3) & 15, code & 7
+        if e == 15 and m == 7:
+            return float("nan")
+        return sign * (m / 8 * 2.0 ** -6 if e == 0 else (1 + m / 8) * 2.0 ** (e - 7))
+
+    def test_table_matches_formula(self):
+        want = np.array([self.decode(c) for c in range(256)], dtype=np.float32)
+        np.testing.assert_array_equal(S.fp8_e4m3_table(), want)
+
+    def test_q8_0_rows(self):
+        rng = np.random.default_rng(1)
+        codes = rng.integers(0, 256, size=(7, S.PLE_DIM), dtype=np.uint8)
+        codes[(codes & 0x7F) == 0x7F] = 0x38
+        scale = 0.0125
+        got = S.fp8_rows_to_q8_0(codes, scale)
+        self.assertEqual(len(got), 7 * S.PLE_DIM // 32 * 34)
+        deq = ggufq.dequantize(np.frombuffer(got, dtype=np.uint8), ggufq.GGMLQuantizationType.Q8_0).reshape(-1, 32)
+        ref = (S.fp8_e4m3_table()[codes] * np.float32(scale)).reshape(-1, 32)
+        step = np.abs(ref).max(axis=1, keepdims=True) / 127.0
+        self.assertTrue((np.abs(deq - ref) <= step * 0.6 + 1e-9).all())
+
+    def test_reads_safetensors_shards(self):
+        rng = np.random.default_rng(2)
+        shards = [rng.integers(0, 0x70, size=(r, S.PLE_DIM), dtype=np.uint8) for r in (3, 5)]
+        stem = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+        scale_bf16 = np.array([0x3C23], dtype="<u2")            # 0.0098...
+        head, data, at = {}, b"", 0
+        for k, arr, dt in [(stem + "weight_scale", scale_bf16, "BF16"), (stem + "shard_0.weight", shards[0], "F8_E4M3"),
+                           (stem + "shard_1.weight", shards[1], "F8_E4M3")]:
+            raw = arr.tobytes()
+            head[k] = {"dtype": dt, "shape": list(arr.shape) if arr.ndim > 1 else [1], "data_offsets": [at, at + len(raw)]}
+            data += raw
+            at += len(raw)
+        hb = json.dumps(head).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.safetensors"
+            path.write_bytes(struct.pack("<Q", len(hb)) + hb + data)
+            ple = S.PleFp8(str(path), chunk_rows=4)
+            self.assertEqual(ple.rows, 8)
+            self.assertAlmostEqual(ple.scale, float((np.uint32(0x3C23) << 16).view(np.float32)), places=9)
+            got = b"".join(S._ple_job(j) for j in ple.jobs())
+            self.assertEqual(len(got), ple.nbytes)
+            want = b"".join(S.fp8_rows_to_q8_0(a, ple.scale) for a in shards)
+            self.assertEqual(got, want)
+            import multiprocessing
+            with multiprocessing.Pool(2) as pool:
+                self.assertEqual(b"".join(ple.chunks(pool, depth=2)), want)
+
+
+class BoundedImapTest(unittest.TestCase):
+    def test_order_and_depth(self):
+        class Pool:
+            live = peak = 0
+
+            def apply_async(self, fn, args):
+                Pool.live += 1
+                Pool.peak = max(Pool.peak, Pool.live)
+                return self
+
+            def get(self):
+                Pool.live -= 1
+                return 1
+
+        self.assertEqual(sum(S.bounded_imap(Pool(), None, range(20), 3)), 20)
+        self.assertEqual(Pool.peak, 3)
+
+
+class Q6KRequantTest(unittest.TestCase):
+    """Q6_K blocks decode (through the reference dequantizer) to within the 6-bit error of their source, and a pack
+    rewrite changes only the Q8_0 projections it can."""
+
+    def dequant(self, blob: bytes) -> np.ndarray:
+        return ggufq.dequantize(np.frombuffer(blob, dtype=np.uint8), ggufq.GGMLQuantizationType.Q6_K).reshape(-1)
+
+    def test_error_bound(self):
+        rng = np.random.default_rng(3)
+        x = (rng.standard_normal((64, 512)) * 0.02).astype(np.float32)
+        x[3, :256] = 0.0
+        x[4, 7] = 0.5
+        got = S.q6_k(x)
+        self.assertEqual(len(got), 64 * 2 * S.Q6K_BYTES)
+        deq = self.dequant(got).reshape(x.shape)
+        err = deq - x
+        self.assertLess(np.sqrt((err ** 2).mean()), 0.025 * x.std())
+        blk = np.abs(x).reshape(-1, 256).max(axis=1)
+        self.assertTrue((np.abs(err).reshape(-1, 256).max(axis=1) <= blk * 0.035 + 1e-7).all())
+        np.testing.assert_array_equal(deq[3, :256], 0.0)
+
+    def test_from_q8_0_is_within_both_steps(self):
+        rng = np.random.default_rng(4)
+        x = (rng.standard_normal((8, 256)) * 0.05).astype(np.float32)
+        q8 = S.q8_0(x)
+        vals = S.q8_0_values(np.frombuffer(q8, dtype=np.uint8)).reshape(x.shape)
+        self.assertLessEqual(np.abs(vals - x).max(), np.abs(x).max() / 127 * 0.51)
+        deq = self.dequant(S.q6_k(vals)).reshape(x.shape)
+        self.assertLess(np.sqrt(((deq - x) ** 2).mean()), 0.025 * x.std())
+
+    def test_gdn_head_order(self):
+        src = S.gdn_block_source()
+        self.assertEqual(sorted(src), list(range(48)))
+        self.assertEqual(list(src[:4]), [0, 3, 6, 9])           # GGUF head r * 16 + k comes from checkpoint head k * 3 + r
+        self.assertEqual(src[16], 1)
+        idx = S.gdn_index(4096 + 6144, 4096)
+        np.testing.assert_array_equal(idx[:4096], np.arange(4096))
+        self.assertEqual(sorted(idx), list(range(4096 + 6144)))
+        self.assertEqual(idx[4096 + 128], 4096 + 3 * 128)
+
+    def test_pack_rewrite(self):
+        rng = np.random.default_rng(5)
+        a = (rng.standard_normal((6, 512)) * 0.03).astype(np.float32)       # blk.0.attn_qkv: ne0 512, 6 rows
+        b = (rng.standard_normal((4, 160)) * 0.03).astype(np.float32)       # blk.0.attn_k: rows not whole blocks
+        qa, qb = S.q8_0(a), S.q8_0(b)
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            w = ModelWriter(str(t / "base.basalt"))
+            w.add_bytes("dense", b"d" * 100)
+            offs = w.add_parts("gguf", [qa, qb], 32)
+            w.add_bytes("experts", b"e" * 300)
+            tens = {"blk.0.attn_qkv.weight": {"type": "Q8_0", "type_id": 8, "shape": [512, 6], "bytes": len(qa), "offset": offs[0]},
+                    "blk.0.attn_k.weight": {"type": "Q8_0", "type_id": 8, "shape": [160, 4], "bytes": len(qb), "offset": offs[1]}}
+            w.add_bytes("meta", json.dumps({"tensors": tens}).encode())
+            w.close()
+            out = t / "out.basalt"
+            args = type("A", (), {"out": str(out), "requant_dense_q6k": str(t / "base.basalt"), "checkpoint": None,
+                                  "workers": 2, "force": False})
+            convert.requant_dense(args)
+            m = ModelFile(str(out))
+            meta = json.loads(m.read("meta"))
+            self.assertEqual(m.read("dense"), b"d" * 100)
+            self.assertEqual(m.read("experts"), b"e" * 300)
+            ta, tb = meta["tensors"]["blk.0.attn_qkv.weight"], meta["tensors"]["blk.0.attn_k.weight"]
+            self.assertEqual((ta["type"], ta["type_id"], ta["bytes"]), ("Q6_K", 14, 6 * 2 * S.Q6K_BYTES))
+            self.assertEqual(tb["type"], "Q8_0")
+            g = m.read("gguf")
+            self.assertEqual(g[tb["offset"]:tb["offset"] + tb["bytes"]], qb)
+            deq = self.dequant(g[ta["offset"]:ta["offset"] + ta["bytes"]]).reshape(a.shape)
+            self.assertLess(np.sqrt(((deq - a) ** 2).mean()), 0.03 * a.std())
 
 
 if __name__ == "__main__":

@@ -12,10 +12,6 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include <pthread.h>
-#include <sched.h>
-#include "pool_affinity_linux.hpp"
-
 namespace basalt::kernels::cpu {
 
 namespace {
@@ -24,164 +20,19 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 }
 }  // namespace
 
-CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
-    CpuTopology topo;
-    // The logical CPUs this process may run on, ONE PER PHYSICAL CORE: SMT siblings share a core's load/store
-    // bandwidth, so a worker on each would put two workers on one core.  sysfs names each CPU's (package, core); the
-    // first allowed CPU of each pair is kept, so a taskset that leaves out the first sibling still gets its core.
-    // Without sysfs every allowed CPU counts.
-    auto topo_read = [](int cpu, const char* what) -> long {
-        char path[96];
-        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
-        long v = -1;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-            std::fclose(f);
-        }
-        return v;
-    };
-    auto cap_read = [](int cpu) -> long {
-        char path[96];
-        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
-        long v = -1;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-            std::fclose(f);
-        }
-        return v;
-    };
-
-    std::vector<int> allowed;
-    std::vector<unsigned long> allowed_mask;
-    if (detail::get_thread_affinity(allowed_mask, &allowed) != 0) {
-        for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) allowed.push_back((int) i);
-    }
-
-    struct CoreLinux {
-        int cpu = -1;
-        long pkg = -1;
-        long core = -1;
-        long cap = -1;
-        bool is_sibling = false;
-    };
-    std::vector<CoreLinux> all_cpus;
-    std::vector<std::pair<long, long>> seen_phys;
-    long max_cap = 0, min_cap = 1000000;
-
-    for (int cpu : allowed) {
-        CoreLinux cl;
-        cl.cpu = cpu;
-        cl.pkg = topo_read(cpu, "physical_package_id");
-        cl.core = topo_read(cpu, "core_id");
-        cl.cap = cap_read(cpu);
-        if (cl.cap > 0) {
-            max_cap = (std::max)(max_cap, cl.cap);
-            min_cap = (std::min)(min_cap, cl.cap);
-        }
-        if (cl.pkg >= 0 && cl.core >= 0) {
-            const std::pair<long, long> key{cl.pkg, cl.core};
-            if (std::find(seen_phys.begin(), seen_phys.end(), key) != seen_phys.end()) {
-                cl.is_sibling = true;
-            } else {
-                seen_phys.push_back(key);
-            }
-        }
-        all_cpus.push_back(cl);
-    }
-
-    topo.is_hybrid = (max_cap > 0 && max_cap > min_cap);
-    if (topo.is_hybrid) {
-        for (const auto& cl : all_cpus) {
-            if (cl.cap == max_cap) {
-                if (!cl.is_sibling) topo.p_cores++;
-                topo.p_threads++;
-            } else {
-                if (!cl.is_sibling) topo.e_cores++;
-            }
-        }
-    } else {
-        topo.p_cores = (int) seen_phys.size();
-        topo.p_threads = (int) all_cpus.size();
-    }
-
-    if (affinity == PoolAffinity::All || !topo.is_hybrid) {
-        if (topo.is_hybrid)
-            std::stable_sort(all_cpus.begin(), all_cpus.end(),
-                             [](const CoreLinux& x, const CoreLinux& y) { return x.cap > y.cap; });
-        for (const auto& cl : all_cpus) {
-            if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
-        }
-        if (skip_first && !topo.worker_cores.empty()) {
-            topo.host_core = topo.worker_cores.front();
-            topo.worker_cores.erase(topo.worker_cores.begin());
-        }
-        return topo;
-    }
-
-    // Hybrid CPU:
-    std::vector<int> p_primaries;
-    std::vector<int> p_siblings;
-    std::vector<int> e_cores;
-
-    for (const auto& cl : all_cpus) {
-        if (cl.cap == max_cap) {
-            if (!cl.is_sibling) p_primaries.push_back(cl.cpu);
-            else p_siblings.push_back(cl.cpu);
-        } else {
-            e_cores.push_back(cl.cpu);
-        }
-    }
-
-    if (skip_first && !p_primaries.empty()) {
-        topo.host_core = p_primaries.front();
-        p_primaries.erase(p_primaries.begin());
-    }
-
-    for (int cpu : p_primaries) topo.worker_cores.push_back(cpu);
-    for (int cpu : p_siblings) topo.worker_cores.push_back(cpu);
-    if (affinity != PoolAffinity::PCores) {
-        for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
-    }
-    return topo;
-    return topo;
-}
-
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
     return detect_cpu_topology(skip_first, affinity).worker_cores;
 }
 
 namespace {
 
-bool pin_this_thread(int core, [[maybe_unused]] int worker = -1) {
-    if (core < 0) return false;
-    const int error = detail::pin_thread_to_cpu(core);
-    if (error != 0)
-        std::fprintf(stderr, "basalt cpu pool: affinity for worker %d (CPU %d) failed: %d; previous affinity kept\n",
-                     worker, core, error);
-    return error == 0;
-}
+bool pin_this_thread(int core, int worker = -1) { return platform::set_thread_affinity(core, worker); }
 
 }  // namespace
 
-ThreadAffinity pin_current_thread(int core) {
-    if (core < 0) return {};
-    ThreadAffinity previous;
-    int error = detail::get_thread_affinity(previous.mask);
-    if (error == 0) error = detail::pin_thread_to_cpu(core);
-    if (error != 0) {
-        std::fprintf(stderr, "basalt cpu pool: host affinity for CPU %d failed: %d; previous affinity kept\n", core, error);
-        return {};
-    }
-    previous.valid = true;
-    return previous;
-}
+ThreadAffinity pin_current_thread(int core) { return platform::pin_current_thread(core); }
 
-void restore_thread_affinity(const ThreadAffinity& previous) {
-    if (!previous.valid) return;
-    const int error = detail::set_thread_affinity(previous.mask);
-    if (error != 0)
-        std::fprintf(stderr, "basalt cpu pool: host affinity restoration failed: %d\n", error);
-}
+void restore_thread_affinity(const ThreadAffinity& previous) { platform::restore_thread_affinity(previous); }
 
 namespace {
 std::atomic<const ExpertPool*> g_diag_pool{nullptr};
@@ -256,6 +107,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
 ExpertPool::~ExpertPool() {
     const ExpertPool* self = this;
     g_diag_pool.compare_exchange_strong(self, nullptr);
+    idle_stop();
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();
@@ -401,7 +253,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
-        if (mode_ == 0) {
+        if (mode_ == 7) {
+            idle_fn_(idle_ctx_, (int) i, n_, idle_halt_);
+        } else if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
         } else if (mode_ == 1) {
@@ -473,7 +327,41 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
+void ExpertPool::idle_start(IdleFn fn, void* ctx) {
+    if (n_ == 1 || fn == nullptr) return;
+    idle_stop();
+    wait_parked("before idle work");
+    idle_fn_ = fn;
+    idle_ctx_ = ctx;
+    idle_halt_.store(false, std::memory_order_relaxed);
+    mode_ = 7;
+    njobs_ = n_;
+    begin_batch(n_);   // the host does not drain it
+    idle_live_ = true;
+}
+
+void ExpertPool::idle_stop() {
+    if (!idle_live_) return;
+    idle_halt_.store(true, std::memory_order_release);
+    // no job of the idle batch can be claimed from here on (a late sleeper's claim fails), and the claimed ones end
+    // before the next batch resets `done`
+    uint64_t h = head_.load(std::memory_order_acquire);
+    uint32_t claimed = 0;
+    for (;;) {
+        const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
+        claimed = i < n ? i : n;
+        if (i >= n || head_.compare_exchange_weak(h, (h & ~(uint64_t) 0xffffu) | n, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire))
+            break;
+    }
+    wait_done((int) claimed);
+    wait_parked("after idle work");
+    idle_live_ = false;
+    mode_ = 0;
+}
+
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    idle_stop();
     wait_parked("before a phase");
     mode_ = mode;
     njobs_ = n_tasks;
@@ -582,6 +470,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     //
     // THE THREE PHASES ARE TIMED SEPARATELY.  They were one number, which cannot distinguish a pool that is
     // slow at the WORK from one that is slow at the SYNCHRONISATION - and those need opposite fixes.
+    idle_stop();
     const auto t_a = std::chrono::steady_clock::now();
     wait_parked("before a batch");
     const auto t_b = std::chrono::steady_clock::now();

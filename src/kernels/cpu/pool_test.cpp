@@ -15,6 +15,7 @@
 //      nothing and `n > workers` is the real case (10 experts, 5 workers).
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/platform/file.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -30,11 +31,25 @@ namespace cpu = basalt::kernels::cpu;
 
 namespace {
 
-bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
+/// A deterministic stand-in for the blob at an index: random 2-bit codes and fp16 scales in the range real packs use.
+/// Distinct indices give distinct data, which is what the structural checks need.
+void synth_blob(long long index, std::vector<uint8_t>& out) {
     out.assign(cpu::BLOB, 0);
-    std::FILE* f = std::fopen(path, "rb");
+    std::mt19937 rng((uint32_t) (index * 2654435761ull + 17));
+    for (size_t i = 0; i < cpu::O_GU_SCALES; ++i) out[i] = (uint8_t) rng();
+    for (size_t i = cpu::O_GU_SCALES; i < cpu::BLOB; i += 2) {
+        const uint16_t h = (uint16_t) (0x1C00 + rng() % 0x0800);
+        std::memcpy(out.data() + i, &h, 2);
+    }
+}
+
+bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
+    if (path == nullptr) { synth_blob(index, out); return true; }
+    out.assign(cpu::BLOB, 0);
+    std::FILE* f = basalt::platform::open_file_utf8(path, "rb");
     if (!f) return false;
-    if (fseeko(f, (off_t) index * (off_t) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
+    // The blob a layer index points at can sit past 4 GiB, so the seek has to be a 64-bit one.
+    if (basalt::platform::fseek64(f, index * (long long) cpu::BLOB, SEEK_SET) != 0) { std::fclose(f); return false; }
     const size_t got = std::fread(out.data(), 1, out.size(), f);
     std::fclose(f);
     return got == out.size();
@@ -49,14 +64,14 @@ double now_ms() {
 
 int main(int argc, char** argv) {
     bool selftest = false;
-    const char* path = "experts.bin";
+    const char* path = nullptr;   // null: a synthetic fixture; --file reads real expert blobs
     long long layer = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--file" && i + 1 < argc) path = argv[++i];
         else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
-        else { std::fprintf(stderr, "usage: pool_test [--selftest] [--file P] [--layer N]\n"); return 2; }
+        else { std::fprintf(stderr, "usage: pool_test [--selftest] [--file experts.bin] [--layer N]\n"); return 2; }
     }
 
     const cpu::CpuFeatures feat = cpu::cpu_features();
@@ -74,7 +89,7 @@ int main(int argc, char** argv) {
     std::vector<std::vector<uint8_t>> blobs((size_t) NEXP);
     for (int e = 0; e < NEXP; ++e)
         if (!read_blob(path, layer * 512 + e, blobs[(size_t) e])) {
-            std::fprintf(stderr, "cannot read expert %d of layer %lld from %s\n", e, layer, path);
+            std::fprintf(stderr, "cannot read expert %d of layer %lld from %s\n", e, layer, path ? path : "the fixture");
             return 2;
         }
 

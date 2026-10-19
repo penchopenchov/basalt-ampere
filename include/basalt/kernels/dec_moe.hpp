@@ -51,7 +51,8 @@ struct DmRouteArgs {
     void* xq = nullptr;              ///< device: n_tok q8_1 rows (block_q8_1, n_embd / 32 per row)
     DmRing* ring_m = nullptr;        ///< mapped: this ring's header
     float* x_m = nullptr;            ///< mapped: this ring's FFN input (written when the CPU has entries)
-    void* xq_m = nullptr;            ///< mapped: this ring's q8_1 rows (written when the peer has entries)
+    void* xq_m = nullptr;            ///< mapped: this ring's q8_1 rows (written when the peer has entries, or `rows`)
+    bool rows = false;               ///< publish the q8_1 rows in every ring (the peer's warm-up predicts from them)
     uint32_t* host_seq_m = nullptr;  ///< mapped doorbells: the ring is stored once everything above has landed
     uint32_t* peer_seq_m = nullptr;
     uint32_t ring = 0;
@@ -98,18 +99,27 @@ struct DmPeerArgs {
     const uint8_t* xq_m = nullptr;               ///< mapped: ring s's q8_1 rows at xq_m + s * xq_stride
     size_t xq_stride = 0;
     const volatile uint32_t* seq_m = nullptr;    ///< mapped: low 16 bits the last ring CUDA0 published, bits 16-23 its
-                                                 ///< tokens, bit 28 set when it has peer entries; UINT32_MAX: stop
+                                                 ///< tokens, bit 28 set when it has peer entries, bit 29 when its q8_1
+                                                 ///< rows were published anyway (the warm-up's input); UINT32_MAX: stop
     uint32_t* done_m = nullptr;                  ///< mapped: the last ring whose rows have landed
     float* rows_m = nullptr;                     ///< mapped: entry i's row at rows_m + i * n_embd
     const unsigned long long* ptr = nullptr;     ///< peer device: [n_layers * n_expert] blob address or 0
     const NativeExpertLayout* lay = nullptr;     ///< peer device: per layer
     int n_expert = 0, k = 0, n_embd = 0, n_ff = 0, steps = 0;
     void* scratch = nullptr;                     ///< peer device: dec_moe_peer_scratch_bytes
-    unsigned int* arrive = nullptr;              ///< peer device: 4 words zeroed before the launch (arrivals, barrier, abort)
+    unsigned int* arrive = nullptr;              ///< peer device: 16 words zeroed before the launch (arrivals, barrier,
+                                                 ///< abort, the warm-up's words)
     unsigned long long* stamps_m = nullptr;      ///< tests: block 0's phase times per ring (8 each), or null
     int gu2 = 0;                                 ///< the grid formats' gate/up two rows a warp (DEC_GU2 sets it)
     uint32_t* diag_m = nullptr;                  ///< mapped, kDmDiagWords zeroed words: the abort record, or null
+    /// The next ring's L2 warm-up: peer device, [n_layers][n_expert][n_embd] the router rows in int8 and one scale per
+    /// 32 of them, or null (no warm-up).  Between rings the idle blocks predict the next layer's experts from this
+    /// ring's q8_1 rows and read the predicted blobs the peer holds; the rows computed are unchanged.
+    const int8_t* rq = nullptr;
+    const float* rs = nullptr;
 };
+/// Router rows the warm-up's predictor covers.
+constexpr int kDmPredExperts = 512;
 /// A down wait inside a ring that does not end within this long aborts the window (so does a corrupt ring, or the host's
 /// release while a ring runs): the kernel writes its record to diag_m, raises done_m past every ring (CUDA0's waits
 /// pass) and exits.

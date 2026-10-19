@@ -89,9 +89,11 @@ class Tokenizer:
     # -------------------------------------------------------------- constructors
     @classmethod
     def from_gguf(cls, path) -> "Tokenizer":
-        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-        from gguf_reader import GGUFFile
-        md = GGUFFile(pathlib.Path(path)).metadata
+        return cls.from_metadata(_gguf_metadata(path))
+
+    @classmethod
+    def from_metadata(cls, md: dict) -> "Tokenizer":
+        """From GGUF tokenizer metadata (`tokenizer.ggml.*`), as a GGUF file or a converter carries it."""
         need = ["tokenizer.ggml.tokens", "tokenizer.ggml.merges"]
         missing = [k for k in need if k not in md]
         if missing:
@@ -227,11 +229,22 @@ class Tokenizer:
 
 
 # ------------------------------------------------------------------ the pack's tokenizer/ directory
+def _gguf_metadata(path) -> dict:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from gguf_reader import GGUFFile
+    return GGUFFile(pathlib.Path(path)).metadata
+
+
 def extract(gguf_path, out_dir) -> dict:
     """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
+    return extract_metadata(_gguf_metadata(gguf_path), out_dir)
+
+
+def extract_metadata(md: dict, out_dir) -> dict:
+    """`extract` from GGUF tokenizer metadata held in a dict."""
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
-    tk = Tokenizer.from_gguf(gguf_path)
+    tk = Tokenizer.from_metadata(md)
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,
@@ -249,9 +262,7 @@ def extract(gguf_path, out_dir) -> dict:
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     # fine-tunes change the chat template, so the model's own is shipped
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from gguf_reader import GGUFFile
-    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
+    tpl = md.get("tokenizer.chat_template")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg

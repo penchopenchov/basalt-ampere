@@ -8,6 +8,7 @@
 //   IQ3_S         d * d8 * (1 + 2 * sc) * dot
 //   Q3_K          d * d8 * ((sc0 - 32) * dot0 + (sc1 - 32) * dot1)   (the two 16-value halves)
 //   Q2_0          d * d8 * dot                              (d per 64 values)
+//   Q8_0          d * d8 * dot                              (the block's int32 dot is exact)
 // The terms are the native kernels' math with fewer roundings, not their bits.  Every column is summed in one order
 // fixed by the shape (n_in, n_out) alone, so a column's value does not depend on how many columns ride along or where
 // it sits.
@@ -46,7 +47,7 @@ void dense_tc_l2_prefetch(const void* w, std::size_t bytes, void* stream);
 /// Which verify projections take dense_tc for every window width (bits): 1 GDN qkv, 2 GDN z, 4 GDN out, 8 QSA q,
 /// 16 QSA out, 32 QSA k/v.
 int dense_tc_mask();
-/// The weight types dense_tc takes: Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0.
+/// The weight types dense_tc takes: Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, Q3_K, Q2_0, Q8_0.
 bool dense_tc_type_on(int ggml_type) noexcept;
 
 }  // namespace basalt::kernels

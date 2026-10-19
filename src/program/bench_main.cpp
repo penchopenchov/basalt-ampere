@@ -21,11 +21,12 @@
 #include <string>
 #include <vector>
 
-#include <dlfcn.h>
+#include "basalt/platform/dynlib.hpp"
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/process.hpp"
+#include "basalt/platform/system.hpp"
+
 #include <errno.h>
-#include <fcntl.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #ifndef BASALT_VERSION
 #define BASALT_VERSION "unknown"
@@ -129,18 +130,18 @@ public:
     };
 
     bool open() {
-        h_ = dlopen("libnvidia-ml.so.1", RTLD_NOW);
-        if (h_ == nullptr) return false;
-        init_ = sym<int (*)()>("nvmlInit_v2");
-        shut_ = sym<int (*)()>("nvmlShutdown");
-        drv_ = sym<int (*)(char*, unsigned)>("nvmlSystemGetDriverVersion");
-        cuda_ = sym<int (*)(int*)>("nvmlSystemGetCudaDriverVersion");
-        count_ = sym<int (*)(unsigned*)>("nvmlDeviceGetCount_v2");
-        handle_ = sym<int (*)(unsigned, void**)>("nvmlDeviceGetHandleByIndex_v2");
-        name_ = sym<int (*)(void*, char*, unsigned)>("nvmlDeviceGetName");
-        plim_ = sym<int (*)(void*, unsigned*)>("nvmlDeviceGetPowerManagementLimit");
-        pcon_ = sym<int (*)(void*, unsigned*, unsigned*)>("nvmlDeviceGetPowerManagementLimitConstraints");
-        clk_ = sym<int (*)(void*, int, unsigned*)>("nvmlDeviceGetClockInfo");
+        lib_ = basalt::platform::DynLib::open_nvml();
+        if (!lib_) return false;
+        init_ = lib_.sym<int (*)()>("nvmlInit_v2");
+        shut_ = lib_.sym<int (*)()>("nvmlShutdown");
+        drv_ = lib_.sym<int (*)(char*, unsigned)>("nvmlSystemGetDriverVersion");
+        cuda_ = lib_.sym<int (*)(int*)>("nvmlSystemGetCudaDriverVersion");
+        count_ = lib_.sym<int (*)(unsigned*)>("nvmlDeviceGetCount_v2");
+        handle_ = lib_.sym<int (*)(unsigned, void**)>("nvmlDeviceGetHandleByIndex_v2");
+        name_ = lib_.sym<int (*)(void*, char*, unsigned)>("nvmlDeviceGetName");
+        plim_ = lib_.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetPowerManagementLimit");
+        pcon_ = lib_.sym<int (*)(void*, unsigned*, unsigned*)>("nvmlDeviceGetPowerManagementLimitConstraints");
+        clk_ = lib_.sym<int (*)(void*, int, unsigned*)>("nvmlDeviceGetClockInfo");
         if (!init_ || !count_ || !handle_ || init_() != 0) return false;
         unsigned n = 0;
         if (count_(&n) != 0) return false;
@@ -181,9 +182,7 @@ public:
     }
 
 private:
-    template <class F>
-    F sym(const char* n) const { return reinterpret_cast<F>(dlsym(h_, n)); }
-    void* h_ = nullptr;
+    basalt::platform::DynLib lib_;
     bool ok_ = false;
     std::vector<void*> dev_;
     int (*init_)() = nullptr;
@@ -199,13 +198,6 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------- engine child
-
-volatile sig_atomic_t g_child = -1;
-
-void on_signal(int) {
-    if (g_child > 0) kill((pid_t) g_child, SIGTERM);
-    _exit(130);
-}
 
 struct Done {
     bool ok = false;
@@ -223,32 +215,10 @@ public:
 
     bool start(const std::string& engine_bin, const std::vector<std::string>& args, const std::string& log_path,
                std::string& err) {
-        int in[2], out[2];
-        if (pipe(in) != 0 || pipe(out) != 0) { err = "pipe failed"; return false; }
-        const pid_t pid = fork();
-        if (pid < 0) { err = "fork failed"; return false; }
-        if (pid == 0) {
-            dup2(in[0], 0);
-            dup2(out[1], 1);
-            const int lf = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (lf >= 0) dup2(lf, 2);
-            close(in[0]); close(in[1]); close(out[0]); close(out[1]);
-            std::vector<std::string> store;
-            store.push_back(engine_bin);
-            store.push_back("--serve");
-            for (const auto& a : args) store.push_back(a);
-            std::vector<char*> av;
-            for (auto& s : store) av.push_back(s.data());
-            av.push_back(nullptr);
-            execv(engine_bin.c_str(), av.data());
-            _exit(127);
-        }
-        close(in[0]);
-        close(out[1]);
-        in_ = in[1];
-        out_ = out[0];
-        pid_ = pid;
-        g_child = pid;
+        std::vector<std::string> argv = {engine_bin, "--serve"};
+        argv.insert(argv.end(), args.begin(), args.end());
+        if (!basalt::platform::spawn_piped(argv, log_path, child_, err)) return false;
+        basalt::platform::set_stop_child(child_.child);
         log_path_ = log_path;
         std::string line;
         while (read_line(line)) {
@@ -313,33 +283,24 @@ public:
 
     // QUIT and wait: the engine flushes its logs on a normal exit.
     void stop() {
-        if (pid_ <= 0) return;
+        if (child_.child.id <= 0 && child_.child.handle == nullptr) return;
         const std::string q = "QUIT\n";
-        if (in_ >= 0) { (void) !write(in_, q.data(), q.size()); close(in_); in_ = -1; }
-        for (int i = 0; i < 600; ++i) {
-            int st = 0;
-            if (waitpid(pid_, &st, WNOHANG) == pid_) { finish_reap(); return; }
-            usleep(100000);
+        if (child_.in_fd >= 0) {
+            (void) basalt::platform::pipe_write_all(child_.in_fd, q.data(), q.size());
+            basalt::platform::close_fd(child_.in_fd);
+            child_.in_fd = -1;
         }
-        kill(pid_, SIGTERM);
+        for (int i = 0; i < 600; ++i) {
+            if (basalt::platform::child_wait(child_.child, 100) >= 0) { finish_reap(); return; }
+        }
+        basalt::platform::child_terminate(child_.child);
         reap();
     }
 
     std::map<std::string, std::string> info;
 
 private:
-    bool write_all(const std::string& s) {
-        size_t off = 0;
-        while (off < s.size()) {
-            const ssize_t n = write(in_, s.data() + off, s.size() - off);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                return false;
-            }
-            off += (size_t) n;
-        }
-        return true;
-    }
+    bool write_all(const std::string& s) { return basalt::platform::pipe_write_all(child_.in_fd, s.data(), s.size()); }
     bool read_line(std::string& line) {
         for (;;) {
             const size_t nl = buf_.find('\n', rpos_);
@@ -350,28 +311,24 @@ private:
                 return true;
             }
             char tmp[65536];
-            const ssize_t n = read(out_, tmp, sizeof tmp);
-            if (n < 0 && errno == EINTR) continue;
+            const int64_t n = basalt::platform::pipe_read(child_.out_fd, tmp, sizeof tmp);
             if (n <= 0) return false;
             buf_.append(tmp, (size_t) n);
         }
     }
     void reap() {
-        if (pid_ > 0) {
-            int st = 0;
-            waitpid(pid_, &st, 0);
-        }
+        // wait for it, up to the time a normal exit needs, then let go whether or not it ended
+        (void) basalt::platform::child_wait(child_.child, 10000);
         finish_reap();
     }
     void finish_reap() {
-        if (in_ >= 0) close(in_);
-        if (out_ >= 0) close(out_);
-        in_ = out_ = -1;
-        pid_ = -1;
-        g_child = -1;
+        if (child_.in_fd >= 0) basalt::platform::close_fd(child_.in_fd);
+        if (child_.out_fd >= 0) basalt::platform::close_fd(child_.out_fd);
+        child_.in_fd = child_.out_fd = -1;
+        basalt::platform::clear_stop_child();
+        basalt::platform::child_close(child_.child);
     }
-    pid_t pid_ = -1;
-    int in_ = -1, out_ = -1;
+    basalt::platform::PipedChild child_;
     std::string buf_, log_path_;
     size_t rpos_ = 0;
 };
@@ -456,11 +413,7 @@ void usage(const std::string& engine) {
     if (!bin.empty() && fs::exists(bin)) {
         std::printf("\nEngine flags (passed to basalt):\n");
         std::fflush(stdout);
-        if (FILE* pf = popen(("'" + bin + "' --help 2>&1").c_str(), "r")) {
-            char buf[4096];
-            while (std::fgets(buf, sizeof buf, pf) != nullptr) std::fputs(buf, stdout);
-            pclose(pf);
-        }
+        if (const auto help = basalt::platform::capture_output({bin, "--help"}, true)) std::fputs(help->c_str(), stdout);
     }
 }
 
@@ -834,9 +787,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
         return 2;
     }
-    std::signal(SIGPIPE, SIG_IGN);
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
+    basalt::platform::ignore_broken_pipe();   // a closed pipe surfaces as a failed write
+    basalt::platform::install_child_stop_signals();
 
     // what to run
     const bool quality_only = o.quality && !o.sel_decode && !o.sel_prefill;
@@ -859,7 +811,10 @@ int main(int argc, char** argv) {
     std::vector<std::string> args;
     if (!o.model.empty()) {
         args = {"--model", fs::absolute(o.model).string()};
-        if (!has_arg(args, "--peer-device") && visible_gpus() > 1) set_arg(args, "--peer-device", "1");
+        // A second GPU can hold an expert tier only where a process is given GPU-to-GPU access between its
+        // devices; the engine refuses --peer-device without it, so the bench does not offer one.
+        if (basalt::platform::gpu_peer_access() && !has_arg(args, "--peer-device") && visible_gpus() > 1)
+            set_arg(args, "--peer-device", "1");
     }
     if (engine_bin.empty()) engine_bin = BASALT_BENCH_ENGINE;
     if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) engine_bin = BASALT_BENCH_ENGINE;
@@ -921,7 +876,7 @@ int main(int argc, char** argv) {
     std::string work = o.logs;
     bool temp_work = false;
     if (work.empty()) {
-        work = fmt("/tmp/basalt-bench-%d", (int) getpid());
+        work = basalt::platform::temp_dir() + "/basalt-bench-" + std::to_string((long long) basalt::platform::process_id());
         temp_work = true;
     }
     std::error_code ec;
@@ -974,7 +929,7 @@ int main(int argc, char** argv) {
             while (std::getline(lg, l))
                 if (l.find("peer GPU") != std::string::npos && l.find("experts") != std::string::npos) peer_line = l;
         }
-        std::mt19937_64 rng((uint64_t) std::chrono::steady_clock::now().time_since_epoch().count() ^ ((uint64_t) getpid() << 32));
+        std::mt19937_64 rng((uint64_t) std::chrono::steady_clock::now().time_since_epoch().count() ^ ((uint64_t) basalt::platform::process_id() << 32));
         int n_requests = 0, n_decode_requests = 0;
         bool failed = false;
         for (int run = 1; run <= o.reps && !failed; ++run) {
@@ -1121,10 +1076,10 @@ int main(int argc, char** argv) {
         if (all_digits(power)) power += " W";
     } else if (!gpus_start.empty() && gpus_start[0].power_limit_w > 0) {
         power = fmt("%.0f W", gpus_start[0].power_limit_w);
-    } else if (FILE* pf = popen("nvidia-smi -i 0 --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null", "r")) {
-        char b[64] = {0};
-        if (std::fgets(b, sizeof b, pf) != nullptr && std::atof(b) > 0) power = fmt("%.0f W", std::atof(b));
-        pclose(pf);
+    } else if (const auto smi = basalt::platform::capture_output(
+                   {"nvidia-smi", "-i", "0", "--query-gpu=power.limit", "--format=csv,noheader,nounits"}, false);
+               smi && std::atof(smi->c_str()) > 0) {
+        power = fmt("%.0f W", std::atof(smi->c_str()));
     }
     if (power == "unknown") std::fprintf(stderr, "basalt-bench: WARNING: the power limit could not be read; pass --power-label W\n");
 

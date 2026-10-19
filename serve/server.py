@@ -3,7 +3,7 @@
     basalt serve --model FILE.basalt [--alias NAME] [--host H] [--port P] [--gpu 0,1] [--api-key KEY] ...
     python -m serve.server --model FILE.basalt --engine-bin bin/basalt ...
     python -m serve.server --config config.json
-    python -m serve.server --mock-engine --port 8095
+    python -m serve.server --mock-engine --port 8080
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel)` -> token ids. ProcessEngine keeps
 one `basalt --serve` process resident; MockEngine is a scripted stand-in for tests. Prompts that do not fit the
@@ -22,10 +22,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
-from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line, engine_settings,  # noqa: E402
-                          parse_settings, sampling_defaults_from_config)
+from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line,  # noqa: E402
+                          parse_settings, sampling_defaults_from_config, sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
+from serve.engine.flags import flag_index  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
 from serve.engine.vision import (EngineVision, Vision, child_env, engine_args, gpu_list, gpus_in_play,  # noqa: E402
@@ -91,21 +92,17 @@ def main() -> int:
             check_engine_flags(cli_engine, known, "command line")
         except ValueError as e:
             fail(str(e))
-        flags, sources = engine_settings(file_engine, cli_engine)
         mode = a.vision
         vision_arg = False if a.mock_engine or mode == "off" else mode
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
                 a.model, a.engine_bin, gpus=len(listed) if listed else None, vision=vision_arg,
-                overrides={f: v for f, v in flags.items() if v is not False}).items()
+                engine_words=file_engine + cli_engine).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
-        off = {f for f, v in flags.items() if v is False}
-        if off and cfg.get("args"):
-            cfg["args"] = [x for x in cfg["args"] if x not in off]
         if not a.mock_engine:
-            print(engine_line(flags, sources, bool(a.config),
+            print(engine_line(file_engine, cli_engine, bool(a.config),
                                     (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None), flush=True)
     if a.alias:
         cfg["model_name"] = a.alias
@@ -131,15 +128,13 @@ def main() -> int:
     if not a.mock_engine:
         vision = None
         env = child_env(cfg)
-        sampling_defaults = sampling_defaults_from_config(cfg)
+        sampling_defaults = {**sampling_defaults_from_config(cfg), **a.sampling_launch}
         if sampling_defaults:
-            pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[server] sampling defaults: {pretty}", flush=True)
+            print(sampling_line(sampling_defaults, a.sampling_cli, set(a.sampling_launch) - a.sampling_cli), flush=True)
         lazy = a.lazy
         if lazy and cfg.get("vision"):
             print("[server] warning: lazy loading is text-only, vision off", flush=True)
-            if "--vision-mmproj" in cfg["args"]:
-                at = cfg["args"].index("--vision-mmproj")
+            while (at := flag_index(cfg["args"], "--vision-mmproj")) is not None:
                 del cfg["args"][at:at + 2]
             del cfg["vision"]
         if cfg.get("vision"):
@@ -171,7 +166,7 @@ def main() -> int:
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
-            "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, {}
+            "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
     # the model's exported template, else the bundled one
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),

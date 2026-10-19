@@ -23,6 +23,7 @@
 #include "basalt/core/hit_hook.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/platform/mapped_file.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -73,15 +74,15 @@ struct HostMemory {
     uint64_t cgroup_limit = ~uint64_t{0};
 };
 
-/// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
-/// defaults are the real files).  A v1 memory controller line wins over the unified line (the hybrid layout): v1 reads
+/// This reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; an
+/// empty one is the system's own file, see platform::meminfo_path - and on a system with none, the OS's available-RAM
+/// reading is the whole answer and no container limit is tighter than it).  A v1 memory controller line wins over the unified line (the hybrid layout): v1 reads
 /// `<root>/memory/<path>` (memory.limit_in_bytes - memory.usage_in_bytes, clean inactive file cache counted as free),
 /// v2 reads `<root>/<path>` (memory.max, memory.current, memory.stat).  A group not visible here is read at the mount's
 /// root (a container's own namespace); groups without a readable limit add none; no cgroup file or line is MemAvailable
 /// alone.  False when MemAvailable is missing or a visible v2 limit or its memory.stat is malformed.
-bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",
-                           const std::string& self_cgroup = "/proc/self/cgroup",
-                           const std::string& cgroup_root = "/sys/fs/cgroup");
+bool host_available_memory(HostMemory& m, const std::string& meminfo = "", const std::string& self_cgroup = "",
+                           const std::string& cgroup_root = "");
 
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
@@ -149,6 +150,10 @@ public:
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
 
+    /// The blob of `(layer, expert)` when it sits in RAM already (no read, no count), else null.  Valid during a verify
+    /// window: the places move only between windows.
+    virtual const uint8_t* resident_blob(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+
     /// Whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an asynchronous host-to-device
     /// copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
@@ -181,7 +186,21 @@ public:
     virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
         (void) pairs; (void) n; return false;
     }
+
+    /// Reader threads `read_blobs` runs; a sink is told which one it is called on.
+    static constexpr int kBlobReaders = 6;
+    /// Receives pair `index`'s blob from reader `worker`; the bytes are valid only during the call.
+    using BlobSink = std::function<bool(int64_t index, int worker, const uint8_t* blob, std::string& err)>;
+    /// Hands every pair's blob to `sink`, from up to `kBlobReaders` threads.  The default reads one blob after another
+    /// through `blob()`, asking the OS for the following ones ahead.
+    virtual bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err);
 };
+
+/// Copies the pairs' blobs into the cache's slots (`slots[i]` for `pairs[i]`) on `device`, reading through
+/// `src.read_blobs` and overlapping the reads with the host-to-device copies.  `on_bytes` is told each blob's size as
+/// it lands (from several threads).  The copies are complete when this returns.
+bool fill_cache_slots(ExpertSource& src, ExpertCache& cache, int device, const std::pair<int32_t, int32_t>* pairs,
+                      const int32_t* slots, int64_t n, const std::function<void(uint64_t)>& on_bytes, std::string& err);
 
 /// What the GPU computes in a verify window's layer, written by the pool (mapped host memory) right after the ring
 /// and published before the CPU starts its own share.  Groups of entries that share a blob; the blob is a VRAM slot or
@@ -485,12 +504,16 @@ public:
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    const uint8_t* resident_blob(int64_t layer, int64_t expert) const override;
     void advise_cpu(int64_t layer, const int32_t* ids, int64_t n) const override;
     bool pinned(int64_t layer, int64_t expert) const override;
     bool file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    /// Each blob read from the file with block-aligned unbuffered reads into small pinned staging buffers; a blob that
+    /// cannot be read that way, or a file system without unbuffered reads, takes the mapped copy.
+    bool read_blobs(const std::pair<int32_t, int32_t>* pairs, int64_t n, const BlobSink& sink, std::string& err) override;
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
@@ -507,6 +530,7 @@ private:
     std::atomic<uint64_t> file_us_{0};
     std::atomic<int64_t> ram_reads_{0};
     std::atomic<uint64_t> file_read_bytes_{0};
+    platform::MappedFile view_;               ///< the mapped experts; base_ is its first byte
     const uint8_t* base_ = nullptr;
     uint64_t file_off_ = 0;                   ///< where the experts start in the mapped file
     int64_t blobs_ = 0;
@@ -575,6 +599,7 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    const uint8_t* resident_blob(int64_t layer, int64_t expert) const override;
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
@@ -596,8 +621,7 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
-    void* map_ = nullptr;            ///< the arena file, mapped read-only (not the PinnedArena)
-    uint64_t map_bytes_ = 0;
+    platform::MappedFile map_;       ///< the arena file, mapped read-only (not the PinnedArena)
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
     uint64_t slice_bytes_ = 0;
     const uint8_t* base_ = nullptr;

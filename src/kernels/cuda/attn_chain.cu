@@ -147,10 +147,12 @@ void attn_chain(const AttnChainArgs& a, void* stream) {
     p.Lc.rec = a.rec;
     p.Lc.geo = make_geo(a.type_q, a.type_z, a.type_o);
     p.Lc.dn1 = p.Lc.dn2 = nullptr;
-    if (!tmap_2d(&p.Lc.stm, a.rec.state, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, (uint64_t) R_HV * S, S, (uint64_t) R_HV * S * 4, S, S)) {
+    CUtensorMap stm_map;
+    if (!tmap_2d(&stm_map, a.rec.state, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, (uint64_t) R_HV * S, S, (uint64_t) R_HV * S * 4, S, S)) {
         std::fprintf(stderr, "attn_chain: the state's tensor map failed\n");
         std::exit(1);
     }
+    std::memcpy(&p.Lc.stm, &stm_map, sizeof stm_map);
     p.NLAY = 1;
     p.iters = 1;
 #ifdef BASALT_PROFILE

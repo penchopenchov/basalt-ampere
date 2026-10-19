@@ -14,6 +14,9 @@
 // (3) iq_mmvq's IQ3_S columns on the tensor-core kernel (MMVQ_MMA, turned on here where the device has it)
 //     against the old kernel, bitwise; with MMVQ_MMA=1 in the environment (1) takes it as well.
 //
+// NVFP4 blocks come in three scale profiles (narrow; pack-like block values with 2e-5..2e-4 tails; pack-like with scale
+// bytes 0x7F, 0xFF, bit 7 set, 0 and subnormals), all of which every path must decode alike.
+//
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
 #include "basalt/kernels/f16_bits.hpp"
@@ -64,10 +67,46 @@ const char* name_of(int t) {
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
+        case 40: return "NVFP4";
+        case 12: return "Q4_K";
+        case 13: return "Q5_K";
+        case 7: return "Q5_1";
+        case 8: return "Q8_0";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+// A UE4M3 sub-block scale byte.  Profile 0: exponent 1..4 (small blocks).  Profile 1: exponent 6..14, block values in
+// the hundreds as the packs' are (their tails are 1e-5..1e-4).  Profile 2: profile 1 with the odd bytes mixed in: 0x7F
+// (the NaN code, decoded as 0), the sign bit set (ignored), zero and subnormals.
+uint8_t nvfp4_scale_byte(int prof, std::mt19937& rng) {
+    if (prof == 0) return (uint8_t) (((1 + rng() % 4) << 3) | (rng() & 7));
+    const uint8_t v = (uint8_t) (((6 + rng() % 9) << 3) | (rng() & 7));
+    if (prof == 1) return v;
+    switch (rng() % 8) {
+        case 0: return 0x7F;
+        case 1: return (uint8_t) (v | 0x80);
+        case 2: return 0xFF;
+        case 3: return 0x00;
+        case 4: return (uint8_t) (rng() & 7);   // subnormal
+        default: return v;
+    }
+}
+// The FP32 tail scale: profile 0 in 0.5 .. 2, else log-uniform in 2e-5 .. 2e-4 (what the packs carry).
+float nvfp4_tail_scale(int prof, std::mt19937& rng) {
+    if (prof == 0) return std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
+    return 2e-5f * std::exp(std::uniform_real_distribution<float>(0.0f, std::log(10.0f))(rng));
+}
+// The NVFP4 scale profile of the blob being made (-1: a random one per matrix)
+int g_nv_profile = -1;
+// NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales
+void append_nvfp4_tail(std::vector<uint8_t>& b, std::mt19937& rng) {
+    const int prof = g_nv_profile >= 0 ? g_nv_profile : 0;
+    const float t[4] = {nvfp4_tail_scale(prof, rng), nvfp4_tail_scale(prof, rng), nvfp4_tail_scale(prof, rng), 0.0f};
+    const uint8_t* p = (const uint8_t*) t;
+    b.insert(b.end(), p, p + sizeof t);
+}
+
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -76,11 +115,21 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 3);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
-        if (t == 29) {
+        if (t == 40) {
+            // NVFP4: four UE4M3 sub-block scales (profiles in nvfp4_scale_byte)
+            const int prof = g_nv_profile >= 0 ? g_nv_profile : (int) (rng() % 3);
+            for (int j = 0; j < 4; ++j) w[o + j] = nvfp4_scale_byte(prof, rng);
+        } else if (t == 29) {
             // IQ1_M: the fp16 scale is the top nibbles of the four scale words (bytes 48..55); nibble 3 carries the
             // sign and the exponent's top bits: 0x1 / 0x2 (or 0x9 / 0xA) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) == 0 ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
+        } else if (t == 12 || t == 13 || t == 7) {
+            // K-quants and Q5_1: two fp16 scales {d, dmin} / {d, m}, small so SwiGLU keeps a finite fp16 q8_1 scale
+            for (int j = 0; j < 2; ++j) {
+                const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | ((2 + byte(rng) % 4) << 10) | man(rng));
+                std::memcpy(&w[o + 2 * j], &h, 2);
+            }
         } else {
             const uint16_t h = (uint16_t) ((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));   // 2^-13 .. 2^-6
             std::memcpy(&w[o], &h, 2);
@@ -265,9 +314,12 @@ struct Grouped {
         std::vector<unsigned long long> ptr;
         for (int g = 0; g < n_groups; ++g) {
             // one blob per group: gate rows | up rows (format gu, H values) | down rows (format dt, FF values)
+            g_nv_profile = g % 3;   // the narrow, the pack-like, the pack-like with odd scale bytes
             auto b = random_rows(gu, 2 * FF, H, rng);
             const auto d = random_rows(dt, H, FF, rng);
             b.insert(b.end(), d.begin(), d.end());
+            if (gu == 40) append_nvfp4_tail(b, rng);
+            g_nv_profile = -1;
             if (b.size() != L.bytes) { std::fprintf(stderr, "blob size %zu != %zu\n", b.size(), L.bytes); std::exit(2); }
             uint8_t* db = dalloc<uint8_t>(b.size());
             ck(cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice), "blob");
@@ -356,7 +408,7 @@ float time_ms(cudaStream_t s, int it, const auto& fn) {
 void bench(cudaStream_t s, std::mt19937& rng) {
     std::printf("\n--bench: microseconds per call, old (per-column decode) / new (decode once), idle GPU assumed\n");
     const int n_in = 2560, n_out = 8192, it = 200;
-    for (int t : {16, 17, 18, 21, 22, 29}) {
+    for (int t : {16, 17, 18, 21, 22, 29, 12, 13, 7, 8}) {
         const auto w = random_rows(t, n_out, n_in, rng);
         uint8_t* dw = dalloc<uint8_t>(w.size());
         ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
@@ -405,16 +457,22 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dy);
     }
     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
-    for (int gu : {16, 17, 18, 21, 22, 29}) {
-        std::printf("%-8s/Q2_0 grouped, 16 groups of m entries:", name_of(gu));
+    // (GB/s: the 16 experts' bytes once per call, at the new kernel's time)
+    for (auto [gu, dt] : {std::pair<int, int>{16, 42}, {17, 42}, {18, 42}, {21, 42}, {22, 42}, {29, 42}, {40, 40},
+                          {12, 7}, {12, 8}, {13, 8}, {8, 8}}) {   // NVFP4 with its own down format; the Q4_K_XL and Q8_0 pairs
+        std::printf("%-8s/%-5s grouped, 16 groups of m entries:", name_of(gu), name_of(dt));
+        std::string gbs;
         for (int m : {1, 2, 3, 4, 8}) {
-            Grouped G(gu, 42, 2560, 640, std::vector<int>(16, m), 8, rng);
+            Grouped G(gu, dt, 2560, 640, std::vector<int>(16, m), 8, rng);
             float us[2];
             for (int old = 1; old >= 0; --old)
                 us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
             std::printf("  m=%d: %.1f/%.1f", m, us[1], us[0]);
+            char b[32];
+            std::snprintf(b, sizeof b, " %.0f", 16.0 * (double) G.L.bytes / (us[0] * 1e3));
+            gbs += b;
         }
-        std::printf("\n");
+        std::printf("   GB/s (new):%s\n", gbs.c_str());
     }
 }
 
@@ -490,7 +548,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 40, 12, 13, 7, 8}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
@@ -498,6 +556,12 @@ int main(int argc, char** argv) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
+    for (auto [gu, dt] : {std::pair<int, int>{12, 7}, {12, 8}, {13, 8}, {13, 7}, {8, 8}}) {   // the Q4_K_XL and Q8_0 pairs
+        check_grouped(gu, dt, 2560, 640, s, rng);
+        check_grouped(gu, dt, 1024, 512, s, rng);
+    }
+    check_grouped(40, 40, 2560, 640, s, rng);                               // NVFP4: its own pair, with the scale tail
+    check_grouped(40, 40, 1024, 512, s, rng);
     check_mmvq_mma(s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);

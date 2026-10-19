@@ -15,10 +15,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -149,6 +151,14 @@ constexpr int NSLOT = 4;
 __device__ HcSync g_hc_sync[NSLOT];
 static_assert(sizeof(g_hc_q8cnt) / sizeof(g_hc_q8cnt[0]) == NSLOT, "a q8_1 count set per counter set");
 
+// A tensor map as a kernel argument. The descriptor type is aligned more strictly than the hardware needs on newer
+// toolkits, and a by-value argument with that alignment is not representable on every host compiler, so the argument
+// carries the bytes at the boundary the hardware requires and the kernel reads them as descriptors.
+struct alignas(64) TmaDesc {
+    unsigned long long w[16];
+};
+static_assert(sizeof(TmaDesc) == sizeof(CUtensorMap), "a descriptor argument is the descriptor's size");
+
 struct HcLaunch {
     HcFusedArgs a;
     int nb;          // CTAs (one per SM)
@@ -161,8 +171,16 @@ struct HcLaunch {
     float* t10_dummy;                      // [NE] fixed logits for the top-10's dry run
     float* t10_scratch;                    // [nb][2 * KT] its outputs
     unsigned long long* lg64;              // [MAXT][NE] logits tagged with the read's epoch (tag << 32 | f32 bits)
-    CUtensorMap tm[6];   // q_down, s_down, q_inject, s_inject by four rows; q_up, s_up
+    TmaDesc tm[6];   // q_down, s_down, q_inject, s_inject by four rows; q_up, s_up
 };
+
+// cuda.h gives the descriptor its alignas only when the compiler reports a C++11 __cplusplus, which MSVC does not
+// unless the build passes /Zc:__cplusplus. A descriptor off the boundary faults when the kernel reads it, so the build
+// says so at compile time rather than at launch. The boundary is named here rather than taken from the header, whose
+// spelling of it changed between toolkit versions; 64 is what the hardware requires, and the newer toolkits align
+// the type more strictly, which satisfies it.
+static_assert(alignof(CUtensorMap) >= 64, "CUtensorMap lost its alignas: the build needs /Zc:__cplusplus");
+static_assert(offsetof(HcLaunch, tm) % 64 == 0, "the TMA descriptors must sit on the map boundary");
 
 // ---------------------------------------------------------------- primitives
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
@@ -976,8 +994,9 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
     bool staged = false;   // the first down item's rows were requested before the wait
     bool cn_bars = false;  // the staged item uses dbars
     unsigned qpeek = 0;    // an up item: the queue's claim count seen while it runs
+    const CUtensorMap* const tms = reinterpret_cast<const CUtensorMap*>(L.tm);
     if (item < it.up) {    // the item's weights do not depend on the previous kernel
-        cn_bars = cn_issue(a, item, tid, smem, dbars, L.tm);
+        cn_bars = cn_issue(a, item, tid, smem, dbars, tms);
         staged = true;
     }
     if (L.early) pdl_launch_dependents();
@@ -988,7 +1007,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
         if (item < it.up) {
             const int d = item;
             if constexpr (DBG) if (tid == 0) dbg[b * 16 + 15] = 1;
-            if (!staged) cn_bars = cn_issue(a, d, tid, smem, dbars, L.tm);
+            if (!staged) cn_bars = cn_issue(a, d, tid, smem, dbars, tms);
             const CnRows w = cn_rows(a, d);
             if (w.q != nullptr) {
                 cn_x<T>(a, w.hs, tid, smem, s_ssp, L.cns, d < CN_HS);
@@ -1002,7 +1021,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             const UpSlice sl = up_slice(item - it.up, it.nu);
             if constexpr (DBG) if (tid == 0) dbg[b * 16 + 15] = 2;
             uint16_t* const sc8 = up_smem(smem, sl.nc, T).sc;
-            if (tid == 0) hc_up_tma(sl, smem, sc8, &L.tm[4], &bars[0]);   // ahead of R'
+            if (tid == 0) hc_up_tma(sl, smem, sc8, &tms[4], &bars[0]);   // ahead of R'
             hc_up_pre<T>(a, sl, tid, smem);
             // the down items' sums by two bulk copies once they are done (after the slice's shared memory)
             const int lst_off = (((up_smem_bytes<T>(sl.nc) + 15) & ~15) + 127) & ~127;
@@ -1131,7 +1150,8 @@ bool hc_fused_q8_rows_ok() { return true; }
 namespace {
 
 struct DevInfo {
-    bool checked = false, ok = false;
+    std::atomic<bool> checked{false};
+    bool ok = false;
     int sms = 0;
     float* t10 = nullptr;                 // [NE] fixed logits for the top-10's dry run, then [sms][2 * KT] float scratch
     unsigned long long* lg = nullptr;     // [NSLOT][MAXT][NE] tagged router logits (zero: no tag)
@@ -1139,6 +1159,7 @@ struct DevInfo {
 };
 constexpr size_t CN_SLOT = (size_t) CN_PART + CN_SSN;
 DevInfo g_dev[16];
+std::mutex g_dev_mu;
 
 const DevInfo& dev_info() {
     int dev = 0;
@@ -1148,27 +1169,30 @@ const DevInfo& dev_info() {
         return none;
     }
     DevInfo& d = g_dev[dev];
-    if (!d.checked) {
-        int major = 0, sms = 0, optin = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-        d.sms = sms;
-        d.ok = major == 12 && sms - CN_ND >= CN_MIN_NU && optin >= SMEM + 1024 &&
-               cudaMalloc((void**) &d.t10, ((size_t) NE + (size_t) sms * 2 * KT) * 4) == cudaSuccess &&
-               cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess &&
-               cudaMalloc((void**) &d.lg, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&
-               cudaMemset(d.lg, 0, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess;
-        if (d.ok) {   // distinct logits with a few ties, so the dry run takes the usual path
-            std::vector<float> f(NE);
-            for (int e = 0; e < NE; ++e) f[e] = (float) (((e * 389) % NE) / 64.0 - 4.0 + (e % 97 == 0 ? 0.0 : 0.001));
-            d.ok = cudaMemcpy(d.t10, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!d.checked.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(g_dev_mu);
+        if (!d.checked.load(std::memory_order_relaxed)) {
+            int major = 0, sms = 0, optin = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+            d.sms = sms;
+            d.ok = major == 12 && sms - CN_ND >= CN_MIN_NU && optin >= SMEM + 1024 &&
+                   cudaMalloc((void**) &d.t10, ((size_t) NE + (size_t) sms * 2 * KT) * 4) == cudaSuccess &&
+                   cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess &&
+                   cudaMalloc((void**) &d.lg, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&
+                   cudaMemset(d.lg, 0, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess;
+            if (d.ok) {   // distinct logits with a few ties, so the dry run takes the usual path
+                std::vector<float> f(NE);
+                for (int e = 0; e < NE; ++e) f[e] = (float) (((e * 389) % NE) / 64.0 - 4.0 + (e % 97 == 0 ? 0.0 : 0.001));
+                d.ok = cudaMemcpy(d.t10, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+            }
+            for (int t = 0; t < MAXT && d.ok; ++t)
+                d.ok = cudaFuncSetAttribute(kKernels[0][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess &&
+                       cudaFuncSetAttribute(kKernels[1][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
+            cudaGetLastError();
+            d.checked.store(true, std::memory_order_release);
         }
-        for (int t = 0; t < MAXT && d.ok; ++t)
-            d.ok = cudaFuncSetAttribute(kKernels[0][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess &&
-                   cudaFuncSetAttribute(kKernels[1][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess;
-        cudaGetLastError();
-        d.checked = true;
     }
     return d;
 }
@@ -1214,6 +1238,33 @@ std::mutex g_hc8_mu;
 std::unordered_map<const void*, Hc8Copy> g_hc8;
 size_t g_hc8_bytes = 0;
 
+// The copies are carved out of large allocations: one cudaMalloc per matrix rounds each up to the allocator's
+// granularity, which costs a fraction of a MiB per matrix.  Offsets stay 256-byte aligned, as separate allocations are.
+// Copies are never returned, so a chunk is never freed.
+cudaError_t hc8_alloc(void** out, size_t bytes) {
+    constexpr size_t kChunk = (size_t) 32 << 20, kAlign = 256;
+    static char* bases[16] = {};
+    static size_t lefts[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return cudaMalloc(out, bytes);
+    char*& base = bases[dev];
+    size_t& left = lefts[dev];
+    bytes = (bytes + kAlign - 1) / kAlign * kAlign;
+    if (bytes > left) {
+        if (bytes > kChunk / 2) return cudaMalloc(out, bytes);
+        void* p = nullptr;
+        const cudaError_t e = cudaMalloc(&p, kChunk);
+        if (e != cudaSuccess) return e;
+        base = (char*) p;
+        left = kChunk;
+    }
+    *out = base;
+    base += bytes;
+    left -= bytes;
+    return cudaSuccess;
+}
+
 // the copy of the bf16 matrix w (device memory of the current card); false when there is no VRAM for it
 bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
     const int64_t n = (int64_t) rows * cols, groups = n / G8;
@@ -1222,7 +1273,7 @@ bool hc8_make(const uint16_t* w, int rows, int cols, Hc8Copy& c) {
     c.rows = rows;
     c.cols = cols;
     c.srow = srow;
-    if (cudaMalloc((void**) &c.q, c.bytes) != cudaSuccess) {
+    if (hc8_alloc((void**) &c.q, c.bytes) != cudaSuccess) {
         cudaGetLastError();
         std::fprintf(stderr, "basalt hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
         return false;
@@ -1295,7 +1346,7 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
     c.cols = cols;
     c.srow = ((cols / G8) + 7) & ~7;
     c.bytes = (size_t) n + (size_t) rows * c.srow * 2;
-    if (cudaMalloc((void**) &c.q, c.bytes) != cudaSuccess) {
+    if (hc8_alloc((void**) &c.q, c.bytes) != cudaSuccess) {
         cudaGetLastError();
         std::fprintf(stderr, "basalt hc8: no VRAM for an 8-bit copy (%zu bytes)\n", c.bytes);
         return nullptr;
@@ -1304,7 +1355,6 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
     if (cudaMemcpy(c.q, q, (size_t) n, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(c.s, s, (size_t) rows * c.srow * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaGetLastError();
-        cudaFree(c.q);
         return nullptr;
     }
     c.owned = w == nullptr;
@@ -1458,10 +1508,12 @@ static bool hc_prepare(const HcFusedArgs& a, HcLaunch& L) {
     L.cnp = d.cn + (size_t) L.slot * CN_SLOT;
     L.cns = L.cnp + CN_PART;
     L.lg64 = d.lg + (size_t) L.slot * MAXT * NE;
-    if (!cn_maps(L.a, L.tm)) {
+    CUtensorMap maps[6];
+    if (!cn_maps(L.a, maps)) {
         std::fprintf(stderr, "hc_fused_read: the tensor maps of the 8-bit matrices failed\n");
         return false;
     }
+    std::memcpy(L.tm, maps, sizeof L.tm);
     L.nu = a.xq != nullptr && a.w_router == nullptr ? CN_MIN_NU : 0;   // whole q8_1 blocks
     return true;
 }

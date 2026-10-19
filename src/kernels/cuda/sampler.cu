@@ -8,13 +8,18 @@
 // distribution level can tell them apart; the parity test does that against an independently computed distribution.
 //
 // `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary (with thread-block clusters and without penalties,
-// `sampler_greedy_cluster_kernel`: the same token from a cluster of 8 CTAs per row).  The sampled chain has two
-// implementations that pick the same token, bit for bit:
-//   - the SPLIT top_k (default): `sampler_split_part_kernel` cuts each row into 4,096-logit blocks over the whole
-//     GPU, each keeps its own top_k, and `sampler_split_merge_kernel` merges those lists and runs the tail;
-//   - `sampler_one_block_kernel` (the fallback when the split cannot run): one block per token, `top_k` block-argmax
+// `sampler_greedy_cluster_kernel`: the same token from a cluster of 8 CTAs per row).  The sampled chain has these
+// implementations, which pick the same token, bit for bit:
+//   - the SORTED SPLIT (top_k <= 32, the engine's): `sampler_sort_kernel` cuts each row into 4,096-logit blocks over
+//     the whole GPU, each finds its first k with bitonic networks, and the row's last block merges the lists and runs
+//     the tail (`sampled_tail_pair`), all in one launch;
+//   - the ROUNDS SPLIT (a wider top_k): `sampler_fused_kernel`, the same blocks with k warp-argmax rounds each, also in
+//     one launch, and `sampled_tail_warp`;
+//   - the two-launch split (the parity test's reference): `sampler_split_part_kernel` keeps each block's top_k and
+//     `sampler_split_merge_kernel` merges the lists and runs `sampled_tail_warp`;
+//   - `sampler_one_block_kernel` (the fallback when no split can run): one block per token, `top_k` block-argmax
 //     rounds, each over the logits after the previous pick.
-// Both share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
+// `sampled_tail_warp` and `sampled_tail_pair` run top_p / min_p / temperature / draw with the same arithmetic.
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/diag.hpp"
@@ -681,6 +686,454 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex, nullptr, query, nq, qprob);
 }
 
+/// **THE SPLIT IN ONE LAUNCH.**  Grid (blocks per row, rows), `kWarps` warps of `kPer` logits per lane: each block
+/// keeps the top_k of its `kWarps * 32 * kPer` logits exactly as `sampler_split_part_kernel` does (the selection
+/// order is a strict total order, so a block's list does not depend on how its logits are cut among warps), writes it
+/// to `cand`, and counts itself done in `done[t]`.  The row's last block to finish resets the counter, merges the
+/// row's lists in block order and runs the tail, as `sampler_split_merge_kernel` does: the same lists, the same merge,
+/// the same tail, so the same token and the same probabilities, bit for bit.
+template <int kPer, int kWarps>
+__global__ void __launch_bounds__(kWarps * 32)
+sampler_fused_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history, int history_len,
+                     const SamplerParams p, int k, int n_blocks, int2* __restrict__ cand, unsigned* __restrict__ done,
+                     int* __restrict__ out, const int* __restrict__ query, int nq, float* __restrict__ qprob) {
+    constexpr int kWarpSpan = 32 * kPer;
+    constexpr int kBlockSpan = kWarps * kWarpSpan;
+    const int t = blockIdx.y;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    const int blo = (int) blockIdx.x * kBlockSpan;
+
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;          // the window is the TAIL
+    }
+    __shared__ unsigned int bits[kBlockSpan / 32];
+    const bool use_bits = hrow != nullptr && hlen > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < kBlockSpan / 32; w += blockDim.x) bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x) {
+            const int h = hrow[i];
+            if (h >= 0 && h < n_vocab && h >= blo && h - blo < kBlockSpan)
+                atomicOr(&bits[(h - blo) >> 5], 1u << ((h - blo) & 31));
+        }
+        __syncthreads();
+    }
+
+    const int lo = blo + warp * kWarpSpan;
+    float s[kPer];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const int v = lo + 32 * j + lane;
+        s[j] = v < n_vocab ? (p.logit_bias ? l[v] + p.logit_bias[v] : l[v]) : __int_as_float(0xff800000);
+    }
+    if (use_bits) {
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+            const int v = lo + 32 * j + lane, b = v - blo;
+            if (v < n_vocab && (bits[b >> 5] & (1u << (b & 31))))
+                s[j] = apply_penalties(s[j], history_count(hrow, hlen, v), p);
+        }
+    }
+
+    __shared__ int2 wl[kWarps][kSelMax];
+    __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    __shared__ int last;
+    float prev_v = __int_as_float(0x7f800000);   // +inf and id -1: round 0 takes every logit
+    int prev_i = -1;
+    int i = 0;
+    for (; i < k; ++i) {
+        float b0 = __int_as_float(0xff800000), b1 = __int_as_float(0xff800000);
+        int i0 = n_vocab, i1 = n_vocab;
+#pragma unroll
+        for (int j = 0; j < kPer; j += 2) {
+            const int v0 = lo + 32 * j + lane, v1 = v0 + 32;
+            const float x0 = s[j], x1 = s[j + 1];
+            if ((x0 < prev_v || (x0 == prev_v && v0 > prev_i)) && x0 > b0) { b0 = x0; i0 = v0; }
+            if ((x1 < prev_v || (x1 == prev_v && v1 > prev_i)) && x1 > b1) { b1 = x1; i1 = v1; }
+        }
+        take_first(b0, i0, b1, i1);
+        warp_first(b0, i0);
+        if (i0 >= n_vocab) break;
+        if (lane == 0) wl[warp][i] = make_int2(i0, __float_as_int(b0));
+        prev_v = b0;
+        prev_i = i0;
+    }
+    for (int r = i + lane; r < k; r += 32) wl[warp][r] = make_int2(n_vocab, (int) 0xff800000u);   // sentinels
+    __syncthreads();
+    if (warp == 0) {
+        int2* dst = cand + ((size_t) t * n_blocks + blockIdx.x) * k;
+        warp_merge_lists(&wl[0][0], kWarps, kSelMax, k, n_vocab, [&](int r, float v, int id) {
+            if (lane == 0) dst[r] = make_int2(id, __float_as_int(v));
+        });
+        __threadfence();                     // the list is visible device-wide before the count that publishes it
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned prior = atomicAdd(&done[t], 1u);
+        last = prior == (unsigned) (n_blocks - 1);
+        if (last) done[t] = 0u;              // every block of the row has counted: ready for the next launch
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    // the whole block stages the row's lists, so the L2 reads overlap instead of queueing on one warp
+    const int2* src = cand + (size_t) t * n_blocks * k;
+    for (int e = threadIdx.x; e < n_blocks * k; e += blockDim.x) lists[e] = __ldcg(src + e);
+    __syncthreads();
+    if (warp != 0) return;
+    warp_merge_lists(lists, n_blocks, k, k, n_vocab, [&](int r, float v, int id) {
+        if (lane == 0) { sel_ids[r] = id < n_vocab ? id : 0; sel_logit[r] = v; }
+    });
+    __syncwarp();
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex, nullptr, query, nq, qprob);
+}
+
+// ---- THE SORTED SPLIT (top_k <= 32).  The same first k of the selection order, found with bitonic networks instead of
+// k argmax rounds: a pair (value, id) that no round could pick (-inf, NaN) becomes the sentinel (-inf, n_vocab), which
+// is what a round that finds nothing yields; every other pair sorts by the selection order.  The order is strict on
+// the selectable pairs and every sentinel is the same pair, so each network's output is exactly the ordered list.
+constexpr int kSortSpan = 32;                         // entries per sorted list (one per lane)
+constexpr int kSortPer = 8;                           // logits per lane
+constexpr int kSortWarps = 16;
+constexpr int kSortBlockSpan = kSortWarps * 32 * kSortPer;   // 4,096: the split's block span
+
+struct Cand {
+    float v;
+    int id;
+};
+
+// branch-free: a short-circuit `||` compiles to a divergent branch around every compare-exchange
+__device__ __forceinline__ bool cand_first(const Cand& a, const Cand& b) {
+    return (a.v > b.v) | ((a.v == b.v) & (a.id < b.id));
+}
+
+__device__ __forceinline__ Cand cand_shfl_xor(const Cand& c, int m) {
+    return {__shfl_xor_sync(kFullMask, c.v, m), __shfl_xor_sync(kFullMask, c.id, m)};
+}
+
+// one compare-exchange step against the lane `stride` away: the lane keeps the first of the pair when `keep_first`
+__device__ __forceinline__ Cand cand_exchange(const Cand& c, int stride, bool keep_first) {
+    const Cand o = cand_shfl_xor(c, stride);
+    return (cand_first(o, c) == keep_first) ? o : c;
+}
+
+// the warp's 32 pairs (one per lane) sorted in the selection order: lane i holds the i-th
+__device__ __forceinline__ Cand warp_sort32(Cand c) {
+    const int lane = (int) (threadIdx.x & 31);
+#pragma unroll
+    for (int size = 2; size <= 32; size <<= 1) {
+#pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const bool lower = (lane & stride) == 0;
+            const bool up = size == 32 || (lane & size) == 0;
+            c = cand_exchange(c, stride, lower == up);
+        }
+    }
+    return c;
+}
+
+// the first 32 of two sorted lists, sorted: the first of a[i] and b[31 - i] keeps the union's first 32 as a bitonic
+// sequence, which the half-cleaners then sort
+__device__ __forceinline__ Cand warp_merge32(const Cand& a, const Cand& b) {
+    const int lane = (int) (threadIdx.x & 31);
+    const Cand rb = {__shfl_sync(kFullMask, b.v, 31 - lane), __shfl_sync(kFullMask, b.id, 31 - lane)};
+    Cand c = cand_first(rb, a) ? rb : a;
+#pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) c = cand_exchange(c, stride, (lane & stride) == 0);
+    return c;
+}
+
+// the first 32 of `n` (a power of two, <= 16) sorted lists, by a tree of merges
+template <int n>
+__device__ __forceinline__ Cand warp_merge_tree(Cand (&c)[n]) {
+#pragma unroll
+    for (int w = 1; w < n; w <<= 1) {
+#pragma unroll
+        for (int i = 0; i + w < n; i += 2 * w) c[i] = warp_merge32(c[i], c[i + w]);
+    }
+    return c[0];
+}
+
+// The two warps of `sampled_tail_pair`, and the 64 threads of its named barrier.
+constexpr int kTailBarrier = 1;
+__device__ __forceinline__ void tail_pair_sync() { asm volatile("bar.sync %0, 64;" ::"n"(kTailBarrier) : "memory"); }
+
+struct TailShared {
+    double e1[kSortSpan];                    // top_p's terms, then its quotients
+    double e2[kSortSpan];                    // the temperature pass's terms, then its quotients
+    double pre2[kSortSpan];                  // the ordered prefix sums of e2
+    float x[kSortSpan];
+    int id[kSortSpan];
+};
+
+// the warp's 32 values sorted, largest first (values only: no NaN reaches here)
+__device__ __forceinline__ float warp_sort32_values(float v) {
+    const int lane = (int) (threadIdx.x & 31);
+#pragma unroll
+    for (int size = 2; size <= 32; size <<= 1) {
+#pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const float o = __shfl_xor_sync(kFullMask, v, stride);
+            const bool keep_max = ((lane & stride) == 0) == (size == 32 || (lane & size) == 0);
+            v = keep_max ? fmaxf(v, o) : fminf(v, o);
+        }
+    }
+    return v;
+}
+
+__device__ __forceinline__ bool cand_live(const Cand& c, float tau) {
+    return (c.v >= tau) & (c.v > __int_as_float(0xff800000));
+}
+
+/// The warp's first k (k <= 32) of its 8 x 32 pairs, sorted, one per lane; the entries past k are sorted too but may
+/// leave pairs out, which no caller reads (the first k of a union are within the first k of each part).  With the
+/// lane maxima sorted, the smallest j whose maximum has at least k live pairs at or above it bounds the warp's k-th
+/// value from below, so the first k are among the pairs at or above it: when at most 32 are, one sort of them is the
+/// answer; otherwise each set of 32 is sorted and the sets are merged.
+__device__ __forceinline__ Cand warp_first_k(Cand (&c)[kSortPer], int k, int n_vocab, Cand* buf) {
+    const int lane = (int) (threadIdx.x & 31);
+    float m = c[0].v;
+#pragma unroll
+    for (int j = 1; j < kSortPer; ++j) m = fmaxf(m, c[j].v);
+    const float sm = warp_sort32_values(m);
+    auto live_count = [&](float tau) {
+        int n = 0;
+#pragma unroll
+        for (int j = 0; j < kSortPer; ++j) n += __popc(__ballot_sync(kFullMask, cand_live(c[j], tau)));
+        return n;
+    };
+    int lo = 0, hi = k - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (live_count(__shfl_sync(kFullMask, sm, mid)) >= k) hi = mid;
+        else lo = mid + 1;
+    }
+    const float tau = __shfl_sync(kFullMask, sm, lo);
+    unsigned bal[kSortPer];
+    int total = 0;
+#pragma unroll
+    for (int j = 0; j < kSortPer; ++j) {
+        bal[j] = __ballot_sync(kFullMask, cand_live(c[j], tau));
+        total += __popc(bal[j]);
+    }
+    if (total <= kSortSpan) {
+        const unsigned below = (1u << lane) - 1u;
+        if (lane >= total) buf[lane] = Cand{__int_as_float(0xff800000), n_vocab};
+        int base = 0;
+#pragma unroll
+        for (int j = 0; j < kSortPer; ++j) {
+            if ((bal[j] >> lane) & 1u) buf[base + __popc(bal[j] & below)] = c[j];
+            base += __popc(bal[j]);
+        }
+        __syncwarp();
+        const Cand r = buf[lane];
+        __syncwarp();
+        return warp_sort32(r);
+    }
+#pragma unroll
+    for (int j = 0; j < kSortPer; ++j) c[j] = warp_sort32(c[j]);
+    return warp_merge_tree(c);
+}
+
+// The ordered running sum acc_i = (..((0 + a[0]) + a[1]) ..) + a[i] over i < n (n <= 32), each term added in turn:
+// `at(i, acc_i)` sees every value, and a true return stops the scan after it.  The terms are read eight at a time
+// ahead of the adds, so the adds wait only on each other.
+template <typename At>
+__device__ __forceinline__ void ordered_scan(const double* a, int n, At&& at) {
+    double acc = 0.0;
+#pragma unroll
+    for (int c = 0; c < kSortSpan; c += 8) {
+        if (c >= n) break;
+        double v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = a[c + j];
+        bool stop = false;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (c + j < n) {
+                acc += v[j];
+                stop |= at(c + j, acc);
+            }
+        if (stop) break;
+    }
+}
+
+/// **THE TAIL ON TWO WARPS** (k <= 32): the sorted list's first 32 entries are in `ts.x` / `ts.id` (the ids mapped as
+/// `sampled_tail_warp` reads them), and warps 0 and 1 of the block call this.  The arithmetic is
+/// `sampled_tail_warp`'s, value for value: the same `exp` arguments, every ordered sum and cumulative scan in the same
+/// order (on one lane), the same correctly rounded quotients.  Only where the work waits changes:
+/// - the list is sorted, so its first entry is its maximum (`fmaxf` over it gives that value up to the sign of a zero,
+///   and the `exp` of a difference that is a zero of either sign is 1), and the temperature pass's maximum is the first
+///   entry's too: warp 1 runs that pass's `exp`s and its ordered prefix sums while warp 0 runs top_p, and the sum over
+///   the first n_keep is the n_keep-th prefix sum;
+/// - a scan reads its terms ahead of its adds and records where it first crosses, so no compare waits in the chain
+///   of adds (the few sums past the crossing are never read).
+__device__ void sampled_tail_pair(TailShared& ts, int k, const SamplerParams& p, int t, int* __restrict__ out,
+                                  const int* query, int nq, float* qprob) {
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    const float x0 = ts.x[0];
+    const bool mine = lane < k;
+    if (warp == 1) {
+        const float smx = x0 * inv_t;
+        if (mine) ts.e2[lane] = exp((double) (ts.x[lane] * inv_t) - (double) smx);
+        __syncwarp();
+        if (lane == 0) ordered_scan(ts.e2, k, [&](int i, double acc) { ts.pre2[i] = acc; return false; });
+        tail_pair_sync();
+        return;
+    }
+    int n_keep = k;
+    if (p.top_p < 1.0f) {
+        if (mine) ts.e1[lane] = exp((double) ts.x[lane] - (double) x0);
+        __syncwarp();
+        double sum = 0.0;
+        if (lane == 0) ordered_scan(ts.e1, k, [&](int, double acc) { sum = acc; return false; });
+        sum = __shfl_sync(kFullMask, sum, 0);
+        if (mine) ts.e1[lane] = ts.e1[lane] / sum;
+        __syncwarp();
+        int cut = k;
+        if (lane == 0)
+            ordered_scan(ts.e1, k, [&](int i, double cum) {
+                if (cut == k && cum >= (double) p.top_p) cut = i + 1;
+                return cut != k;
+            });
+        cut = __shfl_sync(kFullMask, cut, 0);
+        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+        n_keep = cut;
+    }
+    if (p.min_p > 0.0f) {
+        const float thresh = x0 + logf(p.min_p);
+        const unsigned below = __ballot_sync(kFullMask, mine && ts.x[lane] < thresh);
+        const int first = below ? __ffs(below) - 1 : k;
+        if (first < n_keep) n_keep = first;
+    }
+    tail_pair_sync();                        // warp 1's terms and prefix sums
+    const double sum2 = n_keep > 0 ? ts.pre2[n_keep - 1] : 0.0;
+    if (lane < n_keep) ts.e2[lane] = ts.e2[lane] / sum2;
+    __syncwarp();
+    if (lane == 0) {
+        const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+        int pi = n_keep > 0 ? n_keep - 1 : 0;
+        bool found = false;
+        ordered_scan(ts.e2, n_keep, [&](int i, double cum) {
+            if (!found && (double) u < cum) { pi = i; found = true; }
+            return found;
+        });
+        out[t] = ts.id[pi];
+        if (qprob != nullptr && t < nq) {
+            const int q = query[t];
+            float pq = 0.0f;
+            for (int i = 0; i < n_keep; ++i)
+                if (ts.id[i] == q) { pq = (float) ts.e2[i]; break; }
+            if (n_keep == 0 && ts.id[0] == q) pq = 1.0f;
+            qprob[t] = pq;
+        }
+    }
+}
+
+/// **THE SORTED SPLIT IN ONE LAUNCH.**  Grid (blocks per row, rows), 16 warps.  Each warp finds the first k of its
+/// 256 penalised logits (`warp_first_k`), warp 0 merges the 16 warp lists into the block's and writes it to `cand`
+/// (32 entries per block).  The row's last block (counted in `done[t]`, reset by it) merges the row's lists, 16 warps
+/// four lists each and then warp 0 the 16 results, and runs the tail on two warps: the first k that
+/// `sampler_split_merge_kernel` finds, so the same token and probabilities, bit for bit.
+__global__ void __launch_bounds__(kSortWarps * 32)
+sampler_sort_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history, int history_len,
+                    const SamplerParams p, int k, int n_blocks, int2* __restrict__ cand, unsigned* __restrict__ done,
+                    int* __restrict__ out, const int* __restrict__ query, int nq, float* __restrict__ qprob) {
+    const int t = blockIdx.y;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    const int blo = (int) blockIdx.x * kSortBlockSpan;
+
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;          // the window is the TAIL
+    }
+    __shared__ unsigned int bits[kSortBlockSpan / 32];
+    const bool use_bits = hrow != nullptr && hlen > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < kSortBlockSpan / 32; w += blockDim.x) bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x) {
+            const int h = hrow[i];
+            if (h >= 0 && h < n_vocab && h >= blo && h - blo < kSortBlockSpan)
+                atomicOr(&bits[(h - blo) >> 5], 1u << ((h - blo) & 31));
+        }
+        __syncthreads();
+    }
+
+    const int lo = blo + warp * 32 * kSortPer;
+    Cand c[kSortPer];
+#pragma unroll
+    for (int j = 0; j < kSortPer; ++j) {
+        const int v = lo + 32 * j + lane;
+        float s = v < n_vocab ? (p.logit_bias ? l[v] + p.logit_bias[v] : l[v]) : __int_as_float(0xff800000);
+        if (use_bits) {
+            const int b = v - blo;
+            if (v < n_vocab && (bits[b >> 5] & (1u << (b & 31)))) s = apply_penalties(s, history_count(hrow, hlen, v), p);
+        }
+        c[j] = s > __int_as_float(0xff800000) ? Cand{s, v} : Cand{__int_as_float(0xff800000), n_vocab};
+    }
+    __shared__ Cand wl[kSortWarps][kSortSpan];
+    __shared__ Cand lists[kSplitMaxBlocks * kSortSpan];
+    __shared__ TailShared ts;
+    __shared__ int last;
+    wl[warp][lane] = warp_first_k(c, k, n_vocab, wl[warp]);
+    __syncthreads();
+    if (warp == 0) {
+        Cand w[kSortWarps];
+#pragma unroll
+        for (int i = 0; i < kSortWarps; ++i) w[i] = wl[i][lane];
+        const Cand b = warp_merge_tree(w);
+        cand[((size_t) t * n_blocks + blockIdx.x) * kSortSpan + lane] = make_int2(b.id, __float_as_int(b.v));
+        __threadfence();                     // the list is visible device-wide before the count that publishes it
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned prior = atomicAdd(&done[t], 1u);
+        last = prior == (unsigned) (n_blocks - 1);
+        if (last) done[t] = 0u;              // every block of the row has counted: ready for the next launch
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int2* src = cand + (size_t) t * n_blocks * kSortSpan;
+    for (int e = threadIdx.x; e < kSplitMaxBlocks * kSortSpan; e += blockDim.x) {
+        const int2 x = e < n_blocks * kSortSpan ? __ldcg(src + e) : make_int2(n_vocab, (int) 0xff800000u);
+        lists[e] = Cand{__int_as_float(x.y), x.x};
+    }
+    __syncthreads();
+    {   // 64 lists: warp w merges lists 4w .. 4w + 3 into wl[w]
+        Cand m[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) m[i] = lists[(warp * 4 + i) * kSortSpan + lane];
+        wl[warp][lane] = warp_merge_tree(m);
+    }
+    __syncthreads();
+    if (warp > 1) return;
+    if (warp == 0) {
+        Cand w[kSortWarps];
+#pragma unroll
+        for (int i = 0; i < kSortWarps; ++i) w[i] = wl[i][lane];
+        const Cand r = warp_merge_tree(w);
+        ts.x[lane] = r.v;
+        ts.id[lane] = r.id < n_vocab ? r.id : 0;
+    }
+    tail_pair_sync();
+    sampled_tail_pair(ts, k, p, t, out, query, nq, qprob);
+}
+
 // ---- COUPLED DRAFT SAMPLING (include/basalt/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
 // target's chain and the target's Philox draw.  Everything that varies per request or per round - the chain's
 // parameters, the seed, the counter (from the cell's step record), the penalty history - is read from DEVICE memory:
@@ -837,13 +1290,14 @@ bool stream_capturing(void* stream) {
 // smaller than its live one, so a slot holds about 4 MB at most (0.5 MB for the engine's <= 16 rows).  nullptr
 // when the memory cannot be had, and the caller falls back to the one-block kernel; a failed grow is remembered, so
 // later calls of that size do not retry cudaMalloc each time.
-int2* split_scratch(void* stream, size_t entries) {
+int2* split_scratch(void* stream, size_t entries, unsigned** done) {
     struct Slot {
         int device;
         void* stream;
         int2* ptr;
         size_t entries;
         size_t failed;                       // the smallest size cudaMalloc refused (0: none)
+        unsigned* done;                      // the one-launch split's per-row block counters, zero between launches
     };
     static std::mutex mu;
     static std::vector<Slot> slots;
@@ -858,9 +1312,21 @@ int2* split_scratch(void* stream, size_t entries) {
     for (Slot& s : slots)
         if (s.device == device && s.stream == stream) slot = &s;
     if (slot == nullptr) {
-        slots.push_back({device, stream, nullptr, 0, 0});
+        slots.push_back({device, stream, nullptr, 0, 0, nullptr});
         slot = &slots.back();
     }
+    if (slot->done == nullptr) {
+        unsigned* d = nullptr;
+        // zeroed in the stream's own order: a non-blocking stream does not wait for the legacy stream
+        if (cudaMalloc(&d, kSplitMaxRows * sizeof(unsigned)) != cudaSuccess ||
+            cudaMemsetAsync(d, 0, kSplitMaxRows * sizeof(unsigned), (cudaStream_t) stream) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (d != nullptr) cudaFree(d);
+            return nullptr;
+        }
+        slot->done = d;
+    }
+    *done = slot->done;
     if (slot->entries >= entries) return slot->ptr;
     if (slot->failed != 0 && entries >= slot->failed) return nullptr;
     constexpr size_t kCap = (size_t) kSplitMaxRows * kSplitMaxBlocks * kSelMax;
@@ -976,8 +1442,15 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     sample_tokens_probe(logits, n_tokens, n_vocab, history, history_len, p, out, nullptr, 0, nullptr, stream);
 }
 
-void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                         const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream) {
+namespace {
+
+// The sampled path's split: 0 the two launches (block lists, then one warp per row), 1 the one launch with k argmax
+// rounds per warp (`sampler_fused_kernel`), 2 the one launch with bitonic networks (`sampler_sort_kernel`, top_k <= 32;
+// a wider top_k takes 1).  Every one picks the same token.
+constexpr int kEngineSplit = 2;
+
+void sample_tokens_impl(int split, const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return;
     if (qprob == nullptr) n_query = 0;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
@@ -988,35 +1461,42 @@ void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const i
     const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
                                ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)   // the penalty bitmap
                                : 0;
+    const cudaStream_t cs = (cudaStream_t) stream;
     if (p.greedy || p.temperature <= 0.0f) {
         // Without penalties (shmem == 0: no window) with cluster support, a cluster of CTAs per token - the same token; see
         // `sampler_greedy_cluster_kernel`.
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
         if (!(shmem == 0 && p.logit_bias == nullptr && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
-            sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
+            sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, cs>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else {
-        // The split top_k: stage 1 over (61 blocks x rows) for 248,320 logits, stage 2 one warp per
-        // row.  The one-block kernel when the split cannot run: a wider vocabulary than the merge
-        // holds, more than `kSplitMaxRows` rows (the engine samples at most a verify window), a stream under capture,
-        // no scratch.
+        // The split top_k over 4,096-logit blocks (61 per row for 248,320 logits).  The one-block kernel when the
+        // split cannot run: a wider vocabulary than the merge holds, more than `kSplitMaxRows` rows (the engine
+        // samples at most a verify window), a stream under capture, no scratch.
         const int k = sampled_k(p.top_k, n_vocab);
         const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
         int2* scratch = nullptr;
+        unsigned* done = nullptr;
         if (n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
             !stream_capturing(stream))
             // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
-            scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
-        if (scratch != nullptr) {
-            sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0,
-                                        (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, k,
-                                                                 n_blocks, scratch);
-            sampler_split_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(
-                scratch, n_blocks, n_vocab, p, k, out, query, n_query, qprob);
-        } else {
-            sampler_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+            scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax, &done);
+        const dim3 grid((unsigned) n_blocks, (unsigned) n_tokens);
+        if (scratch == nullptr) {
+            sampler_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, cs>>>(
                 logits, n_vocab, history, history_len, p, out, query, n_query, qprob);
+        } else if (split == 2 && k <= kSortSpan) {
+            sampler_sort_kernel<<<grid, kSortWarps * 32, 0, cs>>>(logits, n_vocab, history, history_len, p, k, n_blocks,
+                                                                  scratch, done, out, query, n_query, qprob);
+        } else if (split >= 1) {
+            sampler_fused_kernel<8, 16><<<grid, 512, 0, cs>>>(logits, n_vocab, history, history_len, p, k, n_blocks,
+                                                              scratch, done, out, query, n_query, qprob);
+        } else {
+            sampler_split_part_kernel<<<grid, kSplitWarps * 32, 0, cs>>>(logits, n_vocab, history, history_len, p, k,
+                                                                          n_blocks, scratch);
+            sampler_split_merge_kernel<<<(unsigned) n_tokens, 32, 0, cs>>>(scratch, n_blocks, n_vocab, p, k, out,
+                                                                          query, n_query, qprob);
         }
     }
     const cudaError_t e = cudaGetLastError();
@@ -1025,6 +1505,20 @@ void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const i
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
+}
+
+}  // namespace
+
+void sample_tokens_probe(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                         const SamplerParams& p, int* out, const int* query, int n_query, float* qprob, void* stream) {
+    sample_tokens_impl(kEngineSplit, logits, n_tokens, n_vocab, history, history_len, p, out, query, n_query, qprob,
+                       stream);
+}
+
+void sample_tokens_split(int split, const float* logits, int n_tokens, int n_vocab, const int* history,
+                         int history_len, const SamplerParams& p, int* out, const int* query, int n_query, float* qprob,
+                         void* stream) {
+    sample_tokens_impl(split, logits, n_tokens, n_vocab, history, history_len, p, out, query, n_query, qprob, stream);
 }
 
 namespace {

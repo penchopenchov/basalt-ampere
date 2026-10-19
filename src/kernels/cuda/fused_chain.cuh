@@ -102,7 +102,7 @@ struct LayerC {
     const uint8_t* wo;
     const uint8_t* dn1; const uint8_t* dn2;   // hc down rows as per-CTA smem images (or null)
     Geo geo;
-    alignas(64) CUtensorMap stm;              // rec state [S rows][R_HV * S], box S x S
+    TmaDesc stm;                              // rec state [S rows][R_HV * S], box S x S
 };
 struct KP {
     LayerC Lc; unsigned par; const LayerC* L; int NLAY, iters, T; long long delay_ns; int pf, prt;
@@ -188,7 +188,7 @@ __device__ void fill_dn(const HcFusedArgs& a, const uint8_t* img, int b, char* W
     else if (lane >= 16 && lane - 16 < r.nrows) bulk_w2s(WD + 16 * CN_W + (lane - 16) * 80, r.s + (size_t) (lane - 16) * r.srow, 80, bar);
 }
 __device__ void fill_wu(const HcLaunch& L, const uint16_t* w_router, int b, bool router, char* WU, uint64_t* bar) {
-    if (b < NUP) hc_up_tma(UpSlice{32 * b, 32}, WU, reinterpret_cast<uint16_t*>(WU + UPCM), &L.tm[4], bar);
+    if (b < NUP) hc_up_tma(UpSlice{32 * b, 32}, WU, reinterpret_cast<uint16_t*>(WU + UPCM), reinterpret_cast<const CUtensorMap*>(&L.tm[4]), bar);
     else if (router && b >= RT0 && b < RT0 + NRTC) {
         mbar_expect_tx(bar, RTR * N * 2);
         bulk_w2s(WU, w_router + (size_t) (b - RT0) * RTR * N, RTR * N * 2, bar);
@@ -997,7 +997,7 @@ __device__ __forceinline__ int chain_body(const KP& p, unsigned long long*& srec
                 zz[t] = 0.0f;
             }
             // the state tile: after the hop and the qkv loads (an in-flight 64 KB copy delays this SM's loads and polls)
-            if (tid == 0) { pfence(); mbar_expect_tx(&P.rbar, S * S * 4); tma_2d(sm, &L.stm, head * S, 0, &P.rbar); }
+            if (tid == 0) { pfence(); mbar_expect_tx(&P.rbar, S * S * 4); tma_2d(sm, reinterpret_cast<const CUtensorMap*>(&L.stm), head * S, 0, &P.rbar); }
             float yq[XT], yk[XT];
 #pragma unroll
             for (int t = 0; t < XT; ++t) {

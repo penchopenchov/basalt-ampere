@@ -66,12 +66,22 @@ const char* name_of(int t) {
         case 42: return "Q2_0";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
+        case 14: return "Q6_K";
         case 7: return "Q5_1";
         case 8: return "Q8_0";
+        case 40: return "NVFP4";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+// NVFP4 experts end in {s_gate, s_up, s_down, 0}: FP32 scales in 0.5 .. 2
+void append_nvfp4_tail(std::vector<uint8_t>& b, std::mt19937& rng) {
+    std::uniform_real_distribution<float> u(0.5f, 2.0f);
+    const float t[4] = {u(rng), u(rng), u(rng), 0.0f};
+    const uint8_t* p = (const uint8_t*) t;
+    b.insert(b.end(), p, p + sizeof t);
+}
+
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -80,11 +90,18 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 1);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
-        if (t == 29) {
+        if (t == 40) {
+            // NVFP4: four UE4M3 sub-block scales, exponent 1..4: 2^-7 .. 2^-4 as ggml decodes them
+            for (int j = 0; j < 4; ++j) w[o + j] = (uint8_t) (((1 + byte(rng) % 4) << 3) | (byte(rng) & 7));
+        } else if (t == 29) {
             // IQ1_M: the fp16 scale is the top nibbles of its four scale words (bytes 48..55), the sign and the
             // exponent's top bits in the last: 0x1 / 0x2 there (0x9 / 0xA negative) keeps it in 2^-11 .. 2^-3
             const uint8_t nib = (uint8_t) ((sgn(rng) ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
+        } else if (t == 14) {
+            // Q6_K: the fp16 scale ends the block (offset 208); the codes and the int8 sub-scales stay random
+            const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | ((1 + ex(rng) % 4) << 10) | man(rng));
+            std::memcpy(&w[o + 208], &h, 2);
         } else {   // the other formats start their block with the fp16 scale: 2^-13 .. 2^-6
             // (Q4_K / Q5_K: 2^-14 .. 2^-11, their 6-bit sub-scales multiply it by up to 63)
             const int e = (t == 12 || t == 13) ? 1 + ex(rng) % 4 : ex(rng);
@@ -125,6 +142,7 @@ struct Setup {
             auto blob = random_rows(gu, 2 * FF, H, rng);
             const auto down = random_rows(dt, H, FF, rng);
             blob.insert(blob.end(), down.begin(), down.end());
+            if (gu == 40) append_nvfp4_tail(blob, rng);
             if (blob.size() != L.bytes) { std::fprintf(stderr, "blob %zu != %zu bytes\n", blob.size(), L.bytes); std::exit(2); }
             ck(cudaMemcpy(blobs + slot * (size_t) b, blob.data(), blob.size(), cudaMemcpyHostToDevice), "blob");
         }
@@ -550,9 +568,12 @@ int main(int argc, char** argv) {
         std::printf("native_grouped_parity: %d failures\n", g_fail);
         return g_fail ? 1 : 0;
     }
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 8})        // GU_FMTS
+    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13, 14, 8})        // GU_FMTS
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // D_FMTS; IQ4_XS: n_ff % 256
+    check(14, 8, 2560, 640, s, rng);                                    // Q6_K gate/up, a model's shape
+    check(40, 40, 512, 256, s, rng);                                    // NVFP4: its own pair, with the scale tail
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
+    check(40, 40, 2560, 640, s, rng);
     check(21, 23, 2560, 768, s, rng);
     check(18, 20, 2560, 640, s, rng);
     check(18, 20, 512, 256, s, rng, 12);                                // groups of more than 8 entries

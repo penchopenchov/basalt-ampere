@@ -36,14 +36,25 @@ DRAFT_CUM_HD inline bool draft_keep(const float* probs, int j, float min_p, floa
 }
 
 /// The rule's base threshold: what a request starts from and the device graph's default.
-constexpr float kDraftCumBase = 0.35f;
+constexpr float kDraftCumBase0 = 0.35f;
+
+/// The CPU-served expert bytes per expert slot, in MB, set once when the expert tiers are final.  Each extra verified
+/// token adds distinct experts the CPU must read from RAM, so a pack that leaves more bytes in RAM pays more per extra
+/// token; the rule's threshold rises with it.  Fixed by the pack and its placement, never by timing.
+inline float& draft_cum_cpu_mb() { static float v = 0.0f; return v; }
+inline float draft_cum_scale() {
+    constexpr float kLoMb = 1.1f, kHiMb = 3.5f, kMax = 1.5f;
+    const float t = (draft_cum_cpu_mb() - kLoMb) / (kHiMb - kLoMb);
+    return 1.0f + (kMax - 1.0f) * (t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t);
+}
+inline float draft_cum_base() { return kDraftCumBase0 * draft_cum_scale(); }
 
 /// Per-request threshold.  The threshold falls from the base toward kLo as the
 /// request's drafts are accepted more often than the bin table predicts: when they run well, longer windows pay.  The
 /// observed and expected accepted counts decay per window; the ratio sets the threshold along a linear ramp.  The
 /// window's value is fixed before its drafts are made and shared by the host rule and the device graph.
 struct DraftCumAdapt {
-    float base = kDraftCumBase;   ///< the threshold while nothing is known
+    float base = draft_cum_base();   ///< the threshold while nothing is known
     double obs = 0.0, exp = 0.0;
     float cur = base;
 
@@ -53,7 +64,7 @@ struct DraftCumAdapt {
     void observe(const float* probs, int n, int acc) {
         if (n <= 0) return;
         constexpr double kDecay = 0.97, kRlo = 0.9, kRhi = 1.1;
-        constexpr float kLo = 0.25f;
+        const float kLo = 0.25f * draft_cum_scale();
         double c = 1.0, e = 0.0;
         for (int j = 0; j < n; ++j) { c *= (double) draft_cum_acc(probs[j]); e += c; }
         obs = obs * kDecay + (double) acc;

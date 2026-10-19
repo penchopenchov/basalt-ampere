@@ -41,6 +41,8 @@
 #include <string>
 #include <vector>
 
+namespace basalt::kernels::cpu { class ExpertPool; }
+
 namespace basalt::core {
 
 class NativeHead;
@@ -117,6 +119,10 @@ public:
     /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
     /// per layer.  Before init.
     void set_peer(PeerExperts* peer) { peer_ = peer; }
+    /// The CPU pool and the expert source the window's CPU tier runs on: between doorbells the parked workers predict
+    /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
+    /// Before init; only with the device-planned MoE tail.
+    void set_cpu_warm(basalt::kernels::cpu::ExpertPool* pool, ExpertSource* src) { warm_pool_ = pool; warm_src_ = src; }
 
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -311,6 +317,8 @@ private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
+    basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
+    ExpertSource* warm_src_ = nullptr;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window

@@ -68,6 +68,9 @@ typedef half2 ggml_half2;
 #define QI2_0 (QK2_0 / 32)
 #define QR2_0 1
 
+#define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
+#define QR_NVFP4 2
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -122,7 +125,14 @@ typedef half2 ggml_half2;
 
 #endif // GGML_COMMON_DECL_CUDA
 
+// Marks the anonymous unions below as an accepted extension. It is a syntax marker only: the member layout is
+// what the size checks further down pin, and the compilers without the keyword (MSVC, and nvcc with an MSVC host
+// front end) allow the same unions on their own.
+#if defined(__GNUC__) || defined(__clang__)
 #define GGML_EXTENSION __extension__
+#else
+#define GGML_EXTENSION
+#endif
 
 #define QK2_0 64
 typedef struct {
@@ -130,6 +140,17 @@ typedef struct {
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+// NVFP4: 64 values in four 16-value sub-blocks, each with a UE4M3 scale. Sub-block s keeps its E2M1 codes in
+// qs[8 s .. 8 s + 7]: byte j holds value j (low nibble) and value j + 8 (high nibble). The FP32 scale per
+// expert matrix is not part of the block; it multiplies the projection's output.
+#define QK_NVFP4 64
+#define QK_NVFP4_SUB 16
+typedef struct {
+    uint8_t d[QK_NVFP4 / QK_NVFP4_SUB];   // UE4M3 sub-block scales
+    uint8_t qs[QK_NVFP4 / 2];             // E2M1 codes, 4 bits each
+} block_nvfp4;
+static_assert(sizeof(block_nvfp4) == QK_NVFP4 / QK_NVFP4_SUB + QK_NVFP4 / 2, "wrong nvfp4 block size/padding");
 
 #define QK4_0 32
 typedef struct {
@@ -985,6 +1006,9 @@ GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+GGML_TABLE_END()
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
 #define IQ1M_DELTA 0.125f

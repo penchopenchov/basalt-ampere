@@ -14,6 +14,7 @@ Protocol (one line each):
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -24,6 +25,7 @@ import time
 from pathlib import Path
 
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
+from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStuck
 from serve.engine.slots import AdmissionQueue
 from serve.engine.progress import narrate_start, start_errors, start_failure_hint, start_last_line
@@ -67,11 +69,28 @@ def echo_requests(log_path: str, offset: int) -> None:
                                                  m["tg"]), flush=True)
 
 
+def engine_line(line: str) -> str:
+    """Drop the `\r` a text-mode stream puts before a line's final `\n`; the line keeps its `\n`."""
+    return line[:-2] + "\n" if line.endswith("\r\n") else line
+
+
+def frame_pipes(proc, stderr_pipe: bool) -> None:
+    """Frame a child's pipes on `\n` alone, both directions: the text-mode default for a pipe writes `\r\n` on
+    Windows, and ends a line at a `\r` that belongs to the line rather than ending it.  Only Popen's own text
+    wrappers carry that default; a stream the caller made is left as it is."""
+    if isinstance(proc.stdin, io.TextIOWrapper):
+        proc.stdin.reconfigure(newline="\n", write_through=True, line_buffering=True)
+    if isinstance(proc.stdout, io.TextIOWrapper):
+        proc.stdout.reconfigure(newline="\n")
+    if stderr_pipe and isinstance(proc.stderr, io.TextIOWrapper):
+        proc.stderr.reconfigure(newline="\n")
+
+
 def pump_lines(stream, sink) -> None:
     """Pass each line of a child's pipe to `sink` until it closes."""
     try:
         for line in stream:
-            sink(line)
+            sink(engine_line(line))
     except (OSError, ValueError):
         pass
 
@@ -113,12 +132,11 @@ class ProcessEngine:
     def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        self.model_path = flag_value(args, "--native") or flag_value(args, "--pack") or "pack/full"
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
-        self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.max_context = int(flag_value(args, "--max-context") or 4096)
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
         self.slot_drafts = {}
@@ -153,6 +171,7 @@ class ProcessEngine:
         self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
                                      bufsize=1, env=env)
+        frame_pipes(self.proc, sink is not None)
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
@@ -212,11 +231,11 @@ class ProcessEngine:
         # stdout is pumped on a thread so requests can wait with a timeout
         self.lines: queue.Queue = queue.Queue()
         # the engine reports the slots it actually runs (INFO batch_slots=N), possibly fewer than asked
-        asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
+        asked = next((int(v) for v in (flag_value(args, k) for k in ("--batch", "--slots")) if v), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
             print(f"[server] warning: {asked} parallel requests asked, the engine runs {self.batch or 'one'}", flush=True)
-        groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
+        groups = int(flag_value(args, "--batch-groups") or 1)
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
         # slot order that spreads requests over the groups first: 0, gs, 2gs, .., 1, gs+1, ..
@@ -247,6 +266,7 @@ class ProcessEngine:
         done = False
         try:
             for line in proc.stdout:
+                line = engine_line(line)
                 out.put(line)
                 if line.startswith("READY"):
                     done = True
@@ -262,6 +282,7 @@ class ProcessEngine:
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
+            line = engine_line(line)
             if line.startswith(FATAL_PREFIXES):         # before batch routing
                 if self.proc is proc:
                     self.silent_note = "unrecoverable verification failure: " + line[4:].strip()

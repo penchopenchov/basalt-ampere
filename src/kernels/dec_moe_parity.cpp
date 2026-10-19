@@ -1,6 +1,8 @@
 // src/kernels/dec_moe_parity.cpp - DEC_MOE's kernels on real GGUF experts against the path they replace.
 //
 //     build/dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N]
+//     build/dec_moe_parity --nvfp4 [--bench | --stress N]   (synthetic NVFP4 experts with their scale tail, no GGUF)
+//     build/dec_moe_parity --kq [--bench]        (synthetic Q4_K / Q5_K / Q6_K gate/up with Q5_1 / Q8_0 down, no GGUF)
 //
 // Per layer (default: one of each gate/up + down format pair):
 //   peer math   the persistent kernel's work items (dec_moe_peer_math_test) vs native_expert_grouped, every card
@@ -26,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -71,6 +74,74 @@ size_t ndiff_rows(const std::vector<float>& a, const std::vector<float>& b, cons
     for (int r : rows)
         for (int64_t c = 0; c < H; ++c) d += std::memcmp(&a[(size_t) r * H + c], &b[(size_t) r * H + c], 4) != 0;
     return d;
+}
+
+// A UE4M3 sub-block scale byte.  Profile 0: exponent 1..4 (small blocks).  Profile 1: exponent 6..14, block values in
+// the hundreds as the packs' are (their tails are 1e-5..1e-4).  Profile 2: profile 1 with the odd bytes mixed in: 0x7F
+// (the NaN code, decoded as 0), the sign bit set (ignored), zero and subnormals.
+uint8_t nvfp4_scale_byte(int prof, std::mt19937& rng) {
+    if (prof == 0) return (uint8_t) (((1 + rng() % 4) << 3) | (rng() & 7));
+    const uint8_t v = (uint8_t) (((6 + rng() % 9) << 3) | (rng() & 7));
+    if (prof == 1) return v;
+    switch (rng() % 8) {
+        case 0: return 0x7F;
+        case 1: return (uint8_t) (v | 0x80);
+        case 2: return 0xFF;
+        case 3: return 0x00;
+        case 4: return (uint8_t) (rng() & 7);   // subnormal
+        default: return v;
+    }
+}
+// The FP32 tail scale: profile 0 in 0.5 .. 2, else log-uniform in 2e-5 .. 2e-4 (what the packs carry).
+float nvfp4_tail_scale(int prof, std::mt19937& rng) {
+    if (prof == 0) return std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
+    return 2e-5f * std::exp(std::uniform_real_distribution<float>(0.0f, std::log(10.0f))(rng));
+}
+// NX synthetic NVFP4 expert blobs: random nibbles, UE4M3 sub-block scales, then the FP32 tail {s_gate, s_up, s_down, 0};
+// expert x takes scale profile x % 3
+std::vector<uint8_t> nvfp4_blobs(const K::NativeExpertLayout& L, int nx, std::mt19937& rng) {
+    std::vector<uint8_t> b((size_t) nx * L.bytes);
+    std::uniform_int_distribution<int> byte(0, 255);
+    constexpr size_t bs = 36;   // block_nvfp4: 4 scale bytes, 32 nibble bytes
+    for (int x = 0; x < nx; ++x) {
+        uint8_t* p = b.data() + (size_t) x * L.bytes;
+        const size_t q = L.bytes - 16;
+        for (size_t i = 0; i < q; ++i) p[i] = (uint8_t) byte(rng);
+        for (size_t o = 0; o < q; o += bs)
+            for (int j = 0; j < 4; ++j) p[o + j] = nvfp4_scale_byte(x % 3, rng);
+        const float t[4] = {nvfp4_tail_scale(x % 3, rng), nvfp4_tail_scale(x % 3, rng), nvfp4_tail_scale(x % 3, rng), 0.0f};
+        std::memcpy(p + q, t, sizeof t);
+    }
+    return b;
+}
+
+// NX synthetic blobs of the K-quant and Q8_0 formats (Q4_K / Q5_K / Q8_0 gate/up, Q5_1 / Q8_0 down): random bytes, then finite
+// small fp16 block scales (the first two halves of each block; Q8_0 has one)
+void kq_fix_scales(uint8_t* p, size_t bytes, int type, std::mt19937& rng) {
+    const size_t bs = type == 12 ? 144 : type == 13 ? 176 : type == 14 ? 210 : type == 7 ? 24 : 34;
+    std::uniform_int_distribution<int> ex(2, 5), man(0, 1023);
+    for (size_t o = 0; o + bs <= bytes; o += bs) {
+        if (type == 14) {   // Q6_K: the fp16 scale ends the block
+            const uint16_t h = (uint16_t) ((ex(rng) << 10) | man(rng));
+            std::memcpy(p + o + 208, &h, 2);
+            continue;
+        }
+        for (int j = 0; j < (type == 8 ? 1 : 2); ++j) {
+            const uint16_t h = (uint16_t) ((ex(rng) << 10) | man(rng));
+            std::memcpy(p + o + 2 * j, &h, 2);
+        }
+    }
+}
+std::vector<uint8_t> kq_blobs(const K::NativeExpertLayout& L, int nx, std::mt19937& rng) {
+    std::vector<uint8_t> b((size_t) nx * L.bytes);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (auto& v : b) v = (uint8_t) byte(rng);
+    for (int x = 0; x < nx; ++x) {
+        uint8_t* p = b.data() + (size_t) x * L.bytes;
+        kq_fix_scales(p, L.down_off, L.gu_type, rng);
+        kq_fix_scales(p + L.down_off, L.bytes - L.down_off, L.d_type, rng);
+    }
+    return b;
 }
 
 struct Groups {   // a grouped call's lists on one device
@@ -120,21 +191,29 @@ double time_us(cudaStream_t s, int iters, const std::function<void()>& f) {
 // routes tokens with repeated expert ids and ids past n_expert (the route kernel must keep them off the peer).
 // `torn` (--stress-torn): the host-rung rings carry an expert id with different tiers in different tokens (what the route
 // kernel publishes when it reads a residency table while an upload lands): the peer must neither hang nor fault.
-void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows, bool dup, bool torn, unsigned seed) {
+// `gguf` null: synthetic NVFP4 experts (--nvfp4).  The peer's L2 warm-up runs in warm_pct % of the windows
+// (--stress-warm, default 75), with random predictor rows.
+void stress(const basalt::GgufFile* gguf, int l, int gt, int dt, int windows, bool dup, bool torn, unsigned seed,
+            int warm_pct) {
     const auto L = K::native_expert_layout(gt, dt, H, FF);
     constexpr int NX0 = 32, NP = 48, NX1 = 64, RINGS = 48;
-    const auto* tg = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
-    const auto* tu = gguf.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
-    const auto* td = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
-    std::vector<uint8_t> blobs((size_t) NX1 * L.bytes);
-    for (int x = 0; x < NX1; ++x) {
-        const size_t E = (size_t) ((x * 37 + 5) % NE);
-        uint8_t* b = blobs.data() + (size_t) x * L.bytes;
-        std::memcpy(b, gguf.tensor_data(*tg) + E * L.up_off, L.up_off);
-        std::memcpy(b + L.up_off, gguf.tensor_data(*tu) + E * L.up_off, L.up_off);
-        std::memcpy(b + L.down_off, gguf.tensor_data(*td) + E * (L.bytes - L.down_off), L.bytes - L.down_off);
-    }
     std::mt19937 rng(seed);
+    std::vector<uint8_t> blobs;
+    if (gguf == nullptr) {
+        blobs = nvfp4_blobs(L, NX1, rng);
+    } else {
+        const auto* tg = gguf->find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
+        const auto* tu = gguf->find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
+        const auto* td = gguf->find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
+        blobs.resize((size_t) NX1 * L.bytes);
+        for (int x = 0; x < NX1; ++x) {
+            const size_t E = (size_t) ((x * 37 + 5) % NE);
+            uint8_t* b = blobs.data() + (size_t) x * L.bytes;
+            std::memcpy(b, gguf->tensor_data(*tg) + E * L.up_off, L.up_off);
+            std::memcpy(b + L.up_off, gguf->tensor_data(*tu) + E * L.up_off, L.up_off);
+            std::memcpy(b + L.down_off, gguf->tensor_data(*td) + E * (L.bytes - L.down_off), L.bytes - L.down_off);
+        }
+    }
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> xh((size_t) MT * H);
     for (auto& v : xh) v = nd(rng);
@@ -160,6 +239,16 @@ void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows, bo
     ck(cudaMemcpy(d_lay, lays.data(), RINGS * sizeof(K::NativeExpertLayout), cudaMemcpyHostToDevice), "lay");
     void* pscr = dmal<uint8_t>(K::dec_moe_peer_scratch_bytes((int) H, (int) FF));
     unsigned int* parr = dmal<unsigned int>(16);
+    // the warm-up's predictor rows (random: it predicts any expert, peer-held or not; the rows must not change)
+    std::vector<int8_t> rqh((size_t) RINGS * NE * H);
+    std::vector<float> rsh((size_t) RINGS * NE * (H / 32));
+    for (auto& v : rqh) v = (int8_t) ((int) (rng() % 255) - 127);
+    for (auto& v : rsh) v = 1e-3f * (float) (1 + rng() % 100);
+    int8_t* d_rq = dmal<int8_t>(rqh.size());
+    float* d_rs = dmal<float>(rsh.size());
+    ck(cudaMemcpy(d_rq, rqh.data(), rqh.size(), cudaMemcpyHostToDevice), "rq");
+    ck(cudaMemcpy(d_rs, rsh.data(), rsh.size() * 4, cudaMemcpyHostToDevice), "rs");
+    bool warm = true;   // per window: the peer's warm-up on (and the rings' rows always published) or off
     float* x1 = dmal<float>(xh.size());
     ck(cudaMemcpy(x1, xh.data(), xh.size() * 4, cudaMemcpyHostToDevice), "x1");
     void* xq1 = dmal<uint8_t>(xq_stride);
@@ -203,6 +292,7 @@ void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows, bo
         pa.done_m = h_words + 32; pa.rows_m = h_peer; pa.ptr = d_ptab; pa.lay = d_lay;
         pa.n_expert = (int) NE; pa.k = (int) KK; pa.n_embd = (int) H; pa.n_ff = (int) FF; pa.steps = steps;
         pa.scratch = pscr; pa.arrive = parr; pa.diag_m = h_diag;
+        if (warm) { pa.rq = d_rq; pa.rs = d_rs; }
         if (!K::dec_moe_peer_launch(pa, pblocks, s1, L.gu_type == 42)) std::exit(2);
         ck(cudaSetDevice(0), "dev0");
     };
@@ -276,7 +366,7 @@ void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows, bo
             ra.n_expert = (int) NE; ra.layer = r; ra.res0 = d_res0; ra.res1 = d_res1; ra.cache_base = blob0;
             ra.blob = (long long) L.bytes; ra.plan = d_plan; ra.xq = d_xq; ra.ring_m = h_rings + r;
             ra.x_m = h_x + (size_t) r * MT * H; ra.xq_m = h_xq + r * xq_stride; ra.host_seq_m = h_words;
-            ra.peer_seq_m = h_words + 16; ra.ring = (uint32_t) r + 1; ra.ctr = d_ctr;
+            ra.peer_seq_m = h_words + 16; ra.ring = (uint32_t) r + 1; ra.ctr = d_ctr; ra.rows = warm;
             K::dec_moe_route(ra, s0);
             if (r % 3 == 0)
                 K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok,
@@ -374,6 +464,7 @@ void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows, bo
     const auto t0 = std::chrono::steady_clock::now();
     for (int w = 0; w < windows; ++w) {
         const int T = 1 + (int) (rng() % MT);
+        warm = (int) (rng() % 100) < warm_pct;
         make_window(T);
         const int kind = (int) (rng() % 8);   // 0-4 routed, 5 routed then host-rung, 6-7 abandoned midway
         if (kind <= 5) {
@@ -397,7 +488,8 @@ void stress(const basalt::GgufFile& gguf, int l, int gt, int dt, int windows, bo
             std::printf("  %d windows, %.1f s\n", w + 1,
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
-    std::printf("stress: %d windows without a hang, %d aborted, %d checked bitwise\n", windows, aborted, checked);
+    std::printf("stress: %d windows without a hang, %d aborted, %d checked bitwise (the warm-up on in %d%% of them)\n",
+                windows, aborted, checked, warm_pct);
 }
 
 }  // namespace
@@ -406,13 +498,14 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
         std::fprintf(stderr, "usage: dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N [--stress-dup] [--stress-torn] "
-                     "[--stress-seed N]]\n");
+                     "[--stress-seed N] [--stress-warm PCT]]\n       dec_moe_parity --nvfp4 [--bench | --stress N]\n       dec_moe_parity --kq [--bench]\n");
         return 2;
     }
     bool bench = false;
     int stress_n = 0;
     bool stress_dup = false, stress_torn = false;
     unsigned stress_seed = 4242u;
+    int stress_warm = 75;
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) { bench = true; continue; }
@@ -420,11 +513,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--stress-dup") == 0) { stress_dup = true; continue; }
         if (std::strcmp(argv[i], "--stress-torn") == 0) { stress_torn = true; continue; }
         if (std::strcmp(argv[i], "--stress-seed") == 0 && i + 1 < argc) { stress_seed = (unsigned) std::atoi(argv[++i]); continue; }
+        if (std::strcmp(argv[i], "--stress-warm") == 0 && i + 1 < argc) { stress_warm = std::atoi(argv[++i]); continue; }
         std::stringstream ss(argv[i]);
         std::string t;
         while (std::getline(ss, t, ',')) layers.push_back(std::atoi(t.c_str()));
     }
-    basalt::GgufFile gguf(argv[1]);
+    const bool nvfp4 = std::strcmp(argv[1], "--nvfp4") == 0, kq = std::strcmp(argv[1], "--kq") == 0;
+    const bool synth = nvfp4 || kq;
+    std::unique_ptr<basalt::GgufFile> gguf_p;
+    if (!synth) gguf_p = std::make_unique<basalt::GgufFile>(argv[1]);
     int ndev = 0;
     ck(cudaGetDeviceCount(&ndev), "device count");
     const bool two = ndev >= 2;
@@ -432,7 +529,13 @@ int main(int argc, char** argv) {
     // the layers' formats; by default the first layer of each pair
     std::vector<std::pair<int, int>> fmt(64, {-1, -1});
     std::vector<int> auto_layers;
-    for (int l = 0; l < 64; ++l) {
+    if (nvfp4) { fmt[0] = {40, 40}; auto_layers.push_back(0); layers.clear(); }
+    if (kq) {
+        fmt[0] = {12, 7}; fmt[1] = {12, 8}; fmt[2] = {13, 8}; fmt[3] = {8, 8}; fmt[4] = {14, 8};
+        auto_layers = {0, 1, 2, 3, 4}; stress_n = 0;
+    }
+    for (int l = 0; !synth && l < 64; ++l) {
+        const basalt::GgufFile& gguf = *gguf_p;
         const auto* g = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
         const auto* d = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
         if (!g || !d) continue;
@@ -444,7 +547,8 @@ int main(int argc, char** argv) {
     if (layers.empty()) layers = auto_layers;
     if (stress_n > 0) {   // the first listed layer only
         if (!two || fmt[layers[0]].first < 0) { std::fprintf(stderr, "--stress: two cards and a layer with experts\n"); return 2; }
-        stress(gguf, layers[0], fmt[layers[0]].first, fmt[layers[0]].second, stress_n, stress_dup, stress_torn, stress_seed);
+        stress(gguf_p.get(), layers[0], fmt[layers[0]].first, fmt[layers[0]].second, stress_n, stress_dup, stress_torn, stress_seed,
+               stress_warm);
         std::printf("dec_moe_parity --stress: %s\n", g_fail ? "FAILED" : "no hang, bitwise equal");
         return g_fail ? 1 : 0;
     }
@@ -467,13 +571,15 @@ int main(int argc, char** argv) {
         std::printf("layer %d: gate/up type %d, down type %d, %.2f MB per expert, formats %s\n", l, gt, dt,
                     L.bytes / 1e6, K::dec_moe_formats_ok(gt, dt, H, FF) ? "covered" : "NOT COVERED");
         if (!K::dec_moe_formats_ok(gt, dt, H, FF)) { ++g_fail; continue; }
-        const auto* tg = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
-        const auto* tu = gguf.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
-        const auto* td = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
         // NX distinct experts' blobs; expert id e uses blob e % NX
         constexpr int NX = 48;
-        std::vector<uint8_t> blobs((size_t) NX * L.bytes);
-        for (int x = 0; x < NX; ++x) {
+        std::vector<uint8_t> blobs = nvfp4 ? nvfp4_blobs(L, NX, rng) : kq ? kq_blobs(L, NX, rng)
+                                                                    : std::vector<uint8_t>((size_t) NX * L.bytes);
+        for (int x = 0; !synth && x < NX; ++x) {
+            const basalt::GgufFile& gguf = *gguf_p;
+            const auto* tg = gguf.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
+            const auto* tu = gguf.find("blk." + std::to_string(l) + ".ffn_up_exps.weight");
+            const auto* td = gguf.find("blk." + std::to_string(l) + ".ffn_down_exps.weight");
             const size_t E = (size_t) ((x * 37 + 5) % NE);
             uint8_t* b = blobs.data() + (size_t) x * L.bytes;
             std::memcpy(b, gguf.tensor_data(*tg) + E * L.up_off, L.up_off);
@@ -796,7 +902,9 @@ int main(int argc, char** argv) {
                         K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok,
                                                  n, n, d_xq2, dv[0].scr, d_parts2, s0);
                     });
-                    std::printf("  bench: T=%d route + grouped %.2f us, glue %.2f us\n", T, ur, ug);
+                    const double mb = (double) P.counts[0] * (double) L.bytes / 1e6;   // the VRAM groups' expert bytes
+                    std::printf("  bench: T=%d route + grouped %.2f us, glue %.2f us (%d groups, %.1f MB: %.0f vs %.0f GB/s)\n",
+                                T, ur, ug, P.counts[0], mb, mb * 1e3 / ur, mb * 1e3 / ug);
                 }
                 cudaFree(d_pt); cudaFree(d_p4); cudaFree(d_pub);
             } else {
@@ -816,6 +924,8 @@ int main(int argc, char** argv) {
                 report(what, l, ndiff_rows(a3, b3, rows), rows.size() * H);
                 ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
                 for (int kind : {1, 2, 3}) {
+                    // the TMA kernel stages 8 gate/up or 32 down rows in 11776 bytes: wider rows have no such kernel
+                    if (kind == 1 && (L.gu_row * 8 > 11776 || L.d_row * 32 > 11776)) continue;
                     ck(cudaMemsetAsync(d_p3, 0, (size_t) K::kDmCap * H * 4, s0), "memset");
                     K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_p3, d_vsync, s0, kind, n);
                     ck(cudaStreamSynchronize(s0), "vram kind");
@@ -843,7 +953,10 @@ int main(int argc, char** argv) {
                                              n, n, d_xq2, dv[0].scr, d_parts, s0);
                 }) - r0;
                 const double uf = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0); }) - r0;
-                const double ut = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 1); }) - r0;
+                // the bulk-copy kernel stages 8 gate/up and 32 down rows: formats with wider rows are not timed (nan)
+                const bool tma_fits = L.gu_row * 8 <= 11776 && L.d_row * 32 <= 11776;
+                const double ut = !tma_fits ? std::nan("") :
+                    time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 1); }) - r0;
                 const double u2 = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 2, n); }) - r0;
                 const double u4 = time_us(s0, 200, [&] { route(); K::dec_moe_vram(L, d_plan, d_xq2, d_vscr, d_parts, d_vsync, s0, 3, n); }) - r0;
                 auto phase = [&](int ph) {
@@ -951,7 +1064,8 @@ int main(int argc, char** argv) {
                 char what[64];
                 std::snprintf(what, sizeof what, "window peer rows (%d entries)", (int) rows.size());
                 report(what, l, ndiff_rows(a, b, rows), rows.size() * H);
-                bool done_ok = h_words[32] == (uint32_t) RINGS;
+                // a window whose last ring sends the peer nothing has no done count to check
+                bool done_ok = rows.empty() || h_words[32] == (uint32_t) RINGS;
                 if (!done_ok) { std::printf("  peer done word %u, want %d\n", h_words[32], RINGS); ++g_fail; }
             }
             ck(cudaSetDevice(0), "dev0");
@@ -1001,6 +1115,94 @@ int main(int argc, char** argv) {
                     std::printf("  bench: peer rung by the host: round trip median %.1f us (min %.1f); block 0 phases us: "
                                 "fetch+sync %.1f group %.1f experts %.1f done %.1f\n",
                                 rt[RINGS / 2], rt[1], ph[0], ph[1], ph[2], ph[3]);
+                }
+                // the peer's L2 warm-up: host-rung rings with an idle gap between them, the ring's layer cycling over
+                // LW layers whose peer experts are distinct blobs (each ring cold), the predictor's rows built so its top
+                // k is the routed peer set; off: the same rings without the warm-up
+                {
+                    constexpr int LW = 8, NPOOL = 96;
+                    constexpr double kGapUs = 120.0;
+                    ck(cudaSetDevice(1), "dev1");
+                    uint8_t* pool = dmal<uint8_t>((size_t) NPOOL * L.bytes);
+                    for (int c = 0; c < NPOOL; ++c)
+                        ck(cudaMemcpy(pool + (size_t) c * L.bytes, blobs.data() + (size_t) (c % NX) * L.bytes, L.bytes,
+                                      cudaMemcpyHostToDevice), "pool");
+                    std::vector<int> peer_ids;
+                    for (int i = 0; i < n; ++i)
+                        if (res0[ids[i]] < 0 && res1[ids[i]] >= 0 &&
+                            std::find(peer_ids.begin(), peer_ids.end(), ids[i]) == peer_ids.end())
+                            peer_ids.push_back(ids[i]);
+                    const int npi = (int) peer_ids.size();
+                    std::vector<unsigned long long> wtab((size_t) (LW + 1) * NE, 0ull);
+                    for (int j = 0; j <= LW; ++j)
+                        for (int q = 0; q < npi; ++q)
+                            wtab[(size_t) j * NE + peer_ids[q]] =
+                                (unsigned long long) (pool + (size_t) (((j % LW) * npi + q) % NPOOL) * L.bytes);
+                    unsigned long long* d_wtab = dmal<unsigned long long>(wtab.size());
+                    ck(cudaMemcpy(d_wtab, wtab.data(), wtab.size() * 8, cudaMemcpyHostToDevice), "wtab");
+                    // a routed peer expert's row: the sum of the rings' token inputs (both alternating inputs), in int8
+                    std::vector<float> sum((size_t) H, 0.0f);
+                    for (int t = 0; t < T; ++t)
+                        for (int h = 0; h < H; ++h) sum[h] += x[(size_t) t * H + h] + x[(size_t) (4 + t) * H + h];
+                    std::vector<int8_t> rqh((size_t) (LW + 1) * NE * H, 0);
+                    std::vector<float> rsh((size_t) (LW + 1) * NE * (H / 32), 0.0f);
+                    for (int j = 0; j <= LW; ++j)
+                        for (int e : peer_ids)
+                            for (int b = 0; b < H / 32; ++b) {
+                                float amax = 0.0f;
+                                for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(sum[b * 32 + i]));
+                                const float d = amax / 127.0f;
+                                rsh[((size_t) j * NE + e) * (H / 32) + b] = d;
+                                for (int i = 0; i < 32; ++i)
+                                    rqh[((size_t) j * NE + e) * H + b * 32 + i] =
+                                        (int8_t) (d > 0.0f ? std::lrintf(sum[b * 32 + i] / d) : 0);
+                            }
+                    int8_t* d_rq = dmal<int8_t>(rqh.size());
+                    float* d_rs = dmal<float>(rsh.size());
+                    ck(cudaMemcpy(d_rq, rqh.data(), rqh.size(), cudaMemcpyHostToDevice), "rq");
+                    ck(cudaMemcpy(d_rs, rsh.data(), rsh.size() * 4, cudaMemcpyHostToDevice), "rs");
+                    unsigned int* warr = dmal<unsigned int>(16);
+                    for (int r = 0; r < RINGS; ++r) h_rings[r].layer = r % LW;
+                    ck(cudaSetDevice(0), "dev0");
+                    auto gapped = [&](bool warm) {
+                        std::memset(h_words, 0, 256);
+                        ck(cudaSetDevice(1), "dev1");
+                        ck(cudaMemsetAsync(warr, 0, 64, s1), "arrive");
+                        K::DmPeerArgs pa;
+                        pa.rings_m = h_rings; pa.xq_m = h_xq; pa.xq_stride = xq_stride; pa.seq_m = h_words + 16;
+                        pa.done_m = h_words + 32; pa.rows_m = h_peer; pa.ptr = d_wtab; pa.lay = d_lay;
+                        pa.n_expert = (int) NE; pa.k = (int) KK; pa.n_embd = (int) H; pa.n_ff = (int) FF;
+                        pa.steps = RINGS; pa.scratch = pscr; pa.arrive = warr;
+                        if (warm) { pa.rq = d_rq; pa.rs = d_rs; }
+                        if (!K::dec_moe_peer_launch(pa, pblocks, s1, L.gu_type == 42)) std::exit(2);
+                        ck(cudaSetDevice(0), "dev0");
+                        std::vector<double> rt;
+                        for (int r = 0; r < RINGS; ++r) {
+                            const auto t0 = std::chrono::steady_clock::now();
+                            *(volatile uint32_t*) (h_words + 16) = ((uint32_t) r + 1) | (uint32_t) T << 16 | 1u << 28;
+                            while (*(volatile uint32_t*) (h_words + 32) < (uint32_t) r + 1) {}
+                            const auto t1 = std::chrono::steady_clock::now();
+                            rt.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                            while (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count() <
+                                   kGapUs) {}
+                        }
+                        ck(cudaSetDevice(1), "dev1");
+                        ck(cudaStreamSynchronize(s1), "gapped");
+                        ck(cudaSetDevice(0), "dev0");
+                        std::sort(rt.begin() + 1, rt.end());
+                        return rt[RINGS / 2];
+                    };
+                    double off = 1e30, on = 1e30;
+                    for (int rep = 0; rep < 3; ++rep) {
+                        off = std::min(off, gapped(false));
+                        on = std::min(on, gapped(true));
+                    }
+                    std::printf("  bench: peer warm-up, host-rung rings %.0f us apart, %d distinct peer experts a ring, "
+                                "cold each ring: round trip median %.1f us off, %.1f us on\n", kGapUs, npi, off, on);
+                    for (int r = 0; r < RINGS; ++r) h_rings[r].layer = l;
+                    ck(cudaSetDevice(1), "dev1");
+                    for (void* p : {(void*) pool, (void*) d_wtab, (void*) d_rq, (void*) d_rs, (void*) warr}) cudaFree(p);
+                    ck(cudaSetDevice(0), "dev0");
                 }
                 const double a0 = wall(false, false), a1 = wall(true, false), b0 = wall(false, true), b1 = wall(true, true);
                 std::printf("  bench: per ring on CUDA0 (T=%d, %d peer entries, %d peer blocks): route+wait %.1f us, "

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FFC566"/><stop offset=".55" stop-color="#F2662B"/><stop offset="1" stop-color="#C9461C"/></linearGradient></defs>
+<rect width="1600" height="900" fill="#0E1114"/>
+<text x="60" y="98" font-family="Geist, Helvetica, Arial, sans-serif" font-size="56" font-weight="600" fill="#E9ECEE" letter-spacing="-1">Inside a <tspan fill="#FF7A3D" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace">.basalt</tspan> file</text>
+<text x="1540" y="98" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace" font-size="30" text-anchor="end" fill="#9AA4AD">NVFP4 pack</text>
+<polygon points="290.8,174.0 452.7,267.5 452.7,454.5 290.8,548.0 128.8,454.5 128.8,267.5" fill="#151A1F" stroke="#2A343D" stroke-width="4" stroke-linejoin="round"/>
+<polygon points="290.8,302.4 306.4,311.4 306.4,329.4 290.8,338.4 275.2,329.4 275.2,311.4" fill="#3A4651"/>
+<text x="290.7770625747501" y="385.9" text-anchor="middle" font-family="Geist, Helvetica, Arial, sans-serif" font-size="34" font-weight="600" fill="#E9ECEE">PLE embeddings</text>
+<text x="290.7770625747501" y="419.5" text-anchor="middle" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace" font-size="28" fill="#9AA4AD">50.7 GiB</text>
+<polygon points="630.3,175.0 791.3,268.0 791.3,454.0 630.3,547.0 469.2,454.0 469.2,268.0" fill="#1D1713" stroke="#F2662B" stroke-width="6" stroke-linejoin="round"/>
+<polygon points="630.3,302.4 645.8,311.4 645.8,329.4 630.3,338.4 614.7,329.4 614.7,311.4" fill="url(#g)"/>
+<text x="630.2590208582501" y="385.9" text-anchor="middle" font-family="Geist, Helvetica, Arial, sans-serif" font-size="34" font-weight="600" fill="#FFB547">Routed experts</text>
+<text x="630.2590208582501" y="419.5" text-anchor="middle" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace" font-size="28" fill="#9AA4AD">63.3 GiB</text>
+<polygon points="969.7,174.0 1131.7,267.5 1131.7,454.5 969.7,548.0 807.8,454.5 807.8,267.5" fill="#151A1F" stroke="#2A343D" stroke-width="4" stroke-linejoin="round"/>
+<polygon points="969.7,302.4 985.3,311.4 985.3,329.4 969.7,338.4 954.2,329.4 954.2,311.4" fill="#3A4651"/>
+<text x="969.7409791417499" y="385.9" text-anchor="middle" font-family="Geist, Helvetica, Arial, sans-serif" font-size="34" font-weight="600" fill="#E9ECEE">Dense weights</text>
+<text x="969.7409791417499" y="419.5" text-anchor="middle" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace" font-size="28" fill="#9AA4AD">6.4 GiB</text>
+<polygon points="1309.2,174.0 1471.2,267.5 1471.2,454.5 1309.2,548.0 1147.3,454.5 1147.3,267.5" fill="#151A1F" stroke="#2A343D" stroke-width="4" stroke-linejoin="round"/>
+<polygon points="1309.2,302.4 1324.8,311.4 1324.8,329.4 1309.2,338.4 1293.6,329.4 1293.6,311.4" fill="#3A4651"/>
+<text x="1309.22293742525" y="385.9" text-anchor="middle" font-family="Geist, Helvetica, Arial, sans-serif" font-size="34" font-weight="600" fill="#E9ECEE">Drafter (MTP)</text>
+<text x="1309.22293742525" y="419.5" text-anchor="middle" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace" font-size="28" fill="#9AA4AD">0.8 GiB</text>
+<polygon points="460.5,468.0 622.5,561.5 622.5,748.5 460.5,842.0 298.6,748.5 298.6,561.5" fill="#151A1F" stroke="#2A343D" stroke-width="4" stroke-linejoin="round"/>
+<polygon points="460.5,596.5 476.1,605.5 476.1,623.5 460.5,632.5 444.9,623.5 444.9,605.5" fill="#3A4651"/>
+<text x="460.5180417165001" y="680.0" text-anchor="middle" font-family="Geist, Helvetica, Arial, sans-serif" font-size="34" font-weight="600" fill="#E9ECEE">Vision</text>
+<text x="460.5180417165001" y="713.6" text-anchor="middle" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace" font-size="28" fill="#9AA4AD">0.9 GiB</text>
+<polygon points="800.0,468.0 961.9,561.5 961.9,748.5 800.0,842.0 638.1,748.5 638.1,561.5" fill="#151A1F" stroke="#2A343D" stroke-width="4" stroke-linejoin="round"/>
+<polygon points="800.0,596.5 815.6,605.5 815.6,623.5 800.0,632.5 784.4,623.5 784.4,605.5" fill="#3A4651"/>
+<text x="800.0" y="680.0" text-anchor="middle" font-family="Geist, Helvetica, Arial, sans-serif" font-size="34" font-weight="600" fill="#E9ECEE">Metadata</text>
+<text x="800.0" y="713.6" text-anchor="middle" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace" font-size="28" fill="#9AA4AD">17.1 MiB</text>
+<polygon points="1139.5,468.0 1301.4,561.5 1301.4,748.5 1139.5,842.0 977.5,748.5 977.5,561.5" fill="#151A1F" stroke="#2A343D" stroke-width="4" stroke-linejoin="round"/>
+<polygon points="1139.5,596.5 1155.1,605.5 1155.1,623.5 1139.5,632.5 1123.9,623.5 1123.9,605.5" fill="#3A4651"/>
+<text x="1139.4819582834998" y="680.0" text-anchor="middle" font-family="Geist, Helvetica, Arial, sans-serif" font-size="34" font-weight="600" fill="#E9ECEE">Utilities</text>
+<text x="1139.4819582834998" y="713.6" text-anchor="middle" font-family="Geist Mono, SF Mono, Menlo, Consolas, monospace" font-size="28" fill="#9AA4AD">192 KiB</text>
+</svg>

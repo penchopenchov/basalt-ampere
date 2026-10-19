@@ -20,7 +20,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf_reader import GGUF_MAGIC, GGUFFile  # noqa: E402
 
 # writable ggml_type ids, matching GGML_TYPES in gguf_reader.py
-TYPE_IDS = {"F32": 0, "F16": 1, "Q2_0": 42}
+TYPE_IDS = {"F32": 0, "F16": 1, "Q5_K": 13, "Q6_K": 14, "Q8_0": 8, "Q2_0": 42}
 DEFAULT_ALIGNMENT = 32
 
 _META_IDS = {"u8": 0, "i8": 1, "u16": 2, "i16": 3, "u32": 4, "i32": 5, "f32": 6,
@@ -96,6 +96,10 @@ class GGUFWriter:
     def add_f32(self, name: str, arr: np.ndarray) -> None:
         a = np.ascontiguousarray(arr, dtype="<f4")
         self.tensors.append(_Tensor(name, list(a.shape), "F32", a.tobytes()))
+
+    def add_raw(self, name: str, shape: list[int], type_name: str, data: bytes) -> None:
+        """A tensor whose blocks are given as they are stored (shape in GGUF order)."""
+        self.tensors.append(_Tensor(name, list(shape), type_name, bytes(data)))
 
     def add_q2_0(self, name: str, arr: np.ndarray, shape: list[int]) -> None:
         """`arr` is (rows, in_features) row-major; `shape` is the full GGUF shape, passed explicitly because a

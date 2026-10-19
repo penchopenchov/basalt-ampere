@@ -10,6 +10,7 @@
 #include "basalt/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/ngram.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #include <cuda_runtime.h>
 
@@ -20,15 +21,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-
-// `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
-// spin is just less polite to the pipeline.
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#define SPIN_PAUSE() _mm_pause()
-#else
-#define SPIN_PAUSE() ((void) 0)
-#endif
 
 namespace basalt::core {
 namespace {
@@ -737,7 +729,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
                 return false;
             }
             if (rang) break;                             // rung, and the graph is still running: the overlap
-            SPIN_PAUSE();
+            basalt::platform::cpu_relax();
         }
         if (mid_graph) ++gr.rings_mid_graph;
         // the window, from just before the launch to the instant the ring was seen
@@ -968,7 +960,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
         uint32_t spins = 0;
         progress_at("token: waiting for the GPU to reach layer", l);
         while (*seq < want) {
-            SPIN_PAUSE();
+            basalt::platform::cpu_relax();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(flush_us)) {

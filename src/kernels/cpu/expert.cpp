@@ -4,7 +4,7 @@
 #include "basalt/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
-#include <cpuid.h>
+#include "basalt/platform/compiler.hpp"
 
 #include <cmath>
 #include <atomic>
@@ -309,9 +309,9 @@ CpuFeatures cpu_features() {
     CpuFeatures f;
     int reg[4] = {0, 0, 0, 0};
     unsigned r[4] = {0, 0, 0, 0};
-    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
+    platform::cpuid(0, 0, r);
     if (r[0] < 7) return f;
-    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+    platform::cpuid(7, 0, r);
     for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
     const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
     f.avx512f = (ebx >> 16) & 1u;

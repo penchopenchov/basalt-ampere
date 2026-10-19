@@ -289,10 +289,12 @@ static void fused_pack(const FusedLayerArgs& a, FusedDev& d, void* stream, FZ_NS
     pc.Lc.rec = c.rec;
     pc.Lc.geo = FZ_NSC::make_geo(c.type_q, c.type_z, c.type_o);
     pc.Lc.dn1 = pc.Lc.dn2 = nullptr;
-    if (!tmap_2d(&pc.Lc.stm, c.rec.state, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, (uint64_t) FZ_NSC::R_HV * S, S, (uint64_t) FZ_NSC::R_HV * S * 4, S, S)) {
+    CUtensorMap stm_map;
+    if (!tmap_2d(&stm_map, c.rec.state, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, (uint64_t) FZ_NSC::R_HV * S, S, (uint64_t) FZ_NSC::R_HV * S * 4, S, S)) {
         std::fprintf(stderr, "fused_layer: the state's tensor map failed\n");
         std::exit(1);
     }
+    std::memcpy(&pc.Lc.stm, &stm_map, sizeof stm_map);
     pc.NLAY = 1; pc.iters = 1;
 #ifdef BASALT_PROFILE
     pc.sc = stamp::ctx(); pc.ord = a.ord;

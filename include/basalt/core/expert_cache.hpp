@@ -16,6 +16,7 @@
 
 #include "basalt/core/model_file.hpp"
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -179,7 +180,7 @@ public:
     bool verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
 
     /// Slots filled so far, for the startup report.
-    int64_t fills() const { return fills_; }
+    int64_t fills() const { return fills_.load(); }
 
 private:
     int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }
@@ -202,7 +203,7 @@ private:
     int64_t n_expert_ = 0;
     int64_t blob_ = 0;
     int64_t next_free_ = 0;
-    int64_t fills_ = 0;
+    std::atomic<int64_t> fills_{0};
     /// `per_layer_` off (the default) leaves `next_free_` as the only admission counter.
     bool per_layer_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot

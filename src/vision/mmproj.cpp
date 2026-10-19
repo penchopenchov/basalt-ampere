@@ -1,12 +1,12 @@
 // src/vision/mmproj.cpp - see basalt/vision/mmproj.hpp.
 #include "basalt/vision/mmproj.hpp"
 
-#include <cstring>
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/memory.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 namespace basalt::vision {
 
@@ -84,7 +84,9 @@ Value read_value(Cursor& c, uint32_t t) {
 }  // namespace
 
 void Mmproj::release() {
-    if (map_) munmap(map_, size_);
+    if (map_ && !mapped_) basalt::platform::free_aligned(map_);
+    mapping_.reset();
+    mapped_ = false;
     map_ = nullptr;
     tensors_.clear();
 }
@@ -92,14 +94,38 @@ void Mmproj::release() {
 Mmproj::~Mmproj() { release(); }
 
 bool Mmproj::open(const std::string& path, std::string& err) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) { err = "cannot open " + path; return false; }
-    struct stat st{};
-    if (fstat(fd, &st) != 0 || st.st_size < 32) { ::close(fd); err = "cannot read " + path; return false; }
-    size_ = (size_t) st.st_size;
-    map_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (map_ == MAP_FAILED) { map_ = nullptr; err = "cannot map " + path; return false; }
+    uint64_t file_bytes = 0;
+    if (!platform::file_size(path, file_bytes)) { err = "cannot open " + path; return false; }
+    if (file_bytes < 32) { err = "cannot read " + path; return false; }
+    size_ = (size_t) file_bytes;
+    // read whole with block-aligned unbuffered reads, so the file cache neither copies nor keeps it; a file system that
+    // refuses them, and a platform with no unbuffered descriptor, is mapped instead
+    {
+        constexpr size_t kAlign = 4096, kChunk = 16u << 20;
+        const int dfd = platform::open_unbuffered(path);
+        void* mem = nullptr;
+        if (dfd >= 0) mem = basalt::platform::alloc_aligned((size_t) ((size_ + kAlign - 1) / kAlign * kAlign), kAlign);
+        if (mem != nullptr) {
+            size_t got = 0;
+            while (got < size_) {
+                const size_t want = std::min<size_t>(kChunk, (size_ - got + kAlign - 1) / kAlign * kAlign);
+                const int64_t r = basalt::platform::pread(dfd, (uint8_t*) mem + got, want, got);
+                if (r <= 0) break;
+                got += (size_t) r;
+            }
+            if (got >= size_) { map_ = mem; mapped_ = false; }
+            else basalt::platform::free_aligned(mem);
+        }
+        if (dfd >= 0) platform::close_fd(dfd);
+    }
+    if (map_ == nullptr) {
+        std::string why;
+        auto m = platform::MappedFile::open_ro(path, &why);
+        if (!m) { err = "cannot map " + path; return false; }
+        mapping_ = std::move(*m);
+        map_ = const_cast<uint8_t*>(mapping_.data());
+        mapped_ = true;
+    }
     const uint8_t* base = (const uint8_t*) map_;
     Cursor c{base, base + size_};
     if (c.get<uint32_t>() != 0x46554747u) { err = path + " is not a GGUF file"; return false; }

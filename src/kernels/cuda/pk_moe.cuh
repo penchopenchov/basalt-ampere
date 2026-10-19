@@ -162,7 +162,7 @@ __global__ void __launch_bounds__(256, 2) pk_moe_kernel(PkMoeArgs a, NativeExper
 #pragma unroll
         for (int sb = 0; sb < SUB; ++sb)
             dm_down_item<TD>((const uint8_t*) sm.gptr[g] + L.down_off + (size_t) ((sp * SUB + sb) * R) * L.d_row, e0, e1,
-                             sm.hq, L, sp * SUB + sb, sm.out + sb * R, tid, kPkSpan);
+                             sm.hq, L, sp * SUB + sb, sm.out + sb * R, tid, kPkSpan, sm.gptr[g]);
         __syncthreads();
         constexpr int q = kPkSpan / 4;
         const int nq = (e1 - e0) * q;

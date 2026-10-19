@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "basalt/platform/compiler.hpp"
 #include "gemm_cpu.hpp"
 
 namespace basalt::vision {
@@ -44,7 +45,7 @@ inline void tile4(const uint16_t* x, const uint16_t* w, float* y, int m0, int ro
 
 }  // namespace
 
-bool cpu_has_bf16() { return __builtin_cpu_supports("avx512bf16") && __builtin_cpu_supports("avx512bw"); }
+bool cpu_has_bf16() { return basalt::platform::cpu_has_avx512_bf16(); }
 
 void gemm_bf16_avx512(const float* X, const uint16_t* W, float* Y, int M, int N, int K, int threads) {
     std::vector<uint16_t> xb((size_t) M * K);

@@ -5,11 +5,13 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
 #include "basalt/core/kv_arena.hpp"
+#include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/on_device.hpp"
 
 #include "basalt/core/native_head.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
@@ -53,9 +55,7 @@
 #include <optional>
 #include <sstream>
 #include <vector>
-#if   defined(__x86_64__)
-#include <immintrin.h>
-#endif
+#include "basalt/platform/compiler.hpp"
 
 namespace basalt::core {
 namespace {
@@ -116,7 +116,7 @@ basalt::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
 bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
     if (r.empty() || !r.exists()) return false;
     // `fread` passes a request bigger than the stream buffer straight to the read call.
-    FILE* f = std::fopen(r.path.c_str(), "rb");
+    FILE* f = basalt::platform::open_file_utf8(r.path, "rb");
     if (f == nullptr) return false;
     // A `FILE*` has no destructor and the short-read path below returns early: the guard closes on every path.
     struct Closer {
@@ -124,8 +124,9 @@ bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
         ~Closer() { if (f != nullptr) std::fclose(f); }
     } closer{f};
     const uint64_t n = r.size();
-    if (fseeko(f, (off_t) r.offset, SEEK_SET) != 0) return false;
-    basalt::platform::advise_willneed(fileno(f), r.offset, n);
+    // The expert files are far larger than 4 GiB, so the seek has to be a 64-bit one.
+    if (basalt::platform::fseek64(f, r.offset, SEEK_SET) != 0) return false;
+    basalt::platform::advise_willneed(basalt::platform::file_fd(f), r.offset, n);
     out.resize((size_t) n);
     return n == 0 || std::fread(out.data(), 1, (size_t) n, f) == (size_t) n;
 }
@@ -302,26 +303,13 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             err = "mtp: " + files.experts.path + " is missing or shorter than the draft layer's experts";
             return false;
         }
-        FILE* f = std::fopen(files.experts.path.c_str(), "rb");
-        if (f == nullptr || fseeko(f, (off_t) files.experts.offset, SEEK_SET) != 0) {
-            if (f != nullptr) std::fclose(f);
-            err = "mtp: cannot open " + files.experts.path;
+        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        std::string upload_err;
+        if (!DirectUploader().upload(files.experts.path, files.experts.offset, bytes, experts_, upload_err)) {
+            err = "mtp: cannot read the experts section: " + upload_err;
             return false;
         }
-        struct Closer {
-            FILE* f;
-            ~Closer() { if (f != nullptr) std::fclose(f); }
-        } closer{f};
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-        basalt::platform::advise_willneed(fileno(f), files.experts.offset, bytes);
-        std::vector<uint8_t> chunk(64u << 20);
-        for (uint64_t off = 0; off < bytes;) {
-            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: the experts section is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
-            progress->add(n);
-            off += n;
-        }
+        progress->add(bytes);
         progress->finish();
         vram_ += bytes;
     }
@@ -1275,13 +1263,13 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         CondTail ct{};
         for (int k = 0; k + 1 < steps; ++k) ct.h[k] = hv[k + 1];
         ct.n = steps - 1;
-        ct.cum_th = kDraftCumBase;
+        ct.cum_th = draft_cum_base();
         ctail_ = &ct;
         ctail_done_ = false;
         bool rec = record_round(T, coupled, true, err);
         ctail_ = nullptr;
         if (rec && !ctail_done_)
-            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, kDraftCumBase, m_prob_, 0);
+            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_base(), m_prob_, 0);
         cudaGraph_t g0 = nullptr;
         const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
         ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
@@ -1303,13 +1291,13 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         CondTail ct{};
         ct.h[0] = hv[j + 1];
         ct.n = 1;
-        ct.cum_th = kDraftCumBase;
+        ct.cum_th = draft_cum_base();
         ctail_ = j + 1 < steps ? &ct : nullptr;
         ctail_done_ = false;
         bool rec = record_step(j, coupled, false, err);
         ctail_ = nullptr;
         if (rec && j + 1 < steps && !ctail_done_)
-            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, kDraftCumBase, m_prob_, j);
+            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_base(), m_prob_, j);
         cudaGraph_t captured = nullptr;   // the body itself, owned by the node
         ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
         prev = node;
@@ -1495,7 +1483,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::memcpy(&h_row_[2], &min_p, sizeof(float));   // read by the conditional graph only
-    const float cum_th = cum_th_ >= 0.0f ? cum_th_ : kDraftCumBase;
+    const float cum_th = cum_th_ >= 0.0f ? cum_th_ : draft_cum_base();
     std::memcpy(&h_row_[3], &cum_th, sizeof(float));
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
@@ -1529,9 +1517,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         for (int j = 0; j + 1 < max_steps; ++j) {
             uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
-#if defined(__x86_64__)
-                _mm_pause();
-#endif
+                basalt::platform::cpu_relax();
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
             drafts[j] = ((volatile int32_t*) h_out_)[j];
@@ -1563,9 +1549,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         auto wait_step = [&](int j) {
             uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
-#if defined(__x86_64__)
-                _mm_pause();
-#endif
+                basalt::platform::cpu_relax();
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
         };

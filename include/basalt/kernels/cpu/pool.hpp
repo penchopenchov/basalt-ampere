@@ -28,6 +28,7 @@
 
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
+#include "basalt/platform/cpu.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -64,22 +65,10 @@ struct ExpertJobMulti {
 
 /// How worker threads are allocated across physical/logical CPU cores.  `All` uses every core and is the default; the
 /// hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
-enum class PoolAffinity {
-    Auto,      ///< Hybrid: prioritize physical P-cores, then SMT, then E-cores (defaults to P-core count)
-    PCores,    ///< Restrict workers strictly to Performance cores and their SMT siblings
-    All,       ///< The default: one worker per physical core in the OS's order, without hybrid distinction
-};
+using PoolAffinity = platform::CpuAffinity;
+using CpuTopology = platform::CpuTopology;
 
-struct CpuTopology {
-    bool is_hybrid = false;
-    int p_cores = 0;                ///< Physical performance cores
-    int p_threads = 0;              ///< Total logical threads on performance cores
-    int e_cores = 0;                ///< Efficient cores
-    std::vector<int> worker_cores;   // Ordered CPU IDs
-    int host_core = -1;             ///< Logical core reserved for host thread
-};
-
-CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
+using platform::detect_cpu_topology;
 
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another worker:
 /// `hardware_concurrency()/2` workers on logical processors 0..N/2 could put every worker on a sibling pair and halve
@@ -95,12 +84,9 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 /// this is it: the host loop calls this on entry and restores on exit.  An unpinned spinning host is free to land on a
 /// worker's core or its SMT sibling, which costs the pool bandwidth.
 ///
-/// The previous host placement. `valid` is false when querying or setting placement failed.  The complete,
-/// dynamically sized native CPU mask is stored, including CPU IDs above 63.
-struct ThreadAffinity {
-    std::vector<unsigned long> mask;
-    bool valid = false;
-};
+/// The previous host placement (see platform::ThreadPlacement): the complete, dynamically sized native placement,
+/// including CPU IDs above 63.
+using ThreadAffinity = platform::ThreadPlacement;
 
 /// Selects one encoded processor for the caller.
 /// Restore on the same calling thread. Pool-owned workers use hard group affinity instead.
@@ -155,6 +141,13 @@ public:
     /// the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
+    /// Work for the parked workers between batches (not the host thread): `fn(ctx, worker, workers, stop)` runs once
+    /// per worker index and must return soon after `stop` reads true.  Returns at once.  The next batch, `idle_stop`
+    /// or the destructor raises `stop` and waits for the workers to park, so the work never overlaps a batch; it must
+    /// not write anything a batch reads.
+    using IdleFn = void (*)(void* ctx, int worker, int workers, const std::atomic<bool>& stop);
+    void idle_start(IdleFn fn, void* ctx);
+    void idle_stop();
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
@@ -239,6 +232,11 @@ private:
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
+    // idle work (mode 7): one job per worker index
+    IdleFn idle_fn_ = nullptr;
+    void* idle_ctx_ = nullptr;
+    bool idle_live_ = false;
+    alignas(64) std::atomic<bool> idle_halt_{false};
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
     int parts_a_ = 1, parts_b_ = 1;

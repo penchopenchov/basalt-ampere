@@ -274,13 +274,13 @@ class ParallelOption(unittest.TestCase):
     def test_default_is_one_and_adds_no_engine_flag(self):
         a, _, file_engine, cli_engine = self.parse("--mock-engine")
         self.assertFalse(a.parallel)
-        self.assertNotIn("--batch", {**file_engine, **cli_engine})
+        self.assertNotIn("--batch", file_engine + cli_engine)
         _, _, _, cli_engine = self.parse("--mock-engine", "--parallel", "1")
         self.assertNotIn("--batch", cli_engine)
 
     def test_maps_to_the_engine_batch(self):
         _, _, _, cli_engine = self.parse("--mock-engine", "--parallel", "4")
-        self.assertEqual(cli_engine["--batch"], 4)
+        self.assertEqual(cli_engine[:2], ["--batch", "4"])
 
     def test_range(self):
         for bad in ("0", "9", "x"):
@@ -293,9 +293,9 @@ class ParallelOption(unittest.TestCase):
             p = Path(d) / "c.json"
             p.write_text(json.dumps({"server": {"parallel": 3}}))
             a, _, file_engine, cli_engine = self.parse("--config", str(p))
-            self.assertEqual((a.parallel, file_engine["--batch"], "--batch" in cli_engine), (3, 3, False))
+            self.assertEqual((a.parallel, file_engine[:2], "--batch" in cli_engine), (3, ["--batch", "3"], False))
             _, _, file_engine, cli_engine = self.parse("--config", str(p), "--parallel", "2")
-            self.assertEqual(cli_engine["--batch"], 2)
+            self.assertEqual(cli_engine[:2], ["--batch", "2"])
             p.write_text(json.dumps({"server": {"parallel": 3}, "engine": {"batch": 2}}))
             with self.assertRaises(ValueError):
                 self.parse("--config", str(p))

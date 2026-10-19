@@ -1,5 +1,4 @@
 // Q5_1 shared-expert projection: CUDA dequantization vs ggml.
-#define NOMINMAX
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/ggml/ggml.h"

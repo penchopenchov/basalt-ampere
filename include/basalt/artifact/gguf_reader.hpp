@@ -32,11 +32,8 @@
 #include <algorithm>
 
 #include "basalt/artifact/gguf_split.hpp"
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "basalt/platform/file.hpp"
+#include "basalt/platform/mapped_file.hpp"
 
 namespace basalt {
 
@@ -199,6 +196,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 24:   // I8: raw bytes
         elems = 1;
         bytes = 1;
+        return true;
+    case 40:   // NVFP4
+        elems = 64;
+        bytes = 36;
         return true;
     case 42:
         elems = 64;
@@ -383,15 +384,14 @@ public:
 
 private:
     void open() {
-        int fd = ::open(path_.c_str(), O_RDONLY);
-        if (fd < 0) throw std::runtime_error("cannot open " + path_);
-        fd_ = fd;
-        struct stat st{};
-        if (fstat(fd, &st) != 0) throw std::runtime_error("fstat failed");
-        size_ = (uint64_t)st.st_size;
-        void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
-        base_ = (const uint8_t*)p;
+        // A read-only view: the pages are the cache manager's or page cache's, demand faulted, and nothing here writes
+        // to them.
+        std::string why;
+        auto m = platform::MappedFile::open_ro(path_, &why);
+        if (!m) throw std::runtime_error(why);
+        map_ = std::move(*m);
+        base_ = map_.data();
+        size_ = map_.size();
         const auto& reg = gguf_virtual_registry();
         const auto it = reg.find(path_);
         if (it != reg.end()) {
@@ -406,8 +406,8 @@ private:
         parse();
     }
     void close() {
-        if (base_) munmap((void*)base_, size_);
-        if (fd_ >= 0) ::close(fd_);
+        map_.reset();
+        base_ = nullptr;
     }
 
     void parse() {
@@ -454,7 +454,7 @@ private:
     const uint8_t* base_ = nullptr;
     uint64_t size_ = 0, data_start_ = 0, alignment_ = 32;
     uint32_t version_ = 0;
-    int fd_ = -1;
+    platform::MappedFile map_;
     bool virtual_ = false;
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;

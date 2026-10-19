@@ -1,0 +1,1 @@
+# Legacy raw OS/platform hits outside src/platform: <count> <path>. Counts only go down; new code uses src/platform.

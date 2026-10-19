@@ -278,6 +278,33 @@ inline void dequantize_iq4_xs(const uint8_t* block, float* out) {
         qs += 16;
     }
 }
+// ---- NVFP4: 64 elements from a 36-byte block: `d[4]` UE4M3 sub-block scales, then `qs[32]` E2M1 codes.
+// Transcribed from dequantize_row_nvfp4 (ggml-quants.c). Sub-block s (16 values) reads qs[8 s + j]: the low
+// nibble is value j, the high nibble value j + 8, unlike IQ4_NL's split at 16. kvalues_fp4 holds the E2M1 values
+// doubled, so the scale decode returns half of the UE4M3 value; 0x7F (NaN) decodes as 0 as in ggml. Bit 7 of a
+// scale byte is ignored (0xFF is NaN too). The tensor's FP32 scale is applied by the caller.
+static const int8_t kvalues_fp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+inline float ue4m3_to_fp32_half(uint8_t x) {
+    x &= 0x7F;
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int e = (x >> 3) & 0xF, m = x & 0x7;
+    const float raw = e == 0 ? std::ldexp((float)m, -9) : std::ldexp(1.0f + (float)m / 8.0f, e - 7);
+    return raw * 0.5f;
+}
+
+inline void dequantize_nvfp4(const uint8_t* block, float* out) {
+    const uint8_t* d = block;
+    const uint8_t* qs = block + 4;
+    for (int s = 0; s < 4; ++s) {
+        const float sc = ue4m3_to_fp32_half(d[s]);
+        for (int j = 0; j < 8; ++j) {
+            out[16 * s + j] = (float)kvalues_fp4[qs[8 * s + j] & 0x0F] * sc;
+            out[16 * s + j + 8] = (float)kvalues_fp4[qs[8 * s + j] >> 4] * sc;
+        }
+    }
+}
+
 // ---- element types
 inline void dequantize_f32(const uint8_t* p, float* out, int n) {
     std::memcpy(out, p, (size_t)n * 4);

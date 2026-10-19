@@ -12,7 +12,7 @@ namespace basalt::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
-/// MMQ covers this ggml type (the i-quants, Q2_0 and the K-quants Q4_K, Q5_K and Q5_1 the experts use, and Q8_0;
+/// MMQ covers this ggml type (the i-quants, Q2_0, NVFP4 and the K-quants Q4_K, Q5_K, Q6_K and Q5_1 the experts use, and Q8_0;
 /// IQ1_M is not covered).
 bool supported(int ggml_type);
 /// `supported`, and on every visible GPU llama.cpp's MMQ has a tile for this type and a weight matrix of
@@ -63,26 +63,33 @@ private:
 };
 
 /// A GGUF-native expert (gate at `gate`, up at `up`, down at `down`, each its GGUF rows) into a group buffer's
-/// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
+/// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.  `tail` (NVFP4: the blob's 16-byte FP32 scale tail
+/// {s_gate, s_up, s_down, 0}) is copied to `tail_dst` when both are given.
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
-                   void* gu_dst, void* d_dst, void* stream);
+                   void* gu_dst, void* d_dst, void* stream, const void* tail = nullptr, void* tail_dst = nullptr);
 /// gather_native for an MMQ group's experts [first, n) in ONE launch: expert q's blob (`blob[q]`; gate at +0, up at
 /// +up_off, down at +down_off) to gu_dst + q * gu_stride and d_dst + q * d_stride - the same bytes as one gather_native
 /// each.  Every pointer, offset and size 16-byte aligned (false otherwise: nothing launched, gather one at a time).
+/// With `tail_dst`, expert q's 16-byte scale tail (at +tail_off in its blob) goes to tail_dst + 16 q.
 constexpr int kGatherGroupMax = 16;
 struct GatherGroup {
     const uint8_t* blob[kGatherGroupMax] = {};
     int first = 0, n = 0;
 };
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
-                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream,
+                         size_t tail_off = 0, void* tail_dst = nullptr);
 /// A the engine-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
 
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the the engine pack) or split
-/// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
-void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
+/// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).  NVFP4: `tail` holds the
+/// group's {s_gate, s_up, s_down, 0} per expert and `bounds` its n + 1 row bounds (relative to these rows); then
+/// h = silu(s_gate g) * (s_up u) * s_down, so the down product's output carries s_down (q8_1 keeps an fp32 scale
+/// per 32 values, so the scaled H rounds to the same codes up to fp32 rounding of that scale).
+void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream,
+            const float* tail = nullptr, const int32_t* bounds = nullptr, int n = 0);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);

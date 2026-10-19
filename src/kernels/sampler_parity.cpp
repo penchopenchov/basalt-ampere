@@ -694,15 +694,146 @@ int coupled_parity() {
     return bad;
 }
 
+// `--split`: the one-launch splits (sample_tokens_split 1, 2) against the two-launch split (0) on random rows at real
+// and edge geometry: the same picks and the same probe probabilities, bit for bit.  `bench`: then the per-call time
+// of each at the engine's vocabulary and the default chain (top_k 20, top_p 0.95, temperature 0.6), rows 1..8.
+int split_parity(bool bench) {
+    using namespace basalt::kernels;
+    int bad = 0;
+    std::mt19937 rng(91);
+    cudaStream_t s = nullptr;
+    check(cudaStreamCreate(&s), "stream");
+    const int max_t = 8, H = 80;
+    int* d_o[3] = {};
+    float* d_p[3] = {};
+    int* d_q = nullptr;
+    int* d_h = nullptr;
+    float* d_b = nullptr;
+    float* d_l = nullptr;
+    for (int v = 0; v < 3; ++v) {
+        check(cudaMalloc(&d_o[v], max_t * sizeof(int)), "out");
+        check(cudaMalloc(&d_p[v], max_t * sizeof(float)), "probs");
+    }
+    const int vocabs[] = {248320, 262144, 106299, 4097, 4096, 300, 20, 7};
+    const int max_nv = 262144;
+    check(cudaMalloc(&d_q, max_t * sizeof(int)), "query");
+    check(cudaMalloc(&d_h, (size_t) max_t * H * sizeof(int)), "history");
+    check(cudaMalloc(&d_b, (size_t) max_nv * sizeof(float)), "bias");
+    check(cudaMalloc(&d_l, (size_t) max_t * max_nv * sizeof(float)), "logits");
+    int ncase = 0, nfail = 0;
+    for (int nv : vocabs) {
+        for (int c = 0; c < 40; ++c) {
+            const int T = 1 + c % max_t;
+            std::normal_distribution<float> g(0.0f, c % 3 == 0 ? 1.0f : 4.0f);
+            std::vector<float> l((size_t) T * nv);
+            for (auto& v : l) v = g(rng);
+            if (c % 4 == 1) for (auto& v : l) v = std::round(v * 4.0f) / 4.0f;            // many exact ties
+            if (c % 7 == 2) for (size_t i = 0; i < l.size(); i += 3) l[i] = l[0];        // a wide tie
+            if (c % 9 == 4) for (size_t i = 0; i < l.size(); i += 5) l[i] = -std::numeric_limits<float>::infinity();
+            SamplerParams p;
+            const int tk[] = {20, 0, 1, 64, 5, 20, 100, 40};
+            p.top_k = tk[c % 8];
+            p.top_p = (c % 5 == 0) ? 1.0f : (c % 5 == 3 ? 0.5f : 0.95f);
+            p.min_p = (c % 6 == 3) ? 0.05f : 0.0f;
+            p.temperature = (c % 4 == 2) ? 1.3f : 0.6f;
+            p.seed = 5000 + (uint64_t) c;
+            p.counter = (uint64_t) (rng() % 100000);
+            const bool pen = c % 3 == 1;
+            std::vector<int> hist((size_t) T * H, -1);
+            if (pen) {
+                p.penalty_last_n = 64; p.penalty_repeat = 1.1f; p.penalty_freq = 0.05f; p.penalty_present = 0.3f;
+                for (auto& v : hist) v = (int) (rng() % (unsigned) std::min(nv, 6000)) - 3;   // some ids out of range
+            }
+            const bool bias = c % 10 == 7;
+            if (bias) {
+                std::vector<float> b((size_t) nv, 0.0f);
+                for (int i = 0; i < nv; i += 13) b[(size_t) i] = (i % 2) ? 2.5f : -std::numeric_limits<float>::infinity();
+                check(cudaMemcpy(d_b, b.data(), (size_t) nv * 4, cudaMemcpyHostToDevice), "bias");
+                p.logit_bias = d_b;
+            }
+            std::vector<int> q((size_t) T);
+            for (int t = 0; t < T; ++t) q[(size_t) t] = (int) (rng() % (unsigned) nv);
+            check(cudaMemcpy(d_l, l.data(), l.size() * 4, cudaMemcpyHostToDevice), "logits");
+            check(cudaMemcpy(d_h, hist.data(), hist.size() * 4, cudaMemcpyHostToDevice), "history");
+            check(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice), "query");
+            std::vector<int> o[3];
+            std::vector<uint32_t> pb[3];
+            for (int v = 0; v < 3; ++v) {
+                check(cudaMemset(d_p[v], 0xff, max_t * sizeof(float)), "probs fill");
+                sample_tokens_split(v, d_l, T, nv, pen ? d_h : nullptr, pen ? H : 0, p, d_o[v], d_q, T, d_p[v], s);
+                check(cudaStreamSynchronize(s), "sync");
+                o[v].resize((size_t) T);
+                pb[v].resize((size_t) T);
+                check(cudaMemcpy(o[v].data(), d_o[v], (size_t) T * 4, cudaMemcpyDeviceToHost), "out");
+                check(cudaMemcpy(pb[v].data(), d_p[v], (size_t) T * 4, cudaMemcpyDeviceToHost), "probs");
+            }
+            ++ncase;
+            for (int v = 1; v < 3; ++v)
+                if (o[v] != o[0] || pb[v] != pb[0]) {
+                    ++nfail;
+                    std::printf("  FAIL split %d nv %d case %d T %d: picks or probe bits differ from the two-launch split\n",
+                                v, nv, c, T);
+                }
+        }
+    }
+    std::printf("split parity: %d cases x 2 one-launch splits, %d mismatches\n", ncase, nfail);
+    bad += nfail;
+    if (bench) {
+        const int NV = 248320;
+        std::normal_distribution<float> g(0.0f, 3.0f);
+        std::vector<float> l((size_t) max_t * NV);
+        for (auto& v : l) v = g(rng);
+        check(cudaMemcpy(d_l, l.data(), l.size() * 4, cudaMemcpyHostToDevice), "logits");
+        std::vector<int> q((size_t) max_t, 0);
+        check(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice), "query");
+        cudaEvent_t e0, e1;
+        check(cudaEventCreate(&e0), "event");
+        check(cudaEventCreate(&e1), "event");
+        const char* names[] = {"two launches", "one launch rounds", "one launch sorted"};
+        for (int T : {1, 2, 3, 4, 7}) {
+            for (int v = 0; v < 3; ++v) {
+                SamplerParams p;
+                p.top_k = 20; p.top_p = 0.95f; p.temperature = 0.6f; p.seed = 3;
+                const int iters = 400;
+                for (int w = 0; w < 10; ++w) sample_tokens_split(v, d_l, T, NV, nullptr, 0, p, d_o[v], d_q, T - 1, d_p[v], s);
+                check(cudaStreamSynchronize(s), "warmup");
+                check(cudaEventRecord(e0, s), "record");
+                for (int it = 0; it < iters; ++it) {
+                    p.counter = (uint64_t) it;
+                    sample_tokens_split(v, d_l, T, NV, nullptr, 0, p, d_o[v], d_q, T - 1, d_p[v], s);
+                }
+                check(cudaEventRecord(e1, s), "record");
+                check(cudaEventSynchronize(e1), "sync");
+                float ms = 0.0f;
+                check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+                std::printf("  bench: split n_vocab %d rows %d top_k 20 top_p 0.95 probe %-16s %7.2f us per call\n", NV, T,
+                            names[v], 1000.0 * (double) ms / iters);
+            }
+        }
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+    }
+    for (int v = 0; v < 3; ++v) { cudaFree(d_o[v]); cudaFree(d_p[v]); }
+    cudaFree(d_q); cudaFree(d_h); cudaFree(d_b); cudaFree(d_l);
+    cudaStreamDestroy(s);
+    return bad;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool selftest = false, bench = false, coupled = false;
+    bool selftest = false, bench = false, coupled = false, split = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
         else if (std::string(argv[i]) == "--bench") bench = true;
         else if (std::string(argv[i]) == "--coupled") coupled = true;
-        else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench] [--coupled]\n"); return 2; }
+        else if (std::string(argv[i]) == "--split") split = true;
+        else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench] [--coupled] [--split [--bench]]\n"); return 2; }
+    }
+    if (split) {
+        const int bad = split_parity(bench);
+        std::printf(bad ? "SPLIT PARITY FAIL (%d)\n" : "SPLIT PARITY OK\n", bad);
+        return bad ? 1 : 0;
     }
     if (coupled) {
         const int bad = coupled_parity();
@@ -1615,6 +1746,7 @@ int main(int argc, char** argv) {
     }
 
     bad += probe_parity();
+    bad += split_parity(false);
 
     std::printf("\nsampler: %d failures\n", bad);
     if (bad) return 1;

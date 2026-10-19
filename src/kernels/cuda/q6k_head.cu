@@ -5,10 +5,12 @@
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "head_proxy.cuh"
+#include "smem_opt_in.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -250,19 +252,20 @@ template <int NC>
 void launch_nc(const void* w, const void* x, float* y, int n_out, cudaStream_t s) {
     // one resident wave: every warp walks rows with the grid's stride
     static int grid_max[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
+    static std::atomic<bool> ready[64];
+    const int dev = opt_in_device("q6k_head");
     const size_t smem = (size_t) NC * XBLK * 8 * sizeof(int2);
-    static bool set[64] = {};
-    if (!set[dev]) {
-        cudaFuncSetAttribute(q6k_head_kernel<NC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        set[dev] = true;
-    }
-    if (grid_max[dev] == 0) {
-        int sms = 0, per_sm = 0;
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, q6k_head_kernel<NC>, WPB * WARP, smem);
-        grid_max[dev] = (sms > 0 ? sms : 1) * (per_sm > 0 ? per_sm : 1);
+    if (!ready[dev].load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(opt_in_mutex());
+        if (!ready[dev].load(std::memory_order_relaxed)) {
+            opt_in_check(cudaFuncSetAttribute(q6k_head_kernel<NC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem),
+                         "q6k_head");
+            int sms = 0, per_sm = 0;
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, q6k_head_kernel<NC>, WPB * WARP, smem);
+            grid_max[dev] = (sms > 0 ? sms : 1) * (per_sm > 0 ? per_sm : 1);
+            ready[dev].store(true, std::memory_order_release);
+        }
     }
     const long long want = ((long long) n_out + WPB - 1) / WPB;
     const unsigned grid = (unsigned) (want < grid_max[dev] ? want : grid_max[dev]);
@@ -773,12 +776,18 @@ void q6k_vhead(const void* proxy, const void* weights, const void* x_q8_1, float
         default: vscore_launch<8>(proxy, x_q8_1, y, n_out, vs, s); break;
     }
     static int sms[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) dev = 0;
-    if (sms[dev] == 0) {
-        cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
-        cudaFuncSetAttribute(q6k_vrescore_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * XBLK * 8 * (int) sizeof(int2));
-        if (sms[dev] <= 0) sms[dev] = 1;
+    static std::atomic<bool> ready[64];
+    const int dev = opt_in_device("q6k_vhead");
+    if (!ready[dev].load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(opt_in_mutex());
+        if (!ready[dev].load(std::memory_order_relaxed)) {
+            cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
+            opt_in_check(cudaFuncSetAttribute(q6k_vrescore_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              8 * XBLK * 8 * (int) sizeof(int2)),
+                         "q6k_vhead");
+            if (sms[dev] <= 0) sms[dev] = 1;
+            ready[dev].store(true, std::memory_order_release);
+        }
     }
     launch_pdl(q6k_vselect_kernel, dim3((unsigned) sms[dev] * 2), dim3(256), 0, s, (const float*) y, n_out, ncols, vs,
                list);

@@ -172,15 +172,18 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     uint64_t fill_total = 0;
     for (const auto& pair : selected) fill_total += lay.blob_bytes(pair.first);
     LoadProgress progress(LoadProgress::cuda(device), fill_total, true);
-    for (const auto& pair : selected) {
-        const int32_t slot = cache_.admit(pair.first, pair.second);
-        const uint8_t* blob = source.blob(pair.first, pair.second);
-        if (slot < 0 || !blob || !cache_.fill_slot_blocking(slot, blob, err, (int64_t) lay.blob_bytes(pair.first))) {
-            err = "CUDA" + std::to_string(device) + " experts: " +
-                  (err.empty() ? "cache fill failed" : err);
+    std::vector<int32_t> selected_slots(selected.size());
+    for (size_t i = 0; i < selected.size(); ++i) {
+        selected_slots[i] = cache_.admit(selected[i].first, selected[i].second);
+        if (selected_slots[i] < 0) {
+            err = "CUDA" + std::to_string(device) + " experts: cache fill failed: no slot";
             close(); return false;
         }
-        progress.add(lay.blob_bytes(pair.first));
+    }
+    if (!fill_cache_slots(source, cache_, device, selected.data(), selected_slots.data(), (int64_t) selected.size(),
+                          [&](uint64_t bytes) { progress.add(bytes); }, err)) {
+        err = "CUDA" + std::to_string(device) + " experts: " + (err.empty() ? "cache fill failed" : err);
+        close(); return false;
     }
     progress.finish();
     const auto& first = selected.front();

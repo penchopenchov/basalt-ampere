@@ -4,6 +4,7 @@
 
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/platform/system.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -253,7 +254,6 @@ void test_host_memory() {
     using namespace basalt::core::detail;
     constexpr uint64_t GiB = 1ull << 30;
     HostMemory m;
-#if defined(__linux__)
     TempDirectory t;
     auto put = [&](const fs::path& rel, const std::string& text) {
         fs::create_directories((t.path / rel).parent_path());
@@ -306,17 +306,15 @@ void test_host_memory() {
     // no MemAvailable: the RAM cannot be determined
     put("meminfo-old", "MemTotal: 134217728 kB\nMemFree: 1024 kB\n");
     require(!host_available_memory(m, (t.path / "meminfo-old").string(), cg, root), "no MemAvailable accepted");
-#else
-    require(host_available_memory(m) && m.available > 0 && m.cgroup_limit == ~0ull, "this PC's RAM");
-    (void) GiB;
-#endif
+    // the system's own files (empty paths): some RAM, and no container limit where the OS keeps no accounting file
+    require(host_available_memory(m) && m.available > 0, "this machine's RAM");
+    if (basalt::platform::meminfo_path().empty()) require(m.cgroup_limit == ~0ull, "no cgroup limit without cgroup files");
 }
 
 // A container whose own cgroup namespace shows its group as the mount's root, while /proc/self/cgroup names the
 // group by its host path (not visible here): the limit is read at the root.  The hybrid layout (v1 controllers plus a
 // unified line) reads the v1 memory controller.
 void test_host_memory_namespaced() {
-#if defined(__linux__)
     using namespace basalt::core::detail;
     constexpr uint64_t GiB = 1ull << 30;
     const std::string id = "/docker/4f3c2a";
@@ -374,7 +372,6 @@ void test_host_memory_namespaced() {
         Tree none;
         require(none.probe(m, "") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "no cgroup line");
     }
-#endif
 }
 
 }  // namespace

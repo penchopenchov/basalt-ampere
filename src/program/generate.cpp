@@ -18,7 +18,12 @@
 #include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/pinned.hpp"
+#include "basalt/platform/compiler.hpp"
+#include "basalt/platform/cpu.hpp"
+#include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/platform/process.hpp"
+#include "basalt/platform/system.hpp"
 #include "basalt/core/remote_experts.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -33,6 +38,8 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/dec_moe.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/kernels/s2_expert_grouped.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/kernels/verify_kernels.hpp"
@@ -66,10 +73,8 @@
 #include "basalt/vision/encoder_cuda.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "basalt/vision/preprocess.hpp"
-#include <unistd.h>
 #include <cerrno>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
+#include <cstddef>   // std::ptrdiff_t
 
 #include <cuda_runtime.h>
 
@@ -79,9 +84,6 @@
 #include <iostream>
 #include <future>
 #include <thread>
-#include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -138,58 +140,16 @@ public:
         if (!busy_) return;
         // the caller has nothing else to do: poll rather than sleep, so the job's end is seen at once
         for (unsigned spins = 0; !done_.load(std::memory_order_acquire); ++spins) {
-            if (spins < 20000) cpu_relax();
+            if (spins < 20000) basalt::platform::cpu_relax();
             else std::this_thread::yield();
         }
         busy_ = false;
     }
 private:
-    static void cpu_relax() {
-#if defined(__x86_64__)
-        __builtin_ia32_pause();
-#endif
-    }
-    // The decode loop's thread is pinned to one core, which it spins on; a thread it starts inherits that pin and would
-    // wait for the spinner to yield.  The worker takes the core's SMT sibling instead: the core is awake, so the
-    // worker starts at once, and the loop's thread is not preempted.
-    static void leave_host_core() {
-        const int n = (int) sysconf(_SC_NPROCESSORS_CONF);
-        if (n <= 0) return;
-        cpu_set_t* own = CPU_ALLOC(n);
-        cpu_set_t* sib = CPU_ALLOC(n);
-        if (own != nullptr && sib != nullptr) {
-            const size_t bytes = CPU_ALLOC_SIZE(n);
-            CPU_ZERO_S(bytes, own);
-            CPU_ZERO_S(bytes, sib);
-            if (pthread_getaffinity_np(pthread_self(), bytes, own) == 0 && CPU_COUNT_S(bytes, own) == 1) {
-                int host = 0;
-                while (host < n && !CPU_ISSET_S(host, bytes, own)) ++host;
-                char path[96];
-                std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", host);
-                if (std::FILE* f = std::fopen(path, "r")) {
-                    char line[128] = {};
-                    if (std::fgets(line, sizeof line, f) != nullptr) {
-                        for (const char* q = line; *q != '\0';) {   // "0,16" or "0-1"
-                            char* end = nullptr;
-                            const long lo = std::strtol(q, &end, 10);
-                            if (end == q) break;
-                            long hi = lo;
-                            if (*end == '-') { q = end + 1; hi = std::strtol(q, &end, 10); }
-                            for (long c = lo; c <= hi && c < n; ++c)
-                                if (c != host) CPU_SET_S((int) c, bytes, sib);
-                            q = *end != '\0' ? end + 1 : end;
-                        }
-                    }
-                    std::fclose(f);
-                }
-                if (CPU_COUNT_S(bytes, sib) > 0) (void) pthread_setaffinity_np(pthread_self(), bytes, sib);
-            }
-        }
-        if (own != nullptr) CPU_FREE(own);
-        if (sib != nullptr) CPU_FREE(sib);
-    }
     void loop() {
-        leave_host_core();
+        // the decode loop's thread is pinned to one core, which it spins on, and a thread it starts would inherit
+        // that pin
+        basalt::platform::leave_host_core();
         std::unique_lock<std::mutex> lk(m_);
         for (;;) {
             cv_.wait(lk, [this] { return has_ || stop_; });
@@ -535,6 +495,7 @@ struct Options {
     int adapt_every = 4;
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
+    double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
     /// A draft enters the verify window only while every draft before it (and itself) has at least this probability
     /// under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
@@ -628,12 +589,12 @@ int serve_subcommand(int argc, char** argv) {
     bool have_model = false;
     // the working directory changes below: the paths the server reads must not depend on it
     auto absolute = [](const std::string& path) {
-        char real[4096];
-        if (::realpath(path.c_str(), real) == nullptr) {
+        std::string real;
+        if (!basalt::platform::absolute_path(path, real)) {
             std::fprintf(stderr, "basalt serve: cannot open %s\n", path.c_str());
             std::exit(1);
         }
-        return std::string(real);
+        return real;
     };
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -652,25 +613,19 @@ int serve_subcommand(int argc, char** argv) {
         std::fprintf(stderr, "usage: basalt serve --config FILE | MODEL.basalt [--python PY] [server args...]\n");
         return 2;
     }
-    char exe[4096];
-    const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (n <= 0) { std::fprintf(stderr, "basalt serve: cannot find this binary (/proc/self/exe)\n"); return 1; }
-    exe[n] = 0;
+    const std::string exe = basalt::platform::module_path();
+    if (exe.empty()) { std::fprintf(stderr, "basalt serve: cannot find this binary\n"); return 1; }
     const std::string src_dir = BASALT_SOURCE_DIR;
-    if (python.empty()) {
-        const std::string venv = src_dir + "/.venv/bin/python";
-        python = ::access(venv.c_str(), X_OK) == 0 ? venv : "python3";
-    }
-    if (::chdir(src_dir.c_str()) != 0) {
+    if (python.empty()) python = basalt::platform::python_interpreter(src_dir);
+    if (basalt::platform::set_working_dir(src_dir) != 0) {
         std::fprintf(stderr, "basalt serve: cannot enter the source tree %s\n", src_dir.c_str());
         return 1;
     }
     std::vector<std::string> args = {python, "-m", "serve.server", "--engine-bin", exe};
     args.insert(args.end(), extra.begin(), extra.end());
-    std::vector<char*> cargs;
-    for (std::string& s : args) cargs.push_back(s.data());
-    cargs.push_back(nullptr);
-    ::execvp(python.c_str(), cargs.data());
+    // Does not return when it works. Windows has no exec, so this process waits for the server and ends with the
+    // server's exit code. Reaching the line below means the server never started, and errno says why.
+    basalt::platform::exec_replacing(args);
     std::fprintf(stderr, "basalt serve: cannot run %s: %s\n", python.c_str(), std::strerror(errno));
     return 1;
 }
@@ -725,6 +680,21 @@ void usage() {
                  "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
                  "  --cpu-oracle-q8-0     experimental pinned CPU expert quantization and dot reduction\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
+                 "  --serve              stay resident and take requests on stdin (the server's mode)\n"
+                 "  --exp NAME=VALUE[,...]  diagnostics; concur9_logit_hash=1 prints a hash of each accepted row's\n"
+                 "                       logits on stderr\n"
+                 "  --layer-split K|K1,K2,...|auto  --serve: run the model in stages across GPUs, each a block of layers\n"
+                 "                       not with --peer-device\n"
+                 "  --split-device D1,D2,..  with --layer-split: the later stages' GPUs (default: the next visible ones)\n"
+                 "  --split-skip-if-fits with --layer-split auto: run on CUDA0 alone when it holds every profiled expert,\n"
+                 "                       the session, the drafter and the reserve\n"
+                 "  --mtp-window N       the drafter attends to the last N cells (default 32768; 0 = every cell)\n"
+                 "  --stop-eos           stop when the model emits an end-of-turn token\n"
+                 "  --eos-ids LIST       the end-of-turn token ids for --stop-eos (default 248044,248046); implies it\n"
+                 "  --prompt-cache-root N  --serve: checkpoint a prompt's first turn boundary when it is at least N tokens\n"
+                 "                       long (default 2048, 0 = never)\n"
+                 "  --no-prefill-borrow  reserve the prompt buffers' VRAM for the whole session instead of lending expert\n"
+                 "                       slots\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear\n"
@@ -791,7 +761,8 @@ void usage() {
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens; auto = the fewest\n"
-                 "                       equal chunks of at most 12288 tokens (16384 with --peer-exclusive), within\n"
+                 "                       equal chunks of at most 16384 tokens (32768 for packs whose expert blobs\n"
+                 "                       exceed 1.5 MiB, such as NVFP4), within\n"
                  "                       what the expert cache can lend (with --resident-experts the lent slots the\n"
                  "                       RAM copy backs, else 8192); auto:N (8192, 16384, 32768) sets the ceiling\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
@@ -823,10 +794,16 @@ void usage() {
                  "  --no-ple-prefetch     A/B arm: read the PLE table's sixteen rows one at a time, instead of\n"
                  "                       issuing them in one prefetch.\n"
                  "  --expert-cache N|auto  keep N expert blobs resident in VRAM and compute their rows on the\n"
-                 "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  auto = as many as fit in the VRAM\n"
+                 "                       GPU.  DEFAULT 0.  auto = as many as fit in the VRAM\n"
                  "                       left after the weights, the session and --vram-reserve-mib\n"
                  "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
                  "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
+                 "  --pcie-frac F        the share (0..1) of each layer's missed experts the GPU reads over PCIe from\n"
+                 "                       the pinned RAM copy while the CPU computes the rest (default 0.55, scaled\n"
+                 "                       down on a slow link; 0 keeps every miss on the CPU)\n"
+                 "  --pcie-mode auto|dma|kernel|direct  how that share reaches the GPU: dma = copy engine into staging,\n"
+                 "                       kernel = a copy kernel inside the graph, direct = the grouped kernel reads the\n"
+                 "                       mapped arena; auto (default) = kernel\n"
                  "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
@@ -835,12 +812,23 @@ void usage() {
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
-                 "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
+                  "                       --expert-cache-device1..3; refused where a process has no GPU-to-GPU\n"
+                  "                       access between its devices.  Off by default; the server sets 1 when two\n"
+                  "                       or more GPUs are visible.\n"
                  "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
                  "                       also in RAM (less RAM).  The peer is filled from the file; swaps move\n"
                  "                       peer-held experts between the GPUs and RAM over P2P.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
+                 "  --adapt-every N      adaptive expert tier: a round every N decode windows (default 4;\n"
+                 "                       0 = the VRAM experts stay as loaded)\n"
+                 "  --adapt-decay F      factor the routing counts are multiplied by after each round (default\n"
+                 "                       0.93 on one GPU with or without the peer, 0.7 with the experts split\n"
+                 "                       over several GPUs); lower forgets sooner\n"
+                 "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
+                 "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
+                 "                       from run to run; a weaker CPU may prefer a lower value\n"
+                 "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
@@ -848,9 +836,8 @@ void usage() {
                  "                       position take all of them.  The default policy fills in arrival order\n"
                  "                       from one shared counter, so a small cache goes to a few layers of\n"
                  "                       position 0.\n"
-                 "  --no-host-worker     the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
-                 "                       pool is six threads on six cores instead of five plus an idle core;\n"
-                 "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
+                 "  --no-host-worker     the A/B arm.  By default the host thread joins the drain as one more\n"
+                 "                       worker; this flag leaves it out, for comparison on `pool phases`.\n"
                  "  --pool-workers N     CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on (with --pool-affinity auto or\n"
                  "                       p-cores on a hybrid CPU: P-cores minus 1), lowered so the workers and the\n"
@@ -870,10 +857,11 @@ void usage() {
                  "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
                  "  --resident-experts   the low-RAM resident mode: --mmap-experts --resident-cpu-experts\n"
-                 "                       with the copy page-locked when possible, 4 GiB headroom, plain mmap if it\n"
-                 "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
+                 "                       with the copy page-locked when possible, the RAM floor left free (see the\n"
+                 "                       README's Memory floors), plain mmap if it does not fit.  Same answers as --mmap-experts for the same placement.\n"
                  "                       When some experts stay in the file, the copy leaves a RAM floor free for\n"
-                 "                       the OS file cache (the RAM margin + 3.5 GiB + two layers' experts).\n"
+                 "                       the OS file cache (the RAM margin + the larger of 3.5 GiB + two layers'\n"
+                 "                       experts and 4 GiB).\n"
                  "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
                  "                       the largest safe value.\n");
@@ -1022,30 +1010,12 @@ struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard
 };
 MemSample mem_sample() {
+    const basalt::platform::ProcessMemory p = basalt::platform::process_memory();
     MemSample m;
-    if (std::FILE* f = std::fopen("/proc/self/stat", "r")) {
-        char buf[4096];
-        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
-        buf[n] = 0;
-        std::fclose(f);
-        const char* s = std::strrchr(buf, ')');   // fields after the command name: 3 state ... 12 majflt
-        for (int field = 2; s && field < 12; ++field) s = std::strchr(s + 1, ' ');
-        if (s) m.faults = std::strtoull(s + 1, nullptr, 10);
-    }
-    auto kb = [](const char* path, const char* key) -> unsigned long long {
-        unsigned long long v = 0;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            char line[256];
-            const size_t kl = std::strlen(key);
-            while (std::fgets(line, sizeof line, f))
-                if (std::strncmp(line, key, kl) == 0) { v = std::strtoull(line + kl, nullptr, 10); break; }
-            std::fclose(f);
-        }
-        return v;
-    };
-    m.rss_mib = kb("/proc/self/status", "VmRSS:") >> 10;
-    m.commit_mib = kb("/proc/self/status", "VmSwap:") >> 10;
-    m.avail_mib = kb("/proc/meminfo", "MemAvailable:") >> 10;
+    m.faults = p.faults;
+    m.rss_mib = p.rss_mib;
+    m.avail_mib = p.avail_mib;
+    m.commit_mib = p.commit_mib;
     return m;
 }
 
@@ -1057,50 +1027,16 @@ std::string stage_text() {
     return s;
 }
 
-// whether `path` is on a rotational disk (1), not (0) or unknown (-1), from sysfs; `dev` is the disk's name
-int on_rotational_disk(const std::string& path, std::string& dev) {
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0) return -1;
-    char sys[64];
-    std::snprintf(sys, sizeof sys, "/sys/dev/block/%u:%u", (unsigned) major(st.st_dev), (unsigned) minor(st.st_dev));
-    std::error_code ec;
-    std::filesystem::path p = std::filesystem::canonical(sys, ec);
-    for (int up = 0; !ec && up < 2; ++up, p = p.parent_path()) {   // a partition has its disk's queue
-        std::ifstream q(p / "queue" / "rotational");
-        int r = -1;
-        if (q >> r) {
-            dev = p.filename().string();
-            return r;
-        }
-    }
-    return -1;
-}
-
 // the engine's threads in uninterruptible sleep (state D - almost always waiting for the disk), and where
 // (wchan): many threads in blk_io_schedule is a disk that cannot keep up, not a deadlock in the engine
 void disk_wait_threads(std::FILE* f) {
-    std::map<std::string, int> where;
-    int waiting = 0, threads = 0;
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec)) {
-        ++threads;
-        std::ifstream st(e.path() / "stat");
-        std::string line;
-        std::getline(st, line);
-        const size_t rp = line.rfind(')');
-        if (rp == std::string::npos || rp + 2 >= line.size() || line[rp + 2] != 'D') continue;
-        ++waiting;
-        std::ifstream w(e.path() / "wchan");
-        std::string wc;
-        std::getline(w, wc);
-        ++where[wc.empty() || wc == "0" ? "?" : wc];
-    }
-    if (threads == 0) return;
+    const basalt::platform::ThreadWaits w = basalt::platform::threads_in_disk_wait();
+    if (w.threads == 0) return;
     std::string list;
-    for (const auto& [name, n] : where) list += (list.empty() ? " (" : ", ") + name + " x" + std::to_string(n);
+    for (const auto& [name, n] : w.where) list += (list.empty() ? " (" : ", ") + name + " x" + std::to_string(n);
     if (!list.empty()) list += ")";
-    std::fprintf(f, "  threads waiting on the disk (state D): %d of %d%s%s\n", waiting, threads, list.c_str(),
-                 waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
+    std::fprintf(f, "  threads waiting on the disk (state D): %d of %d%s%s\n", w.waiting, w.threads, list.c_str(),
+                 w.waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
                                "direct (--ple-io ram), or a drive too slow for the reads asked of it" : "");
 }
 
@@ -1351,12 +1287,12 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
     // if memory runs out the kernel ends this process first, not the rest of the machine
-    if (std::FILE* f = std::fopen("/proc/self/oom_score_adj", "w")) { std::fputs("1000", f); std::fclose(f); }
-    // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With lazy
-    // loading, a kernel first used mid-prompt would find no VRAM left for its code and the engine would end ("out of
-    // memory: cudaFuncSetAttribute").
+    basalt::platform::prefer_oom_victim();
+    // Kernels load on first use: loading every kernel of the engine and of cuBLAS at context creation holds a few
+    // hundred MiB of device memory for code that never runs.  The expert cache's sizing keeps back room for what loads
+    // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load.
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
-        setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+        basalt::platform::set_env("CUDA_MODULE_LOADING", "LAZY");
     }
     Options o;
     std::string ppl_base, ppl_out;
@@ -1506,6 +1442,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
+        else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
             o.relaxed_drafting = kRelaxedDraftingDefault;
@@ -1651,6 +1588,16 @@ int main(int argc, char** argv) {
         }
         }
     }
+    // The peer tier holds experts on a second GPU and moves them between the two over direct GPU-to-GPU access, which
+    // a process here is not given.  Refused with the options, before the model opens or a device context exists: a
+    // tier sized and then filled would fail partway through the load.
+    if (o.peer_device >= 1 && !basalt::platform::gpu_peer_access()) {
+        std::fprintf(stderr, "basalt generate: --peer-device is not available here: this platform gives a process no "
+                             "GPU-to-GPU access between its devices, so a second GPU cannot hold an expert tier; keep "
+                             "the experts on one GPU (--expert-cache, --resident-experts) and run without "
+                             "--peer-device\n");
+        return 2;
+    }
     // ---- where every loader reads from: the sections of the .basalt file
     if (o.model.empty()) {
         std::fprintf(stderr, "basalt generate: --model FILE.basalt is required\n");
@@ -1659,6 +1606,8 @@ int main(int argc, char** argv) {
     }
     // a load that exhausts the RAM ends here instead of swapping the machine to a halt; stopped at READY
     if (o.serve) basalt::platform::start_memory_watchdog(1ull << 30);
+    // the serve protocol's pipes carry bytes, so its newlines are the engine's own
+    if (o.serve) basalt::platform::set_stdio_binary();
     basalt::core::ModelSources srcs;
     basalt::core::ModelFile model_file;
     {
@@ -1956,6 +1905,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt generate: invalid sampling or resource parameter\n");
         return 2;
     }
+    if (!(o.prefill_cpu_share >= 0.0 && o.prefill_cpu_share <= 1.0)) {
+        std::fprintf(stderr, "basalt generate: --prefill-cpu-share must be a number from 0 to 1\n");
+        return 2;
+    }
     if (o.vram_reserve_given && o.vram_reserve_mib < kVramStallMib) {
         std::fprintf(stderr, "basalt error: --vram-reserve-mib %d leaves less VRAM free than the engine needs to keep "
                              "requests from stalling; the smallest safe value is %d\n", o.vram_reserve_mib, kVramStallMib);
@@ -2035,13 +1988,42 @@ int main(int argc, char** argv) {
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
             if (!basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
-                char msg[192];
+                char msg[224];
                 std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s (ggml types %d/%d), which this "
-                                               "engine has no GPU kernels for", (long long) l,
+                                               "engine has no GPU kernels for: format not supported for decode",
+                              (long long) l,
                               basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
                               f.gu_type, f.d_type);
                 return fatal_start_error(msg);
             }
+            // Q6_K experts run on the fast kernels only (decode-once grouped / device-planned tail, MMQ prefill, CPU
+            // dot): a pair or shape outside them is refused rather than routed to a general path.
+            if ((f.gu_type == 14 || f.d_type == 14) &&
+                (!basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff) ||
+                 !basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) || !basalt::prefill::mmq::fits(f.d_type, f.n_embd))) {
+                char msg[224];
+                std::snprintf(msg, sizeof msg, "layer %lld's experts are %s/%s: Q6_K experts have fast kernels only "
+                                               "for the covered pairs and shapes",
+                              (long long) l, basalt::ggml_type_name((uint32_t) f.gu_type),
+                              basalt::ggml_type_name((uint32_t) f.d_type));
+                return fatal_start_error(msg);
+            }
+        }
+        // one line per run of layers with the same formats: the kernels each decode and prefill path uses
+        for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size();) {
+            const auto& f = lay.fmt[(size_t) l];
+            int64_t e = l;
+            while (e + 1 < (int64_t) lay.fmt.size() && lay.fmt[(size_t) e + 1].gu_type == f.gu_type &&
+                   lay.fmt[(size_t) e + 1].d_type == f.d_type)
+                ++e;
+            std::fprintf(stderr, "basalt generate: experts %s/%s, layers %lld-%lld: decode %s, prefill %s, CPU tier dot\n",
+                         basalt::ggml_type_name((uint32_t) f.gu_type), basalt::ggml_type_name((uint32_t) f.d_type),
+                         (long long) l, (long long) e,
+                         basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                             ? "device-planned tail + grouped kernels" : "grouped kernels",
+                         basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) && basalt::prefill::mmq::fits(f.d_type, f.n_embd)
+                             ? "MMQ" : "dequant GEMM");
+            l = e + 1;
         }
     }
     // Only CUDA1's context is created here, before the large allocations: the later helpers' come after the arena.
@@ -2191,10 +2173,11 @@ int main(int argc, char** argv) {
         }
         basalt::core::set_native_embed(&native_embed);
         std::fprintf(stderr, "basalt generate: %s experts (largest blob %.2f MB), token embedding "
-                             "%s in mapped host memory (%.0f MiB, %.1f s)\n",
+                             "%s in mapped host memory (%.0f MiB, %.1f s), its first %lld rows in VRAM (%.1f MiB)\n",
                      o.model.c_str(), (double) basalt::kernels::cpu::expert_layout().max_blob / 1e6,
                      basalt::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
-                     std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count(),
+                     (long long) native_embed.hot_rows(), (double) native_embed.hot_bytes() / 1048576.0);
     }
     // Tensors served from the source tensors are not also loaded into the weight arena.
     std::set<std::string> skip;
@@ -2511,7 +2494,7 @@ int main(int argc, char** argv) {
             // --ple-io direct's random reads (up to --ple-inflight at once) are for SSDs; a rotational disk can take
             // longer than the stall watchdog's limit for one prompt chunk's rows.  Recommended, not forced.
             std::string dev;
-            if (on_rotational_disk(o.model, dev) == 1)
+            if (basalt::platform::disk_rotational(o.model, dev) == 1)
                 std::fprintf(stderr, "basalt generate: WARNING: the n-gram table (%s) is on a rotational disk (%s): "
                                      "--ple-io direct reads it at random and can stall a prompt for minutes. "
                                      "--ple-io ram (it then needs RAM for the table) or the model on an SSD is "
@@ -3315,6 +3298,13 @@ int main(int argc, char** argv) {
         // a server allocates its verify windows after the cache is sized: they come out of the reserve too, so the
         // free VRAM after loading is the reserve itself
         int64_t late_b = o.serve ? (kWindowMib << 20) : 0;
+        // the kernels that first run after the cache is sized (the prompt path's, the verify windows') load into the
+        // reserve when modules load lazily
+        {
+            const char* ml = std::getenv("CUDA_MODULE_LOADING");
+            constexpr int64_t kLazyKernelsMib = 96;
+            if (ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
+        }
         // the deferred checkpoint copy's spare device buffer is allocated after the cache, so it comes out of the reserve
         if (o.serve && o.prompt_cache > 0 && !multi_gpu) {
             basalt::core::ConversationStateSizes zc;
@@ -3661,14 +3651,6 @@ int main(int argc, char** argv) {
         const bool per_layer = xcache.per_layer_admission();
         const int64_t want = per_layer ? (int64_t) profile.size()
                                        : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        // mapped reads: advise the next `fill_ahead` pairs so their reads overlap
-        int64_t fill_ahead = 0;
-        if (!per_layer && srcp == &src) {
-            fill_ahead = 256;
-            if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
-            std::fprintf(stderr, "basalt generate: the profile fill asks for %lld pairs ahead\n",
-                         (long long) fill_ahead);
-        }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
         uint64_t fill_total = 0;
@@ -3684,24 +3666,26 @@ int main(int argc, char** argv) {
             }
         }
         basalt::core::LoadProgress fill_progress(basalt::core::LoadProgress::cuda(0), fill_total, srcp != &src);
+        // the slots are handed out in profile order, then the blobs are read and copied together
+        std::vector<std::pair<int32_t, int32_t>> fill_pairs;
+        std::vector<int32_t> fill_slots;
         for (int64_t i = 0; i < want; ++i) {
-            if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == basalt::core::kNotResident) {
                 if (per_layer) continue;
                 break;
             }
-            const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
-                std::fprintf(stderr, "basalt generate: the profile fill failed at pair %lld: %s\n",
-                             (long long) i, err.c_str());
-                return 1;
-            }
+            fill_pairs.push_back(profile[(size_t) i]);
+            fill_slots.push_back(slot);
             fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
-            fill_progress.add(basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first));
-            ++prefilled;
         }
+        if (!basalt::core::fill_cache_slots(*srcp, xcache, 0, fill_pairs.data(), fill_slots.data(),
+                                            (int64_t) fill_pairs.size(),
+                                            [&](uint64_t bytes) { fill_progress.add(bytes); }, err)) {
+            std::fprintf(stderr, "basalt generate: the profile fill failed: %s\n", err.c_str());
+            return 1;
+        }
+        prefilled += (int64_t) fill_pairs.size();
         fill_progress.finish();
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
@@ -3750,18 +3734,21 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < st.profile.size() && (int64_t) i < st.cache.slots(); ++i)
             stage_fill_total += lay.blob_bytes(st.profile[i].first);
         basalt::core::LoadProgress stage_progress(basalt::core::LoadProgress::cuda(st.dev), stage_fill_total);
+        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
+        std::vector<int32_t> stage_slots;
         for (const auto& pr : st.profile) {
             if (filled >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == basalt::core::kNotResident) break;
-            const uint8_t* b = srcp->blob(pr.first, pr.second);
-            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
-                std::fprintf(stderr, "basalt generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
-                             st.dev, (long long) filled, err.c_str());
-                return 1;
-            }
-            stage_progress.add(lay.blob_bytes(pr.first));
+            stage_pairs.push_back(pr);
+            stage_slots.push_back(slot);
             ++filled;
+        }
+        if (!basalt::core::fill_cache_slots(*srcp, st.cache, st.dev, stage_pairs.data(), stage_slots.data(),
+                                            (int64_t) stage_pairs.size(),
+                                            [&](uint64_t bytes) { stage_progress.add(bytes); }, err)) {
+            std::fprintf(stderr, "basalt generate: layer split, CUDA%d profile fill failed: %s\n", st.dev, err.c_str());
+            return 1;
         }
         stage_progress.finish();
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
@@ -4560,7 +4547,8 @@ int main(int argc, char** argv) {
     // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
     // complement to size it from, so it stays at 8192.
     // The largest chunk a bare `auto` reads a prompt in: past it a chunk's cost per token stops falling.
-    constexpr int64_t kMaxAutoChunk = 16384;
+    // A pass streams every expert blob once, so a pack with bigger blobs amortizes the pass over more tokens.
+    const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
     // The auto scan bisects on the 256-token grid the prompt path works on (`request_chunk` rounds up to it):
@@ -4663,7 +4651,9 @@ int main(int argc, char** argv) {
                 : 0;
         const uint64_t late = (o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0) + exchange_bytes;
         uint64_t resident_headroom =
-            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late) : o.resident_headroom + exchange_bytes;
+            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late)
+                    : std::max(o.resident_headroom, basalt::platform::ram_margin() + basalt::platform::kLateHostBytes) +
+                          exchange_bytes;   // what loads after the copy, and the buffers, fit beside the margin
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
         {
@@ -4783,6 +4773,7 @@ int main(int argc, char** argv) {
         tier_file_bytes = b_file;
         const double total = (double) (b_vram + b_peer + b_ram + b_top + b_file);
         if (total <= 0.0) return;
+        basalt::core::draft_cum_cpu_mb() = (float) ((double) (b_ram + b_top) / (double) (g.n_layers * g.n_expert) / 1e6);
         constexpr double kGiB = 1073741824.0;
         auto pct = [&](uint64_t b) { return 100.0 * (double) b / total; };
         // RAM is the loaded copy (the bytes the loader reports); the top-up added after the load is shown beside it
@@ -5016,7 +5007,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-            if (!multi_gpu && o.batch <= 0 && !o.no_pool) sp.set_cpu_pool(&pool);   // the pool is idle while a prompt is read
+            if (!multi_gpu && o.batch <= 0 && !o.no_pool) { sp.set_cpu_pool(&pool); sp.set_cpu_share(o.prefill_cpu_share); }   // the pool is idle while a prompt is read
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
@@ -5195,6 +5186,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
         if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
+        ver.set_cpu_warm(drive.d.pool, drive.d.src);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
             (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
             std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
@@ -5895,7 +5887,7 @@ int main(int argc, char** argv) {
                         buf.erase(0, nlpos + 1);
                         return true;
                     }
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    const std::ptrdiff_t n = (std::ptrdiff_t) basalt::platform::pipe_read(0, chunk, sizeof chunk);
                     if (n < 0 && errno == EINTR) continue;
                     if (n <= 0) {
                         if (buf.empty()) return false;
@@ -9047,7 +9039,7 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "basalt generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && o.batch <= 0 && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (!multi_gpu && o.batch <= 0 && !o.no_pool) { prefill.set_cpu_pool(&pool); prefill.set_cpu_share(o.prefill_cpu_share); }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
@@ -9139,6 +9131,7 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
         vh.n_slots = xcache.slots();
+        ver.set_cpu_warm(drive.d.pool, drive.d.src);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             return fatal_start_error(err);
         }

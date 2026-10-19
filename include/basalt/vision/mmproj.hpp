@@ -4,6 +4,8 @@
 // is checked, and a file that does not match is refused with the reason.
 #pragma once
 
+#include "basalt/platform/mapped_file.hpp"
+
 #include <cstdint>
 #include <map>
 #include <string>
@@ -33,10 +35,10 @@ public:
     Mmproj(const Mmproj&) = delete;
     Mmproj& operator=(const Mmproj&) = delete;
 
-    /// Maps `path`, parses the header and checks it is the expected projector.  False with `err` otherwise.
+    /// Reads `path` (mapped when the file system refuses unbuffered reads), parses the header and checks it is the expected projector.  False with `err` otherwise.
     bool open(const std::string& path, std::string& err);
 
-    /// Unmaps the file: tensor pointers are invalid afterwards, hp() stays.  For callers that copied the weights.
+    /// Drops the file's bytes: tensor pointers are invalid afterwards, hp() stays.  For callers that copied the weights.
     void release();
 
     const Hparams& hp() const { return hp_; }
@@ -47,6 +49,8 @@ public:
 
 private:
     void* map_ = nullptr;
+    platform::MappedFile mapping_;   ///< the file's view, when `map_` is one
+    bool mapped_ = false;   ///< `map_` is a file mapping (else allocated memory the file was read into)
     size_t size_ = 0;
     Hparams hp_;
     std::map<std::string, TensorRef> tensors_;

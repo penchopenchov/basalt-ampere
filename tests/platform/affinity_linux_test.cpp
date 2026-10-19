@@ -14,7 +14,7 @@
 #include <thread>
 #include <vector>
 
-#include "pool_affinity_linux.hpp"
+#include "affinity_linux.hpp"
 
 #include <pthread.h>
 #include <sched.h>
@@ -217,11 +217,11 @@ static bool worker_thread_can_pin(int target) {
         std::vector<int> before;
         if (!get_affinity(before)) return;
         std::vector<unsigned long> saved;
-        if (cpu::detail::get_thread_affinity(saved) != 0) return;
-        const int pin_error = cpu::detail::pin_thread_to_cpu(target);
+        if (basalt::platform::detail::get_thread_affinity(saved) != 0) return;
+        const int pin_error = basalt::platform::detail::pin_thread_to_cpu(target);
         const bool pinned = pin_error == 0 && expect_affinity({target}, "worker thread helper pin") &&
                             sched_getcpu() == target;
-        const int restore_error = cpu::detail::set_thread_affinity(saved);
+        const int restore_error = basalt::platform::detail::set_thread_affinity(saved);
         ok = pinned && restore_error == 0 && expect_affinity(before, "worker thread helper restore");
     });
     worker.join();
@@ -233,7 +233,7 @@ static bool failed_pin_preserves_affinity() {
     if (!get_affinity(before)) return false;
     // An ID outside the caller's current mask may still be online and legal, so it is not a
     // reliable failure case. INT_MAX is rejected before allocating or changing any CPU set.
-    const int error = cpu::detail::pin_thread_to_cpu(INT_MAX);
+    const int error = basalt::platform::detail::pin_thread_to_cpu(INT_MAX);
     std::vector<int> after;
     const bool helper_unchanged = get_affinity(after) && before == after;
     if (error == 0) {

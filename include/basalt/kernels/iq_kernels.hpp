@@ -25,17 +25,20 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
 
-/// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.
-void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
+/// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.  `scale` (device, NVFP4 only): the
+/// matrix's FP32 scale, applied in fp32 before the fp16 rounding.
+void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream,
+                    const float* scale = nullptr);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
 /// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
-/// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
+/// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).  `hot` (optional): a device copy of the
+/// table's first `n_hot` rows, read instead of the table for those ids (the same bytes).
 void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok,
-                   int64_t n_embd, float* out, void* stream);
+                   int64_t n_embd, float* out, void* stream, const void* hot = nullptr, int64_t n_hot = 0);
 /// One expert's gate and up matrices (n_ff rows of n_embd each) into the interleaved fp16 layout the prompt path
-/// uses: row 2r = gate row r, row 2r+1 = up row r.
+/// uses: row 2r = gate row r, row 2r+1 = up row r.  `scale` (device, NVFP4 only): {s_gate, s_up}, as iq_dequant_f16.
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
-                       void* stream);
+                       void* stream, const float* scale = nullptr);
 
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {
@@ -43,7 +46,7 @@ struct NativeExpertLayout {
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
-    size_t bytes = 0;                   // the whole blob
+    size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the

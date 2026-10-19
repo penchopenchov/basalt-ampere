@@ -87,6 +87,9 @@ class Peer(Tmp):
     def test_second_gpu_becomes_the_peer(self):
         path = self.build()
         cfg = modelfile.model_config(path, str(self.engine_bin), gpus=2)
+        if not modelfile.peer_tier_supported():      # the engine refuses a peer tier here, so nothing is offered
+            self.assertNotIn("--peer-device", cfg["args"])
+            return
         self.assertEqual(cfg["args"][-2:], ["--peer-device", "1"])
         self.assertEqual(gpus_in_play(cfg, cfg["args"]), [0, 1])
         self.assertNotIn("--peer-device", modelfile.model_config(path, str(self.engine_bin), gpus=1)["args"])
@@ -98,18 +101,19 @@ class Peer(Tmp):
         self.assertIn("vision", cfg)
         self.assertIn("--vision", cfg["args"])
 
-    def test_overrides_replace_or_add(self):
+    def test_engine_words_follow_the_model_as_given(self):
         path = self.build()
         args = modelfile.model_config(path, str(self.engine_bin), gpus=1,
-                                      overrides={"--spec": 0, "--mtp-max-t": 4})["args"]
-        self.assertEqual(args, ["--model", path, "--spec", "0", "--mtp-max-t", "4"])
-        args = modelfile.model_config(path, str(self.engine_bin), gpus=1, overrides={"--spec": 3})["args"]
-        self.assertEqual(args, ["--model", path, "--spec", "3"])
+                                      engine_words=["--spec", "0", "--mtp-max-t", "4", "--peer-exclusive"])["args"]
+        self.assertEqual(args, ["--model", path, "--spec", "0", "--mtp-max-t", "4", "--peer-exclusive"])
+        args = modelfile.model_config(path, str(self.engine_bin), gpus=1,
+                                      engine_words=["--control-vector-layer-range", "4", "44"])["args"]
+        self.assertEqual(args, ["--model", path, "--control-vector-layer-range", "4", "44"])
 
-    def test_switch_override_is_added_once(self):
+    def test_a_given_peer_device_replaces_the_default(self):
         path = self.build()
-        args = modelfile.model_config(path, str(self.engine_bin), gpus=1, overrides={"--peer-exclusive": True})["args"]
-        self.assertEqual(args, ["--model", path, "--peer-exclusive"])
+        args = modelfile.model_config(path, str(self.engine_bin), gpus=2, engine_words=["--peer-device", "-1"])["args"]
+        self.assertEqual(args, ["--model", path, "--peer-device", "-1"])
 
     def test_plain_pack_gives_only_the_model(self):
         path = self.build()
@@ -118,7 +122,8 @@ class Peer(Tmp):
     def test_engine_args_in_an_old_pack_are_ignored(self):
         path = self.build(meta={**META, "engine_args": ["--spec", "7", "--peer-device", "-1"]})
         cfg = modelfile.model_config(path, str(self.engine_bin), gpus=2)
-        self.assertEqual(cfg["args"], ["--model", path, "--peer-device", "1"])
+        peer = ["--peer-device", "1"] if modelfile.peer_tier_supported() else []
+        self.assertEqual(cfg["args"], ["--model", path] + peer)
         self.assertEqual(cfg["sampling"], META["sampling"])
 
     def test_count_respects_visible_devices_and_nvidia_smi(self):
@@ -133,7 +138,8 @@ class Peer(Tmp):
         with mock.patch.dict(os.environ, env, clear=True), mock.patch("subprocess.run", return_value=out):
             self.assertEqual(modelfile.gpu_count(), 2)
             path = self.build()
-            self.assertEqual(modelfile.model_config(path, str(self.engine_bin))["args"][-2:], ["--peer-device", "1"])
+            peer = ["--peer-device", "1"] if modelfile.peer_tier_supported() else []
+            self.assertEqual(modelfile.model_config(path, str(self.engine_bin))["args"], ["--model", path] + peer)
         with mock.patch.dict(os.environ, env, clear=True), mock.patch("subprocess.run", side_effect=OSError):
             self.assertEqual(modelfile.gpu_count(), 0)
 
