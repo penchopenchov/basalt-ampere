@@ -5,6 +5,7 @@
 #include "basalt/platform/file.hpp"
 
 #include <cerrno>
+#include <cstdint>
 #include <string>
 
 #if defined(_WIN32)
@@ -14,6 +15,7 @@
 #include <io.h>       // _wopen, _waccess, _close, _fileno, _get_osfhandle
 #else
 #include <fcntl.h>    // O_RDONLY, posix_fadvise
+#include <sys/stat.h>  // ::stat
 #include <unistd.h>   // ::open, ::close, ::pread, ::access, ::chdir, ::readlink, fileno
 #endif
 
@@ -144,6 +146,17 @@ int64_t pread(int fd, void* dst, size_t n, uint64_t off) {
     return (int64_t) got;
 }
 
+bool file_size(const std::string& path, uint64_t& out) {
+    WIN32_FILE_ATTRIBUTE_DATA d{};
+    if (!GetFileAttributesExW(to_wide(path).c_str(), GetFileExInfoStandard, &d)) return false;
+    if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;   // stat's S_ISREG, in the form Windows gives
+    ULARGE_INTEGER sz;
+    sz.HighPart = d.nFileSizeHigh;
+    sz.LowPart = d.nFileSizeLow;
+    out = sz.QuadPart;
+    return true;
+}
+
 int fseek64(std::FILE* f, int64_t off, int whence) {
     return _fseeki64(f, (long long) off, whence);
 }
@@ -220,6 +233,13 @@ int64_t pread(int fd, void* dst, size_t n, uint64_t off) {
     return (int64_t) ::pread(fd, dst, n, (off_t) off);
 }
 
+bool file_size(const std::string& path, uint64_t& out) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) return false;
+    out = (uint64_t) st.st_size;
+    return true;
+}
+
 int fseek64(std::FILE* f, int64_t off, int whence) {
     return fseeko(f, (off_t) off, whence);
 }
@@ -249,5 +269,23 @@ int open_unbuffered(const std::string& path) {
 }
 
 #endif
+
+bool pread_all(int fd, void* dst, uint64_t n, uint64_t off) {
+    uint8_t* p = (uint8_t*) dst;
+    while (n > 0) {
+        const int64_t got = pread(fd, p, (size_t) (n < (1ull << 30) ? n : (1ull << 30)), off);
+        if (got <= 0) {
+#if !defined(_WIN32)
+            // A signal can interrupt a read before it has transferred anything; that one is restarted.
+            if (got < 0 && errno == EINTR) continue;
+#endif
+            return false;
+        }
+        p += got;
+        off += (uint64_t) got;
+        n -= (uint64_t) got;
+    }
+    return true;
+}
 
 }  // namespace basalt::platform

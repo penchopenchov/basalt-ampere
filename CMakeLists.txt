@@ -163,7 +163,8 @@ target_link_libraries(basalt-plan PRIVATE plan)
 # The file, memory and process calls the engine makes, so the Win32 and POSIX spellings live in one place.
 # Host-only: no CUDA runtime, which is why the header-only `artifact` target, the vision library, the bench and the
 # standalone test programs can all link it.
-add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp)
+add_library(platform STATIC src/platform/file.cpp src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp
+  src/platform/mapped_file.cpp)
 target_include_directories(platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(platform PUBLIC warnings)
 
@@ -733,6 +734,13 @@ target_link_libraries(path_utf8_test PRIVATE platform)
 basalt_embed_manifest(path_utf8_test)
 basalt_cpu_test(NAME path_utf8_test COMMAND path_utf8_test)
 set_tests_properties(path_utf8_test PROPERTIES TIMEOUT 60)
+
+# platform::MappedFile, file_size and pread_all on a scratch file (CPU only).
+add_executable(mapped_file_test tests/platform/mapped_file_test.cpp)
+target_link_libraries(mapped_file_test PRIVATE platform)
+basalt_embed_manifest(mapped_file_test)
+add_test(NAME mapped_file_test COMMAND mapped_file_test)
+set_tests_properties(mapped_file_test PROPERTIES TIMEOUT 60)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)

@@ -6,6 +6,7 @@
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/ngram/ple_reader.hpp"
+#include "basalt/platform/mapped_file.hpp"
 #include "basalt/platform/memory.hpp"
 
 #include <cerrno>
@@ -14,9 +15,6 @@
 #include <cstring>
 #include <atomic>
 #include <mutex>
-#if !defined(_WIN32)
-#include <sys/mman.h>
-#endif
 #include <vector>
 #include <stdexcept>
 
@@ -237,12 +235,9 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         const uint64_t page = 4096;
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
-#if defined(_WIN32)
-        // Locked pages count against the process working-set minimum, so that minimum is raised first and the
-        // range is then locked in chunks: that is what platform::lock_resident does, and it reports how far it
-        // got. A view of a file mapping can still refuse the lock; touching the pages then gets them resident,
-        // which is what the decode path needs.
-        const basalt::platform::LockResult lr = basalt::platform::lock_resident((void*) a0, a1 - a0);
+        // The pages are asked for ahead and locked; where the OS refuses, touching them gets them resident, which is
+        // what the decode path needs.
+        const basalt::platform::LockResult lr = basalt::platform::lock_view((void*) a0, a1 - a0);
         impl_->locked = lr.ok && lr.locked_bytes >= a1 - a0;
         if (!impl_->locked) {
             std::fprintf(stderr, "basalt: PLE table lock incomplete (%s): touching its pages instead\n",
@@ -251,18 +246,6 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
             (void) sink;
         }
-#else
-        madvise((void*) a0, a1 - a0, MADV_WILLNEED);
-        if (mlock((const void*) a0, a1 - a0) == 0) {
-            impl_->locked = true;
-        } else {
-            std::fprintf(stderr, "basalt: PLE table mlock failed (%s; raise `ulimit -l`): touching its pages instead\n",
-                         std::strerror(errno));
-            volatile uint8_t sink = 0;
-            for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
-            (void) sink;
-        }
-#endif
     }
     impl_->mode = io.mode;
     return true;

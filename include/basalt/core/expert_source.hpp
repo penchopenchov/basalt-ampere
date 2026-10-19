@@ -23,6 +23,7 @@
 #include "basalt/core/hit_hook.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/platform/mapped_file.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -529,6 +530,7 @@ private:
     std::atomic<uint64_t> file_us_{0};
     std::atomic<int64_t> ram_reads_{0};
     std::atomic<uint64_t> file_read_bytes_{0};
+    platform::MappedFile view_;               ///< the mapped experts; base_ is its first byte
     const uint8_t* base_ = nullptr;
     uint64_t file_off_ = 0;                   ///< where the experts start in the mapped file
     int64_t blobs_ = 0;
@@ -619,8 +621,7 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
-    void* map_ = nullptr;            ///< the arena file, mapped read-only (not the PinnedArena)
-    uint64_t map_bytes_ = 0;
+    platform::MappedFile map_;       ///< the arena file, mapped read-only (not the PinnedArena)
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
     uint64_t slice_bytes_ = 0;
     const uint8_t* base_ = nullptr;

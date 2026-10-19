@@ -6,14 +6,6 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#else
-#include <sys/stat.h>
-#endif
-
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -26,58 +18,15 @@ namespace basalt::core {
 
 // ================================ byte ranges ================================
 
-namespace {
-
-bool file_size_of(const std::string& path, uint64_t& size) {
-#if defined(_WIN32)
-    WIN32_FILE_ATTRIBUTE_DATA d{};
-    if (!GetFileAttributesExW(platform::to_wide(path).c_str(), GetFileExInfoStandard, &d)) return false;
-    if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;   // stat's S_ISREG, in the form Windows gives
-    ULARGE_INTEGER sz;
-    sz.HighPart = d.nFileSizeHigh;
-    sz.LowPart = d.nFileSizeLow;
-    size = sz.QuadPart;
-    return true;
-#else
-    struct stat st{};
-    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) return false;
-    size = (uint64_t) st.st_size;
-    return true;
-#endif
-}
-
-/// Reads `n` bytes at `off` through a descriptor, looping over the short counts one positional read answers with.
-bool pread_all(int fd, void* dst, uint64_t n, uint64_t off) {
-    uint8_t* p = (uint8_t*) dst;
-    while (n > 0) {
-        const int64_t got = platform::pread(fd, p, std::min<uint64_t>(n, 1ull << 30), off);
-        if (got <= 0) {
-#if defined(_WIN32)
-            return false;
-#else
-            // A signal can interrupt a read before it has transferred anything; that one is restarted.
-            if (got < 0 && errno == EINTR) continue;
-            return false;
-#endif
-        }
-        p += got;
-        off += (uint64_t) got;
-        n -= (uint64_t) got;
-    }
-    return true;
-}
-
-}  // namespace
-
 bool FileRange::exists() const {
     uint64_t sz = 0;
-    if (path.empty() || !file_size_of(path, sz)) return false;
+    if (path.empty() || !platform::file_size(path, sz)) return false;
     return offset <= sz && (bytes == 0 || bytes <= sz - offset);
 }
 
 uint64_t FileRange::size() const {
     uint64_t sz = 0;
-    if (path.empty() || !file_size_of(path, sz) || offset > sz) return 0;
+    if (path.empty() || !platform::file_size(path, sz) || offset > sz) return 0;
     return bytes != 0 ? bytes : sz - offset;
 }
 
@@ -119,7 +68,7 @@ bool read_range_at(const FileRange& r, uint64_t off, void* dst, uint64_t n, std:
     if (n >= kDirectMin && pread_direct(r.path, dst, n, r.offset + off)) return true;
     const int fd = platform::open_fd_utf8(r.path);
     if (fd < 0) { err = "cannot open " + r.path; return false; }
-    const bool ok = pread_all(fd, dst, n, r.offset + off);
+    const bool ok = platform::pread_all(fd, dst, n, r.offset + off);
     platform::close_fd(fd);
     if (!ok) err = "short read from " + r.path;
     return ok;
@@ -127,7 +76,7 @@ bool read_range_at(const FileRange& r, uint64_t off, void* dst, uint64_t n, std:
 
 bool read_range(const FileRange& r, std::vector<uint8_t>& out, std::string& err) {
     uint64_t sz = 0;
-    if (r.path.empty() || !file_size_of(r.path, sz)) { err = "cannot open " + r.path; return false; }
+    if (r.path.empty() || !platform::file_size(r.path, sz)) { err = "cannot open " + r.path; return false; }
     if (r.offset > sz || (r.bytes != 0 && r.bytes > sz - r.offset)) {
         err = r.path + ": the section runs past the end of the file";
         return false;
@@ -325,13 +274,13 @@ bool ModelFile::open(const std::string& path, std::string& err) {
     meta_ = Json{};
     meta_loaded_ = false;
     uint64_t actual = 0;
-    if (!file_size_of(path, actual)) { err = "cannot open " + path; return false; }
+    if (!platform::file_size(path, actual)) { err = "cannot open " + path; return false; }
     if (actual < kHeaderBytes) { err = path + ": not a .basalt model file (too short)"; return false; }
     std::vector<uint8_t> head((size_t) kHeaderBytes);
     {
         const int fd = platform::open_fd_utf8(path);
         if (fd < 0) { err = "cannot open " + path; return false; }
-        const bool ok = pread_all(fd, head.data(), kHeaderBytes, 0);
+        const bool ok = platform::pread_all(fd, head.data(), kHeaderBytes, 0);
         platform::close_fd(fd);
         if (!ok) { err = "cannot read the header of " + path; return false; }
     }

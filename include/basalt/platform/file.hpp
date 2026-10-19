@@ -72,6 +72,13 @@ std::string temp_dir();
 /// for gigabytes is committing to a buffer of gigabytes.
 int64_t pread(int fd, void* dst, size_t n, uint64_t off);
 
+/// Reads exactly `n` bytes at `off` by looping over `pread`'s short counts, a read a signal interrupted before it
+/// transferred anything being restarted. False when the file ends first or a read fails.
+bool pread_all(int fd, void* dst, uint64_t n, uint64_t off);
+
+/// The size of the regular file at `path`, in bytes. False for anything else - a missing file, a directory.
+bool file_size(const std::string& path, uint64_t& out);
+
 /// The 64-bit seek for a stream: an expert file is larger than 4 GiB, so a 32-bit seek would wrap. Returns what the
 /// platform's seek returns: 0 on success, nonzero on failure.
 int fseek64(std::FILE* f, int64_t off, int whence = SEEK_SET);

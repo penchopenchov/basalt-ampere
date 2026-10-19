@@ -8,15 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#else
-#include <sys/mman.h>
-#include <sys/stat.h>
-#endif
-
 namespace basalt::vision {
 
 namespace {
@@ -93,14 +84,8 @@ Value read_value(Cursor& c, uint32_t t) {
 }  // namespace
 
 void Mmproj::release() {
-#if defined(_WIN32)
-    if (map_) UnmapViewOfFile(map_);
-#else
-    if (map_) {
-        if (mapped_) munmap(map_, size_);
-        else basalt::platform::free_aligned(map_);
-    }
-#endif
+    if (map_ && !mapped_) basalt::platform::free_aligned(map_);
+    mapping_.reset();
     mapped_ = false;
     map_ = nullptr;
     tensors_.clear();
@@ -109,37 +94,10 @@ void Mmproj::release() {
 Mmproj::~Mmproj() { release(); }
 
 bool Mmproj::open(const std::string& path, std::string& err) {
-#if defined(_WIN32)
-    // The projector is read through a file mapping, so this open stays the wide Win32 one the section needs.
-    HANDLE h = CreateFileW(platform::to_wide(path).c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) { err = "cannot open " + path; return false; }
-    LARGE_INTEGER li{};
-    if (!GetFileSizeEx(h, &li) || li.QuadPart < 32) {
-        CloseHandle(h);
-        err = "cannot read " + path;
-        return false;
-    }
-    size_ = (size_t) li.QuadPart;
-    HANDLE m = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (m == nullptr) {
-        CloseHandle(h);
-        err = "cannot map " + path;
-        return false;
-    }
-    map_ = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
-    // The view holds the section open, so both handles go now, as the descriptor does below.
-    CloseHandle(m);
-    CloseHandle(h);
-    if (map_ == nullptr) { err = "cannot map " + path; return false; }
-    mapped_ = true;
-#else
-    const int fd = platform::open_fd_utf8(path);
-    if (fd < 0) { err = "cannot open " + path; return false; }
-    struct stat st{};
-    if (fstat(fd, &st) != 0 || st.st_size < 32) { platform::close_fd(fd); err = "cannot read " + path; return false; }
-    size_ = (size_t) st.st_size;
+    uint64_t file_bytes = 0;
+    if (!platform::file_size(path, file_bytes)) { err = "cannot open " + path; return false; }
+    if (file_bytes < 32) { err = "cannot read " + path; return false; }
+    size_ = (size_t) file_bytes;
     // read whole with block-aligned unbuffered reads, so the file cache neither copies nor keeps it; a file system that
     // refuses them, and a platform with no unbuffered descriptor, is mapped instead
     {
@@ -161,13 +119,13 @@ bool Mmproj::open(const std::string& path, std::string& err) {
         if (dfd >= 0) platform::close_fd(dfd);
     }
     if (map_ == nullptr) {
-        void* m = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (m == MAP_FAILED) { platform::close_fd(fd); err = "cannot map " + path; return false; }
-        map_ = m;
+        std::string why;
+        auto m = platform::MappedFile::open_ro(path, &why);
+        if (!m) { err = "cannot map " + path; return false; }
+        mapping_ = std::move(*m);
+        map_ = const_cast<uint8_t*>(mapping_.data());
         mapped_ = true;
     }
-    platform::close_fd(fd);
-#endif
     const uint8_t* base = (const uint8_t*) map_;
     Cursor c{base, base + size_};
     if (c.get<uint32_t>() != 0x46554747u) { err = path + " is not a GGUF file"; return false; }

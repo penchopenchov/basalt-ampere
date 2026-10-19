@@ -4,6 +4,8 @@
 // is checked, and a file that does not match is refused with the reason.
 #pragma once
 
+#include "basalt/platform/mapped_file.hpp"
+
 #include <cstdint>
 #include <map>
 #include <string>
@@ -47,6 +49,7 @@ public:
 
 private:
     void* map_ = nullptr;
+    platform::MappedFile mapping_;   ///< the file's view, when `map_` is one
     bool mapped_ = false;   ///< `map_` is a file mapping (else allocated memory the file was read into)
     size_t size_ = 0;
     Hparams hp_;

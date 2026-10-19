@@ -32,16 +32,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#else
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 namespace basalt::core {
 
 namespace detail {
@@ -426,70 +416,34 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
         }
     }
     const std::string& path = experts.path;
-#if defined(_WIN32)
-    // The section is taken on a file handle, so this open is the wide Win32 one: the file seam has no mapping call.
-    HANDLE h = CreateFileW(platform::to_wide(path).c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) { err = "FileExpertSource: cannot open " + path; return false; }
-    LARGE_INTEGER li{};
-    if (!GetFileSizeEx(h, &li)) { CloseHandle(h); err = "FileExpertSource: cannot stat " + path; return false; }
-    const uint64_t fsize = (uint64_t) li.QuadPart;
+    uint64_t fsize = 0;
+    if (!platform::file_size(path, fsize)) { err = "FileExpertSource: cannot open " + path; return false; }
     // a whole file is exactly the experts; a section must be, and lie inside the file
     const uint64_t have = experts.bytes != 0 ? experts.bytes : fsize;
-    if (experts.offset > fsize || have > fsize - experts.offset || have != want) {
+    if (have != want || experts.offset > fsize || have > fsize - experts.offset) {
         char buf[400];
         std::snprintf(buf, sizeof buf,
                       "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
                       "the pack this geometry came from",
                       path.c_str(), (unsigned long long) have,
                       (unsigned long long) want);
-        CloseHandle(h);
         err = buf;
         return false;
     }
-    // MapViewOfFile takes only allocation-granularity offsets, so the file is mapped whole and the pointer moved by
-    // the section offset. That is address space only: the pages arrive as they are touched. The view keeps the
-    // section and the file alive, so both handles close here.
-    HANDLE mapping = CreateFileMappingW(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (mapping == nullptr) { CloseHandle(h); err = "FileExpertSource: mapping failed on " + path; return false; }
-    uint8_t* raw = (uint8_t*) MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
-    CloseHandle(mapping);
-    CloseHandle(h);
-    if (raw == nullptr) { err = "FileExpertSource: mapping failed on " + path; return false; }
-    void* view = raw + experts.offset;
-#else
-    const int fd = platform::open_fd_utf8(path);
-    if (fd < 0) { err = "FileExpertSource: cannot open " + path; return false; }
-    struct stat st{};
-    if (fstat(fd, &st) != 0) { platform::close_fd(fd); err = "FileExpertSource: cannot stat " + path; return false; }
-    // a whole file is exactly the experts; a section must be, and lie inside the file
-    const uint64_t have = experts.bytes != 0 ? experts.bytes : (st.st_size < 0 ? 0 : (uint64_t) st.st_size);
-    if (st.st_size < 0 || have != want || experts.offset > (uint64_t) st.st_size ||
-        have > (uint64_t) st.st_size - experts.offset) {
-        char buf[400];
-        std::snprintf(buf, sizeof buf,
-                      "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
-                      "the pack this geometry came from",
-                      path.c_str(), (unsigned long long) have,
-                      (unsigned long long) want);
-        platform::close_fd(fd);
-        err = buf;
-        return false;
-    }
-    void* view = mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, fd, (off_t) experts.offset);
-    if (view == MAP_FAILED) { platform::close_fd(fd); err = "FileExpertSource: mmap failed on " + path; return false; }
-#endif
-#if defined(_WIN32)
-    // A second, plain descriptor for the prompt path's positional reads: the view stays read-only for the compute,
-    // while the staging buffers are filled with reads that do not fault mapping pages in. A failure here is not
-    // fatal - the caller falls back to copying from the view.
+    platform::MapOptions mo;
+    mo.offset = experts.offset;
+    mo.bytes = want;
+    mo.shared = true;
+    std::string map_err;
+    auto view_map = platform::MappedFile::open_ro(path, &map_err, mo);
+    if (!view_map) { err = "FileExpertSource: " + map_err; return false; }
+    // A plain descriptor for the prompt path's positional reads: the view stays read-only for the compute, while the
+    // staging buffers are filled with reads that do not fault mapping pages in. A failure here is not fatal - the
+    // caller falls back to copying from the view.
     fd_ = platform::open_fd_utf8(path);
-#else
-    fd_ = fd;
-#endif
+    view_ = std::move(*view_map);
     file_off_ = experts.offset;
-    base_ = (const uint8_t*) view;
+    base_ = view_.data();
     blobs_ = (int64_t) blob_count;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
@@ -548,14 +502,7 @@ void FileExpertSource::close() {
     ram_reads_.store(0);
     file_read_bytes_.store(0);
     file_us_.store(0);
-    if (base_ != nullptr) {
-#if defined(_WIN32)
-        // the view was taken at offset 0 and moved by file_off_, so it is released from its real start
-        UnmapViewOfFile(base_ - file_off_);
-#else
-        munmap((void*) base_, (size_t) mapped_bytes_);
-#endif
-    }
+    view_.reset();
     platform::close_fd(fd_);
     fd_ = -1;
     base_ = nullptr;
@@ -2260,15 +2207,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
-    if (map_ != nullptr) {
-#if defined(_WIN32)
-        UnmapViewOfFile(map_);
-#else
-        munmap(map_, (size_t) map_bytes_);
-#endif
-    }
-    map_ = nullptr;
-    map_bytes_ = 0;
+    map_.reset();
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;
@@ -2279,34 +2218,17 @@ void ArenaExpertSource::close() {
 }
 
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
-#if defined(_WIN32)
-    (void) layer; (void) expert;   // no per-range read-ahead for the arena; see platform::advise_willneed
-#else
-    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
+    if (!map_ || layer < 0 || expert < 0 || expert >= n_expert_) return;
     const auto& lay = basalt::kernels::cpu::expert_layout();
-    const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
-    const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
-    madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
-#endif
+    map_.prefetch(lay.blob_offset(layer, expert), lay.blob_bytes(layer));
 }
 
-// Only the pages wholly inside the blob: a page shared with a neighbour the CPU may still read stays.  MADV_DONTNEED
-// unmaps them from this process; they stay in the page cache as clean, unmapped pages - the first the kernel takes
-// back under pressure, and a minor fault away when the CPU needs the expert again (an adaptive swap evicts it).
-// Dropping them from the cache too (POSIX_FADV_DONTNEED) would make every eviction a re-read from the disk.
+// Only the pages wholly inside the blob: a page shared with a neighbour the CPU may still read stays (see
+// MappedFile::release).
 uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
-#if defined(_WIN32)
-    (void) layer; (void) expert;
-    return 0;   // nothing is dropped, so nothing is reported dropped
-#else
-    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
+    if (!map_ || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
     const auto& lay = basalt::kernels::cpu::expert_layout();
-    const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
-    const uint64_t end = (lay.blob_offset(layer, expert) + lay.blob_bytes(layer)) & ~(uint64_t) 4095;
-    if (end <= off) return 0;
-    if (madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_DONTNEED) != 0) return 0;
-    return end - off;
-#endif
+    return map_.release(lay.blob_offset(layer, expert), lay.blob_bytes(layer));
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
