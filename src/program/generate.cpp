@@ -1290,10 +1290,9 @@ int main(int argc, char** argv) {
     basalt::platform::prefer_oom_victim();
     // Kernels load on first use: loading every kernel of the engine and of cuBLAS at context creation holds a few
     // hundred MiB of device memory for code that never runs.  The expert cache's sizing keeps back room for what loads
-    // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load.
-    if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
-        basalt::platform::set_env("CUDA_MODULE_LOADING", "LAZY");
-    }
+    // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load; batched serving sets it (below).
+    const bool module_loading_set = std::getenv("CUDA_MODULE_LOADING") != nullptr;
+    if (!module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "LAZY");
     Options o;
     std::string ppl_base, ppl_out;
     bool have_tokens = false;
@@ -1588,6 +1587,10 @@ int main(int argc, char** argv) {
         }
         }
     }
+    // Batched serving reads a prompt on its own thread while verify windows run.  A lazy kernel load on that thread
+    // synchronizes the context and can wait on a window kernel that waits on the load, so batched serving loads every
+    // kernel up front.  An explicit CUDA_MODULE_LOADING wins.
+    if (o.serve && o.batch >= 2 && !module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "EAGER");
     // The peer tier holds experts on a second GPU and moves them between the two over direct GPU-to-GPU access, which
     // a process here is not given.  Refused with the options, before the model opens or a device context exists: a
     // tier sized and then filled would fail partway through the load.
