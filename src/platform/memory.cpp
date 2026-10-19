@@ -14,9 +14,13 @@
 #include <malloc.h>   // _aligned_malloc, _aligned_free
 #else
 #include <fcntl.h>
+#include <linux/mman.h>   // MAP_HUGE_2MB
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+#include <cerrno>
+#include <cstring>
 
 namespace basalt::platform {
 
@@ -359,5 +363,276 @@ bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint6
     return madvise((void*) ((const uint8_t*) base + (size_t) start), (size_t) (wide - start), MADV_DONTNEED) == 0;
 #endif
 }
+
+
+// ---------------------------------------------------------------------------------------------------- host regions
+
+#if defined(_WIN32)
+namespace {
+// A size in GiB, for the notes that have to say how big something was.
+std::string gib_size(uint64_t bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f GiB", (double) bytes / (double) (1ull << 30));
+    return buf;
+}
+
+// What the OS could still commit, for the note that has to say why the arena did not fit.  The commit charge is the
+// sum of RAM and the page file, so its free part is the headroom the arena has to fit into.  Empty when the OS
+// gives no reading.
+std::string commit_headroom_note() {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return "; the commit headroom is unknown";
+    return "; " + gib_size((uint64_t) ms.ullAvailPageFile) + " of commit charge free out of " +
+           gib_size((uint64_t) ms.ullTotalPageFile) + " (RAM plus page file), " +
+           gib_size((uint64_t) ms.ullTotalPhys) + " of RAM";
+}
+}  // namespace
+
+
+void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
+                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+    mapping_base = nullptr;
+    mapping_bytes = 0;
+    if (!shared_file.empty()) {
+        note = "shared arena files are not available on Windows";
+        return nullptr;
+    }
+    // MEM_LARGE_PAGES needs SeLockMemoryPrivilege, and the account having it assigned is not enough: the process
+    // enables it in its own token first. An account without the assignment fails here and falls through to the
+    // ordinary allocation below, which is the expected outcome rather than an error.
+    enable_privilege(L"SeLockMemoryPrivilege");
+    const SIZE_T large = GetLargePageMinimum();
+    if (large > 0) {
+        // The requested size must be an exact multiple of the large-page minimum; the slack is under one page.
+        const SIZE_T lbytes = (SIZE_T) (((SIZE_T) bytes + large - 1) / large * large);
+        void* p = VirtualAlloc(nullptr, lbytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+        if (p != nullptr) {
+            got = RegionBacking::LargePages;
+            note = "large pages (" + std::to_string((unsigned long long) large) + " B)";
+            return p;
+        }
+        // ERROR_NO_SYSTEM_RESOURCES is the page pool declining, ERROR_PRIVILEGE_NOT_HELD is the token and
+        // ERROR_INVALID_PARAMETER a size that is not a multiple of the minimum. They need different fixes, so the
+        // note carries the number.
+        note = "large pages refused for " + std::to_string((unsigned long long) lbytes) +
+               " B (GetLargePageMinimum=" + std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
+               std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
+    } else {
+        note = "this system has no large-page minimum; using 4 KB pages";
+    }
+    {
+        // Reserve first, then commit in chunks.  A single MEM_COMMIT over the whole arena only ever says that the
+        // allocation failed, and whether it can succeed depends on RAM plus page file together, which is not known
+        // before the commit reaches that far.  Committing a chunk at a time makes the failure name the size it
+        // reached, and the region is released before anything is returned, so a half-committed arena is never
+        // handed to the caller and nothing is reported as pinned that was not.
+        void* p = VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE, PAGE_READWRITE);
+        if (p == nullptr) {
+            got = RegionBacking::NormalPages;
+            note = "cannot reserve " + gib_size(bytes) + " of arena (VirtualAlloc error " +
+                   std::to_string((unsigned long long) GetLastError()) + ")" + commit_headroom_note() +
+                   "; the arena needs RAM plus page file; " + note;
+            return nullptr;
+        }
+        constexpr uint64_t kCommitChunk = 1ull << 30;
+        for (uint64_t off = 0; off < bytes; off += kCommitChunk) {
+            const uint64_t n = bytes - off < kCommitChunk ? bytes - off : kCommitChunk;
+            if (VirtualAlloc((uint8_t*) p + off, (SIZE_T) n, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+                const DWORD err = GetLastError();
+                VirtualFree(p, 0, MEM_RELEASE);
+                got = RegionBacking::NormalPages;
+                note = "cannot commit the arena: " + gib_size(off) + " of " + gib_size(bytes) +
+                       " committed (VirtualAlloc error " + std::to_string((unsigned long long) err) + ")" +
+                       commit_headroom_note() + "; the arena needs RAM plus page file; " + note;
+                return nullptr;
+            }
+        }
+        got = RegionBacking::NormalPages;
+        return p;
+    }
+}
+
+void free_region(void* p, uint64_t bytes) {
+    if (!p) return;
+    (void) bytes;   // one VirtualAlloc owns the whole region
+    VirtualFree(p, 0, MEM_RELEASE);
+}
+
+bool pin_budget(uint64_t& limit, std::string& why) {
+    constexpr uint64_t GiB = 1ull << 30;
+    const uint64_t ram = basalt::platform::total_physical_memory();
+    if (ram == 0) return false;
+    limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
+    char buf[192];
+    std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget, RAM/2 - 8 GiB of %.1f GiB RAM",
+                  (double) ram / (double) GiB);
+    why = buf;
+    return true;
+}
+
+#else
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << 26)
+#endif
+
+namespace {
+constexpr uint64_t kSharedArenaHeaderBytes = 4096;
+constexpr char kSharedArenaMagic[16] = "BASALT-ARENA-V1";
+
+struct SharedArenaHeader {
+    char magic[16];
+    uint32_t version;
+    uint32_t header_bytes;
+    uint64_t arena_bytes;
+    uint64_t arena_hash;
+    uint64_t reserved[4];
+};
+static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
+}  // namespace
+
+void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
+                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+    mapping_base = nullptr;
+    mapping_bytes = 0;
+    if (!shared_file.empty()) {
+        if (shared_hash == 0) {
+            note = "shared arena requires a nonzero model hash";
+            return nullptr;
+        }
+        if (bytes > UINT64_MAX - kSharedArenaHeaderBytes) {
+            note = "shared arena size overflows its header";
+            return nullptr;
+        }
+        const uint64_t file_bytes = kSharedArenaHeaderBytes + bytes;
+        const int fd = open(shared_file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            note = "cannot open shared arena " + shared_file + ": " + std::strerror(errno);
+            return nullptr;
+        }
+        struct stat st{};
+        if (fstat(fd, &st) != 0) {
+            const int e = errno;
+            close(fd);
+            note = "cannot stat shared arena " + shared_file + ": " + std::strerror(e);
+            return nullptr;
+        }
+
+        const bool fresh = st.st_size == 0;
+        if (fresh) {
+            if (ftruncate(fd, (off_t) file_bytes) != 0) {
+                const int e = errno;
+                close(fd);
+                note = "cannot size shared arena " + shared_file + ": " + std::strerror(e);
+                return nullptr;
+            }
+            SharedArenaHeader hdr{};
+            std::memcpy(hdr.magic, kSharedArenaMagic, sizeof hdr.magic);
+            hdr.version = 1;
+            hdr.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
+            hdr.arena_bytes = bytes;
+            hdr.arena_hash = shared_hash;
+            const ssize_t written = ::pwrite(fd, &hdr, sizeof hdr, 0);
+            if (written != (ssize_t) sizeof hdr) {
+                const int e = errno;
+                close(fd);
+                note = "cannot write shared arena header " + shared_file + ": " +
+                       (written < 0 ? std::string(std::strerror(e)) : std::string("short write"));
+                return nullptr;
+            }
+        } else {
+            if (st.st_size < 0 || (uint64_t) st.st_size != file_bytes) {
+                close(fd);
+                note = "shared arena " + shared_file + " is " +
+                       std::to_string((unsigned long long) st.st_size) + " B, expected " +
+                       std::to_string((unsigned long long) file_bytes) + " B including its header";
+                return nullptr;
+            }
+            SharedArenaHeader hdr{};
+            const ssize_t got_header = ::pread(fd, &hdr, sizeof hdr, 0);
+            if (got_header != (ssize_t) sizeof hdr ||
+                std::memcmp(hdr.magic, kSharedArenaMagic, sizeof hdr.magic) != 0 ||
+                hdr.version != 1 || hdr.header_bytes != kSharedArenaHeaderBytes || hdr.arena_bytes != bytes) {
+                close(fd);
+                note = "shared arena " + shared_file + " has an incompatible or missing header";
+                return nullptr;
+            }
+            if (hdr.arena_hash != shared_hash) {
+                close(fd);
+                char b[256];
+                std::snprintf(b, sizeof b,
+                              "shared arena %s was written for model hash %016llx, expected %016llx",
+                              shared_file.c_str(), (unsigned long long) hdr.arena_hash,
+                              (unsigned long long) shared_hash);
+                note = b;
+                return nullptr;
+            }
+        }
+
+        void* map = mmap(nullptr, (size_t) file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        const int e = errno;
+        close(fd);
+        if (map == MAP_FAILED) {
+            note = "cannot map shared arena " + shared_file + ": " + std::strerror(e);
+            return nullptr;
+        }
+        mapping_base = map;
+        mapping_bytes = file_bytes;
+        got = RegionBacking::NormalPages;
+        note = "MAP_SHARED file " + shared_file + " (model hash checked)";
+        return (uint8_t*) map + kSharedArenaHeaderBytes;
+    }
+
+    {
+        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+        if (p != MAP_FAILED) {
+            got = RegionBacking::LargePages;
+            note = "hugetlb 2 MB pages";
+            return p;
+        }
+        // MAP_HUGETLB is all-or-nothing: a pool smaller than the mapping fails exactly like an absent
+        // one, and the old message guessed "no hugetlb pool configured" either way. Name the shortfall:
+        // how many 2 MiB pages the mapping needs against what vm.nr_hugepages actually holds.
+        const unsigned long long need = ((unsigned long long) bytes + (1ull << 21) - 1) / (1ull << 21);
+        unsigned long long pool = 0;
+        bool have_pool = false;
+        if (std::FILE* f = std::fopen("/proc/sys/vm/nr_hugepages", "r")) {
+            have_pool = std::fscanf(f, "%llu", &pool) == 1;
+            std::fclose(f);
+        }
+        note = "MAP_HUGETLB unavailable (needed " + std::to_string(need) + " 2 MiB pages, vm.nr_hugepages=" +
+               (have_pool ? std::to_string(pool) : std::string("?")) + "); using 4 KB pages";
+    }
+    // No hugetlb mapping: a 2 MiB-aligned anonymous mapping with MADV_HUGEPAGE, so transparent huge pages back
+    // it where THP is "madvise" (the common distro default). The CPU expert pool streams whole experts out of
+    // this arena; with 4 KB pages every 3 MB expert costs ~750 TLB misses.
+    constexpr uint64_t kAlign = 2ull << 20;
+    const uint64_t padded = bytes + kAlign;
+    void* raw = mmap(nullptr, padded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    got = RegionBacking::NormalPages;
+    if (raw == MAP_FAILED) return nullptr;
+    const uintptr_t start = (uintptr_t) raw;
+    const uintptr_t aligned = (start + kAlign - 1) & ~(uintptr_t) (kAlign - 1);
+    if (aligned > start) munmap(raw, aligned - start);
+    const uintptr_t end = aligned + bytes, raw_end = start + padded;
+    if (raw_end > end) munmap((void*) end, raw_end - end);
+    void* p = (void*) aligned;
+    if (madvise(p, bytes, MADV_HUGEPAGE) == 0) {
+        const std::string four_k = "; using 4 KB pages";
+        if (note.size() >= four_k.size() && note.compare(note.size() - four_k.size(), four_k.size(), four_k) == 0)
+            note.resize(note.size() - four_k.size());
+        note += "; transparent huge pages requested (MADV_HUGEPAGE)";
+    }
+    return p;
+}
+
+void free_region(void* p, uint64_t bytes) {
+    if (!p) return;
+    munmap(p, bytes);
+}
+
+bool pin_budget(uint64_t&, std::string&) { return false; }   // no OS-side budget below the driver's own limit
+#endif
 
 }  // namespace basalt::platform

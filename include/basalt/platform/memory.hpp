@@ -36,6 +36,27 @@ void free_aligned(void* p);
 /// without claiming anything.
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes);
 
+/// What backs a host region from `alloc_region`.
+enum class RegionBacking { LargePages, NormalPages };
+
+/// A host region of `bytes` for a large arena, with the best page size the OS gives it: 2 MiB huge pages (hugetlb on
+/// Linux, large pages on Windows) first, then ordinary pages the OS is asked to back with huge ones where it can.
+/// `got` says which, and `note` says what was done or why the better one was refused, for the startup print. The
+/// bytes are zero-filled and committed (Windows) or demand-faulted (Linux). A non-empty `shared_file` instead maps one
+/// file whose first 4 KiB identify the pack (`shared_hash`, which must not be 0) and whose remaining bytes are the
+/// region - Linux only, meant for tmpfs; elsewhere it fails with a note. `mapping_base` and `mapping_bytes` are what
+/// `free_region` releases (the region itself unless the file header precedes it; both unset on failure). nullptr on
+/// failure.
+void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
+                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes);
+/// Releases what `alloc_region` returned through `mapping_base` and `mapping_bytes`. A null is fine.
+void free_region(void* mapping_base, uint64_t mapping_bytes);
+
+/// The most host memory the GPU may map page-locked before its shared-memory segment is full, when the OS limits it
+/// beneath the driver's own refusal (`why` names where the figure comes from); false when it does not, and the driver's
+/// refusal is the limit.
+bool pin_budget(uint64_t& limit, std::string& why);
+
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
