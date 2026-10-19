@@ -1031,6 +1031,8 @@ if(BUILD_TESTING)
   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
   target_link_libraries(expert_multi_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME expert_multi_test COMMAND expert_multi_test)
+  # needs the AVX-512 VNNI and VBMI instruction sets, which not every host has
+  set_property(TEST expert_multi_test APPEND PROPERTY LABELS avx512)
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE kernels_cpu platform)
