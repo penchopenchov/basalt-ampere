@@ -5331,6 +5331,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
         if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
+        ver.set_cpu_warm(drive.d.pool, drive.d.src);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
             (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
             std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
@@ -9275,6 +9276,7 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
         vh.n_slots = xcache.slots();
+        ver.set_cpu_warm(drive.d.pool, drive.d.src);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             return fatal_start_error(err);
         }

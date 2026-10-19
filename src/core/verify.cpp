@@ -13,6 +13,7 @@
 #include "basalt/kernels/native_router.hpp"
 #include "basalt/kernels/native_moe.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
@@ -68,6 +69,27 @@
 
 namespace basalt::core {
 
+// The CPU tier's cache warm-up.  After layer l's doorbell the parked pool workers score layer l + 1's router on layer
+// l's FFN input (the ring's q8_1 rows; the router in int8 with one scale per 32 values, as the peer's warm-up has it:
+// a prediction only), take every token's top k, rank the predicted experts only the CPU holds by their summed weight,
+// and read the likeliest one into their caches.  The next batch stops the work; the experts are computed as before.
+struct CpuWarm {
+    std::vector<int8_t> rq;   ///< [n_layers][n_expert][n_embd]
+    std::vector<float> rs;    ///< [n_layers][n_expert][n_embd / 32]
+    int n_expert = 0, n_embd = 0, k = 0;
+    size_t bytes = 0, down_off = 0;   ///< a blob's bytes, where its down rows start
+    ExpertSource* src = nullptr;
+    // the job in flight
+    int layer = 0, n_tok = 0;
+    const uint8_t* xq = nullptr;                      ///< the ring's q8_1 rows, tokens back to back
+    const int32_t* res0 = nullptr, *res1 = nullptr;   ///< the layer's CUDA0 / peer residency (res1 may be null)
+    std::vector<float> logits;                        ///< [kVerifyMaxT][n_expert]
+    alignas(64) std::atomic<int> arrive{0};
+    alignas(64) std::atomic<int> ready{0};
+    const uint8_t* blob = nullptr;                    ///< the expert to read, or null
+    std::atomic<uint64_t> sink{0};
+};
+
 // the MoE tail (dec_moe.hpp): planned on CUDA0 from device residency tables, the peer card served from mapped rings
 // by one persistent kernel per window, the CPU pool by the host loop (only its own entries).
 struct DecMoe {
@@ -75,6 +97,7 @@ struct DecMoe {
     int32_t* res0 = nullptr;                 ///< CUDA0: [n_layers * n_expert] CUDA0 slot or -1 (host_res mirrored)
     int32_t* res1 = nullptr;                 ///< CUDA0: the same for the peer's slots
     std::vector<int32_t> shadow0, shadow1;   ///< what res0 / res1 hold
+    CpuWarm* warm = nullptr;                 ///< the CPU tier's warm-up (null: off)
     basalt::kernels::DmPlan* plan = nullptr;
     unsigned int* ctr = nullptr;
     unsigned long long* slot_off = nullptr;  ///< CUDA0's per-slot offsets (null: slot * blob)
@@ -122,6 +145,101 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// layer `c.layer`'s router rows [e0, e1) on the job's tokens
+__attribute__((target("avx2,fma,f16c"))) void warm_logits(CpuWarm& c, int e0, int e1, const std::atomic<bool>& stop) {
+    const int NB = c.n_embd / 32, pt = c.n_tok;
+    const int8_t* R = c.rq.data() + (size_t) c.layer * c.n_expert * c.n_embd;
+    const float* S = c.rs.data() + (size_t) c.layer * c.n_expert * NB;
+    for (int e = e0; e < e1; ++e) {
+        if (stop.load(std::memory_order_relaxed)) return;
+        __m256 acc[basalt::kernels::kVerifyMaxT];
+        for (int t = 0; t < pt; ++t) acc[t] = _mm256_setzero_ps();
+        const int8_t* row = R + (size_t) e * c.n_embd;
+        for (int b = 0; b < NB; ++b) {
+            const __m256i w = _mm256_loadu_si256((const __m256i*) (row + b * 32));
+            const __m256i wl = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
+            const __m256i wh = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
+            const float sw = S[(size_t) e * NB + b];
+            for (int t = 0; t < pt; ++t) {
+                const uint8_t* blk = c.xq + ((size_t) t * NB + b) * 36;   // block_q8_1: half d, half s, 32 x int8
+                uint16_t dh;
+                std::memcpy(&dh, blk, 2);
+                const __m256i x = _mm256_loadu_si256((const __m256i*) (blk + 4));
+                const __m256i p = _mm256_add_epi32(_mm256_madd_epi16(wl, _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x))),
+                                                   _mm256_madd_epi16(wh, _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x, 1))));
+                acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(sw * _cvtsh_ss(dh)), acc[t]);
+            }
+        }
+        for (int t = 0; t < pt; ++t) {
+            __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc[t]), _mm256_extractf128_ps(acc[t], 1));
+            v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+            v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+            c.logits[(size_t) t * c.n_expert + e] = _mm_cvtss_f32(v);
+        }
+    }
+}
+
+// every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the likeliest
+void warm_select(CpuWarm& c) {
+    const int NE = c.n_expert, K = std::min(c.k, 16);
+    float score[512] = {};
+    for (int t = 0; t < c.n_tok; ++t) {
+        const float* lg = c.logits.data() + (size_t) t * NE;
+        int top[16];
+        float val[16];
+        int m = 0;
+        for (int e = 0; e < NE; ++e) {
+            const float v = lg[e];
+            if (m == K && v <= val[K - 1]) continue;
+            int j = m < K ? m++ : K - 1;
+            while (j > 0 && val[j - 1] < v) { val[j] = val[j - 1]; top[j] = top[j - 1]; --j; }
+            val[j] = v;
+            top[j] = e;
+        }
+        float w[16], sum = 0.0f;
+        for (int j = 0; j < m; ++j) sum += (w[j] = std::exp(val[j] - val[0]));
+        for (int j = 0; j < m; ++j) {
+            const int e = top[j];
+            if (c.res0[e] >= 0 || (c.res1 != nullptr && c.res1[e] >= 0)) continue;   // a GPU holds it
+            score[e] += w[j] / sum;
+        }
+    }
+    int best = -1;
+    for (int e = 0; e < NE; ++e)
+        if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
+    c.blob = best >= 0 ? c.src->resident_blob(c.layer, best) : nullptr;
+}
+
+void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
+    CpuWarm& c = *(CpuWarm*) ctx;
+    warm_logits(c, c.n_expert * w / W, c.n_expert * (w + 1) / W, stop);
+    if (c.arrive.fetch_add(1, std::memory_order_acq_rel) + 1 == W) {
+        if (!stop.load(std::memory_order_relaxed)) warm_select(c);
+        c.ready.store(1, std::memory_order_release);
+    } else {
+        while (c.ready.load(std::memory_order_acquire) == 0) {
+            if (stop.load(std::memory_order_relaxed)) return;
+            _mm_pause();
+        }
+    }
+    // this worker's share of the blob, one load per line: the gate and up rows first (computed first), then the down
+    // rows, so a read the doorbell cuts short has warmed the start of the computation
+    if (c.blob == nullptr) return;
+    uint64_t x = 0;
+    for (int part = 0; part < 2; ++part) {
+        const size_t r0 = part == 0 ? 0 : c.down_off, r1 = part == 0 ? c.down_off : c.bytes;
+        const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
+        const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
+        for (size_t o = b0; o < b1; o += 4096) {
+            if (stop.load(std::memory_order_relaxed)) { part = 2; break; }
+            const uint8_t* p = c.blob + o;
+            const size_t n = std::min<size_t>(4096, b1 - o);
+            for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+        }
+    }
+    if (x == 0x9e3779b97f4a7c15ull) c.sink.fetch_add(x, std::memory_order_relaxed);   // keeps the loads
+}
+
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
@@ -146,14 +264,14 @@ struct Bump {
 // filling the card
 constexpr int kCommitBlocks = 32;
 
-// The peer warm-up's predictor rows on the current device: every layer's BF16 router [n_expert x n_embd] as int8
-// with one scale per 32 values (a prediction only).  False when a layer's router is not such a table.
-bool warm_router(const WeightTable& wt, const ModelGeometry& g, int8_t** rq, float** rs) {
+// Every layer's BF16 router [n_expert x n_embd] as int8 with one scale per 32 values (the warm-ups' predictor, a
+// prediction only).  False when a layer's router is not such a table.
+bool router_int8(const WeightTable& wt, const ModelGeometry& g, std::vector<int8_t>& q, std::vector<float>& sc) {
     const int64_t N = g.n_embd, NE = g.n_expert, L = g.n_layers, NB = N / 32;
     if (NE > basalt::kernels::kDmPredExperts || N % 32 != 0) return false;
     std::vector<uint16_t> src((size_t) (NE * N));
-    std::vector<int8_t> q((size_t) (L * NE * N));
-    std::vector<float> sc((size_t) (L * NE * NB));
+    q.assign((size_t) (L * NE * N), 0);
+    sc.assign((size_t) (L * NE * NB), 0.0f);
     for (int64_t l = 0; l < L; ++l) {
         const WeightRef* w = LayerView(wt, l).get("ffn_gate_inp.weight");
         if (w == nullptr || w->bytes != (uint64_t) (NE * N * 2)) return false;
@@ -175,6 +293,11 @@ bool warm_router(const WeightTable& wt, const ModelGeometry& g, int8_t** rq, flo
                     q[(size_t) ((l * NE + r) * N + b * 32 + i)] = (int8_t) (d > 0.0f ? std::lrintf(v[i] / d) : 0);
             }
     }
+    return true;
+}
+
+// The peer warm-up's predictor rows (router_int8's) on the current device.
+bool warm_router(const std::vector<int8_t>& q, const std::vector<float>& sc, int8_t** rq, float** rs) {
     if (cudaMalloc((void**) rq, q.size()) != cudaSuccess || cudaMalloc((void**) rs, sc.size() * 4) != cudaSuccess ||
         cudaMemcpy(*rq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(*rs, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -407,6 +530,14 @@ bool Verifier::dm_init(std::string& err) {
         cudaGetLastError();
         d->pin = nullptr;
     }
+    // the warm-ups' predictor (the peer's and the CPU pool's): every layer's router in int8, quantized once
+    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
+                          std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
+                              return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
+                          });
+    std::vector<int8_t> rq_h;
+    std::vector<float> rs_h;
+    const bool router_ok = (cpu_warm || (peer_ != nullptr && peer_->valid())) && router_int8(*wt_, g, rq_h, rs_h);
     if (peer_ != nullptr && peer_->valid()) {
         const OnDevice on(peer_->device());
         d->pdev = peer_->device();
@@ -430,12 +561,24 @@ bool Verifier::dm_init(std::string& err) {
         for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
-        if (!warm_router(*wt_, g, &d->rq, &d->rs))
+        if (!router_ok || !warm_router(rq_h, rs_h, &d->rq, &d->rs))
             std::fprintf(stderr, "basalt verify: the peer's L2 warm-up is off (a router the predictor does not cover)\n");
+    }
+    if (cpu_warm && router_ok) {
+        CpuWarm* w = new CpuWarm;
+        w->rq = std::move(rq_h);
+        w->rs = std::move(rs_h);
+        w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K; w->src = warm_src_;
+        w->bytes = lay.fmt[0].bytes;
+        w->down_off = lay.fmt[0].down_off;
+        w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
+        d->warm = w;
     }
     std::fprintf(stderr, "basalt verify: the MoE tail planned on the device%s\n",
                  d->pdev >= 0 ? (", the peer card served by a persistent kernel (" + std::to_string(d->pblocks) +
                                  " blocks)").c_str() : "");
+    if (d->warm != nullptr)
+        std::fprintf(stderr, "basalt verify: the CPU pool warms its likeliest next-layer expert between doorbells\n");
     return true;
 }
 
@@ -525,6 +668,10 @@ bool Verifier::dm_fence(cudaStream_t s) {
 void Verifier::dm_free() {
     DecMoe* d = dm_;
     if (d == nullptr) return;
+    if (d->warm != nullptr) {
+        warm_pool_->idle_stop();
+        delete d->warm;
+    }
     if (d->pdev >= 0) {
         const OnDevice on(d->pdev);
         if (d->ps) { cudaStreamSynchronize(d->ps); cudaStreamDestroy(d->ps); }
@@ -1709,7 +1856,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
-            ra.rows = dm_->rq != nullptr;
+            ra.rows = dm_->rq != nullptr || dm_->warm != nullptr;
             PdlScope pr(false);   // after the router's kernel: a plain launch
             if (glue_on[grp]) {   // the ring's work inside post's gate/up launch
                 glue_ring[grp] = ra;
@@ -2659,9 +2806,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             ms_host += ms_since(tp);
         }
         *flag = want;
+        if (dm_ != nullptr && dm_->warm != nullptr && G == 1 && l + 1 < le_) {   // the next layer's warm-up
+            CpuWarm& w = *dm_->warm;
+            warm_pool_->idle_stop();
+            w.layer = (int) (l + 1);
+            w.n_tok = std::min(n, (int) kVerifyMaxT);
+            w.xq = dm_->h_xq + (size_t) k * dm_->xq_stride;
+            w.res0 = dm_->shadow0.data() + (size_t) (l + 1) * g.n_expert;
+            w.res1 = dm_->pdev >= 0 ? dm_->shadow1.data() + (size_t) (l + 1) * g.n_expert : nullptr;
+            w.arrive.store(0, std::memory_order_relaxed);
+            w.ready.store(0, std::memory_order_relaxed);
+            w.blob = nullptr;
+            warm_pool_->idle_start(&warm_job, &w);
+        }
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    if (dm_ != nullptr && dm_->warm != nullptr) warm_pool_->idle_stop();
     }
     // each stage stages its own inputs (the layer split's order)
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
