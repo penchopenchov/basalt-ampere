@@ -18,6 +18,7 @@
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/attn_chain.hpp"
+#include "basalt/kernels/mid_chain.hpp"
 #include "basalt/kernels/qsa_full.hpp"
 #include "basalt/kernels/fused_layer.hpp"
 #include "basalt/kernels/hc_fused.hpp"
@@ -882,6 +883,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     basalt::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     basalt::kernels::hc_fused_init();
     basalt::kernels::attn_chain_init();
+    basalt::kernels::mid_chain_init();
     basalt::kernels::qsa_full_init();
     fused_ok_ = basalt::kernels::fused_layer_init();
     wt_ = &wt;
@@ -1377,6 +1379,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // a GDN layer's attention half as one persistent kernel (attn_chain.hpp): the reads, the qkv + z pair, the
         // recurrence, the output projection and the router, bitwise the kernels it replaces
         bool chain_done = false;
+        // a GDN layer's middle as one persistent kernel (mid_chain.hpp) between the layer's two hc reads: the qkv + z pair,
+        // the recurrence and the output projection, bitwise the kernels it replaces
+        bool mid_ok = false;
+        MidChainArgs ma;
         if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ && tb == 0 && G == 1 &&
             n <= kAttnChainMaxT && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
             const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
@@ -1461,15 +1467,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     fz_done[grp] = true;
                     return true;
                 }
-                if (attn_chain_supported(ca)) {
-                    // after the device-planned tail's combine kernel the chain starts during its tail (PDL); its first
-                    // weight copies are already issued by then
-                    const bool after_kernel = pdl && dm && dec_hc && l > lb_ && !(l == 1 && ple_on);
-                    PdlScope ps(pdl, !after_kernel || chain_ord == 0);
-                    ca.ord = chain_ord++;
-                    attn_chain(ca, cs);
-                    chain_done = true;
-                }
+                ma.T = n;
+                ma.xq = xq_;
+                ma.wq = ca.wq; ma.wz = ca.wz; ma.wo = ca.wo;
+                ma.type_q = ca.type_q; ma.type_z = ca.type_z; ma.type_o = ca.type_o;
+                ma.rec = ca.rec;
+                ma.bo = bo_ + tb * N;
+                mid_ok = mid_chain_supported(ma);
             }
         }
         // QSA layers keep the separate kernels: the single-kernel attention half (qsa_full.hpp) is slower in the engine
@@ -1484,9 +1488,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 HcFusedArgs h = hc_args(0, pending, inj2_, inj_);
                 if (read_q8) h.xq = xq_;
                 // the GDN qkv+z pair kernel follows (dense_tc_pair_mask & 16): its blocks start on the SMs the read leaves
-                h.next_early = read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
+                h.next_early = mid_ok || (read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
                                !is_qsa_layer(g, l) && tb == 0 && N == 2560 && n <= kDecMaxT &&
-                               dec_gdnf_mode() != 0;
+                               dec_gdnf_mode() != 0);
                 // a QSA layer's query projection follows (qsaf_wide path): its blocks start with the read
                 if (read_q8 && is_qsa_layer(g, l) && tb == 0 && N == 2560 && n <= kDecMaxT) {
                     const QsaState& st0 = ss.qsa_states[qsa_idx[(size_t) l]];
@@ -1501,10 +1505,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         stamp(l, 1, grp);
+        if (mid_ok) {
+            // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
+            PdlScope ps(pdl, chain_ord == 0);
+            ma.ord = chain_ord++;
+            mid_chain(ma, cs);
+        }
         float* xm = mixed_ + tb * N;
         try {
             if (chain_done) {
                 // the attention half ran in the chain
+            } else if (mid_ok) {
+                // the middle ran in the mid chain
             } else if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
                 const WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
