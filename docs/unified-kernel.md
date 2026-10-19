@@ -10,7 +10,7 @@ Two pieces of the unified-kernel work are in the engine; the full-layer kernel i
 | Commit finisher | `verify_kernels.cu` | The GDN commit claims its items from a counter on its own stream; the next window starts with a finisher that takes what is left. |
 
 - The mid chain runs for windows of one to four rows, on every pack whose GDN projection triple (qkv, z, out) `mid_chain_supported` accepts. Types accepted for each of the three: Q4_K, Q5_K, Q6_K, IQ3_S, IQ4_XS. `(14, 14, 14)` and `(23, 21, 12)` have specialised instances; any other combination of those types uses the generic one. A pack with Q8_0 or another type in a GDN projection keeps the three separate kernels.
-- The pair ring always has an even slot count, so the two projections of a pair alternate slots the same way on every window.
+- The pair ring always has an even slot count, because the two tile groups take alternate tiles: an odd ring would give a slot consecutive tiles from different groups, and one group could pass its wait before the data arrived. The parity test checks the ring size for every type triple.
 - QSA layers, windows of five or more rows, batched windows and profiled runs keep the separate kernels.
 - Arithmetic and reduction order are those of the kernels it replaces: bitwise identical output and state, no numerics change.
 - The kernel needs every CTA resident, so it is a programmatic dependent of the first read and the second read is its dependent. The attention-chain header keeps the phase code (pair, recurrence, output) and the bounded waits (`attn_chain_bound.cuh` traps instead of hanging).
