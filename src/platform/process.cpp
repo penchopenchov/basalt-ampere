@@ -12,7 +12,10 @@
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
+#include <fcntl.h>   // _O_BINARY, _O_WRONLY, _O_RDONLY
+#include <io.h>      // _open_osfhandle, _read, _write, _close
 #else
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -58,10 +61,17 @@ std::vector<wchar_t> command_line(const std::vector<std::string>& argv) {
 }
 
 /// Starts the child and hands back its handle. nullptr when it could not start, with errno set for the caller.
-HANDLE start(const std::vector<std::string>& argv) {
+/// With `std_handles`, the child's three standard handles are those (stdin, stdout, stderr).
+HANDLE start(const std::vector<std::string>& argv, const HANDLE* std_handles = nullptr) {
     std::vector<wchar_t> line = command_line(argv);
     STARTUPINFOW si{};
     si.cb = sizeof si;
+    if (std_handles != nullptr) {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = std_handles[0];
+        si.hStdOutput = std_handles[1];
+        si.hStdError = std_handles[2];
+    }
     PROCESS_INFORMATION pi{};
     // The handles the caller marked inheritable go to the child: that is how a caller wires a child's standard
     // descriptors to pipes it owns.
@@ -90,6 +100,99 @@ int exited(int status) {
 }
 #endif
 }  // namespace
+
+bool spawn_piped(const std::vector<std::string>& argv, const std::string& stderr_path, PipedChild& out,
+                 std::string& err) {
+    out = PipedChild{};
+    if (argv.empty()) { err = "no program to start"; return false; }
+#if defined(_WIN32)
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof sa;
+    sa.bInheritHandle = TRUE;
+    HANDLE rd_in = nullptr, wr_in = nullptr, rd_out = nullptr, wr_out = nullptr;
+    if (!CreatePipe(&rd_in, &wr_in, &sa, 0) || !CreatePipe(&rd_out, &wr_out, &sa, 0)) {
+        err = "pipe failed";
+        return false;
+    }
+    // The parent keeps only the ends it uses, un-inherited: if the child held the read end of the request pipe
+    // or the write end of the reply pipe, neither would ever report the other side gone.
+    (void) SetHandleInformation(wr_in, HANDLE_FLAG_INHERIT, 0);
+    (void) SetHandleInformation(rd_out, HANDLE_FLAG_INHERIT, 0);
+    // The share mode is what lets the log be read while the run is going on; a share mode of 0 keeps it closed
+    // to any other process until the child exits. `sa` (bInheritHandle) is what hands the handle to the child.
+    HANDLE log = CreateFileW(to_wide(stderr_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const HANDLE std_handles[3] = {rd_in, wr_out, log != INVALID_HANDLE_VALUE ? log : wr_out};
+    const HANDLE proc = start(argv, std_handles);
+    if (proc == nullptr) {
+        err = "CreateProcess failed (error " + std::to_string(GetLastError()) + ")";
+        CloseHandle(rd_in); CloseHandle(wr_in); CloseHandle(rd_out); CloseHandle(wr_out);
+        if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+        return false;
+    }
+    out.child.handle = proc;
+    out.child.id = (int64_t) GetProcessId(proc);
+    // The parent's ends become CRT descriptors, so the request and reply loops are the same code either way.
+    out.in_fd = _open_osfhandle((intptr_t) wr_in, _O_BINARY | _O_WRONLY);
+    out.out_fd = _open_osfhandle((intptr_t) rd_out, _O_BINARY | _O_RDONLY);
+    CloseHandle(rd_in);              // the child owns the request pipe's read end
+    CloseHandle(wr_out);             // the child owns the reply pipe's write end
+    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+    return true;
+#else
+    int in[2], outp[2];
+    if (pipe(in) != 0 || pipe(outp) != 0) { err = "pipe failed"; return false; }
+    std::vector<std::string> store = argv;
+    std::vector<char*> av = c_argv(store);
+    const pid_t pid = fork();
+    if (pid < 0) { err = "fork failed"; return false; }
+    if (pid == 0) {
+        dup2(in[0], 0);
+        dup2(outp[1], 1);
+        const int lf = open(stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (lf >= 0) dup2(lf, 2);
+        close(in[0]); close(in[1]); close(outp[0]); close(outp[1]);
+        execv(store[0].c_str(), av.data());
+        _exit(127);
+    }
+    close(in[0]);
+    close(outp[1]);
+    out.in_fd = in[1];
+    out.out_fd = outp[0];
+    out.child.id = (int64_t) pid;
+    return true;
+#endif
+}
+
+bool pipe_write_all(int fd, const void* data, size_t n) {
+    const char* p = (const char*) data;
+    size_t off = 0;
+    while (off < n) {
+#if defined(_WIN32)
+        const int w = _write(fd, p + off, (unsigned) (n - off));
+#else
+        const ssize_t w = ::write(fd, p + off, n - off);
+#endif
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        off += (size_t) w;
+    }
+    return true;
+}
+
+int64_t pipe_read(int fd, void* dst, size_t n) {
+    for (;;) {
+#if defined(_WIN32)
+        const int r = _read(fd, dst, (unsigned) n);
+#else
+        const ssize_t r = ::read(fd, dst, n);
+#endif
+        if (r < 0 && errno == EINTR) continue;
+        return (int64_t) r;
+    }
+}
 
 int child_wait(Child& c, int timeout_ms) {
 #if defined(_WIN32)

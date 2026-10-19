@@ -29,6 +29,30 @@ struct Child {
     void* handle = nullptr;   ///< where the OS names the child by a handle
 };
 
+/// A child whose standard input and output are pipes this process holds, and whose standard error goes to a file:
+/// the shape of a program driven over a line protocol. `in_fd` writes to the child's input, `out_fd` reads its
+/// output; both are descriptors the CRT can read and write in binary mode, and `close_fd` closes either.
+struct PipedChild {
+    Child child;
+    int in_fd = -1;
+    int out_fd = -1;
+};
+
+/// Starts `argv` (argv[0] is the program path) with its standard input and output piped to this process and its
+/// standard error written to the file at `stderr_path`, which is created or truncated and can be read while the child
+/// runs. The ends this process does not use are not inherited, so a closed end is seen as such on the other side.
+/// False with `err` filled in when something could not be set up.
+bool spawn_piped(const std::vector<std::string>& argv, const std::string& stderr_path, PipedChild& out,
+                 std::string& err);
+
+/// Writes all of `n` bytes to a pipe descriptor, over short writes and interrupted calls. False when the other end is
+/// gone.
+bool pipe_write_all(int fd, const void* data, size_t n);
+
+/// Reads up to `n` bytes from a pipe descriptor, restarting an interrupted call. The bytes read; 0 at the end of the
+/// stream; -1 on failure.
+int64_t pipe_read(int fd, void* dst, size_t n);
+
 /// Waits for the child to end. `timeout_ms` of 0 only asks whether it already has, -1 waits as long as it takes.
 /// Returns the child's exit code, or -1 when it is still running at the timeout. A child stopped by a signal
 /// reports 128 + the signal number, which is how a shell spells it. Linux has reaped the child when this returns a
