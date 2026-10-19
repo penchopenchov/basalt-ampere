@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Engine code outside src/platform and include/basalt/platform must not use raw OS calls or platform macros.
-# tools/platform_boundary.allow lists the files that still do, with their hit counts. A count may only go down:
+# tests/platform tests the backends themselves and is allowed like src/platform. tools/platform_boundary.allow lists the files that still do, with their hit counts. A count may only go down:
 # a higher count fails, and a lower one fails too until the allowlist is lowered to match.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -28,7 +28,7 @@ while IFS=: read -r path count; do
     status=1
   fi
 done < <(git grep -cE "${pattern}" -- src include tools tests \
-           ':!src/platform' ':!include/basalt/platform' ':!src/kernels/cpu/ggml' ':!*stb_image.h' \
+           ':!src/platform' ':!include/basalt/platform' ':!tests/platform' ':!src/kernels/cpu/ggml' ':!*stb_image.h' \
            ':!*.py' ':!tools/check_platform_boundary.sh' ':!tools/platform_boundary.allow' || true)
 
 for path in "${!allowed[@]}"; do
