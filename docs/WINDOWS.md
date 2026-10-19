@@ -3,12 +3,32 @@
 Native Windows build of the engine: the C++/CUDA engine and the Python server, one RTX 5090
 (sm_120). This is a platform port - no kernel math, no weight format and no precision behaviour
 changed. Windows support is community-supported: the engine logic is shared with Linux, which
-stays the regression oracle, and OS-specific code belongs to `src/platform/` and CMake `WIN32`
-blocks rather than to engine logic.
+stays the regression oracle. OS-specific code lives in `src/platform/` (declared in
+`include/basalt/platform/`) and in CMake `WIN32` blocks; engine code outside them contains no
+`_WIN32`, `_MSC_VER` or raw OS calls, so a new feature that goes through the platform headers
+builds on both systems. The exceptions are third-party sources kept verbatim (ggml, stb_image) and
+two CUDA front-end workarounds, described under "Compiler notes".
+
+## Platform layer
+
+| header | what it covers |
+| --- | --- |
+| `file.hpp` | UTF-8 paths, positional reads, file size, unbuffered descriptors |
+| `mapped_file.hpp` | read-only file views (`MappedFile`), prefetch and release hints, locking a view |
+| `memory.hpp` | RAM probes and guards, page locking, aligned allocation, large-page regions (`alloc_region`) |
+| `cpu.hpp` | processor topology, pinning a thread, a host thread's placement |
+| `process.hpp` | spawning and stopping children, a child with piped standard streams, signals |
+| `system.hpp` | process id, Python interpreter, memory-accounting file paths, process memory, disk queries |
+| `dynlib.hpp` | the NVML loader |
+| `compiler.hpp` | CPUID/XGETBV, bit scan, spin hint, fp16 rounding, per-compiler CPU feature probes |
+| `win.hpp` | the only inclusion of `windows.h` (with `NOMINMAX`); Windows platform sources only |
+
+Each platform function has a Linux body and a Windows body behind one declaration, and a test in
+`tests/platform/` that runs on both.
 
 ## Toolchain
 
-The versions this port builds with:
+The versions the port is built and tested with:
 
 | component | version |
 | --- | --- |
@@ -108,15 +128,14 @@ What the engine reports is the honest answer, not an assumption:
 - The resident expert copy is locked through a raised working-set minimum plus chunked
   `VirtualLock`. A quota that cannot be raised is reported in the note, and the lock is attempted
   anyway: a partially locked region is still better than a pageable one.
-- The pinned arena asks for `MEM_LARGE_PAGES` first, like `hugetlb` on Linux. On this machine the
-  large-page minimum is detected (2 MiB) and the privilege enables, but the system's large-page
-  pool declines (`ERROR_NO_SYSTEM_RESOURCES`, 1450): drivers and the OS take that pool at boot, so
-  whether it is available is a machine property. The arena then falls back to ordinary 4 KiB pages
-  and `cudaHostRegister` still pins all of it: a 4 GiB arena registers in a
-  single piece, so the per-slice fallback stays unused. The note names the size, the large-page
-  minimum and the `VirtualAlloc` error, because a declined pool (1450), a missing privilege (1314)
-  and a size that is not a multiple of the minimum (87) need different fixes and look alike
-  otherwise.
+- The pinned arena asks for `MEM_LARGE_PAGES` first, like `hugetlb` on Linux. The large-page
+  minimum (typically 2 MiB) is detected and the privilege is enabled, but the system's large-page
+  pool can still decline (`ERROR_NO_SYSTEM_RESOURCES`, 1450): drivers and the OS take that pool at
+  boot, so whether it is available is a property of the machine. The arena then falls back to
+  ordinary 4 KiB pages and `cudaHostRegister` pins all of it when the driver accepts the whole
+  range, so the per-slice fallback stays unused. The note names the size, the large-page minimum
+  and the `VirtualAlloc` error, because a declined pool (1450), a missing privilege (1314) and a
+  size that is not a multiple of the minimum (87) need different fixes and look alike otherwise.
 - Never assume the backing from the code path: read the note the engine prints at startup. The
   difference between large pages and 4 KiB pages is more than a factor of two in TLB reach.
 
@@ -191,8 +210,8 @@ pretending otherwise:
 The MSVC behaviour that differs from the GCC build, and what the port does about it:
 
 - `windows.h` defines `min`/`max` macros that break `std::min`/`std::max` in every file that
-  includes it, so every inclusion in this tree defines `NOMINMAX` first, including the widely
-  included headers before they pull Win32 types in.
+  includes it, so it is included only through `basalt/platform/win.hpp`, which defines `NOMINMAX`
+  (and `WIN32_LEAN_AND_MEAN`) first. Headers that engine code includes never pull Win32 types in.
 - `/arch:AVX2` defines `__AVX__` and `__AVX2__` but **not** `__F16C__`; `/arch:AVX512` adds
   `F`/`BW`/`VL`/`DQ` but not `F16C`, `VNNI` or `VBMI` - although the intrinsics for all of those
   compile anyway. The sources that branch on those macros therefore silently take the scalar path
@@ -206,9 +225,10 @@ The MSVC behaviour that differs from the GCC build, and what the port does about
   definitions instead of compiler-generated code. Getting this wrong fails quietly: every stored block
   scale reads as zero, the quants stay correct, and each CPU dot product lands ~1e13 off - the engine
   still runs, on garbage numbers.
-- MSVC has no `_Float16`, and no `__builtin_cpu_supports`. The vision encoder's fp32-through-half
-  quantization uses the F16C intrinsic pair, and the BF16 kernel's run-time probe reads the same
-  CPUID leaves and XCR0 bits GCC's probe consults. The AVX-512 BF16 types themselves need no
+- MSVC has no `_Float16`, no `__builtin_ctz`, no `__builtin_cpu_supports` and no `<cpuid.h>`;
+  `basalt/platform/compiler.hpp` gives each a single spelling (`f16_round`, `ctz32`, `cpuid`,
+  `xgetbv0`, `cpu_has_avx512_bf16`). The fp32-through-half quantization uses the F16C intrinsic pair,
+  and the BF16 kernel's run-time probe reads the same CPUID leaves and XCR0 bits GCC's probe consults. The AVX-512 BF16 types themselves need no
   change: MSVC spells `__m256bh` and `__m512bh` as typedefs of the integer vectors.
 - MSVC reports `__cplusplus` as `199711L` unless `/Zc:__cplusplus` is passed. The CUDA driver header
   defines `CUtensorMap` with `alignas(TENSOR_MAP_ALIGN)` only when the reported value looks like
@@ -221,43 +241,39 @@ The MSVC behaviour that differs from the GCC build, and what the port does about
   pass for every Windows translation unit; Linux builds need nothing, because GCC reports the true
   standard version. Same class as CUTLASS issue 2905 and PyGPUkit issue 107.
 
+Two CUDA translation units carry a Windows-only workaround for the host front end, both with the same
+types and the same behaviour as the Linux spelling: `dense_tc.cu` spells out the array type of a braced
+list of six kernel pointers, which the front end cannot deduce, and `qsa_dec_attn.cu` defines `ushort`,
+a typedef of the POSIX `sys/types.h` that the Windows headers lack.
+
 `GGML_EXTENSION` (a GCC `__extension__`) is guarded: it breaks every CUDA translation unit
 that includes the block-layout header on the Windows front end.
 
 ## Quality
 
 **Quality has not been measured on the Windows build.** No perplexity run and no KL-divergence run
-against the Q8_0 reference has been done here: `basalt-bench --quality` needs a KL-divergence base
-that llama.cpp builds from a Q8_0 copy of the model, and no such base exists on this machine. What
-*has* been measured for this build is in [precision.md](precision.md), under "Compiler parity": the
-CPU expert kernel and the expert pool against a plain reference on both toolchains (`expert_parity`
-and `pool_test`, 0 failures on each), and the greedy token streams of the two builds, which part
-company a few tokens into a prompt. That page also names the kernels neither table covers. Read the
-Windows tier as numerically unproven at the quality-gate level until a gate run lands on it.
+against the Q8_0 reference has been done on it: `basalt-bench --quality` needs a KL-divergence base
+that llama.cpp builds from a Q8_0 copy of the model. What *has* been measured for this build is in
+[precision.md](precision.md), under "Compiler parity": the CPU expert kernel and the expert pool
+against a plain reference on both toolchains (`expert_parity` and `pool_test`, 0 failures on each),
+and the greedy token streams of the two builds, which part company a few tokens into a prompt. That
+page also names the kernels neither table covers. Treat the Windows tier as numerically unproven at
+the quality-gate level until a gate run lands on it.
 
 ## Benchmarks
 
-Not yet measured by the maintainer on Windows; a headline number is still pending. A development
-A/B run on this machine (RTX 5090, 575 W power limit; Windows 11, MSVC 19.44, CUDA 13.0; Q3 pack;
-llama-swap-equivalent config: 524288 context, yarn, `--kv int8`, `--spec 7 --spec-min-p 0.5`,
-`--ple-io ram`, `--kv-resident 32768`) measured, as a sanity check only:
+There are no headline numbers for Windows; headline numbers are the maintainer's Linux runs. A
+Windows run is a development check only, and any figure from one is quoted with the GPU power limit
+it ran at. To compare a Windows build with Linux, run the same pack with `basalt-bench` on both and
+check the greedy token streams with `tools/greedy_identity.py` before comparing speed.
 
-- prefill: 64,437 prompt tokens read in 11 s (~5,860 tok/s)
-- decode: 12,299 tokens (reasoning + answer) in 56 s (~220 tok/s steady state)
+## Environment restrictions that look like code defects
 
-These are not a headline figure: headline numbers are the maintainer's Linux runs. Every number
-here was measured on this machine at its 575 W power limit.
-
-## Machine-specific observations
-
-Machine-environment restrictions that look like code defects but are not:
-
-- Creating an executable named `basalt-load.exe` under the workspace on this machine is denied:
-  that exact filename is refused (`Access denied`) in that directory tree, while any other
-  name is allowed. The program compiles and links fine under a different name. Check with a build
-  of your own before treating that failure as a port defect.
-- A process started from under one particular folder on this machine gets a token that cannot
-  raise its own working-set quota (`ERROR_PRIVILEGE_NOT_HELD`, 1314), while the *same* executable
-  run from another folder locks 256 MiB successfully. `platform_memory_test` fails in the first
-  location and passes in the second. If that test fails, run the same binary from somewhere else
-  before believing the port is wrong.
+- Windows, or a security product, may deny creating an executable with a particular name inside a
+  directory tree (`Access denied` for that exact filename while other names are allowed). The
+  program builds and links under a different name, so build under another name before treating
+  that failure as a port defect.
+- A process started from some folders can get a token that cannot raise its own working-set quota
+  (`ERROR_PRIVILEGE_NOT_HELD`, 1314), while the same executable run from another folder locks memory
+  normally. `platform_memory_test` fails in the first case and passes in the second. If it fails, run
+  the same binary from another directory before suspecting the code.
