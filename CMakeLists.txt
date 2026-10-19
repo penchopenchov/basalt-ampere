@@ -744,7 +744,7 @@ set_tests_properties(mapped_file_test PROPERTIES TIMEOUT 60)
 
 # the platform seams below the engine: thread placement and topology, the compiler helpers, large host regions, the
 # piped child, the system questions and the dynamic loader (CPU only, both platforms).
-foreach(_t cpu_test compiler_test region_test system_test)
+foreach(_t cpu_test compiler_test region_test process_pipe_test system_test)
   add_executable(platform_${_t} tests/platform/${_t}.cpp)
   target_link_libraries(platform_${_t} PRIVATE platform Threads::Threads)
   target_include_directories(platform_${_t} PRIVATE include)
