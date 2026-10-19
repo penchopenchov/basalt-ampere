@@ -4,7 +4,8 @@
 //
 // Each line is one kernel on one instruction set: weight bytes read per second with the worker threads each taking
 // a slice of the rows of every expert in a working set far larger than the caches (DRAM-bound), and with one
-// thread on one cache-resident expert (compute ceiling).  Calls go straight to each set's kernels, so the CPU can
+// thread on one cache-resident expert (compute ceiling).  The last line is one NVFP4 expert through the expert pool
+// (the decode CPU tier's path): cold, the pool's idle read of it, and the expert computed after that read.  Calls go straight to each set's kernels, so the CPU can
 // time the set it does not dispatch to.  Weights are random bytes with a valid scale field.
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/expert.hpp"
@@ -15,7 +16,9 @@
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
+#include "basalt/kernels/cpu/pool.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -24,6 +27,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -223,6 +227,71 @@ int main(int argc, char** argv) {
         double c1 = 0;
         for (int trial = 0; trial < 3; ++trial) c1 = std::max(c1, run_1t(op, blobs[0], 30));
         std::printf("%-18s %-7s %6.1f GB/s on %d threads   %5.1f GB/s on 1 thread in cache\n", op.name, op.isa, bw, threads, c1);
+    }
+
+    {   // one NVFP4 expert through the expert pool: cold, its idle read (the warm-up's), and computed after the read
+        cpu::NativeFmt f;
+        std::string ferr;
+        if (!cpu::native_fmt(40, 40, NH, NFF, f, ferr)) { std::printf("NVFP4 expert via the pool: %s\n", ferr.c_str()); return 0; }
+        const size_t stride = (f.bytes + 4095) & ~size_t(4095);
+        const int NB = 192;   // each pick is a different expert, far past the caches
+        std::vector<uint8_t> mem(stride * NB + 4096);
+        uint8_t* base = (uint8_t*) (((uintptr_t) mem.data() + 4095) & ~uintptr_t(4095));
+        std::vector<uint8_t> one(f.bytes);
+        fill(one, 40, ggml_type_size(GGML_TYPE_NVFP4), 99);
+        const float tail[4] = {1.f, 1.f, 1.f, 0.f};
+        std::memcpy(one.data() + f.bytes - sizeof tail, tail, sizeof tail);
+        for (int e = 0; e < NB; ++e) std::memcpy(base + stride * e, one.data(), f.bytes);
+        std::vector<std::vector<uint8_t>> nact(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
+        cpu::ExpertJobMulti job;
+        job.nt = NT;
+        for (int t = 0; t < NT; ++t) {
+            cpu::native_quant_act(f, xs[t].data(), nact[t].data());
+            job.nact[t] = nact[t].data();
+            job.out[t] = out[t];
+        }
+        struct Read {
+            const uint8_t* blob = nullptr;
+            size_t bytes = 0, down_off = 0;
+            std::atomic<int> done{0};
+            std::atomic<uint64_t> sink{0};
+        } rd;
+        rd.bytes = f.bytes;
+        rd.down_off = f.down_off;
+        auto read_fn = [](void* ctx, int w, int W, const std::atomic<bool>& stop) {   // gate/up rows first, then down
+            Read& r = *(Read*) ctx;
+            uint64_t x = 0;
+            for (int part = 0; part < 2 && !stop.load(); ++part) {
+                const size_t r0 = part == 0 ? 0 : r.down_off, r1 = part == 0 ? r.down_off : r.bytes;
+                const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
+                const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
+                for (size_t o = b0; o + 8 <= b1; o += 64) x += *(const volatile uint64_t*) (r.blob + o);
+            }
+            r.sink.fetch_add(x);
+            r.done.fetch_add(1);
+        };
+        cpu::ExpertPool pool;
+        std::vector<double> cold, readus, warm;
+        int pick = 0;
+        for (int it = 0; it < 40; ++it) {
+            job.blob = base + stride * (size_t) (pick++ % NB);
+            auto t0 = std::chrono::steady_clock::now();
+            pool.run_split_multi_native(f, &job, 1);
+            cold.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            rd.blob = job.blob = base + stride * (size_t) (pick++ % NB);
+            rd.done.store(0);
+            t0 = std::chrono::steady_clock::now();
+            pool.idle_start(read_fn, &rd);
+            while (rd.done.load() < pool.workers()) {}
+            readus.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            t0 = std::chrono::steady_clock::now();
+            pool.run_split_multi_native(f, &job, 1);
+            warm.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        }
+        auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        std::printf("NVFP4 expert via the pool (%d workers + host, %.2f MB): cold %.1f us (%.1f GB/s)   idle read %.1f us   "
+                    "after the read %.1f us\n", pool.workers(), f.bytes / 1e6, med(cold), f.bytes / (med(cold) * 1e3),
+                    med(readus), med(warm));
     }
     return 0;
 }
