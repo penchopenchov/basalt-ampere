@@ -247,6 +247,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/verify_kernels.cu
                         src/kernels/stamp_ring.cpp
                         src/kernels/cuda/attn_chain.cu
+                        src/kernels/cuda/mid_chain.cu
                         src/kernels/cuda/fused_layer.cu
                         src/kernels/cuda/fused_layer_t2.cu
                         src/kernels/cuda/fused_layer_t3.cu
