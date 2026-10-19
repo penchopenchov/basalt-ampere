@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -150,6 +151,14 @@ constexpr int NSLOT = 4;
 __device__ HcSync g_hc_sync[NSLOT];
 static_assert(sizeof(g_hc_q8cnt) / sizeof(g_hc_q8cnt[0]) == NSLOT, "a q8_1 count set per counter set");
 
+// A tensor map as a kernel argument. The descriptor type is aligned more strictly than the hardware needs on newer
+// toolkits, and a by-value argument with that alignment is not representable on every host compiler, so the argument
+// carries the bytes at the boundary the hardware requires and the kernel reads them as descriptors.
+struct alignas(64) TmaDesc {
+    unsigned long long w[16];
+};
+static_assert(sizeof(TmaDesc) == sizeof(CUtensorMap), "a descriptor argument is the descriptor's size");
+
 struct HcLaunch {
     HcFusedArgs a;
     int nb;          // CTAs (one per SM)
@@ -162,7 +171,7 @@ struct HcLaunch {
     float* t10_dummy;                      // [NE] fixed logits for the top-10's dry run
     float* t10_scratch;                    // [nb][2 * KT] its outputs
     unsigned long long* lg64;              // [MAXT][NE] logits tagged with the read's epoch (tag << 32 | f32 bits)
-    CUtensorMap tm[6];   // q_down, s_down, q_inject, s_inject by four rows; q_up, s_up
+    TmaDesc tm[6];   // q_down, s_down, q_inject, s_inject by four rows; q_up, s_up
 };
 
 // cuda.h gives the descriptor its alignas only when the compiler reports a C++11 __cplusplus, which MSVC does not
@@ -985,8 +994,9 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
     bool staged = false;   // the first down item's rows were requested before the wait
     bool cn_bars = false;  // the staged item uses dbars
     unsigned qpeek = 0;    // an up item: the queue's claim count seen while it runs
+    const CUtensorMap* const tms = reinterpret_cast<const CUtensorMap*>(L.tm);
     if (item < it.up) {    // the item's weights do not depend on the previous kernel
-        cn_bars = cn_issue(a, item, tid, smem, dbars, L.tm);
+        cn_bars = cn_issue(a, item, tid, smem, dbars, tms);
         staged = true;
     }
     if (L.early) pdl_launch_dependents();
@@ -997,7 +1007,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
         if (item < it.up) {
             const int d = item;
             if constexpr (DBG) if (tid == 0) dbg[b * 16 + 15] = 1;
-            if (!staged) cn_bars = cn_issue(a, d, tid, smem, dbars, L.tm);
+            if (!staged) cn_bars = cn_issue(a, d, tid, smem, dbars, tms);
             const CnRows w = cn_rows(a, d);
             if (w.q != nullptr) {
                 cn_x<T>(a, w.hs, tid, smem, s_ssp, L.cns, d < CN_HS);
@@ -1011,7 +1021,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             const UpSlice sl = up_slice(item - it.up, it.nu);
             if constexpr (DBG) if (tid == 0) dbg[b * 16 + 15] = 2;
             uint16_t* const sc8 = up_smem(smem, sl.nc, T).sc;
-            if (tid == 0) hc_up_tma(sl, smem, sc8, &L.tm[4], &bars[0]);   // ahead of R'
+            if (tid == 0) hc_up_tma(sl, smem, sc8, &tms[4], &bars[0]);   // ahead of R'
             hc_up_pre<T>(a, sl, tid, smem);
             // the down items' sums by two bulk copies once they are done (after the slice's shared memory)
             const int lst_off = (((up_smem_bytes<T>(sl.nc) + 15) & ~15) + 127) & ~127;
@@ -1493,10 +1503,12 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     L.cnp = d.cn + (size_t) L.slot * CN_SLOT;
     L.cns = L.cnp + CN_PART;
     L.lg64 = d.lg + (size_t) L.slot * MAXT * NE;
-    if (!cn_maps(L.a, L.tm)) {
+    CUtensorMap maps[6];
+    if (!cn_maps(L.a, maps)) {
         std::fprintf(stderr, "hc_fused_read: the tensor maps of the 8-bit matrices failed\n");
         std::exit(1);
     }
+    std::memcpy(L.tm, maps, sizeof L.tm);
     L.nu = a.xq != nullptr && a.w_router == nullptr ? CN_MIN_NU : 0;   // whole q8_1 blocks
     launch_pdl(kKernels[g_dbg != nullptr ? 1 : 0][a.T - 1], dim3((unsigned) L.nb), dim3(THREADS), (size_t) SMEM,
                (cudaStream_t) stream, L);
