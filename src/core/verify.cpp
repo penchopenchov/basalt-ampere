@@ -2951,7 +2951,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         dm_->wstat_windows = 0;
         dm_->wstat_t = 0;
     }
-    commit_pending_ = false;
+    // the window does not retire the commit: whoever reads the session from the host or another stream calls wait_commit(),
+    // and a finished event is noticed here at no cost
+    if (commit_pending_ && cudaEventQuery(commit_done_) == cudaSuccess) commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
