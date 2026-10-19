@@ -14,10 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-#if defined(_WIN32)
-// `ushort` is a typedef of the POSIX sys/types.h, which the Windows headers do not provide. Same type.
+// `ushort` comes from the POSIX sys/types.h where there is one; redeclaring the same type is harmless.
 using ushort = unsigned short;
-#endif
 
 namespace basalt::kernels {
 namespace {
