@@ -103,29 +103,5 @@ int main() {
     }
     std::remove(path.c_str());
 
-#if !defined(_WIN32)
-    // A sparse file past 4 GiB: a section at a 64-bit offset must land on the right bytes. Not made on Windows, where
-    // the file system would write the zeros out.
-    {
-        const std::string big = path + ".big";
-        const uint64_t at = (4ull << 30) + 8192;
-        std::FILE* f = basalt::platform::open_file_utf8(big, "wb");
-        if (f && basalt::platform::fseek64(f, (int64_t) at, SEEK_SET) == 0) {
-            const uint8_t mark[4] = {0xde, 0xad, 0xbe, 0xef};
-            std::fwrite(mark, 1, 4, f);
-            std::fclose(f);
-            MapOptions o;
-            o.offset = 4ull << 30;
-            o.bytes = 8196;
-            auto m = MappedFile::open_ro(big, &err, o);
-            check(m.has_value() && m->file_size() == at + 4 && std::memcmp(m->data() + 8192, mark, 4) == 0,
-                  "section at a 64-bit offset");
-        } else {
-            if (f) std::fclose(f);
-            std::printf("mapped_file: no sparse file here, 64-bit offset case skipped\n");
-        }
-        std::remove(big.c_str());
-    }
-#endif
     return failures ? 1 : 0;
 }

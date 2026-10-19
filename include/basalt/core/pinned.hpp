@@ -4,7 +4,7 @@
 // the engine's real working set: it must be PAGE-LOCKED for the copy engine to reach full bandwidth, and it must say
 // which backing it got, because the two options differ by more than twice in TLB reach:
 //
-//   * LARGE PAGES (2 MB) - `mmap(MAP_HUGETLB)` / hugetlbfs.  Tens of GB at 4 KB pages is millions of TLB entries,
+//   * LARGE PAGES (2 MB) - the OS's huge-page allocation (hugetlb on Linux, large pages on Windows).  Tens of GB at 4 KB pages is millions of TLB entries,
 //     which does not fit in any TLB, so every block of every expert matvec takes TLB misses.
 //   * NORMAL PAGES - the fallback.  Correct, slower, and it must be REPORTED rather than silently accepted: "the
 //     engine adapts to the machine it is on" is only true if the engine says what it got.

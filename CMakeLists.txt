@@ -742,6 +742,12 @@ target_link_libraries(mapped_file_test PRIVATE platform)
 basalt_embed_manifest(mapped_file_test)
 add_test(NAME mapped_file_test COMMAND mapped_file_test)
 set_tests_properties(mapped_file_test PROPERTIES TIMEOUT 60)
+if(NOT WIN32)
+  add_executable(mapped_file_large_test tests/platform/mapped_file_large_test.cpp)
+  target_link_libraries(mapped_file_large_test PRIVATE platform)
+  add_test(NAME mapped_file_large_test COMMAND mapped_file_large_test)
+  set_tests_properties(mapped_file_large_test PROPERTIES TIMEOUT 60)
+endif()
 
 # the platform seams below the engine: thread placement and topology, the compiler helpers, large host regions, the
 # piped child, the system questions and the dynamic loader (CPU only, both platforms).
