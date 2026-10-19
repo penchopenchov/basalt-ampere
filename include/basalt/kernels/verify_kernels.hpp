@@ -38,6 +38,22 @@ struct GdnCommitLayers {
 };
 /// From `blocks` persistent blocks (grid-stride); each loads its next item while the current one runs.
 void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 32);
+/// Counters of the commit's dynamic items, two sets used by epoch parity (claim, done, started, pre; one line each),
+/// then the newest epoch and the last epoch a finisher finished.  Zeroed once; a set is reset by the begin kernel of the
+/// epoch that uses it.
+struct CommitCtl {
+    uint32_t w[32 * 10];
+};
+/// The commit epoch's start: reads the epoch (> 0) from `epoch` (a device alias of mapped memory), resets that epoch's
+/// counter set, publishes `started` and writes the epoch to `begun` (a device alias of mapped memory the host polls).
+void gdn_commit_begin(CommitCtl* ctl, const int32_t* epoch, uint32_t* begun, void* stream);
+/// gdn_commit_layers with its items claimed from the epoch's counter, so another grid can take items too.  Block 0
+/// publishes `pre` on entry: the work stream-ordered before this launch (the indexer and PLE commits) is complete.
+void gdn_commit_layers_dyn(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, int blocks = 32);
+/// The first node of a verify window.  With the newest epoch not yet finished (its begin kernel has run: the host
+/// checks `begun` before launching the window) the blocks claim the epoch's remaining items, then wait until all are
+/// done and `pre` is published, and the epoch is marked finished; otherwise every block returns.
+void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, int blocks);
 /// A window of several sequences ("segments"): each segment is n consecutive rows with its own GDN state.  The table
 /// has one entry per window row (a segment's rows all carry the segment's fields), uploaded to the device per window.
 /// A kernel launched over the entries lets only the segment's first row (j == 0) do the segment's work.

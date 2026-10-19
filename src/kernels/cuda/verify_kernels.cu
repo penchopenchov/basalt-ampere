@@ -354,6 +354,144 @@ __device__ __forceinline__ void commit_layers_body(const GdnCommitLayers& a, int
     }
 }
 
+// ---- the commit's items claimed from a device counter: the commit kernel and the finisher share them.
+// A counter set is four words on four lines: claim, done, started (the epoch whose begin kernel ran), pre (the epoch
+// whose indexer and PLE commits have completed).
+constexpr int kCtlWords = 32;
+__device__ __forceinline__ uint32_t* ctl_word(CommitCtl* c, int set, int which) {
+    return c->w + (size_t) (set * 4 + which) * kCtlWords;
+}
+__device__ __forceinline__ uint32_t ld_acquire(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_release(uint32_t* p, uint32_t v) {
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ unsigned long long globaltimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+// Block-wide wait until *p == want (bounded: a commit that never ran traps instead of hanging).
+__device__ __forceinline__ void spin_until_eq(const uint32_t* p, uint32_t want) {
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        const unsigned long long t0 = globaltimer();
+        while (ld_acquire(p) != want) {
+            __nanosleep(64);
+            if (globaltimer() - t0 > 2000000000ull) {
+                printf("commit finisher: block %d waited 2 s for %u (word %u)\n", (int) blockIdx.x, want, ld_acquire(p));
+                __trap();
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// Items claimed one counter step ahead of the loads, which are one item ahead of the run: the next item's loads and the
+// claim after it are in flight while this item computes.  Finished items are added to `done` four at a time (one fence
+// per batch) and at the end.
+__device__ __forceinline__ void commit_drain(const GdnCommitLayers& a, int n, int conv_blocks, uint32_t* claim,
+                                             uint32_t* done) {
+    const int per_state = a.h_v * (S / 32), per_layer = per_state + conv_blocks, total = per_layer * a.n_layers;
+    __shared__ uint32_t s_c[2];
+    const bool lead = threadIdx.x == 0 && threadIdx.y == 0;
+    if (lead) {
+        s_c[0] = atomicAdd(claim, 1u);
+        s_c[1] = atomicAdd(claim, 1u);
+    }
+    __syncthreads();
+    int i = (int) s_c[0], in = (int) s_c[1];
+    __syncthreads();
+    CommitPre cur, nxt;
+    bool cur_state = i < total && i % per_layer < per_state;
+    if (cur_state) commit_pre_load(a, per_layer, n, i, cur);
+    int unpub = 0;
+    while (i < total) {
+        uint32_t nn = 0;
+        if (lead) nn = atomicAdd(claim, 1u);
+        const bool next_state = in < total && in % per_layer < per_state;
+        if (next_state) commit_pre_load(a, per_layer, n, in, nxt);
+        if (cur_state) {
+            commit_pre_run(a, per_layer, n, i, cur);
+        } else {
+            const int l = i / per_layer, j = i - l * per_layer;
+            gdn_conv_commit_n(a.state + (size_t) l * a.state_stride + (size_t) S * a.h_v * S,
+                              a.qkv + (size_t) l * a.h_stride, a.C, n,
+                              (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
+        }
+        const bool flush = ++unpub == 4;
+        if (flush) __syncthreads();
+        if (lead) {
+            if (flush) {
+                __threadfence();
+                atomicAdd(done, 4u);
+            }
+            s_c[0] = nn;
+        }
+        if (flush) unpub = 0;
+        __syncthreads();
+        i = in;
+        in = (int) s_c[0];
+        cur_state = next_state;
+        if (next_state) cur = nxt;
+    }
+    if (unpub > 0) {
+        __syncthreads();
+        if (lead) {
+            __threadfence();
+            atomicAdd(done, (uint32_t) unpub);
+        }
+    }
+}
+
+// The epoch's counters are reset here, before anything of the epoch is claimed; `started` publishes the epoch, and the
+// host word `begun` tells the host that the device side knows it.
+__global__ void gdn_commit_begin_kernel(CommitCtl* ctl, const int32_t* __restrict__ epoch_src,
+                                        volatile uint32_t* begun) {
+    const uint32_t e = (uint32_t) *(const volatile int32_t*) epoch_src;
+    *ctl_word(ctl, (int) (e & 1u), 0) = 0;
+    *ctl_word(ctl, (int) (e & 1u), 1) = 0;
+    ctl->w[kCtlWords * 8] = e;
+    __threadfence();
+    st_release(ctl_word(ctl, (int) (e & 1u), 2), e);
+    *begun = e;
+}
+
+__global__ void __launch_bounds__(32 * RG) gdn_commit_layers_dyn_kernel(GdnCommitLayers a, int conv_blocks,
+                                                                       CommitCtl* ctl) {
+    const uint32_t e = ctl->w[kCtlWords * 8];
+    const int set = (int) (e & 1u);
+    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) st_release(ctl_word(ctl, set, 3), e);
+    commit_drain(a, min(*a.n_keep, kVerifyMaxT), conv_blocks, ctl_word(ctl, set, 0), ctl_word(ctl, set, 1));
+}
+
+// The first node of a window: when the newest epoch has not been finished by a finisher yet, claims what the commit
+// kernel has not and returns once every item of the epoch is done and its indexer and PLE commits have completed; the
+// epoch is then marked finished.  The host has seen the epoch's begin kernel run before it launches the window.
+__global__ void __launch_bounds__(32 * RG) gdn_commit_finish_kernel(GdnCommitLayers a, int conv_blocks, CommitCtl* ctl) {
+    __shared__ uint32_t s_e, s_f;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        s_e = ld_acquire(ctl->w + (size_t) kCtlWords * 8);
+        s_f = ld_acquire(ctl->w + (size_t) kCtlWords * 9);
+    }
+    __syncthreads();
+    const uint32_t e = s_e;
+    if (e == s_f) return;
+    const int set = (int) (e & 1u);
+    spin_until_eq(ctl_word(ctl, set, 2), e);
+    const int n = min(__ldcg(a.n_keep), kVerifyMaxT);
+    commit_drain(a, n, conv_blocks, ctl_word(ctl, set, 0), ctl_word(ctl, set, 1));
+    const int total = (a.h_v * (S / 32) + conv_blocks) * a.n_layers;
+    spin_until_eq(ctl_word(ctl, set, 1), (uint32_t) total);
+    spin_until_eq(ctl_word(ctl, set, 3), e);
+    if (blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+        __threadfence();
+        st_release(ctl->w + (size_t) kCtlWords * 9, e);
+    }
+}
+
 __global__ void __launch_bounds__(32 * RG) gdn_commit_layers_pipe_kernel(GdnCommitLayers a, int conv_blocks) {
     const int n = min(*a.n_keep, kVerifyMaxT);
     if (n <= 0) return;
@@ -854,6 +992,27 @@ void gdn_commit_layers_seg(const GdnCommitSeg& a, void* stream, int blocks) {
     gdn_commit_layers_seg_kernel<<<dim3((unsigned) (blocks > 0 ? blocks : 1), (unsigned) a.n_rows), dim3(32, RG), 0,
                                    (cudaStream_t) stream>>>(a, conv_blocks);
     check("gdn_commit_layers_seg");
+}
+
+void gdn_commit_begin(CommitCtl* ctl, const int32_t* epoch, uint32_t* begun, void* stream) {
+    gdn_commit_begin_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ctl, epoch, begun);
+    check("gdn_commit_begin");
+}
+
+void gdn_commit_layers_dyn(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, int blocks) {
+    if (a.n_layers <= 0) return;
+    const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
+    gdn_commit_layers_dyn_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+        a, conv_blocks, ctl);
+    check("gdn_commit_layers_dyn");
+}
+
+void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, int blocks) {
+    if (a.n_layers <= 0) return;
+    const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
+    gdn_commit_finish_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+        a, conv_blocks, ctl);
+    check("gdn_commit_finish");
 }
 
 void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks) {
