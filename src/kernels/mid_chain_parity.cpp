@@ -375,6 +375,72 @@ int main(int argc, char** argv) {
                         100.0 * (us[kMidPair] - us[kNone]) / (us[kOldPair] - us[kNone]));
         }
     }
+    // the phase ledger of mid_chain (cold weights, a graph of distinct layers with PDL, the stamping instances): times in us
+    // from the first CTA's pass of the grid-dependency wait, medians over the layers; first / median / last over the CTAs
+    {
+        using K::kMidStampCtas;
+        using K::kMidStampPts;
+        const int NL = 48;
+        std::vector<Layer> cold;
+        for (int i = 0; i < NL; ++i) cold.push_back(make_layer(14, 14, 14, false));
+        unsigned long long* sd;
+        const size_t cnt = (size_t) NL * kMidStampCtas * kMidStampPts;
+        CK(cudaMalloc(&sd, cnt * 8));
+        // the stamp points (the kernel's enum)
+        const int E_ENTRY = 0, E_WAIT = 1, E_TILE0 = 2, E_PAIR_REL = 9, E_PZ_REL = 11, E_PAIR_END = 13, E_REQ0 = 14, E_REQ1 = 15, E_OFULL = 16, E_RPAIR = 17,
+                  E_RSTATE = 18, E_RTOK = 19, E_RPZ = 20, E_RREC = 21, E_OREC = 22, E_ODONE = 23;
+        std::printf("phase ledger (cold, 48 layers, PDL; us after the first CTA's wait; first/median/last over CTAs, median over layers):\n");
+        std::printf("  T  pair-end f/m/l        C_PAIR  C_PZ   C_REC  | rec: pair->state state->tok tok->PZ(slack) | last-out CTA: req0 req1 C_REC-seen ofull  done | k_mid end\n");
+        auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v.empty() ? 0.0 : v[v.size() / 2]; };
+        for (int Tl = 1; Tl <= TM; ++Tl) {
+            reset();
+            CK(cudaMemset(sd, 0, cnt * 8));
+            cudaGraph_t g; cudaGraphExec_t ge;
+            CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
+            for (int i = 0; i < NL; ++i) {
+                K::PdlScope ps(true, false);
+                K::hc_fused_read(hcargs(0, Tl), s);
+                K::MidChainArgs a = mid_args(cold[i], Tl, true);
+                a.ord = i; a.stamps = sd;
+                K::PdlScope pm(true, i == 0);
+                K::mid_chain(a, s);
+                K::hc_fused_read(hcargs(1, Tl), s);
+            }
+            CK(cudaStreamEndCapture(s, &g));
+            CK(cudaGraphInstantiate(&ge, g, 0));
+            for (int i = 0; i < 4; ++i) CK(cudaGraphLaunch(ge, s));
+            CK(cudaStreamSynchronize(s));
+            std::vector<unsigned long long> st(cnt);
+            CK(cudaMemcpy(st.data(), sd, cnt * 8, cudaMemcpyDeviceToHost));
+            CK(cudaGraphExecDestroy(ge)); CK(cudaGraphDestroy(g));
+            std::vector<double> pe_f, pe_m, pe_l, cpair, cpz, crec, r1, r2, r3, qreq0, qreq1, qrec, qfull, qdone, kend;
+            for (int l = 0; l < NL; ++l) {
+                auto at = [&](int cta, int pt) { return (double) st[((size_t) l * kMidStampCtas + cta) * kMidStampPts + pt]; };
+                double t0 = 1e30;
+                for (int c = 0; c < 170; ++c) t0 = std::min(t0, at(c, E_WAIT));
+                std::vector<double> pe;
+                double lp = 0, lz = 0, lr = 0, lastdone = -1; int lc = 0;
+                for (int c = 0; c < 170; ++c) {
+                    pe.push_back((at(c, E_PAIR_END) - t0) / 1e3);
+                    for (int gi = 0; gi < 2; ++gi) { lp = std::max(lp, at(c, E_PAIR_REL + gi)); lz = std::max(lz, at(c, E_PZ_REL + gi)); }
+                    if (c >= 122) lr = std::max(lr, at(c, E_RREC));
+                    if (c < 160 && at(c, E_ODONE) > lastdone) { lastdone = at(c, E_ODONE); lc = c; }
+                }
+                std::sort(pe.begin(), pe.end());
+                pe_f.push_back(pe.front()); pe_m.push_back(pe[pe.size() / 2]); pe_l.push_back(pe.back());
+                cpair.push_back((lp - t0) / 1e3); cpz.push_back((lz - t0) / 1e3); crec.push_back((lr - t0) / 1e3);
+                std::vector<double> a1, a2, a3;
+                for (int c = 122; c < 170; ++c) { a1.push_back((at(c, E_RSTATE) - at(c, E_RPAIR)) / 1e3); a2.push_back((at(c, E_RTOK) - at(c, E_RSTATE)) / 1e3); a3.push_back((at(c, E_RPZ) - at(c, E_RTOK)) / 1e3); }
+                r1.push_back(med(a1)); r2.push_back(med(a2)); r3.push_back(med(a3));
+                qreq0.push_back((at(lc, E_REQ0) - t0) / 1e3); qreq1.push_back((at(lc, E_REQ1) - t0) / 1e3);
+                qrec.push_back((at(lc, E_OREC) - t0) / 1e3); qfull.push_back((at(lc, E_OFULL) - t0) / 1e3); qdone.push_back((at(lc, E_ODONE) - t0) / 1e3);
+                kend.push_back((lastdone - t0) / 1e3);
+            }
+            std::printf("  %d  %5.1f/%5.1f/%5.1f   %5.1f  %5.1f  %5.1f  |      %5.1f      %5.1f     %5.1f          |        %5.1f %5.1f   %5.1f      %5.1f %5.1f | %5.1f\n", Tl,
+                        med(pe_f), med(pe_m), med(pe_l), med(cpair), med(cpz), med(crec), med(r1), med(r2), med(r3), med(qreq0), med(qreq1), med(qrec), med(qfull), med(qdone), med(kend));
+        }
+        CK(cudaFree(sd));
+    }
     std::printf(bad == 0 ? "mid_chain_parity: bitwise\n" : "mid_chain_parity: %d differing\n", bad);
     return bad != 0;
 }
