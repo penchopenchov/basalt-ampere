@@ -996,7 +996,7 @@ int sm_count() {
     return n;
 }
 
-#ifndef FZ_DEV_ONLY   // host side: another translation unit (the fused layer) takes only the device code
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 // The dynamic shared-memory opt-in of a launch family is applied once per device (a layer split launches these from
 // several threads, one per card). A failed opt-in is fatal: the launch would otherwise fail later as invalid.
 static int opt_in_device(const char* who) {
@@ -1104,7 +1104,7 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
 
 #endif
 }  // namespace
-#ifndef FZ_DEV_ONLY   // host side: another translation unit (the fused layer) takes only the device code
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 
 bool dense_tc_supported(int t, int n_in) noexcept {
     return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42 || t == 8);

@@ -23,17 +23,7 @@
 #include <cstdlib>
 #include <type_traits>
 
-#ifdef BASALT_PROFILE
-#include "basalt/kernels/stamp_ring.hpp"
-#endif
 namespace basalt::kernels {
-#ifdef BASALT_PROFILE
-__device__ stamp::Ctx g_sp;
-static const int g_sp_reg_ = (stamp::reg_bind([](const stamp::Ctx& c_) { cudaMemcpyToSymbol(g_sp, &c_, sizeof c_); }), 0);
-#define BASALT_SPAN(kid) ::basalt::kernels::stamp::Span sp_(::basalt::kernels::g_sp, kid)
-#else
-#define BASALT_SPAN(kid)
-#endif
 namespace {
 
 void check(const char* what) {
@@ -1956,7 +1946,6 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                                                                 const int32_t* __restrict__ ent_dst,
                                                                 const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                                 float* __restrict__ out) {
-    BASALT_SPAN(::basalt::kernels::stamp::kDmDown);
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     constexpr bool PRE = DEP && TD == 20;

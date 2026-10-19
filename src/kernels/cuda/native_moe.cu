@@ -23,7 +23,6 @@
 #include "basalt/kernels/native_moe.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/pdl.hpp"
-#include "basalt/kernels/stamp_ring.hpp"
 #include "basalt/core/diag.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
@@ -129,12 +128,8 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
                                    const DmPlan* __restrict__ plan, const float* __restrict__ weights,
                                    const float* __restrict__ shared,
                                    float* __restrict__ output, int64_t n_embd, int k,
-                                   const volatile uint32_t* tag_done = nullptr, uint32_t ring = 0 BASALT_STAMP_PARAM_D) {
+                                   const volatile uint32_t* tag_done = nullptr, uint32_t ring = 0) {
     __shared__ int s_kind[16];
-#ifdef BASALT_PROFILE
-    const unsigned long long t_in = ::basalt::kernels::stamp::now();
-    const unsigned launch_no = ::basalt::kernels::stamp::seq_launch(sc, ::basalt::kernels::stamp::kCombine);
-#endif
     // the next kernel (the hc read) may start its blocks and stage weights while this one waits
     if (DEP) pdl_launch_dependents();
     const int64_t tk = blockIdx.y;
@@ -200,15 +195,6 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     }
     if (shared) { sx += h.x; sy += h.y; sz += h.z; sw += h.w; }
     *reinterpret_cast<float4*>(output + tk * n_embd + col) = make_float4(sx, sy, sz, sw);
-#ifdef BASALT_PROFILE
-    if (threadIdx.x == 0) {   // the CTA's end: the layer seam
-        namespace sp = ::basalt::kernels::stamp;
-        const int role = blockIdx.y * gridDim.x + blockIdx.x;
-        unsigned long long* r = sp::open_at(sc, sp::kCombine, launch_no, role, gridDim.x * gridDim.y, 0, (int) gridDim.y, t_in);
-        if (r) r[sp::kExit] = sp::now();
-        sp::seq_done(sc, sp::kCombine, gridDim.x * gridDim.y);
-    }
-#endif
 }
 constexpr bool dm_combine4_on() { return true; }
 }  // namespace
@@ -232,15 +218,15 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         const int ki = int(k);
         if (dep && tag_done != nullptr)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
-                                      shared, output, n_embd, ki, tag_done, ring BASALT_STAMP_ARG(::basalt::kernels::stamp::ctx()));
+                                      shared, output, n_embd, ki, tag_done, ring);
         else if (dep)
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, true>, parts, peer_rows_m, cpu_rows_m, plan, weights,
                                       shared, output, n_embd, ki,
-                                      (const volatile uint32_t*) nullptr, 0u BASALT_STAMP_ARG(::basalt::kernels::stamp::ctx()));
+                                      (const volatile uint32_t*) nullptr, 0u);
         else
             (void) cudaLaunchKernelEx(&cfg, dm_combine4_kernel<10, false>, parts, peer_rows_m, cpu_rows_m, plan, weights,
                                       shared, output, n_embd, ki,
-                                      (const volatile uint32_t*) nullptr, 0u BASALT_STAMP_ARG(::basalt::kernels::stamp::ctx()));
+                                      (const volatile uint32_t*) nullptr, 0u);
         const auto error = cudaGetLastError();
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
         return;

@@ -378,7 +378,6 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_pdl_kernel(const floa
                                                                       const int32_t* __restrict__ grp_start,
                                                                       const int32_t* __restrict__ n_groups, int n_ff,
                                                                       block_q8_1* __restrict__ hq) {
-    BASALT_SPAN(::basalt::kernels::stamp::kDmSwi);
     pdl_trigger();
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     pdl_wait();

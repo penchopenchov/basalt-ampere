@@ -313,7 +313,6 @@ __device__ void dm_poll_tiers(const DmPlan* plan, const volatile uint32_t* peer_
 
 __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
                                uint32_t ring, unsigned long long* stats, int layer, int trigger) {
-    BASALT_SPAN(::basalt::kernels::stamp::kDmWait);
     if ((trigger & 1) != 0) pdl_trigger();
     if (stats != nullptr) {
         stats[1] = dm_clock();
@@ -429,7 +428,6 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
     __shared__ int2 s_wtot[4];
     __shared__ int s_dup;
     __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
-    BASALT_SPAN(::basalt::kernels::stamp::kDmGu);
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     const bool lead = blockIdx.x == 0;
     if (!lead) pdl_trigger();   // the lead block lets the SwiGLU and down launches start once the plan is out
@@ -451,9 +449,6 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
     const int tok = tid / a.k, warp = tid >> 5, lane = tid & 31;
     __syncthreads();   // the masks are zero before any entry marks one
     pdl_wait();
-#ifdef BASALT_PROFILE
-    sp_.rearm();
-#endif
     // the table entry is read at once; the marking and the barrier hide its latency
     const int32_t e0 = tid < n ? __ldcg(a.ids + tid) : -1;
     const bool inr = e0 >= 0 && e0 < a.n_expert;

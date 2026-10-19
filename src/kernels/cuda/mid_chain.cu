@@ -1,8 +1,7 @@
 // src/kernels/cuda/mid_chain.cu - see include/basalt/kernels/mid_chain.hpp.
 //
-// Its own translation unit: the device code of dense_tc.cu / dec_gdn_rec.cu (and the helpers of the attention chain's
-// phase code) without their host sides, so it builds in a fraction of attn_chain.cu's time.  Built WITHOUT fast math,
-// like them.  The attention chain's namespace is renamed so the two never meet.
+// Its own translation unit: the device code of dense_tc.cu / dec_gdn_rec.cu / hc_fused.cu (and the helpers of
+// attn_chain_kernel.cuh's phase code) without their host sides.  Built WITHOUT fast math, like them.
 #define FZ_DEV_ONLY
 #include "hc_fused.cu"
 #define smem smem_dtc
@@ -26,7 +25,6 @@ using namespace basalt::kernels;
 #define mkb_now mid_mkb_now
 #define mkb_try mid_mkb_try
 #include "attn_chain_bound.cuh"
-#include "basalt/kernels/stamp_ring.hpp"
 #define mkc mkmid
 #include "attn_chain_kernel.cuh"
 
