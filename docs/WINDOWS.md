@@ -11,19 +11,22 @@ two CUDA front-end workarounds, described under "Compiler notes".
 
 ## Platform layer
 
-| header | what it covers |
-| --- | --- |
-| `file.hpp` | UTF-8 paths, positional reads, file size, unbuffered descriptors |
-| `mapped_file.hpp` | read-only file views (`MappedFile`), prefetch and release hints, locking a view |
-| `memory.hpp` | RAM probes and guards, page locking, aligned allocation, large-page regions (`alloc_region`) |
-| `cpu.hpp` | processor topology, pinning a thread, a host thread's placement |
-| `process.hpp` | spawning and stopping children, a child with piped standard streams, signals |
-| `system.hpp` | process id, Python interpreter, memory-accounting file paths, process memory, disk queries |
-| `dynlib.hpp` | the NVML loader |
-| `compiler.hpp` | CPUID/XGETBV, bit scan, spin hint, fp16 rounding, per-compiler CPU feature probes |
-| `win.hpp` | the only inclusion of `windows.h` (with `NOMINMAX`); Windows platform sources only |
+`src/platform/` and `include/basalt/platform/` hold every OS-specific call. Engine code calls these
+functions and never an OS API, so it builds unchanged on both systems.
 
-Each platform function has a Linux body and a Windows body behind one declaration, and a test in
+| seam | header | what it wraps |
+| --- | --- | --- |
+| file I/O | `file.hpp` | UTF-8 paths, open, positional reads, file size, unbuffered descriptors |
+| file views | `mapped_file.hpp` | `MappedFile` (mmap / file mapping), prefetch and release hints, locking a view |
+| memory | `memory.hpp` | RAM probes and guards, page locking, aligned allocation, `alloc_region` (huge / large pages) |
+| CPU | `cpu.hpp` | processor topology, thread affinity, a host thread's placement |
+| processes | `process.hpp` | spawn, wait, terminate, `spawn_piped`, signals |
+| system | `system.hpp`, `dynlib.hpp` | process id, Python path, memory-accounting files, process memory, disk queries, the NVML loader |
+| compiler | `compiler.hpp` | CPUID/XGETBV, bit scan, spin hint, fp16 rounding, per-compiler CPU feature probes |
+| atomics | none | `std::atomic_ref`; no wrapper needed |
+| Win32 | `win.hpp` | the one inclusion of `windows.h`; platform sources only |
+
+Each function has a Linux body and a Windows body behind one declaration, and a test in
 `tests/platform/` that runs on both.
 
 ## Toolchain
