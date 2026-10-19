@@ -25,7 +25,9 @@ struct MidChainArgs {
     float* bo = nullptr;             ///< the output projection's result, row t at bo + t * 2560
     int ord = 0;                     ///< launch ordinal within the graph (0 = the first: it zeroes the hand-off counters first)
     bool pair_only = false;          ///< bench: stop after the projection pair
+    unsigned long long* stamps = nullptr;   ///< bench: [ord][kMidStampCtas][kMidStampPts] phase times (null: no stamping)
 };
+constexpr int kMidStampCtas = 170, kMidStampPts = 24;
 
 /// Allocate the kernel's scratch on the current device (outside a stream capture, once).
 void mid_chain_init();

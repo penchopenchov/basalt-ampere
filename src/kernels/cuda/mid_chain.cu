@@ -49,7 +49,13 @@ struct MP {
     unsigned par;                        // the counter set of this launch
     int pair_only;                       // bench: stop after the pair
     TmaDesc stm;                         // rec state [S rows][R_HV * S], box S x S
+    unsigned long long* stamps;          // bench: [launch][CTA][point] phase times
+    int lay;                             // bench: the launch's index in the stamp buffer
 };
+// the stamp points
+enum { ST_ENTRY, ST_WAIT, ST_TILE0, ST_PAIR_REL = ST_TILE0 + 7, ST_PZ_REL = ST_PAIR_REL + 2, ST_PAIR_END = ST_PZ_REL + 2, ST_OUT_REQ0, ST_OUT_REQ1,
+       ST_OFULL, ST_R_PAIR, ST_R_STATE, ST_R_TOKENS, ST_R_PZ, ST_R_REC, ST_O_REC, ST_O_DONE, ST_N };
+static_assert(ST_N == kMidStampPts, "stamp points");
 // the CTA's shared-memory tail: barriers, the IQ3_S grid, the layer's pointers and arguments
 struct MPerm {
     uint64_t slot[P_SLOTS], ofull, oxbar, rbar;
@@ -75,9 +81,16 @@ __device__ __forceinline__ void m_fill(const MP& p, MPerm& P, const PSplit& ps, 
     bulk_w2s(sm + (size_t) sl * P.geo.slotb, s, by, &P.slot[sl]);
 }
 
-template <int T, int FQ, int FZ, int FO>
+__device__ __forceinline__ void stamp_at(const MP& p, int b, int pt) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    p.stamps[((size_t) p.lay * kMidStampCtas + b) * kMidStampPts + pt] = t;
+}
+
+template <int T, int FQ, int FZ, int FO, bool ST>
 __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define STP(cond, pt) do { if constexpr (ST) { if (cond) stamp_at(p, b, pt); } } while (0)
     extern __shared__ __align__(128) char sm_dyn[];
     char* sm = sm_dyn;
     MPerm& P = *reinterpret_cast<MPerm*>(sm + OFF_PERM);
@@ -101,6 +114,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
     if (tid == 0) P.vb = (int) (tk % (unsigned) G);
     __syncthreads();
     const int b = P.vb;
+    STP(tid == 0, ST_ENTRY);
     unsigned PH = 0;   // mbarrier parities (PB_*)
     unsigned* c = p.cnt + (size_t) p.par * NCTR;
     const PSplit ps = p_split(b, G, -3);
@@ -119,6 +133,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         pf_l2(hist + (size_t) (2 * qk + head * S) * 3, (size_t) S * 3 * 4);
     }
     pdl_wait();
+    STP(tid == 0, ST_WAIT);
     if (b == 0 && tid == 0) for (int k = 0; k < NCTR; ++k) p.cnt[(1 - p.par) * NCTR + k] = 0;   // the set the next launch uses
     pdl_launch_dependents();
     // ======== pair
@@ -130,7 +145,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
 #pragma unroll
         for (int j = 0; j < 3; ++j)
             if (mine > 0 && (lw >> 2) + 2 * j < nchunk) pair_xfrag_cg(xs[j], (lw >> 2) + 2 * j, hb, g, t, p.xq, nb32, T);
-        if (ltid == 0 && (gi >= mine || ps.tile(gi) >= P_NTQ)) redrel(&c[C_PAIR]);   // no qkv tile in this group
+        if (ltid == 0 && (gi >= mine || ps.tile(gi) >= P_NTQ)) { STP(true, ST_PAIR_REL + gi); redrel(&c[C_PAIR]); }   // no qkv tile in this group
         for (int k = gi; k < mine; k += 2) {
             const int ns = P.geo.ns, slot = k % ns;
             const uint8_t* s; int by, ty, no, row0; float* y;
@@ -146,6 +161,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             rw[(g + 8) * kMaxCols + 2 * t] = acc[2];
             rw[(g + 8) * kMaxCols + 2 * t + 1] = acc[3];
             barn(2 + gi, 256);
+            STP(ltid == 0, ST_TILE0 + k);
             const bool qrel = ps.tile(k) < P_NTQ && (k + 2 >= mine || ps.tile(k + 2) >= P_NTQ);   // this group's last qkv tile
             if (ltid == 0 && k + ns < mine && !qrel) { pfence(); m_fill(p, P, ps, k + ns, sm); }   // the slot's next tile
             if (ltid < 16 * kMaxCols) {
@@ -166,20 +182,23 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
                 }
                 barn(2 + gi, 256);
             }
-            if (ltid == 0 && qrel) redrel(&c[C_PAIR]);
+            if (ltid == 0 && qrel) { STP(true, ST_PAIR_REL + gi); redrel(&c[C_PAIR]); }
             if (ltid == 0 && k + ns < mine && qrel) { pfence(); m_fill(p, P, ps, k + ns, sm); }   // after the release
         }
-        if (ltid == 0) redrel(&c[C_PZ]);
+        if (ltid == 0) { STP(true, ST_PZ_REL + gi); redrel(&c[C_PZ]); }
         // every slot's uses by both groups
         for (int k = 0; k < mine; ++k) PH ^= 1u << (PB_SLOT + k % P.geo.ns);
         cbar();
+        STP(tid == 0, ST_PAIR_END);
     }
     if (p.pair_only != 0) return;
     // ======== out tile into smem (the pair's ring is free; rec lives above it)
     if (out_role && !rec_role && tid == 32) {
         pfence();
+        STP(true, ST_OUT_REQ0);
         mbar_expect_tx(&P.ofull, 16 * P.geo.orb);
         for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (b * 16 + r) * P.geo.orb, P.geo.orb, &P.ofull);
+        STP(true, ST_OUT_REQ1);
     }
     // ======== rec (48 CTAs, head = b - R_CTA0; rec_rank's code with RecS)
     if (rec_role) {
@@ -198,6 +217,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         const float gam = __ldg(a.gamma + col);
         if (tid == 0) spin_ge(&c[C_PAIR], (unsigned) (2 * G));
         cbar();
+        STP(tid == 0, ST_R_PAIR);
         if (rg == 0 && lane < 2 * T) {   // every rank's copy of the head's alpha/beta (computed in the pair phase)
             const float v = __uint_as_float(ldca32(p.abv + head * 2 * XT + lane));
             ((lane & 1) ? RS_.b[rank] : RS_.g[rank])[lane >> 1] = v;
@@ -244,6 +264,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             if (rank == 1) a.beta[(size_t) ltid * a.h_v + head] = RS_.b[rank][ltid];
         }
         MW(&P.rbar, PB_REC);   // the state tile (tensor copy issued above)
+        STP(tid == 0, ST_R_STATE);
         float sreg[RPG];
         {
             const float* stile = reinterpret_cast<const float*>(sm);
@@ -253,8 +274,10 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
         cbar();   // the state tile is consumed (the out tile lands there); also the ranks' qn/kn
         if (out_role && tid == 32) {
             pfence();
+            STP(true, ST_OUT_REQ0);
             mbar_expect_tx(&P.ofull, 16 * P.geo.orb);
             for (int r = 0; r < 16; ++r) bulk_w2s(sm + r * P.geo.ors, P.lwo + (size_t) (b * 16 + r) * P.geo.orb, P.geo.orb, &P.ofull);
+            STP(true, ST_OUT_REQ1);
         }
         float wsum_t = 0.0f;
         for (int t = 0; t < T; ++t) {
@@ -283,8 +306,10 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
                 if (lane == t) wsum_t = sq_part;
             }
         if (rg == 0 && lane < T) RS_.wsum[lane][rank] = wsum_t;
+        STP(tid == 0, ST_R_TOKENS);
         if (tid == 0) spin_ge(&c[C_PZ], (unsigned) (2 * G));
         cbar();
+        STP(tid == 0, ST_R_PZ);
         if (rg == 0)
 #pragma unroll
             for (int t = 0; t < XT; ++t) zz[t] = t < T ? a.z[(size_t) t * value_dim + head * S + col] : 0.0f;
@@ -297,7 +322,7 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             }
         }
         cbar();
-        if (tid == 0) redrel(&c[C_REC]);
+        if (tid == 0) { STP(true, ST_R_REC); redrel(&c[C_REC]); }
     }
     // ======== out (dense_tc_one<type, 24 logical warps> on 16 warps)
     if (out_role) {
@@ -315,7 +340,9 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
             if (tid == 0) spin_ge(&c[C_REC], R_HV);
             cbar();
         }
+        STP(tid == 0, ST_O_REC);
         MW(&P.ofull, PB_OW);
+        STP(tid == 0, ST_OFULL);
         const uint8_t* slot = reinterpret_cast<const uint8_t*>(sm);
         for (int lw = wp; lw < O_NLW; lw += 16) {
             const int hb = lw & 3, sbi = hb >> 1, n = hb & 1;
@@ -388,7 +415,9 @@ __global__ void __launch_bounds__(CT, 1) k_mid(const __grid_constant__ MP p) {
                 P.lbo[(size_t) col * O_NOUT + b * 16 + row] = bov;
             }
         }
+        STP(tid == 0, ST_O_DONE);
     }
+#undef STP
 #endif
 }
 
@@ -421,17 +450,23 @@ bool type_ok(int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23
 #define MID_TRIPLES X(14, 14, 14) X(23, 21, 12)
 template <int T>
 MFn mid_pick_t(int q, int z, int o) {
-#define X(a, b, c) if (q == a && z == b && o == c) return k_mid<T, a, b, c>;
+#define X(a, b, c) if (q == a && z == b && o == c) return k_mid<T, a, b, c, false>;
     MID_TRIPLES
 #undef X
-    return k_mid<T, 0, 0, 0>;
+    return k_mid<T, 0, 0, 0, false>;
 }
-MFn mid_pick(int T, int q, int z, int o) {
+// the stamping instances (bench only): (14, 14, 14) and the generic one
+template <int T>
+MFn mid_pick_st(int q, int z, int o) {
+    if (q == 14 && z == 14 && o == 14) return k_mid<T, 14, 14, 14, true>;
+    return k_mid<T, 0, 0, 0, true>;
+}
+MFn mid_pick(int T, int q, int z, int o, bool st = false) {
     switch (T) {
-        case 1: return mid_pick_t<1>(q, z, o);
-        case 2: return mid_pick_t<2>(q, z, o);
-        case 3: return mid_pick_t<3>(q, z, o);
-        default: return mid_pick_t<4>(q, z, o);
+        case 1: return st ? mid_pick_st<1>(q, z, o) : mid_pick_t<1>(q, z, o);
+        case 2: return st ? mid_pick_st<2>(q, z, o) : mid_pick_t<2>(q, z, o);
+        case 3: return st ? mid_pick_st<3>(q, z, o) : mid_pick_t<3>(q, z, o);
+        default: return st ? mid_pick_st<4>(q, z, o) : mid_pick_t<4>(q, z, o);
     }
 }
 }  // namespace
@@ -453,6 +488,8 @@ void mid_chain_init() {
               cudaMalloc((void**) &d.abv, (size_t) R_HV * 2 * XT * 4) == cudaSuccess;
     for (int t = 1; ok && t <= kMidChainMaxT; ++t) {
         ok = cudaFuncSetAttribute((const void*) mid_pick(t, 0, 0, 0), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX) == cudaSuccess;
+        if (ok) ok = cudaFuncSetAttribute((const void*) mid_pick(t, 0, 0, 0, true), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX) == cudaSuccess;
+        if (ok) ok = cudaFuncSetAttribute((const void*) mid_pick(t, 14, 14, 14, true), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX) == cudaSuccess;
 #define X(a, b, c) if (ok) ok = cudaFuncSetAttribute((const void*) mid_pick(t, a, b, c), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX) == cudaSuccess;
         MID_TRIPLES
 #undef X
@@ -493,6 +530,8 @@ void mid_chain(const MidChainArgs& a, void* stream) {
     p.abv = d.abv;
     p.cnt = d.cnt;
     p.pair_only = a.pair_only ? 1 : 0;
+    p.stamps = a.stamps;
+    p.lay = a.ord;
     CUtensorMap stm_map;
     if (!tmap_2d(&stm_map, a.rec.state, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, (uint64_t) R_HV * S, S, (uint64_t) R_HV * S * 4, S, S)) {
         std::fprintf(stderr, "mid_chain: the state's tensor map failed\n");
@@ -503,7 +542,7 @@ void mid_chain(const MidChainArgs& a, void* stream) {
     // set the next one uses once their predecessor has completed (see the kernel)
     p.par = (unsigned) (a.ord & 1);
     if (a.ord == 0) cudaMemsetAsync(d.cnt, 0, (2 * NCTR + 1) * 4, (cudaStream_t) stream);
-    launch_pdl(mid_pick(a.T, a.type_q, a.type_z, a.type_o), dim3(kMidCtas), dim3(CT), (size_t) SMEM_MAX, (cudaStream_t) stream, p);
+    launch_pdl(mid_pick(a.T, a.type_q, a.type_z, a.type_o, a.stamps != nullptr), dim3(kMidCtas), dim3(CT), (size_t) SMEM_MAX, (cudaStream_t) stream, p);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "mid_chain: %s\n", cudaGetErrorString(e));
