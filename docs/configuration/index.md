@@ -264,7 +264,8 @@ reports the defaults in effect.
 
 Other request fields the API reads: `max_tokens` / `max_completion_tokens` (the Anthropic `max_tokens`; `0` or
 `-1` means the rest of the context), `stop` / `stop_sequences`, `logit_bias`, `reasoning_effort`, `enable_thinking`
-and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none).
+and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none; `thinking_budget_tokens` is accepted as
+the same field, and `reasoning_budget_tokens` wins when both are sent).
 
 ### The model file's sampling defaults
 

@@ -96,7 +96,10 @@ class Service:
 
     def reasoning_budget(self, req) -> int | None:
         """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer."""
-        value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
+        req = req if isinstance(req, dict) else {}
+        value = req.get("reasoning_budget_tokens")
+        if value is None:                               # llama.cpp's name for the same budget
+            value = req.get("thinking_budget_tokens")
         if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():

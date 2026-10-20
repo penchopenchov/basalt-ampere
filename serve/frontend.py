@@ -445,7 +445,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
-    elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
+    elif thinking is None and not (req.get("reasoning_budget_tokens") or req.get("thinking_budget_tokens")) and not think_unasked:
         # opt-in thinking: short helper calls that ask for none would otherwise spend their tokens thinking
         kwargs["enable_thinking"] = False
     return _late_system_to_user(messages), tools, kwargs
