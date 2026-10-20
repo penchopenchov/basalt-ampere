@@ -2,6 +2,7 @@
 import json
 import io
 import subprocess
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -133,6 +134,22 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("data: [DONE]", stream)
         self.assertEqual(self.engine.starts, 2)
+
+    def test_a_missing_engine_binary_is_a_503_with_the_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            engine = ProcessEngine(str(Path(d) / "no-such-engine"), [], log=str(log), lazy=True)
+            self.svc.engine = engine
+            chat = {"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 32, "reasoning_effort": "none"}
+            with mock.patch("serve.engine.process.narrate_start", lambda *a, **k: None):
+                for stream in (False, True):
+                    with self.subTest(stream=stream):
+                        code, body = self.request("/v1/chat/completions", {**chat, "stream": stream})
+                        self.assertEqual(code, 503, body)
+                        self.assertIn("the engine could not be started", body["error"]["message"])
+                        self.assertIn("no-such-engine", body["error"]["message"])
+                        self.assertIsNone(engine.proc)
+                        self.assertFalse(engine.starting)
 
     def test_busy_auth_and_foreign_origin_cannot_unload(self):
         self.engine.loaded = True

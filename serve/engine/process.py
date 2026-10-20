@@ -135,6 +135,8 @@ class ProcessEngine:
         self.model_path = flag_value(args, "--native") or flag_value(args, "--pack") or "pack/full"
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
+        if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
+            self.slot_cv = threading.Condition()
         self.ended, self.unloaded = True, True
         self.max_context = int(flag_value(args, "--max-context") or 4096)
         self.can_stop = False            # READY <ctx> stop
@@ -168,9 +170,15 @@ class ProcessEngine:
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         sink = None if log else ProcessEngine.stderr_sink
         self.max_context = 0                            # before the new process is visible: never its predecessor's
-        self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE if sink else self.log, text=True, encoding="utf-8",
-                                     bufsize=1, env=env)
+        try:
+            self.proc = subprocess.Popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE if sink else self.log,
+                                         text=True, encoding="utf-8", bufsize=1, env=env)
+        except OSError as e:                            # missing or not executable: nothing started, so this is a start error
+            loading.set()                               # the narrator stops and the log handle goes back
+            if log:
+                self.log.close()
+            raise EngineStartError(f"the engine could not be started: {e}", log) from e
         frame_pipes(self.proc, sink is not None)
         if sink:
             threading.Thread(target=pump_lines, args=(self.proc.stderr, sink), daemon=True).start()
@@ -246,8 +254,7 @@ class ProcessEngine:
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
-        if "slot_cv" not in self.__dict__:
-            self.slot_cv = threading.Condition()
+        if "ctl" not in self.__dict__:
             self.waiting = 0                            # requests waiting for ctl
             self.wait_lens: list[list[int]] = []        # their prompt lengths
             self.ctl_epoch = 0                          # times ctl was taken
@@ -363,6 +370,8 @@ class ProcessEngine:
                     self.__init__(*self.spawn)
                     break
                 except EngineStartError:
+                    if self.proc is None:               # the program could not be started: a retry cannot help
+                        raise
                     try:
                         self.proc.wait(timeout=60)
                     except (subprocess.TimeoutExpired, OSError):
