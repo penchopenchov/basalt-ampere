@@ -181,8 +181,7 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `spec` | engine | integer; `0` or `1` = off | 0 (no speculation, the drafter is not loaded) | The verify window: the last accepted token plus N-1 drafts. The model file does not set it; give it in the config or on the command line (7 is a good start) to turn speculation on. |
-| `spec-min-p` | engine | number 0..1 | 0 (always draft to the cap; not set by the model file) | The drafter's cutoff: a draft enters the window only while it, and every draft before it, has at least this probability under the drafter. Higher values draft fewer, surer tokens. This is not the sampling `min_p` below. |
+| `spec` | engine | integer; `0` or `1` = off | 0 (no speculation, the drafter is not loaded) | The most tokens in a verify window: the last accepted token plus up to N-1 drafts. Each window's size is set by the drafts' joint chance of acceptance, against a threshold adapted per request. The model file does not set it; give it in the config or on the command line (7 is a good start) to turn speculation on. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Cap on the drafter's own window; longer windows then come from `suffix-draft` matches. |
 | `suffix-draft` | engine | integer tokens | 3 (`0` = drafter only) | Draft from an earlier repeat of the last N or more tokens of context (code edits, quoted text, tool-call JSON) when that is likelier to pay than the drafter. |
 | `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
@@ -252,7 +251,7 @@ reports the defaults in effect.
 | `temperature` | number >= 0 | `0` is greedy (argmax); higher is more random. Greedy requests stay exact under every other setting. |
 | `top_p` | number in (0, 1] | Nucleus sampling: keep the smallest set of tokens whose probability adds up to this. `1` is off. |
 | `top_k` | integer 1..64 | Keep only the K likeliest tokens. The sampler keeps at most 64; a larger value, or `0`, is 64. |
-| `min_p` | number in [0, 1] | Sampling cutoff: drop tokens less likely than `min_p` times the likeliest token's probability. `0` is off. It acts on the model's tokens and is unrelated to the server's `spec-min-p`, which stops the drafter from proposing unlikely tokens. |
+| `min_p` | number in [0, 1] | Sampling cutoff: drop tokens less likely than `min_p` times the likeliest token's probability. `0` is off. It acts on the model's tokens. |
 | `repetition_penalty` | number > 0 | Multiplicative penalty on tokens seen in the window; `1` is off. |
 | `presence_penalty` | number | Flat penalty on any token seen in the window; `0` is off. |
 | `frequency_penalty` | number | Penalty that grows with how often a token was seen; `0` is off. |

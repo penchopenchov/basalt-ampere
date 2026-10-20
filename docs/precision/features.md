@@ -97,7 +97,7 @@ head ignores the bias; it only proposes tokens, so a banned token it proposes is
 accepts fewer drafts. A request without a bias takes the unchanged captured greedy sample.
 
 Checked on IQ3_S with the tiers pinned as in the section below: requests with a bias (greedy and seeded, a ban, a
-boost, a mixed map, with and without a presence penalty) return the same text with `--spec 7 --spec-min-p 0.5` as with
+boost, a mixed map, with and without a presence penalty) return the same text with `--spec 7` as with
 `--spec 0`, and a request with an empty map matches one without the field. A -100 bias never yields the token and
 a +100 bias yields it at every step.
 
@@ -110,7 +110,7 @@ Verify guarantees that a token's logits are bit for bit those of plain decode, w
 `data/bench` decode prompts (conv, struct, prose). 256 new tokens each, temperature 0, one engine session per
 configuration, same prompt order. A logit-hash diagnostic prints an FNV-1a hash of the full-vocabulary fp32 head logits
 of every accepted row. Token ids and the hash at each generated position are compared between `--spec 0` and
-`--spec 7 --spec-min-p 0.5`.
+`--spec 7`.
 
 Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with `--expert-cache` and `--peer-slots`
 fixed to the sizes auto-sizing picks), so the same experts sit on the same device in both runs.
@@ -196,7 +196,7 @@ threshold: about +1.5% per 0.01 TV/token. Medusa-style typical acceptance (a thr
 was replayed too and lands on the same line; it is not a better trade, so the flag is the plain probability threshold.
 
 **Speed (400 W).** `basalt-bench` (conv and prose at temperature 0.6, struct greedy), with `--spec 7
---spec-min-p 0.5 --kv int8 --vram-reserve-mib 500 --resident-experts --peer-exclusive`, each value in three rounds
+--kv int8 --vram-reserve-mib 500 --resident-experts --peer-exclusive`, each value in three rounds
 interleaved with the others, the cold repetition dropped:
 
 | Model | Fixture | Exact | P = 0.5 | P = 0.3 | P = 0.2 |

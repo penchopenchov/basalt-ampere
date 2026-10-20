@@ -97,11 +97,11 @@ public:
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-               float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+               float* probs = nullptr, int* n_drafts = nullptr);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                     float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+                     float* probs = nullptr, int* n_drafts = nullptr);
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
@@ -129,7 +129,7 @@ public:
     /// `draft_seq` / `defer_rows` reads its own rows intact; null on failure.
     const float* keep_rows(const float* R_rows, int rows, std::string& err);
     bool draft_seq(int id, const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts,
-                   std::string& err, float* probs, float min_p, int* n_drafts);
+                   std::string& err, float* probs, int* n_drafts);
     /// The K/V cells [cell0, cell0 + n) of sequence `id` from window rows, no draft (`prefill` on that sequence).
     bool catch_up(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
     /// The same, later: the rows are kept and their cells are computed by the next `draft_seq` (or `flush`) of the
@@ -166,7 +166,7 @@ private:
     void end_branches();
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< without the mapped staging (inputs copied on device)
-    /// all_rows: copy every step / position record (the chain's too) and the min_p bits, for a graph without per-step
+    /// all_rows: copy every step / position record (the chain's too) and the threshold bits, for a graph without per-step
     /// copies
     bool record_round(int T, bool coupled, bool all_rows, std::string& err);
     bool record_step(int j, bool coupled, bool copy_records, std::string& err);
@@ -174,7 +174,7 @@ private:
     bool capture_step(int j, bool coupled, std::string& err);
     cudaGraphExec_t step_exec_[2][9] = {};   ///< [tier_]
     /// The round and `steps - 1` chain steps in one graph, step j an IF node on draft j-1's
-    /// probability >= min_p; false (with the per-step path from then on) where it cannot be built
+    /// probability passing the cumulative rule; false (with the per-step path from then on) where it cannot be built
     bool capture_cond(int T, bool coupled, int steps);
     cudaGraphExec_t cond_exec_[2][2][9] = {};   ///< [tier_][coupled]
     int cond_steps_[2][2][9] = {};
@@ -215,7 +215,7 @@ private:
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     uint8_t* xq2_ = nullptr;
     bool par_ = false, pre_next_ = false, have_pre_ = false, fork_open_ = false;
-    struct CondTail { unsigned long long h[8]; int n; float cum_th; };
+    struct CondTail { unsigned long long h[8]; int n; };
     const CondTail* ctail_ = nullptr;   ///< the conditional handles the step being recorded ends with
     bool ctail_done_ = false;           ///< that step's end already set them
     bool step_end(int j);

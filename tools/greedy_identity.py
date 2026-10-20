@@ -22,7 +22,7 @@ sys.path.insert(0, str(HERE))
 
 PROMPTS = ("conv", "struct", "prose")
 # flags after `--` replace these
-BASE = ["--spec", "7", "--spec-min-p", "0.5", "--max-context", "8192"]
+BASE = ["--spec", "7", "--max-context", "8192"]
 PINNED = ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
 
 

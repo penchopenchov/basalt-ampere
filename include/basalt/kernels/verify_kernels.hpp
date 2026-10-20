@@ -155,13 +155,12 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 /// when that row is 0.  The draft round takes its draft row from the catch-up with it (MTP_REUSE_ROW).
 void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, float* mixed, int64_t mixed_stride,
                   const int32_t* row_dev, void* stream);
-/// For draft steps that are conditional (IF) graph nodes (MTP_COND): handle h[0] <- probs[*row] >= min_p, with
-/// min_p's float bits at *min_p_bits, and h[1..n) <- 0 (n <= 8).  With cum_th > 0 the comparison is the cumulative
-/// rule of draft_cum.hpp for chain step j instead: hist[0..j) the earlier steps' probabilities, probs[*row] step j's.
+/// For draft steps that are conditional (IF) graph nodes (MTP_COND): handle h[0] <- the cumulative rule of
+/// draft_cum.hpp for chain step j (hist[0..j) the earlier steps' probabilities, probs[*row] step j's) against the
+/// threshold whose float bits are at *th_bits, and h[1..n) <- 0 (n <= 8).
 /// False (nothing launched) when the build has no conditional graph nodes.
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
-                    const int32_t* min_p_bits, void* stream, float cum_th = 0.0f, const float* hist = nullptr,
-                    int j = 0);
+                    const int32_t* th_bits, void* stream, const float* hist, int j);
 /// The draft round's staging in one launch: each of up to 6 int segments (dst, host-mapped src, count) by a block of its
 /// own, and `n_f` floats (a multiple of 4, 16-byte aligned) from `f_src` to `f_dst` by the other blocks; the same copies
 /// as copy_i32_from_mapped and copy_from_mapped.
@@ -171,7 +170,7 @@ void mtp_stage(const MtpStageSeg* segs, int n_segs, float* f_dst, const float* f
 /// row = *row_dev (the residual is not carried), then, with n > 0, mtp_draft_cond's handles for the same row.  False
 /// (nothing launched) when n > 0 and the build has no conditional graph nodes.
 bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, int32_t* out, int j, const float* probs,
-                  float* out_p, const unsigned long long* h, int n, const int32_t* min_p_bits, float cum_th,
+                  float* out_p, const unsigned long long* h, int n, const int32_t* th_bits,
                   const float* hist, void* stream);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);

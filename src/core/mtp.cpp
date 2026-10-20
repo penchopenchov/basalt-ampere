@@ -1165,8 +1165,8 @@ void MtpDrafter::prefetch_end(cudaStream_t cs) {
 bool MtpDrafter::step_end(int j) {
     using namespace basalt::kernels;
     const CondTail* c = ctail_;
-    if (!mtp_step_end(out_ids_, row_ + 1, tok_, m_out_, j, probs_, m_prob_, c ? c->h : nullptr, c ? c->n : 0, row_ + 2,
-                      c ? c->cum_th : 0.0f, m_prob_, cs_))
+    if (!mtp_step_end(out_ids_, row_ + 1, tok_, m_out_, j, probs_, m_prob_, c ? c->h : nullptr, c ? c->n : 0, row_ + 3,
+                      m_prob_, cs_))
         return false;
     ctail_done_ = c != nullptr;
     return true;
@@ -1219,8 +1219,8 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 
-// [round, h1 <- p0 >= min_p] -> IF h1 [step 1, h2 <- p1 >= min_p] -> IF h2 [...] ...  Every record
-// is copied once, by the round.  The host compares the same probabilities with the same min_p, so it waits only for
+// [round, h1 <- rule(p0)] -> IF h1 [step 1, h2 <- rule(p0, p1)] -> IF h2 [...] ...  Every record
+// is copied once, by the round.  The host applies the same rule to the same probabilities, so it waits only for
 // the drafts the graph makes; the device side only removes the host round trip between steps.
 bool MtpDrafter::prewarm(std::string& err) {
     const OnDevice on_device(device_);
@@ -1263,13 +1263,12 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         CondTail ct{};
         for (int k = 0; k + 1 < steps; ++k) ct.h[k] = hv[k + 1];
         ct.n = steps - 1;
-        ct.cum_th = draft_cum_base();
         ctail_ = &ct;
         ctail_done_ = false;
         bool rec = record_round(T, coupled, true, err);
         ctail_ = nullptr;
         if (rec && !ctail_done_)
-            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_base(), m_prob_, 0);
+            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 3, cs_, m_prob_, 0);
         cudaGraph_t g0 = nullptr;
         const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
         ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
@@ -1291,13 +1290,12 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         CondTail ct{};
         ct.h[0] = hv[j + 1];
         ct.n = 1;
-        ct.cum_th = draft_cum_base();
         ctail_ = j + 1 < steps ? &ct : nullptr;
         ctail_done_ = false;
         bool rec = record_step(j, coupled, false, err);
         ctail_ = nullptr;
         if (rec && j + 1 < steps && !ctail_done_)
-            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 2, cs_, draft_cum_base(), m_prob_, j);
+            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 3, cs_, m_prob_, j);
         cudaGraph_t captured = nullptr;   // the body itself, owned by the node
         ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
         prev = node;
@@ -1440,7 +1438,7 @@ void MtpDrafter::ctx_flush(cudaStream_t cs) {
 }
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, float min_p, int* n_drafts) {
+                       float* probs, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     note_cells(p, p + T + max_t_ + 1);
@@ -1456,8 +1454,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         tier_ = tier2_recent_ > 0 ? 1 : 0;
         if (tier2_recent_ > 0) --tier2_recent_;
     }
-    // the min_p chain in one graph (falls back to the graphs below for good if it cannot be built)
-    const bool cond = !cond_off_ && min_p > 0.0f && max_steps > 1 && capture_cond(T, cp, max_steps);
+    // the chain in one graph (falls back to the graphs below for good if it cannot be built)
+    const bool cond = !cond_off_ && max_steps > 1 && capture_cond(T, cp, max_steps);
     if (!cond) {
         if (!capture_round(T, cp, err)) return false;
         for (int j = 1; j < max_steps; ++j)
@@ -1482,9 +1480,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
     h_row_[0] = a;
     h_row_[1] = 0;
-    std::memcpy(&h_row_[2], &min_p, sizeof(float));   // read by the conditional graph only
     const float cum_th = cum_th_ >= 0.0f ? cum_th_ : draft_cum_base();
-    std::memcpy(&h_row_[3], &cum_th, sizeof(float));
+    std::memcpy(&h_row_[3], &cum_th, sizeof(float));   // the window's threshold, read by the conditional graph
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
@@ -1500,40 +1497,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     };
 
     int n = 0;
-    if (min_p <= 0.0f && max_steps > 0) {
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[tier_][T], cs_) != cudaSuccess) {
-            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
-        }
-        for (int j = 1; j < max_steps; ++j) {
-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[tier_][j], cs_) != cudaSuccess) {
-                err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
-        }
-        (void) cudaStreamQuery(cs_);
-        run_launch_hook();
-        prefetch_ple(tokens[a]);
-        for (int j = 0; j + 1 < max_steps; ++j) {
-            uint32_t spins = 0;
-            while (((volatile int32_t*) h_out_)[j] < 0) {
-                basalt::platform::cpu_relax();
-                if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
-            }
-            drafts[j] = ((volatile int32_t*) h_out_)[j];
-            if (probs) probs[j] = ((volatile float*) h_prob_)[j];
-            prefetch_ple(drafts[j]);
-        }
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
-        }
-        const int last = max_steps - 1;
-        drafts[last] = ((volatile int32_t*) h_out_)[last];
-        if (probs) probs[last] = ((volatile float*) h_prob_)[last];
-        prefetch_ple(drafts[last]);
-        n = max_steps;
-    } else if (max_steps > 0) {
+    if (max_steps > 0) {
         decode_gaps().mark(6);
         const cudaGraphExec_t first = cond ? cond_exec_[tier_][cp ? 1 : 0][T] : (cp ? round_exec_c_[T] : round_exec_[tier_][T]);
         decode_events().record(DecodeEvents::kDraftPre, cs_);
@@ -1560,7 +1524,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         pr[0] = pj;
         if (probs) probs[0] = pj;
         n = 1;
-        for (int j = 1; j < max_steps && draft_keep(pr, j - 1, min_p, cum_th); ++j) {
+        for (int j = 1; j < max_steps && draft_keep(pr, j - 1, cum_th); ++j) {
             if (!cond) {   // the conditional graph runs step j on the device by the same comparison
                 if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[tier_][j], cs_) != cudaSuccess) {
                     err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
@@ -1579,7 +1543,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         }
         // the last draft is a window row only when it passed the cutoff; a row nobody needs would make the window's
         // PLE collect wait for its SSD read
-        if (draft_keep(pr, n - 1, min_p, cum_th)) prefetch_ple(drafts[n - 1]);
+        if (draft_keep(pr, n - 1, cum_th)) prefetch_ple(drafts[n - 1]);
         decode_gaps().mark(8);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
@@ -1701,7 +1665,7 @@ const float* MtpDrafter::keep_rows(const float* R_rows, int rows, std::string& e
 }
 
 bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts,
-                           std::string& err, float* probs, float min_p, int* n_drafts) {
+                           std::string& err, float* probs, int* n_drafts) {
     if (!flush(id, err) || !use_store(id, err)) return false;
     const OnDevice on_device(device_);
     const size_t bytes = (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float);
@@ -1713,7 +1677,7 @@ bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* to
             return false;
         }
     }
-    return draft(T, tokens, p, a, drafts, err, probs, min_p, n_drafts);
+    return draft(T, tokens, p, a, drafts, err, probs, n_drafts);
 }
 
 bool MtpDrafter::flush(int id, std::string& err) {
@@ -1749,7 +1713,7 @@ bool MtpDrafter::catch_up(int id, const float* R_rows, const int32_t* next_token
 }
 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                             float* probs, float min_p, int* n_drafts) {
+                             float* probs, int* n_drafts) {
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -1760,7 +1724,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
             return false;
         }
     std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+    return draft(T, toks.data(), cell, 0, drafts, err, probs, n_drafts);
 }
 
 }  // namespace basalt::core

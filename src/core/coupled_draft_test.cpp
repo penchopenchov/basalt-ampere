@@ -86,7 +86,7 @@ int main() {
             const int n = 7;   // the chain makes up to max_t - 1 drafts, whatever T the next window takes
             check_chain(p, a, n, p_next);
             p = p_next;
-            T = tdist(rng);    // --spec-min-p / the draft policy choose the next window's size
+            T = tdist(rng);    // the draft rule / the draft policy choose the next window's size
         }
     }
     // the CLI's draft_first: the first window at p, drafts from cell p - 1 with a = 0

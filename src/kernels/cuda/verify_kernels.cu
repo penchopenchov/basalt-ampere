@@ -817,32 +817,30 @@ void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, fl
 namespace {
 struct CondHandles { unsigned long long h[8]; };
 __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __restrict__ probs,
-                                      const int32_t* __restrict__ row, const int32_t* __restrict__ min_p_bits,
-                                      float cum_th, const float* hist, int j) {
+                                      const int32_t* __restrict__ row, const int32_t* __restrict__ th_bits,
+                                      const float* hist, int j) {
     const float p = probs[*row];
-    bool keep = p >= __int_as_float(*min_p_bits);
-    if (cum_th > 0.0f) {   // the same products, in the same order, as draft_keep on the host
-        float c = 1.0f;
-        for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
-        c = c * basalt::core::draft_cum_acc(p);
-        keep = c >= __int_as_float(min_p_bits[1]);   // the window's threshold rides beside min_p
-    }
+    // the same products, in the same order, as draft_keep on the host
+    float c = 1.0f;
+    for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
+    c = c * basalt::core::draft_cum_acc(p);
+    const bool keep = c >= __int_as_float(*th_bits);
     cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
     for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);
 }
 }  // namespace
 
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
-                    const int32_t* min_p_bits, void* stream, float cum_th, const float* hist, int j) {
+                    const int32_t* th_bits, void* stream, const float* hist, int j) {
     if (n < 1 || n > 8) { std::fprintf(stderr, "mtp_draft_cond: n out of range\n"); std::exit(1); }
     CondHandles hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
-    mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, min_p_bits, cum_th, hist, j);
+    mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, th_bits, hist, j);
     check("mtp_draft_cond");
     return true;
 }
 #else
-bool mtp_draft_cond(const unsigned long long*, int, const float*, const int32_t*, const int32_t*, void*, float, const float*,
+bool mtp_draft_cond(const unsigned long long*, int, const float*, const int32_t*, const int32_t*, void*, const float*,
                     int) { return false; }
 #endif
 
@@ -889,7 +887,7 @@ namespace {
 struct StepEndCond { unsigned long long h[8]; };
 __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ row_dev,
                                     int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p,
-                                    StepEndCond hs, int n, const int32_t* __restrict__ min_p_bits, float cum_th,
+                                    StepEndCond hs, int n, const int32_t* __restrict__ th_bits,
                                     const float* hist) {
     const int row = *row_dev;
     const int32_t tok = ids[row];
@@ -900,13 +898,11 @@ __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32
     ((volatile int32_t*) out)[j] = tok;
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12040
     if (n <= 0) return;
-    bool keep = p >= __int_as_float(*min_p_bits);
-    if (cum_th > 0.0f) {   // the same products, in the same order, as draft_keep on the host
-        float c = 1.0f;
-        for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
-        c = c * basalt::core::draft_cum_acc(p);
-        keep = c >= __int_as_float(min_p_bits[1]);   // the window's threshold rides beside min_p
-    }
+    // the same products, in the same order, as draft_keep on the host
+    float c = 1.0f;
+    for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
+    c = c * basalt::core::draft_cum_acc(p);
+    const bool keep = c >= __int_as_float(*th_bits);
     cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
     for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);
 #endif
@@ -914,7 +910,7 @@ __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32
 }  // namespace
 
 bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, int32_t* out, int j, const float* probs,
-                  float* out_p, const unsigned long long* h, int n, const int32_t* min_p_bits, float cum_th,
+                  float* out_p, const unsigned long long* h, int n, const int32_t* th_bits,
                   const float* hist, void* stream) {
 #if !(defined(CUDART_VERSION) && CUDART_VERSION >= 12040)
     if (n > 0) return false;
@@ -922,8 +918,8 @@ bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, 
     if (n > 8) { std::fprintf(stderr, "mtp_step_end: n out of range\n"); std::exit(1); }
     StepEndCond hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
-    mtp_step_end_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, row_dev, tok_dst, out, j, probs, out_p, hs, n, min_p_bits,
-                                                            cum_th, hist);
+    mtp_step_end_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, row_dev, tok_dst, out, j, probs, out_p, hs, n, th_bits,
+                                                            hist);
     check("mtp_step_end");
     return true;
 }

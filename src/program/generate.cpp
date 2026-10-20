@@ -495,9 +495,6 @@ struct Options {
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
-    /// A draft enters the verify window only while every draft before it (and itself) has at least this probability
-    /// under the draft layer; 0 = always --spec-1 drafts.
-    double spec_min_p = 0.0;
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
@@ -741,11 +738,10 @@ void usage() {
                  "                       of the batched prompt path (default 64, 0 = off)\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
-                 "  --spec N             speculative decoding: verify windows of N tokens (the last accepted token\n"
-                 "                       plus N-1 MTP drafts); 0 or 1 = no speculation (default 0; the server config\n"
-                 "                       usually sets 7)\n"
-                 "  --spec-min-p P       a draft enters the window only while it and every draft before it have at\n"
-                 "                       least probability P under the drafter (default 0 = always N-1 drafts)\n"
+                 "  --spec N             speculative decoding: verify windows of at most N tokens (the last accepted\n"
+                 "                       token plus up to N-1 MTP drafts, sized per window by the drafts' joint chance\n"
+                 "                       of acceptance against a threshold adapted per request); 0 or 1 = no\n"
+                 "                       speculation (default 0; the server config usually sets 7)\n"
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
                  "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
                  "                       (docs/precision/features.md).  P in (0, 1]; lower is faster and further from exact;\n"
@@ -1438,7 +1434,6 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
         else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
-        else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
             o.relaxed_drafting = kRelaxedDraftingDefault;
             if (i + 1 < argc) {
@@ -5969,7 +5964,7 @@ int main(int argc, char** argv) {
             std::printf("INFO logit_bias=%lld context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                        "conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" BASALT_VERSION "\n",
                         (long long) n_vocab, (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
@@ -5980,7 +5975,7 @@ int main(int argc, char** argv) {
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) ((o.mmap_experts ? src.resident_bytes() : basalt::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
-                        o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                        (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, o.vram_elastic && xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
@@ -6374,7 +6369,6 @@ int main(int argc, char** argv) {
             int32_t dr[16] = {};
             float dprob[16] = {};
             int n_dr = 0;
-            double min_p = 0.0;
             basalt::core::DraftCumAdapt cum;
             std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
             int32_t sbuf[16] = {};
@@ -6707,11 +6701,7 @@ int main(int argc, char** argv) {
                 for (int sg = 0; sg < S; ++sg) {
                     BSlot& sl = bs[(size_t) rows[sg]];
                     int T = 1;
-                    if (sl.min_p > 0.0) {
-                        while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, (float) sl.min_p, sl.cum.th())) ++T;
-                    } else {
-                        T = std::min(S_mtp, 1 + sl.n_dr);
-                    }
+                    while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, sl.cum.th())) ++T;
                     sl.from_sfx = false;
                     sl.sk = 0;
                     if (sl.sfx && sl.n_dr > 0) {
@@ -6951,7 +6941,7 @@ int main(int argc, char** argv) {
                         mtp.set_cum_th(sl.cum.th());
                         int nd = 0;
                         if (!mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err, sl.dprob,
-                                           (float) sl.min_p, &nd)) {
+                                           &nd)) {
                             std::printf("ERR %s\n", err.c_str());
                             return false;
                         }
@@ -7245,7 +7235,6 @@ int main(int argc, char** argv) {
             std::string req_bias_text;   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
             bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
-            double req_spec_min_p = o.spec_min_p;
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed
@@ -7273,7 +7262,6 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "relax") req_relax = std::clamp(fv, 0.0f, 1.0f);
                     else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
@@ -8375,7 +8363,7 @@ int main(int argc, char** argv) {
             static FILE* const draft_log = basalt::core::diagnostics().draft_log.empty() ? nullptr
                 : std::fopen(basalt::core::diagnostics().draft_log.c_str(), "a");
             if (draft_log != nullptr) {
-                std::fprintf(draft_log, "R temp=%g min_p=%g S=%d\n", (double) req_temperature, req_spec_min_p, S_mtp);
+                std::fprintf(draft_log, "R temp=%g S=%d\n", (double) req_temperature, S_mtp);
                 std::fflush(draft_log);
             }
             // spec_log: per window, the target's sampling distribution at each verified row beside the draft head's top-4
@@ -8387,11 +8375,8 @@ int main(int argc, char** argv) {
             bool tk_valid = false;
             if (tk_log != nullptr) { std::fprintf(tk_log, "R temp=%g S=%d\n", (double) req_temperature, S_mtp); std::fflush(tk_log); }
             while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
-                int T = S_mtp;
-                if (req_spec_min_p > 0.0) {
-                    T = 1;
-                    while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, (float) req_spec_min_p, cum_adapt.th())) ++T;
-                }
+                int T = 1;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
                 if (first_window) T = 1;
                 if (ppl != nullptr) {
                     if (p >= ppl->end()) break;
@@ -8641,7 +8626,7 @@ int main(int argc, char** argv) {
                     bool drafted = true;
                     if (will_draft && mtp_on) {
                         mtp.set_launch_hook(after_launch);
-                        drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                        drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
                         mtp.set_launch_hook(nullptr);
                         if (tk_log != nullptr && drafted) {
                             for (int j = 0; j < 16 && j < S_mtp; ++j) {
@@ -8721,7 +8706,7 @@ int main(int argc, char** argv) {
                 if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
                 mtp.set_cum_th(cum_adapt.th());
                 const bool drafted = eos || produced_n >= max_new || !mtp_on ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -8860,7 +8845,6 @@ int main(int argc, char** argv) {
                     sl.script = std::move(bscript[(size_t) admit_slot].first);
                     sl.rng.seed(bscript[(size_t) admit_slot].second);
                     bscript[(size_t) admit_slot].first.clear();
-                    sl.min_p = req_spec_min_p;
                     if (batch_spec && o.suffix_draft > 0) {
                         sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, o.suffix_draft), 64,
                                                                                (size_t) o.max_context + 4096);
@@ -9276,9 +9260,9 @@ int main(int argc, char** argv) {
         while ((int64_t) produced.size() < o.max_new) {
             const Clock::time_point t0 = Clock::now();
             int T = S_mtp;
-            if (use_mtp && o.spec_min_p > 0.0) {
+            if (use_mtp) {
                 T = 1;
-                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, (float) o.spec_min_p, cum_adapt.th())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;
@@ -9355,7 +9339,7 @@ int main(int argc, char** argv) {
             if (use_mtp && !from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
             if (use_mtp) mtp.set_cum_th(cum_adapt.th());
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -9378,11 +9362,9 @@ int main(int argc, char** argv) {
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
-        if (o.spec_min_p > 0.0) {
-            std::printf("%-24s", "window sizes");
-            for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
-            std::printf("  (min draft probability %.2f)\n", o.spec_min_p);
-        }
+        std::printf("%-24s", "window sizes");
+        for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
+        std::printf("  (cumulative draft rule)\n");
         if (o.suffix_draft > 0)
             std::printf("%-24s %lld windows, drafts accepted %lld of %lld\n", "suffix drafts", (long long) sfx_windows,
                         (long long) sfx_ok, (long long) sfx_drafts);

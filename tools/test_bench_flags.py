@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("BASALT_BIN", ROOT / "bin" / "basalt"))
 BENCH = Path(os.environ.get("BASALT_BENCH_BIN", ROOT / "bin" / "basalt-bench"))
 # bench's own options that share an engine flag's name
-BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--spec-min-p", "--set"}
+BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set"}
 
 
 def engine_flags() -> list[str]:

@@ -339,7 +339,7 @@ struct Options {
     std::string engine, model, fixtures = BASALT_BENCH_FIXTURES, format = "md", logs, kld_base, power_label;
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
-    std::string spec, spec_min_p;        // --spec N, --spec-min-p P: engine arguments of the same names
+    std::string spec;                    // --spec N: the engine argument of the same name
     std::vector<std::string> decode;     // -t: conv, struct, prose
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
@@ -361,7 +361,7 @@ void usage(const std::string& engine) {
         "  -r N               repetitions of the whole set (default 1); with N > 1 the table shows mean +- stddev\n"
         "                     and the first repetition is the cold one\n"
         "  --quality [N]      the quality gate on N chunks (default 20): PPL / KLD / top-1 against --kld-base,\n"
-        "                     through the decode path, adaptation off, --spec 5 --spec-min-p 0.7. Alone it runs\n"
+        "                     through the decode path, adaptation off, --spec 5. Alone it runs\n"
         "                     only the gate; with -p / -t it runs after them\n"
         "  --kld-base FILE    llama.cpp KL-divergence base for the quality gate\n"
         "  --quality-t T      tokens per verify window in the quality gate (default 3)\n"
@@ -372,13 +372,11 @@ void usage(const std::string& engine) {
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
         "  --engine BIN       engine binary (default: the one built with this program)\n"
         "  --set \"F V ...\"    FLAG VALUE pairs that replace or add engine arguments (repeatable)\n"
-        "  --spec N           speculation window for the engine (--spec N); without it, and without --spec after --,\n"
+        "  --spec N           speculation window for the engine (--spec N, e.g. 7; also --spec after --); without it\n"
         "                     the run has no speculation (--spec 0): a clean baseline\n"
-        "  --spec-min-p P     the draft cutoff (--spec-min-p P); with N >= 2 and no cutoff given, 0.5\n"
-        "                     MTP: --spec 7 --spec-min-p 0.5 (or -- --spec 7 --spec-min-p 0.5)\n"
         "  -- ARGS...         the same engine arguments, after --: replacing and adding flags\n"
         "  built in (only what the measurement needs, each replaced by giving the flag): --spec 0, --max-context sized\n"
-        "  to the fixtures, --spec-min-p 0.5 when --spec is 2 or more\n"
+        "  to the fixtures\n"
         "\n"
         "output\n"
         "  -o md|json         a markdown table (default), or the full detail as JSON on stdout: per-repetition\n"
@@ -521,7 +519,6 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         } else if (a == "--model") o.model = next("--model");
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--spec") o.spec = next("--spec");
-        else if (a == "--spec-min-p") o.spec_min_p = next("--spec-min-p");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "-o") o.format = next("-o");
         else if (a == "--power-label") o.power_label = next("--power-label");
@@ -824,12 +821,9 @@ int main(int argc, char** argv) {
     }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
     if (!o.spec.empty()) set_arg(args, "--spec", o.spec);
-    if (!o.spec_min_p.empty()) set_arg(args, "--spec-min-p", o.spec_min_p);
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
     else merge_args(args, o.passthrough);
     if (!has_arg(args, "--spec")) set_arg(args, "--spec", "0");
-    if (!has_arg(args, "--spec-min-p") && std::atoi(arg_value(args, "--spec").c_str()) >= 2)
-        set_arg(args, "--spec-min-p", "0.5");
 
     // fixtures, read before anything is started
     std::vector<std::vector<int64_t>> decode_ids(3);
@@ -1020,7 +1014,6 @@ int main(int argc, char** argv) {
         } else {
             std::vector<std::string> qa = args;
             set_arg(qa, "--spec", "5");
-            set_arg(qa, "--spec-min-p", "0.7");
             set_arg(qa, "--adapt-swaps", "0");
             set_arg(qa, "--peer-adapt-swaps", "0");
             // the gate must run on every pack: without this a pack larger than free RAM is refused
