@@ -13,6 +13,7 @@ import uuid
 import queue
 from pathlib import Path
 
+from serve.engine import lifeline
 from serve.engine.flags import flag_value
 from serve.engine.process import frame_pipes
 
@@ -42,8 +43,8 @@ class Vision:
     def _start(self):
         args, log, env = self.spawn
         t0 = time.time()
-        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
-                                     text=True, encoding="utf-8", bufsize=1, env=env)
+        self.proc = lifeline.popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
+                                   text=True, encoding="utf-8", bufsize=1, env=env)
         frame_pipes(self.proc, False)
         try:
             line = self._readline(VISION_READY_S, "the vision encoder did not start")
