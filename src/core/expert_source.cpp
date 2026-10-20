@@ -37,14 +37,48 @@ namespace basalt::core {
 
 namespace detail {
 
+bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat) {
+    stat = CgroupMemoryStat{};
+    bool inactive_file = false, file_dirty = false, file_writeback = false, file = false;
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream fields(line);
+        std::string key;
+        uint64_t value = 0;
+        if (!(fields >> key >> value)) return false;
+        fields >> std::ws;
+        if (!fields.eof()) return false;
+
+        auto take = [&](bool& seen, uint64_t& out) {
+            if (seen) return false;
+            seen = true;
+            out = value;
+            return true;
+        };
+        if (key == "file") { if (!take(file, stat.file)) return false; }
+        else if (key == "inactive_file") { if (!take(inactive_file, stat.inactive_file)) return false; }
+        else if (key == "file_dirty") { if (!take(file_dirty, stat.file_dirty)) return false; }
+        else if (key == "file_writeback") { if (!take(file_writeback, stat.file_writeback)) return false; }
+    }
+    if (!inactive_file || !file_dirty || !file_writeback) return false;
+    stat.current = current;
+    stat.valid = true;
+    return true;
+}
+
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes) {
     bytes = 0;
     if (!stat.valid) return false;
 
-    // memory.stat's inactive_file can race memory.current, so bound it to charged usage first.
-    uint64_t reclaimable = std::min(stat.inactive_file, stat.current);
+    // Clean file pages are reclaimable.  The page cache is the active and inactive lists together (`file`; the
+    // inactive list alone when the file total is not reported), because the container's own reads move pages to
+    // the active list.  The counters can race memory.current, so bound them to charged usage first.
+    uint64_t reclaimable = std::min(std::max(stat.file, stat.inactive_file), stat.current);
     reclaimable = stat.file_dirty >= reclaimable ? 0 : reclaimable - stat.file_dirty;
     reclaimable = stat.file_writeback >= reclaimable ? 0 : reclaimable - stat.file_writeback;
+    // Keep a margin: part of the cache is mapped or locked and does not come back on demand.
+    reclaimable -= std::min(reclaimable / 2, limit / 64);
 
     // Reclaiming clean file pages reduces usage; saturating subtraction also handles a transient over-limit read.
     const uint64_t usage_after_reclaim = stat.current - reclaimable;
@@ -170,35 +204,9 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
                              detail::CgroupMemoryStat& stat) {
     std::ifstream input(path / "memory.stat");
     if (!input) return false;
-
-    bool inactive_file = false, file_dirty = false, file_writeback = false;
-    std::string line;
-    while (std::getline(input, line)) {
-        std::istringstream fields(line);
-        std::string key;
-        uint64_t value = 0;
-        if (!(fields >> key >> value)) return false;
-        fields >> std::ws;
-        if (!fields.eof()) return false;
-
-        if (key == "inactive_file") {
-            if (inactive_file) return false;
-            inactive_file = true;
-            stat.inactive_file = value;
-        } else if (key == "file_dirty") {
-            if (file_dirty) return false;
-            file_dirty = true;
-            stat.file_dirty = value;
-        } else if (key == "file_writeback") {
-            if (file_writeback) return false;
-            file_writeback = true;
-            stat.file_writeback = value;
-        }
-    }
-    if (!input.eof() || !inactive_file || !file_dirty || !file_writeback) return false;
-    stat.current = current;
-    stat.valid = true;
-    return true;
+    std::ostringstream text;
+    text << input.rdbuf();
+    return text.good() && detail::parse_cgroup_memory_stat(text.str(), current, stat);
 }
 
 // cgroup v1's memory.stat: the group's hierarchical counters (total_*), the same allowance as v2's.  False when the
@@ -208,13 +216,15 @@ bool read_cgroup_v1_memory_stat(const std::filesystem::path& path, uint64_t usag
     if (!input) return false;
     bool inactive_file = false;
     std::string key;
-    uint64_t value = 0;
+    uint64_t value = 0, active_file = 0;
     while (input >> key >> value) {
         if (key == "total_inactive_file") { stat.inactive_file = value; inactive_file = true; }
+        else if (key == "total_active_file") active_file = value;
         else if (key == "total_dirty") stat.file_dirty = value;
         else if (key == "total_writeback") stat.file_writeback = value;
     }
     if (!inactive_file) return false;
+    stat.file = stat.inactive_file + active_file;
     stat.current = usage;
     stat.valid = true;
     return true;
@@ -2102,7 +2112,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     // its pages are committed as the load writes them, so a container whose memory limit is below the arena would be
     // killed by the OOM killer part-way through the load, without a message.  A hard cgroup limit below it is certain
     // to end that way: refused, with the numbers.  Less RAM available than the arena (another program, an engine
-    // still exiting) is only a warning - the OS may make room.
+    // still exiting) is refused as well, with the numbers: the arena is locked resident, so the room is needed up front.
     ram_warning_.clear();
     // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
     if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {

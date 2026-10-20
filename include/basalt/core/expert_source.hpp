@@ -60,9 +60,14 @@ struct CgroupMemoryStat {
     uint64_t file_dirty = 0;
     uint64_t file_writeback = 0;
     bool valid = false;
+    uint64_t file = 0;  // page cache, active + inactive; 0 when memory.stat does not report it
 };
 
-/// Calculate additional bytes under a finite cgroup limit after reclaiming only clean inactive file cache.
+/// Parse a cgroup-v2 memory.stat text (inactive_file, file_dirty, file_writeback required; file optional).
+/// False on a malformed or incomplete text.
+bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat);
+
+/// Calculate additional bytes under a finite cgroup limit after reclaiming clean file cache.
 /// Returns false when the required memory.stat counters were unavailable.
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
 
