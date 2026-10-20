@@ -63,6 +63,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
   # nvcc takes host-compiler options through -Xcompiler, and this reaches every CUDA target.
   string(APPEND CMAKE_CUDA_FLAGS " -Xcompiler=/Zc:__cplusplus")
+  # CUDA 13.2's CCCL headers reject cl.exe's traditional preprocessor (C1189); gate on nvcc's host so a non-cl host stays out.
+  if(NOT CMAKE_CUDA_HOST_COMPILER OR CMAKE_CUDA_HOST_COMPILER MATCHES "(^|[/\\\\])cl(\\.exe)?$")
+    string(APPEND CMAKE_CUDA_FLAGS " -Xcompiler=/Zc:preprocessor")
+  endif()
 endif()
 
 # Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied

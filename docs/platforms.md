@@ -70,3 +70,7 @@ ctest --test-dir build -L cpu -j 8 --output-on-failure
 
 If tests fail to create fixtures, point `TEMP` and `TMP` at a directory inside the build tree.
 `cpu_quota_test` and `pool_affinity_test` exercise Linux-only surfaces and are not built.
+
+CUDA 13.2 and later ship CCCL headers that `#error` under cl.exe's traditional preprocessor (C1189); the
+CMakeLists hands `/Zc:preprocessor` to nvcc's host compiler, verified on CUDA 13.4 and MSVC 19.44.
+Anything compiling these headers outside this CMakeLists needs the same flag.
