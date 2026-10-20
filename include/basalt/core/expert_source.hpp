@@ -347,7 +347,7 @@ struct ExpertDispatch {
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
-    /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
+    /// (the PCIe share, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off), which the driver

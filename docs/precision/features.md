@@ -112,7 +112,7 @@ configuration, same prompt order. A logit-hash diagnostic prints an FNV-1a hash 
 of every accepted row. Token ids and the hash at each generated position are compared between `--spec 0` and
 `--spec 7 --spec-min-p 0.5`.
 
-Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0 --pcie-frac 0`, with `--expert-cache` and `--peer-slots`
+Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with `--expert-cache` and `--peer-slots`
 fixed to the sizes auto-sizing picks), so the same experts sit on the same device in both runs.
 
 | Pack | Prompts | Identical tokens | Logit rows compared | Bit-identical rows | First divergence | Accepted drafts | Decode tok/s, spec 0 → spec 7 |

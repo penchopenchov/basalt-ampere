@@ -99,8 +99,6 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `split-skip-if-fits` | engine | switch | off | Advanced. With `layer-split auto`, run on the first card alone when it holds every profiled expert, the session, the drafter and the reserve; a split then only adds hand-offs. |
 | `batch-groups` | engine | integer | 1 | Advanced. With `parallel` and `layer-split`, put the slots in this many groups pipelined through the GPUs; must divide the slot count. |
 | `trim-stage-weights` | engine | switch | off | Advanced. With an explicit `layer-split` list, each GPU loads only its own layers' dense weights. |
-| `pcie-frac` | engine | number 0..1 | 0.55, scaled down on a slow link | The share of each layer's missed experts the GPU reads over PCIe from the pinned RAM copy while the CPU computes the rest. `0` keeps every miss on the CPU (used to pin placement in identity checks). |
-| `pcie-mode` | engine | `auto`, `dma`, `kernel`, `direct` | `auto` (= `kernel`) | How that share reaches the GPU: `dma` copies through staging with the copy engine, `kernel` stages it with a copy kernel inside the graph, `direct` has the grouped kernel read the mapped arena. |
 
 ## Context and KV cache
 

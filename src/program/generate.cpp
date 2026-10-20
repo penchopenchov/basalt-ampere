@@ -487,9 +487,8 @@ struct Options {
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
     /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the pinned arena while the
-    /// CPU computes the rest (verify windows).
-    double pcie_frac = -1.0;   ///< < 0: the default (0.55), scaled down on a slow link
-    std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
+    /// CPU computes the rest (host-planned verify windows).  Set from the startup link probe.
+    double pcie_frac = -1.0;
     /// Every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into the VRAM tier in
     /// place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
@@ -798,12 +797,6 @@ void usage() {
                  "                       left after the weights, the session and --vram-reserve-mib\n"
                  "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
                  "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
-                 "  --pcie-frac F        the share (0..1) of each layer's missed experts the GPU reads over PCIe from\n"
-                 "                       the pinned RAM copy while the CPU computes the rest (default 0.55, scaled\n"
-                 "                       down on a slow link; 0 keeps every miss on the CPU)\n"
-                 "  --pcie-mode auto|dma|kernel|direct  how that share reaches the GPU: dma = copy engine into staging,\n"
-                 "                       kernel = a copy kernel inside the graph, direct = the grouped kernel reads the\n"
-                 "                       mapped arena; auto (default) = kernel\n"
                  "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
@@ -1278,6 +1271,10 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// How the PCIe share reaches the GPU: a copy kernel stages it inside the graph, so the host makes no CUDA call in a
+// verify window (a copy-engine call there can block on a driver lock for good).
+constexpr int kPcieModeKernel = 2;
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1438,7 +1435,6 @@ int main(int argc, char** argv) {
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
-        else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
         else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
@@ -1460,7 +1456,6 @@ int main(int argc, char** argv) {
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
-        else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--vision-mmproj") { o.vision_mmproj = next("--vision-mmproj"); o.vision = true; }
@@ -1657,9 +1652,6 @@ int main(int argc, char** argv) {
     // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across
     // GPUs, not supported: control vectors, the helper caches (--expert-cache-remote), and lending cache slots to the
     // prompt path (each stage's prompt path has its own buffers).
-    // --pcie-frac given: that one share is every stage's (the stages' own link probes are skipped), so a split over
-    // a fast and a slow link cannot set the two apart from the command line
-    const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
     bool split_auto = false, split_same = false;
@@ -2739,10 +2731,9 @@ int main(int argc, char** argv) {
             }
             basalt::kernels::mrope_table_set(st.mrope);
         }
-        // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed).  A given
-        // --pcie-frac is every stage's share and skips these probes (pcie_given); there is no per-stage setting yet.
+        // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed)
         st.pcie_frac = o.pcie_frac;
-        if (!pcie_given) {
+        {
             std::string bursts;
             const double bw = probe_pcie_h2d_gbps(&bursts);
             if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
@@ -5212,7 +5203,7 @@ int main(int argc, char** argv) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
-                stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver(st).set_pcie_mode(kPcieModeKernel);
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
@@ -5222,7 +5213,7 @@ int main(int argc, char** argv) {
         // auto: the copy kernel for every pack.  DMA has the host call cudaMemcpyAsync + cudaLaunchHostFunc inside a
         // verify window while the GPU spins on the flag they raise, and the host can get stuck in that cudaMemcpyAsync
         // on a driver lock for good.  The copy kernel needs no host CUDA call there.
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_mode(kPcieModeKernel);
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens it
         // has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the saved
@@ -7254,9 +7245,7 @@ int main(int argc, char** argv) {
             std::string req_bias_text;   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
             bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
-            // tuning keys (calibration can measure settings without restarting the engine): the PCIe share of
-            // the missed experts and the draft-probability floor, for this request only
-            double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            double req_spec_min_p = o.spec_min_p;
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed
@@ -7284,7 +7273,6 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "relax") req_relax = std::clamp(fv, 0.0f, 1.0f);
                     else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
@@ -8216,10 +8204,10 @@ int main(int argc, char** argv) {
             for (size_t i = ids.size(); i-- > 0;)
                 if (ids[i] == o.relax_call_open || ids[i] == o.relax_call_close) { in_call = ids[i] == o.relax_call_open; break; }
             int64_t relaxed_kept = 0;
-            drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
-            // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
+            drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+            // a layer split: CUDA0's share; a later GPU keeps its own (its link)
             for (int st = 0; st < split_drive.n; ++st)
-                split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
+                split_drive.pcie_num[st] = (st == 0 || split_same)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
@@ -8951,8 +8939,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "basalt serve: relaxed drafting %.2f: %lld of the %lld accepted drafts were kept by it\n",
                              (double) req_relax, (long long) relaxed_kept, (long long) draft_accepted);
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU to
-            // read (--pcie-frac) are in neither count, so that share is said beside it (raising --pcie-frac raises the
-            // hit rate while the PCIe reads may make the decode slower)
+            // read are in neither count, so that share is said beside it
             if (req_look > 0) {
                 char off[160] = "";
                 if (req_offload > 0)
@@ -9163,7 +9150,7 @@ int main(int argc, char** argv) {
         // auto: the copy kernel for every pack.  DMA has the host call cudaMemcpyAsync + cudaLaunchHostFunc inside a
         // verify window while the GPU spins on the flag they raise, and the host can get stuck in that cudaMemcpyAsync
         // on a driver lock for good.  The copy kernel needs no host CUDA call there.
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_mode(kPcieModeKernel);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

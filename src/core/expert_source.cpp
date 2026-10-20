@@ -953,7 +953,7 @@ bool FileExpertSource::pin_cache_complement(
             if (pin) {
                 // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
                 // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
-                // read by the GPU over PCIe (--pcie-frac) and copied by DMA; only the rest is locked in the working
+                // read by the GPU over PCIe (the PCIe share) and copied by DMA; only the rest is locked in the working
                 // set (the registered prefix is page-locked by the driver already - locking it twice made the next
                 // device allocation fail).
                 lock_off = partial_pin;
