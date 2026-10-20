@@ -300,11 +300,6 @@ public:
     /// Split the window into two token groups and pipeline the CPU experts of one with the GPU work of the other
     /// (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
-    /// How the PCIe share of the misses reaches the GPU: 0 = DMA into staging (the copy engine works beside the CPU;
-    /// best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped arena directly,
-    /// 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when the CPU is
-    /// RAM-bound, Q2_0).  Set before the first `run`.
-    void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     double ms_launch = 0;   ///< host time inside the window graph's launch
@@ -411,7 +406,6 @@ private:
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
-    bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     double prof_graph0_ = 0;                        // the graph's start to layer 0's first stamp (ns, summed)
@@ -484,10 +478,7 @@ private:
     bool commit_begun() const;                       ///< the begin kernel of the last async commit has run
     void order_after_commit();                       ///< a launch on cs_ outside the solo windows follows the async commit
     basalt::kernels::GdnCommitLayers commit_gdn_args() const;
-    cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
-    struct FlagSet { uint32_t* flag; uint32_t value; };
-    FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
-    static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
+    static void raise_flag_b(void* ctx);
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block

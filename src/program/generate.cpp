@@ -1267,10 +1267,6 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
-// How the PCIe share reaches the GPU: a copy kernel stages it inside the graph, so the host makes no CUDA call in a
-// verify window (a copy-engine call there can block on a driver lock for good).
-constexpr int kPcieModeKernel = 2;
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -5196,19 +5192,12 @@ int main(int argc, char** argv) {
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
-            if (st > 0) {
-                stage_ver(st).set_split(o.spec_split);
-                stage_ver(st).set_pcie_mode(kPcieModeKernel);
-            }
+            if (st > 0) stage_ver(st).set_split(o.spec_split);
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const basalt::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         ver.set_split(o.spec_split);
-        // auto: the copy kernel for every pack.  DMA has the host call cudaMemcpyAsync + cudaLaunchHostFunc inside a
-        // verify window while the GPU spins on the flag they raise, and the host can get stuck in that cudaMemcpyAsync
-        // on a driver lock for good.  The copy kernel needs no host CUDA call there.
-        ver.set_pcie_mode(kPcieModeKernel);
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens it
         // has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the saved
@@ -9131,10 +9120,6 @@ int main(int argc, char** argv) {
         if (use_mtp) mtp.set_draft_sampling(sp);   // sampled drafts (a no-op without --coupled-draft)
         if (use_mtp) mtp.begin_request(o.tokens.data(), (int64_t) o.tokens.size());
         ver.set_split(o.spec_split);
-        // auto: the copy kernel for every pack.  DMA has the host call cudaMemcpyAsync + cudaLaunchHostFunc inside a
-        // verify window while the GPU spins on the flag they raise, and the host can get stuck in that cudaMemcpyAsync
-        // on a driver lock for good.  The copy kernel needs no host CUDA call there.
-        ver.set_pcie_mode(kPcieModeKernel);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

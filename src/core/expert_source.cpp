@@ -1721,7 +1721,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
-        const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
@@ -1741,7 +1740,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
-                            dma_src[fetches] = src;
                             pcie_i0[fetches] = i0;
                             ++fetches;
                         }
@@ -1763,11 +1761,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++groups;
         }
         P.start[groups] = entries;
-        const uint64_t bb = lay.blob_bytes(d.layers);
-        for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
+        for (int q = 0; q < fetches; ++q) {       // the PCIe groups: the arena alias, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
-            P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
-                                 : P.staging + (unsigned long long) q * (unsigned long long) bb;
+            P.ptr2[q] = (unsigned long long) d.src->device_alias(d.layers, ids[i0]);
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
                 if (first_of[i] == i0) {
@@ -1783,7 +1779,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[2] = fetches;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (P.publish) P.publish(P.ctx);
-        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        if (P.staged) P.staged(P.ctx);
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];

@@ -406,7 +406,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     _mm_sfence();
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
-    for (cudaStream_t s : {cs_, copy_}) {
+    for (cudaStream_t s : {cs_}) {
         if (s == nullptr) continue;
         while (cudaStreamQuery(s) == cudaErrorNotReady) {
             if (ms_since(t0) > timeout_ms) {
@@ -741,7 +741,6 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (ev_ring_) cudaEventDestroy(ev_ring_);
     if (ev_ring_join_) cudaEventDestroy(ev_ring_join_);
-    if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
@@ -970,7 +969,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.start2 = h_plan_ + ptr_off + 4 * cap;
         sink_.cap = cap;
         sink_.publish = &Verifier::publish_plan;
-        sink_.fetch = &Verifier::fetch_dma;
+        sink_.staged = &Verifier::raise_flag_b;
         sink_.ctx = this;
     }
 
@@ -1032,13 +1031,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
-    sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
-    if (cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) {
-        err = "verify: copy stream create failed";
-        return false;
-    }
     int cs_least = 0, cs_greatest = 0;
     cudaDeviceGetStreamPriorityRange(&cs_least, &cs_greatest);
     const int cs_prio = main_high_ ? cs_greatest : 0;
@@ -2068,8 +2062,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe groups are planned
+            {   // stage them with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
@@ -2955,10 +2949,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // and a finished event is noticed here at no cost
     if (commit_pending_ && cudaEventQuery(commit_done_) == cudaSuccess) commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
-    if (copy_used_) {
-        cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
-        copy_used_ = false;
-    }
     gm.mark(0);
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
     gm.mark(1);
@@ -3003,31 +2993,20 @@ void Verifier::set_plan_slot(int grp) {
     sink_.start2 = base + ptr_off + 4 * cap;
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * basalt::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
 }
 
-// Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
+// Flag B only rises.
 void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
     std::atomic_ref<uint32_t> f(*flag);
     uint32_t cur = f.load();
     while (cur < value && !f.compare_exchange_strong(cur, value)) {}
 }
 
-// The PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the GPU its VRAM
-// experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe groups).
-// Staging is split between the two token groups of a split window.
-void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
+// The PCIe groups are planned: raise flag B for the layer (the graph waits for it before staging them).
+void Verifier::raise_flag_b(void* ctx) {
     Verifier* v = (Verifier*) ctx;
-    const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
-    v->copy_used_ = true;
-    uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
-    for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
-    FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
-    fs.flag = v->h_flagB_;
-    fs.value = want;
-    cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+    raise_flag(v->h_flagB_, v->cur_layer_ + 1);
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -3529,7 +3508,6 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (dm && !dm_end(err)) return false;
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-    cudaStreamSynchronize(copy_);
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_segs(rows, lens, S, tokens, pos, pool, next_user_, out, err);
@@ -3678,8 +3656,6 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     const cudaError_t q = cudaStreamQuery(cs_);
     if (q == cudaErrorNotReady) return 0;
     if (q != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(q); b_running_ = false; return -1; }
-    const cudaError_t qc = cudaStreamQuery(copy_);   // no host function of this window may raise flag B in the next
-    if (qc == cudaErrorNotReady) return 0;
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }

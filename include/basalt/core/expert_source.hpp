@@ -216,22 +216,17 @@ struct GpuPlanSink {
     int32_t* dst = nullptr;                ///< cap: the entry's row of parts (token * k + j)
     int32_t* tok = nullptr;                ///< cap: the entry's token
     unsigned long long* ptr = nullptr;     ///< cap: the group's blob, device address
-    /// (DMA): the PCIe share is a second list of groups - `ptr2[q]` is staging slot q, `start2` indexes the same
-    /// dst/tok entries - computed by the GPU after `fetch` has copied their blobs into staging with the copy engine.
+    /// The PCIe share is a second list of groups - `ptr2[q]` is the blob's device alias in the mapped arena, `start2`
+    /// indexes the same dst/tok entries - staged by a copy kernel inside the graph, then computed by the GPU.
     /// counts[0] = VRAM groups, counts[1] = all entries, counts[2] = PCIe groups.
     unsigned long long* ptr2 = nullptr;
     int32_t* start2 = nullptr;
-    unsigned long long staging = 0;
     int64_t staging_cap = 0;
     int64_t cap = 0;
     void (*publish)(void* ctx) = nullptr;
-    /// Starts the DMA copies of `n` host blobs (pinned) into staging slots 0..n-1 and signals the GPU when they land.
-    void (*fetch)(void* ctx, const uint8_t* const* src, int n, size_t bytes) = nullptr;
+    /// Raises flag B: the PCIe groups of this layer are planned and the graph may stage them.
+    void (*staged)(void* ctx) = nullptr;
     void* ctx = nullptr;
-    /// How a PCIe group reaches the GPU.  0 = the copy engine stages it (DMA, `fetch`); 1 = the grouped kernel reads
-    /// the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2` holds the arena's
-    /// device alias.
-    int pcie_mode = 0;
     /// the window planned this layer on the device; ext_kind[i] is entry i's tier (0 CUDA0, 2 the peer, -1 the CPU).
     /// The pool then computes only the CPU entries, publishes no plan and launches no peer.
     const int32_t* ext_kind = nullptr;

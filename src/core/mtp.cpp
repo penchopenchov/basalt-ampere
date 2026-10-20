@@ -1480,6 +1480,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
     h_row_[0] = a;
     h_row_[1] = 0;
+    // slot 2 is reserved: the row layout is fixed by the graphs that copy it
     const float cum_th = cum_th_ >= 0.0f ? cum_th_ : draft_cum_base();
     std::memcpy(&h_row_[3], &cum_th, sizeof(float));   // the window's threshold, read by the conditional graph
     std::atomic_thread_fence(std::memory_order_seq_cst);
