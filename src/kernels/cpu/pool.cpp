@@ -50,6 +50,7 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, "  expert pool: epoch %u, batch epoch %u: %u of %u jobs claimed, %u done; %u of %d workers parked, "
                     "%u sleeping; mode %d\n", epoch_.load(), (uint32_t) (h >> 32), (uint32_t) h & 0xffffu,
                  (uint32_t) (h >> 16) & 0xffffu, done_.load(), parked_.load(), n_, sleepers_.load(), mode_);
+    std::fprintf(f, "  expert pool active workers: %d\n", active_.load());
     std::fprintf(f, "  expert pool threads:");
     for (int i = 0; i < n_; ++i) {
         const int32_t s = wstate_[(size_t) i].load();
@@ -86,6 +87,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         }
     }
     if (n_ < 1) n_ = 1;
+    active_.store(n_);
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
@@ -164,6 +166,8 @@ void ExpertPool::worker(int id) {
         if (stop_.load(std::memory_order_acquire)) return;
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
         seen = epoch_.load(std::memory_order_acquire);
+        // An inactive worker stays counted as parked and claims nothing; it just waits for the next epoch.
+        if (id >= active_.load(std::memory_order_acquire)) continue;
         parked_.fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
 
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
@@ -254,7 +258,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
         if (mode_ == 7) {
-            idle_fn_(idle_ctx_, (int) i, n_, idle_halt_);
+            idle_fn_(idle_ctx_, (int) i, active_.load(std::memory_order_relaxed), idle_halt_);
         } else if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
@@ -327,6 +331,14 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
+int ExpertPool::set_active_workers(int k) {
+    k = (std::min)((std::max)(k, 1), n_);
+    idle_stop();
+    wait_parked("before changing the active workers");
+    active_.store(k, std::memory_order_release);
+    return k;
+}
+
 void ExpertPool::idle_start(IdleFn fn, void* ctx) {
     if (n_ == 1 || fn == nullptr) return;
     idle_stop();
@@ -335,8 +347,9 @@ void ExpertPool::idle_start(IdleFn fn, void* ctx) {
     idle_ctx_ = ctx;
     idle_halt_.store(false, std::memory_order_relaxed);
     mode_ = 7;
-    njobs_ = n_;
-    begin_batch(n_);   // the host does not drain it
+    const int act = active_.load(std::memory_order_relaxed);
+    njobs_ = act;
+    begin_batch(act);   // the host does not drain it
     idle_live_ = true;
 }
 
@@ -378,7 +391,7 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     if (n > kMaxSplit || n_ == 1 || expert_oracle_q8_0_enabled()) { run(jobs, n); return; }
     const auto t0 = std::chrono::steady_clock::now();
     jobs_ = jobs;
-    const int threads = n_ + (host_works_ ? 1 : 0);
+    const int threads = active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0);
     // about three tasks per thread in each phase, so the tail is short
     parts_a_ = (std::max)(1, (3 * threads + n - 1) / n);
     parts_b_ = parts_a_;
@@ -408,7 +421,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
-    const int threads = n_ + (host_works_ ? 1 : 0);
+    const int threads = active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0);
     mtasks_ = 3 * threads;
     mrows_ = (int64_t) n * FF;
     run_phase(3, mtasks_);
@@ -436,7 +449,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
-        const int threads = n_ + (host_works_ ? 1 : 0);
+        const int threads = active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0);
         mtasks_ = 3 * threads;
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();

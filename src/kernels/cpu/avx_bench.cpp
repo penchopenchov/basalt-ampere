@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
             rd.done.store(0);
             t0 = std::chrono::steady_clock::now();
             pool.idle_start(read_fn, &rd);
-            while (rd.done.load() < pool.workers()) {}
+            while (rd.done.load() < pool.active_workers()) {}
             readus.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
             t0 = std::chrono::steady_clock::now();
             pool.run_split_multi_native(f, &job, 1);
@@ -292,6 +292,23 @@ int main(int argc, char** argv) {
         std::printf("NVFP4 expert via the pool (%d workers + host, %.2f MB): cold %.1f us (%.1f GB/s)   idle read %.1f us   "
                     "after the read %.1f us\n", pool.workers(), f.bytes / 1e6, med(cold), f.bytes / (med(cold) * 1e3),
                     med(readus), med(warm));
+        // the same cold expert at each active worker count
+        std::vector<int> cs;
+        for (int k = 1; k < pool.workers(); k *= 2) cs.push_back(k);
+        cs.push_back(pool.workers());
+        for (int k : cs) {
+            pool.set_active_workers(k);
+            std::vector<double> us;
+            for (int it = 0; it < 40; ++it) {
+                job.blob = base + stride * (size_t) (pick++ % NB);
+                const auto t0 = std::chrono::steady_clock::now();
+                pool.run_split_multi_native(f, &job, 1);
+                us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            }
+            std::printf("NVFP4 expert, %3d active workers + host: cold %.1f us (%.1f GB/s)\n", k, med(us),
+                        f.bytes / (med(us) * 1e3));
+        }
+        pool.set_active_workers(pool.workers());
     }
     return 0;
 }

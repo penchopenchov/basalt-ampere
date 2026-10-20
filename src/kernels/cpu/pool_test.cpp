@@ -15,6 +15,7 @@
 //      nothing and `n > workers` is the real case (10 experts, 5 workers).
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/platform/file.hpp"
 
 #include <algorithm>
@@ -192,6 +193,102 @@ int main(int argc, char** argv) {
         std::printf("  %-44s %s (1, w-1, w, w+1, 10)\n", "batch sizes around the worker count",
                     size_bad ? "*** NO ***" : "yes");
         if (size_bad) ++bad;
+    }
+
+    // ---- 5: the active worker count changes live.  1, 2, half, all, and back, with batches in between; every output
+    //        is bit-identical to the serial run at every count, for whole-expert jobs and for the row-split ones.
+    {
+        const int W = pool.workers();
+        std::vector<int> counts = {1, 2, (std::max)(1, W / 2), W, 1, W, (std::max)(1, W / 2), 2, W};
+        int count_bad = 0, wrong_count = 0;
+        for (int k : counts) {
+            const int in_effect = pool.set_active_workers(k);
+            if (in_effect != (std::min)(k, W) || pool.active_workers() != in_effect) ++wrong_count;
+            for (int rep = 0; rep < 20; ++rep) {
+                for (int mode = 0; mode < 2; ++mode) {
+                    for (int e = 0; e < NEXP; ++e) std::fill(jobs[(size_t) e].out, jobs[(size_t) e].out + cpu::H, SENTINEL);
+                    if (mode == 0) pool.run(jobs.data(), NEXP);
+                    else pool.run_split(jobs.data(), NEXP);
+                    if (std::memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) != 0) ++count_bad;
+                }
+            }
+        }
+        std::printf("  %-44s %s (counts 1, 2, half, all and back; run and run_split)\n",
+                    "bitwise at every active worker count", (count_bad || wrong_count) ? "*** NO ***" : "yes");
+        if (count_bad || wrong_count) ++bad;
+        pool.set_active_workers(W);
+    }
+
+    // ---- 6: one NVFP4 expert (real geometry) at every count, against a plain serial CPU reference
+    {
+        cpu::NativeFmt f;
+        std::string ferr;
+        constexpr int kNvfp4 = 40, kBlock = 36;
+        if (!cpu::native_fmt(kNvfp4, kNvfp4, cpu::H, cpu::FF, f, ferr) || f.gu_row % kBlock != 0) {
+            std::printf("  %-44s SKIPPED (%s)\n", "NVFP4 expert at every active worker count", ferr.c_str());
+        } else {
+            std::vector<uint8_t> nb(f.bytes);
+            std::mt19937_64 r64(7);
+            for (size_t i = 0; i + 8 <= nb.size(); i += 8) { const uint64_t v = r64(); std::memcpy(nb.data() + i, &v, 8); }
+            for (size_t b = 0; b + kBlock <= nb.size() - cpu::kNvfp4Tail; b += kBlock)
+                for (int k = 0; k < 4; ++k) nb[b + (size_t) k] = (uint8_t) (0x30 + (nb[b + (size_t) k] & 7));
+            const float tail[4] = {1.f, 1.f, 1.f, 0.f};
+            std::memcpy(nb.data() + f.bytes - sizeof tail, tail, sizeof tail);
+            std::vector<uint8_t> nact(cpu::kNativeActBytes), hq(cpu::kNativeHBytes);
+            cpu::native_quant_act(f, x.data(), nact.data());
+            std::vector<float> ff(cpu::FF), nref(cpu::H), nout(cpu::H);
+            {
+                const void* a[1] = {nact.data()};
+                float* fp[1] = {ff.data()};
+                cpu::native_gu_rows(f, nb.data(), a, 1, fp, 0, cpu::FF);
+                cpu::native_quant_h(f, ff.data(), hq.data());
+                const void* h[1] = {hq.data()};
+                float* op[1] = {nref.data()};
+                cpu::native_down_rows(f, nb.data(), h, 1, op, 0, cpu::H);
+            }
+            cpu::ExpertJobMulti mj;
+            mj.blob = nb.data();
+            mj.nt = 1;
+            mj.nact[0] = nact.data();
+            mj.out[0] = nout.data();
+            const int W = pool.workers();
+            int nbad = 0;
+            for (int k : {1, 2, (std::max)(1, W / 2), W, 1, W}) {
+                pool.set_active_workers(k);
+                for (int rep = 0; rep < 10; ++rep) {
+                    std::fill(nout.begin(), nout.end(), SENTINEL);
+                    pool.run_split_multi_native(f, &mj, 1);
+                    if (std::memcmp(nref.data(), nout.data(), nout.size() * sizeof(float)) != 0) ++nbad;
+                }
+            }
+            std::printf("  %-44s %s\n", "NVFP4 expert, every count, vs serial CPU", nbad ? "*** NO ***" : "yes");
+            if (nbad) ++bad;
+
+            // microbench: one expert, best-of median per count; each pick is a different expert far past the caches
+            constexpr int NB = 192;
+            const size_t stride = (f.bytes + 4095) & ~(size_t) 4095;
+            std::vector<uint8_t> mem(stride * NB + 4096);
+            uint8_t* base = (uint8_t*) (((uintptr_t) mem.data() + 4095) & ~(uintptr_t) 4095);
+            for (int e = 0; e < NB; ++e) std::memcpy(base + stride * (size_t) e, nb.data(), f.bytes);
+            std::vector<int> cs;
+            for (int k = 1; k < W; k *= 2) cs.push_back(k);
+            cs.push_back(W);
+            std::printf("\n  NVFP4 expert (%.2f MB) through the pool, cold, median of 40:\n", (double) f.bytes / 1e6);
+            for (int k : cs) {
+                pool.set_active_workers(k);
+                std::vector<double> us;
+                for (int it = 0; it < 40; ++it) {
+                    mj.blob = base + stride * (size_t) (it % NB);
+                    const double t0 = now_ms();
+                    pool.run_split_multi_native(f, &mj, 1);
+                    us.push_back((now_ms() - t0) * 1e3);
+                }
+                std::sort(us.begin(), us.end());
+                std::printf("    %3d workers + host: %8.1f us   (%.1f GB/s)\n", k, us[us.size() / 2],
+                            (double) f.bytes / (us[us.size() / 2] * 1e3));
+            }
+            pool.set_active_workers(W);
+        }
     }
 
     // ---- and the number that matters: c for one layer, 10 experts over 48 layers.

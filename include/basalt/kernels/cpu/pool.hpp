@@ -113,6 +113,12 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    /// How many of the workers take work.  The rest stay parked and never claim.
+    int active_workers() const { return active_.load(std::memory_order_relaxed); }
+    /// Change the active worker count live, clamped to 1..workers(); returns the count in effect.  The threads stay as
+    /// created.  Host thread only, between batches: it waits for every worker to park first.  Work is split by the
+    /// active count, so a given count always cuts the same tasks, and outputs do not depend on the count.
+    int set_active_workers(int k);
     /// The cgroup CPU quota, in CPUs, that capped the default worker count; 0 when it did not.
     double quota_limit() const { return quota_limit_; }
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
@@ -194,6 +200,8 @@ private:
     void publish();
 
     int n_ = 0;
+    /// Workers with id < active_ take work; written only while every worker is parked, before the next publish.
+    std::atomic<int> active_{0};
     double quota_limit_ = 0.0;
     bool host_works_ = true;
     ExpertJob* jobs_ = nullptr;
