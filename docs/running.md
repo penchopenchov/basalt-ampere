@@ -121,3 +121,23 @@ The image encoder is Basalt's own, written for this model's vision tower (no lla
 products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on the CPU. It replaces llama.cpp's
 mtmd encoder as a drop-in, is faster than it at every image size, and stays closer to an fp32 reference: mtmd's fp16
 attention drifts on large images, ours does not.
+
+## `PROBE rates` (engine command)
+
+With `--serve`, the line `PROBE rates` on stdin, between requests, measures the machine's rates inside the loaded
+engine in about half a second and prints one block on stdout: `PROBE begin rates v1`, lines `PROBE <section> key=value ...`,
+`PROBE end ms=<wall>`. It changes no engine state (tiers, caches, KV, RNG, the CPU pool's active worker count) and saves
+nothing. Sections:
+
+| section | measures |
+|---|---|
+| `gpu`, `host`, `pack` | device, link generation and width, power limit, RAM, CPU pool, expert format |
+| `link` | pinned host-to-device and device-to-host GB/s per GPU, best of six 64 MiB bursts |
+| `gpu_mem` | device-to-device copy GB/s per GPU (counts the bytes read and written) |
+| `host_mem` | GB/s the CPU pool reads from RAM-resident experts, by active worker count |
+| `cpu_expert` | cold experts through the pool at 1, 2, 3 and 8 per call, at the two best worker counts and the current one |
+| `peer` | peer round trip by entry count (1 to 8) and the linear fit: base and per-entry microseconds |
+| `copy` | one expert-sized copy into each GPU, and the peer round trip while such a copy runs |
+
+A step that cannot run prints `n/a` with a reason (no peer, no RAM-resident experts, a non-native expert format).
+During a batch the command answers `ERR PROBE: ...`.

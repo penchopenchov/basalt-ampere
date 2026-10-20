@@ -62,6 +62,7 @@
 #include "basalt/program/logits_selection.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/ppl_gate.hpp"
+#include "basalt/program/probe_rates.hpp"
 #include "basalt/spec/draft_policy.hpp"
 #include "basalt/spec/suffix_drafter.hpp"
 #include "basalt/kernels/cvec.hpp"
@@ -7152,6 +7153,24 @@ int main(int argc, char** argv) {
             if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
             if (line.rfind("ENC ", 0) == 0) {   // the in-engine image encoder, between requests and windows
                 enc_command(line);
+                continue;
+            }
+            if (line.rfind("PROBE", 0) == 0) {   // between requests, not a request: measures rates, changes no state
+                std::string perr;
+                if (line != "PROBE rates") perr = "PROBE: expected PROBE rates";
+                else if (batch_on()) perr = "PROBE: not while batch slots are decoding";
+                else {
+                    if (ba_job) { ba_thr.join(); ba_job = false; }
+                    basalt::program::ProbeEnv penv;
+                    penv.pool = &pool;
+                    penv.src = srcp;
+                    penv.peer = peer.valid() ? &peer : nullptr;
+                    penv.n_layers = g.n_layers;
+                    penv.n_expert = g.n_expert;
+                    basalt::program::probe_rates(penv, stdout, perr);
+                }
+                if (!perr.empty()) std::printf("ERR %s\n", perr.c_str());
+                std::fflush(stdout);
                 continue;
             }
             if (line.rfind("VRAM", 0) == 0) {   // between requests, not a request
