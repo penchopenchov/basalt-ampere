@@ -1116,6 +1116,100 @@ int main(int argc, char** argv) {
                                 "fetch+sync %.1f group %.1f experts %.1f done %.1f\n",
                                 rt[RINGS / 2], rt[1], ph[0], ph[1], ph[2], ph[3]);
                 }
+                // the same rings while an expert-sized copy from pinned host memory runs into this device on another
+                // stream: a ring's round trip is counted as "during" when the copy has not finished at its start
+                {
+                    ck(cudaSetDevice(1), "dev1");
+                    const size_t cb = L.bytes;
+                    constexpr int kBurst = 10;
+                    uint8_t* h_src = nullptr;
+                    ck(cudaMallocHost((void**) &h_src, cb * kBurst), "copy src");
+                    std::memset(h_src, 0x5a, cb * kBurst);
+                    uint8_t* d_dst = dmal<uint8_t>(cb * kBurst);
+                    cudaStream_t s2;
+                    ck(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking), "copy stream");
+                    cudaEvent_t e0, e1;
+                    ck(cudaEventCreate(&e0), "e0");
+                    ck(cudaEventCreate(&e1), "e1");
+                    struct Shape { const char* name; int pieces; bool gap; int copies; };
+                    const Shape shapes[] = {{"no copy", 0, false, 0},
+                                            {"1 copy, whole", 1, false, 1},
+                                            {"16 chunks back to back", 16, false, 1},
+                                            {"16 chunks, host callback between", 16, true, 1},
+                                            {"8 chunks, host callback between", 8, true, 1},
+                                            {"4 chunks, host callback between", 4, true, 1},
+                                            {"burst of 10 whole copies", 1, false, kBurst}};
+                    std::printf("  bench: peer rings beside a %.2f MB copy into the peer (pinned host source, other stream):\n",
+                                (double) cb / 1e6);
+                    for (const Shape& sh : shapes) {
+                        std::vector<double> during, idle, gbs;
+                        for (int launch = 0; launch < 40; ++launch) {
+                            std::memset(h_words, 0, 256);
+                            ck(cudaSetDevice(1), "dev1");
+                            ck(cudaMemsetAsync(parr, 0, 16, s1), "arrive");
+                            K::DmPeerArgs pa;
+                            pa.rings_m = h_rings; pa.xq_m = h_xq; pa.xq_stride = xq_stride; pa.seq_m = h_words + 16;
+                            pa.done_m = h_words + 32; pa.rows_m = h_peer; pa.ptr = d_ptab; pa.lay = d_lay;
+                            pa.n_expert = (int) NE; pa.k = (int) KK; pa.n_embd = (int) H; pa.n_ff = (int) FF;
+                            pa.steps = RINGS; pa.scratch = pscr; pa.arrive = parr;
+                            if (!K::dec_moe_peer_launch(pa, pblocks, s1, L.gu_type == 42)) std::exit(2);
+                            bool active = false;
+                            int quiet = 0;
+                            for (int r = 0; r < RINGS; ++r) {
+                                if (sh.copies > 0 && !active && quiet >= 4 && r < RINGS - 6) {
+                                    ck(cudaSetDevice(1), "dev1");
+                                    ck(cudaEventRecord(e0, s2), "e0");
+                                    for (int c = 0; c < sh.copies; ++c) {
+                                        const size_t piece = (cb + sh.pieces - 1) / sh.pieces;
+                                        for (int p = 0; p < sh.pieces; ++p) {
+                                            const size_t off = (size_t) c * cb + p * piece;
+                                            const size_t len = std::min(piece, cb - p * piece);
+                                            ck(cudaMemcpyAsync(d_dst + off, h_src + off, len, cudaMemcpyHostToDevice, s2), "copy");
+                                            if (sh.gap && p + 1 < sh.pieces)
+                                                ck(cudaLaunchHostFunc(s2, [](void*) {}, nullptr), "gap");
+                                        }
+                                    }
+                                    ck(cudaEventRecord(e1, s2), "e1");
+                                    ck(cudaSetDevice(0), "dev0");
+                                    active = true;
+                                }
+                                const bool busy = active && cudaEventQuery(e1) == cudaErrorNotReady;
+                                if (active && !busy) {
+                                    float ms = 0.0f;
+                                    ck(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+                                    gbs.push_back((double) cb * sh.copies / 1e9 / (ms / 1e3));
+                                    active = false;
+                                    quiet = 0;
+                                }
+                                const auto t0 = std::chrono::steady_clock::now();
+                                *(volatile uint32_t*) (h_words + 16) = ((uint32_t) r + 1) | (uint32_t) T << 16 | 1u << 28;
+                                while (*(volatile uint32_t*) (h_words + 32) < (uint32_t) r + 1) {}
+                                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                                if (r >= 2) (busy ? during : idle).push_back(us);
+                                if (!busy && !active) ++quiet;
+                            }
+                            ck(cudaSetDevice(1), "dev1");
+                            ck(cudaStreamSynchronize(s1), "rings");
+                            ck(cudaStreamSynchronize(s2), "copy");
+                            ck(cudaSetDevice(0), "dev0");
+                        }
+                        auto q = [](std::vector<double>& v, double f) {
+                            if (v.empty()) return 0.0;
+                            std::sort(v.begin(), v.end());
+                            return v[(size_t) (f * (double) (v.size() - 1))];
+                        };
+                        std::printf("    %-34s idle rings median %.1f us | during the copy (%zu rings) median %.1f p90 %.1f us | "
+                                    "copy %.1f GB/s\n", sh.name, q(idle, 0.5), during.size(), q(during, 0.5), q(during, 0.9),
+                                    q(gbs, 0.5));
+                    }
+                    ck(cudaSetDevice(1), "dev1");
+                    ck(cudaStreamDestroy(s2), "s2");
+                    ck(cudaEventDestroy(e0), "e0");
+                    ck(cudaEventDestroy(e1), "e1");
+                    cudaFree(d_dst);
+                    cudaFreeHost(h_src);
+                    ck(cudaSetDevice(0), "dev0");
+                }
                 // the peer's L2 warm-up: host-rung rings with an idle gap between them, the ring's layer cycling over
                 // LW layers whose peer experts are distinct blobs (each ring cold), the predictor's rows built so its top
                 // k is the routed peer set; off: the same rings without the warm-up
