@@ -522,8 +522,9 @@ class Service:
                 raise ValueError("request exceeds the context window: "
                                  f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's <model>.json to shorten it to the room left")
+                                 f"max_tokens (at most {max(0, room)} here), or start the server with "
+                                 "--fit-max-tokens (or set \"fit-max-tokens\": true in the \"server\" section of "
+                                 "the --config file) to shorten it to the room left")
             max_new = max(1, room)          # fit_max_tokens: shorten rather than 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
