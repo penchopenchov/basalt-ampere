@@ -545,15 +545,18 @@ class Service:
     def _progress(self, last_print, every=1.0, st=None):
         """Print a progress line at most every `every` seconds while a request runs."""
         now = time.time()
-        if now - last_print < every:
-            return last_print
         with self.status_lock:
             s = dict(self.status if st is None else st)
+        if now - last_print < (READ_PRINT_EVERY if s.get("first_token") is None else every):
+            return last_print
         el = now - s.get("started", now)
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position, prompt tokens); a reused prefix counts as read
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read
-            print(f"[server] reading the prompt: {done} tokens, {el:.0f} s", flush=True)
+            # the engine's average over the tokens it read for this request (a reused prefix is not in it)
+            pp = getattr(self.engine, "prefill_tok_s_mean", None) if pr and pr[1] else None
+            speed = f", {pp:,.0f} tok/s" if pp and pp > 0 else ""
+            print(f"[server] reading the prompt: {done} tokens{speed}, {el:.0f} s", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
             print(f"[server] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
@@ -832,8 +835,9 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
-                            print(f"[server] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                            ttft = ft - st["started"] if ft and st.get("started") else None
+                            print(done_line(seen, n, finish, cancel.is_set(), timings, ttft, rate) + hit_msg,
+                                  flush=True)
                             if finish == "length" and parser.state == "reasoning":
                                 print("[server] warning: max tokens reached while thinking, no answer "
                                       "(set reasoning_budget_tokens)", flush=True)
@@ -870,6 +874,30 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     if read is None or last.get("finish") != "cancel":
         return prompt_tokens
     return min(prompt_tokens, int(last.get("reused") or 0) + int(read))
+
+
+READ_PRINT_EVERY = 5.0      # seconds between the prompt-reading lines
+MIN_RATE_TOKENS = 16     # a prompt read of fewer tokens shows its time, not a rate
+
+
+def done_line(prompt_total: int, generated: int, finish: str, cancelled: bool, timings: dict | None,
+              ttft: float | None, wall_rate: float) -> str:
+    """The request's closing log line: the prompt (read, reused, time, speed), the reply (count, speed) and the
+    time to the first token.  `timings` is request_timings(); None when the engine gave no clock."""
+    t = timings or {}
+    prompt = f"prompt {prompt_total:,} tokens"
+    if t.get("cache_n"):
+        prompt += f" ({t['cache_n']:,} reused)"
+    if t.get("prompt_ms") is not None:
+        prompt += f" in {t['prompt_ms'] / 1000:.1f} s"
+        if (t.get("prompt_n") or 0) >= MIN_RATE_TOKENS and t.get("prompt_per_second"):
+            prompt += f", {t['prompt_per_second']:,.0f} tok/s"
+    rate = t.get("predicted_per_second") or (wall_rate if generated >= MIN_RATE_TOKENS else 0.0)
+    reply = f"{generated} tokens" + (f" at {rate:.1f} tok/s" if generated and rate else "")
+    parts = [prompt, reply]
+    if ttft is not None:
+        parts.append(f"first token after {ttft:.1f} s")
+    return f"[server] done: {'; '.join(parts)} ({finish}{', cancel=True' if cancelled else ''})"
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:

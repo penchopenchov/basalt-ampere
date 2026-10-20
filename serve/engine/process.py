@@ -559,6 +559,12 @@ class ProcessEngine:
                     self._send("STOP")
                     stopped = True
                 yield None
+            elif line.startswith("PL "):
+                self._note_live(line)
+                if not stopped and cancel.is_set():
+                    self._send("STOP")
+                    stopped = True
+                yield None
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
@@ -679,6 +685,16 @@ class ProcessEngine:
         else:
             carry[0] += last["drafts_accepted"]
             carry[1] += last["drafts_offered"]
+
+    def _note_live(self, line: str):
+        """A `PL <position> <total> <ms> <tok/s>` line: the display's position and speed inside a chunk."""
+        f = line.split()
+        if len(f) >= 5 and f[1].isdigit() and f[2].isdigit():
+            self.progress = (int(f[1]), int(f[2]))
+            try:
+                self.prefill_tok_s_mean = float(f[4])
+            except ValueError:
+                pass
 
     def _note_first_reused(self, first: list, last0):
         """Keep the reused-prefix count of the request's first engine run: later runs of the same request (solo, then
@@ -1127,6 +1143,11 @@ class ProcessEngine:
                     if cancel.is_set():
                         return
                     yield None                            # PP lines reset the 10 s wait, so heartbeat here
+                elif line.startswith("PL "):              # live progress inside a chunk: only the display moves
+                    self._note_live(line)
+                    if cancel.is_set():
+                        return
+                    yield None
                 elif line.startswith("RESUME "):          # reused tokens: the first chunk starts after them
                     try:
                         read_to = int(line.split()[1])

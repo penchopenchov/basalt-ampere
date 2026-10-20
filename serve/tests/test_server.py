@@ -1822,6 +1822,60 @@ class LiveRate(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/metrics", timeout=10) as r:
             return json.loads(r.read())
 
+    def test_the_reading_line_shows_the_average_speed(self):
+        from types import SimpleNamespace
+        st = {"started": time.time() - 10, "first_token": None, "prompt_tokens": 3905}
+        for eng, want in ((SimpleNamespace(progress=(2048, 3905), prefill_tok_s_mean=410.2),
+                           "reading the prompt: 2,048 of 3,905 tokens, 410 tok/s, 10 s"),
+                          (SimpleNamespace(progress=(2048, 3905), prefill_tok_s_mean=None),
+                           "reading the prompt: 2,048 of 3,905 tokens, 10 s"),
+                          (SimpleNamespace(progress=None, prefill_tok_s_mean=410.2),
+                           "reading the prompt: 3,905 tokens, 10 s")):
+            self.svc.engine = eng
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.svc._progress(0, st=st)
+            self.assertIn(want, out.getvalue())
+
+    def test_done_line_formats(self):
+        from serve.service import done_line, request_timings
+        last = {"prompt_ms": 1200.0, "decode_ms": 8560.0, "generated": 412, "reused": 3700}
+        tm = request_timings(3838, 412, last)
+        self.assertEqual(done_line(3838, 412, "stop", False, tm, 1.3, 40.0),
+                         "[server] done: prompt 3,838 tokens (3,700 reused) in 1.2 s, 115 tok/s; "
+                         "412 tokens at 48.1 tok/s; first token after 1.3 s (stop)")
+        # no reuse
+        tm = request_timings(2000, 5, {"prompt_ms": 4000.0, "decode_ms": 500.0, "generated": 5})
+        self.assertEqual(done_line(2000, 5, "length", True, tm, 4.1, 9.0),
+                         "[server] done: prompt 2,000 tokens in 4.0 s, 500 tok/s; "
+                         "5 tokens at 10.0 tok/s; first token after 4.1 s (length, cancel=True)")
+        # a one-token tail: the time, no rate
+        tm = request_timings(3839, 10, {"prompt_ms": 30.0, "decode_ms": 200.0, "generated": 10, "reused": 3838})
+        self.assertEqual(done_line(3839, 10, "stop", False, tm, 0.2, 50.0),
+                         "[server] done: prompt 3,839 tokens (3,838 reused) in 0.0 s; "
+                         "10 tokens at 50.0 tok/s; first token after 0.2 s (stop)")
+        # no engine clock: the wall rate, no prompt timing
+        self.assertEqual(done_line(100, 0, "stop", False, None, None, 0.0),
+                         "[server] done: prompt 100 tokens; 0 tokens (stop)")
+        self.assertEqual(done_line(100, 7, "stop", False, None, 0.5, 21.0),
+                         "[server] done: prompt 100 tokens; 7 tokens; first token after 0.5 s (stop)")
+        self.assertIn("20 tokens at 21.0 tok/s", done_line(100, 20, "stop", False, None, 0.5, 21.0))
+
+    def test_live_progress_lines(self):
+        from types import SimpleNamespace
+        eng = ProcessEngine.__new__(ProcessEngine)
+        eng.progress, eng.prefill_tok_s_mean = None, None
+        eng._note_live("PL 1600 3838 3900 410.3")
+        self.assertEqual((eng.progress, eng.prefill_tok_s_mean), ((1600, 3838), 410.3))
+        eng._note_live("PL garbage")
+        self.assertEqual(eng.progress, (1600, 3838))
+        st = {"started": time.time() - 6, "first_token": None, "prompt_tokens": 3838}
+        self.svc.engine = SimpleNamespace(progress=eng.progress, prefill_tok_s_mean=eng.prefill_tok_s_mean)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(self.svc._progress(time.time() - 2, st=st) > 0, True)
+            self.svc._progress(time.time() - 6, st=st)
+        self.assertEqual(out.getvalue().count("reading the prompt"), 1)   # 2 s since the last line: too soon
+        self.assertIn("reading the prompt: 1,600 of 3,838 tokens, 410 tok/s, 6 s", out.getvalue())
+
     def test_prefill_rate_excludes_cached_tokens(self):
         import io
         import queue

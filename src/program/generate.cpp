@@ -4494,7 +4494,7 @@ int main(int argc, char** argv) {
     //          <drafts offered> <prompt tokens reused> ... <prompt tokens read>   (see the DONE line below)
     //
     // Before that, `RESUME <n>` (n prompt tokens are not read again), `PP <position> <prompt_tokens> <ms> <tok/s>`
-    // after every prompt chunk, and `REUSED <n>` once the prompt is read.  (`ERR <message>` instead when a request
+    // after every prompt chunk (`PL`, the same fields, inside a chunk: the position is an estimate), and `REUSED <n>` once the prompt is read.  (`ERR <message>` instead when a request
     // cannot run; `STOP` ends the running request at its next step; `QUIT` ends the process.)  A request continues
     // from the live session or the longest conversation checkpoint its prompt starts with (see ConvCheckpoint),
     // otherwise from an empty sequence (`session_zero`); the rest of the prompt goes through the batched prompt path
@@ -5467,6 +5467,17 @@ int main(int argc, char** argv) {
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
+        };
+        // live progress inside a chunk: PL <estimated position> <prompt tokens> <ms> <tokens/s>, at most twice a second
+        sp.on_layer = [&, last_ms = 0.0](int64_t layers_done, int64_t n_layers, int64_t T, int64_t p0) mutable {
+            if (pp_total <= 0 || layers_done <= 0 || n_layers <= 0) return;
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+            if (ms - last_ms < 500.0 && ms >= last_ms) return;
+            last_ms = ms;
+            const int64_t at = p0 + T * layers_done / n_layers;
+            std::printf("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) pp_total, ms,
+                        ms > 0.0 ? 1000.0 * (double) (at - pp_from) / ms : 0.0);
+            std::fflush(stdout);
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
