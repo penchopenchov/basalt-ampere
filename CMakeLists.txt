@@ -427,6 +427,17 @@ target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   BASALT_BENCH_CUDA="${CMAKE_CUDA_COMPILER_VERSION}")
 
+# closing the engine's stdin mid-request stops it (runs the real engine on a model pack:
+# -DBASALT_STDIN_STOP_MODEL=<pack>, with python3)
+if(BASALT_STDIN_STOP_MODEL AND Python3_Interpreter_FOUND)
+  add_test(NAME stdin_stop_test
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/stdin_stop_test.py
+                   $<TARGET_FILE:basalt> ${BASALT_STDIN_STOP_MODEL} ${CMAKE_CURRENT_SOURCE_DIR}/data/bench/conv.ids
+                   ${BASALT_STDIN_STOP_ARGS})
+  set_property(TEST stdin_stop_test APPEND PROPERTY LABELS gpu)
+  set_tests_properties(stdin_stop_test PROPERTIES TIMEOUT 600)
+endif()
+
 add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
 # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
 # and cudart explicitly: enabling the CUDA language gives those to .cu sources automatically, but a .cpp

@@ -5883,6 +5883,7 @@ int main(int argc, char** argv) {
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
         std::atomic<bool> stop_req{false};
+        std::atomic<bool> stdin_lost{false};   // set once at EOF: the peer is gone, so no request keeps running
         std::mutex in_mu;
         std::condition_variable in_cv;
         std::deque<std::string> in_lines;
@@ -5919,6 +5920,8 @@ int main(int argc, char** argv) {
                 in_lines.push_back(l);
                 in_cv.notify_one();
             }
+            stdin_lost.store(true);
+            stop_req.store(true);
             std::lock_guard<std::mutex> lk(in_mu);
             in_eof = true;
             in_cv.notify_one();
@@ -5935,7 +5938,7 @@ int main(int argc, char** argv) {
         // the request ends on an error instead of a cancel
         std::atomic<bool> ram_stop{false};
         auto halted = [&]() -> bool {
-            if (stop_req.load()) return true;
+            if (stop_req.load() || stdin_lost.load()) return true;
             if (!basalt::platform::ram_guard_low()) return false;
             ram_stop.store(true);
             return true;
@@ -8294,7 +8297,7 @@ int main(int argc, char** argv) {
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
                 if (sp_ok && win && !ov_window()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (!sp_ok) {
-                    if (yielded_at < 0 && (batch_fatal || !(stop_req.load() || ram_stop.load()))) {
+                    if (yielded_at < 0 && (batch_fatal || !(stop_req.load() || stdin_lost.load() || ram_stop.load()))) {
                         std::fprintf(stderr, "basalt serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         // a CUDA fault (an illegal address) poisons the context for the whole process, and unwinding
