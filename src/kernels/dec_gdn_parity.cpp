@@ -451,6 +451,9 @@ bool parity_seg(cudaStream_t s) {
             void *yq_r, *yq_f;
             CK(cudaMalloc(&yq_r, (size_t) R * (ZV / 32) * 36 + 64)); CK(cudaMemset(yq_r, 0xff, (size_t) R * (ZV / 32) * 36));
             CK(cudaMalloc(&yq_f, (size_t) R * (ZV / 32) * 36 + 64)); CK(cudaMemset(yq_f, 0xff, (size_t) R * (ZV / 32) * 36));
+            // the poison fills run on the legacy stream, which the non-blocking test stream does not wait for: finish them
+            // before any kernel can write these buffers
+            CK(cudaDeviceSynchronize());
             for (int k = 0; k < nseg; ++k) {
                 const size_t r0 = row0[k];
                 float* st = sbase[k] + layer * SF;
@@ -469,6 +472,7 @@ bool parity_seg(cudaStream_t s) {
             float *h_s = fbuf((size_t) R * C), *y_s = fbuf((size_t) R * ZV);
             float *h_f = fbuf((size_t) R * C), *g_f = fbuf((size_t) R * HV), *b_f = fbuf((size_t) R * HV),
                   *y_f = fbuf((size_t) R * ZV);
+            CK(cudaDeviceSynchronize());   // the fills above, before the segment kernels write these
             gdn_conv_l2_seg(d_rows, layer * SF + (size_t) S * HV * S, d_qkv, L.conv_w, h_s, C, 2 * HK, EPS, R, s);
             gdn_step_norm_seg(d_rows, layer * SF, h_r, C, g_r, b_r, d_z, L.gamma, EPS, y_s, HK, HV, R, s);
             {
