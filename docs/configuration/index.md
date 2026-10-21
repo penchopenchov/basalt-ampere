@@ -138,7 +138,7 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `adapt-every` | engine | integer | 1 for a server on one card, else 4 (`0` = static residency) | How many decode windows pass between adaptive rounds. A round moves experts between the tiers (see below). `1` follows the conversation fastest. |
 | `adapt-decay` | engine | number, 0 to 1 | 0.85 on a single card (with or without the peer); 0.7 when the experts are split over several cards | The factor the usage counts are multiplied by after each round. Lower forgets sooner; higher remembers longer. |
 | `prefill-cpu-share` | engine | number, 0 to 1 | 0.6 (`0` = the GPU streams every expert) | The share of the streamed (not VRAM-resident) experts that the CPU computes while a prompt is read; the GPU streams and computes the rest. The value is fixed, not tuned from timing, so the output is identical from run to run at a given value. A weaker CPU may do better with a lower value. |
-| `adapt-swaps` | engine | integer | 96 (`0` = static residency) | The most experts one round swaps into the main card's tier. |
+| `adapt-swaps` | engine | integer | 96 (`0` = static residency) | The most experts one round swaps into the main card's tier. While rounds are saturated (the last round found at least twice this many to swap) the next may swap four times as many; the RAM copy keeps that many free places (about 2.6 MiB each on NVFP4, 1 GiB at the default). |
 | `peer-adapt-swaps` | engine | integer | same as `adapt-swaps` (`0` = the peer's experts stay fixed) | The most experts one round moves on the peer card. |
 | `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. |
 | `vram-segment-mib` | engine | integer MiB | 512 | Segment size for `vram-elastic`. |
@@ -150,7 +150,9 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 The engine counts how often each expert is routed to. After every `adapt-every` decode windows it runs a round: in each
 layer it takes the most-used experts that are not in VRAM and swaps them in for the least-used resident ones, when the
 gain is clear (a candidate needs a count of at least 2 and 1.5 above the expert it replaces), at most `adapt-swaps`
-swaps per round, best gain first. Experts held by the peer card count against a margin of 10 before they move to the
+swaps per round, best gain first. While the previous round found at least twice `adapt-swaps` to swap (a topic change), the cap
+is four times that; the main card's first `adapt-swaps` go first, then the peer takes its share, and only then do the extra
+swaps take what is left, so a large round never starves the peer. Experts held by the peer card count against a margin of 10 before they move to the
 main card, and the peer takes the next most-used experts the main card does not hold, up to `peer-adapt-swaps`. After
 each round every count is multiplied by `adapt-decay`, so recent routing outweighs old. A count settles at about
 1 / (1 - decay) times the routing per round, so the decay sets how long the tier remembers: 0.93 is roughly the last 14

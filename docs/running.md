@@ -84,6 +84,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the
   model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
   buffers and a request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
+- With the adaptive tier, the RAM copy also holds free places for the experts that leave the GPU: four times `--adapt-swaps`
+  (384 at the default, about 2.6 MiB each on NVFP4, 1 GiB), so a topic change can swap quickly. The startup line
+  `free places for the adaptive swaps` shows the count; if RAM is short, fewer are kept and a round swaps fewer.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
   states the RAM free and the largest safe value ('max').
 - While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is

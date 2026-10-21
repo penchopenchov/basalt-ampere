@@ -387,6 +387,14 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
 }
 
+std::vector<size_t> PeerExperts::incoming() const {
+    std::vector<size_t> v;
+    v.reserve(pending_.size() + evicting_.size());
+    for (const auto& p : pending_) v.push_back((size_t) p.first);
+    for (const Evict& x : evicting_) v.push_back((size_t) (x.layer * n_expert_ + x.in));
+    return v;
+}
+
 bool PeerExperts::reassign(int64_t layer, int32_t in, int32_t out, const uint8_t* blob, std::string& err) {
     const size_t i_in = (size_t) (layer * n_expert_ + in), i_out = (size_t) (layer * n_expert_ + out);
     const int32_t slot = res_[i_in];

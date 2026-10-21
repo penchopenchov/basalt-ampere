@@ -175,6 +175,11 @@ private:
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
 // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes.
 constexpr int kVramStallMib = 256;
+// A round that found at least kSatRatio times --adapt-swaps misses to swap (the pipeline is saturated) lets the next
+// round swap kSatBoost times --adapt-swaps into the main card; the free RAM places are sized for it.  Fewer misses than
+// that are not worth the extra copies.
+constexpr int kSatBoost = 4;
+constexpr int kSatRatio = 2;
 
 // A byte count in GiB with one decimal, rounded down (a safe limit must not round up past itself).
 std::string gib_text(uint64_t bytes) {
@@ -520,6 +525,8 @@ struct Options {
     /// --vision-mmproj PATH: the image encoder runs in this process on the model's GPU (implies --vision).  Its weights
     /// stay in pinned host memory; each ENC command borrows expert-cache slots, encodes in them and refills them.
     std::string vision_mmproj;
+    /// The most experts one adaptive round swaps into the main card's tier; a saturated pipeline (see `kSatBoost`) may
+    /// swap `kSatBoost` times as many.
     int adapt_swaps = 96;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole prompt
     /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
@@ -4648,7 +4655,8 @@ int main(int argc, char** argv) {
         const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
         // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
         if (adapt_fast_on)
-            src.set_spares(o.peer_exclusive ? o.adapt_swaps + std::max(o.peer_adapt_swaps, o.adapt_swaps) : o.adapt_swaps);
+            src.set_spares(o.peer_exclusive ? o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)
+                                            : o.adapt_swaps * kSatBoost);
         // A server also leaves room for what it allocates after this copy, before it is ready (the top-up below takes
         // back whatever that does not use), and for what it takes while serving.
         // Exchange buffers are reserved after the copy when the adaptive swaps do not use spares; the copy leaves them room.
@@ -5722,19 +5730,25 @@ int main(int argc, char** argv) {
         const bool peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
         std::vector<XSwap> xq;
         int xq_stage = 0;   // 0 idle, 1 evictions copying to RAM, 2 incoming experts copying to their slots
+        bool xq_saturated = false;   // the last round had at least kSatRatio times --adapt-swaps misses to swap
         auto xq_round = [&]() -> bool {
             const auto at0 = Clock::now();
             const int64_t peer_sw0 = peer.valid() ? peer.swaps() : 0;
             std::vector<Swap> swaps;
             rank_swaps(swaps);
             const size_t n_ranked = swaps.size();
-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            // the base share goes first, then the peer takes its own from the rest, then a saturated pipeline's extra
+            // swaps take what the peer left: a large round never takes the peer's candidates
+            const size_t base = (size_t) o.adapt_swaps;
+            const size_t cap = xq_saturated ? base * (size_t) kSatBoost : base;
+            xq_saturated = n_ranked >= base * (size_t) kSatRatio;
+            if (swaps.size() > cap) swaps.resize(cap);
             xq.clear();
             size_t n_noplace = 0;
             const auto& lay = basalt::kernels::cpu::expert_layout();
             std::set<size_t> taken;   // the round's victims
             for (const Swap& s : swaps) taken.insert((size_t) s.layer * g.n_expert + s.out);
-            for (Swap s : swaps) {
+            auto plan = [&](Swap s) -> bool {
                 // an expert only the peer holds is copied from its VRAM; it needs a RAM place for the one it replaces
                 const bool p2p = peer_excl && peer.has(s.layer, s.in) && !src.has_resident(s.layer, s.in);
                 if (p2p && src.has_resident(s.layer, s.out)) {
@@ -5747,18 +5761,18 @@ int main(int argc, char** argv) {
                         if (host_res[k] < 0 || src.has_resident(s.layer, e) || taken.count(k)) continue;
                         if (best < 0 || u[e] < u[best]) best = e;
                     }
-                    if (best < 0 || u[s.in] - promote_margin < u[best] + 1.5f) continue;
+                    if (best < 0 || u[s.in] - promote_margin < u[best] + 1.5f) return true;
                     taken.insert((size_t) s.layer * g.n_expert + best);
                     s.out = best;
                 }
                 const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
-                if (slot < 0) continue;
+                if (slot < 0) return true;
                 const bool xchg = src.complement_ready() && (p2p || src.has_resident(s.layer, s.in)) &&
                                   !src.has_resident(s.layer, s.out);
                 uint64_t off = 0;
                 if (xchg) {
                     uint8_t* dst = src.spare_take(s.layer, off);
-                    if (dst == nullptr) { ++n_noplace; continue; }   // no free place: a later round
+                    if (dst == nullptr) { ++n_noplace; return true; }   // no free place: a later round
                     if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
                                         cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
                         std::fprintf(stderr, "basalt serve: an eviction copy failed (layer %d, slot %d): %s\n",
@@ -5769,12 +5783,13 @@ int main(int argc, char** argv) {
                 if (p2p) peer.hold(s.layer, s.in);
                 xq.push_back({s.layer, s.in, s.out, slot, off, xchg,
                               peer.valid() && peer.has(s.layer, s.in), p2p});
-            }
-            if (!xq.empty()) {
-                cudaEventRecord(adapt_ev, adapt_stream);
-                xq_stage = 1;
-            }
+                return true;
+            };
+            const size_t n_base = std::min(swaps.size(), base);
+            for (size_t i = 0; i < n_base; ++i)
+                if (!plan(swaps[i])) return false;
             for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
+            std::vector<size_t> peer_takes;
             if (peer.valid()) {   // the peer takes the next most-routed CPU misses (not the ones moving to CUDA0)
                 std::vector<int32_t> r0 = host_res;
                 for (const XSwap& x : xq) r0[(size_t) x.layer * g.n_expert + x.in] = x.slot;
@@ -5784,6 +5799,17 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "basalt serve: %s\n", perr.c_str());
                     return false;
                 }
+                if (swaps.size() > n_base) peer_takes = peer.incoming();
+                std::sort(peer_takes.begin(), peer_takes.end());
+            }
+            for (size_t i = n_base; i < swaps.size(); ++i) {
+                if (std::binary_search(peer_takes.begin(), peer_takes.end(),
+                                       (size_t) swaps[i].layer * g.n_expert + swaps[i].in)) continue;
+                if (!plan(swaps[i])) return false;
+            }
+            if (!xq.empty()) {
+                cudaEventRecord(adapt_ev, adapt_stream);
+                xq_stage = 1;
             }
             for (float& v : drive.d.usage) v *= fast_decay;
             return true;
@@ -8783,6 +8809,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
+            xq_saturated = false;   // the next request starts at the base cap
             if (ppl != nullptr && !ppl->finish(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;

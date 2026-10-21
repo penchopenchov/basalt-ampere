@@ -88,6 +88,9 @@ public:
     /// return without waiting for them (`apply_pending` then lands them).  False when `wait` is off and they are not done.
     bool issue_pending(bool wait);
     bool has_pending() const { return !pending_.empty() || !evicting_.empty(); }
+    /// The residency indices (layer * n_expert + expert) of the experts the peer is taking in: the last round's picks
+    /// and any refill still landing.
+    std::vector<size_t> incoming() const;
     /// --peer-exclusive, once the RAM copy is built: the peer's experts have no RAM place.  Swaps then keep every
     /// expert somewhere: an evicted one goes to a free RAM place before its slot is reused, and a RAM place is freed
     /// once its expert is resident on the peer.  Nothing is read from the file for them.
