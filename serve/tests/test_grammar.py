@@ -97,6 +97,11 @@ class GrammarOff(Fixture, unittest.TestCase):
         self.assertIn("output_config.format json_schema", err["message"])
         self.assertIn("need grammar enabled", err["message"])
 
+    def test_anthropic_output_format_is_refused(self):
+        code, _ = self.refused("/v1/messages", {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+                                                "output_format": {"type": "json_schema", "schema": SCHEMA}})
+        self.assertEqual(code, 400)
+
     def test_responses_text_format_is_allowed(self):
         self.assertIsNone(self.sent("/v1/responses", {"input": "hi", "text": {"format": {"type": "text"}}}))
 
@@ -167,6 +172,33 @@ class GrammarOn(Fixture, unittest.TestCase):
     def test_responses_json_object(self):
         self.assertEqual(self.sent("/v1/responses", {"input": "hi", "text": {"format": {"type": "json_object"}}}),
                          {"kind": "json_object"})
+
+    def anthropic(self, **extra):
+        return {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], **extra}
+
+    def test_anthropic_json_schema(self):
+        want = {"kind": "json_schema", "schema": SCHEMA}
+        fmt = {"type": "json_schema", "schema": SCHEMA}
+        for stream in (False, True):
+            self.assertEqual(self.sent("/v1/messages", self.anthropic(stream=stream, output_config={"format": fmt})), want)
+        self.assertEqual(self.sent("/v1/messages", self.anthropic(output_config={"effort": "low", "format": fmt})), want)
+
+    def test_anthropic_output_format_alias(self):
+        fmt = {"type": "json_schema", "schema": SCHEMA}
+        self.assertEqual(self.sent("/v1/messages", self.anthropic(output_format=fmt)), {"kind": "json_schema", "schema": SCHEMA})
+
+    def test_anthropic_plain_has_no_key(self):
+        self.assertIsNone(self.sent("/v1/messages", self.anthropic()))
+        self.assertIsNone(self.sent("/v1/messages", self.anthropic(stream=True, output_config={"effort": "low"})))
+
+    def test_anthropic_bad_format(self):
+        for body in ({"output_config": {"format": {"type": "json_schema"}}},
+                     {"output_config": {"format": {"type": "text"}}},
+                     {"output_format": {"type": "json_schema", "schema": {"type": "string"}}},
+                     {"output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}, "tools": [
+                         {"name": "t", "input_schema": {"type": "object"}}]}):
+            code, err = self.refused("/v1/messages", self.anthropic(**body))
+            self.assertEqual((code, err["type"]), (400, "invalid_request_error"))
 
 
 class EngineWithoutTheFlag(unittest.TestCase):

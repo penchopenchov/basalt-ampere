@@ -37,3 +37,23 @@ def check_format(response_format) -> bool:
                 check_refs(value)
     check_refs(spec["schema"])
     return True
+
+
+def anthropic_format(req: dict):
+    """The chat path's response_format for an Anthropic request's `output_config.format` (or the older top-level
+    `output_format`), or None for plain text. ValueError for a request the server cannot take."""
+    out = req.get("output_config")
+    fmt = out.get("format") if isinstance(out, dict) else None
+    where = "output_config.format"
+    if fmt is None and req.get("output_format") is not None:
+        fmt, where = req["output_format"], "output_format"
+    if fmt is None:
+        return None
+    if not isinstance(fmt, dict) or fmt.get("type") != "json_schema":
+        raise ValueError(f"{where}.type must be json_schema")
+    response_format = {"type": "json_schema", "json_schema": {"name": "output", "schema": fmt.get("schema")}}
+    try:
+        check_format(response_format)
+    except ValueError as e:
+        raise ValueError(str(e).replace("response_format.json_schema", where).replace("response_format", where)) from None
+    return response_format

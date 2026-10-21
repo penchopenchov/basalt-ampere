@@ -23,7 +23,7 @@ from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
-from serve.api.structured import check_format
+from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
 
 
@@ -663,14 +663,14 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             tools, force = forced_call(req.get("tool_choice"), tools)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            out = req.get("output_config")
-            fmt = out.get("format") if isinstance(out, dict) else None
-            if isinstance(fmt, dict) and fmt.get("type") == "json_schema":     # Anthropic structured outputs
-                try:
-                    svc.require_grammar({"type": "json_schema", "json_schema": {"schema": fmt.get("schema")}})
-                except ValueError as e:
-                    raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
-            req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), None)
+            response_format = anthropic_format(req)            # structured outputs
+            if response_format and tools:
+                raise ValueError("a JSON output format with tools is not supported")
+            try:
+                svc.require_grammar(response_format)
+            except ValueError as e:
+                raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
+            req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
