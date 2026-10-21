@@ -57,7 +57,7 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
   its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream decoding only; `--parallel` slots
   stay exact.
 - The startup line `[server] engine: ...` lists the settings that came from the file or the command line, then the grammar state; with
-  none it says `using default flags`, and without `--config` that the built-in defaults apply.
+  none it says `using default flags` (with or without `--config`), e.g. `using default flags, grammar off (cli)`.
 
 ## Memory floors
 

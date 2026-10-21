@@ -188,10 +188,9 @@ class Precedence(unittest.TestCase):
                                       "--control-vector-layer-range", "4", "44"], ["--spec", "7"]),
                          "[server] engine: --max-context 32768 (config), --resident-experts (config), "
                          "--kv int8 (config), --control-vector-layer-range 4 44 (config), --spec 7 (cli)")
-        self.assertEqual(engine_line([], [], config=False),
-                         "[server] engine: built-in defaults (no --config): spec 7 with a drafter, 4096 context")
-        self.assertEqual(engine_line([], ["--spec", "7"], config=False),
-                         "[server] engine: built-in defaults (no --config): spec 7, 4096 context; --spec 7 (cli)")
+        self.assertEqual(engine_line([], ["--spec", "7"]), "[server] engine: --spec 7 (cli)")
+        self.assertEqual(engine_line([], [], grammar=(False, "cli")),
+                         "[server] engine: using default flags, grammar off (cli)")
         self.assertEqual(engine_line([], []), "[server] engine: using default flags")
 
 
@@ -271,10 +270,10 @@ class SlotContext(unittest.TestCase):
     def test_engine_line_shows_the_division(self):
         ap = build_parser()
         a, _, file_words, cli_words = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
-        line = engine_line(file_words, cli_words, False, (a.shared_context, a.parallel))
+        line = engine_line(file_words, cli_words, (a.shared_context, a.parallel))
         self.assertEqual(flag_value(cli_words, "--max-context"), "16384")
         self.assertIn("--max-context 16384 (cli: 65536 / 4 slots)", line)
-        self.assertNotIn("slots", engine_line(file_words, cli_words, False))
+        self.assertNotIn("slots", engine_line(file_words, cli_words))
 
     def test_slot_full_context_keeps_the_whole(self):
         self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144", "--slot-full-context"]), 262144)

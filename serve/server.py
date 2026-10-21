@@ -109,7 +109,7 @@ def main() -> int:
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
         if not a.mock_engine:
-            print(engine_line(file_engine, cli_engine, bool(a.config),
+            print(engine_line(file_engine, cli_engine,
                                     (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
                                     grammar_entry(a.grammar, sys.argv[1:], used_argv)), flush=True)
     if a.alias:

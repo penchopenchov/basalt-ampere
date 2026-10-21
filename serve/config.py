@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from serve import ROOT
-from serve.engine.flags import flag_index, flag_value
+from serve.engine.flags import flag_index
 from serve.engine.vision import VISION_MODES, VISION_USAGE, vision_mode
 
 
@@ -197,10 +197,10 @@ def engine_groups(words: list[str]) -> list[list[str]]:
     return groups
 
 
-def engine_line(file_words: list[str], cli_words: list[str], config: bool = True,
+def engine_line(file_words: list[str], cli_words: list[str],
                 shared: tuple[int, int] | None = None, grammar: tuple[bool, str] | None = None) -> str:
     """The startup line listing the engine words from --config and the command line, each flag with its values and
-    origin; without a config file it says the built-in defaults apply. `shared` is (total, slots) when --max-context
+    origin; with none it says the default flags are used. `shared` is (total, slots) when --max-context
     was divided among the slots. `grammar` is (on, origin) with origin "config" or "cli", None when left at its default (no entry)."""
     groups = [(g, "config") for g in engine_groups(file_words)] + [(g, "cli") for g in engine_groups(cli_words)]
     last_ctx = max((i for i, (g, _) in enumerate(groups) if g[0] == "--max-context"), default=None)
@@ -215,12 +215,7 @@ def engine_line(file_words: list[str], cli_words: list[str], config: bool = True
         base = "using default flags, " + entry if not groups else shown
     else:
         base = shown or "using default flags"
-    if config:
-        return f"[server] engine: {base}"
-    words = file_words + cli_words
-    spec = flag_value(words, "--spec")
-    state = f"spec {'7 with a drafter' if spec is None else 'off' if not int(spec) else spec}, {flag_value(words, '--max-context') or ENGINE_DEFAULT_CONTEXT} context"
-    return f"[server] engine: built-in defaults (no --config): {state}" + (f"; {shown}" if shown else "")
+    return f"[server] engine: {base}"
 
 
 def _num(v):
