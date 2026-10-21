@@ -77,26 +77,9 @@ using platform::detect_cpu_topology;
 /// `skip_first` drops the first core, which is reserved for the host loop.
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
 
-/// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
-///
-/// `physical_cores(true)` keeps the workers off the first physical core so that the host loop can spin on
-/// `cudaEventQuery` without stealing a worker's cycles.  Nothing in the pool can enforce the other half of that, so
-/// this is it: the host loop calls this on entry and restores on exit.  An unpinned spinning host is free to land on a
-/// worker's core or its SMT sibling, which costs the pool bandwidth.
-///
-/// The previous host placement (see platform::ThreadPlacement): the complete, dynamically sized native placement,
-/// including CPU IDs above 63.
-using ThreadAffinity = platform::ThreadPlacement;
-
-/// Selects one encoded processor for the caller.
-/// Restore on the same calling thread. Pool-owned workers use hard group affinity instead.
-ThreadAffinity pin_current_thread(int core);
-void restore_thread_affinity(const ThreadAffinity& previous);
-
 class ExpertPool {
 public:
-    /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores (minus core
-    /// 0 by default) and each owns one `ExpertScratch`, so nothing in the token path allocates.
+    /// `n_workers <= 0` means "every physical core except the first".  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
     /// **`host_works` PUTS THE HOST THREAD INTO THE DRAIN.**
     ///
@@ -104,7 +87,7 @@ public:
     /// `run()` the host does not spin, it waits, so core 0 is idle for the whole drain.  With `host_works`, `run()`
     /// claims jobs itself instead of spinning on `done_`, and the pool uses every core.  `false` is the A/B arm - the
     /// counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
+    explicit ExpertPool(int n_workers = 0, bool host_works = true,
                         PoolAffinity affinity = PoolAffinity::All);
     /// The watchdog's view of the pool: the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;

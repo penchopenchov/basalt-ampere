@@ -586,27 +586,10 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
         free();
         return false;
     }
-    // **PIN THE HOST ONCE, NOT ONCE PER TOKEN.**  `ExpertPool` builds its workers from `physical_cores(true)`,
-    // which drops the first physical core so the host loop can spin without taking a worker's cycles - and
-    // nothing in the pool can pin the host, so if this does not happen the spin is free to land on a worker's
-    // core or its SMT sibling.  The symptom is not an error: it is a slower CPU path.  Doing and undoing it on EVERY
-    // token would be a syscall pair on the critical path for a property that wants to hold for the whole session.
-    const std::vector<int> cores = basalt::kernels::cpu::physical_cores(false);
-    if (!cores.empty()) {
-        pinned_core = basalt::kernels::cpu::pin_current_thread(cores[0]);
-        pinned = pinned_core.valid;
-    }
     return true;
 }
 
 void SessionLoopScratch::free() {
-    // Restores the caller's affinity on every path, including teardown: a library that silently leaves its
-    // caller's thread nailed to one core is worse than one that never pinned at all.
-    if (pinned) {
-        basalt::kernels::cpu::restore_thread_affinity(pinned_core);
-        pinned = false;
-        pinned_core = {};
-    }
     if (probe != nullptr) { cudaEventDestroy(probe); probe = nullptr; }
     if (y_miss != nullptr) { cudaFreeHost(y_miss); y_miss = nullptr; }
     parts_bytes = 0;

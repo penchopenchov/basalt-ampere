@@ -27,7 +27,7 @@ behind one declaration, and a test in `tests/platform/` that runs on both.
 | file I/O | `file.hpp` | UTF-8 paths, open, positional reads, unbuffered descriptors |
 | file views | `mapped_file.hpp` | mapped files, prefetch and release hints, locking |
 | memory | `memory.hpp` | RAM probes, page locking, aligned and huge-page allocation |
-| CPU | `cpu.hpp` | topology, thread affinity |
+| CPU | `cpu.hpp` | topology |
 | processes | `process.hpp` | spawn, wait, terminate, pipes, signals |
 | system | `system.hpp`, `dynlib.hpp` | process memory, disk queries, the NVML loader |
 | compiler | `compiler.hpp` | CPUID, bit scan, spin hint, fp16 rounding |

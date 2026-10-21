@@ -36,23 +36,5 @@ int main() {
         check(!t.worker_cores.empty(), "a hybrid-aware ordering still finds cores");
     }
 
-    check(!set_thread_affinity(-1), "a negative core is refused");
-    const ThreadPlacement none = pin_current_thread(-1);
-    check(!none.valid, "pinning to a negative core is a no-op");
-    restore_thread_affinity(none);
-
-    const int target = all.worker_cores.front();
-    const ThreadPlacement prev = pin_current_thread(target);
-    if (!prev.valid) {
-        std::printf("cpu: this environment refuses a thread placement; placement cases skipped\n");
-    } else {
-        restore_thread_affinity(prev);
-        check(true, "a thread is pinned and its placement restored");
-        bool pinned = false;
-        std::thread([&] { pinned = set_thread_affinity(target, 0); }).join();
-        check(pinned, "a worker thread is pinned for good");
-        std::thread([&] { leave_host_core(); }).join();
-        check(true, "leave_host_core returns");
-    }
     return failures ? 1 : 0;
 }

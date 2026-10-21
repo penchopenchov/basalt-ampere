@@ -8,7 +8,7 @@
 #include <utility>
 
 #if defined(_WIN32)
-#include "affinity_win.hpp"
+#include "basalt/platform/win.hpp"
 #else
 #include <pthread.h>
 #include <sched.h>
@@ -134,37 +134,6 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
     return topo;
 }
 
-bool set_thread_affinity(int core, int worker) {
-    if (core < 0) return false;
-    return detail::set_thread_group_affinity(core, worker);
-}
-
-ThreadPlacement pin_current_thread(int core) {
-    if (core < 0) return {};
-    ThreadPlacement previous;
-    ULONG target = 0;
-    if (!detail::get_thread_cpu_sets(previous.ids) || !detail::cpu_set_for_core(core, target) ||
-        !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
-        std::fprintf(stderr, "basalt cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement kept\n",
-                     core, (unsigned long) GetLastError());
-        return {};
-    }
-    previous.valid = true;
-    return previous;
-}
-
-void restore_thread_affinity(const ThreadPlacement& previous) {
-    if (!previous.valid) return;
-    // Clearing an originally empty selection restores the process default rather than turning the caller's implicit
-    // all-group placement into an explicit single-group hard mask.
-    if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.ids.empty() ? nullptr : previous.ids.data(),
-                                  (ULONG) previous.ids.size()))
-        std::fprintf(stderr, "basalt cpu pool: host CPU Set restoration failed: %lu\n",
-                     (unsigned long) GetLastError());
-}
-
-void leave_host_core() {}
-
 #else
 // --------------------------------------------------------------------------------------------- Linux
 
@@ -287,72 +256,6 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
         for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
     }
     return topo;
-}
-
-bool set_thread_affinity(int core, int worker) {
-    if (core < 0) return false;
-    const int error = detail::pin_thread_to_cpu(core);
-    if (error != 0)
-        std::fprintf(stderr, "basalt cpu pool: affinity for worker %d (CPU %d) failed: %d; previous affinity kept\n",
-                     worker, core, error);
-    return error == 0;
-}
-
-ThreadPlacement pin_current_thread(int core) {
-    if (core < 0) return {};
-    ThreadPlacement previous;
-    int error = detail::get_thread_affinity(previous.ids);
-    if (error == 0) error = detail::pin_thread_to_cpu(core);
-    if (error != 0) {
-        std::fprintf(stderr, "basalt cpu pool: host affinity for CPU %d failed: %d; previous affinity kept\n", core, error);
-        return {};
-    }
-    previous.valid = true;
-    return previous;
-}
-
-void restore_thread_affinity(const ThreadPlacement& previous) {
-    if (!previous.valid) return;
-    const int error = detail::set_thread_affinity(previous.ids);
-    if (error != 0)
-        std::fprintf(stderr, "basalt cpu pool: host affinity restoration failed: %d\n", error);
-}
-
-void leave_host_core() {
-    const int n = (int) sysconf(_SC_NPROCESSORS_CONF);
-    if (n <= 0) return;
-    cpu_set_t* own = CPU_ALLOC(n);
-    cpu_set_t* sib = CPU_ALLOC(n);
-    if (own != nullptr && sib != nullptr) {
-        const size_t bytes = CPU_ALLOC_SIZE(n);
-        CPU_ZERO_S(bytes, own);
-        CPU_ZERO_S(bytes, sib);
-        if (pthread_getaffinity_np(pthread_self(), bytes, own) == 0 && CPU_COUNT_S(bytes, own) == 1) {
-            int host = 0;
-            while (host < n && !CPU_ISSET_S(host, bytes, own)) ++host;
-            char path[96];
-            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", host);
-            if (std::FILE* f = std::fopen(path, "r")) {
-                char line[128] = {};
-                if (std::fgets(line, sizeof line, f) != nullptr) {
-                    for (const char* q = line; *q != '\0';) {   // "0,16" or "0-1"
-                        char* end = nullptr;
-                        const long lo = std::strtol(q, &end, 10);
-                        if (end == q) break;
-                        long hi = lo;
-                        if (*end == '-') { q = end + 1; hi = std::strtol(q, &end, 10); }
-                        for (long c = lo; c <= hi && c < n; ++c)
-                            if (c != host) CPU_SET_S((int) c, bytes, sib);
-                        q = *end != '\0' ? end + 1 : end;
-                    }
-                }
-                std::fclose(f);
-            }
-            if (CPU_COUNT_S(bytes, sib) > 0) (void) pthread_setaffinity_np(pthread_self(), bytes, sib);
-        }
-    }
-    if (own != nullptr) CPU_FREE(own);
-    if (sib != nullptr) CPU_FREE(sib);
 }
 
 #endif

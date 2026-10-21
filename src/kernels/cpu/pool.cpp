@@ -25,16 +25,6 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
 }
 
 namespace {
-
-bool pin_this_thread(int core, int worker = -1) { return platform::set_thread_affinity(core, worker); }
-
-}  // namespace
-
-ThreadAffinity pin_current_thread(int core) { return platform::pin_current_thread(core); }
-
-void restore_thread_affinity(const ThreadAffinity& previous) { platform::restore_thread_affinity(previous); }
-
-namespace {
 std::atomic<const ExpertPool*> g_diag_pool{nullptr};
 void diag_active_pool(std::FILE* f) {
     if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
@@ -67,7 +57,7 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity)
+ExpertPool::ExpertPool(int n_workers, bool host_works, PoolAffinity affinity)
     : host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (n_workers > 0) {
         n_ = n_workers;
@@ -98,11 +88,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
-        threads_.emplace_back([this, i, core] {
-            pin_this_thread(core, i);
-            worker(i);
-        });
+        threads_.emplace_back([this, i] { worker(i); });
     }
 }
 

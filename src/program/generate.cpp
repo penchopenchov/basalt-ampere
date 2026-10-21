@@ -147,9 +147,6 @@ public:
     }
 private:
     void loop() {
-        // the decode loop's thread is pinned to one core, which it spins on, and a thread it starts would inherit
-        // that pin
-        basalt::platform::leave_host_core();
         std::unique_lock<std::mutex> lk(m_);
         for (;;) {
             cv_.wait(lk, [this] { return has_ || stop_; });
@@ -754,9 +751,9 @@ void usage() {
                  "                       except the one the host loop spins on (with --pool-affinity auto or\n"
                  "                       p-cores on a hybrid CPU: P-cores minus 1), lowered so the workers and the\n"
                  "                       host thread fit a cgroup CPU quota (container CPU limit).\n"
-                 "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
-                 "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
-                 "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
+                 "  --pool-affinity MODE Which cores size the worker pool (workers are not pinned): all (default:\n"
+                 "                       one worker per physical core), auto or p-cores (hybrid CPUs: sized by\n"
+                 "                       the P-cores, minus the host's).\n"
                  "  --mmap-experts       opt OUT of the default resident RAM copy, back to a file mapping.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       the experts, so cold and warm runs differ.\n"
@@ -3107,7 +3104,7 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    basalt::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/true, o.pool_affinity);
+    basalt::kernels::cpu::ExpertPool pool(o.pool_workers, /*host_works=*/true, o.pool_affinity);
     if (pool.is_hybrid() && pool.affinity() != basalt::kernels::cpu::PoolAffinity::All) {
         const char* aff_str = pool.affinity() == basalt::kernels::cpu::PoolAffinity::PCores ? "p-cores" :
                               pool.affinity() == basalt::kernels::cpu::PoolAffinity::All ? "all" : "auto";
