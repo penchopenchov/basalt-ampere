@@ -420,7 +420,7 @@ add_custom_target(git_stamp
 execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 # the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
-add_library(engine_session STATIC src/program/engine_session.cpp src/program/probe_report.cpp src/program/probe_derive.cpp)
+add_library(engine_session STATIC src/program/engine_session.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp)
 target_include_directories(engine_session PUBLIC include)
 target_link_libraries(engine_session PUBLIC platform)
 add_executable(basalt-bench src/program/bench_main.cpp)
@@ -812,6 +812,13 @@ target_link_libraries(probe_derive_test PRIVATE engine_session warnings)
 basalt_embed_manifest(probe_derive_test)
 basalt_cpu_test(NAME probe_derive_test COMMAND probe_derive_test)
 set_tests_properties(probe_derive_test PROPERTIES TIMEOUT 60)
+
+# the start-up picks for settings left out: the rules and the printed line (CPU only)
+add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
+target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
+basalt_embed_manifest(auto_plan_test)
+basalt_cpu_test(NAME auto_plan_test COMMAND auto_plan_test)
+set_tests_properties(auto_plan_test PROPERTIES TIMEOUT 60)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
