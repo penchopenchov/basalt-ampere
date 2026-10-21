@@ -404,7 +404,7 @@ target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_t
 add_executable(basalt src/program/generate.cpp src/program/probe_rates.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE engine engine_session prefill spec ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE engine engine_session grammar prefill spec ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -424,7 +424,7 @@ add_library(engine_session STATIC src/program/engine_session.cpp src/program/pro
 target_include_directories(engine_session PUBLIC include)
 target_link_libraries(engine_session PUBLIC platform)
 # the GBNF grammar engine and the JSON-schema and tool-call grammar builders (CPU only, no engine dependency)
-add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/schema.cpp)
+add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/schema.cpp src/program/grammar/guard.cpp)
 target_include_directories(grammar PUBLIC include)
 target_link_libraries(grammar PRIVATE warnings)
 add_executable(basalt-bench src/program/bench_main.cpp)
@@ -461,6 +461,16 @@ if(BASALT_STDIN_STOP_MODEL AND Python3_Interpreter_FOUND)
                    ${BASALT_STDIN_STOP_ARGS})
   set_property(TEST stdin_stop_test APPEND PROPERTY LABELS gpu)
   set_tests_properties(stdin_stop_test PROPERTIES TIMEOUT 600)
+endif()
+
+# the engine enforces a request grammar on what it samples (runs the real engine on a model pack:
+# -DBASALT_GRAMMAR_MODEL=<pack>, with python3)
+if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
+  add_test(NAME grammar_engine_test
+           COMMAND  /tests/program/grammar_engine_test.py
+                   $<TARGET_FILE:basalt>  )
+  set_property(TEST grammar_engine_test APPEND PROPERTY LABELS gpu)
+  set_tests_properties(grammar_engine_test PROPERTIES TIMEOUT 900)
 endif()
 
 add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
@@ -830,6 +840,13 @@ target_link_libraries(grammar_test PRIVATE grammar warnings)
 basalt_embed_manifest(grammar_test)
 basalt_cpu_test(NAME grammar_test COMMAND grammar_test)
 set_tests_properties(grammar_test PROPERTIES TIMEOUT 120)
+
+# the pack vocabulary reader and the per-request window check (CPU only)
+add_executable(grammar_guard_test tests/program/grammar_guard_test.cpp)
+target_link_libraries(grammar_guard_test PRIVATE grammar warnings)
+basalt_embed_manifest(grammar_guard_test)
+basalt_cpu_test(NAME grammar_guard_test COMMAND grammar_guard_test)
+set_tests_properties(grammar_guard_test PROPERTIES TIMEOUT 120)
 
 # schema-to-grammar and the tool-call grammar (CPU only)
 add_executable(grammar_schema_test tests/program/grammar_schema_test.cpp)
