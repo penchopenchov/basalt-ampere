@@ -424,7 +424,8 @@ add_library(engine_session STATIC src/program/engine_session.cpp src/program/pro
 target_include_directories(engine_session PUBLIC include)
 target_link_libraries(engine_session PUBLIC platform)
 # the GBNF grammar engine and the JSON-schema and tool-call grammar builders (CPU only, no engine dependency)
-add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/schema.cpp src/program/grammar/guard.cpp)
+add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/schema.cpp src/program/grammar/json_schema.cpp
+            src/program/grammar/schema_convert.cpp src/program/grammar/guard.cpp)
 target_include_directories(grammar PUBLIC include)
 target_link_libraries(grammar PRIVATE warnings)
 add_executable(basalt-bench src/program/bench_main.cpp)

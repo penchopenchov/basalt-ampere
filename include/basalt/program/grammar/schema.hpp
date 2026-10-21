@@ -1,9 +1,10 @@
 // include/basalt/program/grammar/schema.hpp - GBNF text built from a JSON schema or from a tool list.
 //
-// json_schema_to_gbnf covers type (also lists), enum, const, properties/required/additionalProperties, items,
-// prefixItems, minItems/maxItems, minLength/maxLength, format (date, time, date-time, uuid), anyOf/oneOf/allOf and local
-// $ref. Keywords with no grammar form (pattern, numeric bounds, uniqueItems, ...) are left to a validator after the
-// fact: a pattern accepts any string, a bound any number.
+// json_schema_to_gbnf is llama.cpp's json-schema-to-grammar: the same schema keywords and the same grammar text (type,
+// enum, const, properties/required/additionalProperties, items/prefixItems, minItems/maxItems, minLength/maxLength,
+// integer minimum/maximum, pattern, format, anyOf/oneOf/allOf, local ). What llama.cpp ignores is ignored here
+// too: uniqueItems, number bounds, a pattern that is not anchored or has no grammar form (any string is accepted);
+// what it refuses (a  outside the document) is refused.
 //
 // tool_call_gbnf writes the tool-call text the server parses:
 //   <tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n</function>\n</tool_call>

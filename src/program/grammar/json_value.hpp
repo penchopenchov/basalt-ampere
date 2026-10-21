@@ -2,7 +2,11 @@
 // engine's own Json sorts members and keeps only the head of an array).
 #pragma once
 
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -23,12 +27,28 @@ struct JsonValue {
         for (const auto& m : members) if (m.first == key) return &m.second;
         return nullptr;
     }
-    /// Compact JSON text, as a grammar constant for this value.
+    bool contains(const std::string& key) const { return get(key) != nullptr; }
+    /// Replaces the member, or appends it.
+    void set(const std::string& key, JsonValue v) {
+        for (auto& m : members) {
+            if (m.first == key) { m.second = std::move(v); return; }
+        }
+        members.emplace_back(key, std::move(v));
+    }
+    /// A number written without a fraction or an exponent.
+    bool is_integer() const {
+        return type == Type::Number && s.find_first_of(".eE") == std::string::npos;
+    }
+    int64_t as_int() const { return (int64_t) std::strtoll(s.c_str(), nullptr, 10); }
+    double as_double() const { return std::strtod(s.c_str(), nullptr); }
+    bool is_true() const { return type == Type::Bool && b; }
+    /// Compact JSON text, as a grammar constant for this value (numbers are written back the way a JSON library
+    /// prints them: integers as integers, others in the shortest form that reads back the same).
     std::string dump() const {
         switch (type) {
             case Type::Null: return "null";
             case Type::Bool: return b ? "true" : "false";
-            case Type::Number: return s;
+            case Type::Number: return number_text();
             case Type::String: return quote(s);
             case Type::Array: {
                 std::string o = "[";
@@ -43,6 +63,53 @@ struct JsonValue {
             }
         }
         return "null";
+    }
+    std::string number_text() const {
+        if (is_integer()) {
+            if (s.size() < 19) return std::to_string(std::strtoll(s.c_str(), nullptr, 10));
+            if (s[0] != '-') {
+                unsigned long long u = std::strtoull(s.c_str(), nullptr, 10);
+                if (u != ULLONG_MAX) return std::to_string(u);
+            } else {
+                errno = 0;
+                long long i = std::strtoll(s.c_str(), nullptr, 10);
+                if (errno == 0) return std::to_string(i);
+            }
+        }
+        double d = std::strtod(s.c_str(), nullptr);
+        if (d == 0) return std::signbit(d) ? "-0.0" : "0.0";
+        char buf[64];
+        int prec = 0;
+        for (prec = 0; prec < 17; ++prec) {
+            std::snprintf(buf, sizeof buf, "%.*e", prec, std::fabs(d));
+            if (std::strtod(buf, nullptr) == std::fabs(d)) break;
+        }
+        // digits and decimal exponent from d.ddde+XX
+        std::string mant(buf), digits;
+        size_t epos = mant.find('e');
+        int exp10 = std::atoi(mant.c_str() + epos + 1);
+        for (size_t i = 0; i < epos; ++i) if (mant[i] != '.') digits += mant[i];
+        while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
+        int k = (int) digits.size();
+        int dec = exp10 - (k - 1);   // value = digits * 10^dec
+        int n = k + dec;
+        std::string o = d < 0 ? "-" : "";
+        if (dec >= 0 && n <= 15) {
+            o += digits + std::string((size_t) dec, '0') + ".0";
+        } else if (0 < n && n <= 15) {
+            o += digits.substr(0, (size_t) n) + "." + digits.substr((size_t) n);
+        } else if (-4 < n && n <= 0) {
+            o += "0." + std::string((size_t) -n, '0') + digits;
+        } else {
+            o += digits.substr(0, 1);
+            if (k > 1) o += "." + digits.substr(1);
+            int e = n - 1;
+            o += e < 0 ? "e-" : "e+";
+            int ae = e < 0 ? -e : e;
+            if (ae < 10) o += "0";
+            o += std::to_string(ae);
+        }
+        return o;
     }
     static std::string quote(const std::string& in) {
         std::string o = "\"";
