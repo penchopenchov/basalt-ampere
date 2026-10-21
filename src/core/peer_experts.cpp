@@ -313,7 +313,14 @@ bool PeerExperts::finish(float* out, std::string& err) {
 }
 
 bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err) {
-    if (!pending_.empty() || !evicting_.empty() || max_swaps <= 0) return true;
+    if (!evicting_.empty() || max_swaps <= 0) return true;
+    // experts whose refill is still landing are not resident yet: they must not be picked again as candidates
+    // (their slots belong to no resident expert, so no victim can collide with them)
+    std::vector<uint8_t> inflight;
+    if (!pending_.empty()) {
+        inflight.assign((size_t) (n_layers_ * n_expert_), 0);
+        for (const auto& p : pending_) inflight[(size_t) p.first] = 1;
+    }
     const auto& lay = basalt::kernels::cpu::expert_layout();
     struct Swap { float gain; int32_t layer, in, out; };
     std::vector<Swap> swaps;
@@ -328,7 +335,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
             if (r1[e] >= 0) {
                 if (!hold_[(size_t) (l * n_expert_ + e)]) vict.emplace_back(u[e], e);
             }
-            else if (r0[e] < 0 && u[e] >= 2.0f) cand.emplace_back(u[e], e);
+            else if (r0[e] < 0 && u[e] >= 2.0f && (inflight.empty() || !inflight[(size_t) (l * n_expert_ + e)])) cand.emplace_back(u[e], e);
         }
         if (cand.empty() || vict.empty()) continue;
         std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
