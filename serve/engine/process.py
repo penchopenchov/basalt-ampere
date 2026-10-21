@@ -24,6 +24,7 @@ import threading
 import time
 from pathlib import Path
 
+from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.engine import lifeline
 from serve.engine.flags import flag_value
@@ -529,7 +530,8 @@ class ProcessEngine:
             keys += " relax=0"
         elif isinstance(rd, (int, float)) and not isinstance(rd, bool) and 0.0 <= float(rd) <= 1.0:
             keys += f" relax={float(rd)!r}"
-        return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY))
+        return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
+            + grammar_key(sampling.get(GRAMMAR_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
