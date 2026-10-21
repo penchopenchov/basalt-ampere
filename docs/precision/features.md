@@ -148,7 +148,7 @@ against the base.
 - Identity is bitwise with the expert tiers pinned. With adaptation on, experts move between the CPU pool and the GPU,
   which round differently: a rounding difference, not a quality difference.
 - The GPU tiers (VRAM and peer card) share one arithmetic; the CPU tier quantizes with ggml's vec_dot_type (Q8_K per 256
-  for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:52-62). In the quality gate about 0.8% of
+  for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 76-86). In the quality gate about 0.8% of
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the
   same for spec 0 and spec 7.
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
@@ -159,7 +159,7 @@ against the base.
 is kept only when it equals the target's own draw at that row (`src/program/generate.cpp`, the acceptance loop after
 `ver.run`). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
 final distribution (top_k, top_p, min_p, temperature and penalties applied). The sampler reports that probability next to
-its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu:1512); the logits and the draws themselves do not change.
+its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu:1375); the logits and the draws themselves do not change.
 
 **What changes.** The drafts are the draft head's argmax, fixed by the context. At a row where the draft d has
 p(d) ≥ P, the output is d every time instead of a draw from p: that row is greedy. Its total-variation distance from the
