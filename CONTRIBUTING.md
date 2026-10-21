@@ -40,7 +40,12 @@ Basalt is a single-purpose engine: Qwen3.8-Flash-Next on Linux with NVIDIA Black
 
 ## Other ways to help
 
-- Cannot contribute code? Run `basalt-bench` and the quality check on your hardware and open an issue with the output (see [building](docs/building.md)).
+- Cannot contribute code? Add a benchmark run from your hardware to the community table (details in [community runs](docs/community.md)):
+  1. Run `basalt-bench --community --model PACK --submitter YOUR_GITHUB_HANDLE`. It prints one JSON row ([building](docs/building.md)).
+  2. Add the row to the `runs` list in `docs/community/benchmarks.json`.
+  3. Check it with `python3 tools/check_benchmarks.py docs/community/benchmarks.json`.
+  4. Open a pull request; the `pages` workflow runs the same check.
+  5. Once merged, the row appears on the runs page.
 - Any Blackwell (sm_120) machine with spare hours helps; bigger setups help most: 96 GB+ VRAM (single large cards or multi-GPU), quad- or octa-channel DDR5.
 - A few hours of remote access to a machine speeds up development.
 - Or sponsor the project through GitHub Sponsors (the repository's Sponsor button): it pays for tokens for agentic development and for time on different hardware to test on.
