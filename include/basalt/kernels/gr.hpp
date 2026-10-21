@@ -21,9 +21,6 @@
 
 namespace basalt::kernels {
 
-/// The projections are the FP32-activation MMVF; this reports that, for callers that gate on it.
-inline bool gr_native_mmvf_enabled() { return true; }
-
 /// Geometry of the hyper-connection.  The real model: n_embd = 2560, hc = 4, hc_lr = 320.
 struct GrShapes {
     int64_t n_embd = 0;   ///< width of one residual stream

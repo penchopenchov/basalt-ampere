@@ -15,7 +15,6 @@
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/core/conversation_memory.hpp"
-#include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/core/pinned.hpp"
 #include "basalt/platform/compiler.hpp"
@@ -1510,7 +1509,6 @@ int main(int argc, char** argv) {
     }
     const basalt::core::PackFiles pack_files = basalt::core::PackFiles::from(srcs);
     const basalt::core::ExpertFiles expert_files = basalt::core::ExpertFiles::from(srcs);
-    basalt::core::set_coupled_draft(false);
     basalt::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // multi-GPU: without direct access the prompt path cannot take the peer, so it keeps the single-GPU kernels
     basalt::core::set_prompt_peer(o.peer_device >= 1 && o.peer_prefill_rows != 0 &&
@@ -5047,12 +5045,10 @@ int main(int argc, char** argv) {
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
-            if (st > 0) stage_ver(st).set_split(false);
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const basalt::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
-        ver.set_split(false);
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens it
         // has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the saved
@@ -6265,8 +6261,6 @@ int main(int argc, char** argv) {
         const bool batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
         const int S_all = S;
         basalt::spec::DraftPolicy bpolicy(S);   // the lookup-or-MTP choice, costs per row
-        basalt::kernels::SamplerParams greedy_sp;
-        greedy_sp.greedy = true;
         double bt_draft = 0, bt_draft_last = 0;
         int64_t bt_slotwin = 0, bt_dr_off = 0, bt_dr_acc = 0;
         std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript((size_t) std::max(o.batch, 0));
@@ -6806,7 +6800,6 @@ int main(int argc, char** argv) {
                     const BSlot& s2 = bs[(size_t) rows[x2]];
                     return s1.acc + 0.05 * (double) s1.since_draft > s2.acc + 0.05 * (double) s2.since_draft;
                 });
-                mtp.set_draft_sampling(greedy_sp);   // (the drafts are the draft layer's own picks)
                 const float* Rw = mtp.keep_rows(ver.final_R_all(), R, err);
                 if (Rw == nullptr) { std::printf("ERR %s\n", err.c_str()); return false; }
                 const int64_t HCN = (int64_t) g.hc * g.n_embd;
@@ -8098,7 +8091,6 @@ int main(int argc, char** argv) {
                 continue;
             }
             ver.set_sampling(req_sp);
-            if (mtp_on) mtp.set_draft_sampling(req_sp);   // sampled drafts
             // relaxed acceptance: sampled text requests without a logit_bias; never the quality gate
             const bool relax_on = req_relax > 0.0f && !req_sp.greedy && !req_bias_present && ppl == nullptr;
             ver.set_draft_probe(relax_on);
@@ -8532,8 +8524,6 @@ int main(int argc, char** argv) {
                     };
                     ++rounds;
                     const Clock::time_point tw2 = Clock::now();
-                    if (hist_n > 0 && mtp_on && mtp.coupled() && will_draft)
-                        mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                     basalt::core::decode_gaps().mark(5);
                     if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
                     mtp.set_cum_th(cum_adapt.th());
@@ -8612,10 +8602,6 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
-                // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's commit,
-                // outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (hist_n > 0 && mtp_on && mtp.coupled() && !eos && produced_n < max_new)
-                    mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 basalt::core::decode_gaps().mark(5);
                 if (!from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
                 mtp.set_cum_th(cum_adapt.th());
@@ -9043,9 +9029,7 @@ int main(int argc, char** argv) {
             return fatal_start_error(err);
         }
         ver.set_sampling(sp);   // the CLI's own sampling; no penalties here
-        if (use_mtp) mtp.set_draft_sampling(sp);   // sampled drafts
         if (use_mtp) mtp.begin_request(o.tokens.data(), (int64_t) o.tokens.size());
-        ver.set_split(false);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

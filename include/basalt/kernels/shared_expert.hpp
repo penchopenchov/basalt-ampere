@@ -20,10 +20,6 @@
 
 namespace basalt::kernels {
 
-/// The shared scalar gate is the BF16 MMVF with an FP32 sigmoid, so shared_expert requires its unrounded x_f32
-/// input; this reports that, for callers that gate on it.
-inline bool shared_expert_native_bf16_enabled() { return true; }
-
 /// Optional native GGUF projections. Each supported type with nonnull data
 /// replaces only that canonical projection; absent or unsupported entries fall
 /// back independently. Any active entry selects pinned FP32 SwiGLU arithmetic.
@@ -49,11 +45,11 @@ uint64_t shared_expert_scratch_bytes(int64_t n_ff);
 /// Q8_0; and its `n_in` is 640, which is not a multiple of 256, so **Q8_K is structurally impossible for it**.
 /// The gate/up weights are Q2_0 on 21 and 13 layers (Q8_0 again) and K-quants on the rest.
 ///
-/// x_f32 is required (the gate and the native gate/up projections read it); `x_bf16` is unused.
+/// x_f32 is required (the gate and the native gate/up projections read it).
 /// Native down reads the unrounded F32 SwiGLU intermediate directly. No allocation occurs.
 ///
 /// `s_gemv_q8_0_split` serves the Q8_0 half and `s2_gemv_q8` the Q2_0 half.
-void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* x_bf16, const SForm& gate_form,
+void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const SForm& gate_form,
                    const uint8_t* gate_codes, const float* gate_scales, const float* gate_off,
                    const SForm& up_form, const uint8_t* up_codes, const float* up_scales, const float* up_off,
                    const SForm& down_form, const uint8_t* down_codes, const float* down_scales,
@@ -63,9 +59,9 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 
 /// Plan v0.3 P6: the shared expert for `n_tok` <= 8 tokens (a verify window) with all three projections native:
 /// multi-column MMVQ, so the weights are read once; every token is bitwise `shared_expert` on that token.
-/// `x` (n_tok, n_embd) f32, `x_bf16` unused, `gate`/`up`
+/// `x` (n_tok, n_embd) f32, `gate`/`up`
 /// (n_tok, n_ff) scratch, `g` n_tok floats, `out` (n_tok, n_embd).  `nw.q8_1` must hold n_tok columns of n_embd.
-void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
+void shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream);
 

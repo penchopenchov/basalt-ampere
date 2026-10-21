@@ -1,7 +1,6 @@
 // src/core/mtp.cpp - see include/basalt/core/mtp.hpp.
 #include "basalt/core/mtp.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
 #include "basalt/core/kv_arena.hpp"
@@ -150,17 +149,8 @@ MtpDrafter::~MtpDrafter() {
         for (auto& e : row) if (e) cudaGraphExecDestroy(e);
     for (auto& row : step_exec_)
         for (auto& e : row) if (e) cudaGraphExecDestroy(e);
-    for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
-    for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
-    for (auto& tier : cond_exec_)
-        for (auto& row : tier)
-            for (auto& e : row) if (e) cudaGraphExecDestroy(e);
-    if (cparams_) cudaFree(cparams_);
-    if (cring_) cudaFree(cring_);
-    if (dinv_) cudaFree(dinv_);
-    if (cscratch_) cudaFree(cscratch_);
-    if (h_cparams_) cudaFreeHost(h_cparams_);
-    if (h_chist_) cudaFreeHost(h_chist_);
+    for (auto& row : cond_exec_)
+        for (auto& e : row) if (e) cudaGraphExecDestroy(e);
     if (cs_) cudaStreamDestroy(cs_);
     if (cs2_) cudaStreamDestroy(cs2_);
     if (cs3_) cudaStreamDestroy(cs3_);
@@ -426,7 +416,6 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         hit_scratch_ = b.take<uint8_t>(basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
         sh_scratch_ = (float*) b.take<uint8_t>(basalt::kernels::shared_expert_scratch_bytes(g.n_ff));
-        x_bf16_ = b.take<uint16_t>(N);
         out_ids_ = b.take<int32_t>(T + 4);
         probs_ = b.take<float>(T + 4);
         dummy_inj_ = b.take<float>(HC);
@@ -529,65 +518,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
             }
         }
     }
-    // coupled draft sampling (only when enabled): an upper bound - the id -> subset map, the penalty ring,
-    // the split scratch (64 lists of 64 entries at most) and the parameters
-    if (coupled_draft_env() && cparams_ == nullptr)
-        bytes += (uint64_t) n_vocab * 4 + (uint64_t) (kCoupledHistCap + max_t_) * 4 + 64ull * 64ull * 8ull + 4096;
     return bytes;
-}
-
-bool MtpDrafter::setup_coupled(std::string& err) {
-    const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
-    const size_t scratch = basalt::kernels::coupled_draft_scratch_bytes((int) nv);
-    if (scratch == 0) {
-        std::fprintf(stderr, "basalt mtp: coupled draft sampling: %lld draft logits are too wide for the coupled sampler; "
-                             "argmax drafts\n", (long long) nv);
-        return true;
-    }
-    const size_t ring = (size_t) (kCoupledHistCap + max_t_) * sizeof(int32_t);
-    if (cudaMalloc((void**) &cparams_, sizeof(basalt::kernels::SamplerParams)) != cudaSuccess ||
-        cudaMalloc((void**) &cring_, ring) != cudaSuccess || cudaMalloc(&cscratch_, scratch) != cudaSuccess ||
-        !mapped(sizeof(basalt::kernels::SamplerParams), (void**) &h_cparams_, (void**) &m_cparams_) ||
-        !mapped((size_t) kCoupledHistCap * sizeof(int32_t), (void**) &h_chist_, (void**) &m_chist_)) {
-        err = "mtp: the coupled draft sampler's buffers do not fit";
-        return false;
-    }
-    cudaMemset(cring_, 0xff, ring);   // -1: no token
-    std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
-    vram_ += sizeof(basalt::kernels::SamplerParams) + ring + scratch;
-    if (dhead_ != nullptr) {   // token id -> subset index (-1: not in the draft head), for the penalties
-        std::vector<int32_t> sub((size_t) n_dvocab_), inv((size_t) n_vocab_, -1);
-        cudaMemcpy(sub.data(), dvocab_, sub.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
-        for (size_t i = 0; i < sub.size(); ++i)
-            if (sub[i] >= 0 && sub[i] < n_vocab_ && inv[(size_t) sub[i]] < 0) inv[(size_t) sub[i]] = (int32_t) i;
-        if (cudaMalloc((void**) &dinv_, inv.size() * sizeof(int32_t)) != cudaSuccess) {
-            err = "mtp: the coupled draft sampler's token map does not fit";
-            return false;
-        }
-        cudaMemcpy(dinv_, inv.data(), inv.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
-        vram_ += inv.size() * sizeof(int32_t);
-    }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-        err = std::string("mtp: coupled setup: ") + cudaGetErrorString(cudaGetLastError());
-        return false;
-    }
-    coupled_ok_ = true;
-    std::fprintf(stderr, "basalt mtp: coupled draft sampling on: sampled requests draft with the "
-                         "target's chain and Philox draw over %lld tokens\n", (long long) nv);
-    return true;
-}
-
-void MtpDrafter::set_draft_sampling(const basalt::kernels::SamplerParams& sp) {
-    coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f;
-    if (!coupled_active_) return;
-    *h_cparams_ = sp;   // read by the next round graph (after the previous one has synced)
-    std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
-}
-
-void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next) {
-    if (!coupled_active_) return;
-    const int h = coupled_hist_len(h_cparams_->penalty_last_n, kCoupledHistCap);
-    coupled_hist_base(tail, n_tail, next, h, h_chist_ + (kCoupledHistCap - h));
 }
 
 namespace {
@@ -633,7 +564,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             for (int64_t i = 1; i < n_raw; ++i)
                 if (ids[i] < ids[i - 1]) { n_base = i; break; }
             // context rows follow the base rows
-            if (!coupled_draft_env() && head->type() == 13 && n_raw > 0) n_xcap_ = kDraftCtxRows;
+            if (head->type() == 13 && n_raw > 0) n_xcap_ = kDraftCtxRows;
             xbase_ = n_base;
             std::vector<int32_t> map((size_t) (n_raw + n_xcap_));
             std::copy(ids, ids + n_base, map.begin());
@@ -692,7 +623,6 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             }
         }
     }
-    if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     if (diag_ == nullptr && exp_flag("spec_log", 0) != 0) {
         diag_stride_ = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
         if (cudaHostAlloc((void**) &diag_, (size_t) max_t_ * (size_t) diag_stride_ * sizeof(float), cudaHostAllocDefault) != cudaSuccess)
@@ -735,11 +665,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const int32_t* step = step_ + row0 * 4;
     const int32_t* pos = pos_ + row0 * NH;
-    const bool kv_fused = st_.kv_int8 && !st_.kv_q4 && !st_.kv_rot && native_rope_enabled() &&
+    const bool kv_fused = st_.kv_int8 && !st_.kv_q4 && !st_.kv_rot &&
                           qsa_dec_fused_supported(s);
     const bool kv_par = par_ && full && !reuse_row && kv_fused;
     // chain-step kernels that start while the one before them still runs (the paths below all use the fused kernels)
-    const bool pdl_ok = kv_par && !st_.kv_rot && native_rope_enabled() && qsa_dec_fused_supported(s) &&
+    const bool pdl_ok = kv_par && !st_.kv_rot && qsa_dec_fused_supported(s) &&
                         qsa_dec_attn_supported(qsa_attn_pools(st_), s) && par_ && dec_draft_hcf() && have_pre_;
     std::unique_ptr<PdlScope> psc;
     auto pscope = [&](bool first_plain) {
@@ -750,8 +680,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     try {
         auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
             native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
-            if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
-            else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
+            native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
         };
         if (reuse_row) {
             // the catch-up already ran this row's input branches, attention hyper-connection and K/V append, with
@@ -846,7 +775,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         if (!full) return true;
         pscope(false);   // the query follows the hc read (or its quantize)
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
-        if (!st_.kv_rot && native_rope_enabled() && qsa_dec_fused_supported(s)) {
+        if (!st_.kv_rot && qsa_dec_fused_supported(s)) {
             QsaDecQPost qp;   // the query split, norm and RoPE in one launch
             qp.q_full = qfull_; qp.qcur = qcur_; qp.pos_q = pos; qp.q_norm = f32("self_attn.q_norm.weight"); qp.eps = EPS;
             qsa_dec_q_post(qp, T, s, rope_scaling(), cs);
@@ -894,7 +823,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             }
             if (par_ && dec_draft_hcf()) {   // the read with its write folded in, and the router when it is native
                 HcFusedArgs h = hcf_args(fa, T, xn_);
-                if (native_router_enabled() && g.n_expert == 512 && K == 10) {
+                if (g.n_expert == 512 && K == 10) {
                     h.w_router = bf16("mlp.gate.weight"); h.logits = logits_; h.ids = ids_; h.weights = w_;
                     routed = true;
                 }
@@ -913,8 +842,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         if (sh_par) fork(cs);
         for (int t = 0; t < T && !routed; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
-            if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
-            else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
+            native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
         }
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) basalt::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
@@ -927,29 +855,21 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         nsw.down_type = GGML_Q8_0; nsw.down_data = q8("mlp.shared_expert.down_proj.weight");
         nsw.q8_1 = xq_;
         const SForm none{};
-        const bool need_bf16_x = !shared_expert_native_bf16_enabled();
         const bool fold_write = par_ && dec_draft_hcf();   // the mixer read applies the write
         const cudaStream_t csh = sh_par ? cs2_ : cs;
         for (int t = 0; t < T; ++t) {
-            if (need_bf16_x) f32_to_bf16_bulk(mixed_ + t * N, x_bf16_, N, csh);
-            shared_expert(nullptr, nullptr, x_bf16_, none, nullptr, nullptr, nullptr, none, nullptr, nullptr, nullptr, none,
+            shared_expert(nullptr, nullptr, none, nullptr, nullptr, nullptr, none, nullptr, nullptr, nullptr, none,
                           nullptr, nullptr, nullptr, bf16("mlp.shared_expert_gate.weight"), sh_scratch_, shared_ + t * N,
                           N, g.n_ff, 32, csh, mixed_ + t * N, &nsw);
             if (sh_par) continue;
-            if (native_moe_combine_enabled())
-                native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
-            else
-                moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
+            native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
             if (!fold_write)
                 gr_write(R_ + (size_t) t * HC * N, y_ + t * N, inj2_ + t * HC, gs, R_ + (size_t) t * HC * N, cs);
         }
         if (sh_par) {
             join(cs);
             for (int t = 0; t < T; ++t) {
-                if (native_moe_combine_enabled())
-                    native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
-                else
-                    moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
+                native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
                 if (!fold_write)
                     gr_write(R_ + (size_t) t * HC * N, y_ + t * N, inj2_ + t * HC, gs, R_ + (size_t) t * HC * N, cs);
             }
@@ -990,18 +910,18 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         if (mixer_q8) pscope(false);   // the head follows the read
         if (!mixer_q8) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
-        // the argmax drafts over the base rows only on tier 0 (the coupled sampler keeps the whole subset)
-        const int64_t nv = sub ? ((tier_ == 0 && !coupled_rec_) ? n_tier1_ : n_dvocab_) : n_vocab_;
+        // the argmax drafts over the base rows only on tier 0
+        const int64_t nv = sub ? (tier_ == 0 ? n_tier1_ : n_dvocab_) : n_vocab_;
         // The head, its argmax and the argmax's probability in one launch (the probability's sum in
         // another order: last bits)
-        if (!coupled_rec_ && T == 1 && sub && proxy_ != nullptr && nv == n_tier1_ && diag_ == nullptr &&
+        if (T == 1 && sub && proxy_ != nullptr && nv == n_tier1_ && diag_ == nullptr &&
             (head_->type() == 13
                  ? basalt::kernels::q5k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
                                                    proxy_scratch_, cs)
                  : basalt::kernels::q6k_proxy_top1(proxy_, dhead_, xq_, (int) nv, n_tier1_, dvocab_, out_ids_, probs_,
                                                    proxy_scratch_, cs)))
             return true;
-        if (!coupled_rec_ && T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
+        if (T == 1 && head_->type() == 13 && top_scratch_ != nullptr && diag_ == nullptr &&
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
             return true;
@@ -1011,16 +931,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (sub && n_xcap_ > 0)   // rows without a token never win
             for (int t = 0; t < T; ++t) q5k_head_mask_unmapped(head_logits_ + (size_t) t * nv, dvocab_, (int) nv, cs);
-        if (diag_ != nullptr && !coupled_rec_ && T == 1)   // the step's logits to the host, for the draft-tree study
-            cudaMemcpyAsync(diag_ + (size_t) coupled_j_ * (size_t) diag_stride_, head_logits_, (size_t) nv * sizeof(float),
+        if (diag_ != nullptr && T == 1)   // the step's logits to the host, for the draft-tree study
+            cudaMemcpyAsync(diag_ + (size_t) chain_j_ * (size_t) diag_stride_, head_logits_, (size_t) nv * sizeof(float),
                             cudaMemcpyDeviceToHost, cs);
-        if (coupled_rec_) {
-            // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
-            // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
-            coupled_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
-                                 cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, cs);
-            return true;
-        }
         if (sample_greedy_top_prob(head_logits_, T, (int) nv, sub ? dvocab_ : nullptr, out_ids_, probs_, cs))
             return true;
         SamplerParams sp;
@@ -1079,11 +992,9 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
 // again, identically, unless the row is taken from the catch-up), staged by the host in step row
 // 2*max_t - 1; draft 0 and its probability to the mapped outputs.  The draft chain is one graph per step
 // (`capture_step`) so the host can stop it when a draft is unlikely, or conditional nodes (`capture_cond`).
-bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& err) {
+bool MtpDrafter::record_round(int T, bool all_rows, std::string& err) {
     using namespace basalt::kernels;
     const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
-    // coupled: the request's chain and the penalty history's base, for this round's drafts
-    if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
     const int64_t rows = all_rows ? 2 * (int64_t) max_t_ : 2 * (int64_t) T;
     const int ra = 2 * max_t_ - 1;
     {   // the catch-up reads rows below 2T only: the draft row's records are staged with the rest
@@ -1100,11 +1011,9 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
     par_ = true;
     bool ok = record_forward(T, -1, cs_, err);
     if (ok) {
-        coupled_rec_ = coupled;
-        coupled_j_ = 0;
+        chain_j_ = 0;
         pre_next_ = par_;
         ok = record_forward(1, ra, cs_, err, true);
-        coupled_rec_ = false;
     }
     end_branches();
     if (ok) ok = step_end(0);
@@ -1114,7 +1023,7 @@ bool MtpDrafter::record_round(int T, bool coupled, bool all_rows, std::string& e
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in tok_[0] by the previous step); draft j and its probability to the mapped outputs.
-bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string& err) {
+bool MtpDrafter::record_step(int j, bool copy_records, std::string& err) {
     using namespace basalt::kernels;
     const int64_t NH = g_->n_head;
     const int row = max_t_ + j - 1;
@@ -1122,12 +1031,10 @@ bool MtpDrafter::record_step(int j, bool coupled, bool copy_records, std::string
         copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
         copy_i32_from_mapped(pos_ + row * NH, m_pos_ + row * NH, NH, cs_);
     }
-    coupled_rec_ = coupled;
-    coupled_j_ = j;
+    chain_j_ = j;
     par_ = true;
     have_pre_ = pre_next_ = par_;   // every full row hands the next its hidden input
     bool ok = record_forward(1, row, cs_, err);
-    coupled_rec_ = false;
     end_branches();
     if (ok) ok = step_end(j);
     if (ok && gstamp_ != nullptr) gpu_stamp(gstamp_, 1, cs_);
@@ -1203,20 +1110,20 @@ void MtpDrafter::end_branches() {
     fork_open_ = par_ = pre_next_ = have_pre_ = false;
 }
 
-bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[tier_][T];
+bool MtpDrafter::capture_round(int T, std::string& err) {
+    cudaGraphExec_t& exec = round_exec_[tier_][T];
     if (exec) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
-    const bool ok = record_round(T, coupled, false, err);
-    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+    const bool ok = record_round(T, false, err);
+    return finish_capture(cs_, ok, exec, "round", err);
 }
 
-bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[tier_][j];
+bool MtpDrafter::capture_step(int j, std::string& err) {
+    cudaGraphExec_t& exec = step_exec_[tier_][j];
     if (exec) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
-    const bool ok = record_step(j, coupled, true, err);
-    return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+    const bool ok = record_step(j, true, err);
+    return finish_capture(cs_, ok, exec, "step", err);
 }
 
 // [round, h1 <- rule(p0)] -> IF h1 [step 1, h2 <- rule(p0, p1)] -> IF h2 [...] ...  Every record
@@ -1230,7 +1137,7 @@ bool MtpDrafter::prewarm(std::string& err) {
     bool ok = true;
     for (int tier = 0; ok && tier < (tier2_.empty() ? 1 : 2); ++tier) {
         tier_ = tier2_.empty() ? saved : tier;
-        for (int T = 1; ok && T <= max_t_ && !cond_off_; ++T) ok = capture_cond(T, false, max_steps);
+        for (int T = 1; ok && T <= max_t_ && !cond_off_; ++T) ok = capture_cond(T, max_steps);
     }
     tier_ = saved;
     if (!ok && cond_off_) return true;   // the per-step graphs take over, as at a lazy failure
@@ -1238,10 +1145,9 @@ bool MtpDrafter::prewarm(std::string& err) {
     return ok;
 }
 
-bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
-    const int c = coupled ? 1 : 0;
-    cudaGraphExec_t& exec = cond_exec_[tier_][c][T];
-    if (exec && cond_steps_[tier_][c][T] == steps) return true;
+bool MtpDrafter::capture_cond(int T, int steps) {
+    cudaGraphExec_t& exec = cond_exec_[tier_][T];
+    if (exec && cond_steps_[tier_][T] == steps) return true;
     if (exec) {
         cudaGraphExecDestroy(exec);
         exec = nullptr;
@@ -1265,7 +1171,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         ct.n = steps - 1;
         ctail_ = &ct;
         ctail_done_ = false;
-        bool rec = record_round(T, coupled, true, err);
+        bool rec = record_round(T, true, err);
         ctail_ = nullptr;
         if (rec && !ctail_done_)
             rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 3, cs_, m_prob_, 0);
@@ -1292,7 +1198,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         ct.n = 1;
         ctail_ = j + 1 < steps ? &ct : nullptr;
         ctail_done_ = false;
-        bool rec = record_step(j, coupled, false, err);
+        bool rec = record_step(j, false, err);
         ctail_ = nullptr;
         if (rec && j + 1 < steps && !ctail_done_)
             rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 3, cs_, m_prob_, j);
@@ -1316,7 +1222,7 @@ bool MtpDrafter::capture_cond(int T, bool coupled, int steps) {
         cond_off_ = true;
         return false;
     }
-    cond_steps_[tier_][c][T] = steps;
+    cond_steps_[tier_][T] = steps;
     return true;
 }
 
@@ -1442,7 +1348,6 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     note_cells(p, p + T + max_t_ + 1);
-    const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (n_xcap_ > 0) {   // the window's committed picks (rows 0..a) may hold names the subset lacks
         for (int t = 0; t <= a; ++t) ctx_note(tokens[t]);
         ctx_flush(cs_);
@@ -1455,11 +1360,11 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (tier2_recent_ > 0) --tier2_recent_;
     }
     // the chain in one graph (falls back to the graphs below for good if it cannot be built)
-    const bool cond = !cond_off_ && max_steps > 1 && capture_cond(T, cp, max_steps);
+    const bool cond = !cond_off_ && max_steps > 1 && capture_cond(T, max_steps);
     if (!cond) {
-        if (!capture_round(T, cp, err)) return false;
+        if (!capture_round(T, err)) return false;
         for (int j = 1; j < max_steps; ++j)
-            if (!capture_step(j, cp, err)) return false;
+            if (!capture_step(j, err)) return false;
     }
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
@@ -1474,9 +1379,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         h_tok_[t] = tokens[t];
         put(t, p + t);
     }
-    put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
+    put(2 * max_t_ - 1, p + a);   // p + a: draft 0's cell
     for (int j = 1; j < max_steps; ++j)
-        put(max_t_ + j - 1, coupled_draft_cell(p, a, j));
+        put(max_t_ + j - 1, p + a + j);
     for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
     h_row_[0] = a;
     h_row_[1] = 0;
@@ -1500,7 +1405,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     int n = 0;
     if (max_steps > 0) {
         decode_gaps().mark(6);
-        const cudaGraphExec_t first = cond ? cond_exec_[tier_][cp ? 1 : 0][T] : (cp ? round_exec_c_[T] : round_exec_[tier_][T]);
+        const cudaGraphExec_t first = cond ? cond_exec_[tier_][T] : round_exec_[tier_][T];
         decode_events().record(DecodeEvents::kDraftPre, cs_);
         if (cudaGraphLaunch(first, cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
@@ -1527,7 +1432,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         n = 1;
         for (int j = 1; j < max_steps && draft_keep(pr, j - 1, cum_th); ++j) {
             if (!cond) {   // the conditional graph runs step j on the device by the same comparison
-                if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[tier_][j], cs_) != cudaSuccess) {
+                if (cudaGraphLaunch(step_exec_[tier_][j], cs_) != cudaSuccess) {
                     err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }

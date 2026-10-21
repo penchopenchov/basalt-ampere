@@ -297,9 +297,6 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
-    /// Split the window into two token groups and pipeline the CPU experts of one with the GPU work of the other
-    /// (default on).  Set before the first `run`.
-    void set_split(bool on) { split_ = on; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     double ms_launch = 0;   ///< host time inside the window graph's launch
@@ -485,9 +482,7 @@ private:
     GpuPlanSink sink_;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
-    void set_plan_slot(int grp);
-    bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
+    void set_plan_slot();
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
@@ -515,7 +510,6 @@ private:
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
-    uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM

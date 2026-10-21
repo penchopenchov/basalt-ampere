@@ -209,7 +209,6 @@ int main(int argc, char** argv) {
     // shared expert
     float *sh_gate = dalloc<float>((size_t) TM * FF), *sh_up = dalloc<float>((size_t) TM * FF), *sh_g = dalloc<float>(TM),
           *shared = dalloc<float>((size_t) TM * N);
-    uint16_t* sh_bf16 = dalloc<uint16_t>((size_t) TM * N);
     void* sh_xq = dalloc<uint8_t>((size_t) TM * (N / 32) * 36 + 4096);
 
     cudaStream_t cs, sh;
@@ -240,7 +239,7 @@ int main(int argc, char** argv) {
         nsw.gate_type = 8; nsw.gate_data = lay[l].sg; nsw.up_type = 8; nsw.up_data = lay[l].su;
         nsw.down_type = 8; nsw.down_data = lay[l].sdn; nsw.q8_1 = sh_xq;
         K::PdlScope ps(false);
-        K::shared_expert_multi(T, mixed, sh_bf16, nsw, lay[l].gate_inp, sh_gate, sh_up, sh_g, shared, N, FF, sh);
+        K::shared_expert_multi(T, mixed, nsw, lay[l].gate_inp, sh_gate, sh_up, sh_g, shared, N, FF, sh);
         if (flag) K::pk_moe_shared_done(sync, sh);
     };
     auto join_side = [&]() {

@@ -127,9 +127,8 @@ int main(int argc, char** argv) {
 
     // THE SCALAR GATE IS A BF16 WEIGHT DOTTED WITH THE UNROUNDED F32 ACTIVATION (the single-token MMVF contract);
     // the reference therefore dots the bf16 image of the weight with the original x.
-    std::vector<uint16_t> hx_bf16((size_t) n_embd), hginp_bf16((size_t) n_embd);
+    std::vector<uint16_t> hginp_bf16((size_t) n_embd);
     for (long long i = 0; i < n_embd; ++i) {
-        hx_bf16[(size_t) i] = basalt::kernels::bf16_from_f32(fx[(size_t) i]);
         hginp_bf16[(size_t) i] = basalt::kernels::bf16_from_f32(ginp[(size_t) i]);
     }
 
@@ -188,7 +187,7 @@ int main(int argc, char** argv) {
     // ---- device side
     uint16_t* d_x = nullptr;
     uint8_t* d_x_used = nullptr;   // the Q8_0 image the kernel now takes
-    uint16_t *d_xb = nullptr, *d_ginpb = nullptr;
+    uint16_t* d_ginpb = nullptr;
     uint8_t *d_gc = nullptr, *d_uc = nullptr, *d_dc = nullptr;
     float *d_gs = nullptr, *d_us = nullptr, *d_ds = nullptr, *d_ginp = nullptr, *d_out = nullptr;
     check(cudaMalloc(&d_x, hx.size() * sizeof(uint16_t)), "m x");
@@ -199,7 +198,6 @@ int main(int argc, char** argv) {
     check(cudaMalloc(&d_us, us.size() * sizeof(float)), "m us");
     check(cudaMalloc(&d_ds, ds.size() * sizeof(float)), "m ds");
     check(cudaMalloc(&d_ginp, ginp.size() * sizeof(float)), "m ginp");
-    check(cudaMalloc(&d_xb, hx_bf16.size() * sizeof(uint16_t)), "m xb");
     check(cudaMalloc(&d_ginpb, hginp_bf16.size() * sizeof(uint16_t)), "m ginpb");
     check(cudaMalloc(&d_out, (size_t) n_embd * sizeof(float)), "m out");
     check(cudaMemcpy(d_x, hx.data(), hx.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c x");
@@ -210,7 +208,6 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(d_us, us.data(), us.size() * sizeof(float), cudaMemcpyHostToDevice), "c us");
     check(cudaMemcpy(d_ds, ds.data(), ds.size() * sizeof(float), cudaMemcpyHostToDevice), "c ds");
     check(cudaMemcpy(d_ginp, ginp.data(), ginp.size() * sizeof(float), cudaMemcpyHostToDevice), "c ginp");
-    check(cudaMemcpy(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c xb");
     check(cudaMemcpy(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice),
           "c ginpb");
 
@@ -234,7 +231,7 @@ int main(int argc, char** argv) {
     // layer does, so the test exercises the real contract instead of a private one.
     float* d_scratch = nullptr;
     check(cudaMalloc(&d_scratch, basalt::kernels::shared_expert_scratch_bytes(n_ff)), "m scratch");
-    basalt::kernels::shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
+    basalt::kernels::shared_expert(d_x_used, nullptr, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
                                    d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr, d_xf);
     std::vector<float> got((size_t) n_embd);
     check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "c out");
@@ -334,7 +331,7 @@ int main(int argc, char** argv) {
         check(cudaMalloc(&d_witness, witness.size() * sizeof(float)), "shared witness x");
         check(cudaMemcpy(d_witness, witness.data(), witness.size() * sizeof(float), cudaMemcpyHostToDevice), "shared upload x");
         auto run = [&](void* stream, const float* x_float = nullptr) {
-            shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
+            shared_expert(d_x_used, nullptr, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
                           d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, stream, x_float);
         };
         check(cudaMemcpy(d_ginpb, zeros.data(), zeros.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "zero shared gate");

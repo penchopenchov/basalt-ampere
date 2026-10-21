@@ -103,14 +103,6 @@ public:
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, int* n_drafts = nullptr);
 
-    /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; set up by bind()): the request's
-    /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
-    /// the target's Philox draw for the verifying row, and `probs` is the draft's probability under that chain; a
-    /// greedy one keeps the argmax drafts and their graphs.  A no-op when the switch is off.
-    void set_draft_sampling(const basalt::kernels::SamplerParams& sp);
-    /// Coupled mode with penalties: the history the next draft() chain starts from - what the session holds after the
-    /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
-    void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
 
     /// BATCH WINDOWS: one draft K/V per sequence.  `n` stores for the slots (set before `load`); the working state
@@ -136,7 +128,6 @@ public:
     /// sequence, in one pass.  The copy runs on the drafter's stream: `idle` before the rows' buffer is reused.
     bool defer_rows(int id, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
     bool flush(int id, std::string& err);
-    bool coupled() const { return coupled_active_; }
     /// Diagnostic (gate spec_log): the top-k tokens and softmax probabilities of the last draft's step j, from the
     /// draft head's logits kept per step.  Returns the count written (0 when the diagnostic is off).
     int diag_top(int j, int k, int32_t* ids, float* probs) const;
@@ -168,28 +159,18 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< without the mapped staging (inputs copied on device)
     /// all_rows: copy every step / position record (the chain's too) and the threshold bits, for a graph without per-step
     /// copies
-    bool record_round(int T, bool coupled, bool all_rows, std::string& err);
-    bool record_step(int j, bool coupled, bool copy_records, std::string& err);
-    bool capture_round(int T, bool coupled, std::string& err);
-    bool capture_step(int j, bool coupled, std::string& err);
+    bool record_round(int T, bool all_rows, std::string& err);
+    bool record_step(int j, bool copy_records, std::string& err);
+    bool capture_round(int T, std::string& err);
+    bool capture_step(int j, std::string& err);
     cudaGraphExec_t step_exec_[2][9] = {};   ///< [tier_]
     /// The round and `steps - 1` chain steps in one graph, step j an IF node on draft j-1's
     /// probability passing the cumulative rule; false (with the per-step path from then on) where it cannot be built
-    bool capture_cond(int T, bool coupled, int steps);
-    cudaGraphExec_t cond_exec_[2][2][9] = {};   ///< [tier_][coupled]
-    int cond_steps_[2][2][9] = {};
+    bool capture_cond(int T, int steps);
+    cudaGraphExec_t cond_exec_[2][9] = {};   ///< [tier_]
+    int cond_steps_[2][9] = {};
     bool cond_off_ = false;
-    // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
-    // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
-    bool setup_coupled(std::string& err);
-    cudaGraphExec_t round_exec_c_[9] = {};
-    cudaGraphExec_t step_exec_c_[9] = {};
-    bool coupled_ok_ = false, coupled_active_ = false;
-    bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
-    int coupled_j_ = 0;
-    basalt::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
-    int32_t *h_chist_ = nullptr, *m_chist_ = nullptr, *cring_ = nullptr, *dinv_ = nullptr;
-    void* cscratch_ = nullptr;
+    int chain_j_ = 0;   ///< record_forward: the chain step being recorded (the diagnostic logits' slot)
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
@@ -321,7 +302,6 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float* sh_scratch_ = nullptr;
-    uint16_t* x_bf16_ = nullptr;
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;

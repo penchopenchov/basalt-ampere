@@ -99,7 +99,7 @@ __global__ void sigmoid_scale_rows_kernel(float* __restrict__ out, const float* 
 constexpr bool fused_swiglu_q81_enabled() { return true; }
 }  // namespace
 
-void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
+void shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream) {
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
@@ -132,7 +132,7 @@ uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
     return a * 2 + q0 + qk + 32;
 }
 
-void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* x_bf16, const SForm& gate_form,
+void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const SForm& gate_form,
                    const uint8_t* gate_codes, const float* gate_scales, const float* gate_off,
                    const SForm& up_form, const uint8_t* up_codes, const float* up_scales, const float* up_off,
                    const SForm& down_form, const uint8_t* down_codes, const float* down_scales,

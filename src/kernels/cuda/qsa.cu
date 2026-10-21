@@ -786,27 +786,6 @@ void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scr
     qsa_attend_step(q, k_scratch, v_scratch, step_upload_width(n_ids, s), n_ids, s, attn, weights, stream);
 }
 
-/// The same multiply as `qsa_gate_apply_kernel` WITHOUT the fp16 round - see the header for why the caller
-/// whose weight is a K-quant needs the f32 form.  Identical arithmetic up to the last step.
-__global__ void qsa_gate_apply_f32_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
-                                          int n_head, int head_dim, float* __restrict__ out) {
-    const long long i = blockIdx.x * (long long) blockDim.x + threadIdx.x;
-    if (i >= (long long) n_head * head_dim) return;
-    const int h = (int) (i / head_dim), d = (int) (i % head_dim);
-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
-    const double sig = 1.0 / (1.0 + exp(-g));
-    out[i] = (float) ((double) attn[i] * sig);
-}
-
-void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
-    validate(s, "qsa_gate_apply_f32");
-    const long long n = s.n_head * s.head_dim;
-    qsa_gate_apply_f32_kernel<<<grid_for(n, 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, (int) s.n_head,
-                                                                                  (int) s.head_dim, out);
-    check_launch("qsa_gate_apply_f32");
-    if (stream == nullptr) check_sync("qsa_gate_apply_f32");
-}
-
 void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, uint16_t* out, void* stream) {
     validate(s, "qsa_gate_apply");
     const long long n = s.n_head * s.head_dim;

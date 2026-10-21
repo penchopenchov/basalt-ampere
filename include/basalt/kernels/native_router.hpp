@@ -2,7 +2,6 @@
 #include <cstdint>
 
 namespace basalt::kernels {
-inline bool native_router_enabled() { return true; }
 
 // Pinned CUDA topk-moe contract for ONE token, 512 experts, top 10, softmax,
 // no selection bias, lower normalization clamp 2^-14, and scale 1.

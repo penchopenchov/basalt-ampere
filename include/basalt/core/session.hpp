@@ -123,8 +123,8 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 /// `moe_layer` consumes it directly; the doorbell protocol's job is to let it be produced DURING the layer rather
 /// than before it, which is a change to *when* the host runs, not to what this function computes.
 ///
-/// `sync_every_layer` inserts a device synchronisation and an error check after EVERY layer.  That is the
-/// `--sync-every-layer` debug mode, and it is deliberately a parameter rather than a compile-time choice: the errors
+/// `sync_every_layer` inserts a device synchronisation and an error check after EVERY layer.  That is a
+/// debug mode, and it is deliberately a parameter rather than a compile-time choice: the errors
 /// it catches (a kernel reading a buffer that a later layer writes) are invisible otherwise, and the synchronisation
 /// it costs is exactly what the fast path avoids.
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,

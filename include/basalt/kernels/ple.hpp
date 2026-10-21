@@ -27,11 +27,6 @@
 
 namespace basalt::kernels {
 
-/// The value projection is the BF16 MMVF and the post-projection norms, gate, convolution and residual arithmetic
-/// are the pinned kernels; these report that, for callers that gate on it.
-inline bool ple_native_bf16_enabled() { return true; }
-inline bool ple_native_postops_enabled() { return true; }
-
 /// Weights of the single PLE layer (`ple.layers = [1]`).  `blk.1.*` in the pack.
 ///
 ///   key_codes / key_scales   `ple_key.weight`   S2, [n_embd, hc_dim], code_bias -1, group 64.

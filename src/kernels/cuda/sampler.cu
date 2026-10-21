@@ -21,7 +21,6 @@
 //     rounds, each over the logits after the previous pick.
 // `sampled_tail_warp` and `sampled_tail_pair` run top_p / min_p / temperature / draw with the same arithmetic.
 #include "basalt/kernels/sampler.hpp"
-#include "basalt/core/coupled_draft.hpp"
 #include "basalt/core/diag.hpp"
 
 #include <cuda_runtime.h>
@@ -1134,142 +1133,6 @@ sampler_sort_kernel(const float* __restrict__ logits, int n_vocab, const int* __
     sampled_tail_pair(ts, k, p, t, out, query, nq, qprob);
 }
 
-// ---- COUPLED DRAFT SAMPLING (include/basalt/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
-// target's chain and the target's Philox draw.  Everything that varies per request or per round - the chain's
-// parameters, the seed, the counter (from the cell's step record), the penalty history - is read from DEVICE memory:
-// these kernels are captured into the drafter's round/step graphs.  One row, `nv` logits: the draft head's
-// vocabulary subset (rt/draft_vocab.bin) or the whole vocabulary; `sub_to_id` maps a subset index to its token id.
-
-/// The round's inputs: the request's SamplerParams and the history base (the last h slots before `cap`), from
-/// mapped host memory into the device copies the chain's kernels read.
-__global__ void coupled_stage_kernel(const SamplerParams* __restrict__ mp, const int* __restrict__ mh,
-                                     SamplerParams* __restrict__ dp, int* __restrict__ ring, int cap) {
-    const volatile int* s = (const volatile int*) mp;
-    int* d = (int*) dp;
-    for (int i = threadIdx.x; i < (int) (sizeof(SamplerParams) / sizeof(int)); i += blockDim.x) d[i] = s[i];
-    const int h = basalt::core::coupled_hist_len(((const volatile SamplerParams*) mp)->penalty_last_n, cap);
-    const volatile int* vh = (const volatile int*) mh;
-    for (int i = cap - h + (int) threadIdx.x; i < cap; i += blockDim.x) ring[i] = vh[i];
-}
-
-/// The penalties, applied in place to the draft logits before the selection - the target applies the same
-/// `apply_penalties` to the same token with the same count over the same window before its own.  Draft j's window
-/// is the ring's [cap + j - h, cap + j): the base plus drafts 0 .. j-1.  A history token outside the draft head's
-/// subset has no logit here.  Each distinct token is penalised once: the entry whose `atomicOr` sets its bit does it.
-__global__ void coupled_penalize_kernel(float* __restrict__ logits, int nv, const int* __restrict__ id_to_sub,
-                                        int id_vocab, const SamplerParams* __restrict__ dp, const int* __restrict__ ring,
-                                        int cap, int j) {
-    const SamplerParams p = *dp;
-    const int h = basalt::core::coupled_hist_len(p.penalty_last_n, cap);
-    if (h <= 0) return;
-    const int* hrow = ring + basalt::core::coupled_hist_start(cap, j, h);
-    extern __shared__ unsigned int seen[];
-    const int words = (nv + 31) / 32;
-    for (int w = threadIdx.x; w < words; w += blockDim.x) seen[w] = 0u;
-    __syncthreads();
-    for (int i = threadIdx.x; i < h; i += blockDim.x) {
-        const int v = hrow[i];
-        if (v < 0 || v >= id_vocab) continue;
-        const int s = id_to_sub != nullptr ? id_to_sub[v] : v;
-        if (s < 0 || s >= nv) continue;
-        const unsigned bit = 1u << (s & 31);
-        if (atomicOr(&seen[s >> 5], bit) & bit) continue;
-        logits[s] = apply_penalties(logits[s], history_count(hrow, h, v), p);
-    }
-}
-
-/// Draft-only selection stage: the same exact top-k of every block's logits as `sampler_split_part_kernel`, but
-/// with the request's own k (read from the device copy of the chain) instead of the widest list, and narrower
-/// warps (`kPer` logits per lane, `kWarps` warps per block) so every round scans less and more warps run.  The
-/// selection order is a strict total order, so the lists, and the merged first k, are the same whatever the split.
-/// Penalties were applied to the logits by `coupled_penalize_kernel`.
-template <int kPer, int kWarps>
-__global__ void __launch_bounds__(kWarps * 32)
-coupled_part_kernel(const float* __restrict__ l, int n_vocab, const SamplerParams* __restrict__ dp,
-                    int2* __restrict__ cand) {
-    constexpr int kWarpSpan = 32 * kPer;
-    constexpr int kBlockSpan = kWarps * kWarpSpan;
-    const int k = sampled_k(dp->top_k, n_vocab);
-    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
-    const int lo = (int) blockIdx.x * kBlockSpan + warp * kWarpSpan;
-    float s[kPer];
-#pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-        const int v = lo + 32 * j + lane;
-        s[j] = v < n_vocab ? l[v] : __int_as_float(0xff800000);
-    }
-    __shared__ int2 wl[kWarps][kSelMax];
-    float prev_v = __int_as_float(0x7f800000);   // +inf and id -1: round 0 takes every logit
-    int prev_i = -1;
-    int i = 0;
-    for (; i < k; ++i) {
-        float b0 = __int_as_float(0xff800000), b1 = __int_as_float(0xff800000);
-        int i0 = n_vocab, i1 = n_vocab;
-#pragma unroll
-        for (int j = 0; j < kPer; j += 2) {
-            const int v0 = lo + 32 * j + lane, v1 = v0 + 32;
-            const float x0 = s[j], x1 = s[j + 1];
-            if ((x0 < prev_v || (x0 == prev_v && v0 > prev_i)) && x0 > b0) { b0 = x0; i0 = v0; }
-            if ((x1 < prev_v || (x1 == prev_v && v1 > prev_i)) && x1 > b1) { b1 = x1; i1 = v1; }
-        }
-        take_first(b0, i0, b1, i1);
-        warp_first(b0, i0);
-        if (i0 >= n_vocab) break;
-        if (lane == 0) wl[warp][i] = make_int2(i0, __float_as_int(b0));
-        prev_v = b0;
-        prev_i = i0;
-    }
-    for (int r = i + lane; r < k; r += 32) wl[warp][r] = make_int2(n_vocab, (int) 0xff800000u);
-    __syncthreads();
-    if (warp == 0) {
-        int2* dst = cand + (size_t) blockIdx.x * kSelMax;
-        warp_merge_lists(&wl[0][0], kWarps, kSelMax, k, n_vocab, [&](int r, float v, int id) {
-            if (lane == 0) dst[r] = make_int2(id, __float_as_int(v));
-        });
-    }
-}
-
-/// The merge of the block lists (the first k entries of each, the request's top_k), then `sampled_tail_warp` with the
-/// counter of the row that will verify this draft.  Lane 0 maps the pick to its token id, writes it and its
-/// probability, and appends it to the ring for the next draft's penalty window.
-__global__ void __launch_bounds__(32)
-coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, const SamplerParams* __restrict__ dp,
-                     const int* __restrict__ step_rec, const int* __restrict__ sub_to_id, int* __restrict__ ring,
-                     int cap, int j, int* __restrict__ out_id, float* __restrict__ out_prob) {
-    const int lane = (int) threadIdx.x;
-    SamplerParams p = *dp;
-    p.counter = basalt::core::coupled_draft_counter((int64_t) step_rec[0]);
-    const int k = sampled_k(p.top_k, nv);
-    __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
-    __shared__ int sel_ids[kSelMax];
-    __shared__ float sel_logit[kSelMax];
-    __shared__ double ex[kSelMax];
-    __shared__ int pick[1];
-    __shared__ float prob[1];
-    for (int e = lane; e < n_blocks * k; e += 32) {
-        const int b = e / k, r = e - b * k;
-        lists[b * kSelMax + r] = cand[(size_t) b * kSelMax + r];
-    }
-    __syncwarp();
-    warp_merge_lists(lists, n_blocks, kSelMax, k, nv, [&](int i, float v, int id) {
-        if (lane == 0) { sel_ids[i] = id < nv ? id : 0; sel_logit[i] = v; }
-    });
-    __syncwarp();
-    if (p.greedy || p.temperature <= 0.0f) {
-        if (lane == 0) { pick[0] = sel_ids[0]; prob[0] = 1.0f; }
-    } else {
-        sampled_tail_warp<true>(sel_ids, sel_logit, k, p, 0, pick, ex, prob);
-    }
-    __syncwarp();
-    if (lane == 0) {
-        const int s = pick[0];
-        const int id = sub_to_id != nullptr ? sub_to_id[s] : s;
-        *out_id = id;
-        *out_prob = prob[0];
-        ring[cap + j] = id;
-    }
-}
-
 // A stream being captured into a graph must not reach `split_scratch` (cudaMalloc): it
 // gets the one-block kernel, which needs no memory of its own.  The legacy stream cannot be captured.
 bool stream_capturing(void* stream) {
@@ -1519,49 +1382,6 @@ void sample_tokens_split(int split, const float* logits, int n_tokens, int n_voc
                          int history_len, const SamplerParams& p, int* out, const int* query, int n_query, float* qprob,
                          void* stream) {
     sample_tokens_impl(split, logits, n_tokens, n_vocab, history, history_len, p, out, query, n_query, qprob, stream);
-}
-
-namespace {
-int coupled_blocks(int nv) { return (nv + kSplitBlockSpan - 1) / kSplitBlockSpan; }
-void coupled_check(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s launch: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
-}  // namespace
-
-size_t coupled_draft_scratch_bytes(int nv) {
-    if (nv <= 0 || coupled_blocks(nv) > kSplitMaxBlocks) return 0;
-    return (size_t) coupled_blocks(nv) * (size_t) kSelMax * sizeof(int2);
-}
-
-void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapped_hist, SamplerParams* params,
-                         int32_t* ring, int cap, void* stream) {
-    coupled_stage_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(mapped_params, mapped_hist, params, ring, cap);
-    coupled_check("coupled_draft_stage");
-}
-
-void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
-                          const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
-                          void* scratch, int32_t* out_id, float* out_prob, void* stream) {
-    const cudaStream_t s = (cudaStream_t) stream;
-    const int n_blocks = coupled_blocks(nv);
-    if (nv <= 0 || n_blocks > kSplitMaxBlocks || scratch == nullptr) {
-        std::fprintf(stderr, "coupled_draft_sample: %d logits need scratch and at most %d blocks\n", nv, kSplitMaxBlocks);
-        std::exit(1);
-    }
-    coupled_penalize_kernel<<<1, 1024, (unsigned) ((nv + 31) / 32) * sizeof(unsigned), s>>>(logits, nv, id_to_sub,
-                                                                                           id_vocab, params, ring, cap, j);
-    coupled_check("coupled_penalize");
-    // the block span is 4,096, so the scratch bound is that of the split sampler
-    int2* cand = (int2*) scratch;
-    coupled_part_kernel<8, 16><<<(unsigned) n_blocks, 512, 0, s>>>(logits, nv, params, cand);
-    coupled_check("coupled_draft part");
-    coupled_merge_kernel<<<1, 32, 0, s>>>(cand, n_blocks, nv, params, step_rec, sub_to_id, ring, cap, j, out_id,
-                                          out_prob);
-    coupled_check("coupled_draft merge");
 }
 
 }  // namespace basalt::kernels

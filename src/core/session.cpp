@@ -713,7 +713,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         volatile uint32_t* const seq = s.db->h_seq;
         for (;;) {
             // **THE PER-ITERATION DRIVER CALL IS REQUIRED.**  Throttling it, with or without
-            // `__threadfence_system()` in `doorbell_ring_kernel` and a volatile read here, breaks the protocol.
+            // `__threadfence_system()` in the ring kernel and a volatile read here, breaks the protocol.
             // The call is not merely flushing submission and it is not a missing fence either: the device's
             // write to mapped pinned memory becomes host-visible only when the driver is entered.  The fence and the volatile read are kept because they are correct and cost nothing -
             // without them the ring's ordering against `x_f`/`ids`/`weights` is unstated - but they do not
