@@ -318,8 +318,10 @@ class EveryOption(unittest.TestCase):
 
     def test_every_engine_flag_by_both_paths(self):
         flags = engine_parser_flags()
-        self.assertGreater(len(flags), 100)
         server = set(server_options(build_parser()))
+        # A parse that came back empty or cut short would make the loop below vacuous.
+        self.assertIn("--help", flags)
+        self.assertTrue(any(f[2:] not in server for f in flags), "no engine-only flags parsed")
         engine_bin = write("\0".join(flags) + "\0", "fake-engine")
         known = engine_flags_of(engine_bin)
         self.assertEqual(known, set(flags))

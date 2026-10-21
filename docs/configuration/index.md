@@ -174,7 +174,6 @@ The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a token count | `auto` | Read prompts in batched chunks. `auto` takes the fewest equal chunks of at most 16384 tokens (32768 for packs whose expert blobs exceed 1.5 MiB, such as NVFP4) that the expert cache can lend buffers for; `auto:N` sets the ceiling; a number is a fixed chunk. |
-| `no-prefill-borrow` | engine | switch | off | Reserve the prompt buffers' VRAM for the whole session instead of lending expert slots. Costs expert cache; only for experiments. |
 | `short-read` | engine | integer tokens | 64 | A text part of at most this many tokens goes through the decode windows instead of the batched path. `0` always uses the batched path. |
 
 ## Speculative decoding (MTP)
