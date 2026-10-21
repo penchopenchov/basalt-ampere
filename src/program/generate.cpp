@@ -445,6 +445,7 @@ struct Options {
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
     /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
     bool prefill_auto = false;
+    bool prefill_given = false;   // --prefill on the command line
     /// Opt-in: the largest chunk `--prefill auto` may take - 8192 by default; `--prefill auto:16384` or
     /// `auto:32768` lets it go further, never past the context
     int64_t prefill_auto_max = 8192;
@@ -464,6 +465,7 @@ struct Options {
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test);
     /// `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
     int spec = 0;
+    bool spec_given = false;      // --spec on the command line
     /// --relaxed-drafting [P]: under sampling, a draft the target gives probability >= P is kept even when the target's
     /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
     /// docs/precision/features.md.  Solo decode only; a request's relax=P key overrides it.
@@ -493,6 +495,7 @@ struct Options {
     /// Every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into the VRAM tier in
     /// place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
+    bool adapt_every_given = false;   // --adapt-every on the command line
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
@@ -742,7 +745,7 @@ void usage() {
                  "  --spec N             speculative decoding: verify windows of at most N tokens (the last accepted\n"
                  "                       token plus up to N-1 MTP drafts, sized per window by the drafts' joint chance\n"
                  "                       of acceptance against a threshold adapted per request); 0 or 1 = no\n"
-                 "                       speculation (default 0; the server config usually sets 7)\n"
+                 "                       speculation (default 7 when the pack has a drafter, else 0)\n"
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
                  "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
                  "                       (docs/precision/features.md).  P in (0, 1]; lower is faster and further from exact;\n"
@@ -756,7 +759,7 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens; auto = the fewest\n"
+                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (default auto); auto = the fewest\n"
                  "                       equal chunks of at most 16384 tokens (32768 for packs whose expert blobs\n"
                  "                       exceed 1.5 MiB, such as NVFP4), within\n"
                  "                       what the expert cache can lend (with --resident-experts the lent slots the\n"
@@ -790,7 +793,7 @@ void usage() {
                  "  --no-ple-prefetch     A/B arm: read the PLE table's sixteen rows one at a time, instead of\n"
                  "                       issuing them in one prefetch.\n"
                  "  --expert-cache N|auto  keep N expert blobs resident in VRAM and compute their rows on the\n"
-                 "                       GPU.  DEFAULT 0.  auto = as many as fit in the VRAM\n"
+                 "                       GPU.  Default auto on packs with an expert profile.  auto = as many as fit in the VRAM\n"
                  "                       left after the weights, the session and --vram-reserve-mib\n"
                  "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
                  "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
@@ -810,10 +813,11 @@ void usage() {
                  "                       peer-held experts between the GPUs and RAM over P2P.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
-                 "  --adapt-every N      adaptive expert tier: a round every N decode windows (default 4;\n"
+                 "  --adapt-every N      adaptive expert tier: a round every N decode windows (default 1 for a\n"
+                 "                       server on one GPU, else 4;\n"
                  "                       0 = the VRAM experts stay as loaded)\n"
                  "  --adapt-decay F      factor the routing counts are multiplied by after each round (default\n"
-                 "                       0.93 on one GPU with or without the peer, 0.7 with the experts split\n"
+                 "                       0.85 on one GPU with or without the peer, 0.7 with the experts split\n"
                  "                       over several GPUs); lower forgets sooner\n"
                  "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
                  "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
@@ -837,7 +841,7 @@ void usage() {
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
                  "  --coupled-draft      enable coupled draft sampling for MTP drafter under sampling\n"
                  "  --no-coupled-draft   disable coupled draft sampling (propose argmax drafts)\n"
-                 "  --mmap-experts       opt OUT of the resident expert arena, back to a file mapping.\n"
+                 "  --mmap-experts       opt OUT of the default resident RAM copy, back to a file mapping.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       the experts, so cold and warm runs differ.\n"
                  "  --shared-expert-arena FILE  back the resident arena with one MAP_SHARED file.\n"
@@ -846,7 +850,7 @@ void usage() {
                  "  --resident-cpu-experts  with mmap and a static profile, keep the experts the GPU cache does not\n"
                  "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
-                 "  --resident-experts   the low-RAM resident mode: --mmap-experts --resident-cpu-experts\n"
+                 "  --resident-experts   (the default on packs with an expert profile) the low-RAM resident mode: --mmap-experts --resident-cpu-experts\n"
                  "                       with the copy page-locked when possible, the RAM floor left free (see the\n"
                  "                       README's Memory floors), plain mmap if it does not fit.  Same answers as --mmap-experts for the same placement.\n"
                  "                       When some experts stay in the file, the copy leaves a RAM floor free for\n"
@@ -1407,6 +1411,7 @@ int main(int argc, char** argv) {
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
+            o.prefill_given = true;
             o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
             // auto:N (N = 16384 or 32768) lets auto take chunks above 8192
             const long long want_max = v.rfind("auto:", 0) == 0 ? std::atoll(v.c_str() + 5) : 8192;
@@ -1420,7 +1425,7 @@ int main(int argc, char** argv) {
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
-        else if (a == "--spec") o.spec = std::atoi(next("--spec"));
+        else if (a == "--spec") { o.spec = std::atoi(next("--spec")); o.spec_given = true; }
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
@@ -1428,7 +1433,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
-        else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
+        else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
         else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
         else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
@@ -1697,6 +1702,22 @@ int main(int argc, char** argv) {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
+    // Built-in defaults for what is given nowhere: the fastest settings that need no knowledge of the machine.
+    // Speculation needs the pack's drafter; prompt chunks are sized from what the expert cache can lend; the experts
+    // the GPU does not hold go to page-locked RAM when they fit (a plain file mapping when not); the adaptive tier
+    // of a server on one card runs a round every window.  An explicit flag always wins.
+    if (!o.spec_given && !o.mtp.empty()) o.spec = 7;
+    if (!o.prefill_given) {
+        o.prefill_auto = o.prefill_auto_fit = true;
+        o.prefill_auto_max = 32768;
+        o.prefill_chunk = o.prefill_auto_max;
+    }
+    if (!o.mmap_experts && !o.resident_cpu_experts && o.shared_expert_arena.empty() && !o.expert_profile.empty() &&
+        !multi_gpu && o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0) {
+        o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
+        o.resident_headroom = 0;
+    }
+    if (!o.adapt_every_given && o.serve && !multi_gpu && !o.remote_expert_opt) o.adapt_every = 1;
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "basalt generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
         return 2;
@@ -5694,9 +5715,9 @@ int main(int argc, char** argv) {
         const bool adapt_fast =
                                 !multi_gpu && !remote_opt;
         // Its rounds come every --adapt-every windows, so the counts decay less per round than the plain default
-        // (--adapt-decay when given, else 0.93): the routing counts stay large enough for the thresholds and the peer
+        // (--adapt-decay when given, else 0.85): the routing counts stay large enough for the thresholds and the peer
         // margin.
-        const float fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.93f;
+        const float fast_decay = o.adapt_decay_set ? o.adapt_decay : 0.85f;
         struct XSwap { int32_t layer, in, out, slot; uint64_t off; bool xchg, promo, p2p; };
         const bool peer_excl = o.peer_exclusive && peer.valid() && src.complement_ready();
         std::vector<XSwap> xq;

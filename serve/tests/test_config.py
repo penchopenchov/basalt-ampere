@@ -189,7 +189,7 @@ class Precedence(unittest.TestCase):
                          "[server] engine: --max-context 32768 (config), --resident-experts (config), "
                          "--kv int8 (config), --control-vector-layer-range 4 44 (config), --spec 7 (cli)")
         self.assertEqual(engine_line([], [], config=False),
-                         "[server] engine: built-in defaults (no --config): spec off, 4096 context")
+                         "[server] engine: built-in defaults (no --config): spec 7 with a drafter, 4096 context")
         self.assertEqual(engine_line([], ["--spec", "7"], config=False),
                          "[server] engine: built-in defaults (no --config): spec 7, 4096 context; --spec 7 (cli)")
         self.assertEqual(engine_line([], []), "[server] engine: config sets nothing, built-in defaults")

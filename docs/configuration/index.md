@@ -56,8 +56,9 @@ A config file is one JSON object with two optional blocks:
   the command line's, and a flag given twice takes its last value.
 - An engine flag in `server`, or a server option in `engine`, stops the server at startup, as does an unknown name.
 - `api-key` cannot be set in a config file; a file that sets it is refused.
-- The built-in defaults are untuned (4096 context, fp16 KV, no speculation, no expert cache). A config file is how
-  you tune them. The startup line `[server] engine: ...` lists what came from the file or the command line.
+- The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 7 with a drafter,
+  expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window), and keep
+  the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine: ...` lists what came from the file or the command line.
 
 In the tables, "default" is what applies when the setting is absent everywhere.
 
@@ -123,19 +124,19 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `expert-cache` | engine | integer or `auto` | 0 (none) | Experts held in VRAM. `auto` uses every slot that fits after the weights, the sessions and `vram-reserve-mib`. Almost always `auto`. |
+| `expert-cache` | engine | integer or `auto` | `auto` on packs with an expert profile | Experts held in VRAM. `auto` uses every slot that fits after the weights, the sessions and `vram-reserve-mib`; a number gives that many. |
 | `vram-reserve-mib` | engine | integer MiB, at least 256 | 700 (lowered automatically, down to 300, on a card that would otherwise get too few slots; a value you give is kept) | VRAM left free on the main card for graphs, scratch and the head when `expert-cache auto` sizes the cache. Below 256 is refused. Raise it if the machine pages GPU memory or other programs need VRAM. |
-| `resident-experts` | engine | switch | off | Keep the experts the GPU does not hold in page-locked RAM, so none is read from the file again. Leaves a RAM floor free for the OS. Recommended whenever the RAM can hold them. |
+| `resident-experts` | engine | switch | on when the pack has an expert profile and the experts are not split over several cards | Keep the experts the GPU does not hold in page-locked RAM, so none is read from the file again. Leaves a RAM floor free for the OS; when the RAM cannot hold them it falls back to a plain file mapping. `mmap-experts` turns it off. |
 | `resident-budget-gib` | engine | number GiB | off | Like `resident-experts` but with at most N GiB of experts in RAM, hottest first. Refused when it would leave less than the RAM floor free; the error names the largest safe value. |
 | `resident-cpu-experts` | engine | switch | off | The lower-level form of `resident-experts` (with `mmap-experts`): experts in ordinary RAM. Use `resident-experts` instead. |
-| `mmap-experts` | engine | switch | off | Opt out of the resident arena and back to a file mapping. Speed then depends on the OS page cache. |
+| `mmap-experts` | engine | switch | off | Opt out of the default resident RAM copy and back to a file mapping. Speed then depends on the OS page cache. |
 | `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`. |
 | `pool-workers` | engine | integer | 0 (every physical core but the host loop's) | CPU expert pool threads, lowered automatically to fit a container CPU quota. |
 | `pool-affinity` | engine | `all`, `auto`, `p-cores` | `all` | CPU affinity of the workers. `auto` and `p-cores` suit hybrid CPUs. |
 | `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. `tools/convert/convert.py --profile` reads it. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
-| `adapt-every` | engine | integer | 4 (`0` = static residency) | How many decode windows pass between adaptive rounds. A round moves experts between the tiers (see below). `1` follows the conversation fastest. |
-| `adapt-decay` | engine | number, 0 to 1 | 0.93 on a single card (with or without the peer); 0.7 when the experts are split over several cards | The factor the usage counts are multiplied by after each round. Lower forgets sooner; higher remembers longer. |
+| `adapt-every` | engine | integer | 1 for a server on one card, else 4 (`0` = static residency) | How many decode windows pass between adaptive rounds. A round moves experts between the tiers (see below). `1` follows the conversation fastest. |
+| `adapt-decay` | engine | number, 0 to 1 | 0.85 on a single card (with or without the peer); 0.7 when the experts are split over several cards | The factor the usage counts are multiplied by after each round. Lower forgets sooner; higher remembers longer. |
 | `prefill-cpu-share` | engine | number, 0 to 1 | 0.6 (`0` = the GPU streams every expert) | The share of the streamed (not VRAM-resident) experts that the CPU computes while a prompt is read; the GPU streams and computes the rest. The value is fixed, not tuned from timing, so the output is identical from run to run at a given value. A weaker CPU may do better with a lower value. |
 | `adapt-swaps` | engine | integer | 96 (`0` = static residency) | The most experts one round swaps into the main card's tier. |
 | `peer-adapt-swaps` | engine | integer | same as `adapt-swaps` (`0` = the peer's experts stay fixed) | The most experts one round moves on the peer card. |
@@ -158,7 +159,7 @@ the tiers stay as loaded (`expert-profile-save` then has nothing to learn). Adap
 the GPUs, so output is not bit-identical from run to run; see [precision](../precision/index.md).
 
 A tuning note: on the NVIDIA NVFP4 pack (6-bit dense) with an RTX 5090 and an RTX 5060 Ti as the peer, both at a 400 W
-power limit, `--adapt-every 1 --adapt-decay 0.85` measured prose right after a topic switch 233.2 to 241.5 tok/s
+power limit, the defaults (`adapt-every 1`, `adapt-decay` 0.85) measured prose right after a topic switch 233.2 to 241.5 tok/s
 (+3.6%), a conversation 264.5 to 275.6 (+4.2%), and structured output 491.4 to 487.0 (neutral), each an ABBA run of 4
 processes per arm. A longer memory (`adapt-decay` 0.97 and up) looked 3 to 6% slower on prose in single runs (about
 3% run-to-run noise).
@@ -170,7 +171,7 @@ The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a token count | 0 (the decode path) | Read prompts in batched chunks. `auto` takes the fewest equal chunks of at most 16384 tokens (32768 for packs whose expert blobs exceed 1.5 MiB, such as NVFP4) that the expert cache can lend buffers for; `auto:N` sets the ceiling; a number is a fixed chunk. Always set it to `auto` for serving. |
+| `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a token count | `auto` | Read prompts in batched chunks. `auto` takes the fewest equal chunks of at most 16384 tokens (32768 for packs whose expert blobs exceed 1.5 MiB, such as NVFP4) that the expert cache can lend buffers for; `auto:N` sets the ceiling; a number is a fixed chunk. |
 | `no-prefill-borrow` | engine | switch | off | Reserve the prompt buffers' VRAM for the whole session instead of lending expert slots. Costs expert cache; only for experiments. |
 | `short-read` | engine | integer tokens | 64 | A text part of at most this many tokens goes through the decode windows instead of the batched path. `0` always uses the batched path. |
 
@@ -181,7 +182,7 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `spec` | engine | integer; `0` or `1` = off | 0 (no speculation, the drafter is not loaded) | The most tokens in a verify window: the last accepted token plus up to N-1 drafts. Each window's size is set by the drafts' joint chance of acceptance, against a threshold adapted per request. The model file does not set it; give it in the config or on the command line (7 is a good start) to turn speculation on. |
+| `spec` | engine | integer; `0` or `1` = off | 7 when the pack has a drafter, else 0 (no speculation, the drafter is not loaded) | The most tokens in a verify window: the last accepted token plus up to N-1 drafts. Each window's size is set by the drafts' joint chance of acceptance, against a threshold adapted per request. `0` turns speculation off. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Cap on the drafter's own window; longer windows then come from `suffix-draft` matches. |
 | `suffix-draft` | engine | integer tokens | 3 (`0` = drafter only) | Draft from an earlier repeat of the last N or more tokens of context (code edits, quoted text, tool-call JSON) when that is likelier to pay than the drafter. |
 | `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |

@@ -203,8 +203,8 @@ def engine_line(file_words: list[str], cli_words: list[str], config: bool = True
     if config:
         return f"[server] engine: {shown}" if shown else "[server] engine: config sets nothing, built-in defaults"
     words = file_words + cli_words
-    spec = flag_value(words, "--spec") or 0
-    state = f"spec {'off' if not int(spec) else spec}, {flag_value(words, '--max-context') or ENGINE_DEFAULT_CONTEXT} context"
+    spec = flag_value(words, "--spec")
+    state = f"spec {'7 with a drafter' if spec is None else 'off' if not int(spec) else spec}, {flag_value(words, '--max-context') or ENGINE_DEFAULT_CONTEXT} context"
     return f"[server] engine: built-in defaults (no --config): {state}" + (f"; {shown}" if shown else "")
 
 
