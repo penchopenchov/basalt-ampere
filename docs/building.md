@@ -32,3 +32,21 @@ three decode prompts and a prefill filler); run it from the repository root or p
 The build needs nothing outside this repository and fetches nothing. The parts of ggml and llama.cpp that Basalt uses
 (quantization formats, CPU dot products, the prompt path's MMQ kernels) are extracted into `src/` and `include/basalt/ggml/`,
 with their MIT licence in `THIRD_PARTY_LICENSES`.
+
+`basalt-bench --community` runs the fixed preset `community-1` for the public table in [community runs](community.md):
+the three decode fixtures, a 16384-token prefill and a 65536-token prefill, each once, with int8 KV cache and the
+engine's own defaults otherwise (drafting included). The decode fixtures and each prefill run in their own fresh engine
+process, with no warm-up pass and no repetition, so every number is the cold first run. It
+prints the usual table, then one JSON row to paste into `docs/community/benchmarks.json`:
+
+```sh
+bin/basalt-bench --community --model Qwen3.8-FN-NVFP4.basalt --submitter YOUR_GITHUB_HANDLE
+```
+
+`prefill_16k_tps` and `prefill_64k_tps` are the engine tokens per second of those two prompts; `decode_tps` is the generated tokens of conv, struct and prose over their summed decode time (token-weighted). The row
+records the engine commit, the GPUs the engine used (main first) with VRAM and enforced power limit from NVML, system
+RAM, the OS (`Linux`, `Windows` or `WSL2`), the pack's quant label. Every expert must sit in VRAM, the peer GPU or RAM: if the engine would read any from the SSD, the bench stops before measuring, says how many GiB would spill and roughly how much more free RAM is needed, exits non-zero and prints no row. NVML is required;
+without it, or without a git build, the run stops with a message. Only `--model`, `--submitter`, `--fixtures` (the
+repository's `data/bench`), `--logs` and `--print-command` are accepted: any other bench option or engine flag changes
+the workload and is refused. A second visible GPU is used as the peer tier, as in the plain bench; hide it with
+`CUDA_VISIBLE_DEVICES=0` for a single-GPU row. The preset's version changes whenever the workload does.

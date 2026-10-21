@@ -5998,11 +5998,28 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
+            // the pack's quantization label (the last word of its name, without the publisher's prefixes) and the PCI
+            // bus ids of the cards this engine computes on, primary first: what a benchmark row records
+            std::string quant_label, gpu_ids;
+            {
+                const basalt::core::Json* nm = model_file.meta().get("name");
+                std::string nmv = nm != nullptr && nm->is_string() ? nm->s : std::string();
+                quant_label = nmv.substr(nmv.rfind(' ') == std::string::npos ? 0 : nmv.rfind(' ') + 1);
+                for (const char* pre : {"NVIDIA-", "UD-"})
+                    if (quant_label.rfind(pre, 0) == 0) quant_label.erase(0, std::strlen(pre));
+                if (quant_label.empty()) quant_label = "unknown";
+                for (int d : {0, o.peer_device >= 1 ? o.peer_device : 0}) {
+                    char bus[32] = {};
+                    if (!gpu_ids.empty() && d == 0) continue;
+                    if (cudaDeviceGetPCIBusId(bus, sizeof bus, d) == cudaSuccess)
+                        gpu_ids += (gpu_ids.empty() ? "" : ",") + std::string(bus);
+                }
+            }
             std::printf("INFO logit_bias=%lld context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" BASALT_VERSION "\n",
+                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s quant=%s gpus=%s engine=" BASALT_VERSION "\n",
                         (long long) n_vocab, (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -6017,7 +6034,8 @@ int main(int argc, char** argv) {
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0) +
-                                       " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "");
+                                       " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "",
+                        quant_label.c_str(), gpu_ids.c_str());
         }
         // a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on a flag nobody
         // will raise - end the engine with where it was, so the server starts it again instead of the GPU spinning
@@ -6117,6 +6135,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "basalt serve: capturing the draft graphs failed: %s\n", err.c_str());
             return 1;
         }
+        std::printf("INFO file_experts_bytes=%llu\n", (unsigned long long) tier_file_bytes);   // experts only the file holds
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;

@@ -69,6 +69,26 @@ class BenchFlags(unittest.TestCase):
         self.assertNotIn("--kv", cmd)
         self.assertNotIn("--resident-experts", cmd)
 
+    def test_community_keeps_the_engine_defaults(self):
+        cmd = self.command_community()
+        self.assertNotIn("--spec", cmd)
+        self.assertEqual(cmd[cmd.index("--kv") + 1], "int8")
+
+    def command_community(self) -> list[str]:
+        r = subprocess.run([str(BENCH), "--model", "m.basalt", "--fixtures", str(self.fixtures), "--print-command",
+                            "--community"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.split()
+
+    def test_community_refuses_anything_that_changes_the_workload(self):
+        for extra in (["--spec", "0"], ["--kv", "int8"], ["-t", "conv"], ["-p", "16384"], ["-r", "2"], ["--quality"],
+                      ["--set", "--kv int8"], ["-o", "json"], ["--engine", "x"], ["--", "--spec", "3"]):
+            with self.subTest(extra=extra):
+                r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", *extra],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("incomparable", r.stderr)
+
     def test_help_lists_the_engine_flags(self):
         r = subprocess.run([str(BENCH), "--help", "--engine", str(ENGINE)], capture_output=True, text=True)
         self.assertIn("Engine flags (passed to basalt):", r.stdout)

@@ -15,6 +15,10 @@ namespace basalt::platform {
 /// This process's id.
 int64_t process_id();
 
+/// The kind of system the program runs on, for a benchmark row: "Linux", "Windows", or "WSL2" for Linux inside the
+/// Windows subsystem.
+std::string host_os_name();
+
 /// The Python the server runs under: the virtual environment in `src_dir` when it has one, else the interpreter name
 /// the platform puts on PATH.
 std::string python_interpreter(const std::string& src_dir);

@@ -4,6 +4,7 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,6 +75,8 @@ std::optional<std::string> capture_output(const std::vector<std::string>& argv, 
 
 int64_t process_id() { return (int64_t) GetCurrentProcessId(); }
 
+std::string host_os_name() { return "Windows"; }
+
 std::string python_interpreter(const std::string& src_dir) {
     const std::string venv = src_dir + "/.venv/Scripts/python.exe";
     return path_executable(venv) ? venv : "python";
@@ -107,6 +110,14 @@ ThreadWaits threads_in_disk_wait() {
 // --------------------------------------------------------------------------------------------- Linux
 
 int64_t process_id() { return (int64_t) getpid(); }
+
+std::string host_os_name() {
+    std::ifstream in("/proc/sys/kernel/osrelease");
+    std::string rel;
+    std::getline(in, rel);
+    for (char& c : rel) c = (char) std::tolower((unsigned char) c);
+    return rel.find("microsoft") != std::string::npos || rel.find("wsl") != std::string::npos ? "WSL2" : "Linux";
+}
 
 std::string python_interpreter(const std::string& src_dir) {
     const std::string venv = src_dir + "/.venv/bin/python";
