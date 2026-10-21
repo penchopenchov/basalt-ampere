@@ -410,6 +410,7 @@ void rig_begin(Rig& r, uint32_t e) {
     r.h_epoch[0] = (int32_t) e;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     gdn_commit_begin(r.ctl, r.d_epoch, r.d_begun, r.sc);
+    (void) cudaStreamQuery(r.sc);   // submit the launch now: the host polls mapped memory the kernel writes
 }
 void rig_rest(Rig& r) {
     native_qsa_indexer_commit_layers(r.q.a, qsa_real_shapes(), RopeScaling{}, r.sc);
@@ -579,6 +580,7 @@ bool finisher_tests(cudaStream_t) {
         for (int k = 1; k <= N; ++k) {
             if (k > 1) CK(cudaStreamWaitEvent(r.sc, fin[k - 1], 0));
             gdn_commit_begin(r.ctl, d_ep_arr + k, d_begun_arr + k, r.sc);
+            (void) cudaStreamQuery(r.sc);   // submit the launch now: the host polls mapped memory the kernel writes
             copy_indexed(r.ple_hist, r.ple_snap, HS, cm[k] + 1, HS, r.sc);
             gdn_commit_layers_dyn(rig_args(r, cm[k]), r.ctl, r.sc, 32);
             wait_begun(h_begun_arr + k, e0 + k);
