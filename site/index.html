@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Basalt Community Runs</title>
+<link rel="icon" href="mark.svg">
+<style>
+@font-face { font-family: "Geist"; font-weight: 100 900; font-display: swap; src: url(fonts/geist-latin-wght.woff2) format("woff2"); }
+@font-face { font-family: "Geist Mono"; font-weight: 100 900; font-display: swap; src: url(fonts/geist-mono-latin-wght.woff2) format("woff2"); }
+:root {
+  --bg: #0E1114; --panel: #151A1F; --raised: #2A333C; --line: #28313A; --line-soft: #222A32;
+  --fg: #E9ECEE; --fg-2: #9AA4AD; --fg-3: #77828C; --accent: #FF7A3D;
+  --font-sans: "Geist", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 400 14px/1.5 var(--font-sans); }
+main { max-width: 1180px; margin: 0 auto; padding: 0 16px 48px; }
+header { display: flex; align-items: center; gap: 12px; padding: 28px 0 8px; }
+header img { width: 36px; height: 36px; }
+.wordmark { font: 700 26px/1 var(--font-sans); letter-spacing: -.035em; }
+.title { font: 400 15px/1 var(--font-mono); color: var(--fg-3); }
+p.lede { color: var(--fg-2); max-width: 72ch; margin: 8px 0 20px; }
+p.lede code, .how code { font-family: var(--font-mono); color: var(--fg); background: var(--panel); padding: 1px 6px; border-radius: 4px; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.controls input, .ms > button {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--fg);
+  font: 400 13.5px/1 var(--font-mono); padding: 9px 12px; min-width: 0;
+}
+.controls input { flex: 1 1 220px; }
+.controls input:focus, .ms > button:focus-visible { outline: none; border-color: var(--accent); }
+
+/* Multi-select dropdown: a button and a checkbox list in a popover. */
+.ms { position: relative; flex: 0 1 auto; }
+.ms > button { display: flex; align-items: center; gap: 10px; cursor: pointer; white-space: nowrap; }
+.ms > button::after { content: ""; width: 6px; height: 6px; border: solid var(--fg-3); border-width: 0 1.5px 1.5px 0; transform: translateY(-2px) rotate(45deg); transition: transform .15s; }
+.ms[data-open] > button { border-color: var(--raised); }
+.ms[data-open] > button::after { transform: translateY(1px) rotate(-135deg); }
+.ms[data-active] > button { color: var(--accent); border-color: rgba(255, 122, 61, .45); }
+.ms .pop {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 10; min-width: 100%; max-height: 300px; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--raised); border-radius: 8px; padding: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
+}
+.ms:not([data-open]) .pop { display: none; }
+.ms .opt {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border-radius: 5px;
+  font: 400 13.5px/1 var(--font-mono); color: var(--fg-2); white-space: nowrap; cursor: pointer; text-align: left;
+  background: none; border: 0;
+}
+.ms .opt:hover, .ms .opt:focus-visible { background: var(--raised); color: var(--fg); outline: none; }
+.ms .box { width: 14px; height: 14px; flex: none; display: grid; place-items: center; border: 1.5px solid var(--fg-3); border-radius: 3px; }
+.ms .box svg { width: 10px; height: 10px; visibility: hidden; }
+.ms .opt[aria-checked="true"] { color: var(--fg); }
+.ms .opt[aria-checked="true"] .box { background: var(--accent); border-color: var(--accent); }
+.ms .opt[aria-checked="true"] .box svg { visibility: visible; }
+.ms .n { margin-left: auto; padding-left: 16px; color: var(--fg-3); font-size: 12px; }
+.ms .clear { display: block; width: 100%; margin-top: 4px; padding: 8px 10px; border-top: 1px solid var(--line); border-radius: 0; color: var(--fg-3); font: 400 12.5px/1 var(--font-sans); text-align: left; cursor: pointer; background: none; border-left: 0; border-right: 0; border-bottom: 0; }
+.ms .clear:hover { color: var(--accent); }
+.count { font: 400 13px/1 var(--font-mono); color: var(--fg-3); align-self: center; margin-left: auto; }
+.wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font: 400 13.5px/1.4 var(--font-mono); font-variant-numeric: tabular-nums; }
+th, td { padding: 10px 12px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line-soft); }
+th { color: var(--fg-3); font-weight: 500; font-family: var(--font-sans); font-size: 13px; background: var(--panel); position: sticky; top: 0; cursor: pointer; user-select: none; }
+th:hover { color: var(--fg); }
+th[aria-sort="ascending"]::after { content: " ↑"; color: var(--accent); }
+th[aria-sort="descending"]::after { content: " ↓"; color: var(--accent); }
+th.num, td.num { text-align: right; }
+tbody tr:hover { background: var(--panel); }
+tbody tr:last-child td { border-bottom: 0; }
+td.hi { color: var(--accent); }
+td.dim { color: var(--fg-3); }
+td a { color: var(--fg-2); }
+tr.x { cursor: pointer; }
+.chev { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-right: 6px; vertical-align: -2px; color: var(--fg-3); transition: transform .15s; }
+.chev svg { width: 10px; height: 10px; }
+tr.x[aria-expanded="true"] .chev { transform: rotate(90deg); color: var(--accent); }
+.more { color: var(--fg-3); }
+tr.detail td { background: var(--panel); padding: 4px 12px 12px 32px; }
+tr.detail:hover { background: none; }
+.cards { display: grid; grid-template-columns: auto auto auto auto; gap: 4px 28px; justify-content: start; color: var(--fg-2); }
+.cards .h { color: var(--fg-3); font-family: var(--font-sans); font-size: 12px; }
+.cards .r { text-align: right; }
+.empty { padding: 32px; text-align: center; color: var(--fg-3); }
+.how { margin-top: 28px; color: var(--fg-2); max-width: 72ch; }
+.how h2 { font-size: 15px; color: var(--fg); margin: 0 0 6px; }
+.how ol { margin: 0; padding-left: 20px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="mark.svg" alt="">
+    <span class="wordmark">Basalt</span>
+    <span class="title">community runs</span>
+  </header>
+  <p class="lede">Performance submitted by users, all from the same preset (<code id="preset">basalt-bench --community</code>).</p>
+
+  <div class="controls">
+    <input id="q" type="search" placeholder="Search GPU, quant, submitter…" aria-label="Search">
+    <div class="ms" id="f-gpu"></div>
+    <div class="ms" id="f-n"></div>
+    <div class="ms" id="f-quant"></div>
+    <div class="ms" id="f-os"></div>
+    <span class="count" id="count"></span>
+  </div>
+
+  <div class="wrap">
+    <table>
+      <thead><tr id="head"></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <section class="how">
+    <h2>Add your run</h2>
+    <ol>
+      <li>Stop any running Basalt server, run <code>basalt-bench --community</code> and copy the JSON row it prints.</li>
+      <li>Open a pull request that adds the row to <code>docs/community/benchmarks.json</code>.</li>
+    </ol>
+  </section>
+</main>
+<script>
+const COLS = [
+  { key: "_rig", label: "GPUs", html: r => (r._n > 1 ? `<span class="chev"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3.5 1.5 7 5 3.5 8.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>` : `<span class="chev"></span>`) + r._short },
+  { key: "_vram", label: "VRAM", num: true, fmt: v => v + " GiB" },
+  { key: "_power", label: "Power", num: true, fmt: v => v.toLocaleString("en-US") + " W" },
+  { key: "ram_gib", label: "RAM", num: true, fmt: v => v + " GiB" },
+  { key: "os", label: "System" },
+  { key: "quant", label: "Quant" },
+  { key: "prefill_16k_tps", label: "Prefill 16K", num: true, hi: true, fmt: v => v.toLocaleString("en-US") },
+  { key: "prefill_64k_tps", label: "Prefill 64K", num: true, hi: true, fmt: v => v.toLocaleString("en-US") },
+  { key: "decode_tps", label: "Decode tok/s", num: true, hi: true, fmt: v => v.toLocaleString("en-US", { maximumFractionDigits: 1 }) },
+  { key: "commit", label: "Commit" },
+  { key: "date", label: "Date" },
+  { key: "submitter", label: "By", link: true },
+];
+
+let runs = [];
+let sort = { key: "decode_tps", dir: -1 };
+const open = new Set();
+const $ = id => document.getElementById(id);
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+// Multi-select: picks within one filter are OR'd, filters are AND'd. Each option shows how many runs have it.
+const filters = {};
+function multiSelect(id, all, options) {
+  const root = $(id), picked = new Set();
+  filters[id] = picked;
+  root.innerHTML = `<button type="button" aria-haspopup="true" aria-expanded="false"></button>` +
+    `<div class="pop" role="menu">` +
+    options.map(o => `<button type="button" class="opt" role="menuitemcheckbox" aria-checked="false" data-v="${esc(o.value)}">` +
+      `<span class="box"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 5.2 4 7.6 8.5 2.6" fill="none" stroke="#0E1114" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>${esc(o.label)}<span class="n">${o.count}</span></button>`).join("") +
+    `<button type="button" class="clear">Clear</button></div>`;
+  const btn = root.firstElementChild;
+  const label = () => {
+    const sel = options.filter(o => picked.has(o.value));
+    btn.textContent = !sel.length ? all : sel.length === 1 ? sel[0].label : `${sel.length} selected · ${all.replace(/^All |^Any /, "")}`;
+    sel.length ? root.setAttribute("data-active", "") : root.removeAttribute("data-active");
+  };
+  const setOpen = on => {
+    document.querySelectorAll(".ms[data-open]").forEach(m => { if (m !== root) { m.removeAttribute("data-open"); m.firstElementChild.setAttribute("aria-expanded", "false"); } });
+    on ? root.setAttribute("data-open", "") : root.removeAttribute("data-open");
+    btn.setAttribute("aria-expanded", String(on));
+  };
+  btn.addEventListener("click", () => {
+    const on = !root.hasAttribute("data-open");
+    setOpen(on);
+    if (on) root.querySelector(".opt")?.focus();
+  });
+  root.querySelector(".pop").addEventListener("click", e => {
+    const opt = e.target.closest(".opt");
+    if (opt) {
+      const v = opt.dataset.v;
+      picked.has(v) ? picked.delete(v) : picked.add(v);
+      opt.setAttribute("aria-checked", String(picked.has(v)));
+    } else if (e.target.closest(".clear")) {
+      picked.clear();
+      root.querySelectorAll(".opt").forEach(o => o.setAttribute("aria-checked", "false"));
+    } else return;
+    label(); render();
+  });
+  root.addEventListener("keydown", e => {
+    const opts = [...root.querySelectorAll(".opt, .clear")], k = opts.indexOf(document.activeElement);
+    if (e.key === "Escape") { setOpen(false); btn.focus(); }
+    else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!root.hasAttribute("data-open")) { setOpen(true); opts[0]?.focus(); return; }
+      opts[(k + (e.key === "ArrowDown" ? 1 : -1) + opts.length) % opts.length]?.focus();
+    }
+  });
+  label();
+}
+document.addEventListener("click", e => {
+  if (!e.target.closest(".ms")) document.querySelectorAll(".ms[data-open]").forEach(m => { m.removeAttribute("data-open"); m.firstElementChild.setAttribute("aria-expanded", "false"); });
+});
+
+function countBy(values) {
+  const m = new Map();
+  values.forEach(v => m.set(v, (m.get(v) || 0) + 1));
+  return [...m].sort((a, b) => String(a[0]).localeCompare(String(b[0]))).map(([value, count]) => ({ value, label: value, count }));
+}
+const any = (id, test) => !filters[id]?.size || [...filters[id]].some(test);
+
+// Full rig label for search; the cell shows a short one ("2× RTX 5080", "RTX 5090 +3") and the
+// expanded row lists every card. Totals drive sorting.
+function rig(r, i) {
+  const g = r.gpus || [];
+  const counts = new Map();
+  g.forEach(x => counts.set(x.name, (counts.get(x.name) || 0) + 1));
+  const parts = [...counts].map(([n, k]) => (k > 1 ? k + "× " : "") + n);
+  r._id = i;
+  r._rig = parts.join(" + ");
+  r._short = parts.length > 1 ? esc(g[0].name) + ` <span class="more">+${g.length - 1}</span>` : esc(r._rig);
+  r._names = g.map(x => x.name);
+  r._n = g.length;
+  r._vram = g.reduce((s, x) => s + (x.vram_gib || 0), 0);
+  r._power = g.reduce((s, x) => s + (x.power_w || 0), 0);
+  return r;
+}
+
+function detail(r) {
+  const cells = r.gpus.map((x, k) =>
+    `<span>GPU ${k}</span><span>${esc(x.name)}</span><span class="r">${x.vram_gib} GiB</span><span class="r">${x.power_w} W</span>`).join("");
+  return `<tr class="detail"><td colspan="${COLS.length}"><div class="cards">` +
+    `<span class="h">#</span><span class="h">Card</span><span class="h r">VRAM</span><span class="h r">Power limit</span>` +
+    cells + `</div></td></tr>`;
+}
+
+function renderHead() {
+  $("head").innerHTML = COLS.map(c => {
+    const s = sort.key === c.key ? (sort.dir > 0 ? "ascending" : "descending") : "none";
+    return `<th data-key="${c.key}" class="${c.num ? "num" : ""}" aria-sort="${s}" scope="col">${c.label}</th>`;
+  }).join("");
+}
+
+function render() {
+  const q = $("q").value.trim().toLowerCase();
+  const shown = runs.filter(r =>
+    any("f-gpu", v => r._names.includes(v)) && any("f-n", v => v === String(Math.min(r._n, 3))) &&
+    any("f-quant", v => r.quant === v) && any("f-os", v => r.os === v) &&
+    (!q || COLS.some(c => String(r[c.key] ?? "").toLowerCase().includes(q)) || String(r.preset ?? "").toLowerCase().includes(q)));
+  shown.sort((a, b) => {
+    const x = a[sort.key], y = b[sort.key];
+    return (typeof x === "number" ? x - y : String(x).localeCompare(String(y))) * sort.dir;
+  });
+  $("rows").innerHTML = shown.length ? shown.map(r => {
+    const multi = r._n > 1, isOpen = multi && open.has(r._id);
+    const tr = multi ? `<tr class="x" data-id="${r._id}" aria-expanded="${isOpen}" tabindex="0">` : "<tr>";
+    return tr + COLS.map(c => {
+      const v = r[c.key] ?? "";
+      let text = c.html ? c.html(r) : esc(c.fmt ? c.fmt(v) : v);
+      if (c.link && r.link) text = `<a href="${esc(r.link)}" rel="noopener">${text}</a>`;
+      const cls = [c.num && "num", c.hi && "hi"].filter(Boolean).join(" ");
+      return `<td class="${cls}">${text}</td>`;
+    }).join("") + "</tr>" + (isOpen ? detail(r) : "");
+  }).join("")
+    : `<tr><td class="empty" colspan="${COLS.length}">${runs.length ? "No runs match." : "No runs yet. Be the first: see below."}</td></tr>`;
+  $("count").textContent = `${shown.length} of ${runs.length} runs`;
+}
+
+$("head").addEventListener("click", e => {
+  const th = e.target.closest("th"); if (!th) return;
+  const key = th.dataset.key, col = COLS.find(c => c.key === key);
+  sort = sort.key === key ? { key, dir: -sort.dir } : { key, dir: col.num ? -1 : 1 };
+  renderHead(); render();
+});
+function toggle(e) {
+  const tr = e.target.closest("tr.x");
+  if (!tr || e.target.closest("a")) return;
+  if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
+  e.preventDefault();
+  const id = +tr.dataset.id;
+  open.has(id) ? open.delete(id) : open.add(id);
+  render();
+}
+$("rows").addEventListener("click", toggle);
+$("rows").addEventListener("keydown", toggle);
+$("q").addEventListener("input", render);
+
+fetch("benchmarks.json").then(r => r.json()).then(data => {
+  runs = (data.runs || []).map((r, i) => rig(r, i));
+  if (data.preset) $("preset").textContent = data.preset;
+  multiSelect("f-gpu", "All GPUs", countBy(runs.flatMap(r => [...new Set(r._names)])));
+  multiSelect("f-n", "Any GPU count", countBy(runs.map(r => String(Math.min(r._n, 3))))
+    .map(o => ({ ...o, label: o.value === "1" ? "1 GPU" : o.value === "3" ? "3+ GPUs" : o.value + " GPUs" })));
+  multiSelect("f-quant", "All quants", countBy(runs.map(r => r.quant)));
+  multiSelect("f-os", "All systems", countBy(runs.map(r => r.os)));
+  renderHead(); render();
+}).catch(() => { $("rows").innerHTML = `<tr><td class="empty" colspan="12">Could not load benchmarks.json.</td></tr>`; });
+</script>
+</body>
+</html>

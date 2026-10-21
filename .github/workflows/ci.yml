@@ -4,8 +4,18 @@ name: ci
 # No GPU is available: the engine is compiled for sm_120 and only the `cpu`-labelled tests run.
 on:
   pull_request:
+    paths-ignore:
+      - "docs/community/**"
+      - "site/**"
+      - "tools/check_benchmarks.py"
+      - ".github/workflows/pages.yml"
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/community/**"
+      - "site/**"
+      - "tools/check_benchmarks.py"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
   schedule:
     - cron: "17 5 * * *"   # keeps the compiler caches from expiring
