@@ -498,6 +498,7 @@ def make_handler(svc: Service):
             tools, force = forced_call(req.get("tool_choice"), tools)   # a bad choice is a 400 before streaming
             if check_format(req.get("response_format")) and tools:
                 raise ValueError("structured response_format with tools is not supported")
+            svc.require_grammar(req.get("response_format"))
             svc.load()
             req[BIAS_KEY] = checked_bias(req, svc.engine)     # a bad logit_bias is a 400 before streaming
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
@@ -618,6 +619,10 @@ def make_handler(svc: Service):
             if structured and tools:
                 raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
                                      "unsupported_parameter")
+            try:
+                svc.require_grammar(responses_api.text_format(req))
+            except ValueError as e:
+                raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
                                                responses_api.text_format(req))
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
@@ -658,6 +663,13 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             tools, force = forced_call(req.get("tool_choice"), tools)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            out = req.get("output_config")
+            fmt = out.get("format") if isinstance(out, dict) else None
+            if isinstance(fmt, dict) and fmt.get("type") == "json_schema":     # Anthropic structured outputs
+                try:
+                    svc.require_grammar({"type": "json_schema", "json_schema": {"schema": fmt.get("schema")}})
+                except ValueError as e:
+                    raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), None)
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop

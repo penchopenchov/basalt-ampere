@@ -17,7 +17,7 @@ from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
 from serve.engine.vision import Vision
-from serve.api.grammar import grammar_spec
+from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
 
 
@@ -216,6 +216,12 @@ class Service:
         log = getattr(self.engine, "log_path", None)
         why = f"{e}: {note}" if note else str(e)
         print(f"[server] warning: {why} (the next request restarts it{', log ' + log if log else ''})", flush=True)
+
+    def require_grammar(self, response_format) -> None:
+        """A JSON response format the engine would not enforce is refused rather than silently served as free text."""
+        if unenforced(self.grammar, response_format):
+            raise ValueError("response_format json_schema and json_object (structured output) need grammar enabled "
+                             "on this server; start it without --no-grammar, or send strict: true")
 
     def grammar_for(self, tools, tool_choice, raw_tools, response_format) -> dict | None:
         """The engine request's `grammar` value (api.grammar.grammar_spec); None when the engine cannot take it."""

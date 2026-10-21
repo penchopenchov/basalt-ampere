@@ -43,6 +43,12 @@ def grammar_spec(enabled: bool, tools, tool_choice, raw_tools, response_format) 
     return None
 
 
+def unenforced(enabled: bool, response_format) -> bool:
+    """True when response_format asks for JSON output but the request would get no grammar key."""
+    kind = response_format.get("type") if isinstance(response_format, dict) else None
+    return kind in ("json_schema", "json_object") and grammar_spec(enabled, None, None, None, response_format) is None
+
+
 def engine_key(spec: dict | None) -> str:
     """The engine protocol's ` grammar=<JSON>`: compact, ASCII, no space (the line is split at spaces)."""
     if not spec:

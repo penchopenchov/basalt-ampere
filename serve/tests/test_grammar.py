@@ -50,6 +50,14 @@ class Fixture:
             r.read()
         return self.engine.requests[-1][1].get("_grammar")
 
+    def refused(self, path, body):
+        """(status, error body) of a request the server answers with an HTTP error."""
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=30)
+        return cm.exception.code, json.loads(cm.exception.read())["error"]
+
     def chat(self, **extra):
         return self.sent("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], **extra})
 
@@ -64,8 +72,33 @@ class GrammarOff(Fixture, unittest.TestCase):
 
     def test_no_key_without_strict(self):
         self.assertIsNone(self.chat(tools=[TOOL]))
-        self.assertIsNone(self.chat(response_format=self.json_schema()))
-        self.assertIsNone(self.chat(response_format={"type": "json_object"}))
+        self.assertIsNone(self.chat(response_format={"type": "text"}))
+
+    def test_chat_json_format_is_refused(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        for fmt in (self.json_schema(), {"type": "json_object"}):
+            code, err = self.refused("/v1/chat/completions", {"messages": msgs, "response_format": fmt})
+            self.assertEqual(code, 400)
+            self.assertEqual(err["type"], "invalid_request_error")
+            self.assertIn("need grammar enabled", err["message"])
+
+    def test_responses_json_format_is_refused(self):
+        for fmt in ({"type": "json_schema", "name": "s", "schema": SCHEMA}, {"type": "json_object"}):
+            code, err = self.refused("/v1/responses", {"input": "hi", "text": {"format": fmt}})
+            self.assertEqual(code, 400)
+            self.assertEqual(err["param"], "text.format")
+            self.assertIn("text.format json_schema and json_object (structured output) need grammar enabled", err["message"])
+
+    def test_anthropic_json_format_is_refused(self):
+        code, err = self.refused("/v1/messages", {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+                                                  "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}})
+        self.assertEqual(code, 400)
+        self.assertEqual(err["type"], "invalid_request_error")
+        self.assertIn("output_config.format json_schema", err["message"])
+        self.assertIn("need grammar enabled", err["message"])
+
+    def test_responses_text_format_is_allowed(self):
+        self.assertIsNone(self.sent("/v1/responses", {"input": "hi", "text": {"format": {"type": "text"}}}))
 
     def test_strict_json_schema(self):
         self.assertEqual(self.chat(response_format=self.json_schema(strict=True)),

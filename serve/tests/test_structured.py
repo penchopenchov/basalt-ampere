@@ -129,8 +129,11 @@ class Structured(unittest.TestCase):
         self.svc.grammar = False
         self.chat()
         self.assertEqual(self.engine.requests[-1][1]["_grammar"], {"kind": "json_schema", "schema": STORY_SCHEMA})  # strict: true
-        self.chat(response_format={"type": "json_object"})
-        self.assertIsNone(self.engine.requests[-1][1]["_grammar"])
+        n = len(self.engine.requests)
+        status, body = self.chat(response_format={"type": "json_object"})
+        self.assertEqual(status, 400)
+        self.assertIn("need grammar enabled", str(body))
+        self.assertEqual(len(self.engine.requests), n)    # refused before the engine
 
 
 if __name__ == "__main__":
