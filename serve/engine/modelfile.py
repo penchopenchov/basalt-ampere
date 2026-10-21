@@ -24,7 +24,7 @@ def peer_tier_supported() -> bool:
 
 
 def cache_root() -> Path:
-    return Path(os.environ.get("BASALT_CACHE") or Path.home() / ".cache" / "basalt")
+    return Path.home() / ".cache" / "basalt"
 
 
 def cache_dir(mf: ModelFile) -> Path:
