@@ -295,8 +295,6 @@ struct ExpertDispatch {
     /// hit path reads.  When set, the pool leaves a resident expert's row at zero (the GPU computes it) without any
     /// `Launch` callback.
     const int32_t* host_res = nullptr;
-    /// Split every expert by rows across the pool's threads (default on; A/B `--no-split-rows`).
-    bool split_rows = true;
 
     // ================================ DID THE GPU ACTUALLY START? ================================
     //
@@ -309,10 +307,6 @@ struct ExpertDispatch {
     void* hit_done = nullptr;      ///< cudaEvent_t, created at session setup
     int64_t hit_ready = 0;         ///< layers where the hit work was DONE by the time the pool returned
     int64_t hit_late = 0;          ///< layers where it was not
-    /// The candidate fix, as an A/B arm: enter the driver once right after the hit launch.  If submission is
-    /// lazy, this starts the GPU work before the pool instead of after it.
-    bool hit_poke = false;
-    bool hit_cpu_order = false;    ///< experimental CPU-order GPU expert arithmetic; opt-in only
     int64_t n_hits = 0;                    ///< this layer's hits
     /// Set by `Launch` and consumed by `Combine`, so a `Combine` with no `Launch` in front of it cannot
     /// add a stale buffer into `parts`.

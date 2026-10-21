@@ -1647,8 +1647,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     }
 
     // rows of every expert across all threads (bitwise the same as `run`).
-    if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
-    else d.pool->run(d.jobs.data(), (int) njobs);
+    d.pool->run_split(d.jobs.data(), (int) njobs);
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
@@ -1991,17 +1990,15 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         }
         basalt::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, basalt::kernels::cpu::H,
                                               cs);
-        if (d.hit_cpu_order)
-            basalt::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
-                d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
-        else
-            basalt::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
+        basalt::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
                 d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
-        if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
-        // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host
-        // to enter the driver, this is what lets it start while the pool runs.
-        if (d.hit_poke && d.hit_done != nullptr) (void) cudaEventQuery((cudaEvent_t) d.hit_done);
+        if (d.hit_done != nullptr) {
+            cudaEventRecord((cudaEvent_t) d.hit_done, cs);
+            // ONE driver entry here: if the work was waiting for the host to enter the driver, this is what lets it
+            // start while the pool runs.
+            (void) cudaEventQuery((cudaEvent_t) d.hit_done);
+        }
         return;
     }
 

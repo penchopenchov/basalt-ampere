@@ -130,7 +130,6 @@ int main(int argc, char** argv) {
     if (!K::hc_fused_supported()) { std::printf("pk_moe_bench: no fused hc read on this device\n"); return 1; }
     const K::NativeExpertLayout L = K::native_expert_layout(gu, dt, N, FF);
     if (!K::pk_moe_ok(L) || !K::dec_moe_glue_ok(L)) { std::printf("pk_moe_bench: formats %d/%d not covered\n", gu, dt); return 1; }
-    K::shared_expert_set_native_bf16(true);
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
 

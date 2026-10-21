@@ -23,7 +23,6 @@
 #include "basalt/kernels/mrope.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,7 +31,6 @@
 
 namespace basalt::kernels {
 namespace {
-std::atomic<bool> enabled{false};
 constexpr int D = 128, R = 4, ROT = 64, THREADS = 256;
 __device__ float warp_sum(float x) {
 #pragma unroll
@@ -269,8 +267,6 @@ bool overlaps(Span a, Span b) {
 }
 } // namespace
 
-void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
                                const float* gamma, float epsilon, const QsaIndexerBuffers& b,
                                const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {

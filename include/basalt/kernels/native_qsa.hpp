@@ -4,8 +4,7 @@ namespace basalt::kernels {
 
 // Set before session construction/capture; existing CUDA graphs retain their
 // selected kernels. Disabled by default. Integration chooses the call sites.
-void native_qsa_set_enabled(bool enabled);
-bool native_qsa_enabled();
+inline bool native_qsa_enabled() { return true; }
 
 // Pinned single-token CUDA F32 arithmetic from llama.cpp
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d. No allocation or synchronization;

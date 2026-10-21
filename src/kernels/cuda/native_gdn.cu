@@ -25,7 +25,6 @@
 // SOFTWARE.
 #include "basalt/kernels/native_gdn.hpp"
 #include <cuda_runtime.h>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -33,7 +32,6 @@
 
 namespace basalt::kernels {
 namespace {
-std::atomic<bool> enabled{false};
 constexpr int S = 128;
 
 __device__ __forceinline__ float warp_sum(float value) {
@@ -90,8 +88,6 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
 }
 }
 
-void native_gdn_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_gdn_enabled() { return enabled.load(std::memory_order_relaxed); }
 
 void native_gdn_step(float* state, const float* q, const float* k, const float* v,
                      const float* gate, const float* beta, float* output,

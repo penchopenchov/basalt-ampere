@@ -15,9 +15,9 @@
 //
 // The result is ADDED to the routed output - not router-weighted, not renormalised against it.
 //
-// The legacy canonical projections use their explicit Q8_0/Q8_K activation images. The optional native
-// BF16 path affects only the scalar gate: it reads the original F32 input and uses pinned CUDA MMVF plus
-// an FP32 sigmoid. Native projection overrides independently select CUDA Q8_1 MMVQ and FP32 SwiGLU.
+// The canonical projections use their explicit Q8_0/Q8_K activation images. The scalar gate reads the original F32
+// input and uses the BF16 MMVF plus an FP32 sigmoid. Native projection overrides independently select CUDA Q8_1
+// MMVQ and FP32 SwiGLU.
 #include "basalt/kernels/shared_expert.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
@@ -43,7 +43,6 @@ namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 128;
-bool native_bf16 = false;
 
 // The fp16 conversion lives in one place (`f16_bits.hpp`), with the regimes spelled out: a private copy that
 // tests `exp >= 31` conflates an f32 inf/NaN with an out-of-range finite exponent and returns a NaN for every
@@ -64,74 +63,8 @@ __global__ void native_swiglu_kernel(const float* gate, const float* up, float* 
     if (i >= n) return;
     // Pinned CUDA unary.cuh op_silu, then unary_gated_op_kernel's multiply.
     // Explicit intrinsics reproduce its --use_fast_math operations without
-    // changing compilation of the default legacy arithmetic in this file.
+    // changing compilation of the canonical arithmetic in this file.
     out[i] = __fdividef(gate[i], 1.0f + __expf(-gate[i])) * up[i];
-}
-
-__global__ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = f16_from_f32(in[i]);
-}
-
-// The per-token scalar gate: sigmoid(dot(x, w)) with w = `ffn_gate_inp_shexp` (n_embd,).
-//
-// **ONE THREAD WOULD BE THE LARGEST SINGLE KERNEL IN THE MODEL.**  "n_embd is 2560, so this is a short serial
-// loop" is wrong: 2560 iterations is not short when each one is a DOUBLE multiply-add.  The double rate is
-// a small fraction of the float rate, so the loop is a 2560-long dependency chain through a 1/64-rate unit - tens of microseconds
-// from the chain alone, before counting 2560 sequential global loads issued by one thread with no coalescing.
-//
-// From outside, a single-thread `shared_expert` costs a large share of the whole block for three projections
-// that read little memory.  It is seven kernels, and six of them are GEMVs or elementwise passes over
-// 640-2560 elements.  This is the one that cannot be explained by bandwidth.
-//
-// THE DOUBLE ACCUMULATOR IS KEPT.  the Python reference reduces in float64 and `block_sum` in `gr.cu` exists for the
-// same reason - the summation order of a tree is not the reference's, so the defence is enough precision that
-// the order stops mattering.  What changes is the CHAIN: ten terms per thread instead of 2560, then a
-// tree-reduce.  Through a sigmoid, a 1e-16 relative difference in the dot is not a difference.
-//
-// **BOTH OPERANDS ARE BF16, AND THAT IS THE REFERENCE'S CONTRACT, NOT A STORAGE DETAIL.**  `gate_inp_shexp` is a
-// BF16 weight, so ggml converts the activation to its `vec_dot_type` - BF16 - exactly as it does for the router.
-// The loader re-rounds the tensor to 2 B/elem, so reading it as `const float* w` would read 2560 floats out
-// of a 5120-byte buffer: 5120 B past the end of the tensor, inside the arena, where nothing faults.
-//
-// A wrong scalar here is the quiet failure mode: sigmoid bounds the damage to [0,1], so a gate that should be
-// 0.5 and reads 1.0 scales the shared expert by 2x and produces perfectly finite, perfectly plausible logits.
-__device__ __forceinline__ double warp_sum_d(double v) {
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
-    return __shfl_sync(0xFFFFFFFFu, v, 0);
-}
-
-__global__ void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
-                                   float* __restrict__ out, int n_embd) {
-    __shared__ double scratch[8];   // 8 warps: the launch is <<<1, 256>>>
-    double acc = 0.0;
-    for (int i = threadIdx.x; i < n_embd; i += blockDim.x)
-        acc += (double) f32_from_bf16(x_bf16[i]) * (double) f32_from_bf16(w_bf16[i]);
-    __syncthreads();
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    acc = warp_sum_d(acc);
-    if (lane == 0) scratch[warp] = acc;
-    __syncthreads();
-    const int nw = ((int) blockDim.x + 31) >> 5;
-    if (warp == 0) {
-        acc = (threadIdx.x < nw) ? scratch[threadIdx.x] : 0.0;
-        acc = warp_sum_d(acc);
-        if (threadIdx.x == 0) out[0] = (float) (1.0 / (1.0 + exp(-acc)));
-    }
-}
-
-__global__ void scale_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] *= g[0];
-}
-
-__global__ void native_scalar_sigmoid_kernel(float* gate) {
-    // Match the single-token CUDA sigmoid's FP32 fast-math operations without changing legacy kernels'
-    // compilation flags. The dot product was already reduced by the pinned native MMVF implementation.
-    gate[0] = __fdividef(1.0f, 1.0f + __expf(-gate[0]));
-}
-__global__ void native_scalar_sigmoid_multi_kernel(float* gate) {   // thread t = token t, same expression
-    gate[threadIdx.x] = __fdividef(1.0f, 1.0f + __expf(-gate[threadIdx.x]));
 }
 
 /// The MoE block's final combination.  See the header for the two readings it exists to pin.
@@ -151,16 +84,7 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, const float*
 
 }  // namespace
 
-void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
-bool shared_expert_native_bf16_enabled() { return native_bf16; }
-
 namespace {
-__global__ void scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
-    const int t = blockIdx.y;
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[(size_t) t * n + i] *= g[t];
-}
-
 __global__ void sigmoid_scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
     pdl_launch_dependents();
     pdl_wait();
@@ -185,32 +109,15 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     const void* x_q8_1 = nw.q8_1;
     native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
     native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
-    const int n = (int) (n_ff * n_tok);
-    if (fused_swiglu_q81_enabled()) {
-        native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
-    } else {
-        native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
-        native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
-    }
+    native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
-    if (native_bf16 && n_tok > 1) {   // one gemv for all rows (outputs identical), fused sigmoid+scale
+    if (n_tok > 1) {   // one gemv for all rows (outputs identical), fused sigmoid+scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
         launch_pdl(sigmoid_scale_rows_kernel, dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok),
                    dim3(THREADS), 0, cs, out, g, (int) n_embd);
-    } else if (native_bf16 && n_tok == 1) {
+    } else {
         bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, stream);
         sigmoid_scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), 1u), THREADS, 0, cs>>>(
-            out, g, (int) n_embd);
-    } else {
-        for (int t = 0; t < n_tok; ++t) {
-            if (native_bf16) {
-                bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
-                native_scalar_sigmoid_kernel<<<1, 1, 0, cs>>>(g + t);
-            } else {
-                scalar_gate_kernel<<<1, 256, 0, cs>>>(x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
-            }
-        }
-        scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok), THREADS, 0, cs>>>(
             out, g, (int) n_embd);
     }
     const cudaError_t e = cudaGetLastError();
@@ -233,13 +140,11 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                    int64_t n_embd, int64_t n_ff, int tpr, void* stream, const float* x_f32,
                    const NativeSharedWeights* native) {
     if (n_embd <= 0 || n_ff <= 0) return;
-    const bool use_native = native_bf16;
     const bool native_gate = native && native->gate_data && native_mmvq_supported(native->gate_type);
     const bool native_up = native && native->up_data && native_mmvq_supported(native->up_type);
     const bool native_down = native && native->down_data && native_mmvq_supported(native->down_type);
     const bool native_projection = native_gate || native_up || native_down;
-    if ((use_native || native_gate || native_up) && !x_f32)
-        throw std::invalid_argument("shared_expert native input projection requires unrounded x_f32");
+    if (!x_f32) throw std::invalid_argument("shared_expert requires the unrounded x_f32");
     if (native_projection) {
         if (!native->q8_1 || !stream || n_embd > INT_MAX || n_ff > INT_MAX)
             throw std::invalid_argument("shared_expert native projections require scratch, stream and int32 dimensions");
@@ -324,17 +229,9 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     }
 
     // the per-token scalar gate, then the multiply.  Note the gate is computed from `x`, the ORIGINAL hidden
-    // state, not from anything the expert produced. The historical branch uses BF16-rounded inputs; the
-    // native branch uses the pinned CUDA FP32 activation contract.
-    // `<<<1, 256>>>`: one block, because the output is ONE scalar and a second block would only add a global
-    // round trip.  256 threads is the reduction's width, not the problem's size.
-    if (use_native) {
-        bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, stream);
-        sigmoid_scale_rows_kernel<<<dim3(g_embd, 1u), THREADS, 0, (cudaStream_t) stream>>>(out, g, (int) n_embd);
-    } else {
-        scalar_gate_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(x_bf16, gate_inp_bf16, g, (int) n_embd);
-        scale_kernel<<<g_embd, THREADS, 0, (cudaStream_t) stream>>>(out, g, (int) n_embd);
-    }
+    // state, not from anything the expert produced.  The dot is the FP32-activation BF16 MMVF.
+    bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, stream);
+    sigmoid_scale_rows_kernel<<<dim3(g_embd, 1u), THREADS, 0, (cudaStream_t) stream>>>(out, g, (int) n_embd);
 
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();

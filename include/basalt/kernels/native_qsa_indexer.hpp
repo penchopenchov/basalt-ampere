@@ -6,8 +6,6 @@ namespace basalt::kernels {
 
 // Configure before session construction/capture. Disabled independently of the
 // native QSA norm/gate switch; existing captures retain their selected kernels.
-void native_qsa_indexer_set_enabled(bool enabled);
-bool native_qsa_indexer_enabled();
 
 // Pinned F16 raw-key cache / F32 pooling / weighted RMSNorm / text IMRoPE.
 // Fixed single-sequence geometry: idx_dim=128, idx_block=4, n_rot=64.

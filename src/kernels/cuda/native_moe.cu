@@ -25,7 +25,6 @@
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/diag.hpp"
 #include <cuda_runtime.h>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -34,7 +33,6 @@
 
 namespace basalt::kernels {
 namespace {
-std::atomic<bool> enabled{false};
 __global__ void combine(const float* __restrict__ parts, const float* __restrict__ weights,
                         const float* __restrict__ shared, float* __restrict__ output,
                         int64_t n_embd, int k) {
@@ -59,8 +57,6 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
     return ap < bp + bn && bp < ap + an;
 }
 }
-void native_moe_combine_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_moe_combine_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_moe_combine(const float* parts, const float* weights, const float* shared,
                         float* output, int64_t n_embd, int64_t k, void* stream) {
     if (!stream || n_embd <= 0 || n_embd > std::numeric_limits<int>::max() || k < 1 || k > 15)

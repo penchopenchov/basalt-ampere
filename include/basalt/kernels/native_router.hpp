@@ -2,10 +2,7 @@
 #include <cstdint>
 
 namespace basalt::kernels {
-// Configure before session capture. Existing graphs retain their selected kernels.
-// This experiment is off by default and does not modify the legacy router.
-void native_router_set_enabled(bool enabled);
-bool native_router_enabled();
+inline bool native_router_enabled() { return true; }
 
 // Pinned CUDA topk-moe contract for ONE token, 512 experts, top 10, softmax,
 // no selection bias, lower normalization clamp 2^-14, and scale 1.

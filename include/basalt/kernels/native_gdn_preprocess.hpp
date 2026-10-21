@@ -3,8 +3,7 @@
 
 namespace basalt::kernels {
 
-// Optional pinned CUDA GDN preprocessing. The layer selects these functions with
-// native_gdn_enabled(); direct callers explicitly select them by calling them.
+// Pinned CUDA GDN preprocessing, called by the layer and by direct callers.
 // Require a nonnull ordered stream, finite inputs, and four-byte aligned spans.
 // No function allocates or synchronizes. All pointers are caller-owned.
 

@@ -222,7 +222,6 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/native_qsa.cu
                         src/kernels/cuda/native_rope.cu
                         src/kernels/cuda/native_ple_postops.cu
-                        src/kernels/cuda/native_flash_attn.cu
                         src/kernels/cuda/native_qsa_indexer.cu
                         src/kernels/cuda/native_qsa_score.cu
                         src/kernels/cuda/ple.cu
@@ -277,7 +276,6 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/kernels/cuda/native_qsa.cu
     src/kernels/cuda/native_rope.cu
     src/kernels/cuda/native_ple_postops.cu
-    src/kernels/cuda/native_flash_attn.cu
     src/kernels/cuda/native_qsa_indexer.cu
     src/kernels/cuda/native_qsa_score.cu
     src/kernels/cuda/qsa_dec_fused.cu

@@ -24,7 +24,6 @@
 
 #include "basalt/kernels/native_qsa.hpp"
 #include <cuda_runtime.h>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -34,7 +33,6 @@
 
 namespace basalt::kernels {
 namespace {
-std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
@@ -102,8 +100,6 @@ void check_launch() {
 }
 } // namespace
 
-void native_qsa_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_qsa_enabled() { return enabled.load(std::memory_order_relaxed); }
 
 void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                   int n_cols, int n_rows, float epsilon, void* stream) {

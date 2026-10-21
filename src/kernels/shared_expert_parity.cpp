@@ -125,11 +125,8 @@ int main(int argc, char** argv) {
     std::vector<float> ginp((size_t) n_embd);
     for (auto& v : ginp) v = gauss(rng) * 0.05f;
 
-    // THE SCALAR GATE'S TWO OPERANDS ARE BF16, because `ffn_gate_inp_shexp` is a BF16 weight and ggml converts
-    // the activation to the weight's `vec_dot_type`.  The reference therefore dots the bf16 IMAGES of both, not
-    // the originals - and the kernel is handed the same bf16 images.  Rounding both here rather than only on
-    // the device is what keeps the comparison honest: rounding one side alone would show up as a fixed offset
-    // in the gate and be blamed on the kernel.
+    // THE SCALAR GATE IS A BF16 WEIGHT DOTTED WITH THE UNROUNDED F32 ACTIVATION (the single-token MMVF contract);
+    // the reference therefore dots the bf16 image of the weight with the original x.
     std::vector<uint16_t> hx_bf16((size_t) n_embd), hginp_bf16((size_t) n_embd);
     for (long long i = 0; i < n_embd; ++i) {
         hx_bf16[(size_t) i] = basalt::kernels::bf16_from_f32(fx[(size_t) i]);
@@ -179,7 +176,7 @@ int main(int argc, char** argv) {
         }
         double dot = 0;
         for (long long i = 0; i < n_embd; ++i)
-            dot += (double) basalt::kernels::f32_from_bf16(hx_bf16[(size_t) i]) * (double) basalt::kernels::f32_from_bf16(hginp_bf16[(size_t) i]);
+            dot += (double) fx[(size_t) i] * (double) basalt::kernels::f32_from_bf16(hginp_bf16[(size_t) i]);
         const double sg = 1.0 / (1.0 + std::exp(-dot));
         for (long long o = 0; o < n_embd; ++o) {
             out[(size_t) o] = elementwise_gate ? (float) ((double) out[(size_t) o] * sg)
@@ -222,8 +219,8 @@ int main(int argc, char** argv) {
     // the three projections is the wrong `vec_dot_type`, and a reference computed with the fp16 values would
     // agree with the kernel on a number the reference model would not produce.  A fixture that agrees with the kernel about the wrong activation is not a check.
     hx0.assign((size_t) (n_embd / 32) * 34, 0);
+    float* d_xf = nullptr;
     {
-        float* d_xf = nullptr;
         uint8_t* d_x0 = nullptr;
         check(cudaMalloc(&d_xf, (size_t) n_embd * 4), "xf");
         check(cudaMalloc(&d_x0, hx0.size()), "x0");
@@ -231,7 +228,6 @@ int main(int argc, char** argv) {
         basalt::kernels::quantize_q8_0(d_xf, d_x0, n_embd, nullptr);
         check(cudaMemcpy(hx0.data(), d_x0, hx0.size(), cudaMemcpyDeviceToHost), "cx0");
         d_x_used = d_x0;
-        cudaFree(d_xf);
     }
     // THE SCRATCH IS THE CALLER'S: allocation inside the kernel would be illegal during
     // stream capture and a token-path allocation.  The fixture owns it here, exactly as the
@@ -239,7 +235,7 @@ int main(int argc, char** argv) {
     float* d_scratch = nullptr;
     check(cudaMalloc(&d_scratch, basalt::kernels::shared_expert_scratch_bytes(n_ff)), "m scratch");
     basalt::kernels::shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
-                                   d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr);
+                                   d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr, d_xf);
     std::vector<float> got((size_t) n_embd);
     check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "c out");
 
@@ -326,75 +322,70 @@ int main(int argc, char** argv) {
         if (!in_range) ++bad;
     }
 
-    // Isolate the BF16 scalar gate: keep the quantized expert inputs fixed and vary only its F32/BF16
-    // activation. A zero scalar weight first exposes half the ungated output without duplicating the GEMVs.
+    // Isolate the scalar gate: keep the quantized expert inputs fixed and vary only its F32 activation. A zero
+    // scalar weight first exposes half the ungated output without duplicating the GEMVs.
     {
         using namespace basalt::kernels;
         std::vector<uint16_t> zeros((size_t) n_embd, 0), basis(zeros);
         basis[0] = bf16_from_f32(1.0f);
         std::vector<float> witness((size_t) n_embd, 0.0f);
         witness[0] = 1.00390625f;
-        std::vector<uint16_t> witness_bf16((size_t) n_embd, 0);
-        witness_bf16[0] = bf16_from_f32(witness[0]);
         float* d_witness = nullptr;
-        check(cudaMalloc(&d_witness, witness.size() * sizeof(float)), "native shared x");
-        check(cudaMemcpy(d_witness, witness.data(), witness.size() * sizeof(float), cudaMemcpyHostToDevice), "native shared upload x");
+        check(cudaMalloc(&d_witness, witness.size() * sizeof(float)), "shared witness x");
+        check(cudaMemcpy(d_witness, witness.data(), witness.size() * sizeof(float), cudaMemcpyHostToDevice), "shared upload x");
         auto run = [&](void* stream, const float* x_float = nullptr) {
             shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
                           d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, stream, x_float);
         };
         check(cudaMemcpy(d_ginpb, zeros.data(), zeros.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "zero shared gate");
-        run(nullptr);
-        std::vector<float> half_output((size_t) n_embd), legacy((size_t) n_embd), native((size_t) n_embd), replay((size_t) n_embd);
+        run(nullptr, d_xf);
+        std::vector<float> half_output((size_t) n_embd), native((size_t) n_embd), replay((size_t) n_embd);
         check(cudaMemcpy(half_output.data(), d_out, half_output.size() * sizeof(float), cudaMemcpyDeviceToHost), "half shared output");
         check(cudaMemcpy(d_ginpb, basis.data(), basis.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "basis shared gate");
-        check(cudaMemcpy(d_xb, witness_bf16.data(), witness_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "witness shared bf16");
-        run(nullptr);
-        check(cudaMemcpy(legacy.data(), d_out, legacy.size() * sizeof(float), cudaMemcpyDeviceToHost), "legacy witness output");
-        shared_expert_set_native_bf16(true);
         bool refused_missing = false;
         try { run(nullptr); } catch (const std::invalid_argument&) { refused_missing = true; }
         if (!refused_missing) ++bad;
         cudaStream_t stream;
-        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "native shared stream");
+        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "shared stream");
         run(stream, d_witness);
-        check(cudaStreamSynchronize(stream), "native shared sync");
-        check(cudaMemcpy(native.data(), d_out, native.size() * sizeof(float), cudaMemcpyDeviceToHost), "native witness output");
+        check(cudaStreamSynchronize(stream), "shared sync");
+        check(cudaMemcpy(native.data(), d_out, native.size() * sizeof(float), cudaMemcpyDeviceToHost), "shared witness output");
         const float expected_gate = 1.0f / (1.0f + std::exp(-witness[0]));
-        double error = 0.0, magnitude = 0.0;
+        const float rival_gate = 1.0f / (1.0f + std::exp(-f32_from_bf16(bf16_from_f32(witness[0]))));
+        double error = 0.0, magnitude = 0.0, visible = 0.0;
         for (size_t i = 0; i < native.size(); ++i) {
             const float expected = (half_output[i] * 2.0f) * expected_gate;
             error += std::fabs((double) native[i] - expected);
             magnitude += std::fabs((double) expected);
+            visible += std::fabs((double) (half_output[i] * 2.0f) * rival_gate - expected);
         }
         const double rel = error / (magnitude > 1e-30 ? magnitude : 1e-30);
-        const double visible = rel_l1(native, legacy);
+        visible /= (magnitude > 1e-30 ? magnitude : 1e-30);
         const bool correct = std::isfinite(rel) && rel < 2e-6 && visible > 1e-5 && refused_missing;
-        std::printf("  native shared scalar gate: %s (ref rel %.3e, BF16 separation %.3e, missing input %s)\n",
+        std::printf("  shared scalar gate: %s (ref rel %.3e, BF16 separation %.3e, missing input %s)\n",
                     correct ? "pass" : "FAIL", rel, visible, refused_missing ? "refused" : "FAIL");
         if (!correct) ++bad;
         cudaGraph_t graph;
         cudaGraphExec_t executable;
-        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "native shared capture");
+        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "shared capture");
         run(stream, d_witness);
-        check(cudaStreamEndCapture(stream, &graph), "native shared capture end");
-        check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "native shared graph instantiate");
-        shared_expert_set_native_bf16(false);
-        check(cudaGraphLaunch(executable, stream), "native shared graph replay");
-        check(cudaStreamSynchronize(stream), "native shared graph sync");
-        check(cudaMemcpy(replay.data(), d_out, replay.size() * sizeof(float), cudaMemcpyDeviceToHost), "native shared graph read");
+        check(cudaStreamEndCapture(stream, &graph), "shared capture end");
+        check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "shared graph instantiate");
+        check(cudaMemsetAsync(d_out, 0xa5, (size_t) n_embd * sizeof(float), stream), "shared poison");
+        check(cudaGraphLaunch(executable, stream), "shared graph replay");
+        check(cudaStreamSynchronize(stream), "shared graph sync");
+        check(cudaMemcpy(replay.data(), d_out, replay.size() * sizeof(float), cudaMemcpyDeviceToHost), "shared graph read");
         const bool captured = std::memcmp(native.data(), replay.data(), native.size() * sizeof(float)) == 0;
-        std::printf("  native shared captured selection: %s\n", captured ? "byte-identical" : "FAIL");
+        std::printf("  shared captured replay: %s\n", captured ? "byte-identical" : "FAIL");
         if (!captured) ++bad;
-        check(cudaGraphExecDestroy(executable), "native shared graph exec destroy");
-        check(cudaGraphDestroy(graph), "native shared graph destroy");
-        check(cudaStreamDestroy(stream), "native shared stream destroy");
+        check(cudaGraphExecDestroy(executable), "shared graph exec destroy");
+        check(cudaGraphDestroy(graph), "shared graph destroy");
+        check(cudaStreamDestroy(stream), "shared stream destroy");
         check(cudaMemcpy(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "restore shared gate");
-        check(cudaMemcpy(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "restore shared bf16");
-        run(nullptr);
+        run(nullptr, d_xf);
         check(cudaMemcpy(replay.data(), d_out, replay.size() * sizeof(float), cudaMemcpyDeviceToHost), "restored shared output");
         const bool restored = std::memcmp(got.data(), replay.data(), got.size() * sizeof(float)) == 0;
-        std::printf("  restored shared default: %s\n", restored ? "byte-identical" : "FAIL");
+        std::printf("  restored shared output: %s\n", restored ? "byte-identical" : "FAIL");
         if (!restored) ++bad;
         cudaFree(d_witness);
     }

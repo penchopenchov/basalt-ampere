@@ -34,7 +34,6 @@
 
 namespace basalt::kernels {
 namespace {
-std::atomic<bool> enabled{false};
 bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
     auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
     return x <= y ? y - x < an : x - y < bn;
@@ -97,8 +96,6 @@ void rope_table_release(const float* cos_tab) {
 }
 // the kernels compute the angles (the stored table is not read)
 RopeTab rope_table_for(const RopeScaling&) { return {}; }
-void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_rope_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {
     if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||

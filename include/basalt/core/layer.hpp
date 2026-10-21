@@ -47,13 +47,6 @@ namespace basalt::core {
 
 class KvArena;
 
-/// Select pinned CUDA BF16/F32 projections for SSM gates, routing and the sparse indexer.
-/// Configure before session capture; captured graphs retain the selected implementation.
-/// Does not change GR, PLE or the shared expert's scalar gate.
-void layer_set_native_bf16(bool enabled);
-// Diagnostic vector-attention adapter; configure before capture, context <=256.
-void layer_set_native_flash_attn_short(bool enabled);
-
 /// Every buffer one GDN layer needs, carved from an arena ONCE.  Sizes are functions of `ModelGeometry`, and
 /// `gdn_buffers_bytes` returns the total so a caller can size the arena before committing.
 struct GdnBuffers {
@@ -252,7 +245,6 @@ struct QsaState {
     /// THE PER-TOKEN COUNTS, IN DEVICE MEMORY - the whole reason this layer can be a graph.  `qsa_step_fill`
     /// computes all four from the position, so one H2D per token updates every count every kernel needs.
     int32_t* step = nullptr;
-    int32_t* attention_status = nullptr; ///< per-layer device status, captured D2H to host_step[kStepCount]
     /// The rope positions, (n_head,) int32, all equal to the current position.  `rope_neox_apply` reads its
     /// positions from the DEVICE, so a host scalar here would be an illegal access (and uncapturable).
     int32_t* pos_dev = nullptr;
@@ -266,7 +258,7 @@ struct QsaState {
     ///
     /// Pinned as well as fixed, because a pageable source would make `cudaMemcpyAsync` a synchronous staged
     /// copy and give back the overlap the doorbell protocol exists for.
-    int32_t* host_step = nullptr;    ///< (kStepCount + 1,) pinned; final element is attention status
+    int32_t* host_step = nullptr;    ///< (kStepCount,) pinned
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
 };
 
@@ -465,19 +457,8 @@ uint64_t block_buffers_bytes(const ModelGeometry& g);
 void layer_set_fused_gr(bool enabled);
 bool layer_fused_gr();
 
-/// QSA attention by the split-K kernel reading the KV pools directly (default ON; `false` keeps the gather +
-/// one-block-per-head kernel).  Set before capture.
-void layer_set_fast_attn(bool enabled);
-/// Doorbell payload + ring as one kernel, QSA step staging read by a kernel from mapped memory (default ON; `false`
-/// keeps the memcpy nodes).  Set before capture.
-void layer_set_publish_kernel(bool enabled);
-/// GDN step + output norm as one coalesced kernel under the native contract (default ON).
-void layer_set_fused_gdn(bool enabled);
-/// QSA block scores in FP32 and a radix top-k over blocks (default ON; `false` = the FP64 row scores and the
-/// bit-serial cell top-k).  Set before capture.
-void layer_set_fast_select(bool enabled);
-/// Whether the current decode configuration is the one the speculative verify window reproduces bit for bit (native
-/// projections, fused GR and GDN, split-K attention, block selection, native indexer).
+/// Whether the current decode configuration is the one the speculative verify window reproduces bit for bit (the
+/// fused hyper-connection read).
 bool layer_verify_compatible(std::string& why);
 uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b);
 

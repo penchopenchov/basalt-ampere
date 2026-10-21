@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -785,33 +786,33 @@ int main(int argc, char** argv) {
         if (t == 0) {
             // Deliberate BF16 halfway values make the value projection's activation precision visible.
             // The scalar reference uses the actual packed BF16 weight bits and unrounded F32 inputs.
-            std::vector<float> witness(nd), reference_value(nd), native_value(nd), native_result(hcd), replay(hcd);
+            std::vector<float> witness(nd), reference_value(nd), rival_value(nd), native_value(nd), native_result(hcd), replay(hcd);
             for (size_t i = 0; i < nd; ++i) witness[i] = i % 7 == 0 ? 1.00390625f : -0.501953125f;
             for (size_t row = 0; row < nd; ++row) {
-                double sum = 0.0;
+                double sum = 0.0, rival = 0.0;
                 for (size_t col = 0; col < nd; ++col) {
                     const uint32_t bits = uint32_t(value_bf16[row * nd + col]) << 16;
                     float weight;
                     std::memcpy(&weight, &bits, sizeof(weight));
                     sum += double(weight) * witness[col];
+                    // the BF16-rounded activation reading, which the FP32 contract must be distinguishable from
+                    const uint32_t rbits = ((std::bit_cast<uint32_t>(witness[col]) + 0x7fffu +
+                                             ((std::bit_cast<uint32_t>(witness[col]) >> 16) & 1u)) & 0xffff0000u);
+                    rival += double(weight) * std::bit_cast<float>(rbits);
                 }
                 reference_value[row] = float(sum);
+                rival_value[row] = float(rival);
             }
             ck(cudaMemcpy(d_emb, witness.data(), nd * sizeof(float), cudaMemcpyHostToDevice), "native PLE witness");
-            k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-            ck(cudaDeviceSynchronize(), "legacy PLE witness sync");
-            std::vector<float> legacy_value(nd);
-            ck(cudaMemcpy(legacy_value.data(), d_cv, nd * sizeof(float), cudaMemcpyDeviceToHost), "legacy PLE witness value");
             cudaStream_t stream;
             ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "native PLE stream");
-            k::ple_set_native_bf16(true);
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, stream);
             ck(cudaStreamSynchronize(stream), "native PLE sync");
             ck(cudaMemcpy(native_value.data(), d_cv, nd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE value");
             ck(cudaMemcpy(native_result.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE result");
             long long nf = 0;
             const double rel = rel_l1(reference_value.data(), native_value.data(), nd, nullptr, &nf);
-            const double separation = rel_l1(native_value.data(), legacy_value.data(), nd);
+            const double separation = rel_l1(native_value.data(), rival_value.data(), nd);
             const bool correct = le(rel, 2e-6) && nf == 0 && gt(separation, 1e-5);
             std::printf("  native PLE value: %s (ref rel %.3e, BF16 separation %.3e)\n",
                         correct ? "pass" : "FAIL", rel, separation);
@@ -822,7 +823,7 @@ int main(int argc, char** argv) {
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, stream);
             ck(cudaStreamEndCapture(stream, &graph), "native PLE capture end");
             ck(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "native PLE instantiate");
-            k::ple_set_native_bf16(false);
+            ck(cudaMemsetAsync(d_cr, 0xa5, hcd * sizeof(float), stream), "native PLE poison");
             ck(cudaGraphLaunch(executable, stream), "native PLE replay");
             ck(cudaStreamSynchronize(stream), "native PLE replay sync");
             ck(cudaMemcpy(replay.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE replay result");
@@ -843,7 +844,7 @@ int main(int argc, char** argv) {
 
         if (t == 0) {
             // This checks native-projection wiring and graph lifetime, independently
-            // of the legacy CPU/F32 structural capture. Actual Q2_0 arithmetic is
+            // of the CPU/F32 structural capture. Actual Q2_0 arithmetic is
             // checked separately by native_mmvq_parity against the pinned CUDA DLL.
             const size_t blocks = n_scales, native_bytes = blocks * 18, guard = 64;
             const size_t qbytes = k::native_q8_1_bytes(k::NG_N_EMBD);

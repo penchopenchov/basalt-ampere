@@ -2,8 +2,7 @@
 //
 // See include/basalt/kernels/ple.hpp for the structure and for the `normalized`-is-the-conv-input finding.
 //
-// The legacy arithmetic below follows the captured CPU ggml graph
-// (captured input and output vectors):
+// The arithmetic follows the captured CPU ggml graph (captured input and output vectors):
 //
 //   * `rms_norm` accumulates `(double)(x*x)` with the PRODUCT rounded in f32 first - that is literally what
 //     `ggml_compute_forward_rms_norm_f32` does (`sum += (ggml_float)(x[i00]*x[i00])` with `ggml_float` =
@@ -11,8 +10,7 @@
 //   * `silu` is `x / (1 + expf(-x))` in f32, which is `ggml_silu_f32`.
 //   * the gate's `sqrt` and `sigmoid` are f32.
 //
-// The opt-in native BF16 path replaces only ple_value with the pinned CUDA single-token BF16/F32 MMVF.
-// A separate opt-in native postops path follows the pinned CUDA arithmetic after both projections.
+// ple_value is the single-token BF16/F32 MMVF, and the post-projection arithmetic is `native_ple_postops`.
 #include "basalt/kernels/ple.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/f16_bits.hpp"
@@ -34,8 +32,6 @@ namespace basalt::kernels {
 namespace {
 
 constexpr int THREADS = 256;
-bool native_bf16 = false;
-bool native_postops = false;
 
 bool overlap(const void* a, size_t a_bytes, const void* b, size_t b_bytes) {
     if (a == nullptr || b == nullptr || a_bytes == 0 || b_bytes == 0) return false;
@@ -51,142 +47,6 @@ __global__ void history_advance_kernel(float* __restrict__ history, const float*
     column[NG_HIST - 1] = normalized[channel];
 }
 
-__device__ __forceinline__ uint16_t bf16_bits(float f) {
-    uint32_t i;
-    memcpy(&i, &f, 4);
-    i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
-    return (uint16_t) (i >> 16);
-}
-
-__device__ __forceinline__ float bf16_float(uint16_t h) {
-    const uint32_t i = (uint32_t) h << 16;
-    float f;
-    memcpy(&f, &i, 4);
-    return f;
-}
-
-__device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x)); }
-
-/// Block-wide sum in double, broadcast to all threads.  The leading `__syncthreads` matters: the result is
-/// read out of `scratch[0]` and a later call reuses the array, so without a barrier a fast thread can
-/// overwrite it before a slow one has read it - invisible in most runs and a slightly different norm when it
-/// fires.
-__device__ double block_sum(double v, double* scratch) {
-    __syncthreads();
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-    const int nw = ((int) blockDim.x + 31) >> 5;
-    v = (threadIdx.x < nw) ? scratch[threadIdx.x] : 0.0;
-    if (warp == 0)
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
-    if (threadIdx.x == 0) scratch[0] = v;
-    __syncthreads();
-    return scratch[0];
-}
-
-/// `grouped_norm`, ONE BLOCK PER STREAM.  The ggml form is `reshape_3d(x, n_embd, hc, T)` then
-/// `rms_norm(..., eps) * w`, so ne0 = n_embd is the reduction axis and each hc stream is normalised on its
-/// own.  In the flat ggml layout (ne0 fastest) stream c occupies [c*n_embd, (c+1)*n_embd).
-__global__ void gnorm_kernel(const float* __restrict__ x, const float* __restrict__ w,
-                             float* __restrict__ y, int n_embd, float eps) {
-    __shared__ double scratch[8];
-    const int c = blockIdx.x;
-    const float* xc = x + (size_t) c * n_embd;
-    const float* wc = w + (size_t) c * n_embd;
-    float* yc = y + (size_t) c * n_embd;
-
-    double acc = 0.0;
-    for (int d = threadIdx.x; d < n_embd; d += blockDim.x) {
-        // The PRODUCT is rounded in f32 before it is widened - `(ggml_float)(x[i00]*x[i00])`.
-        const float sq = xc[d] * xc[d];
-        acc += (double) sq;
-    }
-    const float mean = (float) (block_sum(acc, scratch) / (double) n_embd);
-    const float scale = 1.0f / sqrtf(mean + eps);
-    for (int d = threadIdx.x; d < n_embd; d += blockDim.x) yc[d] = xc[d] * scale * wc[d];
-}
-
-/// `s[c] = sum_d key[c][d]*query[c][d] / sqrt(n_embd)`, then the signed square root and the sigmoid.
-///
-/// `mag = sqrt(clamp(|s|, 1e-6, inf))` and `gate = sigmoid(sgn(s) * mag)`.  The clamp is a floor on |s|, so
-/// it only bites near zero; the SIGN is carried separately, which is what keeps the gate symmetric about 0.5.
-__global__ void gate_kernel(const float* __restrict__ key, const float* __restrict__ query,
-                            float* __restrict__ gate, int n_embd, float inv_sqrt_n) {
-    __shared__ double scratch[8];
-    const int c = blockIdx.x;
-    const float* kc = key + (size_t) c * n_embd;
-    const float* qc = query + (size_t) c * n_embd;
-    double acc = 0.0;
-    for (int d = threadIdx.x; d < n_embd; d += blockDim.x) acc += (double) (kc[d] * qc[d]);
-    const float s = (float) (block_sum(acc, scratch) / (double) 1.0) * inv_sqrt_n;
-    const float mag = sqrtf(fmaxf(fabsf(s), 1e-6f));
-    const float sgn = (s > 0.0f) ? 1.0f : ((s < 0.0f) ? -1.0f : 0.0f);
-    if (threadIdx.x == 0) gate[c] = 1.0f / (1.0f + expf(-(sgn * mag)));
-}
-
-/// `gated[c][d] = value[d] * gate[c]` - the value broadcast across the hc streams.
-__global__ void bcast_kernel(const float* __restrict__ value, const float* __restrict__ gate,
-                             float* __restrict__ gated, int n_embd, int hc) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_embd * hc) return;
-    gated[i] = value[i % n_embd] * gate[i / n_embd];
-}
-
-/// The depthwise causal dilated conv, then SiLU.  One thread per channel.
-///
-/// `out[c] = sum_k kW[k][c] * terms[t - (kern-1-k)*dil][c]` with `t = hist` (the first new position), so tap k
-/// reads row `hist - (kern-1-k)*dil` of `[history | new]`.  For the real geometry (kern 4, dil 3, hist 9) the
-/// four taps read rows 0, 3, 6 and 9 - and row 9 is the NEW row, which is the only one beyond the history.
-/// That is why no `terms` buffer is built: three taps come from the caller's history and one from `norm`.
-///
-/// `kW` IS GGML-NATIVE: `kW[k + kern*c]`.  The manifest's shape is [4, 10240] with ne0 = 4 fast, and
-/// the Python reference's (4, 10240) numpy `kernel[k][c]` is the TRANSPOSE of that.  The source's own view
-/// (`ggml_view_2d(model.layers[il].ple_conv1d, 1, hc_dim, nb[1], k*nb[0])`) settles which one is meant.
-__global__ void conv_kernel(const float* __restrict__ hist, const float* __restrict__ norm,
-                            const uint16_t* __restrict__ kW, float* __restrict__ out, int hc_dim, int kern,
-                            int dil, int nhist) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= hc_dim) return;
-    float acc = 0.0f;
-    for (int k = 0; k < kern; ++k) {
-        const int row = nhist - (kern - 1 - k) * dil;      // tap 0 reads the FURTHEST back
-        // ROW-FASTEST: `hist[row + nhist*c]`.  The conv state is `ggml_reshape_3d(state, d_conv-1,
-        // conv_channels, n_seqs)`, so ne0 = hist varies fastest and the flat index is row + hist*channel.
-        // Channel-slowest (`row*hc_dim + c`) is the natural thing to write and would read a transposed state -
-        // getting this wrong fails ggml's own assert.
-        const float v = (row == nhist) ? norm[c] : hist[(size_t) row + (size_t) nhist * c];
-        acc += f32_from_f16(kW[k + kern * c]) * v;
-    }
-    out[c] = silu_f(acc);
-}
-
-/// `result = hidden + gated + conv`, elementwise over hc_dim.
-__global__ void add3_kernel(const float* __restrict__ hidden, const float* __restrict__ gated,
-                            const float* __restrict__ conv, float* __restrict__ result, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) result[i] = hidden[i] + gated[i] + conv[i];
-}
-
-/// `y[o] = sum_i bf16(x[i]) * bf16(w[o*n_in + i])`.  The weight is BF16 and so is the ACTIVATION, which is
-/// the contract for a BF16 tensor; with both sides bf16 the products are
-/// exact in f32 and only the summation order differs from ggml's.
-__global__ void bf16_gemv_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
-                                 float* __restrict__ y, int n_in, int n_out) {
-    const int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= n_out) return;
-    const uint16_t* row = w + (size_t) o * n_in;
-    double acc = 0.0;
-    for (int i = 0; i < n_in; ++i) acc += (double) bf16_float(x[i]) * (double) bf16_float(row[i]);
-    y[o] = (float) acc;
-}
-
-__global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = bf16_bits(x[i]);
-}
-
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "ple_block: %s: %s\n", what, cudaGetErrorString(e));
@@ -195,11 +55,6 @@ void ck(cudaError_t e, const char* what) {
 }
 
 }  // namespace
-
-void ple_set_native_bf16(bool enabled) { native_bf16 = enabled; }
-bool ple_native_bf16_enabled() { return native_bf16; }
-void ple_set_native_postops(bool enabled) { native_postops = enabled; }
-bool ple_native_postops_enabled() { return native_postops; }
 
 void ple_history_advance(float* hist, const float* normalized, void* stream) {
     if (hist == nullptr || normalized == nullptr)
@@ -217,12 +72,11 @@ bool ple_block_available() {
 }
 
 uint64_t ple_block_scratch_bytes() {
-    // five hc_dim floats + n_embd + hc, then the Q8 activation image, then the BF16 embedding copy, each
-    // 16-byte aligned because `d_scratch` is cast to `float*` and `d_act` to `uint8_t*` at those offsets.
+    // five hc_dim floats + n_embd + hc, then the Q8 activation image, each 16-byte aligned because `d_scratch` is
+    // cast to `float*` and `d_act` to `uint8_t*` at those offsets.
     const size_t f = (size_t) (5 * NG_HC_DIM + NG_N_EMBD + NG_HC) * sizeof(float);
     const size_t q = (size_t) (NG_N_EMBD / 32) * 34;
-    const size_t e = (size_t) NG_N_EMBD * sizeof(uint16_t);
-    return ((f + 15) & ~(size_t) 15) + ((q + 15) & ~(size_t) 15) + e + 256;
+    return ((f + 15) & ~(size_t) 15) + ((q + 15) & ~(size_t) 15) + 256;
 }
 
 void ple_block(const float* emb, const float* hidden, const float* hist_rows, const PleWeights& w,
@@ -282,7 +136,6 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     uint8_t* base = (uint8_t*) scratch;
     float* d_scratch = (float*) base;
     uint8_t* d_act = base + ((float_bytes + 15) & ~(size_t) 15);
-    uint16_t* d_emb16 = (uint16_t*) (d_act + ((q8_bytes + 15) & ~(size_t) 15));
     float* d_key = d_scratch;
     float* d_query = d_key + hc_dim;
     float* d_norm = d_query + hc_dim;
@@ -291,8 +144,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     float* d_value = d_conv + hc_dim;
     float* d_gate = d_value + n_embd;
 
-    // ---- key = grouped_norm(ple_key @ emb). The optional native projection
-    // follows pinned CUDA Q8_1 MMVQ; the default retains its canonical Q8_0 path.
+    // ---- key = grouped_norm(ple_key @ emb). A GGUF-native key follows the Q8_1 MMVQ; the S2 key the Q8_0 path.
     if (w.key_bf16 != nullptr) {
         bf16_gemv_fp32_mmvf(emb, w.key_bf16, d_key, n_embd, hc_dim, stream);
     } else if (native_key) {
@@ -303,37 +155,13 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         quantize_q8_0(emb, d_act, n_embd, st);
         s2_gemv_q8(d_act, w.key_codes, w.key_scales, d_key, n_embd, hc_dim, 8, st);
     }
-    if (!native_postops) {
-        gnorm_kernel<<<hc, THREADS, 0, st>>>(d_key, w.norm_key, d_key, n_embd, NG_RMS_EPS);
-        gnorm_kernel<<<hc, THREADS, 0, st>>>(hidden, w.norm_query, d_query, n_embd, NG_RMS_EPS);
-    }
+    bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, stream);
 
-    // The value projection's independent option leaves the nonlinear PLE operations unchanged.
-    if (native_bf16) {
-        bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, stream);
-    } else {
-        to_bf16_kernel<<<(n_embd + THREADS - 1) / THREADS, THREADS, 0, st>>>(emb, d_emb16, n_embd);
-        bf16_gemv_kernel<<<(n_embd + THREADS - 1) / THREADS, THREADS, 0, st>>>(d_emb16, w.value_bf16, d_value,
-                                                                              n_embd, n_embd);
-    }
-
-    const float* normalized_key = d_key;
-    if (native_postops) {
-        // The key norm has a distinct destination; temporary query storage can
-        // be reused for normalized gated values after the gate consumes it.
-        NativePlePostopsBuffers buffers{d_query,d_norm,d_gate,d_gated,d_norm,d_conv,out.result};
-        native_ple_postops(d_key,hidden,d_value,hist_rows,w,buffers,stream);
-        normalized_key = d_query;
-    } else {
-        gate_kernel<<<hc, THREADS, 0, st>>>(d_key, d_query, d_gate, n_embd, 1.0f / sqrtf((float) n_embd));
-        bcast_kernel<<<(hc_dim + THREADS - 1) / THREADS, THREADS, 0, st>>>(d_value, d_gate, d_gated, n_embd, hc);
-        gnorm_kernel<<<hc, THREADS, 0, st>>>(d_gated, w.norm_conv, d_norm, n_embd, NG_RMS_EPS);
-        conv_kernel<<<(hc_dim + THREADS - 1) / THREADS, THREADS, 0, st>>>(hist_rows, d_norm, w.conv1d_f16, d_conv,
-                                                                         hc_dim, PLE_CONV_KERNEL, NGRAM_SIZE,
-                                                                         NG_HIST);
-        add3_kernel<<<(hc_dim + THREADS - 1) / THREADS, THREADS, 0, st>>>(hidden, d_gated, d_conv, out.result,
-                                                                         hc_dim);
-    }
+    // The key norm has a distinct destination; temporary query storage is reused for the normalized gated values
+    // after the gate consumes it.
+    NativePlePostopsBuffers buffers{d_query,d_norm,d_gate,d_gated,d_norm,d_conv,out.result};
+    native_ple_postops(d_key,hidden,d_value,hist_rows,w,buffers,stream);
+    const float* normalized_key = d_query;
 
     // ---- the intermediates the oracle comparison needs.  `key` is the NORMALISED key, because the source's
     //      `cb(key, ...)` capture is after `gnorm`; `value` is the projection before the gate.  Each stage the

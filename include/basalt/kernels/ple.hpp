@@ -27,16 +27,10 @@
 
 namespace basalt::kernels {
 
-/// Opt in to pinned CUDA BF16/F32 MMVF for the PLE value projection only (default false).
-/// Configure before session capture; captured graphs retain their selected projection kernels.
-void ple_set_native_bf16(bool enabled);
-bool ple_native_bf16_enabled();
-
-/// Opt in to pinned CUDA postprojection norms, gate, convolution and residual
-/// arithmetic (default false). Set before capture; existing graphs keep their
-/// selected kernels. Independent of the key/value projection options.
-void ple_set_native_postops(bool enabled);
-bool ple_native_postops_enabled();
+/// The value projection is the BF16 MMVF and the post-projection norms, gate, convolution and residual arithmetic
+/// are the pinned kernels; these report that, for callers that gate on it.
+inline bool ple_native_bf16_enabled() { return true; }
+inline bool ple_native_postops_enabled() { return true; }
 
 /// Weights of the single PLE layer (`ple.layers = [1]`).  `blk.1.*` in the pack.
 ///

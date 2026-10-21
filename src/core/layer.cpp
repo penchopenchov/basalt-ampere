@@ -25,7 +25,6 @@
 #include "basalt/kernels/native_qsa_indexer.hpp"
 #include "basalt/kernels/mrope.hpp"
 #include "basalt/kernels/native_rope.hpp"
-#include "basalt/kernels/native_flash_attn.hpp"
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/qsa_decode_attn.hpp"
@@ -40,7 +39,7 @@
 #include <cstring>
 #include <vector>
 namespace basalt::core {
-namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
+namespace { bool g_shared_early = true; bool g_fused_gr = false; }
 namespace {constexpr int Q8K_BYTES_PER_BLOCK = 292;
 constexpr int Q8K_ELEMS_PER_BLOCK = 256;
 constexpr float RMS_EPS = 1e-6f;
@@ -78,15 +77,9 @@ bool plane_ptrs(const WeightRef& r, const std::string& name, Planes& out, std::s
 // S2 tensor's activation contract is Q8_0 (`s2_gemv_q8`) while a K-quant's is Q8_K (`s_gemv_q8k`).
 if (r.code_bits != 2 && r.code_bits != 4 && r.code_bits != 8) {        err = name + ": code_bits " + std::to_string(r.code_bits) + " is not an S2/S4/S8 form";        return false;    }    const uint64_t end = r.codes_bytes + r.scales_bytes + r.offset_bytes;    if (r.codes_bytes == 0 || r.scales_bytes == 0 || end != r.bytes) {        char buf[320];        std::snprintf(buf, sizeof buf,                      "%s: the planes add up to %llu B but the tensor is %llu B (codes %llu, scales %llu, "                      "offsets %llu) - what the loader recorded is not the layout that was loaded",                      name.c_str(), (unsigned long long) end, (unsigned long long) r.bytes,                      (unsigned long long) r.codes_bytes, (unsigned long long) r.scales_bytes,                      (unsigned long long) r.offset_bytes);        err = buf;        return false;    }    if (r.has_offset != (r.offset_bytes != 0)) {        err = name + ": has_offset is " + std::to_string(r.has_offset ? 1 : 0) + " but the offset plane is " +              std::to_string(r.offset_bytes) + " B";        return false;    }    const uint8_t* base = (const uint8_t*) r.data;    out.codes = base;    out.scales = (const float*) (base + r.codes_bytes);    out.offset = r.offset_bytes ? (const float*) (base + r.codes_bytes + r.scales_bytes) : nullptr;    return true;}
 constexpr int TPR = 32;
-bool native_bf16_projections = false;
-bool native_flash_attn_short = false;
 
-void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weights, float* out,
-                  int64_t n_in, int64_t n_out, bool split, void* stream) {
-    using namespace basalt::kernels;
-    if (native_bf16_projections) bf16_gemv_fp32_mmvf(x, weights, out, n_in, n_out, stream);
-    else if (split) bf16_gemv_split(x_bf16, weights, out, n_in, n_out, TPR, stream);
-    else bf16_gemv(x_bf16, weights, out, n_in, n_out, stream);
+void project_bf16(const float* x, const uint16_t* weights, float* out, int64_t n_in, int64_t n_out, void* stream) {
+    basalt::kernels::bf16_gemv_fp32_mmvf(x, weights, out, n_in, n_out, stream);
 }
 // The doorbell ring kernel lives in src/kernels/cuda/elementwise.cu; this file is HOST code.
 //
@@ -135,8 +128,6 @@ if (w.has_offset || p.offset != nullptr) {            err = name + ": an S2 form
 // kind therefore comes from the manifest's `source_type`, through the index.
 if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);        return true;    }    s_gemv_q8k_split(xq8k, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);    return true;}}
 // namespace
-void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
-void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
 namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false; }
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
@@ -205,41 +196,24 @@ st_begin(layer, 9, stream);    if (!gemv_quantized(*w_qkv, p_qkv, f_qkv, b.x_q8_
 // ---- 3. conv, then SiLU on the WHOLE conv output - before the q|k|v split, which is what
 //         the Python reference says and what makes the split a reshape rather than a copy.
 st_begin(layer, 10, stream);
-// Under the native contract, conv + SiLU + both L2 norms are one kernel, and alpha/beta with their epilogues another
-// (`fused_gdn.hpp`).
-const bool fused_pre = g_fused_gdn && native_gdn_enabled() && native_bf16_projections && g.ssm_d_conv == 4 &&
-                       g.ssm_state_size == 128;
+// Conv + SiLU + both L2 norms are one kernel, and alpha/beta with their epilogues another (`fused_gdn.hpp`).
+const bool fused_pre = g.ssm_d_conv == 4 && g.ssm_state_size == 128;
 if (fused_pre) {
     fused_gdn_conv_l2(b.conv_state, b.qkv, conv_kernel, b.h, (int) C, (int) (2 * g.ssm_k_heads), RMS_EPS, stream);
 } else
 try {
-    if (native_gdn_enabled()) native_gdn_conv_silu(b.conv_state, b.qkv, conv_kernel, b.conv_out, b.h, C, g.ssm_d_conv, stream);
-    else {
-        gdn_conv_step(b.conv_state, b.qkv, conv_kernel, b.conv_out, C, g.ssm_d_conv, stream);
-        cudaMemcpyAsync(b.h, b.conv_out, (size_t) C * 4, cudaMemcpyDeviceToDevice, st);
-        silu_inplace(b.h, C, stream);
-    }
+    native_gdn_conv_silu(b.conv_state, b.qkv, conv_kernel, b.conv_out, b.h, C, g.ssm_d_conv, stream);
 } catch (const std::exception& error) { err = v.name("gdn_conv_silu") + ": " + error.what(); return false; }
 st_end(layer, 10, stream);
 // ---- 4. q,k = l2_norm; v is NOT normalised.  The three views are contiguous runs of the same buffer:
 //         q at [0, 2048), k at [2048, 4096), v at [4096, 10240), each 128-wide heads.    const
 st_begin(layer, 11, stream);    int64_t qk = g.ssm_state_size * g.ssm_k_heads;
 if (!fused_pre) try {
-    if (native_gdn_enabled()) {
-        native_gdn_l2_norm(b.h, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
-        native_gdn_l2_norm(b.h + qk, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
-    } else {
-        gdn_l2_norm(b.h, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
-        gdn_l2_norm(b.h + qk, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
-    }
+    native_gdn_l2_norm(b.h, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
+    native_gdn_l2_norm(b.h + qk, g.ssm_k_heads, g.ssm_state_size, RMS_EPS, stream);
 } catch (const std::exception& error) { err = v.name("gdn_l2_norm") + ": " + error.what(); return false; }
-// The recurrence needs another 1/sqrt(S) beyond Q/K normalization. The legacy
-// recurrence consumes prescaled Q; pinned CUDA applies it after the readout dot.
-// Keep the scale at that backend-specific boundary to preserve rounding order.
-if (!native_gdn_enabled()) scale_inplace(b.h, qk, 1.0f / std::sqrt((float) g.ssm_state_size), stream);
 st_end(layer, 11, stream);
-// ---- 5. beta and the gate. The weights are BF16. Native single-token CUDA MMVF consumes F32 activations; the legacy
-// path rounds them to BF16 first.
+// ---- 5. beta and the gate. The weights are BF16; the single-token MMVF consumes F32 activations.
 //
 // THE ROW-SPLIT FORM: `ssm_v_heads` is **48**, so the plain one-thread-per-row form puts 48 threads on 48 SMs and
 // each walks 2,560 elements alone.  The split form is several times faster, and there are two of them, in all 36
@@ -249,26 +223,19 @@ st_begin(layer, 12, stream);
         fused_gdn_ab(mixed, (const uint16_t*) w_alpha->data, (const uint16_t*) w_beta->data, dt, ssm_a, b.gate, b.beta,
                      (int) g.n_embd, (int) g.ssm_v_heads, stream);
     } else {
-    if (!native_bf16_projections) f32_to_bf16_bulk(mixed, b.x_bf16, g.n_embd, stream);
-    project_bf16(mixed, b.x_bf16, (const uint16_t*) w_alpha->data, b.alpha, g.n_embd, g.ssm_v_heads, true, stream);
-    project_bf16(mixed, b.x_bf16, (const uint16_t*) w_beta->data, b.beta, g.n_embd, g.ssm_v_heads, true, stream);
+    project_bf16(mixed, (const uint16_t*) w_alpha->data, b.alpha, g.n_embd, g.ssm_v_heads, stream);
+    project_bf16(mixed, (const uint16_t*) w_beta->data, b.beta, g.n_embd, g.ssm_v_heads, stream);
     }
     if (!fused_pre) try {
-        if (native_gdn_enabled()) {
-            native_gdn_beta_gate(b.beta, g.ssm_v_heads, stream);
-            native_gdn_gate(b.alpha, dt, ssm_a, b.gate, g.ssm_v_heads, stream);
-        } else {
-            gdn_beta_gate(b.beta, g.ssm_v_heads, stream);
-            gdn_gate(b.alpha, dt, ssm_a, b.gate, 1, g.ssm_v_heads, stream);
-        }
+        native_gdn_beta_gate(b.beta, g.ssm_v_heads, stream);
+        native_gdn_gate(b.alpha, dt, ssm_a, b.gate, g.ssm_v_heads, stream);
     } catch (const std::exception& error) { err = v.name("gdn_gate") + ": " + error.what(); return false; }
     st_end(layer, 12, stream); st_begin(layer, 13, stream);
     GdnShapes gs{g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads};
-    // with the native contract the step and the output norm are one kernel (after the z GEMV).
-    const bool fused_gdn = g_fused_gdn && native_gdn_enabled() && g.ssm_state_size == 128;
+    // the step and the output norm are one kernel (after the z GEMV).
+    const bool fused_gdn = g.ssm_state_size == 128;
     if (!fused_gdn) try {
-        if (native_gdn_enabled()) native_gdn_step(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.o, gs, stream);
-        else gdn_step(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.o, gs, stream);
+        native_gdn_step(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.o, gs, stream);
     } catch (const std::exception& error) {
         err = v.name("gdn_step") + ": " + error.what();
         return false;
@@ -283,8 +250,7 @@ if (!gemv_quantized(*w_gate, p_gate, f_gate, b.x_q8_0, b.x_q8k, b.z, g.n_embd, g
 try {
     if (fused_gdn) fused_gdn_step_norm(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.z, ssm_norm, RMS_EPS, b.y,
                                        (int) g.ssm_k_heads, (int) g.ssm_v_heads, stream);
-    else if (native_gdn_enabled()) native_gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, stream);
-    else gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, stream);
+    else native_gdn_out_norm(b.o, b.z, ssm_norm, b.y, g.ssm_v_heads, g.ssm_state_size, RMS_EPS, stream);
 } catch (const std::exception& error) { err = v.name("gdn_out_norm") + ": " + error.what(); return false; }
 st_end(layer, 14, stream);
 // ---- 8. out = ssm_out @ y, whose activation is whatever THIS layer's `ssm_out` asks for
@@ -316,17 +282,12 @@ q8k_bytes(g.n_embd),
 uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        basalt::kernels::shared_expert_scratch_bytes(g.n_ff),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, void* stream, std::string& err, const Doorbell* db) {    using namespace basalt::kernels;    const LayerView v(tables, layer);    const WeightRef* w_router = v.get("ffn_gate_inp.weight");    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
 // ---- the router's activation.  The router's weight is BF16 and that is the one the Python reference singles out.
-if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
-// ---- logits = ffn_gate_inp @ bf16(x).  The weight is BF16, so this is `bf16_gemv` and not `s_gemv` - and using the
-// fp16 activation here instead is an error that flips a selection.
-//
-// **THE ROW-SPLIT VARIANT, BECAUSE THE PLAIN ONE'S PARALLELISM IS THE OUTPUT WIDTH.**  `bf16_gemv` is one thread per
-// output row: for the router that is 512 threads over the SMs, each walking 2,560 elements sequentially, far from
-// the memory-bound floor.  `bf16_gemv_split` exists for precisely this case; its own header says so.
-project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+// ---- logits = ffn_gate_inp @ x.  The weight is BF16, so this is the BF16 MMVF and not `s_gemv`; using the fp16
+// activation here instead is an error that flips a selection.
+project_bf16(x, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
-if (native_router_enabled() && g.n_expert == 512 && k == 10) {
+if (g.n_expert == 512 && k == 10) {
     try { native_router_top10(b.logits, b.ids, b.weights, stream); }
     catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
 } else router_top10(b.logits, 1, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
@@ -334,24 +295,18 @@ if (native_router_enabled() && g.n_expert == 512 && k == 10) {
 // (`ids`, `weights`) are published to the host HERE, before anything that depends on them, so a CPU pool can start
 // on them while the GPU keeps working.  Both the copy and the ring are captured into `G[l]` like anything else - a
 // kernel writing mapped pinned memory, which the host sees early in the graph.
-if (db != nullptr && g_publish_kernel) {
+if (db != nullptr) {
     basalt::kernels::doorbell_publish(x, b.ids, b.weights, g.n_embd, k, db->d_x_f, db->d_ids, db->d_weights, db->d_seq,
                                       stream);
-} else if (db != nullptr) {        if (cudaMemcpyAsync(db->d_x_f, x, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(db->d_ids, b.ids, (size_t) k * 4, cudaMemcpyDeviceToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(db->d_weights, b.weights, (size_t) k * 4, cudaMemcpyDeviceToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "moe_route: the doorbell handoff copy failed";            return false;        }
-// THE RING IS LAST, so a host that sees it knows every byte above is in place.  Ordering within a
-// stream is what makes that true; it is not a timing assumption.
-// THE RING LIVES IN A .cu: this file is compiled by the HOST compiler, where `__global__` and `<<<>>>` do
-// not exist.  The sequence value is read from the HOST copy and incremented, which is what makes the
-// write idempotent across replays of the same graph - a captured literal would ring the same number
-// forever and the host would never see a change.
-basalt::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
+}
+return true;}
 // The verify window's routing: n tokens' logits in one BF16 projection and their top-k in one launch, each token
 // bitwise what `moe_route` gives it (the projection is the same kernel per column, the top-k kernel is per token).
 // Anything else (a native router, the canonical BF16 GEMVs, a doorbell) takes the per-token `moe_route`.
 bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                       const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err) {
     using namespace basalt::kernels;
-    const bool batched = native_bf16_projections && !(native_router_enabled() && g.n_expert == 512 && k == 10);
+    const bool batched = !(g.n_expert == 512 && k == 10);
     if (!batched || n == 1) {
         for (int t = 0; t < n; ++t) {
             MoEBuffers mb = b;
@@ -379,8 +334,7 @@ if (w_ginp->kind != WeightKind::Bf16InF32) {        err = v.name("ffn_gate_inp_s
 // the rest, `ffn_up_shexp` Q2_0 on 13, and `ffn_down_shexp` is LEGACY in every layer (IQ4_NL/Q4_0/Q5_0/
 // Q8_0/Q2_0, `n_in` 640 so Q8_K is impossible).  So BOTH quantized images of the activation are produced
 // and each projection takes the one its own form asks for.
-f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
-    if (!w_sgate->native_data || !w_sup->native_data) {
+if (!w_sgate->native_data || !w_sup->native_data) {
         quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
         quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
     }
@@ -412,8 +366,7 @@ bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const M
 // reason this is a separate function: a caller that passes the previous layer's expert vectors gets
 // `sum_j w_l[j] * expert_{ids_{l-1},j}(x_{l-1})`, which is finite, fluent and not the model.
 try {
-    if (native_moe_combine_enabled()) native_moe_combine(parts, b.weights, b.shared, out, g.n_embd, k, stream);
-    else moe_combine(parts, b.weights, b.shared, out, g.n_embd, k, stream);
+    native_moe_combine(parts, b.weights, b.shared, out, g.n_embd, k, stream);
 } catch (const std::exception& error) {
     err = "blk." + std::to_string(layer) + ".moe_combine" + ": " + error.what();
     return false;
@@ -427,19 +380,12 @@ bool moe_finish(const WeightTable& tables, const ModelGeometry& g, int64_t layer
 }
 bool layer_verify_compatible(std::string& why) {
     // the verify window reproduces exactly this configuration's per-token arithmetic.
-    if (!native_bf16_projections) why = "the native BF16 projections are off";
-    else if (!g_fused_gr) why = "the fused hyper-connection read is off";
-    else if (!g_fused_gdn || !basalt::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
-    else if (!g_fast_attn || native_flash_attn_short) why = "the split-K decode attention is off";
-    else if (!g_fast_select) why = "the block top-k selection is off";
-    else if (!basalt::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
-    else return true;
-    return false;
+    if (!g_fused_gr) {
+        why = "the fused hyper-connection read is off";
+        return false;
+    }
+    return true;
 }
-void layer_set_publish_kernel(bool enabled) { g_publish_kernel = enabled; }
-void layer_set_fused_gdn(bool enabled) { g_fused_gdn = enabled; }
-void layer_set_fast_select(bool enabled) { g_fast_select = enabled; }
-void layer_set_fast_attn(bool enabled) { g_fast_attn = enabled; }
 void layer_set_fused_gr(bool enabled) { g_fused_gr = enabled; }
 bool layer_fused_gr() { return g_fused_gr; }
 void layer_set_shared_early(bool enabled) { g_shared_early = enabled; }
@@ -527,7 +473,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     if (!elastic) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;               // pooled
     n += 16;                                                                   // block_pos
     if (with_rope && !elastic) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;   // cos + sin tables
-    n += basalt::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
+    n += basalt::kernels::qsa_step_bytes();                                    // counts
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
 }
@@ -662,16 +608,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
     }
     st.step = c.take<int32_t>((uint64_t) basalt::kernels::kStepCount);
-    st.attention_status = c.take<int32_t>(1);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
-    if (cudaHostAlloc((void**) &st.host_step, basalt::kernels::qsa_step_bytes() + sizeof(int32_t),
+    if (cudaHostAlloc((void**) &st.host_step, basalt::kernels::qsa_step_bytes(),
                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
             cudaSuccess) {
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
-    st.host_step[basalt::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
     st.host = basalt::kernels::KvHostPools{};
     if (p.mode != 0) {
@@ -903,10 +847,8 @@ static void dump_slot(float* dump, const ModelGeometry& g, int64_t layer, const 
 bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace basalt::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t n_bid = n_kv / s.idx_block;    const int64_t width = qsa_selection_width(n_kv, s);    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
 const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, int cols) {
     try {
-        if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
-        else rms_norm_weighted(data, (const float*) norm->data, rows, cols, RMS_EPS, stream);
-        if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), st.pos_dev, stream);
-        else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, st.pos_dev, stream);
+        native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
+        native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), st.pos_dev, stream);
         return true;
     } catch (const std::exception& error) {
         err = v.name("qsa_norm_rope") + ": " + error.what();
@@ -924,7 +866,6 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
         quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
         quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
     }
-    if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 // ---- 2. the step state: ONE H2D carries every per-token count the kernels need.  Nothing below passes a
 // per-token scalar as an argument, which is what keeps this layer capturable.
 //
@@ -935,14 +876,14 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
 {        qsa_step_fill(st.host_step, pos, s);        for (int64_t h = 0; h < g.n_head; ++h) st.host_pos[h] = (int32_t) (pos_base + pos);
         int32_t* m_step = nullptr;
         int32_t* m_pos = nullptr;
-        if (g_publish_kernel && cudaHostGetDevicePointer((void**) &m_step, st.host_step, 0) == cudaSuccess &&
+        if (cudaHostGetDevicePointer((void**) &m_step, st.host_step, 0) == cudaSuccess &&
             cudaHostGetDevicePointer((void**) &m_pos, st.host_pos, 0) == cudaSuccess) {
             basalt::kernels::copy_i32_from_mapped(st.step, m_step, basalt::kernels::kStepCount, stream);
             basalt::kernels::copy_i32_from_mapped(st.pos_dev, m_pos, g.n_head, stream);
         } else
         if (cudaMemcpyAsync(st.step, st.host_step, qsa_step_bytes(), cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(st.pos_dev, st.host_pos, (size_t) g.n_head * 4, cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
 // ---- 3. the indexer's RAW key: appended before any norm, pooled later once per block
-project_bf16(x, b.x_bf16, (const uint16_t*) w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, false, stream);
+project_bf16(x, (const uint16_t*) w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, stream);
 // ---- 4. K and V, in Q8_K, then norm and rotate K only
 SForm f_k, f_v, f_o, f_q;    if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"), err)) return false;    if (!sform_of(*w_attnv, f_v, v.name("attn_v.weight"), err)) return false;    if (!sform_of(*w_attno, f_o, v.name("attn_output.weight"), err)) return false;    if (!sform_of(*w_attnq, f_q, v.name("attn_q.weight"), err)) return false;    Planes p_k, p_v, p_o, p_q;    if (!plane_ptrs(*w_attnk, v.name("attn_k.weight"), p_k, err)) return false;    if (!plane_ptrs(*w_attnv, v.name("attn_v.weight"), p_v, err)) return false;    if (!plane_ptrs(*w_attno, v.name("attn_output.weight"), p_o, err)) return false;    if (!plane_ptrs(*w_attnq, v.name("attn_q.weight"), p_q, err)) return false;
 // k and v, with the activation THIS layer's tensors ask for.  Both are K-quants in every QSA layer of this
@@ -967,13 +908,11 @@ if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0
 }
 if (st.kv_q4) {
     basalt::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
-} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
-    try {
-        native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
-            (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, rope_scaling(), stream);
-    } catch (const std::exception& error) { err = v.name("native_indexer") + ": " + error.what(); return false; }
-} else indexer_key_append(b.idx_raw, st.pos_dev, pos_base, (const float*) w_ikn->data, RMS_EPS, ib, s,
-                          st.cos_tab, st.sin_tab, stream);    }
+} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        try {
+            native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
+                (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, rope_scaling(), stream);
+        } catch (const std::exception& error) { err = v.name("native_indexer") + ": " + error.what(); return false; }
+    }
 // ---- 6. the query projection, and the HALF-SPLIT into q and gate.
 //
 // **`attn_q` IS *NOT* ALWAYS Q2_0.**  It is Q2_0 on two of the twelve QSA layers, Q3_K on six and IQ4_XS on four, so the
@@ -985,23 +924,19 @@ if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g
 // case A) and needs no kernel.
 if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4,                          (size_t) g.head_dim * 4, (size_t) g.n_head, cudaMemcpyDeviceToDevice,                          (cudaStream_t) stream) != cudaSuccess) {        err = "qsa_layer: the q/gate split failed";        return false;    }    if (!normalize_rotate(b.qcur, w_qn, (int) g.n_head, (int) g.head_dim)) return false;
 // ---- 7. the indexer's query: BF16, then norm and rotate
-project_bf16(x, b.x_bf16, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream);
+project_bf16(x, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, stream);
 if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim)) return false;
 // ---- 8. score, select, gather, attend.  `max_blocks` and `cap` are CAPACITIES from the state, not this
 // token's counts: a grid or a shared-memory size that follows the sequence length is baked into a captured
 // graph, and the kernels guard for the surplus.    const
 int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
-    if (g_fast_select) {
-        // block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
-        qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
-        qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
-    } else {
-    qsa_index_step(st.idx_pooled, b.q_idx, nullptr, s, st.step, max_blocks, b.cell_scores, stream);    topk_512_step(b.cell_scores, s, cap, st.step, b.ids, stream);
-    }
+    // block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
+    qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
+    qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
     if (st.kv_rot) basalt::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
-    if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
+    if (dump == nullptr) {
         const basalt::kernels::QsaAttnPools pools = qsa_attn_pools(st);
         basalt::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
     } else {
@@ -1012,20 +947,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
                                            b.v_scratch, b.v_scratch, stream);
     }
     else if (st.kv_q4) basalt::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
-    else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);    if (native_flash_attn_short) {
-    if (st.max_cells < 1 || st.max_cells > 256 || !st.attention_status || !st.host_step) {
-        err = v.name("native_flash_attn") + ": short adapter requires context <=256 and persistent status storage";
-        return false;
-    }
-    try {
-        native_flash_attn_short_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap,
-            (int) st.max_cells, s, b.attn, st.attention_status, nullptr, stream);
-    } catch (const std::exception& error) { err = v.name("native_flash_attn") + ": " + error.what(); return false; }
-    if (cudaMemcpyAsync(st.host_step + kStepCount, st.attention_status, sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess) {
-        err = v.name("native_flash_attn") + ": status readback failed"; return false;
-    }
-} else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
+    else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);    qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
     if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
@@ -1033,8 +955,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
 // sigmoid/multiply arithmetic and uses Q8_1 for the native quantized projection.
 // The canonical fallback retains its prior FP64 gate and Q8_K projection.
 try {
-    if (native_qsa_enabled()) native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
-    else qsa_gate_apply_f32(b.attn, b.q_full, s, b.attn32, stream);
+    native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
 } catch (const std::exception& error) { err = v.name("qsa_gate") + ": " + error.what(); return false; }
     if (!w_attno->native_data) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);    if (w_attno->native_data) {
     if (!gemv_quantized(*w_attno, p_o, f_o, nullptr, b.attn_q8k, out,

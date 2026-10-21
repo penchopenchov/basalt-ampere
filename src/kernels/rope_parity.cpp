@@ -344,7 +344,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- 5. THE TWO PATHS MUST AGREE.  The table path (the default) computes cos/sin on the host in float64;
-    // the native path (`--native-rope`) computes the same angles on device in float32 under `--use_fast_math`.
+    // the on-device path computes the same angles on device in float32 under `--use_fast_math`.
     // They answer to ONE config - `RopeScaling` - and a disagreement between them would put differently-rotated
     // K into the cache depending on which path ran.  The tolerance is NOT the 1e-6 of checks 2/4g: the device
     // side takes fast-math trig at angles up to ~2048 rad, where the fp32 range reduction alone is worth ~1e-4,

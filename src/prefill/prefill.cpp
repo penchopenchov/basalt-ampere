@@ -1354,8 +1354,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
     const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
-    // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token)
-    const bool ple_batch = ple_on && basalt::kernels::ple_native_postops_enabled() &&
+    // the PLE block batched over the chunk: a BF16 or GGUF-native key (else token by token)
+    const bool ple_batch = ple_on &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * basalt::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};

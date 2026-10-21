@@ -11,10 +11,9 @@
 // re-rounding to 16 bits costs nothing.  It is also worth a large share of the dense weights, which is the
 // difference between them fitting in VRAM beside the expert cache and not fitting at all.
 //
-// The default activation contract is the historical BF16-rounded reference.  The opt-in FP32 contract
-// matches the pinned llama.cpp CUDA single-token BF16 MMVF input precision: BF16 weights multiply FP32
-// activations.  The CPU oracle and some batched CUDA paths instead round activations to BF16.  Therefore
-// activation precision must be pinned with the oracle backend and batch geometry, not inferred from weights.
+// The projections are the BF16 MMVF: BF16 weights multiply FP32 activations, as the single-token BF16 MMVF of the
+// reference CUDA backend does.  The CPU oracle and some batched CUDA paths instead round activations to BF16.
+// Activation precision is therefore fixed by the oracle backend and batch geometry, not inferred from weights.
 #pragma once
 
 #include <cstdint>
@@ -22,20 +21,8 @@
 
 namespace basalt::kernels {
 
-/// Select the activation precision for subsequent gr_read launches (default: false/BF16).
-/// Configure before creating/capturing a session, and do not mutate concurrently with gr_read.
-/// A captured graph retains the kernel variants chosen at capture; changing this flag cannot alter it.
-/// This changes activation precision only; the existing FP32 reduction trees remain unchanged.
-void gr_set_fp32_activations(bool enabled);
-
-/// Select pinned single-token BF16/F32 MMVF projections for subsequent gr_read launches (default false).
-/// This implies FP32 activations regardless of gr_set_fp32_activations. Configure before session capture;
-/// a captured graph retains its selected kernels. Requires even hc*n_embd and hc_lr, as MMVF reads pairs.
-/// This also selects pinned weighted F32 RMSNorm and nonlinear/combine arithmetic.
-/// Layer reads use fused HC pre; the final mixer (null w_inject) retains its unfused graph order.
-/// Subsequent gr_write calls select pinned sigmoid/scatter arithmetic under the same setting.
-void gr_set_native_mmvf(bool enabled);
-bool gr_native_mmvf_enabled();
+/// The projections are the FP32-activation MMVF; this reports that, for callers that gate on it.
+inline bool gr_native_mmvf_enabled() { return true; }
 
 /// Geometry of the hyper-connection.  The real model: n_embd = 2560, hc = 4, hc_lr = 320.
 struct GrShapes {
@@ -52,17 +39,13 @@ struct GrShapes {
 /// reported fault address is the low 32 bits of a host pointer, which reads as a wild pointer rather than as
 /// the mistake it is.  That cost one round in `gr_parity`;
 ///
-///   xn    hc*n_embd floats   the unrounded activated streams (the gated mean needs the unrounded value)
-///   xq    hc*n_embd uint16   bf16(xn), used by the default activation contract
-///   lq    hc_lr     uint16   bf16(lo), used by the default activation contract
+///   xn    hc*n_embd floats   the activated streams
 ///   gated hc*n_embd floats   xn * sigmoid(gate), before the mean over streams
-///   lo    hc_lr     floats   SiLU bottleneck, used by the FP32 activation contract
+///   lo    hc_lr     floats   SiLU bottleneck
 ///
 /// `cudaMalloc(gr_workspace_bytes(s))`, then `gr_workspace_init(s, ptr, ws)` to carve it.
 struct GrWorkspace {
     float* xn = nullptr;
-    uint16_t* xq = nullptr;
-    uint16_t* lq = nullptr;
     float* gated = nullptr;
     float* lo = nullptr;
     /// Set by `gr_workspace_init`.  `gr_read` CHECKS it, so an under-sized buffer is a loud failure at the
@@ -82,21 +65,14 @@ inline size_t gr_workspace_bytes(const GrShapes& s) { GrWorkspace w; return gr_w
 ///   w_up     (hc*n_embd, hc_lr)   MANIFEST LAYOUT - row i is contiguous, `w_up[i*hc_lr + k]`
 ///   w_inject (hc, hc*n_embd)      null for the FINAL mixer, which has no write-back to gate
 ///
-///   mixed    (n_embd)   = mean over streams of  xn * sigmoid(bf16(lo) @ w_up.T)
-///   inject   (hc)       = bf16(xn) @ w_inject.T, or untouched when w_inject is null
+///   mixed    (n_embd)   = mean over streams of  xn * sigmoid(lo @ w_up.T)
+///   inject   (hc)       = xn @ w_inject.T, or untouched when w_inject is null
 ///
-/// `lo = silu((bf16(xn) @ w_down.T) / hc)` - the division by hc is INSIDE the silu, which is easy to read
-/// past and changes the result materially.
-/// With gr_set_fp32_activations(true), replace bf16(xn) and bf16(lo) by xn and lo respectively.
+/// `lo = silu((xn @ w_down.T) / hc)` - the division by hc is INSIDE the silu, which is easy to read
+/// past and changes the result materially.  The activations stay FP32: xn and lo feed the projections unrounded.
 ///
 /// **NO PERMUTATION: both matrices are taken exactly as the manifest stores them**, so the loader does nothing
-/// to them.  Both are coalesced because each projection assigns ONE WARP PER OUTPUT ROW and strides the
-/// reduction axis across its 32 lanes: for a fixed output, consecutive lanes touch consecutive addresses in
-/// either orientation.  One THREAD per row would be coalesced with itself but 32 transactions away from its
-/// warp neighbours, and a single block would leave most SMs idle (the work is issue-bound).
-///
-/// The work is split the way the shapes want: `hc` blocks for the per-stream norm, one warp per row for each
-/// of the two projections, and one block-tile for the mean.  No transposes are needed.
+/// to them.
 void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
              const uint16_t* w_inject, float eps, const GrShapes& s, const GrWorkspace& ws, float* mixed,
              float* inject, void* stream);

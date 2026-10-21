@@ -23,7 +23,6 @@
 #include "basalt/kernels/native_router.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include <cuda_runtime.h>
-#include <atomic>
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
@@ -31,7 +30,6 @@
 
 namespace basalt::kernels {
 namespace {
-std::atomic<bool> enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int mask = 16; mask; mask >>= 1) value += __shfl_xor_sync(0xffffffffu, value, mask, 32);
@@ -107,8 +105,6 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
     return ap < bp + bn && bp < ap + an;
 }
 }
-void native_router_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_router_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
     if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)

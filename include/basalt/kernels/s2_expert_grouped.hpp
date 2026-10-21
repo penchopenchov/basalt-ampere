@@ -121,9 +121,5 @@ void moe_grouped_select_old(int old);
 /// Which kernels the last call of the entry points above launched: 1 = new, 0 = previous, -1 = none since the
 /// previous query (the query clears it).  For the parity test, which must know the path it compared was taken.
 int moe_grouped_last_path();
-void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_index,
-                                 const int32_t* dst_index, int64_t n_hits, int64_t blob_bytes,
-                                 const uint8_t* x_q8_0, void* scratch, float* out, void* stream,
-                                 const float* x_scales, float* gate_up_trace = nullptr);
 
 }  // namespace basalt::kernels

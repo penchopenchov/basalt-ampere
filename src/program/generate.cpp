@@ -2236,26 +2236,10 @@ int main(int argc, char** argv) {
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
     }
 
-    basalt::kernels::gr_set_fp32_activations(false);
-    basalt::kernels::gr_set_native_mmvf(true);
-    // The fused hyper-connection read rides the native (FP32-activation) contract; the per-stage and dump
-    // measurements need the unfused layout of R, so they keep the old kernels.
-    basalt::core::layer_set_fast_attn(true);
-    basalt::core::layer_set_publish_kernel(true);
-    basalt::core::layer_set_fused_gdn(true);
-    basalt::core::layer_set_fast_select(true);
+    // The fused hyper-connection read needs the layout where R lags by one pending write; the per-stage and dump
+    // measurements need the unfused layout of R.
     basalt::core::layer_set_fused_gr(!o.gpu_stages && o.dump_layers.empty() && o.dump_halves.empty() &&
                                      !o.stage_timing);
-    basalt::core::layer_set_native_bf16(true);
-    basalt::core::layer_set_native_flash_attn_short(false);
-    basalt::kernels::ple_set_native_bf16(true);
-    basalt::kernels::shared_expert_set_native_bf16(true);
-    basalt::kernels::native_moe_combine_set_enabled(true);
-    basalt::kernels::native_gdn_set_enabled(true);
-    basalt::kernels::native_router_set_enabled(true);
-    basalt::kernels::native_qsa_set_enabled(true);
-    basalt::kernels::native_qsa_indexer_set_enabled(true);
-    basalt::kernels::native_rope_set_enabled(true);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (basalt/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
@@ -2273,7 +2257,6 @@ int main(int argc, char** argv) {
         }
         basalt::kernels::mrope_table_set(d_mrope);
     }
-    basalt::kernels::ple_set_native_postops(true);
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
     if (!o.cvec_files.empty()) {
@@ -3724,8 +3707,6 @@ int main(int argc, char** argv) {
     Drive drive;
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
-    drive.d.hit_cpu_order = false;
-    drive.d.split_rows = true;
     drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
@@ -3774,7 +3755,6 @@ int main(int argc, char** argv) {
             return 1;
         }
         drive.d.hit_done = (void*) hit_done;
-        drive.d.hit_poke = true;
         drive.d.h_dst.resize((size_t) K);
         std::fprintf(stderr, "basalt generate: R4 hit path ON - resident experts are computed on the GPU\n");
     }
@@ -3905,18 +3885,17 @@ int main(int argc, char** argv) {
     // At `pos == 0` that is `session_zero`, which is the reference's own initial condition - the embedding
     // broadcast to all `hc` streams.  After that `session_zero` would also wipe the recurrence, so the
     // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
-    void* token_stream = main_cs;
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
-        if (!basalt::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
+        if (!basalt::core::embed_row(wt, g, tok, d_emb, main_cs, err)) {
             std::fprintf(stderr, "basalt generate: %s\n", err.c_str());
             return false;
         }
         if (pos == 0) {
-            basalt::core::session_zero(ss, g, d_emb, token_stream);
+            basalt::core::session_zero(ss, g, d_emb, main_cs);
         } else {
             for (int64_t c = 0; c < g.hc; ++c)
                 if (cudaMemcpyAsync(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
-                                    cudaMemcpyDeviceToDevice, (cudaStream_t) token_stream) != cudaSuccess) {
+                                    cudaMemcpyDeviceToDevice, (cudaStream_t) main_cs) != cudaSuccess) {
                     std::fprintf(stderr, "basalt generate: the residual broadcast failed\n");
                     return false;
                 }
