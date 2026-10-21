@@ -26,7 +26,7 @@ int main() {
         const std::vector<std::string> block = {
             "PROBE begin rates v1",
             "PROBE gpu dev=0 name=\"NVIDIA GeForce RTX 5090\" sm=170",
-            "PROBE host pool_workers=15 active_workers=15 host_works=1",
+            "PROBE host pool_workers=15 active_workers=15",
             "PROBE cpu_expert workers=8 entries=8 median_us=400.0 per_entry_us=50.0 gbps=55.0",
             "PROBE cpu_expert workers=15 entries=1 median_us=53.5 per_entry_us=53.5 gbps=51.6",
             "PROBE end ms=500"};

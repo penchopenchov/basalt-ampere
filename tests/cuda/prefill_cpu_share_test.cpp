@@ -395,7 +395,7 @@ int main(int argc, char** argv) {
                               {GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0, "IQ4_XS / Q2_0"}};
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
-        basalt::kernels::cpu::ExpertPool pool(0, true, basalt::kernels::cpu::PoolAffinity::All);
+        basalt::kernels::cpu::ExpertPool pool(0, basalt::kernels::cpu::PoolAffinity::All);
         for (const Pair& p : pairs)
             for (bool outliers : {false, true}) run_pair(p, outliers, pool, s);
         ck(cudaStreamDestroy(s), "destroy");

@@ -1824,7 +1824,6 @@ int main(int argc, char** argv) {
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI), so on a CPU without those features it
     // does not fail - it executes an illegal instruction at some unpredictable token.  Refusing at second zero is the
     // whole point of this check.
-    basalt::kernels::cpu::expert_set_oracle_q8_0(false);
     // ... and nothing runs on a CPU without AVX2: every CPU expert kernel is AVX2 at least (the AVX-512 ones are
     // chosen above it), and so is ggml-cpu, which the native pack's layout load initializes next.  Refused here, by name, rather than an illegal instruction in the first expert.
     if (!basalt::kernels::cpu::cpu_avx2_ok()) {
@@ -3104,7 +3103,7 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    basalt::kernels::cpu::ExpertPool pool(o.pool_workers, /*host_works=*/true, o.pool_affinity);
+    basalt::kernels::cpu::ExpertPool pool(o.pool_workers, o.pool_affinity);
     if (pool.is_hybrid() && pool.affinity() != basalt::kernels::cpu::PoolAffinity::All) {
         const char* aff_str = pool.affinity() == basalt::kernels::cpu::PoolAffinity::PCores ? "p-cores" :
                               pool.affinity() == basalt::kernels::cpu::PoolAffinity::All ? "all" : "auto";
@@ -3810,8 +3809,7 @@ int main(int argc, char** argv) {
     void* pool_user = o.no_pool ? nullptr : (void*) &drive;
     char quota_note[64] = "";
     if (pool.quota_limit() > 0) std::snprintf(quota_note, sizeof quota_note, " (quota %.2f CPUs)", pool.quota_limit());
-    std::fprintf(stderr, "basalt generate: %d expert-pool workers%s%s%s\n", pool.workers(), quota_note,
-                 pool.host_works() ? " + the host thread" : "",
+    std::fprintf(stderr, "basalt generate: %d expert-pool workers%s + the host thread%s\n", pool.workers(), quota_note,
                  o.no_pool ? " (UNUSED: --no-pool)" : "");
 
     // THE LOOP RUNS A CAPTURED PAIR PER LAYER: `pre[l]` ends with the router and the doorbell, then the CPU pool runs,

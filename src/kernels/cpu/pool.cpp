@@ -57,8 +57,8 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool host_works, PoolAffinity affinity)
-    : host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
+    : affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (n_workers > 0) {
         n_ = n_workers;
     } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
@@ -365,7 +365,7 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
-    if (host_works_) drain(-1, host_scratch_, e);
+    drain(-1, host_scratch_, e);
     wait_done(n_tasks);
     wait_parked("after a phase");
     hstate_.store(kIdle, std::memory_order_relaxed);
@@ -374,10 +374,10 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
     if (n <= 0) return;
-    if (n > kMaxSplit || n_ == 1 || expert_oracle_q8_0_enabled()) { run(jobs, n); return; }
+    if (n > kMaxSplit || n_ == 1) { run(jobs, n); return; }
     const auto t0 = std::chrono::steady_clock::now();
     jobs_ = jobs;
-    const int threads = active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0);
+    const int threads = active_.load(std::memory_order_relaxed) + 1;
     // about three tasks per thread in each phase, so the tail is short
     parts_a_ = (std::max)(1, (3 * threads + n - 1) / n);
     parts_b_ = parts_a_;
@@ -390,8 +390,8 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
 
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
-    if (n > kMaxSplitMulti || expert_oracle_q8_0_enabled()) {
-        // one token at a time through the single-token path (the oracle contract has no multi kernel)
+    if (n > kMaxSplitMulti) {
+        // one token at a time through the single-token path
         std::vector<ExpertJob> single;
         for (int e = 0; e < n; ++e)
             for (int t = 0; t < jobs[e].nt; ++t) {
@@ -407,7 +407,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
-    const int threads = active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0);
+    const int threads = active_.load(std::memory_order_relaxed) + 1;
     mtasks_ = 3 * threads;
     mrows_ = (int64_t) n * FF;
     run_phase(3, mtasks_);
@@ -435,7 +435,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
-        const int threads = active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0);
+        const int threads = active_.load(std::memory_order_relaxed) + 1;
         mtasks_ = 3 * threads;
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();
@@ -490,16 +490,14 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     //
     // The host's `done_.fetch_add` is a release for the same reason a worker's is: `j.out` is read by the device
     // after `run()` returns, so the write must be published, not merely performed.
-    if (host_works_) {
-        for (;;) {
-            const int ci = claim(e);
-            if (ci < 0) break;
-            hstate_.store(ci, std::memory_order_relaxed);
-            hstate_ms_.store(now_ms(), std::memory_order_relaxed);
-            const ExpertJob& j = jobs_[ci];
-            s2_expert_vnni_q(j.blob, *j.act, j.out, host_scratch_);
-            done_.fetch_add(1, std::memory_order_release);
-        }
+    for (;;) {
+        const int ci = claim(e);
+        if (ci < 0) break;
+        hstate_.store(ci, std::memory_order_relaxed);
+        hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+        const ExpertJob& j = jobs_[ci];
+        s2_expert_vnni_q(j.blob, *j.act, j.out, host_scratch_);
+        done_.fetch_add(1, std::memory_order_release);
     }
 
     wait_done(n);

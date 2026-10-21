@@ -42,9 +42,7 @@ inline constexpr size_t O_GU_SCALES = O_D_CODES + 1ull * H * ROW_D;
 inline constexpr size_t O_D_SCALES = O_GU_SCALES + 2ull * FF * SC_GU * 2;
 
 /// One activation in the engine's planar storage: `QKA` elements per chunk.
-/// The default legacy quantizer uses FP32 scales and half-away rounding. It is
-/// not the pinned ggml CPU Q8_0 contract; expert_set_oracle_q8_0 selects that
-/// experimental contract (FP16-rounded scales and x86 nearest-even codes).
+/// The quantizer uses FP32 scales and half-away rounding; it is not the ggml CPU Q8_0 contract.
 ///
 /// The historical function name `act_quant_q8_1` does not describe a native
 /// ggml block layout. One 64-weight block always spans two 32-element chunks.
@@ -87,14 +85,6 @@ CpuFeatures cpu_features();
 /// older CPU learns why at second zero instead of seeing an illegal instruction at token 4000.
 void cpu_require_expert_support();
 
-/// Select the pinned x86 Q8_0 activation contract at BOTH expert quantization
-/// boundaries and the pinned generic CPU Q2_0 dot reduction in all projections.
-/// Default false preserves the legacy quantizer and eight-lane FP32 reduction.
-/// Configure before starting worker threads and do not change during a request.
-/// GPU expert-cache parity is not established for this mode; the driver must
-/// reject combining it with that cache. No allocation occurs in either mode.
-void expert_set_oracle_q8_0(bool enabled);
-
 /// `x` -> `a` in the configured contract. The function name is historical;
 /// `n` must be a multiple of QKA and at most H. No allocation occurs.
 void act_quant_q8_1(const float* x, int n, ActQ& a);
@@ -117,14 +107,12 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
 /// Plan v0.3 P6: ONE expert applied to up to MAXT tokens that were all routed to it (a speculative verify
 /// window routes ~1.5 tokens to each distinct expert). The 1.38 MB blob is read and its 2-bit codes unpacked
 /// ONCE per block for all tokens; only the VNNI dot and the accumulation run per token. Every token's output
-/// is bitwise equal to `s2_expert_vnni_q` on that token (same operation order per token). Legacy activation
-/// contract only; with `expert_set_oracle_q8_0(true)` it falls back to one `s2_expert_vnni_q` per token.
+/// is bitwise equal to `s2_expert_vnni_q` on that token (same operation order per token). A batch above `MAXT` runs one `s2_expert_vnni_q` per token.
 inline constexpr int MAXT = 8;
 /// Plan v0.3 P4: the expert in row ranges, so several threads can share one expert.  `s2_expert_gu_rows` writes
 /// ff[r] = silu(gate_r . x) * (up_r . x) for r in [r0, r1) (of FF); `s2_expert_down_rows` writes out[r] for r in
 /// [r0, r1) (of H) from the intermediate's quantized image.  Together with `act_quant_q8_1(ff, FF, a2)` in
 /// between they are exactly `s2_expert_vnni_q`, row for row (same `row_dot`), so the result is bitwise the same.
-bool expert_oracle_q8_0_enabled();
 void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1);
 void s2_expert_down_rows(const uint8_t* blob, const ActQ& a2, float* out, int r0, int r1);
 
@@ -138,7 +126,7 @@ void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n
 struct ExpertScratchMulti {
     ActQ a2[MAXT];
     alignas(64) float ff[MAXT][FF];
-    ExpertScratch single;                 // the oracle-contract fallback
+    ExpertScratch single;                 // the per-token fallback
 };
 void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
                           ExpertScratchMulti& ws);

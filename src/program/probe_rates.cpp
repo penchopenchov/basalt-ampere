@@ -211,11 +211,11 @@ void step_facts(Probe& P) {
                2.0 * (double) mclk * 1e3 * (bus / 8.0) / 1e9, n.gen, n.width, n.max_gen, n.max_width, n.power_w, n.sm_mhz);
     }
     const C::ExpertPool& pool = *P.env.pool;
-    P.line("host", "ram_total_mib=%llu ram_avail_mib=%llu threads=%u pool_workers=%d active_workers=%d host_works=%d "
+    P.line("host", "ram_total_mib=%llu ram_avail_mib=%llu threads=%u pool_workers=%d active_workers=%d "
                    "p_cores=%d e_cores=%d hybrid=%d quota_cpus=%.1f",
            (unsigned long long) (platform::total_physical_memory() >> 20),
            (unsigned long long) (platform::available_memory() >> 20), std::thread::hardware_concurrency(),
-           pool.workers(), pool.active_workers(), pool.host_works() ? 1 : 0, pool.p_cores(), pool.e_cores(),
+           pool.workers(), pool.active_workers(), pool.p_cores(), pool.e_cores(),
            pool.is_hybrid() ? 1 : 0, pool.quota_limit());
     if (P.have_layout)
         P.line("pack", "layers=%lld experts=%lld gu_type=%d down_type=%d blob_bytes=%zu top_k=%d ram_blobs=%zu",
