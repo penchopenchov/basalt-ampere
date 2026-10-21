@@ -60,6 +60,27 @@ A config file is one JSON object with two optional blocks:
 
 In the tables, "default" is what applies when the setting is absent everywhere.
 
+## Automatic settings
+
+Four settings are picked by the engine at start when they are left out: `peer-exclusive`, `resident`
+(`resident-budget-gib`), `pool-affinity` and `pool-workers`. A value in the config file or on the command line always
+wins and is never changed.
+
+| setting | rule |
+| --- | --- |
+| `peer-exclusive` | on only with a peer card and `--serve`, when the full expert set does not fit in free RAM but the set without the peer card's share does; otherwise off. |
+| `resident` | the free RAM above the safety floor, capped at the experts the GPUs do not hold. |
+| `pool-affinity` | `auto`. |
+| `pool-workers` | the physical cores minus the host thread; on a hybrid CPU with `auto` or `p-cores`, the P-cores minus one; fitted to a container CPU quota. |
+
+The engine prints one line naming only the picked settings, in the order above, and the server relays it once per start:
+
+```
+[server] auto flags: peer-exclusive off, resident 51.2 GB, pool-affinity all, pool-workers 15
+```
+
+When every setting is given, no line is printed.
+
 ## Server
 
 Server options. Command line `--name`, config `server` block `"name"`.
@@ -120,7 +141,7 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | --- | --- | --- | --- | --- |
 | `vram-reserve-mib` | engine | integer MiB, at least 256 | 700 (lowered automatically, down to 300, on a card that would otherwise get too few slots; a value you give is kept) | VRAM left free on the main card for graphs, scratch and the head when `expert-cache auto` sizes the cache. Below 256 is refused. Raise it if the machine pages GPU memory or other programs need VRAM. |
 | `resident-experts` | engine | switch | on when the pack has an expert profile and the experts are not split over several cards | Keep the experts the GPU does not hold in page-locked RAM, so none is read from the file again. Leaves a RAM floor free for the OS; when the RAM cannot hold them it falls back to a plain file mapping. `mmap-experts` turns it off. |
-| `resident-budget-gib` | engine | number GiB | off | Like `resident-experts` but with at most N GiB of experts in RAM, hottest first. Refused when it would leave less than the RAM floor free; the error names the largest safe value. |
+| `resident-budget-gib` | engine | number GiB | auto when not set | Like `resident-experts` but with at most N GiB of experts in RAM, hottest first. Refused when it would leave less than the RAM floor free; the error names the largest safe value. |
 | `mmap-experts` | engine | switch | off | Opt out of the default resident RAM copy and back to a file mapping. Speed then depends on the OS page cache. |
 | `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`. |
 | `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. `tools/convert/convert.py --profile` reads it. |
