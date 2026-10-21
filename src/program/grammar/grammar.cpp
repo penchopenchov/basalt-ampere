@@ -7,6 +7,7 @@
 #include <atomic>
 #include <deque>
 #include <map>
+#include <regex>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -22,30 +23,74 @@ bool end_of_seq(const Element& e) { return e.type == ElemType::End || e.type == 
 
 using Rule = std::vector<Element>;
 
-}  // namespace
-
 // --------------------------------------------------------------------------------------------- parser
+
+// A rule that can reach itself as its leftmost symbol would never leave the closure.
+bool left_recursive(const std::vector<Rule>& rules, size_t idx, std::vector<bool>& visited,
+                    std::vector<bool>& in_progress, std::vector<bool>& may_be_empty) {
+    if (in_progress[idx]) return true;
+    in_progress[idx] = true;
+    const Rule& rule = rules[idx];
+    bool at_start = true;
+    for (const Element& e : rule) {
+        if (end_of_seq(e)) {
+            if (at_start) {
+                may_be_empty[idx] = true;
+                break;
+            }
+            at_start = true;
+        } else {
+            at_start = false;
+        }
+    }
+    bool descend = true;
+    for (const Element& e : rule) {
+        if (e.type == ElemType::RuleRef && descend) {
+            if (left_recursive(rules, e.value, visited, in_progress, may_be_empty)) return true;
+            if (!may_be_empty[e.value]) descend = false;
+        } else if (end_of_seq(e)) {
+            descend = true;
+        } else {
+            descend = false;
+        }
+    }
+    in_progress[idx] = false;
+    visited[idx] = true;
+    return false;
+}
+
+// Throws if a rule refers to a rule that is not defined or if any rule is left-recursive.
+void check_rules(const std::vector<Rule>& rules, const std::function<std::string(uint32_t)>& name_of) {
+    for (const Rule& r : rules) {
+        if (r.empty() || r.back().type != ElemType::End) throw std::runtime_error("undefined rule");
+    }
+    for (const Rule& r : rules) {
+        for (const Element& e : r) {
+            if (e.type == ElemType::RuleRef && (e.value >= rules.size() || rules[e.value].empty()))
+                throw std::runtime_error("undefined rule identifier '" + name_of(e.value) + "'");
+        }
+    }
+    std::vector<bool> visited(rules.size()), in_progress(rules.size()), may_be_empty(rules.size());
+    for (size_t i = 0; i < rules.size(); ++i) {
+        if (!visited[i] && left_recursive(rules, i, visited, in_progress, may_be_empty))
+            throw std::runtime_error("left recursion in rule '" + name_of((uint32_t) i) + "'");
+    }
+}
+
+}  // namespace
 
 class GrammarParser {
 public:
     std::vector<Rule> rules;
     std::map<std::string, uint32_t> ids;
+    ParseOptions opt;
 
     void run(const std::string& text) {
         src_ = text.c_str();
         const char* pos = space(src_, true);
         while (*pos) pos = parse_rule(pos);
-        for (const Rule& r : rules) {
-            if (r.empty()) throw std::runtime_error("undefined rule");
-        }
-        for (const Rule& r : rules) {
-            for (const Element& e : r) {
-                if (e.type == ElemType::RuleRef && (e.value >= rules.size() || rules[e.value].empty()))
-                    throw std::runtime_error("undefined rule identifier '" + name_of(e.value) + "'");
-            }
-        }
-        if (!ids.count("root")) throw std::runtime_error("no root rule");
-        check_left_recursion();
+        if (!ids.count(opt.root)) throw std::runtime_error("no " + opt.root + " rule");
+        check_rules(rules, [this](uint32_t id) { return name_of(id); });
     }
 
 private:
@@ -141,6 +186,32 @@ private:
             v = (v << 6) | ((unsigned char) p[i] & 0x3F);
         }
         return {v, p + len};
+    }
+
+    // <[id]> or <name>; a name is looked up through the resolver.
+    std::pair<uint32_t, const char*> token(const char* src) {
+        const char* p = src;
+        if (*p != '<') throw fail("expecting '<'", p);
+        ++p;
+        if (*p == '[') {
+            ++p;
+            const char* ie = integer(p);
+            uint64_t id = to_u64(p, ie);
+            if (id > UINT32_MAX) throw fail("token id is too big", p);
+            p = ie;
+            if (*p != ']') throw fail("expecting ']'", p);
+            ++p;
+            if (*p != '>') throw fail("expecting '>'", p);
+            return {(uint32_t) id, p + 1};
+        }
+        if (!opt.token) throw fail("no vocabulary to look up the token", src);
+        while (*p && *p != '>') ++p;
+        if (*p != '>') throw fail("expecting '>'", p);
+        ++p;
+        uint32_t id = 0;
+        if (!opt.token(std::string_view(src, (size_t) (p - src)), id))
+            throw std::runtime_error("invalid token '" + std::string(src, (size_t) (p - src)) + "'");
+        return {id, p};
     }
 
     const char* parse_rule(const char* p) {
@@ -239,6 +310,17 @@ private:
                     }
                 }
                 pos = space(pos + 1, nested);
+            } else if (*pos == '<' || *pos == '!') {
+                ElemType type = ElemType::Token;
+                if (*pos == '!') {
+                    type = ElemType::TokenNot;
+                    ++pos;
+                }
+                auto t = token(pos);
+                last_start = rule.size();
+                n_prev = 1;
+                rule.push_back({type, t.first});
+                pos = space(t.second, nested);
             } else if (is_word(*pos)) {
                 const char* e = name(pos);
                 uint32_t ref = symbol(std::string(pos, e));
@@ -301,64 +383,46 @@ private:
         }
         return pos;
     }
-
-    // A rule that can reach itself as its leftmost symbol would never leave the closure.
-    bool left_recursive(size_t idx, std::vector<bool>& visited, std::vector<bool>& in_progress,
-                        std::vector<bool>& may_be_empty) {
-        if (in_progress[idx]) return true;
-        in_progress[idx] = true;
-        const Rule& rule = rules[idx];
-        bool at_start = true;
-        for (const Element& e : rule) {
-            if (end_of_seq(e)) {
-                if (at_start) {
-                    may_be_empty[idx] = true;
-                    break;
-                }
-                at_start = true;
-            } else {
-                at_start = false;
-            }
-        }
-        bool descend = true;
-        for (const Element& e : rule) {
-            if (e.type == ElemType::RuleRef && descend) {
-                if (left_recursive(e.value, visited, in_progress, may_be_empty)) return true;
-                if (!may_be_empty[e.value]) descend = false;
-            } else if (end_of_seq(e)) {
-                descend = true;
-            } else {
-                descend = false;
-            }
-        }
-        in_progress[idx] = false;
-        visited[idx] = true;
-        return false;
-    }
-    void check_left_recursion() {
-        std::vector<bool> visited(rules.size()), in_progress(rules.size()), may_be_empty(rules.size());
-        for (size_t i = 0; i < rules.size(); ++i) {
-            if (!visited[i] && left_recursive(i, visited, in_progress, may_be_empty))
-                throw std::runtime_error("left recursion in rule '" + name_of((uint32_t) i) + "'");
-        }
-    }
 };
 
+std::shared_ptr<const Grammar> Grammar::make(const std::vector<std::vector<Element>>& rules,
+                                             std::map<std::string, uint32_t> ids, uint32_t root) {
+    auto g = std::make_shared<Grammar>();
+    g->root_ = root;
+    g->symbols_ = std::move(ids);
+    for (const Rule& r : rules) {
+        g->rule_start_.push_back((uint32_t) g->elems_.size());
+        g->elems_.insert(g->elems_.end(), r.begin(), r.end());
+    }
+    return g;
+}
+
 std::shared_ptr<const Grammar> Grammar::parse(const std::string& gbnf, std::string& err) {
+    return parse(gbnf, err, ParseOptions{});
+}
+
+std::shared_ptr<const Grammar> Grammar::parse(const std::string& gbnf, std::string& err, const ParseOptions& opt) {
     GrammarParser p;
+    p.opt = opt;
     try {
         p.run(gbnf);
     } catch (const std::exception& e) {
         err = std::string("grammar: ") + e.what();
         return nullptr;
     }
-    auto g = std::make_shared<Grammar>();
-    g->root_ = p.ids.at("root");
-    for (const Rule& r : p.rules) {
-        g->rule_start_.push_back((uint32_t) g->elems_.size());
-        g->elems_.insert(g->elems_.end(), r.begin(), r.end());
+    return make(p.rules, p.ids, p.ids.at(opt.root));
+}
+
+std::shared_ptr<const Grammar> Grammar::from_rules(const std::vector<std::vector<Element>>& rules, uint32_t root,
+                                                   std::string& err) {
+    try {
+        if (root >= rules.size()) throw std::runtime_error("no root rule");
+        check_rules(rules, [](uint32_t id) { return std::to_string(id); });
+    } catch (const std::exception& e) {
+        err = std::string("grammar: ") + e.what();
+        return nullptr;
     }
-    return g;
+    return make(rules, {}, root);
 }
 
 // --------------------------------------------------------------------------------------------- stacks
@@ -394,6 +458,10 @@ struct GrammarState::Arena {
     }
 
     const Element& el(uint32_t i) const { return g->elements()[i]; }
+    bool is_token(uint32_t e) const { return el(e).type == ElemType::Token || el(e).type == ElemType::TokenNot; }
+    bool token_matches(uint32_t e, uint32_t id) const {
+        return el(e).type == ElemType::Token ? el(e).value == id : el(e).value != id;
+    }
 
     uint32_t push(uint32_t parent, uint32_t elem) {
         uint64_t key = ((uint64_t) elem << 32) | parent;
@@ -500,7 +568,7 @@ struct GrammarState::Arena {
         if (*slot >= 0) return sets[(size_t) *slot];
         std::vector<uint32_t> out;
         uint32_t next;
-        if (s != 0 && match(nodes[s].elem, cp, next)) {
+        if (s != 0 && !is_token(nodes[s].elem) && match(nodes[s].elem, cp, next)) {
             uint32_t ns = nodes[s].parent;
             if (!end_of_seq(el(next))) ns = push(ns, next);
             out = closure(ns);
@@ -515,7 +583,7 @@ struct GrammarState::Arena {
 
     bool partial_ok(const std::vector<uint32_t>& stacks, uint32_t value, int n_remain) const {
         for (uint32_t s : stacks) {
-            if (s != 0 && match_partial(nodes[s].elem, value, n_remain)) return true;
+            if (s != 0 && !is_token(nodes[s].elem) && match_partial(nodes[s].elem, value, n_remain)) return true;
         }
         return false;
     }
@@ -554,11 +622,53 @@ Vocab::Vocab(std::vector<std::string> bytes, std::vector<int32_t> end_ids)
 
 // --------------------------------------------------------------------------------------------- state
 
+struct GrammarState::PatternSet {
+    std::vector<std::regex> re;
+    std::vector<std::string> src;
+
+    // Where the grammar starts in `input` for pattern i: the first non-empty capture group, else the match itself.
+    size_t find(size_t i, const std::string& input) const {
+        auto start_of = [](const std::smatch& m) {
+            for (size_t g = 1; g < m.size(); ++g) {
+                if (m.length(g) > 0) return (size_t) m.position(g);
+            }
+            return (size_t) m.position(0);
+        };
+        const std::string& p = src[i];
+        std::smatch m;
+        if (!p.empty() && p.front() == '^' && p.back() == '$' && std::regex_match(input, m, re[i])) return start_of(m);
+        if (std::regex_search(input, m, re[i])) return start_of(m);
+        return std::string::npos;
+    }
+};
+
+bool Triggers::valid(std::string& err) const {
+    for (const std::string& p : patterns) {
+        try {
+            std::regex re(p);
+        } catch (const std::regex_error& e) {
+            err = "trigger pattern '" + p + "': " + e.what();
+            return false;
+        }
+    }
+    return true;
+}
+
 GrammarState::GrammarState(std::shared_ptr<const Grammar> g, Triggers triggers)
     : g_(std::move(g)), arena_(std::make_shared<Arena>(g_.get())), triggers_(std::move(triggers)) {
     size_t longest = 0;
     for (const std::string& w : triggers_.words) longest = (std::max)(longest, w.size());
     tail_keep_ = longest > 0 ? longest - 1 : 0;
+    if (!triggers_.patterns.empty()) {
+        std::string err;
+        if (!triggers_.valid(err)) throw std::invalid_argument(err);
+        auto set = std::make_shared<PatternSet>();
+        for (const std::string& p : triggers_.patterns) {
+            set->re.emplace_back(p);
+            set->src.push_back(p);
+        }
+        patterns_ = std::move(set);
+    }
     reset();
 }
 
@@ -566,6 +676,7 @@ void GrammarState::reset() {
     active_ = !triggers_.lazy();
     utf8_ = Utf8{};
     tail_.clear();
+    pieces_.clear();
     stacks_.clear();
     // enter the root rule: one stack per alternative
     Arena& a = *arena_;
@@ -629,50 +740,117 @@ bool GrammarState::feed(const std::string_view& bytes, std::vector<uint32_t>& st
     return true;
 }
 
+// Advances `stacks` over one token: a stack waiting for a token reference takes the token by id, the others read its
+// bytes. False if no stack survives.
+bool GrammarState::advance(std::vector<uint32_t>& stacks, Utf8& u, std::string_view bytes, int32_t token_id) const {
+    Arena& a = *arena_;
+    bool any_token = false;
+    for (uint32_t s : stacks) {
+        if (s != 0 && a.is_token(a.nodes[s].elem)) any_token = true;
+    }
+    if (!any_token) return feed(bytes, stacks, u);
+    std::vector<uint32_t> text, out;
+    for (uint32_t s : stacks) {
+        if (s == 0 || !a.is_token(a.nodes[s].elem)) {
+            text.push_back(s);
+        } else if (token_id >= 0 && a.token_matches(a.nodes[s].elem, (uint32_t) token_id)) {
+            uint32_t e = a.nodes[s].elem;
+            uint32_t ns = a.nodes[s].parent;
+            if (!end_of_seq(a.el(e + 1))) ns = a.push(ns, e + 1);
+            const std::vector<uint32_t>& c = a.closure(ns);
+            out.insert(out.end(), c.begin(), c.end());
+        }
+    }
+    Utf8 nu = u;
+    if (!text.empty() && feed(bytes, text, nu)) {
+        out.insert(out.end(), text.begin(), text.end());
+        u = nu;
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    if (out.empty()) return false;
+    stacks.swap(out);
+    return true;
+}
+
+// Starts the grammar from the root and feeds it the output from `from` on (the replay of the buffered tokens when
+// patterns are in use); on failure the state is unchanged.
+bool GrammarState::fire(size_t from, bool by_token, int32_t token_id, std::string_view bytes) {
+    GrammarState fresh = *this;
+    fresh.reset();
+    std::vector<uint32_t> st = fresh.stacks_;
+    Utf8 u;
+    if (by_token) {
+        if (!advance(st, u, bytes, token_id)) return false;
+    } else if (patterns_) {
+        for (const Piece& p : pieces_) {
+            if (p.end <= from) continue;
+            size_t b = (std::max)(p.begin, from);
+            if (!advance(st, u, std::string_view(tail_).substr(b, p.end - b), p.token)) return false;
+        }
+    } else if (!advance(st, u, std::string_view(tail_).substr(from), -1)) {
+        return false;
+    }
+    stacks_.swap(st);
+    utf8_ = u;
+    active_ = true;
+    tail_.clear();
+    pieces_.clear();
+    if (stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
+    return true;
+}
+
 bool GrammarState::accept(std::string_view bytes, int32_t token_id) {
     if (!g_) return true;
     if (active_) {
         std::vector<uint32_t> st = stacks_;
         Utf8 u = utf8_;
-        if (!feed(bytes, st, u)) return false;
+        if (!advance(st, u, bytes, token_id)) return false;
         stacks_.swap(st);
         utf8_ = u;
         if (triggers_.lazy() && stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
         return true;
     }
-    size_t from = std::string::npos;
     for (int32_t t : triggers_.tokens) {
-        if (t == token_id) from = 0;
+        if (t == token_id) return fire(0, true, token_id, bytes);
     }
-    std::string buf;
-    if (from == std::string::npos) {
-        buf = tail_;
-        buf.append(bytes.data(), bytes.size());
-        for (const std::string& w : triggers_.words) {
-            if (w.empty()) continue;
-            size_t lo = tail_.size() >= w.size() ? tail_.size() - w.size() + 1 : 0;
-            size_t p = buf.find(w, lo);
-            if (p != std::string::npos) from = (std::min)(from, p);
+    // text trigger: look for a word or a pattern in the output so far plus this token
+    std::string buf = tail_;
+    buf.append(bytes.data(), bytes.size());
+    size_t from = std::string::npos;
+    for (const std::string& w : triggers_.words) {
+        if (w.empty()) continue;
+        size_t lo = tail_.size() >= w.size() ? tail_.size() - w.size() + 1 : 0;
+        size_t p = buf.find(w, lo);
+        if (p != std::string::npos) from = (std::min)(from, p);
+    }
+    std::vector<Piece> pieces;
+    if (patterns_) {
+        pieces = pieces_;
+        pieces.push_back({token_id, tail_.size(), buf.size()});
+        for (size_t i = 0; i < patterns_->src.size(); ++i) {
+            size_t p = patterns_->find(i, buf);
+            if (p != std::string::npos) {
+                from = (std::min)(from, p);
+                break;
+            }
         }
-    } else {
-        buf.assign(bytes.data(), bytes.size());
     }
     if (from == std::string::npos) {
-        tail_ = buf.size() > tail_keep_ ? buf.substr(buf.size() - tail_keep_) : buf;
+        if (patterns_) {
+            tail_ = std::move(buf);
+            pieces_ = std::move(pieces);
+        } else {
+            tail_ = buf.size() > tail_keep_ ? buf.substr(buf.size() - tail_keep_) : buf;
+        }
         return true;
     }
-    GrammarState fresh = *this;
-    fresh.reset();
-    fresh.active_ = true;
-    std::vector<uint32_t> st = fresh.stacks_;
-    Utf8 u;
-    if (!feed(std::string_view(buf).substr(from), st, u)) return false;
-    stacks_.swap(st);
-    utf8_ = u;
-    active_ = true;
-    tail_.clear();
-    if (stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
-    return true;
+    GrammarState keep = *this;
+    tail_ = std::move(buf);
+    pieces_ = std::move(pieces);
+    if (fire(from, false, token_id, bytes)) return true;
+    *this = std::move(keep);
+    return false;
 }
 
 bool GrammarState::allows(std::string_view bytes, int32_t token_id) const {
@@ -747,6 +925,19 @@ void GrammarState::fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool
     }
     out.assign(vocab.size(), 0);
     if (!stacks_.empty()) walk(vocab, 0, stacks_, utf8_, out);
+    if (utf8_.n_remain == 0) {
+        for (uint32_t s : stacks_) {
+            if (s == 0 || !a.is_token(a.nodes[s].elem)) continue;
+            const Element& t = a.el(a.nodes[s].elem);
+            if (t.type == ElemType::Token) {
+                if (t.value < out.size()) out[t.value] = 1;
+            } else {
+                for (size_t id = 0; id < out.size(); ++id) {
+                    if (id != t.value && !vocab.bytes((int32_t) id).empty()) out[id] = 1;
+                }
+            }
+        }
+    }
     bool end_ok = accepting();
     for (int32_t e : vocab.end_ids()) {
         if (e >= 0 && (size_t) e < out.size()) out[(size_t) e] = end_ok ? 1 : 0;
@@ -759,6 +950,19 @@ void GrammarState::fill_mask(const Vocab& vocab, std::vector<uint8_t>& out, bool
                                        [](const Arena::MaskEntry& x, const Arena::MaskEntry& y) { return x.used < y.used; });
         *oldest = {vocab.id(), stacks_, out, ++a.tick};
     }
+}
+
+std::vector<std::vector<Element>> GrammarState::stack_elements() const {
+    std::vector<std::vector<Element>> out;
+    if (!g_) return out;
+    const Arena& a = *arena_;
+    for (uint32_t s : stacks_) {
+        std::vector<Element> st;
+        for (uint32_t n = s; n != 0; n = a.nodes[n].parent) st.push_back(a.el(a.nodes[n].elem));
+        std::reverse(st.begin(), st.end());
+        out.push_back(std::move(st));
+    }
+    return out;
 }
 
 }  // namespace basalt::program::grammar

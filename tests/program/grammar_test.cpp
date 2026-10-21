@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -225,6 +226,122 @@ static void test_lazy() {
     CHECK(sum == voc.size());                     // inactive: nothing is masked
 }
 
+// <[id]> / !<[id]> references: matched by token id, in the mask and in accept.
+static void test_token_refs() {
+    auto g = parse("root ::= <[300]> content <[301]>\ncontent ::= (!<[301]>)*");
+    CHECK(g && g->elements().size() > 0);
+    int32_t eos;
+    std::vector<std::string> v;
+    for (int i = 0; i < 256; ++i) v.push_back(std::string(1, (char) i));
+    v.push_back("ab");          // 256
+    while (v.size() < 300) v.push_back("x" + std::to_string(v.size()));
+    v.push_back("");            // 300: a special token with no text
+    v.push_back("");            // 301: another
+    v.push_back("zz");          // 302
+    eos = (int32_t) v.size();
+    v.push_back("");
+    Vocab voc(v, {eos});
+    GrammarState s(g);
+    std::vector<uint8_t> mask;
+    s.fill_mask(voc, mask);
+    size_t n = 0;
+    for (uint8_t m : mask) n += m;
+    CHECK(n == 1 && mask[300]);                     // only the opener, though it has no text
+    CHECK(!s.accept("<[300]>", 1) && s.accept("", 300));
+    s.fill_mask(voc, mask);
+    CHECK(mask[301]);                               // the closer is allowed
+    CHECK(mask[0] && mask[256] && mask[302] && !mask[(size_t) eos]);
+    // every id: the mask agrees with accept (empty-text ids only count when a reference names them)
+    for (size_t id = 0; id < voc.size(); ++id) {
+        if ((int32_t) id == eos) continue;
+        bool want = mask[id] != 0;
+        bool got = s.allows(voc.bytes((int32_t) id), (int32_t) id);
+        if (voc.bytes((int32_t) id).empty() && id != 301) continue;
+        CHECK(want == got);
+    }
+    CHECK(s.accept("ab", 256) && s.accept("zz", 302) && s.accept("", 301));
+    CHECK(s.accepting() && !s.accept("a", 5));
+    // a token that is not the named id does not take a reference's place, whatever its text says
+    GrammarState t(g);
+    CHECK(!t.accept("<[300]>", 5) && !t.accept("a", 5));
+    // <name> needs a resolver
+    std::string err;
+    CHECK(!Grammar::parse("root ::= <think> \"a\"", err) && !err.empty());
+    ParseOptions opt;
+    opt.token = [](std::string_view name, uint32_t& id) { if (name == "<think>") { id = 77; return true; } return false; };
+    auto named = Grammar::parse("root ::= <think> \"a\"", err, opt);
+    CHECK(named != nullptr);
+    GrammarState u(named);
+    CHECK(!u.accept("a", 5) && u.accept("<think>", 77) && u.accept("a") && u.accepting());
+    CHECK(!Grammar::parse("root ::= <nope> \"a\"", err, opt));
+}
+
+// A regex trigger: the grammar starts at the first non-empty capture group (else the match), over tokens.
+static void test_patterns() {
+    auto g = parse("root ::= \"<c>\" [a-z]+ \"</c>\"");
+    Triggers tr;
+    tr.patterns = {"[\\s\\S]*?(<c>)"};
+    GrammarState s(g, tr);
+    CHECK(!s.active());
+    CHECK(s.accept("say ", 1) && s.accept("<", 2) && !s.active());
+    CHECK(s.accept("c>ab", 3) && s.active());     // the group starts at "<c>"; the text from there is replayed
+    CHECK(!s.allows("1") && s.accept("c") && s.accept("</c>") && s.accepting() && !s.active());
+    // no group: the match itself is where the grammar starts
+    Triggers m;
+    m.patterns = {"<c>"};
+    GrammarState a(g, m);
+    CHECK(a.accept("zz<c>q", 1) && a.active());
+    // a whole-output pattern
+    Triggers w;
+    w.patterns = {"^hi (<c>)$"};
+    GrammarState b(g, w);
+    CHECK(b.accept("hi ", 1) && !b.active());
+    CHECK(b.accept("<c>", 2) && b.active());
+    // a bad pattern is refused up front
+    Triggers bad;
+    bad.patterns = {"(["};
+    std::string err;
+    CHECK(!bad.valid(err) && !err.empty());
+    bool threw = false;
+    try { GrammarState x(g, bad); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    // a token reference inside a replayed trigger sees the token ids
+    auto r = parse("root ::= <[5]> \"x\"");
+    Triggers rt;
+    rt.patterns = {"(g)"};
+    GrammarState c(r, rt);
+    CHECK(!c.accept("g", 1) && !c.active());      // the trigger fires, the grammar wants token 5: refused, unchanged
+    CHECK(c.accept("g", 5) && c.active() && c.accept("x") && c.accepting());
+}
+
+// A byte sequence split across tokens: a prefix is fine while some completion can match.
+static void test_partial_utf8() {
+    auto g = parse("root ::= \"\xC3\xA9\" \"a\"");
+    std::vector<std::string> v;
+    for (int i = 0; i < 256; ++i) v.push_back(std::string(1, (char) i));
+    v.push_back("\xC3\xA9");   // 256
+    v.push_back("\xE2\x82");   // 257: a prefix of a euro sign
+    v.push_back("\xC3\xA9" "a");
+    Vocab voc(v, {});
+    GrammarState s(g);
+    std::vector<uint8_t> mask;
+    s.fill_mask(voc, mask);
+    CHECK(mask[0xC3] && mask[256] && mask[258] && !mask[0xA9] && !mask[0xE2] && !mask[257] && !mask['a']);
+    CHECK(s.accept("\xC3") && !s.accepting());
+    s.fill_mask(voc, mask);
+    CHECK(mask[0xA9] && !mask[0xC3] && !mask['a']);
+    CHECK(s.accept("\xA9") && s.accept("a") && s.accepting());
+    // a class that takes any code point takes any lead byte; a negated class too
+    auto any = parse("root ::= . [^a]");
+    GrammarState t(any);
+    t.fill_mask(voc, mask);
+    CHECK(mask[0xE2] && mask[257] && mask['a'] && !mask[0xA9] && !mask[0xFF]);
+    CHECK(t.accept("\xE2\x82") && t.accept("\xAC") && t.accept("\xF0\x9F") && t.accept("\x98\x80") && t.accepting());
+    // a continuation byte after a finished character, or a bad lead, is refused
+    GrammarState u(any);
+    CHECK(!u.accept("\x80") && !u.accept("\xC0\x80") && !u.accept("\xFF"));
+}
+
 static double now_us() {
     using namespace std::chrono;
     return (double) duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() / 1000.0;
@@ -336,6 +453,9 @@ int main() {
     test_clone_rewind();
     test_mask();
     test_lazy();
+    test_token_refs();
+    test_patterns();
+    test_partial_utf8();
     if (std::getenv("BASALT_GRAMMAR_BENCH")) bench();
     if (g_fail) { std::printf("grammar_test: %d failures\n", g_fail); return 1; }
     std::printf("grammar_test: ok\n");
