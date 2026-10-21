@@ -29,7 +29,11 @@ template <typename T> T* dalloc(size_t n) {
     ck(cudaMemset(p, 0, n * sizeof(T) + 256), "memset");
     return p;
 }
-template <typename T> void up(T* d, const std::vector<T>& h) { ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "up"); }
+// a pageable copy may return before it lands and the non-blocking test stream does not wait for it: finish it here
+template <typename T> void up(T* d, const std::vector<T>& h) {
+    ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "up");
+    ck(cudaDeviceSynchronize(), "up sync");
+}
 template <typename T> std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
     ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "down");
