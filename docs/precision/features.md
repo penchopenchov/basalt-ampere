@@ -109,8 +109,9 @@ mask added to the request's logit bias (same filters, penalties and position dra
 drafts after it are dropped like a rejection. A window the grammar accepts is untouched: no extra launch or sync.
 Tool-call grammars start at the call opener, JSON grammars at the first token after the thinking block. Relaxed
 drafting is off for a request with a grammar. The prompt is never constrained. Requests without the key, and the engine
-with `--grammar off`, run the unchanged path. Keywords the grammar cannot express (patterns, numeric bounds) are not
-enforced.
+with `--grammar off`, run the unchanged path. The schema grammar is llama.cpp's (integer bounds, string length, patterns,
+array sizes and formats are enforced); what llama.cpp does not express (`uniqueItems`, number bounds, a pattern with no
+grammar form) is not enforced.
 
 ## Speculative decoding does not change output
 
