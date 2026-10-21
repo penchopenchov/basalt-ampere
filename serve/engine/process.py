@@ -75,6 +75,17 @@ def engine_line(line: str) -> str:
     return line[:-2] + "\n" if line.endswith("\r\n") else line
 
 
+AUTO_FLAGS = "auto flags: "
+
+
+def relay_auto_flags(line: str) -> bool:
+    """Print the engine's auto-picked flags as a server line; False when the line is not that line."""
+    if not line.startswith(AUTO_FLAGS):
+        return False
+    print("[server] " + line.rstrip("\n"), flush=True)
+    return True
+
+
 def frame_pipes(proc, stderr_pipe: bool) -> None:
     """Frame a child's pipes on `\n` alone, both directions: the text-mode default for a pipe writes `\r\n` on
     Windows, and ends a line at a `\r` that belongs to the line rather than ending it.  Only Popen's own text
@@ -199,6 +210,8 @@ class ProcessEngine:
                 continue
             if line is None:
                 break
+            if relay_auto_flags(line):
+                continue
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
@@ -291,6 +304,8 @@ class ProcessEngine:
         line = None
         for line in proc.stdout:
             line = engine_line(line)
+            if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
+                continue
             if line.startswith(FATAL_PREFIXES):         # before batch routing
                 if self.proc is proc:
                     self.silent_note = "unrecoverable verification failure: " + line[4:].strip()
