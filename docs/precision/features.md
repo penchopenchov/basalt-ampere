@@ -243,3 +243,12 @@ themselves are exact).
 **Choosing P.** `--relaxed-drafting` alone means 0.5: the smallest cost (TV/token 0.03 to 0.04), roughly +5% at
 temperature 0.6 and +6 to 10% at 1.0. 0.3 doubles both the gain and the cost; 0.2 is the aggressive end. Values above
 0.5 keep few drafts (0.7: about +2.5% at TV 0.015).
+
+## Prefill CPU share
+
+The CPU pool and the GPU round a streamed prompt expert differently (see the CPU-share paragraph in [index.md](index.md)), so
+`--prefill-cpu-share` can move numbers. NVFP4 pack, quality gate 20 chunks against the Q8_0 reference, T 3, int8 KV,
+`--spec 0`, 400 W, share 0 (all GPU) against 1 (all CPU): PPL 2.3046 / 2.3142 (standard error 0.06 each), KLD 0.07766 /
+0.07717, top-1 92.86% / 92.82%. The two ends differ by 0.0095 PPL, 0.0005 KLD and 0.04 points of top-1, inside the
+run-to-run size of this gate, so any share between them is bounded by that. `basalt-probe` may print a different share
+as a suggestion ([probe](../probe.md)); it never changes it on its own.

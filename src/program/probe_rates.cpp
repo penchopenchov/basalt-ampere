@@ -347,7 +347,7 @@ void step_host_mem(Probe& P) {
     for (auto& r : rank) P.host_k.push_back(r.second);
 }
 
-// 5: CPU expert rate: cold experts through the pool, n per call, at the two best worker counts and the current one
+// 5: CPU expert rate: cold experts through the pool, n per call, at every measured worker count and the current one
 void step_cpu_expert(Probe& P, int original_workers) {
     C::ExpertPool& pool = *P.env.pool;
     if (!P.have_layout || P.blobs.size() < 64) {
@@ -363,8 +363,7 @@ void step_cpu_expert(Probe& P, int original_workers) {
     std::vector<uint8_t> act(C::kNativeActBytes);
     C::native_quant_act(f, x.data(), act.data());
     std::vector<std::vector<float>> outs(kMaxN, std::vector<float>((size_t) f.n_embd));
-    std::vector<int> ks;
-    for (size_t i = 0; i < P.host_k.size() && ks.size() < 2; ++i) ks.push_back(P.host_k[i]);
+    std::vector<int> ks = worker_counts(pool.workers());
     if (std::find(ks.begin(), ks.end(), original_workers) == ks.end()) ks.push_back(original_workers);
     size_t pick = 0;
     for (int k : ks) {

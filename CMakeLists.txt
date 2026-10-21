@@ -412,6 +412,10 @@ add_custom_target(git_stamp
   COMMENT "Refreshing the commit stamp")
 execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
+# the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
+add_library(engine_session STATIC src/program/engine_session.cpp src/program/probe_report.cpp src/program/probe_derive.cpp)
+target_include_directories(engine_session PUBLIC include)
+target_link_libraries(engine_session PUBLIC platform)
 add_executable(basalt-bench src/program/bench_main.cpp)
 set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
@@ -419,13 +423,23 @@ add_subdirectory(tools/vision)
 target_link_libraries(basalt PRIVATE vision_cuda)
 add_dependencies(basalt-bench basalt git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
-target_link_libraries(basalt-bench PRIVATE platform warnings ${CMAKE_DL_LIBS})
+target_link_libraries(basalt-bench PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-bench)
 target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
   BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   BASALT_BENCH_CUDA="${CMAKE_CUDA_COMPILER_VERSION}")
+
+# basalt-probe: starts the engine, measures its rates and cold decode speed, prints a report
+add_executable(basalt-probe src/program/probe_main.cpp)
+set_target_properties(basalt-probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+add_dependencies(basalt-probe basalt)
+target_link_libraries(basalt-probe PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
+basalt_embed_manifest(basalt-probe)
+target_compile_definitions(basalt-probe PRIVATE
+  BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
+  BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench")
 
 # closing the engine's stdin mid-request stops it (runs the real engine on a model pack:
 # -DBASALT_STDIN_STOP_MODEL=<pack>, with python3)
@@ -777,6 +791,20 @@ foreach(_t cpu_test compiler_test region_test process_pipe_test system_test)
   basalt_cpu_test(NAME platform_${_t} COMMAND platform_${_t})
   set_tests_properties(platform_${_t} PROPERTIES TIMEOUT 120)
 endforeach()
+
+# basalt-probe's report: rates block and layout (CPU only)
+add_executable(probe_report_test tests/program/probe_report_test.cpp)
+target_link_libraries(probe_report_test PRIVATE engine_session warnings)
+basalt_embed_manifest(probe_report_test)
+basalt_cpu_test(NAME probe_report_test COMMAND probe_report_test)
+set_tests_properties(probe_report_test PROPERTIES TIMEOUT 60)
+
+# basalt-probe's suggested values: the worker pick, the balance share and the suggestion lines (CPU only)
+add_executable(probe_derive_test tests/program/probe_derive_test.cpp)
+target_link_libraries(probe_derive_test PRIVATE engine_session warnings)
+basalt_embed_manifest(probe_derive_test)
+basalt_cpu_test(NAME probe_derive_test COMMAND probe_derive_test)
+set_tests_properties(probe_derive_test PROPERTIES TIMEOUT 60)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)

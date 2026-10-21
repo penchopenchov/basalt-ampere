@@ -7178,7 +7178,22 @@ int main(int argc, char** argv) {
             }
             if (line.rfind("PROBE", 0) == 0) {   // between requests, not a request: measures rates, changes no state
                 std::string perr;
-                if (line != "PROBE rates") perr = "PROBE: expected PROBE rates";
+                if (line.rfind("PROBE set ", 0) == 0) {   // PROBE set workers=K share=F: live values for the next requests
+                    if (batch_on()) perr = "PROBE: not while batch slots are decoding";
+                    else {
+                        if (ba_job) { ba_thr.join(); ba_job = false; }
+                        std::istringstream kvs(line.substr(10));
+                        for (std::string kv; kvs >> kv;) {
+                            const size_t eq = kv.find('=');
+                            const std::string key = eq == std::string::npos ? kv : kv.substr(0, eq);
+                            const double v = eq == std::string::npos ? -1.0 : std::atof(kv.c_str() + eq + 1);
+                            if (key == "workers" && v >= 1) pool.set_active_workers((int) v);
+                            else if (key == "share" && v >= 0 && v <= 1) sp.set_cpu_share(v);
+                            else perr = "PROBE: bad setting " + kv;
+                        }
+                        if (perr.empty()) std::printf("PROBE end workers=%d\n", pool.active_workers());
+                    }
+                } else if (line != "PROBE rates") perr = "PROBE: expected PROBE rates";
                 else if (batch_on()) perr = "PROBE: not while batch slots are decoding";
                 else {
                     if (ba_job) { ba_thr.join(); ba_job = false; }
@@ -8341,8 +8356,8 @@ int main(int argc, char** argv) {
             {   // a request decoded here starts its adaptation from the experts its own prompt routed to
                 std::vector<uint32_t> hist;
                 int64_t hist_tokens = 0;
-                if (!drive.d.usage.empty() && sp.route_hist_take(hist, hist_tokens) && (!in_slot || solo_req))
-                    seed_usage_from_prompt(drive.d.usage, hist, hist_tokens, host_res, g.n_expert, peer);
+                const bool seeded = !drive.d.usage.empty() && sp.route_hist_take(hist, hist_tokens) && (!in_slot || solo_req);
+                if (seeded) seed_usage_from_prompt(drive.d.usage, hist, hist_tokens, host_res, g.n_expert, peer);
             }
             std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob((size_t) S, 0.0f);

@@ -135,9 +135,12 @@ nothing. Sections:
 | `link` | pinned host-to-device and device-to-host GB/s per GPU, best of six 64 MiB bursts |
 | `gpu_mem` | device-to-device copy GB/s per GPU (counts the bytes read and written) |
 | `host_mem` | GB/s the CPU pool reads from RAM-resident experts, by active worker count |
-| `cpu_expert` | cold experts through the pool at 1, 2, 3 and 8 per call, at the two best worker counts and the current one |
+| `cpu_expert` | cold experts through the pool at 1, 2, 3 and 8 per call, at every measured worker count and the current one |
 | `peer` | peer round trip by entry count (1 to 8) and the linear fit: base and per-entry microseconds |
 | `copy` | one expert-sized copy into each GPU, and the peer round trip while such a copy runs |
 
 A step that cannot run prints `n/a` with a reason (no peer, no RAM-resident experts, a non-native expert format).
 During a batch the command answers `ERR PROBE: ...`.
+
+`PROBE set workers=K share=F` (either key) sets the CPU pool's active worker count and the prompt path's CPU share for the
+requests that follow, and answers `PROBE end workers=<count>`. It is for `basalt-probe`; the settings last until the engine stops.
