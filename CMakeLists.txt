@@ -404,7 +404,7 @@ target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_t
 add_executable(basalt src/program/generate.cpp src/program/probe_rates.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE engine prefill spec ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE engine engine_session prefill spec ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

@@ -34,6 +34,8 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/kernels/cpu/cpu_quota.hpp"
+#include "basalt/program/auto_plan.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -338,9 +340,9 @@ struct Options {
     /// stage events include every gap where the GPU waited for the host.
     bool graph_only = false;
     bool gpu_only_full = false;   ///< pre + post + head, the true per-token GPU floor
-    int pool_workers = 0;         ///< 0 = "all physical cores minus the host's"; >0 overrides
-    /// The pool's core layout; `all` (the default) uses every core, auto / p-cores are opt-in
-    basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::All;
+    int pool_workers = 0;         ///< >0 = the user's worker count; otherwise the start-up pick
+    /// The pool's core layout; the start-up pick unless given
+    basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
     bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
@@ -446,6 +448,10 @@ struct Options {
     /// place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
     bool adapt_every_given = false;   // --adapt-every on the command line
+    bool peer_exclusive_given = false;   // --peer-exclusive on the command line
+    bool resident_budget_given = false;  // --resident-budget-gib on the command line
+    bool pool_affinity_given = false;    // --pool-affinity on the command line
+    bool pool_workers_given = false;     // --pool-workers on the command line
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
@@ -731,7 +737,8 @@ void usage() {
                   "                       or more GPUs are visible.\n"
                  "  --peer-exclusive     with --resident-experts: experts on the peer are held only there, not\n"
                  "                       also in RAM (less RAM).  The peer is filled from the file; swaps move\n"
-                 "                       peer-held experts between the GPUs and RAM over P2P.\n"
+                 "                       peer-held experts between the GPUs and RAM over P2P.  Auto when not set\n"
+                 "                       (on only when it keeps every expert off the SSD).\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
                  "  --peer-slots N       expert slots on the peer (default: what fits)\n"
                  "  --adapt-every N      adaptive expert tier: a round every N decode windows (default 1 for a\n"
@@ -747,13 +754,13 @@ void usage() {
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
-                 "  --pool-workers N     CPU expert pool worker count.  Default 0 = every physical core\n"
+                 "  --pool-workers N     CPU expert pool worker count.  Auto when not set: every physical core\n"
                  "                       except the one the host loop spins on (with --pool-affinity auto or\n"
                  "                       p-cores on a hybrid CPU: P-cores minus 1), lowered so the workers and the\n"
                  "                       host thread fit a cgroup CPU quota (container CPU limit).\n"
-                 "  --pool-affinity MODE Which cores size the worker pool (workers are not pinned): all (default:\n"
-                 "                       one worker per physical core), auto or p-cores (hybrid CPUs: sized by\n"
-                 "                       the P-cores, minus the host's).\n"
+                 "  --pool-affinity MODE Which cores size the worker pool (workers are not pinned): all (one\n"
+                 "                       worker per physical core), auto or p-cores (hybrid CPUs: sized by\n"
+                 "                       the P-cores, minus the host's).  Auto when not set.\n"
                  "  --mmap-experts       opt OUT of the default resident RAM copy, back to a file mapping.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       the experts, so cold and warm runs differ.\n"
@@ -769,7 +776,8 @@ void usage() {
                  "                       When some experts stay in the file, the copy leaves a RAM floor free for\n"
                  "                       the OS file cache (the RAM margin + the larger of 3.5 GiB + two layers'\n"
                  "                       experts and 4 GiB).\n"
-                 "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first);\n"
+                 "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
+                 "                       auto when not set: what fits);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
                  "                       the largest safe value.\n");
 }
@@ -1272,9 +1280,10 @@ int main(int argc, char** argv) {
         else if (a == "--stage-timing") o.stage_timing = true;
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
-        else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+        else if (a == "--pool-workers") { o.pool_workers = std::atoi(next("--pool-workers")); o.pool_workers_given = true; }
         else if (a == "--pool-affinity") {
             const std::string v = next("--pool-affinity");
+            o.pool_affinity_given = true;
             if (v == "auto") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
             else if (v == "p-cores" || v == "pcores") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::PCores;
             else if (v == "all") o.pool_affinity = basalt::kernels::cpu::PoolAffinity::All;
@@ -1405,7 +1414,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
-        else if (a == "--peer-exclusive") o.peer_exclusive = true;
+        else if (a == "--peer-exclusive") { o.peer_exclusive = true; o.peer_exclusive_given = true; }
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
@@ -1425,6 +1434,7 @@ int main(int argc, char** argv) {
             const double gib = std::atof(next("--resident-budget-gib"));
             if (!(gib > 0.0)) { std::fprintf(stderr, "basalt generate: --resident-budget-gib needs N > 0\n"); return 2; }
             o.resident_budget = (uint64_t) (gib * 1073741824.0);
+            o.resident_budget_given = true;
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
             o.resident_headroom = 0;
         }
@@ -1514,8 +1524,11 @@ int main(int argc, char** argv) {
     // every expert streams through the ring.  The routed-only path costs ~0.3 ms per token, streaming ~0.12 ms
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
     // peer-only experts, staged through the host, so streaming loses until later.
-    if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && !basalt::core::peers_access(o.peer_device))
-        basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
+    auto set_stream_all_min = [&]() {
+        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && !basalt::core::peers_access(o.peer_device))
+            basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
+    };
+    set_stream_all_min();
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "basalt serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -3102,13 +3115,10 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    basalt::kernels::cpu::ExpertPool pool(o.pool_workers, o.pool_affinity);
-    if (pool.is_hybrid() && pool.affinity() != basalt::kernels::cpu::PoolAffinity::All) {
-        const char* aff_str = pool.affinity() == basalt::kernels::cpu::PoolAffinity::PCores ? "p-cores" :
-                              pool.affinity() == basalt::kernels::cpu::PoolAffinity::All ? "all" : "auto";
-        std::fprintf(stderr, "basalt generate: hybrid CPU detected (%d P-cores / %d threads, %d E-cores), pool workers: %d, affinity: %s\n",
-                     pool.p_cores(), pool.p_threads(), pool.e_cores(), pool.workers(), aff_str);
-    }
+    // the pool is built once the start-up picks are known (below, with the resident RAM plan)
+    std::optional<basalt::kernels::cpu::ExpertPool> pool_store;
+    uint64_t ram_available_at_plan = 0;   // the available RAM the start-up plan was sized from
+    uint64_t auto_resident_bytes = 0;   // the start-up pick for the RAM copy (used when no budget is given)
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
@@ -3415,6 +3425,26 @@ int main(int argc, char** argv) {
     // keeps its weights and the cache just sized, the peer card its free memory less its buffers and reserve, and the
     // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
     // arena mode was checked against the RAM above).
+    // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
+    auto peer_expert_room = [&]() -> uint64_t {
+        uint64_t room = 0;
+        if (o.peer_device < 1) return 0;
+        int cur = 0, count = 0;
+        size_t pfree = 0, ptotal = 0;
+        if (cudaGetDevice(&cur) == cudaSuccess && cudaGetDeviceCount(&count) == cudaSuccess &&
+            o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
+            if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
+                const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
+                                         basalt::core::PeerExperts::device_overhead_bytes();
+                room = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
+                if (o.peer_slots > 0)
+                    room = std::min<uint64_t>(room, (uint64_t) o.peer_slots * basalt::kernels::cpu::expert_layout().max_blob);
+            }
+            (void) cudaSetDevice(cur);
+        }
+        (void) cudaGetLastError();
+        return room;
+    };
     if (model_bytes > 0 && o.mmap_experts) {
         const auto free_ram = basalt::core::conversation_available_memory();
         if (free_ram) {
@@ -3438,25 +3468,7 @@ int main(int argc, char** argv) {
                 if (o.resident_budget > 0) ram = std::min(ram, o.resident_budget);
             }
             // the peer tier holds experts too: what its card has free beyond its buffers and the reserve it leaves
-            uint64_t peer_vram = 0;
-            if (o.peer_device >= 1) {
-                int cur = 0, count = 0;
-                size_t pfree = 0, ptotal = 0;
-                if (cudaGetDevice(&cur) == cudaSuccess && cudaGetDeviceCount(&count) == cudaSuccess &&
-                    o.peer_device < count && cudaSetDevice(o.peer_device) == cudaSuccess) {
-                    if (cudaMemGetInfo(&pfree, &ptotal) == cudaSuccess) {
-                        const uint64_t reserve =
-                            ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
-                            basalt::core::PeerExperts::device_overhead_bytes();
-                        peer_vram = (uint64_t) pfree > reserve ? (uint64_t) pfree - reserve : 0;
-                        if (o.peer_slots > 0)
-                            peer_vram = std::min<uint64_t>(
-                                peer_vram, (uint64_t) o.peer_slots * basalt::kernels::cpu::expert_layout().max_blob);
-                    }
-                    (void) cudaSetDevice(cur);
-                }
-                (void) cudaGetLastError();
-            }
+            uint64_t peer_vram = peer_expert_room();
             peer_vram = std::min(peer_vram, outside);
             outside -= peer_vram;
             uint64_t file_headroom = headroom;
@@ -3700,7 +3712,6 @@ int main(int argc, char** argv) {
     Drive drive;
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
-    drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
@@ -3806,10 +3817,6 @@ int main(int argc, char** argv) {
     basalt::core::HitFn hit_fn =
         (o.no_pool || o.expert_cache <= 0) ? nullptr : &basalt::core::expert_hit_run;
     void* pool_user = o.no_pool ? nullptr : (void*) &drive;
-    char quota_note[64] = "";
-    if (pool.quota_limit() > 0) std::snprintf(quota_note, sizeof quota_note, " (quota %.2f CPUs)", pool.quota_limit());
-    std::fprintf(stderr, "basalt generate: %d expert-pool workers%s + the host thread%s\n", pool.workers(), quota_note,
-                 o.no_pool ? " (UNUSED: --no-pool)" : "");
 
     // THE LOOP RUNS A CAPTURED PAIR PER LAYER: `pre[l]` ends with the router and the doorbell, then the CPU pool runs,
     // then `post[l]` combines those experts with THAT layer's weights - so layer `l`'s experts meet layer `l`'s
@@ -4427,6 +4434,124 @@ int main(int argc, char** argv) {
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
         return true;
     };
+    // every expert of the largest layer: what one prompt layer can read from the file (see platform::file_cache_floor)
+    uint64_t largest_layer_bytes = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        largest_layer_bytes = std::max<uint64_t>(largest_layer_bytes,
+                                                 (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
+    // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
+    const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
+    // A server also leaves room for what it allocates after the RAM copy, before it is ready (the top-up below takes
+    // back whatever that does not use), and for what it takes while serving.
+    // Exchange buffers are reserved after the copy when the adaptive swaps do not use spares; the copy leaves them room.
+    const uint64_t exchange_bytes =
+        (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on)
+            ? (uint64_t) std::min<int64_t>(o.adapt_swaps, 96) * basalt::kernels::cpu::expert_layout().max_blob
+            : 0;
+    const uint64_t late = (o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0) + exchange_bytes;
+    const uint64_t resident_headroom_base =
+        o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late)
+                : std::max(o.resident_headroom, basalt::platform::ram_margin() + basalt::platform::kLateHostBytes) +
+                      exchange_bytes;   // what loads after the copy, and the buffers, fit beside the margin
+    // the GPU cache's last slots are lent to the prompt path (and the elastic KV): their experts are kept in RAM too
+    int64_t lend_from = -1;
+    if (o.prefill_chunk > 0 && d_res != nullptr && xcache.slots() > 0) {
+        int64_t chunk = o.prefill_chunk;
+        const int64_t k = plan_lend(chunk);
+        if (k > 0) lend_from = xcache.slots() - k;
+    }
+    // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
+    // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
+    if (kv_tail_slots > 0)
+        lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
+    // ---- the start-up picks for the settings the user left out (peer-exclusive, resident RAM, pool affinity and
+    // size): one pure rule over what this machine and pack have, so a given setting is never replaced.  The pool is
+    // built here, with the picks.
+    {
+        namespace bp = basalt::program;
+        namespace cpu = basalt::kernels::cpu;
+        const auto topo = basalt::platform::detect_cpu_topology(true, basalt::platform::CpuAffinity::All);
+        bp::AutoInputs in;
+        in.ram_total = basalt::platform::total_physical_memory();
+        // the container-aware reading (a memory cap below the machine's RAM), the one the RAM copy is checked against
+        in.ram_available = basalt::platform::available_memory();
+        if (basalt::core::detail::HostMemory hm; basalt::core::detail::host_available_memory(hm) && hm.available > 0)
+            in.ram_available = in.ram_available > 0 ? std::min(in.ram_available, hm.available) : hm.available;
+        in.peer = o.peer_device >= 1 && o.resident_cpu_experts;
+        in.serve = o.serve;
+        in.worker_cores = (int) topo.worker_cores.size();
+        in.p_cores = topo.p_cores;
+        in.e_cores = topo.e_cores;
+        in.hybrid = topo.is_hybrid;
+        in.cpu_quota = cpu::cgroup_cpu_quota();
+        const uint64_t margin = basalt::platform::ram_margin();
+        const uint64_t head = std::max(resident_headroom_base, margin);
+        const uint64_t lent_bytes =
+            lend_from >= 0 ? (uint64_t) (xcache.slots() - lend_from) * basalt::kernels::cpu::expert_layout().max_blob : 0;
+        in.complement_full = expert_total_bytes - std::min(expert_total_bytes, cache_fill_bytes);
+        in.complement_peer_excl = in.complement_full - std::min(in.complement_full, peer_expert_room());
+        // the RAM copy also holds the free places the adaptive swaps use (see set_spares)
+        const uint64_t blob = basalt::kernels::cpu::expert_layout().max_blob;
+        const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
+        const uint64_t spares_excl =
+            adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
+        in.complement_full += lent_bytes + spares_full;
+        in.complement_peer_excl += lent_bytes + spares_excl;
+        auto fits_beside = [&](uint64_t c) { return in.ram_available > head && c <= in.ram_available - head; };
+        // the floor when the whole complement is placed is the headroom; with experts left on the SSD it adds the file cache's
+        in.floor_bytes = fits_beside(in.complement_full) || (in.peer && in.serve && fits_beside(in.complement_peer_excl))
+                             ? head
+                             : std::max(head, basalt::platform::ram_floor(margin, 1, largest_layer_bytes) + late);
+        bp::AutoGiven& gv = in.given;
+        if (!(in.peer && in.serve) || o.peer_exclusive_given) {   // not applicable, or given
+            gv.peer_exclusive = true;
+            gv.peer_exclusive_value = o.peer_exclusive;
+        }
+        if (!o.resident_cpu_experts || o.resident_budget_given) {
+            gv.resident = true;
+            gv.resident_gb = (double) o.resident_budget / 1073741824.0;
+        }
+        if (o.pool_affinity_given) {
+            gv.pool_affinity = true;
+            gv.pool_affinity_value = o.pool_affinity == cpu::PoolAffinity::All    ? bp::AutoAffinity::All
+                                     : o.pool_affinity == cpu::PoolAffinity::PCores ? bp::AutoAffinity::PCores
+                                                                                    : bp::AutoAffinity::Auto;
+        }
+        if (o.pool_workers_given && o.pool_workers > 0) {
+            gv.pool_workers = true;
+            gv.pool_workers_value = o.pool_workers;
+        }
+        const bp::AutoPlan plan = bp::choose_auto(in);
+        auto_resident_bytes = plan.resident_bytes;
+        ram_available_at_plan = in.ram_available;
+        if (plan.peer_exclusive_src == bp::AutoSource::Auto && plan.peer_exclusive != o.peer_exclusive) {
+            o.peer_exclusive = plan.peer_exclusive;
+            set_stream_all_min();
+        }
+        const cpu::PoolAffinity affinity = plan.pool_affinity == bp::AutoAffinity::All    ? cpu::PoolAffinity::All
+                                           : plan.pool_affinity == bp::AutoAffinity::PCores ? cpu::PoolAffinity::PCores
+                                                                                            : cpu::PoolAffinity::Auto;
+        const std::string line = bp::auto_flags_line(plan);
+        if (!line.empty()) {
+            // the server reads the engine's status lines on stdout
+            if (o.serve) { std::printf("%s\n", line.c_str()); std::fflush(stdout); }
+            else std::fprintf(stderr, "basalt generate: %s\n", line.c_str());
+        }
+        auto& pool = pool_store.emplace(plan.pool_workers, affinity);
+        if (pool.is_hybrid() && pool.affinity() != cpu::PoolAffinity::All) {
+            const char* aff_str = pool.affinity() == cpu::PoolAffinity::PCores ? "p-cores" : "auto";
+            std::fprintf(stderr, "basalt generate: hybrid CPU detected (%d P-cores / %d threads, %d E-cores), pool workers: %d, affinity: %s\n",
+                         pool.p_cores(), pool.p_threads(), pool.e_cores(), pool.workers(), aff_str);
+        }
+        char quota_note[64] = "";
+        if (plan.pool_workers_src == bp::AutoSource::Auto && in.cpu_quota > 0 &&
+            plan.pool_workers == (std::max)(1, (int) in.cpu_quota - 1))
+            std::snprintf(quota_note, sizeof quota_note, " (quota %.2f CPUs)", in.cpu_quota);
+        std::fprintf(stderr, "basalt generate: %d expert-pool workers%s + the host thread%s\n", pool.workers(), quota_note,
+                     o.no_pool ? " (UNUSED: --no-pool)" : "");
+        drive.d.pool = &pool;
+    }
+    auto& pool = *pool_store;
     std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts only the peer holds (--peer-exclusive)
     uint64_t peer_only_bytes = 0;
     if (o.resident_cpu_experts && o.peer_exclusive && o.peer_device >= 1) {
@@ -4445,11 +4570,6 @@ int main(int argc, char** argv) {
     // streamed during a prompt and copied back after it, so those are kept in RAM too as far as RAM allows.  The
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
-    // every expert of the largest layer: what one prompt layer can read from the file (see platform::file_cache_floor)
-    uint64_t largest_layer_bytes = 0;
-    for (int64_t l = 0; l < g.n_layers; ++l)
-        largest_layer_bytes = std::max<uint64_t>(largest_layer_bytes,
-                                                 (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
     uint64_t ram_floor_bytes = basalt::platform::ram_margin();   // the RAM the copy leaves free; the serve guard's floor
     if (o.resident_cpu_experts) {
         // the RAM copy is sized from the available RAM: without a reading the experts would silently stay in the file
@@ -4458,43 +4578,19 @@ int main(int argc, char** argv) {
                 "cannot determine the available RAM (no MemAvailable in /proc/meminfo, or a malformed cgroup memory "
                 "limit or memory.stat), which the resident RAM mode (--resident-experts) sizes its copy of the "
                 "experts from");
-        int64_t lend_from = -1;
-        if (o.prefill_chunk > 0 && d_res != nullptr && xcache.slots() > 0) {
-            int64_t chunk = o.prefill_chunk;
-            const int64_t k = plan_lend(chunk);
-            if (k > 0) lend_from = xcache.slots() - k;
-        }
-        // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
-        // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-        if (kv_tail_slots > 0)
-            lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
-        // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
-        const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
         // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)
                                             : o.adapt_swaps * kSatBoost);
-        // A server also leaves room for what it allocates after this copy, before it is ready (the top-up below takes
-        // back whatever that does not use), and for what it takes while serving.
-        // Exchange buffers are reserved after the copy when the adaptive swaps do not use spares; the copy leaves them room.
-        const uint64_t exchange_bytes =
-            (o.adapt_every > 0 && o.adapt_swaps > 0 && !adapt_fast_on)
-                ? (uint64_t) std::min<int64_t>(o.adapt_swaps, 96) * basalt::kernels::cpu::expert_layout().max_blob
-                : 0;
-        const uint64_t late = (o.serve ? basalt::platform::kLateHostBytes + serve_growth_bytes(o, g) : 0) + exchange_bytes;
-        uint64_t resident_headroom =
-            o.serve ? std::max(o.resident_headroom, basalt::platform::ram_margin() + late)
-                    : std::max(o.resident_headroom, basalt::platform::ram_margin() + basalt::platform::kLateHostBytes) +
-                          exchange_bytes;   // what loads after the copy, and the buffers, fit beside the margin
+        uint64_t resident_headroom = resident_headroom_base;
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
         {
             const uint64_t gpu_held = std::min(expert_total_bytes, cache_fill_bytes + peer_only_bytes);
             const uint64_t complement = expert_total_bytes - gpu_held;
-            const uint64_t avail = basalt::platform::available_memory();
+            const uint64_t avail = ram_available_at_plan;
             const uint64_t margin = basalt::platform::ram_margin();
-            const uint64_t room = avail > std::max(resident_headroom, margin) ? avail - std::max(resident_headroom, margin) : 0;
-            const uint64_t copy = o.resident_budget > 0 ? std::min(o.resident_budget, complement) : std::min(room, complement);
+            const uint64_t copy = std::min(o.resident_budget > 0 ? o.resident_budget : auto_resident_bytes, complement);
             const uint64_t file_bytes = complement - copy;
             ram_floor_bytes = basalt::platform::ram_floor(margin, file_bytes, largest_layer_bytes);
             if (avail > 0 && file_bytes > 0) {

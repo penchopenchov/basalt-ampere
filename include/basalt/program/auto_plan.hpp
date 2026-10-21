@@ -46,6 +46,7 @@ enum class AutoSource { Auto, Given };
 struct AutoPlan {
     bool peer_exclusive = false;
     double resident_gb = 0;               ///< GiB of experts held in RAM
+    uint64_t resident_bytes = 0;          ///< the same in bytes, exact: what the RAM copy is sized by
     AutoAffinity pool_affinity = AutoAffinity::All;
     int pool_workers = 1;
     AutoSource peer_exclusive_src = AutoSource::Auto;

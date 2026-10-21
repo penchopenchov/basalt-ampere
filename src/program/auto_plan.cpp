@@ -44,11 +44,13 @@ AutoPlan choose_auto(const AutoInputs& in) {
     // Resident: what fits, capped at the complement.
     if (g.resident) {
         p.resident_gb = g.resident_gb;
+        p.resident_bytes = (uint64_t) (g.resident_gb * kGiB);
         p.resident_src = AutoSource::Given;
     } else {
         const uint64_t complement = p.peer_exclusive ? in.complement_peer_excl : in.complement_full;
         const uint64_t room = in.ram_available > in.floor_bytes ? in.ram_available - in.floor_bytes : 0;
-        p.resident_gb = (double) (std::min)(room, complement) / kGiB;
+        p.resident_bytes = (std::min)(room, complement);
+        p.resident_gb = (double) p.resident_bytes / kGiB;
     }
 
     if (g.pool_affinity) {
