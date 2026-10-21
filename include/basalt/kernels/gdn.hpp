@@ -78,14 +78,6 @@ void gdn_conv_step(float* conv_state, const float* x, const float* kW, float* ou
 /// sqrt(S) = 11.3x here, which is why the test asserts the two are distinguishable.
 void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream);
 
-/// `beta = sigmoid(beta)`, in place over `h_v` values.
-///
-/// **`gdn_step` DOES NOT DO THIS AND THE LAYER MUST.**  `build_layer_attn_linear` has
-/// `beta = ggml_sigmoid(beta)` and the step kernel's contract is `d = (v - sk) * beta`, so what it receives has
-/// to be a fraction.  Passing the raw `ssm_beta @ cur` leaves the delta-net write strength unbounded and signed.
-/// This call is what makes the C++ agree with the reference.
-void gdn_beta_gate(float* beta, int64_t h_v, void* stream);
-
 /// The layer's closing norm: `y = rms_norm(o, eps) * ssm_norm * sigmoid(z)`.
 ///
 /// Note SIGMOID, not SiLU - qwen3.5 used SiLU and this artifact does not.

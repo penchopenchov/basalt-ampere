@@ -183,30 +183,6 @@ void silu_inplace(float* x, int64_t n, void* stream) {
     sync_if_needed(stream, "silu_inplace");
 }
 
-/// THE DOORBELL.  One thread, one INCREMENT - the cost is the launch, and inside a graph that is paid once.
-///
-/// **IT INCREMENTS THE MEMORY, AND IT DOES NOT TAKE THE VALUE AS AN ARGUMENT.**  The first version did -
-/// doorbell_ring(d_seq, *(h_seq) + 1u) - and that is a CLONED LITERAL: the expression is evaluated on the HOST
-/// at CAPTURE time, so the graph rings 1 on every replay and a host waiting for a change waits forever.  It
-/// would have looked like a working doorbell on the first token, which is the worst way for it to be wrong.
-/// **THE FENCE IS NOT DECORATION.**
-///
-/// The ring PUBLISHES three buffers the host is about to read - `h_x_f`, `h_ids`, `h_weights` - so the increment
-/// must be ordered after their writes, or the host can observe the ring and then read a payload that has not
-/// landed.  `__threadfence_system()` is what orders them, and it covers the HOST as well as the device, which is
-/// the whole point: the reader is the CPU.
-///
-/// Without it a memory-only spin never sees the datum flip: the write is not ordered into host-visible memory,
-/// so no amount of reading it shows it, and only a driver call flushing the pipeline makes it appear.  The fence
-/// orders the write; `session_loop` still makes its per-iteration driver call.
-///
-/// **THE STORE IS VOLATILE**, like `doorbell_publish_kernel`'s.  A plain store to mapped pinned
-/// memory may stay in the GPU's L2 until the stream is synchronized, so the host would never see the ring.
-__global__ void doorbell_ring_kernel(uint32_t* seq) {
-    __threadfence_system();
-    *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
-}
-
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
     const uint32_t want = *seq;
     while (*flag != want) spin_pause();
@@ -370,13 +346,6 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
     if (n <= 0) return;
     copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
-}
-
-void doorbell_ring(uint32_t* d_seq, void* stream) {
-    if (d_seq == nullptr) return;
-    doorbell_ring_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_seq);
-    check_launch("doorbell_ring");
-    sync_if_needed(stream, "doorbell_ring");
 }
 
 void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream) {

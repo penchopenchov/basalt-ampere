@@ -202,34 +202,6 @@ void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream) 
     }
 }
 
-/// `beta = sigmoid(beta)`, in place, over the `h_v` per-head scalars.
-///
-/// **THIS IS `build_layer_attn_linear`'s SIGMOID, AND LEAVING IT OUT IS WRONG.**  The reference computes
-/// `beta = ggml_sigmoid(ssm_beta @ cur)` and hands the RESULT to the delta net; `gdn_step_kernel` is documented
-/// as `d[h,j] = (v[h,j] - sk[h,j]) * beta[h]` and applies no sigmoid of its own, so the layer glue owes it one.
-/// Passing the raw pre-activation, which is unbounded and signed, makes the delta-net write strength stop being
-/// a fraction and the whole recurrence wrong from layer 0.
-///
-/// **`gdn_parity` CANNOT SEE IT, BECAUSE THAT TEST SUPPLIES ITS OWN `beta`.**  The step kernel is right; the
-/// glue between the projection and the kernel is what owes the sigmoid, so the layer-level parity test is the check.
-__global__ void gdn_beta_gate_kernel(float* __restrict__ beta, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) beta[i] = sigmoid_f(beta[i]);
-}
-
-void gdn_beta_gate(float* beta, int64_t h_v, void* stream) {
-    if (beta == nullptr || h_v <= 0) return;
-    const int n = (int) h_v;
-    gdn_beta_gate_kernel<<<(unsigned) ((n + 127) / 128), 128, 0, (cudaStream_t) stream>>>(beta, n);
-    if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "gdn_beta_gate: %s\n", cudaGetErrorString(e));
-            std::exit(1);
-        }
-    }
-}
-
 void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* y, int64_t h_v, int64_t S,
                   float eps, void* stream) {
     if (h_v <= 0 || S <= 0) return;
