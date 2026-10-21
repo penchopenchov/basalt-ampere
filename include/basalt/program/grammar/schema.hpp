@@ -1,0 +1,49 @@
+// include/basalt/program/grammar/schema.hpp - GBNF text built from a JSON schema or from a tool list.
+//
+// json_schema_to_gbnf covers type (also lists), enum, const, properties/required/additionalProperties, items,
+// prefixItems, minItems/maxItems, minLength/maxLength, format (date, time, date-time, uuid), anyOf/oneOf/allOf and local
+// $ref. Keywords with no grammar form (pattern, numeric bounds, uniqueItems, ...) are left to a validator after the
+// fact: a pattern accepts any string, a bound any number.
+//
+// tool_call_gbnf writes the tool-call text the server parses:
+//   <tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n</function>\n</tool_call>
+// where VALUE follows the declared type: raw text for strings (anything but a closing </parameter>), JSON otherwise.
+#pragma once
+
+#include <memory>
+#include <string>
+
+#include "basalt/program/grammar/grammar.hpp"
+
+namespace basalt::program::grammar {
+
+/// GBNF with a `root` rule for the schema (JSON text). Empty with `err` set on bad JSON or an unresolvable $ref.
+std::string json_schema_to_gbnf(const std::string& schema_json, std::string& err);
+
+struct ToolGrammarOptions {
+    bool params_in_order = true;     ///< parameters follow the declared order (optional ones may be left out)
+    bool multiple_calls = true;      ///< more than one <tool_call> block
+};
+
+/// `tools_json` is an array of {name, parameters:{properties, required}} (or the OpenAI {type:"function",
+/// function:{...}} wrapper). Empty with `err` set on bad input or an empty list.
+std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptions& opt, std::string& err);
+
+/// The text that starts a tool call: the lazy trigger for tool_call_gbnf.
+inline const char* tool_call_trigger() { return "<tool_call>"; }
+
+/// What the engine needs for one request: the parsed grammar and when it starts.
+struct RequestGrammar {
+    std::shared_ptr<const Grammar> grammar;   ///< null: nothing to enforce
+    Triggers triggers;                        ///< empty: enforce from the first answer token
+};
+
+/// Builds the grammar from the request's "grammar" JSON object:
+///   {"kind":"tools","tools":[<OpenAI tool objects>],"tool_choice":<as received>}   lazy, trigger "<tool_call>"
+///   {"kind":"json_schema","schema":{...}}                                          from the first answer token
+///   {"kind":"json_object"}                                                         any JSON object
+/// tool_choice "none" gives a null grammar; a named choice keeps only that tool. A null grammar with empty `err` is
+/// not an error; an unusable request sets `err`.
+RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err);
+
+}  // namespace basalt::program::grammar
