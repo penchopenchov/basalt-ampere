@@ -79,11 +79,11 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 
 class ExpertPool {
 public:
-    /// `n_workers <= 0` means "every physical core except the first".  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
+    /// `n_workers` is the worker count (at least 1); the caller sizes it (see program/auto_plan).  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
     /// The host thread joins the drain: `run()` claims jobs itself instead of spinning on `done_`, so the pool uses
     /// every core.
-    explicit ExpertPool(int n_workers = 0, PoolAffinity affinity = PoolAffinity::All);
+    explicit ExpertPool(int n_workers, PoolAffinity affinity = PoolAffinity::All);
     /// The watchdog's view of the pool: the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
@@ -97,8 +97,6 @@ public:
     /// created.  Host thread only, between batches: it waits for every worker to park first.  Work is split by the
     /// active count, so a given count always cuts the same tasks, and outputs do not depend on the count.
     int set_active_workers(int k);
-    /// The cgroup CPU quota, in CPUs, that capped the default worker count; 0 when it did not.
-    double quota_limit() const { return quota_limit_; }
     bool is_hybrid() const { return topo_.is_hybrid; }
     int p_cores() const { return topo_.p_cores; }
     int p_threads() const { return topo_.p_threads; }
@@ -176,7 +174,6 @@ private:
     int n_ = 0;
     /// Workers with id < active_ take work; written only while every worker is parked, before the next publish.
     std::atomic<int> active_{0};
-    double quota_limit_ = 0.0;
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;
     /// The host's own scratch .  A separate object rather than a share of `scratch_[i]`,

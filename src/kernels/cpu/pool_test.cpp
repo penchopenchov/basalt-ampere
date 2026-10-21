@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
     std::printf("  %-44s %d logical, %d physical (skipping the first)\n", "cores the pool will use",
                 hw, (int) cores.size());
 
-    cpu::ExpertPool pool;
+    cpu::ExpertPool pool((std::max)(1, (int) cores.size()));
     std::printf("  %-44s %d\n", "workers", pool.workers());
 
     std::vector<cpu::ExpertJob> jobs((size_t) NEXP);

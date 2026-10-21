@@ -13,6 +13,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -45,7 +46,7 @@ int main(int argc, char** argv) {
         jobs[(size_t) e].slot = e;
     }
 
-    cpu::ExpertPool pool;
+    cpu::ExpertPool pool((std::max)(1, (int) cpu::physical_cores(true).size()));
     std::printf("pool_stress: %d workers + host, %.0f s\n", pool.workers(), seconds);
     pool.run(jobs.data(), NJ);
     const std::vector<float> ref = out;

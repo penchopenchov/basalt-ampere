@@ -176,6 +176,16 @@ int main(int argc, char** argv) {
     }
     const auto allowed = original.ids();
 
+    // The pool takes its size from the caller as given (the sizing rules live in program/auto_plan).
+    {
+        cpu::ExpertPool three(3, cpu::PoolAffinity::All);
+        cpu::ExpertPool none(0, cpu::PoolAffinity::Auto);
+        if (three.workers() != 3 || none.workers() != 1) {
+            std::fprintf(stderr, "affinity test: pool sizes %d / %d, expected 3 / 1\n", three.workers(), none.workers());
+            return 1;
+        }
+    }
+
     const bool ok = topology_under_masks(allowed, require_high);
     const bool restored = original.restore() && expect_affinity(allowed, "final original affinity cleanup");
     if (!ok || !restored) return 1;

@@ -1,7 +1,6 @@
 // src/kernels/cpu/pool.cpp - the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/core/progress.hpp"
-#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -59,23 +58,7 @@ void ExpertPool::diag(std::FILE* f) const {
 
 ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     : affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
-    if (n_workers > 0) {
-        n_ = n_workers;
-    } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
-        n_ = (std::max)(1, topo_.p_cores - 1);
-    } else {
-        n_ = (int) topo_.worker_cores.size();
-    }
-    // A cgroup CPU quota below the allowed CPUs throttles every thread of the group once its time slice is spent, and
-    // spinning workers use theirs on nothing: the workers and the host thread together must fit the quota.
-    if (n_workers <= 0) {
-        const double quota = cgroup_cpu_quota();
-        const int fit = (std::max)(1, (int) quota - 1);
-        if (quota > 0 && fit < n_) {
-            n_ = fit;
-            quota_limit_ = quota;
-        }
-    }
+    n_ = n_workers;
     if (n_ < 1) n_ = 1;
     active_.store(n_);
     scratch_.resize((size_t) n_);

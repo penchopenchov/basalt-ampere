@@ -270,7 +270,7 @@ int main(int argc, char** argv) {
             r.sink.fetch_add(x);
             r.done.fetch_add(1);
         };
-        cpu::ExpertPool pool;
+        cpu::ExpertPool pool((std::max)(1, (int) cpu::physical_cores(true).size()));
         std::vector<double> cold, readus, warm;
         int pick = 0;
         for (int it = 0; it < 40; ++it) {

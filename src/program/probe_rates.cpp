@@ -7,6 +7,7 @@
 
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/dec_moe.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -216,7 +217,7 @@ void step_facts(Probe& P) {
            (unsigned long long) (platform::total_physical_memory() >> 20),
            (unsigned long long) (platform::available_memory() >> 20), std::thread::hardware_concurrency(),
            pool.workers(), pool.active_workers(), pool.p_cores(), pool.e_cores(),
-           pool.is_hybrid() ? 1 : 0, pool.quota_limit());
+           pool.is_hybrid() ? 1 : 0, C::cgroup_cpu_quota());
     if (P.have_layout)
         P.line("pack", "layers=%lld experts=%lld gu_type=%d down_type=%d blob_bytes=%zu top_k=%d ram_blobs=%zu",
                (long long) P.env.n_layers, (long long) P.env.n_expert, P.fmt.gu_type, P.fmt.d_type, P.fmt.bytes,
