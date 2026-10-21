@@ -17,6 +17,7 @@ MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-c
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer")       # relative to the config file
+GRAMMAR_DEFAULT = False                     # the `grammar` option when neither the file nor the command line sets it
 
 
 def engine_flags_of(engine_bin: str) -> set[str] | None:
@@ -33,6 +34,18 @@ def server_options(ap: argparse.ArgumentParser) -> dict:
     """{name: action} of the server's own options (names without the dashes), apart from --config and --help."""
     return {o[2:]: act for act in ap._actions for o in act.option_strings
             if o.startswith("--") and o[2:] not in ("help", "config")}
+
+
+def grammar_words(on: bool, known: set[str] | None, vocab_path: str | None = None) -> list[str]:
+    """The engine words for the `grammar` option: `--grammar on` only when it is on and the engine binary has the
+    flag, so an engine without it still starts (the caller says so when it is on and the flag is missing);
+    `--grammar-vocab PATH` too when the binary has that flag and a vocabulary file was written."""
+    if not on or known is None or "--grammar" not in known:
+        return []
+    words = ["--grammar", "on"]
+    if vocab_path and "--grammar-vocab" in known:
+        words += ["--grammar-vocab", vocab_path]
+    return words
 
 
 def split_engine_extras(extras: list[str]) -> list[str]:
@@ -336,6 +349,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request with 400")
+    ap.add_argument("--grammar", action="store_true", default=GRAMMAR_DEFAULT,
+                    help="constrain tool calls and JSON response formats with a grammar in the engine (a request "
+                         "with strict: true gets it either way)")
     ap.add_argument("--api-key", default="",
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); command line only, "
                          "not allowed in a --config file")

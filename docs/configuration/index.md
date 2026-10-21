@@ -99,6 +99,7 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `lazy` | switch | off | Start the text-only API unloaded and load the model on the first request. Turns vision off. |
 | `idle-unload` | seconds | off | Unload the model after this long without requests; the next request loads it again. Frees VRAM for other programs. |
 | `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free, otherwise answer 503. Pairs with `lazy` and `idle-unload`. |
+| `grammar` | switch | off | Hold tool calls and JSON response formats to their schema inside the engine, so a malformed call or object cannot be produced. A request with `strict: true` on its schema or a tool gets it either way. Needs an engine that has `--grammar`; the server passes it on. |
 | `debug` | switch | off | One log line per request and the raw model text after each reply. |
 | `request-lines` | switch | off | Echo the engine's per-request summary on stdout, for a supervisor that sees only that output. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |

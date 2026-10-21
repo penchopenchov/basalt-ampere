@@ -11,9 +11,12 @@ context are rejected with a 400, never truncated.
 """
 from __future__ import annotations
 
+import atexit
 import json
+import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
@@ -22,8 +25,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
+from serve.api.grammar import write_vocab  # noqa: E402
 from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line,  # noqa: E402
-                          parse_settings, sampling_defaults_from_config, sampling_line)
+                          grammar_words, parse_settings, sampling_defaults_from_config, sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.flags import flag_index  # noqa: E402
@@ -154,8 +158,19 @@ def main() -> int:
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
+        known_flags = engine_flags_of(cfg["engine_bin"])
+        has_grammar = known_flags is not None and "--grammar" in known_flags
+        if a.grammar and not has_grammar:
+            print("[server] warning: grammar is on but this engine has no --grammar; requests go without one", flush=True)
+        vocab_path = None
+        if a.grammar and has_grammar and "--grammar-vocab" in known_flags and hasattr(tok, "token_types"):
+            fd, vocab_path = tempfile.mkstemp(prefix="basalt-vocab-", suffix=".txt")
+            os.close(fd)
+            atexit.register(lambda p=vocab_path: os.path.exists(p) and os.remove(p))
+            write_vocab(tok, vocab_path)
+        gwords = grammar_words(a.grammar, known_flags, vocab_path)
         try:
-            engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg), log=cfg.get("log"), env=env, lazy=lazy)
+            engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=lazy)
         except EngineStartError as e:
             print(f"[server] error: {e}", file=sys.stderr, flush=True)
             if e.log:
@@ -171,7 +186,8 @@ def main() -> int:
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
-                  sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens)
+                  sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
+                  grammar_engine=bool(a.mock_engine or has_grammar))
     svc.logs = logs
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):
