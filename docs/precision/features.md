@@ -101,6 +101,17 @@ boost, a mixed map, with and without a presence penalty) return the same text wi
 `--spec 0`, and a request with an empty map matches one without the field. A -100 bias never yields the token and
 a +100 bias yields it at every step.
 
+## Request grammar
+
+A request with a `grammar` key (engine started with `--grammar on`) is checked on the host after each verify window.
+The tokens are fed to the grammar in order; at the first one it refuses, that row is drawn again with the grammar's
+mask added to the request's logit bias (same filters, penalties and position draw), and the window ends there, so the
+drafts after it are dropped like a rejection. A window the grammar accepts is untouched: no extra launch or sync.
+Tool-call grammars start at the call opener, JSON grammars at the first token after the thinking block. Relaxed
+drafting is off for a request with a grammar. The prompt is never constrained. Requests without the key, and the engine
+with `--grammar off`, run the unchanged path. Keywords the grammar cannot express (patterns, numeric bounds) are not
+enforced.
+
 ## Speculative decoding does not change output
 
 Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width

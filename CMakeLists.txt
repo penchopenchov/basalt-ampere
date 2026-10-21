@@ -467,8 +467,8 @@ endif()
 # -DBASALT_GRAMMAR_MODEL=<pack>, with python3)
 if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
   add_test(NAME grammar_engine_test
-           COMMAND  /tests/program/grammar_engine_test.py
-                   $<TARGET_FILE:basalt>  )
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_engine_test.py
+                   $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_ARGS})
   set_property(TEST grammar_engine_test APPEND PROPERTY LABELS gpu)
   set_tests_properties(grammar_engine_test PROPERTIES TIMEOUT 900)
 endif()
