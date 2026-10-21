@@ -50,22 +50,3 @@ def engine_key(spec: dict | None) -> str:
     text = json.dumps(spec, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     return " grammar=" + text.replace(" ", "\\u0020")
 
-
-END_TEXTS = ("<|im_end|>", "<|endoftext|>")
-
-
-def write_vocab(tok, path) -> int:
-    """Write the token-id -> bytes table the engine needs (it has no tokenizer) and return the token count.
-    Line 1: `end ID...` (the end tokens); then one line per id with the token's bytes in hex. Control tokens and
-    anything outside the byte alphabet are empty lines, never allowed by a grammar."""
-    types = getattr(tok, "token_types", None) or []
-    end = [tok.ids[t] for t in END_TEXTS if t in tok.ids]
-    with open(path, "w", encoding="ascii", newline="\n") as f:
-        f.write("end " + " ".join(map(str, end)) + "\n")
-        for i in range(len(tok.tokens)):
-            try:
-                raw = b"" if i < len(types) and types[i] == 3 else tok.token_bytes(i)
-            except KeyError:
-                raw = b""
-            f.write(raw.hex() + "\n")
-    return len(tok.tokens)

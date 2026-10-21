@@ -11,12 +11,9 @@ context are rejected with a 400, never truncated.
 """
 from __future__ import annotations
 
-import atexit
 import json
-import os
 import signal
 import sys
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
@@ -25,7 +22,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
-from serve.api.grammar import write_vocab  # noqa: E402
 from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line,  # noqa: E402
                           grammar_words, parse_settings, sampling_defaults_from_config, sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
@@ -162,13 +158,10 @@ def main() -> int:
         has_grammar = known_flags is not None and "--grammar" in known_flags
         if a.grammar and not has_grammar:
             print("[server] warning: grammar is on but this engine has no --grammar; requests go without one", flush=True)
-        vocab_path = None
-        if a.grammar and has_grammar and "--grammar-vocab" in known_flags and hasattr(tok, "token_types"):
-            fd, vocab_path = tempfile.mkstemp(prefix="basalt-vocab-", suffix=".txt")
-            os.close(fd)
-            atexit.register(lambda p=vocab_path: os.path.exists(p) and os.remove(p))
-            write_vocab(tok, vocab_path)
-        gwords = grammar_words(a.grammar, known_flags, vocab_path)
+        gwords = grammar_words(known_flags)
+        if gwords:
+            print(f"[server] grammar: engine {' '.join(gwords)}, "
+                  f"{'every tool and JSON request' if a.grammar else 'strict requests'} get the key", flush=True)
         try:
             engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=lazy)
         except EngineStartError as e:
