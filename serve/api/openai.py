@@ -1,4 +1,4 @@
-"""OpenAI chat completion chunks, their non-streaming collection and structured-output buffering."""
+"""OpenAI chat completion chunks, and their non-streaming collection."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,6 @@ import uuid
 
 from serve.frontend import Event
 from serve.service import Service
-from serve.api.structured import validated_json
 
 
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
@@ -97,27 +96,3 @@ def openai_collect(chunks) -> dict:
     if last.get("timings"):
         out["timings"] = last["timings"]
     return out
-
-
-def structured_chunks(chunks, validator):
-    """Buffer structured streams so a client never receives unvalidated content."""
-    buffered = []
-    heartbeat = time.monotonic()
-    try:
-        for chunk in chunks:
-            if chunk is not None:
-                buffered.append(chunk)
-            if chunk is None or time.monotonic() - heartbeat >= 1:
-                heartbeat = time.monotonic()
-                yield None
-        result = openai_collect(buffered)
-        choice = result["choices"][0]
-        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
-        yield buffered[0]
-        delta = {"content": content}
-        if choice["message"].get("reasoning_content"):
-            delta["reasoning_content"] = choice["message"]["reasoning_content"]
-        yield {**buffered[0], "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-        yield buffered[-1]
-    finally:
-        chunks.close()

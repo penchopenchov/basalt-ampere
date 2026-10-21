@@ -1,4 +1,4 @@
-"""Exercise the JSON contract through HTTP, including H3's strict Story shape."""
+"""JSON response formats through HTTP: the request is checked, the engine gets the grammar, the text passes as is."""
 import json
 import unittest
 import urllib.error
@@ -7,17 +7,10 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.api import structured
 from serve.engine.mock import MockEngine
 from serve.handler import serve
 from serve.service import Service
 from serve.util.text import ByteTokenizer
-
-try:
-    import jsonschema  # noqa: F401
-    HAVE_JSONSCHEMA = True
-except ImportError:                  # optional: json_schema answers are then only checked to be one object
-    HAVE_JSONSCHEMA = False
 
 
 STORY = {"title": "Photobooth", "sheet": "A single continuous shot.", "cast": [],
@@ -58,7 +51,8 @@ class Structured(unittest.TestCase):
     def setUp(self):
         self.tok = ByteTokenizer()
         self.engine = MockEngine(self.tok, json.dumps(STORY), max_context=16384)
-        self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja"))
+        self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).resolve().parents[1] / "chat_template.jinja"),
+                           grammar=True)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -74,13 +68,14 @@ class Structured(unittest.TestCase):
                "response_format": FORMAT, "reasoning_effort": "none", **kwargs}
         return self.request("/v1/chat/completions", req)
 
-    def test_h3_schema_success_and_stream_with_reasoning(self):
+    def test_schema_request_carries_the_grammar_and_no_prompt_directive(self):
         code, reply = self.chat()
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]), STORY)
-        prompt = self.tok.decode(self.engine.last_prompt)
-        self.assertIn("OUTPUT FORMAT REQUIREMENT", prompt)
-        self.assertIn('"duration_ms"', prompt)
+        self.assertEqual(self.engine.requests[-1][1]["_grammar"], {"kind": "json_schema", "schema": STORY_SCHEMA})
+        self.assertNotIn("OUTPUT FORMAT REQUIREMENT", self.tok.decode(self.engine.last_prompt))
+
+    def test_stream_with_reasoning(self):
         code, raw = self.chat("Consider the shot.</think>\n" + json.dumps(STORY), stream=True, reasoning_effort="low")
         self.assertEqual(code, 200)
         chunks = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
@@ -89,45 +84,30 @@ class Structured(unittest.TestCase):
         self.assertIn("reasoning_content", raw)
         self.assertIn("data: [DONE]", raw)
 
-    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
-    def test_invalid_generation_is_an_error_and_never_streams_content(self):
-        for script in ("## Film Plan - Photobooth", '{"title":"Only a title"}',
-                       json.dumps({**STORY, "extra": True}),
-                       json.dumps({**STORY, "boxes": [{**STORY["boxes"][0], "duration_ms": "15000"}]})):
-            with self.subTest(script=script):
-                code, reply = self.chat(script)
-                self.assertEqual(code, 502)
-                self.assertEqual(reply["error"]["code"], "structured_output_failed")
-                _, raw = self.chat(script, stream=True)
-                self.assertIn('"structured_output_failed"', raw)
-                self.assertNotIn('"delta"', raw)
-                self.assertIn("data: [DONE]", raw)
+    def test_the_answer_is_not_checked_after_the_fact(self):
+        for script in ("## Film Plan - Photobooth", '{"title":"Only a title"}'):
+            code, reply = self.chat(script)
+            self.assertEqual(code, 200)
+            self.assertEqual(reply["choices"][0]["message"]["content"], script)
 
-    def test_object_mode_strict_json_and_truncation(self):
-        fmt = {"type": "json_object"}
-        self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
-        for script in ('[]', '{"x":NaN}', '{"x":1,"x":2}', '{"x":1e999}', '```json\n{}\n```'):
-            self.assertEqual(self.chat(script, response_format=fmt)[0], 502)
-        self.assertEqual(self.chat('{"answer":4}', response_format=fmt, max_tokens=5)[0], 502)
-        # Plain text callers retain normal streaming, without a JSON validation gate.
+    def test_object_mode(self):
+        code, reply = self.chat('{"answer":4}', response_format={"type": "json_object"})
+        self.assertEqual(code, 200)
+        self.assertEqual(self.engine.requests[-1][1]["_grammar"], {"kind": "json_object"})
+        # Plain text callers get no grammar.
         self.assertEqual(self.chat("Prose.", response_format={"type": "text"})[0], 200)
+        self.assertIsNone(self.engine.requests[-1][1]["_grammar"])
 
-    def test_rejected_schema_does_not_load_the_engine_or_retry(self):
+    def test_rejected_schema_does_not_load_the_engine(self):
         with mock.patch.object(self.svc, "load") as load:
             code, _ = self.chat(response_format={"type": "json_schema"})
             self.assertEqual(code, 400)
             load.assert_not_called()
-        self.engine = self.svc.engine = MockEngine(self.tok, "Markdown is not JSON", max_context=16384)
-        with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generate:
-            self.assertEqual(self.chat()[0], 502)
-            self.assertEqual(generate.call_count, 1)
 
-    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
-    def test_invalid_schema_is_400_and_local_refs_work(self):
-        for schema in ({"type": "object", "properties": {"x": {"type": "invalid"}}},
-                       {"type": "object", "$ref": "https://other.example/schema"}):
-            fmt = {"type": "json_schema", "json_schema": {"name": "test", "strict": True, "schema": schema}}
-            self.assertEqual(self.chat(response_format=fmt)[0], 400)
+    def test_remote_refs_are_400_and_local_refs_work(self):
+        remote = {"type": "object", "$ref": "https://other.example/schema"}
+        fmt = {"type": "json_schema", "json_schema": {"name": "test", "strict": True, "schema": remote}}
+        self.assertEqual(self.chat(response_format=fmt)[0], 400)
         schema = object_schema({"answer": {"$ref": "#/$defs/n"}})
         schema["$defs"] = {"n": {"type": "integer"}}
         fmt = {"type": "json_schema", "json_schema": {"name": "local", "schema": schema}}
@@ -145,23 +125,12 @@ class Structured(unittest.TestCase):
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
             load.assert_not_called()
 
-    def test_without_jsonschema_an_object_is_still_required(self):
-        # jsonschema is optional and not imported at server start
-        with mock.patch.object(structured, "_jsonschema", False):
-            self.assertEqual(self.chat()[0], 200)
-            for script in ("## Film Plan - Photobooth", "[1, 2]"):
-                code, reply = self.chat(script)
-                self.assertEqual(code, 502, script)
-                self.assertEqual(reply["error"]["code"], "structured_output_failed")
-            self.assertEqual(self.chat('{"answer":4}', response_format={"type": "json_object"})[0], 200)
-
-    def test_the_server_does_not_import_jsonschema_at_start(self):
-        import subprocess
-        import sys
-        code = ("import sys; import serve.server; "
-                "sys.exit(1 if any(m == 'jsonschema' or m.startswith('jsonschema.') for m in sys.modules) else 0)")
-        r = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[2]))
-        self.assertEqual(r.returncode, 0)
+    def test_no_grammar_option_leaves_the_key_out(self):
+        self.svc.grammar = False
+        self.chat()
+        self.assertEqual(self.engine.requests[-1][1]["_grammar"], {"kind": "json_schema", "schema": STORY_SCHEMA})  # strict: true
+        self.chat(response_format={"type": "json_object"})
+        self.assertIsNone(self.engine.requests[-1][1]["_grammar"])
 
 
 if __name__ == "__main__":

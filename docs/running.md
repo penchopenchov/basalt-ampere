@@ -53,7 +53,7 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
   draw would have been another token. Lower P is faster and further from the model's true sampling distribution; the
   measured speed and cost per value are in [precision/features.md](precision/features.md#relaxed-drafting). Off by default:
   without it, speculative decoding returns exactly what plain sampling would. Greedy (temperature 0) requests,
-  `logit_bias`, JSON `response_format`, control tokens and everything inside a tool call stay exact. A request can set
+  `logit_bias`, a request with a grammar (JSON `response_format`, tools), control tokens and everything inside a tool call stay exact. A request can set
   its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream decoding only; `--parallel` slots
   stay exact.
 - The startup line `[server] engine: ...` lists the settings that came from the file or the command line, then the grammar state; with

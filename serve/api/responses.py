@@ -330,13 +330,11 @@ def template_kwargs(req: dict) -> dict:
 class Assembler:
     """Builds one response's output items and typed events from Service.run's events."""
 
-    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool,
-                 json_mode: bool = False):
-        self.names, self.encrypted, self.json_mode = names, encrypted, json_mode
+    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool):
+        self.names, self.encrypted = names, encrypted
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item = None                             # the open output item
-        self.json_text = []                          # structured output: the answer, held until it is checked
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
         self.response = {
             "id": new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
@@ -427,10 +425,6 @@ class Assembler:
         elif kind == "content":
             if not ev.text:
                 return out
-            if self.json_mode:                       # sent once it is checked (finish)
-                out += self.close()
-                self.json_text.append(ev.text)
-                return out
             if self.item is None or self.item["type"] != "message":
                 out += self.close()
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
@@ -479,20 +473,12 @@ class Assembler:
             item["namespace"] = namespace
         return item
 
-    def finish(self, done: dict, validate=None) -> list[dict]:
-        """Close open items, then response.completed (or .incomplete on length). `validate` checks structured text."""
+    def finish(self, done: dict) -> list[dict]:
+        """Close open items, then response.completed (or .incomplete on length)."""
         length = done.get("finish") == "length"
         # an open call was cut off: incomplete whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
         out = self.close("incomplete" if length or unfinished else "completed")
-        if self.json_mode:
-            text = validate("".join(self.json_text), done.get("finish"))
-            out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress", "role": "assistant",
-                               "content": []})
-            self.item["content"][0]["text"] = text
-            out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
-                                  content_index=0, delta=text, logprobs=[]))
-            out += self.close()
         n = done.get("completion_tokens", 0)
         prompt = done.get("prompt_tokens", self.prompt_tokens)
         self.response["usage"] = {

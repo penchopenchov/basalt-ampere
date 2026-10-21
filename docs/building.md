@@ -21,7 +21,7 @@ run on a synthetic expert fixture; pass `--file experts.bin` (the pack's experts
 and says so; it skips the lock case only when the limit is too low to lock anything.
 
 The server tests run with `python -m unittest discover -s serve/tests -t .` after `pip install -r requirements-test.txt`
-(the server's requirements plus `jsonschema`, which the json_schema tests need). Two tokenizer tests read the pack's
+(the server's requirements). Two tokenizer tests read the pack's
 vocabulary and skip without a pack; the same checks run on a synthetic vocabulary in the same file. The test that runs
 the built engine with every flag needs `bin/basalt`.
 

@@ -18,6 +18,7 @@ from serve.security import LOOPBACK_NAMES
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
 from serve.engine.vision import Vision
 from serve.api.grammar import grammar_spec
+from serve.config import GRAMMAR_DEFAULT
 
 
 IMAGE_PAD = "<|image_pad|>"
@@ -50,7 +51,7 @@ DEBUG = False            # --debug: one line per request plus the raw model text
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False, grammar: bool = False, grammar_engine: bool = True):
+                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
@@ -416,8 +417,8 @@ class Service:
         return {
             "service": "basalt", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+            "structured_output": {"formats": ["json_object", "json_schema"], "method": "grammar",
+                                  "constrained_decoding": bool(self.grammar_engine), "stream_buffered": False},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,

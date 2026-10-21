@@ -17,7 +17,7 @@ MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-c
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer")       # relative to the config file
-GRAMMAR_DEFAULT = False                     # the `grammar` option when neither the file nor the command line sets it
+GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
 
 def engine_flags_of(engine_bin: str) -> set[str] | None:
@@ -352,7 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request with 400")
     ap.add_argument("--grammar", action=argparse.BooleanOptionalAction, default=GRAMMAR_DEFAULT,
-                    help="hold every tool call and JSON response format to a grammar in the engine (a request "
+                    help="hold every tool call and JSON response format to a grammar in the engine (on by default; a request "
                          "with strict: true gets it either way); --no-grammar turns it off")
     ap.add_argument("--api-key", default="",
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); command line only, "

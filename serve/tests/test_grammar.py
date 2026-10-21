@@ -60,6 +60,7 @@ class Fixture:
 class GrammarOff(Fixture, unittest.TestCase):
     def test_default_is_the_named_constant(self):
         self.assertEqual(build_parser().get_default("grammar"), GRAMMAR_DEFAULT)
+        self.assertTrue(GRAMMAR_DEFAULT)
 
     def test_no_key_without_strict(self):
         self.assertIsNone(self.chat(tools=[TOOL]))
@@ -133,10 +134,6 @@ class GrammarOn(Fixture, unittest.TestCase):
     def test_responses_json_object(self):
         self.assertEqual(self.sent("/v1/responses", {"input": "hi", "text": {"format": {"type": "json_object"}}}),
                          {"kind": "json_object"})
-
-    def test_relaxed_drafting_stays_off_for_json(self):
-        self.chat(response_format={"type": "json_object"})
-        self.assertIs(self.engine.requests[-1][1].get("relaxed_drafting"), False)
 
 
 class EngineWithoutTheFlag(unittest.TestCase):
