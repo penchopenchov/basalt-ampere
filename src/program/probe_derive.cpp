@@ -58,13 +58,12 @@ double share_gain(const std::vector<ShareTrial>& trials, double base, double can
 std::string suggest_workers(const ProbeRates& rates, const WorkerPick& pick) {
     const int cur = rates.active_workers > 0 ? rates.active_workers : rates.pool_workers;
     if (pick.workers <= 0 || pick.workers >= cur) return "";
-    return fmt("--pool-workers %d (CPU experts %.0f us each vs %.0f us best, frees %d cores)", pick.workers, pick.us_pick,
-               pick.us_best, cur - pick.workers);
+    return fmt("--pool-workers %d (%.0f us/expert, best %.0f us)", pick.workers, pick.us_pick, pick.us_best);
 }
 
 std::string suggest_share(double candidate, double base, double gain) {
     if (std::fabs(candidate - base) < 1e-9) return "";
-    return fmt("--prefill-cpu-share %.2f (prompt chunk %+.0f%% vs %.2f, live 8k chunks)", candidate, gain * 100.0, base);
+    return fmt("--prefill-cpu-share %.2f (prefill %+.0f%%)", candidate, gain * 100.0);
 }
 
 }  // namespace basalt::program

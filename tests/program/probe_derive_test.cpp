@@ -22,7 +22,7 @@ int main() {
     WorkerPick p;
     // 50.5 is within 2% of 50: the smallest count that is
     CHECK(pick_workers(r, 8, 0.02, p) && p.workers == 8 && p.us_best == 50 && p.us_pick == 50.5);
-    CHECK(!suggest_workers(r, p).empty() && suggest_workers(r, p).find("--pool-workers 8") == 0);
+    CHECK(!suggest_workers(r, p).empty() && suggest_workers(r, p)== "--pool-workers 8 (50 us/expert, best 50 us)");
     // 54 is not
     r.cpu_expert[6].per_entry_us = 56;
     CHECK(pick_workers(r, 8, 0.02, p) && p.workers == 15);
@@ -43,7 +43,7 @@ int main() {
     CHECK(mean_ms_at(t, 0.3) == 0.0);
     CHECK(std::fabs(share_gain(t, 0.6, 0.5) - (1950.0 / 1880.0 - 1.0)) < 1e-9);
     CHECK(share_gain(t, 0.6, 0.3) == 0.0);
-    CHECK(suggest_share(0.5, 0.6, 0.037).find("--prefill-cpu-share 0.50 (prompt chunk +4%") == 0);
+    CHECK(suggest_share(0.5, 0.6, 0.037) == "--prefill-cpu-share 0.50 (prefill +4%)");
     CHECK(suggest_share(0.6, 0.6, 0.1).empty());
 
     std::printf(g_fail ? "probe_derive_test: FAILED\n" : "probe_derive_test: ok\n");

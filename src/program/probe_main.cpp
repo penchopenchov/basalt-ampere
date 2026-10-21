@@ -244,7 +244,11 @@ int main(int argc, char** argv) {
         WorkerPick wp;
         if (pick_workers(rates, 8, kWorkerTolerance, wp)) {
             const std::string s = suggest_workers(rates, wp);
-            if (!s.empty()) suggested.push_back(s);
+            if (!s.empty()) {
+                suggested.push_back(s);
+                std::fprintf(stderr, "basalt-probe: pool pick %d frees %d cores\n", wp.workers,
+                             (rates.active_workers > 0 ? rates.active_workers : rates.pool_workers) - wp.workers);
+            }
         }
         const std::string given = arg_value(args, "--prefill-cpu-share");
         const double base = given.empty() ? 0.6 : std::atof(given.c_str());
