@@ -3644,8 +3644,9 @@ bool Verifier::resample_row(int t, int64_t pos0, const std::vector<float>& bias,
     const OnDevice on_device(device_);
     if (head_logits_ == nullptr || t < 0 || bias.size() != (size_t) n_vocab_) { err = "resample_row: no such row or a bad bias"; return false; }
     const size_t bytes = bias.size() * sizeof(float);
+    // on cs_ itself: the stream does not order against a plain cudaMemcpy, so the draw could read the previous bias
     if ((!row_bias_device_ && cudaMalloc((void**) &row_bias_device_, bytes) != cudaSuccess) ||
-        cudaMemcpy(row_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaMemcpyAsync(row_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
         err = "resample_row: the bias upload failed";
         return false;
     }

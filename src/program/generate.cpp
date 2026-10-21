@@ -8,6 +8,7 @@
 
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/logit_bias.hpp"
+#include "basalt/program/grammar/guard.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -422,6 +423,9 @@ struct Options {
     /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
     /// docs/precision/features.md.  Solo decode only; a request's relax=P key overrides it.
     float relaxed_drafting = 0.0f;
+    /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
+    /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
+    bool grammar = false;
     /// Never relaxed: the added tokens (control and tool tags, ids from relax_special_from on) and every token
     /// between the tool-call tags, so tool calls are sampled exactly.
     int64_t relax_special_from = 248044;
@@ -686,6 +690,8 @@ void usage() {
                  "                       (docs/precision/features.md).  P in (0, 1]; lower is faster and further from exact;\n"
                  "                       the flag alone = 0.5.  Tool calls, control tokens, logit_bias and greedy\n"
                  "                       requests stay exact.  Default off (exact)\n"
+                 "  --grammar on|off     --serve: enforce a request's \"grammar\" (tool-call, JSON-schema or JSON-object\n"
+                 "                       grammar) on the sampled tokens; the vocabulary comes from the pack.  Default off\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
@@ -1345,6 +1351,11 @@ int main(int argc, char** argv) {
                     o.relaxed_drafting = v;
                 }
             }
+        }
+        else if (a == "--grammar") {
+            const std::string v = next("--grammar");
+            if (v != "on" && v != "off") { std::fprintf(stderr, "--grammar: on or off\n"); return 2; }
+            o.grammar = v == "on";
         }
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
@@ -3022,6 +3033,23 @@ int main(int argc, char** argv) {
     const basalt::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "basalt generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
+    // --grammar on: the token texts the grammar walks, read from the pack's tokenizer files
+    std::optional<basalt::program::grammar::PackVocab> grammar_vocab;
+    if (o.serve && o.grammar) {
+        std::vector<uint8_t> vj, tj;
+        std::string gerr;
+        basalt::program::grammar::PackVocab pv;
+        if (!basalt::core::read_range(model_file.range("tokenizer/vocab.json"), vj, gerr) ||
+            !basalt::core::read_range(model_file.range("tokenizer/token_type.json"), tj, gerr))
+            return fatal_start_error("--grammar on: the pack has no tokenizer files: " + gerr);
+        std::vector<int32_t> ends;
+        for (int64_t e : o.eos_ids) ends.push_back((int32_t) e);
+        if (!basalt::program::grammar::vocab_from_pack(std::string_view((const char*) vj.data(), vj.size()),
+                                                       std::string_view((const char*) tj.data(), tj.size()),
+                                                       (size_t) n_vocab, ends, pv, gerr))
+            return fatal_start_error("--grammar on: " + gerr);
+        grammar_vocab = std::move(pv);
+    }
     basalt::core::NativeHead native_head;
     if (!multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -7231,6 +7259,7 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             std::string req_bias_text;   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
             bool req_bias_present = false;
+            std::string req_grammar_text;   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
@@ -7249,6 +7278,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -7285,6 +7315,21 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            std::unique_ptr<basalt::program::grammar::Guard> gguard;
+            if (!req_grammar_text.empty() && grammar_vocab) {
+                std::string gerr;
+                if (o.batch > 0) gerr = "continuous batching is not supported";
+                else {
+                    gguard = std::make_unique<basalt::program::grammar::Guard>(*grammar_vocab);
+                    if (!gguard->begin(req_grammar_text, ids.data(), ids.size(), gerr)) gguard.reset();
+                    else if (!gguard->on()) gguard.reset();
+                }
+                if (!gerr.empty()) { std::printf("ERR grammar: %s\n", gerr.c_str()); continue; }
+            } else if (!req_grammar_text.empty()) {
+                std::fprintf(stderr, "basalt grammar: the request has a grammar but this engine runs with --grammar off; ignored\n");
+            }
+            std::vector<float> grammar_bias;
+            int64_t grammar_resamples = 0;
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             basalt::program::PplGate* ppl = nullptr;
@@ -8182,7 +8227,7 @@ int main(int argc, char** argv) {
             }
             ver.set_sampling(req_sp);
             // relaxed acceptance: sampled text requests without a logit_bias; never the quality gate
-            const bool relax_on = req_relax > 0.0f && !req_sp.greedy && !req_bias_present && ppl == nullptr;
+            const bool relax_on = req_relax > 0.0f && !req_sp.greedy && !req_bias_present && ppl == nullptr && gguard == nullptr;
             ver.set_draft_probe(relax_on);
             bool in_call = false;   // inside a tool call (its tags seen last in the prompt or the output): exact
             for (size_t i = ids.size(); i-- > 0;)
@@ -8465,6 +8510,23 @@ int main(int argc, char** argv) {
                         else if (outv[(size_t) i] == o.relax_call_close) in_call = false;
                 } else
                     while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (gguard != nullptr && gguard->on()) {
+                    // the first sampled token the grammar refuses is drawn again under the grammar's mask, and the window ends there
+                    const int miss = gguard->scan(outv.data(), a + 1);
+                    if (miss >= 0) {
+                        gguard->mask_bias(req_bias, grammar_bias);
+                        int32_t gtok = 0;
+                        if (!ver.resample_row(miss, p, grammar_bias, gtok, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        outv[(size_t) miss] = gtok;
+                        a = miss;
+                        if (!gguard->take(gtok))
+                            std::fprintf(stderr, "basalt grammar: the masked draw at row %d of %d was token %d\n", miss, T, (int) gtok);
+                        ++grammar_resamples;
+                    }
+                }
                 if (ppl != nullptr) {   // every row scored and committed
                     a = T - 1;
                     for (int t = 0; t < T; ++t) {
@@ -8722,6 +8784,10 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            if (gguard != nullptr)
+                std::fprintf(stderr, "basalt grammar: %lld windows checked, %lld masked resamples, %.3f ms in grammar code (%.2f us/window)\n",
+                             (long long) gguard->windows(), (long long) grammar_resamples, gguard->ms(),
+                             gguard->windows() > 0 ? gguard->ms() * 1000.0 / (double) gguard->windows() : 0.0);
             if (apply_thr.joinable()) apply_thr.join();
             if (copy_live) src.commit_exchanges();   // swaps applied early: the rest of their copies
             copy_live = false;
