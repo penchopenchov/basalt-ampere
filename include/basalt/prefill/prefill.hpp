@@ -7,7 +7,7 @@
 // walk the chunk inside one kernel, and the routed experts are grouped by expert: resident ones are read from the
 // VRAM tier, the others streamed from the host arena through a pinned ring on a copy stream.
 //
-// Requires the native weights (`--native`): every quantized projection must carry its GGUF blocks.
+// Requires the native weights: every quantized projection must carry its GGUF blocks.
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
