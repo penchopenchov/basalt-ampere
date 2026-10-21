@@ -55,11 +55,10 @@ public:
 
     /// `table_offset` is the byte offset of row 0 in the file and `n_rows` the row count; both come from a
     /// validated GGUF parse (PleTable::open checks the table exactly fills the file from there).
-    /// `io_thread` (default): a worker thread submits and reaps reads, so `issue` costs the caller no ReadFile
-    /// calls. false: the caller's thread does it (A/B arm).
+    /// A worker thread submits and reaps reads, so `issue` costs the caller no ReadFile calls.
     /// `row_bytes`: one row's size in the file (90 IQ4_NL, 160 FP8), at most one page.
     bool open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,
-              uint64_t cache_rows, std::string& err, bool io_thread = true, uint32_t row_bytes = ROW_BYTES);
+              uint64_t cache_rows, std::string& err, uint32_t row_bytes = ROW_BYTES);
     uint32_t row_bytes() const;
     void close();
     bool is_open() const;
@@ -71,7 +70,7 @@ public:
     /// Block until every row of the ticket is in `out_raw`. Returns false on an I/O error (message in `err`).
     bool collect(Ticket t, std::string& err);
 
-    /// Keep the SSD awake while the table is in use (io_thread mode only; call after `open`): when no read has
+    /// Keep the SSD awake while the table is in use (call after `open`): when no read has
     /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`.
     /// Some SSDs drop into a power state after ~250 ms without a command and stall the next reads 50-150 ms
     ///, which in

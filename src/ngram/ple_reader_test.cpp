@@ -87,12 +87,11 @@ int selftest(const std::string& dir, uint32_t rb) {
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
     if (!make_table(path, N, rb)) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return 2; }
     std::mt19937 rng(7);
-    for (bool thr : {false, true})
     for (uint64_t cache : {0ull, 4096ull}) {
         for (uint32_t inflight : {1u, 8u, 64u}) {
             ng::PleReader rd;
             std::string err;
-            CHECK(rd.open(path, HEADER, N, inflight, cache, err, thr, rb), "open: %s", err.c_str());
+            CHECK(rd.open(path, HEADER, N, inflight, cache, err, rb), "open: %s", err.c_str());
             // decode-shaped tickets: 16 random rows
             for (int t = 0; t < 200; ++t) {
                 std::vector<uint32_t> rows(16);
@@ -132,10 +131,10 @@ int selftest(const std::string& dir, uint32_t rb) {
         }
     }
     // fault injection: a 3 ms delay must be observed, and must not change the bytes
-    for (bool thr : {false, true}) {
+    {
         ng::PleReader rd;
         std::string err;
-        CHECK(rd.open(path, HEADER, N, 16, 0, err, thr, rb), "open: %s", err.c_str());
+        CHECK(rd.open(path, HEADER, N, 16, 0, err, rb), "open: %s", err.c_str());
         rd.set_injected_delay_us(3000);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
@@ -150,7 +149,7 @@ int selftest(const std::string& dir, uint32_t rb) {
     {
         ng::PleReader rd;
         std::string err;
-        CHECK(rd.open(path, HEADER, N, 16, 4096, err, true, rb), "open: %s", err.c_str());
+        CHECK(rd.open(path, HEADER, N, 16, 4096, err, rb), "open: %s", err.c_str());
         rd.set_keepalive(20.0, 0.5);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
@@ -182,17 +181,6 @@ int selftest(const std::string& dir, uint32_t rb) {
         CHECK(rd.snapshot().keepalive_reads <= k4 + 1, "keep-alive went on after it was turned off");
         rd.reset_stats();
         CHECK(rd.snapshot().keepalive_reads == 0 && rd.snapshot().keepalive_us_max == 0, "reset_stats kept keep-alive counts");
-    }
-    {   // the caller's thread does the reads: no worker, so no keep-alive
-        ng::PleReader rd;
-        std::string err;
-        CHECK(rd.open(path, HEADER, N, 16, 0, err, false, rb), "open: %s", err.c_str());
-        rd.set_keepalive(20.0, 1.0);
-        std::vector<uint32_t> rows(16);
-        for (auto& r : rows) r = rng() % N;
-        check_rows(rd, rows, N, rb, "keep-alive, caller thread");
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        CHECK(rd.snapshot().keepalive_reads == 0, "keep-alive without the worker thread");
     }
     std::filesystem::remove(path);
     std::printf("ple_reader selftest (row_bytes=%u): %s\n", rb, g_fail ? "FAILED" : "OK");
@@ -249,7 +237,7 @@ void stress(k::PleTable& mm, k::PleTable& direct, double secs) {
 }
 
 int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
-         bool direct_only, bool sync_submit, double stress_secs) {
+         bool direct_only, double stress_secs) {
     k::PleTable mm, direct;
     std::string err;
     basalt::core::ModelFile container;   // a .basalt file serves its source tensors as a GGUF view
@@ -263,7 +251,6 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
     k::PleIoOptions dopt;
     dopt.cache_rows = 0;                               // measure the SSD, not the cache
     dopt.max_inflight = inflight;
-    dopt.io_thread = !sync_submit;
     // `--direct-only` measures the direct path with NO mapping of the file alive anywhere in the process: a
     // live section on the same file forces the file system to keep cached and non-cached views coherent.
     if (!direct_only && !mm.open(gguf, err, mo)) { std::fprintf(stderr, "mmap open: %s\n", err.c_str()); return 2; }
@@ -358,7 +345,6 @@ int main(int argc, char** argv) {
     uint32_t inflight = 64;
     bool direct_first = false;
     bool direct_only = false;
-    bool sync_submit = false;
     bool self = false;
     double stress_secs = 0;
     for (int i = 1; i < argc; ++i) {
@@ -371,7 +357,6 @@ int main(int argc, char** argv) {
         else if (a == "--inflight" && i + 1 < argc) inflight = (uint32_t) std::atoi(argv[++i]);
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
-        else if (a == "--sync") sync_submit = true;
         else if (a == "--stress" && i + 1 < argc) stress_secs = std::atof(argv[++i]);
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--stress SECS]\n"); return 2; }
     }
@@ -384,7 +369,7 @@ int main(int argc, char** argv) {
         const int q8 = q8_decode_check();
         return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8;
     }
-    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, stress_secs);
+    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");
     return 2;
 }

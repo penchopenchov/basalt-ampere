@@ -111,12 +111,11 @@ struct PleIoOptions {
     PleIo mode = PleIo::Direct;
     uint32_t max_inflight = 256;     ///< outstanding SSD reads (decode needs 16; a prompt chunk saturates the SSD at 256)
     uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
-    bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
     /// Mmap mode only (`--ple-io ram`): lock the whole mapped table in RAM at open, so no SSD read ever sits on
     /// the prompt or token path. Needs RAM for the full table. Locked through the platform helper (`mlock` on
     /// Linux, the working-set minimum plus `VirtualLock` on Windows); `locked()` reports the outcome.
     bool lock = false;
-    /// Direct mode with the I/O worker only: keep the SSD awake while rows are asked for - one page of the table
+    /// Direct mode: keep the SSD awake while rows are asked for - one page of the table
     /// after this long without a read (0 = off), until `keepalive_window_s` after the last request for rows
     /// (see PleReader::set_keepalive).
     double keepalive_ms = 0;
@@ -187,18 +186,6 @@ private:
     struct Impl;
     Impl* impl_ = nullptr;
 };
-
-// ================================ THE PLE GATHER'S PREFETCH, AND ITS A/B ARM ================================
-//
-// `gather` issues its sixteen row reads as sixteen SEPARATE page faults into a 26.8 GB mapping.  The table
-// is 90 B per row, so the sixteen rows are 1,440 B per token: the cost is latency, not bandwidth, and it comes
-// from taking the sixteen pages one at a time.  A prefetch issues them together.
-//
-// **THIS SWITCH EXISTS SO THE CLAIM CAN BE MEASURED RATHER THAN ASSERTED.**  Cross-build comparisons are
-// unreliable (run-to-run drift is large), so the two arms are alternated inside one session.  Off is
-// `--no-ple-prefetch`.
-void ple_prefetch_enable(bool on);
-bool ple_prefetch_enabled();
 
 
 }  // namespace basalt::kernels

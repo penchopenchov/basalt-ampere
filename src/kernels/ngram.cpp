@@ -21,14 +21,6 @@
 
 namespace basalt::kernels {
 
-namespace {
-/// The A/B arm.  Host-token-path only, so it needs no atomics; see the note on `ple_prefetch_enable`.
-bool g_ple_prefetch = true;
-}  // namespace
-
-void ple_prefetch_enable(bool on) { g_ple_prefetch = on; }
-bool ple_prefetch_enabled() { return g_ple_prefetch; }
-
 PleConsts ple_artifact_consts() {
     // the GGUF metadata, verbatim.  Written once here rather than derived, because `head_offsets` is
     // ALSO in the metadata as its own array - and deriving one from the other would hide a mismatch between
@@ -223,7 +215,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         delete impl_->file;
         impl_->file = nullptr;
         impl_->data = nullptr;
-        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err, io.io_thread,
+        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err,
                                 impl_->rb)) {
             close();
             return false;

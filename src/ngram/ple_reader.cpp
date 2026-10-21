@@ -91,10 +91,10 @@ struct TicketState {
 
 }  // namespace
 
-// THREADING. With `io_thread` (the default) one worker thread owns every DirectFile call: it submits queued jobs
+// THREADING. One worker thread owns every DirectFile call: it submits queued jobs
 // and reaps completions, so `issue` on the caller's thread only builds jobs and wakes it (the per-read call
 // cost stays off the host loop). `mu` guards everything below except `file`, which only the worker touches
-// (plus `wake`, which is thread-safe). Without `io_thread` the caller does all of it, as before.
+// (plus `wake`, which is thread-safe).
 struct PleReader::Impl {
     DirectFile file;
     uint64_t table_offset = 0;
@@ -120,7 +120,6 @@ struct PleReader::Impl {
     double last_read_us = 0;              // the last read that went out, rows or keep-alive
     uint64_t rng = 0x9E3779B97F4A7C15ull;
 
-    bool threaded = false;
     bool stop = false;
     std::mutex mu;
     std::condition_variable cv_work;      // worker: there is something to submit
@@ -284,17 +283,6 @@ struct PleReader::Impl {
         return true;
     }
 
-    /// Caller-thread mode: process whatever has completed; blocks up to `timeout_ms` for the first completion.
-    bool drain(int timeout_ms) {
-        Completion got[64];
-        if (!delayed.empty()) {
-            if (!release_delayed()) return false;
-            timeout_ms = 0;                        // keep polling the held completions
-        }
-        const int n = file.wait(got, 64, timeout_ms);
-        return process(got, n);
-    }
-
     void worker_loop() {
         std::unique_lock<std::mutex> lk(mu);
         for (;;) {
@@ -333,7 +321,7 @@ PleReader::~PleReader() {
 }
 
 bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_rows, uint32_t max_inflight,
-                     uint64_t cache_rows, std::string& err, bool io_thread, uint32_t row_bytes) {
+                     uint64_t cache_rows, std::string& err, uint32_t row_bytes) {
     close();
     if (max_inflight == 0 || max_inflight > 1024) { err = "PleReader: max_inflight must be 1..1024"; return false; }
     if (row_bytes == 0 || row_bytes > PAGE) { err = "PleReader: row_bytes must be 1..4096"; return false; }
@@ -360,8 +348,7 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     if (impl_->rng == 0) impl_->rng = 1;
     reset_stats();
     impl_->stop = false;
-    impl_->threaded = io_thread;
-    if (io_thread) {
+    {
         try {
             impl_->worker = std::thread([this] { impl_->worker_loop(); });
         } catch (const std::exception& e) {
@@ -409,7 +396,6 @@ void PleReader::close() {
     m.inflight.clear();
     m.free_slots.clear();
     m.cache.init(0);
-    m.threaded = false;
     m.stop = false;
     m.keep_us = 0;
     m.last_issue_us = m.last_read_us = 0;
@@ -420,8 +406,7 @@ uint32_t PleReader::row_bytes() const { return impl_->row_bytes; }
 
 PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_raw) {
     Impl& m = *impl_;
-    std::unique_lock<std::mutex> lk(m.mu, std::defer_lock);
-    if (m.threaded) lk.lock();
+    std::unique_lock<std::mutex> lk(m.mu);
     const uint32_t id = m.next_ticket++;
     if (m.next_ticket == 0) m.next_ticket = 1;
     const double now = now_us();
@@ -467,16 +452,12 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     ts.pending = (uint32_t) jobs.size();
     const bool has_jobs = ts.pending > 0;
     for (Job& j : jobs) m.queue.push_back(std::move(j));
-    if (m.threaded) {
-        lk.unlock();
-        if (has_jobs) {
-            m.cv_work.notify_one();
-            m.file.wake();                         // in case the worker is blocked in the port
-        } else if (rearm) {
-            m.cv_work.notify_one();                // the keep-alive had lapsed: start it again
-        }
-    } else if (!m.pump() && m.error.empty()) {
-        m.error = "PleReader: submit failed";
+    lk.unlock();
+    if (has_jobs) {
+        m.cv_work.notify_one();
+        m.file.wake();                             // in case the worker is blocked in the port
+    } else if (rearm) {
+        m.cv_work.notify_one();                    // the keep-alive had lapsed: start it again
     }
     return Ticket{id};
 }
@@ -484,29 +465,15 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
 bool PleReader::collect(Ticket t, std::string& err) {
     Impl& m = *impl_;
     const double start = now_us();
-    if (m.threaded) {
-        std::unique_lock<std::mutex> lk(m.mu);
-        auto it = m.tickets.find(t.id);
-        if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-        m.cv_done.wait(lk, [&] {
-            const auto current = m.tickets.find(t.id);
-            return current == m.tickets.end() || current->second.pending == 0;
-        });
-        it = m.tickets.find(t.id);
-        if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-        if (!m.error.empty()) { err = m.error; return false; }
-        m.stats.wait_us += now_us() - start;
-        m.tickets.erase(it);
-        return true;
-    }
+    std::unique_lock<std::mutex> lk(m.mu);
     auto it = m.tickets.find(t.id);
     if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-    while (it->second.pending > 0) {
-        const bool drained = m.drain(-1);
-        if (!drained && m.error.empty()) m.error = "PleReader: read failed";
-        it = m.tickets.find(t.id);
-        if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-    }
+    m.cv_done.wait(lk, [&] {
+        const auto current = m.tickets.find(t.id);
+        return current == m.tickets.end() || current->second.pending == 0;
+    });
+    it = m.tickets.find(t.id);
+    if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
     if (!m.error.empty()) { err = m.error; return false; }
     m.stats.wait_us += now_us() - start;
     m.tickets.erase(it);
@@ -517,7 +484,7 @@ void PleReader::set_keepalive(double period_ms, double window_s) {
     Impl& m = *impl_;
     {
         std::lock_guard<std::mutex> lk(m.mu);
-        m.keep_us = m.threaded && period_ms > 0 ? period_ms * 1000.0 : 0.0;
+        m.keep_us = period_ms > 0 ? period_ms * 1000.0 : 0.0;
         m.keep_window_us = window_s > 0 ? window_s * 1e6 : 0.0;
     }
     m.cv_work.notify_all();
@@ -530,14 +497,12 @@ void PleReader::set_injected_delay_us(double delay_us) {
 const ReaderStats& PleReader::stats() const { return impl_->stats; }
 ReaderStats PleReader::snapshot() const {
     Impl& m = *impl_;
-    std::unique_lock<std::mutex> lk(m.mu, std::defer_lock);
-    if (m.threaded) lk.lock();
+    std::lock_guard<std::mutex> lk(m.mu);
     return m.stats;
 }
 void PleReader::reset_stats() {
     Impl& m = *impl_;
-    std::unique_lock<std::mutex> lk(m.mu, std::defer_lock);
-    if (m.threaded) lk.lock();                     // the worker may be counting a keep-alive read
+    std::lock_guard<std::mutex> lk(m.mu);          // the worker may be counting a keep-alive read
     m.stats = ReaderStats{};
     m.ring_pos = 0;
 }
