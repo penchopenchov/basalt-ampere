@@ -6,6 +6,8 @@ It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120); see [platfor
 Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
 
+**Help wanted:** have some spare compute to lend for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
+
 <p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
 
 ## Requirements
