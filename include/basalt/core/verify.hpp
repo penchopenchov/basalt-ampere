@@ -159,6 +159,10 @@ public:
     /// clears it.  Applies to this verifier's own sampling only: the drafter never sees it.  Call before set_sampling;
     /// copied to the final stage's device only when it changed.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
+    /// Draws row `t` of the window just run again, with `bias` (one float per vocabulary entry, -inf bans) in place of
+    /// the request's logit_bias; the penalties, the filters and the position's draw are the window's own. `pos0` is the
+    /// window's first position. The token is in `token`; the window's other rows are untouched.
+    bool resample_row(int t, int64_t pos0, const std::vector<float>& bias, int32_t& token, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
     /// slots at that stride (`basalt::kernels::penalty_rows` builds them), most recent token LAST, unused front slots
@@ -382,6 +386,7 @@ private:
     bool draft_probe_ = false;           ///< set_draft_probe
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
+    float* row_bias_device_ = nullptr;   ///< resample_row's bias
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     std::atomic<bool> released_{false};   // release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
