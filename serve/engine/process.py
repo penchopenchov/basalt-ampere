@@ -133,7 +133,7 @@ class ProcessEngine:
     def __init__(self, engine_bin: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False):
         self.spawn = (engine_bin, list(args), cwd, log, env)   # to start it again
-        self.model_path = flag_value(args, "--native") or flag_value(args, "--pack") or "pack/full"
+        self.model_path = flag_value(args, "--model") or ""
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
