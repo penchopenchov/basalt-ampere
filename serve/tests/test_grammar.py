@@ -211,6 +211,20 @@ class EngineStart(unittest.TestCase):
         for block in ({"grammar": True}, {"grammar": False}, {}):
             self.assertEqual(self.engine_args(block), ["--serve", "--grammar", "on"], block)
 
+    def line(self, block, cli=()):
+        import io
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.engine_args(block, cli)
+        return next(x for x in out.getvalue().splitlines() if x.startswith("[server] engine:"))
+
+    def test_startup_line(self):
+        self.assertEqual(self.line({}), "[server] engine: using default flags")
+        self.assertEqual(self.line({"grammar": True}), "[server] engine: using default flags, grammar on (config)")
+        self.assertEqual(self.line({"grammar": True}, ["--no-grammar"]), "[server] engine: using default flags, grammar off (cli)")
+        self.assertEqual(self.line({}, ["--grammar"]), "[server] engine: using default flags, grammar on (cli)")
+
     def test_command_line(self):
         self.assertEqual(self.engine_args({}, ["--grammar"]), ["--serve", "--grammar", "on"])
 

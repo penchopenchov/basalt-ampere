@@ -60,6 +60,13 @@ def warn_tight_ram(arena_mib) -> None:
         print(f"[server] warning: low RAM: {left:.1f} of {total / 2**30:.0f} GB left after experts", flush=True)
 
 
+def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str] | None:
+    """(on, origin) for the startup line when the command line or the config file set grammar; None for the default."""
+    names = ("--grammar", "--no-grammar")
+    origin = "cli" if any(w in names for w in cli) else "config" if any(w in names for w in used) else ""
+    return (on, origin) if origin else None
+
+
 def main() -> int:
     ap = build_parser()
     try:
@@ -103,7 +110,8 @@ def main() -> int:
             fail(f"{a.model}: {e}")
         if not a.mock_engine:
             print(engine_line(file_engine, cli_engine, bool(a.config),
-                                    (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None), flush=True)
+                                    (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
+                                    grammar_entry(a.grammar, sys.argv[1:], used_argv)), flush=True)
     if a.alias:
         cfg["model_name"] = a.alias
     try:                                                # fail fast if the port is taken
@@ -159,9 +167,6 @@ def main() -> int:
         if a.grammar and not has_grammar:
             print("[server] warning: grammar is on but this engine has no --grammar; requests go without one", flush=True)
         gwords = grammar_words(known_flags)
-        if gwords:
-            print(f"[server] grammar: engine {' '.join(gwords)}, "
-                  f"{'every tool and JSON request' if a.grammar else 'strict requests'} get the key", flush=True)
         try:
             engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=lazy)
         except EngineStartError as e:
