@@ -1,6 +1,6 @@
 # Running the server
 
-The long-form notes behind the settings in [configuration](configuration/index.md): concurrent requests, the KV cache, prompt chunks, memory floors and image input.
+The long-form notes behind the settings in [configuration](configuration/index.md): concurrent requests, the KV cache, memory floors and image input. Diagnostic flags: `bin/basalt --help`.
 
 ## Concurrent requests: `--parallel N`
 
@@ -59,18 +59,6 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
 - The startup line `[server] engine: ...` lists the settings that came from the file or the command line; without
   `--config` it says the built-in defaults apply.
 
-## Prompt chunks: `--prefill`
-
-A prompt is read in chunks. `--prefill auto` (the usual setting) takes the largest chunk whose buffers the expert cache
-can lend: the buffers are carved from the cache's last slots for the length of the prompt and the experts in those slots
-are copied back afterwards, so a short prompt lends only what it needs. A bare `auto` reads a prompt in the fewest equal chunks of at most 16384 tokens (32768 for packs whose expert blobs exceed 1.5 MB, such as NVFP4), because
-a chunk's cost per token stops falling past a few thousand tokens; it is still limited to what the lend can fund, which with
-`--resident-experts` is the lent slots whose experts the RAM copy holds plus a fixed amount of file reading (7 GiB), and without
-`--resident-experts` is 8192. `--prefill auto:N` (N = 8192, 16384 or 32768) sets the ceiling yourself; a number sets a
-fixed chunk. A prompt longer than one chunk is split into equal chunks (a short tail chunk costs nearly a whole pass over
-the streamed experts). The startup line `prompt chunk auto: N tokens` says what was
-chosen.
-
 ## Memory floors
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
@@ -84,9 +72,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the
   model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
   buffers and a request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
-- With the adaptive tier, the RAM copy also holds free places for the experts that leave the GPU: four times `--adapt-swaps`
-  (384 at the default, about 2.6 MiB each on NVFP4, 1 GiB), so a topic change can swap quickly. The startup line
-  `free places for the adaptive swaps` shows the count; if RAM is short, fewer are kept and a round swaps fewer.
+- With the adaptive tier, the RAM copy also holds free places for the experts that leave the GPU, so a topic change can
+  swap quickly. The startup line `free places for the adaptive swaps` shows the count; if RAM is short, fewer are kept
+  and a round swaps fewer.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
   states the RAM free and the largest safe value ('max').
 - While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is
