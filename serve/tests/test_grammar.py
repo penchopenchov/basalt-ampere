@@ -59,7 +59,7 @@ class Fixture:
         return cm.exception.code, json.loads(cm.exception.read())["error"]
 
     def chat(self, **extra):
-        return self.sent("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], **extra})
+        return self.sent("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": [{"role": "user", "content": "hi"}], **extra})
 
     def json_schema(self, **spec):
         return {"type": "json_schema", "json_schema": {"name": "s", "schema": SCHEMA, **spec}}
@@ -77,20 +77,20 @@ class GrammarOff(Fixture, unittest.TestCase):
     def test_chat_json_format_is_refused(self):
         msgs = [{"role": "user", "content": "hi"}]
         for fmt in (self.json_schema(), {"type": "json_object"}):
-            code, err = self.refused("/v1/chat/completions", {"messages": msgs, "response_format": fmt})
+            code, err = self.refused("/v1/chat/completions", {"model": "qwen3.8-flash-next", "messages": msgs, "response_format": fmt})
             self.assertEqual(code, 400)
             self.assertEqual(err["type"], "invalid_request_error")
             self.assertIn("need grammar enabled", err["message"])
 
     def test_responses_json_format_is_refused(self):
         for fmt in ({"type": "json_schema", "name": "s", "schema": SCHEMA}, {"type": "json_object"}):
-            code, err = self.refused("/v1/responses", {"input": "hi", "text": {"format": fmt}})
+            code, err = self.refused("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": fmt}})
             self.assertEqual(code, 400)
             self.assertEqual(err["param"], "text.format")
             self.assertIn("text.format json_schema and json_object (structured output) need grammar enabled", err["message"])
 
     def test_anthropic_json_format_is_refused(self):
-        code, err = self.refused("/v1/messages", {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        code, err = self.refused("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                                   "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}})
         self.assertEqual(code, 400)
         self.assertEqual(err["type"], "invalid_request_error")
@@ -98,12 +98,12 @@ class GrammarOff(Fixture, unittest.TestCase):
         self.assertIn("need grammar enabled", err["message"])
 
     def test_anthropic_output_format_is_refused(self):
-        code, _ = self.refused("/v1/messages", {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        code, _ = self.refused("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                                 "output_format": {"type": "json_schema", "schema": SCHEMA}})
         self.assertEqual(code, 400)
 
     def test_responses_text_format_is_allowed(self):
-        self.assertIsNone(self.sent("/v1/responses", {"input": "hi", "text": {"format": {"type": "text"}}}))
+        self.assertIsNone(self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": {"type": "text"}}}))
 
     def test_strict_json_schema(self):
         self.assertEqual(self.chat(response_format=self.json_schema(strict=True)),
@@ -114,24 +114,24 @@ class GrammarOff(Fixture, unittest.TestCase):
         self.assertEqual(g, {"kind": "tools", "tools": [STRICT_TOOL], "tool_choice": "required"})
 
     def test_anthropic_strict_tool(self):
-        g = self.sent("/v1/messages", {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        g = self.sent("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                        "tools": [{"name": "get_weather", "strict": True,
                                                   "input_schema": FN["parameters"]}]})
         self.assertEqual(g["kind"], "tools")
         self.assertEqual(g["tools"][0]["function"]["name"], "get_weather")
 
     def test_anthropic_tools_without_strict(self):
-        self.assertIsNone(self.sent("/v1/messages", {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        self.assertIsNone(self.sent("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                                      "tools": [{"name": "t", "input_schema": {"type": "object"}}]}))
 
     def test_responses_strict_tool(self):
-        g = self.sent("/v1/responses", {"input": "hi", "tools": [{"type": "function", "name": "get_weather", "strict": True,
+        g = self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "tools": [{"type": "function", "name": "get_weather", "strict": True,
                                                                    "parameters": FN["parameters"]}]})
         self.assertEqual(g["kind"], "tools")
         self.assertEqual(g["tools"][0]["function"]["name"], "get_weather")
 
     def test_responses_strict_schema(self):
-        g = self.sent("/v1/responses", {"input": "hi", "text": {"format": {"type": "json_schema", "name": "s",
+        g = self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": {"type": "json_schema", "name": "s",
                                                                             "schema": SCHEMA, "strict": True}}})
         self.assertEqual(g, {"kind": "json_schema", "schema": SCHEMA})
 
@@ -157,24 +157,24 @@ class GrammarOn(Fixture, unittest.TestCase):
         self.assertIsNone(self.chat(response_format={"type": "text"}))
 
     def test_anthropic_tools(self):
-        g = self.sent("/v1/messages", {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
+        g = self.sent("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}],
                                        "tools": [{"name": "get_weather", "description": "weather",
                                                   "input_schema": FN["parameters"]}], "tool_choice": {"type": "any"}})
         self.assertEqual(g, {"kind": "tools", "tools": [TOOL], "tool_choice": {"type": "any"}})
 
     def test_responses_tools(self):
-        g = self.sent("/v1/responses", {"input": "hi", "tools": [{"type": "function", "name": "get_weather",
+        g = self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "tools": [{"type": "function", "name": "get_weather",
                                                                    "description": "weather",
                                                                    "parameters": FN["parameters"]}]})
         self.assertEqual(g["kind"], "tools")
         self.assertEqual(g["tools"], [TOOL])
 
     def test_responses_json_object(self):
-        self.assertEqual(self.sent("/v1/responses", {"input": "hi", "text": {"format": {"type": "json_object"}}}),
+        self.assertEqual(self.sent("/v1/responses", {"model": "qwen3.8-flash-next", "input": "hi", "text": {"format": {"type": "json_object"}}}),
                          {"kind": "json_object"})
 
     def anthropic(self, **extra):
-        return {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], **extra}
+        return {"model": "qwen3.8-flash-next", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}], **extra}
 
     def test_anthropic_json_schema(self):
         want = {"kind": "json_schema", "schema": SCHEMA}

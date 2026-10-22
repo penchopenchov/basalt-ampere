@@ -40,6 +40,16 @@ def http_json(base, path, body=None, timeout=30):
         return r.status, data
 
 
+_SERVED = {}
+
+
+def served_model(base):
+    """The model name the server lists; requests must name it."""
+    if base not in _SERVED:
+        _SERVED[base] = http_json(base, "/v1/models")[1]["data"][0]["id"]
+    return _SERVED[base]
+
+
 def png(w=96, h=96, seed=0):
     rnd = random.Random(seed)
     rows = b"".join(b"\x00" + bytes(((x * 3 + seed * 40) & 255, (y * 3) & 255, rnd.randrange(256)) [i % 3] for x in range(w) for i in range(3)) for y in range(h))
@@ -80,11 +90,11 @@ def stream(base, req, text, max_tokens, cancel_after=None, image=None, stop=None
     try:
         if req.kind == "openai":
             path = "/v1/chat/completions"
-            body = {"messages": [message("openai", text, image)], "max_tokens": max_tokens, "temperature": 0.7,
+            body = {"model": served_model(base), "messages": [message("openai", text, image)], "max_tokens": max_tokens, "temperature": 0.7,
                     "stream": True, "stream_options": {"include_usage": True}, "reasoning_effort": "none"}
         else:
             path = "/v1/messages"
-            body = {"model": "x", "max_tokens": max_tokens, "temperature": 0.7, "stream": True,
+            body = {"model": served_model(base), "max_tokens": max_tokens, "temperature": 0.7, "stream": True,
                     "messages": [message("anthropic", text, image)]}
         conn.request("POST", path, json.dumps(body),
                      {"Content-Type": "application/json", "x-api-key": "k", "anthropic-version": "2023-06-01"})
@@ -191,7 +201,7 @@ def run_topics(a):
 
 
 def count_tokens(base, text):
-    st, j = http_json(base, "/v1/messages/count_tokens", {"model": "x", "messages": [{"role": "user", "content": text}]})
+    st, j = http_json(base, "/v1/messages/count_tokens", {"model": served_model(base), "messages": [{"role": "user", "content": text}]})
     return j.get("input_tokens") if st == 200 and isinstance(j, dict) else None
 
 

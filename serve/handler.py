@@ -334,7 +334,7 @@ def make_handler(svc: Service):
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
                         return
-                    if req.get("model") not in (None, svc.model):
+                    if req.get("model") not in (None, *svc.served_names()):
                         self._json(404, {"error": {"message": "model not found"}})
                         return
                     if path == "/v1/unload":
@@ -366,8 +366,12 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
+                requested = req.get("model")
+                if not (isinstance(requested, str) and requested in svc.served_names()):
+                    self._unknown_model(path, requested)
+                    return
                 svc.request_ctx.path = path
-                svc.request_ctx.model = req.get("model") if isinstance(req.get("model"), str) else None
+                svc.request_ctx.model = svc.model            # always the served name, never the requested one
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/chat/completions":
@@ -492,6 +496,18 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # proxies pass each event at once
             self._cors()
             self.end_headers()
+
+        def _unknown_model(self, path, name):
+            """404 for a missing or unserved model, in the shape of the API called."""
+            anthropic = path.startswith("/v1/messages")
+            if name is None:
+                text = "model: required" if anthropic else "model is required"
+            else:
+                text = f"model: {name}" if anthropic else f"The model '{name}' does not exist"
+            if anthropic:
+                self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": text}})
+            else:
+                self._json(404, responses_error_body(text, "invalid_request_error", "model", "model_not_found"))
 
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)

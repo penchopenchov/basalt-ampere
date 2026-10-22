@@ -64,9 +64,9 @@ class Http(unittest.TestCase):
                 return e.code, json.loads(e.read())
 
     def ask(self, path):
-        body = {"model": "m", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+        body = {"model": "qwen3.8-flash-next", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
         if path == "/v1/responses":
-            body = {"model": "m", "input": "hi"}
+            body = {"model": "qwen3.8-flash-next", "input": "hi"}
         self.assertEqual(self.call(path, body)[0], 200)
 
     # --- /metrics

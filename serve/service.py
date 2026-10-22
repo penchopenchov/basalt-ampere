@@ -49,6 +49,14 @@ DEBUG = False            # --debug: one line per request plus the raw model text
 
 
 class Service:
+    def served_names(self) -> list[str]:
+        """The model names a request may use: the one /v1/models lists, and the model file's own name."""
+        names = [self.model]
+        path = getattr(self.engine, "model_path", None)
+        if isinstance(path, str) and path:
+            names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
+        return names
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True):
