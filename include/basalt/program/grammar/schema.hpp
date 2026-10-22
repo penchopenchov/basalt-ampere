@@ -9,6 +9,8 @@
 // tool_call_gbnf writes the tool-call text the server parses:
 //   <tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n</function>\n</tool_call>
 // where VALUE follows the declared type: raw text for strings (anything but a closing </parameter>), JSON otherwise.
+// The required parameters come in any order, each once (up to max_permute of them), then the optional ones in any order,
+// repeatable: the construction of llama.cpp's Qwen3-Coder parser.
 #pragma once
 
 #include <memory>
@@ -22,7 +24,7 @@ namespace basalt::program::grammar {
 std::string json_schema_to_gbnf(const std::string& schema_json, std::string& err);
 
 struct ToolGrammarOptions {
-    bool params_in_order = true;     ///< parameters follow the declared order (optional ones may be left out)
+    size_t max_permute = 6;          ///< required parameters are permuted up to this many; more keep the declared order
     bool multiple_calls = true;      ///< more than one <tool_call> block
 };
 

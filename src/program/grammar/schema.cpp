@@ -126,8 +126,7 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
             for (const JsonValue& n : r->items) if (n.is(Type::String)) required.insert(n.s);
         }
         std::string fn_id = "fn" + std::to_string(ti);
-        std::vector<std::string> items;
-        std::vector<bool> is_req;
+        std::vector<std::string> req_items, opt_items;
         if (props && props->is(Type::Object)) {
             for (const auto& m : props->members) {
                 const JsonValue* ps = deref(params, &m.second);
@@ -178,18 +177,31 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
                     err = "tools: " + nm->s + "." + m.first + ": no rule";
                     return "";
                 }
-                items.push_back(literal("<parameter=" + m.first + ">\n") + " " + value + " " +
-                                literal("\n</parameter>\n"));
-                is_req.push_back(required.count(m.first) > 0);
+                (required.count(m.first) ? req_items : opt_items)
+                    .push_back(literal("<parameter=" + m.first + ">\n") + " " + value + " " + literal("\n</parameter>\n"));
             }
         }
+        // As llama.cpp's Qwen3-Coder parser (common/chat-peg-parser.cpp permute, parsers/qwen3-coder.cpp): the required
+        // parameters in any order, each once (one rule per set still to write; past max_permute they keep the declared
+        // order), then the optional ones in any order, repeatable.
         std::string body;
-        if (opt.params_in_order) {
-            for (size_t i = 0; i < items.size(); ++i) body += (is_req[i] ? items[i] : "(" + items[i] + ")?") + " ";
-        } else if (!items.empty()) {
-            std::string param = c.add_rule(fn_id + "-param", join(items, " | "));
-            body = "(" + param + ")* ";
+        const size_t n = req_items.size();
+        if (n == 1 || n > opt.max_permute) {
+            for (const std::string& it : req_items) body += it + " ";
+        } else if (n > 1) {
+            auto rule_of = [&](size_t remaining) { return fn_id + "-req" + std::to_string(remaining); };
+            for (size_t remaining = 1; remaining < ((size_t) 1 << n); ++remaining) {
+                std::vector<std::string> alts;
+                for (size_t i = 0; i < n; ++i) {
+                    const size_t bit = (size_t) 1 << i;
+                    if (!(remaining & bit)) continue;
+                    alts.push_back(req_items[i] + (remaining & ~bit ? " " + rule_of(remaining & ~bit) : ""));
+                }
+                c.add_rule(rule_of(remaining), join(alts, " | "));
+            }
+            body = rule_of(((size_t) 1 << n) - 1) + " ";
         }
+        if (!opt_items.empty()) body += "(" + c.add_rule(fn_id + "-opt", join(opt_items, " | ")) + ")* ";
         fns.push_back(c.add_rule(fn_id, literal("<function=" + nm->s + ">\n") + " " + body + literal("</function>")));
     }
     c.add_rule("call", literal("<tool_call>\n") + " (" + join(fns, " | ") + ") " + literal("\n</tool_call>"));

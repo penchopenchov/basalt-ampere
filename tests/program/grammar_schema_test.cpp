@@ -128,7 +128,7 @@ static void test_tools() {
     const std::string city = "<parameter=city>\nParis\n</parameter>\n";
     const std::string metric = "<parameter=metric>\ntrue\n</parameter>\n";
     CHECK(call_ok(g, head + city + metric + "</function>\n</tool_call>"));
-    CHECK(call_ok(g, head + city + "<parameter=days>\n-3\n</parameter>\n" + metric + "</function>\n</tool_call>"));
+    CHECK(call_ok(g, head + city + metric + "<parameter=days>\n-3\n</parameter>\n</function>\n</tool_call>"));
     CHECK(call_ok(g, head + city + metric + "<parameter=unit>\nc\n</parameter>\n</function>\n</tool_call>"));
     CHECK(call_ok(g, head + city + metric + "<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n</function>\n</tool_call>"));
     // a string may hold anything but the closing tag, newlines and angle brackets included
@@ -146,9 +146,13 @@ static void test_tools() {
     CHECK(!pre(g, "<tool_call>\n<function=get_wether>"));
     CHECK(pre(g, "<tool_call>\n<function=get_w"));
     CHECK(!pre(g, head + "<parameter=zip>"));
-    // a required parameter cannot be skipped
-    CHECK(!call_ok(g, head + city + "</function>\n</tool_call>"));
-    CHECK(!pre(g, head + "<parameter=days>"));                        // city comes first
+    // required parameters in any order, each once; optional ones after them, any order, repeatable
+    CHECK(call_ok(g, head + metric + city + "</function>\n</tool_call>"));
+    CHECK(call_ok(g, head + metric + city + "<parameter=days>\n2\n</parameter>\n<parameter=unit>\nc\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"));
+    CHECK(!call_ok(g, head + city + "</function>\n</tool_call>"));                    // metric is required
+    CHECK(!pre(g, head + city + "<parameter=city>"));                                // a required one is written once
+    CHECK(!pre(g, head + "<parameter=days>"));                                       // optional ones follow the required
+    CHECK(!pre(g, head + city + metric + city));
     // no parameters, wrapper form, untyped parameter takes free text
     CHECK(call_ok(g, "<tool_call>\n<function=ping>\n</function>\n</tool_call>"));
     CHECK(call_ok(g, "<tool_call>\n<function=set_flag>\n<parameter=on>\nfalse\n</parameter>\n<parameter=note>\nhi there\n</parameter>\n</function>\n</tool_call>"));
@@ -171,11 +175,11 @@ static void test_tools() {
     auto g1 = Grammar::parse(tool_call_gbnf(kTools, one, err), err);
     CHECK(g1 && ok(g1, "<tool_call>\n<function=ping>\n</function>\n</tool_call>") &&
           !pre(g1, "<tool_call>\n<function=ping>\n</function>\n</tool_call>\n<"));
-    // any parameter order
-    ToolGrammarOptions any;
-    any.params_in_order = false;
-    auto ga = Grammar::parse(tool_call_gbnf(kTools, any, err), err);
-    CHECK(ga && ok(ga, head + metric + city + "</function>\n</tool_call>"));
+    // past max_permute the required parameters keep the declared order
+    ToolGrammarOptions big;
+    big.max_permute = 1;
+    auto gb = Grammar::parse(tool_call_gbnf(kTools, big, err), err);
+    CHECK(gb && ok(gb, head + city + metric + "</function>\n</tool_call>") && !pre(gb, head + metric));
     CHECK(tool_call_gbnf("[]", ToolGrammarOptions{}, err).empty());
     CHECK(tool_call_gbnf("[{\"parameters\":{}}]", ToolGrammarOptions{}, err).empty());
 }
