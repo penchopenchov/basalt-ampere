@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import sys
 import tempfile
 import types
@@ -238,6 +239,12 @@ class Wire(unittest.TestCase):
                 self.assertEqual(parse_settings(build_parser(), ["--config", str(p)] + cli)[0].grammar, want)
 
 
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 class EngineStart(unittest.TestCase):
     """What main() hands the engine when `grammar` comes from the config file or the command line."""
 
@@ -255,7 +262,7 @@ class EngineStart(unittest.TestCase):
             eng.write_bytes(flags)
             conf = Path(d) / "c.json"
             conf.write_text(json.dumps({"server": {"model": "m.basalt", **server_block}}))
-            argv = ["x", "--config", str(conf), "--engine-bin", str(eng), *cli]
+            argv = ["x", "--config", str(conf), "--engine-bin", str(eng), "--port", str(free_port()), *cli]
             tokdir = Path(d) / "tok"
             tokdir.mkdir()
             (tokdir / "vocab.json").write_text("{}")

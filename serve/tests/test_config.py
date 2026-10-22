@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -369,11 +370,18 @@ class ApiKey(unittest.TestCase):
         self.assertFalse(exposed_without_key("127.0.0.1", ""))
 
 
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 class Startup(unittest.TestCase):
     """The server process itself: the checks of main() apply to values from the file."""
 
     def run_server(self, cfg, *argv):
-        r = subprocess.run([sys.executable, "-m", "serve.server", "--config", conf(cfg), *argv], cwd=ROOT,
+        own_port = [] if "port" in cfg.get("server", {}) or "--port" in argv else ["--port", str(free_port())]
+        r = subprocess.run([sys.executable, "-m", "serve.server", "--config", conf(cfg), *own_port, *argv], cwd=ROOT,
                            capture_output=True, text=True, timeout=60, env=os.environ)
         return r.returncode, r.stderr
 
