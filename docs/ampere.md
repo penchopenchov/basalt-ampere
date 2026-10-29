@@ -37,6 +37,17 @@ Its published SHA-256 is:
 
 The complete local download was verified against this hash.
 
+The IQ3_XXS comparison pack, `Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt`, is
+79,867,643,037 bytes. Its verified published SHA-256 is:
+
+```text
+d02bb1b188bbc9ed6bc88ce5e89c7c2d64247290c7bae70fbb9d9d17fe65ed71
+```
+
+Its expert section is 40.0 GiB. The smaller footprint leaves more RAM headroom;
+the [upstream model card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt)
+reports lower accuracy than IQ3_S. Neither quant is validated here against Q8_0.
+
 ```bat
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt --local-dir models
 bin\basalt.exe serve --config basalt_config.json
@@ -99,8 +110,8 @@ prose requests generated at 24.7 and 32.8 tokens/s respectively (204 and 256
 generated tokens, including reasoning; the prose request reached its cap).
 After reloading the delivered 8K setup, exact text and constrained JSON output
 were checked again: the arithmetic request returned `{"answer": 323}` for
-17 × 19. The server is available locally at `http://127.0.0.1:8080/`; restart it
-from the repository root with `bin\basalt.exe serve --config basalt_config.json`.
+17 × 19. Start the local server from the repository root with
+`bin\basalt.exe serve --config basalt_config.json`.
 
 `basalt-probe` cold decode, 400 tokens per standard fixture, at 350 W:
 
@@ -121,5 +132,82 @@ The 16K probe's aggressive prefill-share trial hit the RAM safety guard; its
 subsequent adaptation figures are excluded. The default prefill share is kept.
 The 8K adaptation trials did not beat the repeated default beyond the measured
 30.9% noise band, so the original placement and worker defaults are also kept.
-No model-level speed comparison with the upstream hardware path, greedy-identity
-comparison, or Q8_0 PPL/KLD quality gate has been completed.
+No model-level speed comparison with the upstream hardware path or Q8_0
+PPL/KLD quality gate has been completed.
+
+## Experimental RAM staging
+
+Solo-window staging is disabled by default and uses the existing copy and
+grouped-expert kernels. Mixed layer sizes use a shared stride sized for the
+largest expert. Source aliases refresh between windows after placement changes.
+The activation and reduction changes are described in
+[Ampere precision](precision/ampere.md).
+
+Development A/B on RTX 3090 at 350 W: IQ3_S, 256 greedy tokens per fixture,
+12K context, int8 KV, prompt cache disabled, 9021 fixed GPU expert entries,
+adaptive swaps disabled, all remaining experts in RAM. The experimental arm
+uses CPU/link cost estimates of 20/24 GB/s. Each arm starts a fresh engine and
+runs conversation, structured and prose fixtures in that order.
+
+| Fixture | Path | tok/s | ms/window | passes/s |
+| --- | --- | ---: | ---: | ---: |
+| Conversation | Baseline | 43.9 | 49.42 | 20.23 |
+| Conversation | Staging | 69.1 | 35.98 | 27.79 |
+| Structured | Baseline | 33.5 | 165.99 | 6.02 |
+| Structured | Staging | 51.0 | 116.68 | 8.57 |
+| Prose | Baseline | 31.3 | 71.64 | 13.96 |
+| Prose | Staging | 45.4 | 49.91 | 20.04 |
+
+The structured prefix matches all 256 token IDs. Conversation first differs at
+token 30 and prose at token 5; these are changed-numerics development results,
+not quality equivalence. Window width identity and Q8_0 PPL/KLD remain
+unvalidated, so this path is not a validated default.
+
+At 350 W, the staged-copy microbench moves four synthetic blobs (12.3 MB) in
+512.1 us, or 24.0 GB/s, with eight copy blocks. Captured cross-stream replay
+matches the CPU routing reference and resident GPU output, including widened
+staging stride and relocated host aliases. Both staging format suites pass;
+the existing grouped-IQ format sweep also passes.
+
+## IQ3_XXS standard fixtures
+
+Development A/B on RTX 3090 at 350 W, seed 42, fresh engines, 12K context,
+int8 KV, prompt cache disabled and adaptive swaps enabled. Both arms hold
+10806 GPU expert entries in 17.52 GiB and read no expert blobs from SSD.
+The staging arm uses the same 20/24 GB/s cost estimates as above.
+
+| Fixture | Baseline tok/s | Staging tok/s | Baseline ms/window | Staging ms/window |
+| --- | ---: | ---: | ---: | ---: |
+| Conversation | 78.8 | 85.1 | 36.10 | 32.43 |
+| Structured | 163.7 | 192.3 | 47.25 | 40.35 |
+| Prose | 51.5 | 92.2 | 42.61 | 24.37 |
+
+Baseline/staging passes per second are 27.70/30.83, 21.16/24.78 and
+23.47/41.03 respectively. Both structured runs produce the expected 7230
+tokens. Both arms exercise adaptive expert exchanges; the staging arm
+completes 28770 exchanges. These are single-pair development results with
+changed outputs. N-gram I/O varies substantially: an additional unchanged-engine
+run with 15.0 GiB of GPU expert cache reaches 83.5/157.6/69.8 tok/s at 350 W.
+The prose difference cannot be attributed entirely to expert staging.
+
+The n-gram table still reads SSD pages when all expert weights fit in RAM.
+The decode timing diagnostic includes cumulative row-cache hits and I/O latencies.
+A shorter SSD keep-alive trial did not improve throughput and is not retained.
+The real-table reader test checks direct/mapped byte identity; this does not
+remove storage-read latency from inference.
+
+The verified smaller pack can be served with the baseline engine:
+
+```bat
+bin\basalt.exe serve --config basalt_config.iq3xxs.json
+```
+
+That configuration uses automatic placement and 8K context. It does not enable
+experimental staging or change the model selected by `basalt_config.json`.
+
+With this configuration and the baseline engine, API smoke checks on RTX 3090
+at 350 W return the exact requested phrase and constrained JSON `{"answer": 323}`.
+A code request generates 198 tokens at 51.4 tokens/s; a prose request reaches
+its 256-token limit at 63.4 tokens/s. Thinking is disabled for these requests.
+These short requests differ from the native benchmark fixtures and are not
+an isolated comparison with IQ3_S or a quality gate.

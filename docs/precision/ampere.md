@@ -1,5 +1,15 @@
 # Ampere precision
 
+Experimental solo-window staging is off by default. It can copy pinned RAM
+experts into GPU staging for solo multi-row windows, including packs with different expert
+sizes by layer. It uses the existing staged-copy and grouped-expert kernels;
+some work previously computed by the CPU now uses GPU Q8_1 activations per 32
+values and GPU reductions. CPU i-quant gate/up uses Q8_K activations per 256.
+Selection depends on the window's misses; single-row windows retain the CPU
+path. Greedy identity across window widths is unvalidated.
+Numerical differences are possible. Q8_0 PPL/KLD is unvalidated for this path;
+kernel parity and greedy checks do not establish model quality equivalence.
+
 Ampere selects existing native quantized projection and per-stage GDN recurrence
 kernels when dense TMA or cluster specializations are unavailable. These are
 alternative existing reduction paths; their output is not assumed bit-identical

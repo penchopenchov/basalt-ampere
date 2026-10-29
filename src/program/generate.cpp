@@ -10052,6 +10052,8 @@ int main(int argc, char** argv) {
                 if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
+                const std::string io = ple_table.io_report();
+                if (!io.empty()) basalt::log::info("basalt decode io", "cumulative %s", io.c_str());
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from

@@ -1157,7 +1157,7 @@ int main(int argc, char** argv) {
             // ring's, the glue's and the stage kernel's kinds against a CPU reference, the staged lists and bytes, and
             // the tail against the same window with those experts resident in VRAM (the same bits)
             if (L.bytes % 16 == 0) {
-                const int64_t stride = K::dec_moe_stage_stride((int64_t) L.bytes);
+                const int64_t stride = K::dec_moe_stage_stride((int64_t) std::max<size_t>(L.bytes, 4u << 20));
                 // host copies of the blobs, each 16-byte aligned at a varying offset within its 128-byte line
                 const size_t hstride = ((size_t) L.bytes + 255) / 128 * 128;
                 uint8_t* h_sb = hmap<uint8_t>((size_t) NX * hstride);
@@ -1206,8 +1206,40 @@ int main(int argc, char** argv) {
                 rs.stage_src = d_src; rs.stage_k = d_kt;
                 ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
                 std::memset((void*) (h_rings + 5), 0, sizeof(K::DmRing));
+                cudaStream_t stage_stream;
+                cudaEvent_t stage_fork, stage_join;
+                ck(cudaStreamCreateWithFlags(&stage_stream, cudaStreamNonBlocking), "stage stream");
+                ck(cudaEventCreateWithFlags(&stage_fork, cudaEventDisableTiming), "stage fork");
+                ck(cudaEventCreateWithFlags(&stage_join, cudaEventDisableTiming), "stage join");
+                ck(cudaStreamBeginCapture(s0, cudaStreamCaptureModeThreadLocal), "stage capture");
                 K::dec_moe_route(rs, s0);
-                K::dec_moe_stage(rs, d_stg, stride, (int64_t) L.bytes, 8, s0);
+                ck(cudaEventRecord(stage_fork, s0), "stage fork record");
+                ck(cudaStreamWaitEvent(stage_stream, stage_fork), "stage fork wait");
+                K::dec_moe_stage(rs, d_stg, stride, (int64_t) L.bytes, 8, stage_stream);
+                ck(cudaEventRecord(stage_join, stage_stream), "stage join record");
+                ck(cudaStreamWaitEvent(s0, stage_join), "stage join wait");
+                cudaGraph_t stage_graph;
+                cudaGraphExec_t stage_exec;
+                ck(cudaStreamEndCapture(s0, &stage_graph), "stage capture end");
+                ck(cudaGraphInstantiate(&stage_exec, stage_graph, 0), "stage instantiate");
+                for (int replay = 0; replay < 3; ++replay) {
+                    if (replay == 2) {
+                        for (int x2 = 0; x2 < NX; ++x2) {
+                            uint8_t* p = h_sb + (size_t) x2 * hstride + (size_t) (x2 % 8) * 16;
+                            std::memmove(p + 16, p, L.bytes);
+                        }
+                        for (auto& p : src) if (p) p += 16;
+                        ck(cudaMemcpyAsync(d_src, src.data(), NE * 8, cudaMemcpyHostToDevice, s0), "stage moved src");
+                    }
+                    ck(cudaMemsetAsync(d_stg, 0xee, (size_t) K::kDmStageMax * stride, s0), "stage sentinel");
+                    ck(cudaGraphLaunch(stage_exec, s0), "stage replay");
+                    ck(cudaStreamSynchronize(s0), "stage replay sync");
+                }
+                ck(cudaGraphExecDestroy(stage_exec), "stage exec destroy");
+                ck(cudaGraphDestroy(stage_graph), "stage graph destroy");
+                ck(cudaEventDestroy(stage_fork), "stage fork destroy");
+                ck(cudaEventDestroy(stage_join), "stage join destroy");
+                ck(cudaStreamDestroy(stage_stream), "stage stream destroy");
                 ck(cudaStreamSynchronize(s0), "staged route");
                 K::DmPlan S;
                 ck(cudaMemcpy(&S, d_plan, sizeof S, cudaMemcpyDeviceToHost), "plan");

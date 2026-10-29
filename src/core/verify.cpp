@@ -10,6 +10,7 @@
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/device_caps.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/native_router.hpp"
@@ -175,6 +176,7 @@ struct DecMoe {
     int64_t stage_stride = 0;
     int stage_blocks = 0;
     int stage_min = 0;   // the fewest distinct CPU misses a layer stages a share of
+    bool stage_solo = false;
     // pinned staging of the residency uploads: the copies take their source from here, so the call does
     // not wait for the stream; a ring of slots, each reused only after the window's stream sync
     uint8_t* pin = nullptr;
@@ -739,22 +741,28 @@ bool Verifier::dm_init(std::string& err) {
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
-    // The staged share: on one card, a batch window's layer with enough CPU misses sends some of them to CUDA0, copied
+    // The staged share: on one card, a window's layer with enough CPU misses sends some of them to CUDA0, copied
     // over PCIe from their RAM copies into staging while the pool reads the rest.  An expert without a mapped RAM copy
-    // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
+    // is never staged; the addresses are read again before a window when the source's places moved (a swap).
     // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
     // memory at once.
+    d->stage_solo = ampere_device() && exp_flag("solo_stage") != 0.0;
     bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
                  warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0) && lay.fmt[0].bytes % 16 == 0;
-    for (int64_t l = 1; stage && l < g.n_layers; ++l) stage = lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes;
-    const int64_t blob = (int64_t) lay.fmt[0].bytes, stride = dec_moe_stage_stride(blob);
+    for (int64_t l = 1; stage && l < g.n_layers; ++l)
+        stage = lay.fmt[(size_t) l].bytes % 16 == 0 &&
+                (d->stage_solo || lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes);
+    const int64_t blob = (int64_t) (d->stage_solo ? lay.max_blob : lay.fmt[0].bytes);
+    const int64_t stride = dec_moe_stage_stride(blob);
     const int stage_slots =
         (int) std::min<int64_t>(kDmStageMax, (int64_t) (kStagingBlobs * (int64_t) lay.max_blob) / stride);
     if (stage && stage_slots >= 1) {
         // per layer: the pool's experts after its doorbell, the staged ones after the copy, their own launches and
         // the combine's wait for them
-        constexpr double kPoolBytesPerUs = 45e3, kLinkBytesPerUs = 18e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
-        const double cpu_us = (double) blob / kPoolBytesPerUs, link_us = (double) blob / kLinkBytesPerUs;
+        constexpr double kPoolFixUs = 15.0, kStageFixUs = 35.0;
+        const double pool_bytes = d->stage_solo ? std::max(1.0, exp_flag("stage_cpu_gbps", 45.0)) * 1e3 : 45e3;
+        const double link_bytes = d->stage_solo ? std::max(1.0, exp_flag("stage_link_gbps", 18.0)) * 1e3 : 18e3;
+        const double cpu_us = (double) blob / pool_bytes, link_us = (double) blob / link_bytes;
         std::vector<int32_t> kt((size_t) kDmCap + 1, 0);
         for (int m = 1; m <= kDmCap; ++m) {
             double best = kPoolFixUs + m * cpu_us;
@@ -775,11 +783,14 @@ bool Verifier::dm_init(std::string& err) {
                    cudaEventCreateWithFlags(&d->st_join, cudaEventDisableTiming) == cudaSuccess;
         if (!sok) { err = "verify: the staged share's buffers"; return false; }
         std::memset(d->stage_host, 0, (size_t) LE * 8);
-        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
+        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first window
         d->stage_stride = stride;
         d->stage_blocks = 8;
         d->stage_min = 1;
         while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
+        if (d->stage_solo)
+            basalt::log::info("basalt verify", "solo staging: %d+ CPU misses, %lld-byte slots", d->stage_min,
+                              (long long) d->stage_stride);
     }
     std::string served;
     if (d->pdev >= 0) {
@@ -2779,7 +2790,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
             ra.rows = dm_->rq != nullptr || dm_->warm != nullptr;
-            if (dm_->stage_src != nullptr && batch_rec_) {   // batch windows: many rows, many misses
+            if (dm_->stage_src != nullptr && (batch_rec_ || (dm_->stage_solo && n > 1))) {
                 ra.stage_src = dm_->stage_src + l * g.n_expert;
                 ra.stage_k = dm_->stage_k;
             }
@@ -2961,7 +2972,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                       nat_xq_, hit_scratch_, parts_out, cs);
             }
-            if (dm_->stage_src != nullptr && batch_rec_) {   // the staged share, once its copy is in staging
+            if (dm_->stage_src != nullptr && (batch_rec_ || (dm_->stage_solo && n > 1))) {
                 cudaStreamWaitEvent(cs, dm_->st_join, 0);
                 PdlScope pst(false);
                 native_expert_grouped(L, P->sptr, P->sstart, P->scounts, P->sdst, P->stok, cap, cap, nat_xq_,
@@ -3688,6 +3699,7 @@ void Verifier::collect_profile() {
 // The device-planned tail's window start: residency tables, the flag words, and the peer card's persistent window.
 bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
     if (!dm_sync(err)) return false;
+    if (!dm_stage_places(err)) return false;
     decode_events().stamp(4);
     if (gm) gm->mark(13);
     *(volatile uint32_t*) (dm_->h_w + 0) = 0;
