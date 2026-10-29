@@ -152,7 +152,8 @@ struct DirectFile::Impl {
             DWORD bytes = 0;
             ULONG_PTR key = 0;
             OVERLAPPED* ov = nullptr;
-            if (!GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE)) return;
+            const BOOL ok = GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE);
+            if (!ok && ov == nullptr) return;
             if (ov == nullptr) continue;   // a posted wake or nudge: it carries no request
             std::lock_guard<std::mutex> lk(mu);
             free_reqs.push_back((Req*) ov);

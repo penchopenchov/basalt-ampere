@@ -89,10 +89,20 @@ int run() {
     // the experts the copy holds, and what they read now
     std::vector<std::pair<int64_t, int64_t>> probe = {{0, held}, {0, experts - 1}, {1, held + 7}, {1, experts - 1}};
     std::vector<std::vector<uint8_t>> bytes;
+    bool host_alias = true;
     for (const auto& [l, e] : probe) {
         require(src.has_resident(l, e) && registered(src.blob(l, e)), "a resident expert is registered after the load");
-        require(src.device_alias(l, e) == src.blob(l, e), "the device alias is the host address");
+        void* alias = nullptr;
+        require(cudaHostGetDevicePointer(&alias, const_cast<uint8_t*>(src.blob(l, e)), 0) == cudaSuccess &&
+                alias == src.device_alias(l, e), "the device alias matches the driver mapping");
+        host_alias = host_alias && alias == src.blob(l, e);
         bytes.emplace_back(src.blob(l, e), src.blob(l, e) + blob);
+    }
+    if (!host_alias) {
+        require(!src.unpin_complement(err) && !src.complement_unpinned(), "a separate device alias prevents unpinning");
+        for (const auto& [l, e] : probe) require(registered(src.blob(l, e)), "a refused unpin preserves registration");
+        std::puts("the driver uses separate device aliases: repinning skipped");
+        return 77;
     }
     for (int cycle = 0; cycle < 2; ++cycle) {
         require(src.unpin_complement(err), "unpin: " + err);

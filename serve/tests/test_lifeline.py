@@ -59,6 +59,7 @@ class Flags(unittest.TestCase):
         self.assertNotIn("creationflags", seen["kw"])
         self.assertTrue(callable(seen["kw"]["preexec_fn"]))
 
+    @unittest.skipUnless(hasattr(os, "setpgid"), "requires POSIX process groups")
     def test_the_child_setup_makes_a_group_sets_the_death_signal_and_chains(self):
         calls = []
         then = mock.Mock()
@@ -70,6 +71,7 @@ class Flags(unittest.TestCase):
                                  ("prctl", (lifeline.PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0))])
         then.assert_called_once_with()
 
+    @unittest.skipUnless(hasattr(os, "setpgid"), "requires POSIX process groups")
     def test_a_parent_that_already_died_kills_the_child(self):
         with mock.patch.object(os, "setpgid"), mock.patch.object(lifeline, "_prctl"), \
                 mock.patch.object(os, "getppid", return_value=1), mock.patch.object(os, "kill") as kill:
