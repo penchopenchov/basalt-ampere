@@ -97,6 +97,10 @@ The local API returned the exact requested phrase and a coherent Fibonacci
 function that passed checks for 0, 1, 2, 10, 20 and a negative input. Code and
 prose requests generated at 24.7 and 32.8 tokens/s respectively (204 and 256
 generated tokens, including reasoning; the prose request reached its cap).
+After reloading the delivered 8K setup, exact text and constrained JSON output
+were checked again: the arithmetic request returned `{"answer": 323}` for
+17 × 19. The server is available locally at `http://127.0.0.1:8080/`; restart it
+from the repository root with `bin\basalt.exe serve --config basalt_config.json`.
 
 `basalt-probe` cold decode, 400 tokens per standard fixture, at 350 W:
 
