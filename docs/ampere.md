@@ -11,17 +11,17 @@ newer hardware and must not be dispatched by the Ampere build.
 Use an x64 Visual Studio 2022 Developer command prompt with CUDA 13 and Ninja:
 
 ```bat
-cmake -S . -B build-ampere -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=ON
+uv venv --python 3.12 .venv
+uv pip install --python .venv/Scripts/python.exe -r requirements-test.txt
+cmake -S . -B build-ampere -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=ON -DPython3_EXECUTABLE="%CD%/.venv/Scripts/python.exe"
 cmake --build build-ampere -j 6
 ctest --test-dir build-ampere -L cpu -LE avx512 --output-on-failure
 ctest --test-dir build-ampere -L gpu --output-on-failure
 ```
 
-The Python server uses a local virtual environment:
+The Python server uses that local virtual environment:
 
 ```bat
-uv venv .venv
-uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 .venv\Scripts\python.exe -m serve.server --help
 ```
 
@@ -89,3 +89,33 @@ windows at least 5, and IQ4_XS 2560 / 10240 or 12288 with windows at least 7.
 Other shapes keep their previous dispatch. Explicit test setters still exercise
 the full implementations. These are development measurements, not full-model
 speed claims or community benchmark results.
+
+## Full-model development runs
+
+The verified IQ3_S pack runs on this RTX 3090 at its unchanged 350 W limit.
+The local API returned the exact requested phrase and a coherent Fibonacci
+function that passed checks for 0, 1, 2, 10, 20 and a negative input. Code and
+prose requests generated at 24.7 and 32.8 tokens/s respectively (204 and 256
+generated tokens, including reasoning; the prose request reached its cap).
+
+`basalt-probe` cold decode, 400 tokens per standard fixture, at 350 W:
+
+| Context | Conversation | Structured | Prose |
+| --- | ---: | ---: | ---: |
+| 16384 | 34.6 tok/s | 28.2 tok/s | 28.2 tok/s |
+| 8192 | 35.7 tok/s | 15.8 tok/s | 16.8 tok/s |
+
+These sequential development runs have different cache and memory conditions;
+they do not isolate context length as the cause of the difference. The delivered
+configuration uses 8192 tokens and automatic placement. The first API load put
+9043 experts in 17.15 GiB of GPU cache, 23.01 GiB of experts in pinned RAM, and
+left about 6.5 GiB of experts on SSD. Free RAM changes the plan and SSD reads can
+dominate a request. The probes measured 746–813 GB/s GPU copies, 26.2–26.3 GB/s
+host-to-GPU and 30–33 GB/s host reads at 350 W.
+
+The 16K probe's aggressive prefill-share trial hit the RAM safety guard; its
+subsequent adaptation figures are excluded. The default prefill share is kept.
+The 8K adaptation trials did not beat the repeated default beyond the measured
+30.9% noise band, so the original placement and worker defaults are also kept.
+No model-level speed comparison with the upstream hardware path, greedy-identity
+comparison, or Q8_0 PPL/KLD quality gate has been completed.

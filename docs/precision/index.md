@@ -3,6 +3,9 @@
 This page shows what precision Basalt computes in, that speculative decoding (MTP) does not change its output, and how
 its quality compares with llama.cpp on the same GGUFs against the same Q8_0 reference.
 
+The quality figures below are inherited upstream measurements. This fork's
+sm_86 paths and their current validation are described in [Ampere precision](ampere.md).
+
 Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expert tier, 128 GB of system RAM
 (121 GiB visible to the OS). Each section names the build it measured.
 
