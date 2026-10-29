@@ -3,7 +3,7 @@
 // The `gpu` setting means the same in the server, the engine, basalt-bench and basalt-probe:
 //   unset       the first visible card alone (one warning names the others when there are any);
 //   A,B,...     exactly these cards, in this order: the first is the main card;
-//   auto        every visible Blackwell card, the fastest (memory bandwidth, then VRAM) as the main card.
+//   auto        every visible supported card, the fastest (memory bandwidth, then VRAM) as the main card.
 // Cards are numbered as nvidia-smi numbers them; under CUDA_VISIBLE_DEVICES the numbers count within that list. The
 // choice is made before any CUDA call and narrows CUDA_VISIBLE_DEVICES to the chosen cards, main first, so the engine
 // always runs on device 0 with the rest after it. The decisions are pure functions over a card table.

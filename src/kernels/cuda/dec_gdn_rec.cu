@@ -24,6 +24,13 @@
 #include "basalt/log.hpp"
 
 namespace cg = cooperative_groups;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+using RecCluster = cg::cluster_group;
+#define BASALT_REC_CLUSTER __cluster_dims__(4, 1, 1)
+#else
+using RecCluster = void;
+#define BASALT_REC_CLUSTER
+#endif
 
 namespace basalt::kernels {
 namespace {
@@ -168,7 +175,7 @@ __device__ __forceinline__ void rec_sync() {
 // head's raw output goes to a.o for dec_gdn_rec_norm.
 template<int MAXT, bool SPLIT, bool SUB = false>
 __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem& sm,
-                                          cg::cluster_group* cluster) {
+                                          RecCluster* cluster) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
     const int col = rank * 32 + lane;
@@ -200,9 +207,11 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     asm volatile("cp.async.commit_group;" ::: "memory");
     const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
     stamp(a, 1);
-    if (a.early_trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the out projection may stage its weights
+    if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights
     // this block has started: the barrier the ranks wait on before writing into each other's shared memory
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if (!SPLIT) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#endif
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
     asm volatile("cp.async.wait_all;" ::: "memory");
@@ -314,6 +323,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     if (SPLIT) return;
     // every rank's sums of squares, pushed into every rank's shared memory (once every rank has started) before one
     // cluster barrier
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
     if (rg == 0) {
         const int t = lane / 4, r = lane % 4;
@@ -321,6 +331,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         if (t < T) *cluster->map_shared_rank(&sm.wsum[t][rank], r) = v;
     }
     cluster->sync();
+#endif
     stamp(a, 7);
 
     // ---- the gated RMS norm and the q8_1 of the output: one warp, one q8_1 block per token
@@ -337,10 +348,15 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
 }
 
 template<int MAXT>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
+__global__ void BASALT_REC_CLUSTER __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+
     __shared__ RecSmem sm;
     cg::cluster_group cl = cg::this_cluster();
     rec_block<MAXT, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+#else
+    __trap();
+#endif
 }
 
 template<int MAXT>
@@ -352,8 +368,10 @@ __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T)
 // rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
 // segment's rows and state
 template<int MAXT>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
+__global__ void BASALT_REC_CLUSTER __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
                                                                               size_t state_off) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+
     const SegRow r = rows[blockIdx.y];
     if (r.j != 0) return;
     __shared__ RecSmem sm;
@@ -366,6 +384,9 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
     if (a.y) a.y += r0 * vd;
     a.yq = static_cast<char*>(a.yq) + r0 * (vd / 32) * sizeof(Q81);
     rec_block<MAXT, false>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
+#else
+    __trap();
+#endif
 }
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
@@ -396,6 +417,10 @@ static int mapped_heads(const DecRecArgs& a) {
     if (a.nk == 0) return a.h_v;
     if (a.nk < 0 || a.k0 < 0 || a.k0 + a.nk > a.h_k) return -1;
     return a.nk * (a.h_v / a.h_k);
+}
+
+int dec_gdnf_mode() {
+    return pdl_kernel_ok((const void*) rec_kernel<2>) ? 3 : 0;
 }
 
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {

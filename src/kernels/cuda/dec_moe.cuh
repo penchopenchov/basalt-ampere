@@ -1957,6 +1957,8 @@ template<int TG, int TD>
 __global__ void __launch_bounds__(kDmThreads) dm_vram_tma_kernel(const DmPlan* __restrict__ plan,
                                                                  const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                                  float* gate, float* up, float* out, unsigned int* sync) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+
     __shared__ DmTmaShared sm;
     const int tid = threadIdx.x;
     const int ng = plan->counts[0];
@@ -1971,6 +1973,9 @@ __global__ void __launch_bounds__(kDmThreads) dm_vram_tma_kernel(const DmPlan* _
     dm_bars_init(sm);
     dm_experts_tma<TG, TD>(sm, ng, xq, L, gate, up, out, sync + 1, blockIdx.x, gridDim.x, 0);
     if (dm_arrive(sync, gridDim.x, sync + 1, ng)) sync[0] = 0u;
+#else
+    __trap();
+#endif
 }
 
 // ---------------------------------------------------------------- the VRAM share as three launches, NR rows a warp
@@ -2539,6 +2544,10 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         }
         check("dec_moe_vram");
         return;
+    }
+    if (kind == 1) {
+        if (!pdl_kernel_ok((const void*) dm_vram_tma_kernel<21, 21>))
+            kind = 0;
     }
     if (kind == 1) {
         if (L.gu_row * kTmaGuRows > (size_t) kTmaStage || L.d_row * kTmaDownRows > (size_t) kTmaStage ||

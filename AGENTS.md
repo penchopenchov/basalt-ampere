@@ -1,10 +1,10 @@
 # AGENTS.md
 
-Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts model, built for NVIDIA Blackwell (sm_120) on Linux and Windows x64. It runs on an NVIDIA Blackwell GPU, optionally with a second GPU as a peer expert tier, and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
+Basalt is a local inference engine for the Qwen3.8-Flash-Next mixture-of-experts model, ported here for NVIDIA Ampere (sm_86) on Linux and Windows x64. It runs on an NVIDIA Ampere GPU, optionally with a second GPU as a peer expert tier, and system RAM holding the rest. It is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
 
 ## Working rules
 
-`CONTRIBUTING.md` sets the project scope (CUDA + Blackwell only) and what every change must include (parity test, profile, quality check). It applies to agents too.
+`CONTRIBUTING.md` sets this fork's scope (CUDA + Ampere, with the inherited Blackwell build retained) and what every change must include (parity test, profile, quality check). It applies to agents too.
 
 - **Commits:** small and logical, message style `area: what it does`. Never amend and never force-push; always make new commits. End each message with the co-author line your tool's instructions specify.
 - **Platform code:** engine code never names an OS or a compiler. No `_WIN32`, `_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS calls (mmap, pread, pthread, fork/exec, dlopen, /proc, /sys) outside `src/platform/` and `include/basalt/platform/`. A missing seam is added there with a Linux and a Windows body; the Linux body is the code you would have written anyway. `tools/check_platform_boundary.sh` enforces it.

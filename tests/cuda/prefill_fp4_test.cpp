@@ -1128,6 +1128,7 @@ int main(int argc, char** argv) {
         std::printf("no CUDA device: skipped\n");
         return 77;
     }
+    if (!fp4::supported()) { std::printf("native FP4 unavailable: skipped\n"); return 77; }
     bool do_bench = true;
     for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], "--no-bench") == 0) do_bench = false;
     try {

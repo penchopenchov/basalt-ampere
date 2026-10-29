@@ -3,6 +3,7 @@
 //
 //   1. every output (FP32, BF16 and its low part, FP16) bitwise equal to the two steps' at chunk widths from
 //      kUpMixMinT up to a long prompt's chunk, with the weights as a BF16 matrix and as an 8-bit copy;
+//      a reference-width-dependent reduction is checked numerically, including each output image's encoding;
 //   2. the mixed rows against the CPU reference (max abs and rel error, for the kernel and for the two steps);
 //   3. a token's outputs do not depend on the chunk width or on the token's place in the chunk;
 //   4. output hashes of both paths (FNV-1a over the three images);
@@ -10,10 +11,12 @@
 //
 //     build/prefill_hc_up_mix_test [--no-bench]
 #include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/device_caps.hpp"
 #include "basalt/prefill/gemm.hpp"
 #include "basalt/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <cmath>
@@ -86,6 +89,26 @@ size_t diff_rows(const Out& a, int64_t a_t0, const Out& b, int64_t b_t0, int64_t
         for (size_t i = 0; i < e; ++i) bad += u[i] != v[i];
     }
     return bad;
+}
+bool near_rows(const Out& a, const Out& b, int64_t T) {
+    const size_t n = (size_t) T * N;
+    std::vector<float> x(n), y(n);
+    cudaMemcpy(x.data(), a.mixed, n * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(y.data(), b.mixed, n * 4, cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < n; ++i)
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i]) ||
+            std::fabs(x[i] - y[i]) > 5e-7f + 5e-7f * std::max(std::fabs(x[i]), std::fabs(y[i]))) return false;
+    for (const Out* o : {&a, &b}) {
+        const auto& values = o == &a ? x : y;
+        std::vector<uint16_t> hi(n), low(n), half(n);
+        cudaMemcpy(hi.data(), o->m16, n * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(low.data(), o->m16lo, n * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(half.data(), o->mh, n * 2, cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < n; ++i)
+            if (hi[i] != bf16(values[i]) || low[i] != bf16(values[i] - (float) f32(hi[i])) ||
+                half[i] != __half_as_ushort(__float2half_rn(values[i]))) return false;
+    }
+    return true;
 }
 uint64_t hash_out(const Out& o, int64_t T) {
     std::vector<uint8_t> h((size_t) T * N * 4);
@@ -164,23 +187,29 @@ int main(int argc, char** argv) {
             const size_t bad = diff_rows(a, 0, b, 0, T);
             std::printf("%s T=%-6lld outputs differing from the two steps: %zu of %lld\n", wsel ? "8-bit copy" : "bf16      ",
                         (long long) T, bad, (long long) T * N * 4);
-            expect(bad == 0, "bitwise vs the two steps at T=" + std::to_string(T));
+            if (K::ampere_device() && T == 129)
+                expect(near_rows(a, b, T), "finite near outputs and exact image encodings at the reference boundary");
+            else
+                expect(bad == 0, "bitwise vs the two steps at T=" + std::to_string(T));
         }
     }
     expect(cudaGetLastError() == cudaSuccess, "no CUDA error");
 
-    // ---------------------------------------------------------------- 2. CPU reference (sampled tokens of the last run)
-    {
-        const int64_t T = TM;
+    // ---------------------------------------------------------------- 2. CPU reference (boundary and long chunks)
+    for (int wsel = 0; wsel < 2; ++wsel) for (int64_t T : {int64_t{129}, TM}) {
+        const uint16_t* W = wsel == 0 ? dwu : (const uint16_t*) wq;
+        two_steps(W, 0, T, a);
+        fused(W, 0, T, b, 0);
+        cudaStreamSynchronize(st);
         std::vector<float> mk((size_t) T * N), m2((size_t) T * N);
         cudaMemcpy(mk.data(), b.mixed, mk.size() * 4, cudaMemcpyDeviceToHost);
         cudaMemcpy(m2.data(), a.mixed, m2.size() * 4, cudaMemcpyDeviceToHost);
         std::vector<uint16_t> wd(wu.size());
-        const uint16_t* wdev = gm.bf16_rows((const uint16_t*) wq, D, LR);
+        const uint16_t* wdev = gm.bf16_rows(W, D, LR);
         cudaMemcpy(wd.data(), wdev, wd.size() * 2, cudaMemcpyDeviceToHost);
         double ea = 0, eb = 0, ref = 0;
         for (int s = 0; s < 64; ++s) {
-            const int64_t t = s == 0 ? 0 : s == 63 ? T - 1 : (int64_t) (rng() % T);
+            const int64_t t = s == 0 ? 0 : s == 1 ? 127 : s == 2 ? 128 : s == 63 ? T - 1 : (int64_t) (rng() % T);
             for (int d = 0; d < N; ++d) {
                 double m = 0;
                 for (int c = 0; c < HC; ++c) {
@@ -196,14 +225,19 @@ int main(int argc, char** argv) {
                 ref = std::max(ref, std::fabs(m));
             }
         }
-        std::printf("vs CPU double (64 tokens of T=%lld): gr_up_mix max abs %.3e rel %.3e; two steps max abs %.3e rel %.3e\n",
-                    (long long) T, ea, ea / ref, eb, eb / ref);
+        std::printf("vs CPU double (%s, 64 tokens of T=%lld): gr_up_mix max abs %.3e rel %.3e; two steps max abs %.3e rel %.3e\n",
+                    wsel ? "8-bit copy" : "bf16", (long long) T, ea, ea / ref, eb, eb / ref);
         expect(ea / ref < 1e-5, "gr_up_mix near the CPU reference");
+        expect(eb / ref < 1e-5, "two steps near the CPU reference");
     }
 
     // ---------------------------------------------------------------- 3. width and position independence
     {
         const int64_t T = 1000;
+        two_steps(dwu, 0, 129, a);
+        two_steps(dwu, 0, T, b);
+        cudaStreamSynchronize(st);
+        std::printf("two-step reference width dependence, first 129 rows: %zu outputs differ\n", diff_rows(a, 0, b, 0, 129));
         b.clear(T);
         fused(dwu, 0, T, b, 0);
         Out c;

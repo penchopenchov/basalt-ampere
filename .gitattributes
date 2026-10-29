@@ -2,3 +2,6 @@
 tests/data/native_experts/** -text
 # the table is checked byte for byte (tools/check_benchmarks.py), so it stays LF on every checkout
 docs/community/benchmarks.json text eol=lf
+# Shell tooling reads these paths as exact keys.
+tools/*.sh text eol=lf
+tools/*.allow text eol=lf

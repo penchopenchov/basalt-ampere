@@ -343,7 +343,7 @@ __global__ void __launch_bounds__(256) native_gu2_kernel(const unsigned long lon
                                                          const int32_t* __restrict__ ent_tok,
                                                          const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                          float* __restrict__ gate, float* __restrict__ up) {
-    asm volatile("griddepcontrol.launch_dependents;");   // the down kernel may start (it waits for this grid)
+    pdl_launch_dependents();   // the down kernel may start (it waits for this grid)
     const int ng = *n_groups;
     if ((int) blockIdx.y >= ng) return;
     __shared__ alignas(16) uint32_t s_grid_buf[gu2::Fmt2<TG>::kGridWords];
@@ -366,7 +366,7 @@ __host__ __device__ inline bool gu2_usable(const NativeExpertLayout& L) {
 // letting the next one launch as soon as all its blocks have started: a down block prefetches its weight rows into
 // L2 before it waits for the SwiGLU pass, so the down weights stream while the gate/up rows are still being read.
 // Before its wait a kernel reads only the plan (written before the gate/up kernel) and the weights.
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;"); }
+__device__ __forceinline__ void pdl_trigger() { pdl_launch_dependents(); }
 
 __device__ __forceinline__ void prefetch_l2(const uint8_t* p, int bytes, int tid) {
     for (int o = tid * 128; o < bytes; o += 256 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + o));
@@ -391,6 +391,10 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_pdl_kernel(const floa
 
 template<typename... KArgs, typename... Args>
 void launch_dependent(void (*kernel)(KArgs...), dim3 grid, cudaStream_t s, Args... args) {
+    if (!pdl_kernel_ok((const void*) kernel)) {
+        kernel<<<grid, 256, 0, s>>>(args...);
+        return;
+    }
     cudaLaunchAttribute at[1];
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     at[0].val.programmaticStreamSerializationAllowed = 1;

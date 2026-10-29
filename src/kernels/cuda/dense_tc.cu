@@ -1107,11 +1107,35 @@ void launch(const void* w, const void* x, float* y, int n_in, int n_out, int nco
 }  // namespace
 #ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 
+static bool dense_tc_device_supported() noexcept {
+    static std::atomic<int> known[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return false;
+    }
+    int state = known[dev].load(std::memory_order_acquire);
+    if (state == 0) {
+        int major = 0;
+        cudaFuncAttributes attr{};
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        major >= 9 &&
+                        cudaFuncGetAttributes(&attr, dense_tc_kernel<12, 3, 1, 1>) == cudaSuccess &&
+                        attr.ptxVersion >= 90;
+        if (!ok) cudaGetLastError();
+        state = ok ? 1 : -1;
+        known[dev].store(state, std::memory_order_release);
+    }
+    return state > 0;
+}
+
 bool dense_tc_supported(int t, int n_in) noexcept {
-    return n_in > 0 && n_in % 512 == 0 && (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42 || t == 8);
+    return dense_tc_device_supported() && n_in > 0 && n_in % 512 == 0 &&
+           (t == 12 || t == 13 || t == 14 || t == 23 || t == 11 || t == 42 || t == 8);
 }
 
 bool dense_tc_supported(int t, int n_in, int n_out, const void* w) noexcept {
+    if (!dense_tc_device_supported()) return false;
     if (t == 21) return n_in > 0 && n_in % 512 == 0 && n_out > 0 && one_ok<21>(w, n_in, n_out);
     return dense_tc_supported(t, n_in);
 }
@@ -1146,6 +1170,7 @@ void dense_tc(int type, const void* w, const void* x, float* y, int n_in, int n_
 }
 
 bool dense_tc_pair_supported(int t0, int t1, int n_in) noexcept {
+    if (!dense_tc_device_supported()) return false;
     auto ok = [&](int t) { return t == 12 || t == 13 || t == 14 || t == 21 || t == 23 || t == 11 || t == 42 || t == 8; };
     if (!ok(t0) || !ok(t1) || n_in <= 0 || n_in % 512 != 0) return false;
     const int tb = 16 * (n_in / 256) * std::max(sb_bytes_lq(t0), sb_bytes_lq(t1));

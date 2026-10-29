@@ -47,12 +47,17 @@ __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned
 // c += A (16 tokens x 64 values, E2M1 with a UE4M3 scale per 16) * B (64 x 8 weight rows, same format)
 __device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa,
                                         unsigned sfb) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1200
+
     constexpr unsigned short kId = 0;
     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(kId), "h"(kId),
                    "r"(sfb), "h"(kId), "h"(kId));
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void cp_async8(void* dst, const void* src) {
@@ -95,6 +100,8 @@ template <int NBL, bool TOKENS>
 __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                 const int32_t* __restrict__ bounds, const int32_t* __restrict__ tile_off, int n,
                                 uint8_t* __restrict__ a4, float* __restrict__ gs, int cols, int64_t ld, int64_t rows) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1200
+
     const int lane = threadIdx.x & 31;
     const int64_t r = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (r >= rows) return;
@@ -167,6 +174,9 @@ __global__ void quantize_kernel(const float* __restrict__ x, const int32_t* __re
         *(uint2*) (ktp + rr * 64 + swz(rr, lb)) = make_uint2(w[0], w[1]);
         ktp[kACodeBytes + rr * 8 + (b % 8)] = (uint8_t) sb;
     }
+#else
+    __trap();
+#endif
 }
 
 // ----------------------------------------------------------------------------------------------- GEMM
@@ -373,6 +383,16 @@ __global__ void tails_kernel(GemmArgs a, size_t off, int n, float* dst) {
 }
 
 }  // namespace
+
+bool supported() {
+#if BASALT_NATIVE_FP4
+    int dev = 0, major = 0;
+    return cudaGetDevice(&dev) == cudaSuccess &&
+           cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major == 12;
+#else
+    return false;
+#endif
+}
 
 size_t a4_bytes(int64_t rows, int64_t cols, int experts) {
     return (size_t) ((rows + kTileTokens - 1) / kTileTokens + experts) * (size_t) (cols / kKTile) * kAStage;

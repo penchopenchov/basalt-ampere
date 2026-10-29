@@ -64,6 +64,6 @@ void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream);
 /// The verify window's GDN block around native q8_1 + qkv/z/out projections, as run: dec_gdn_rec_split beside the z
 /// projection (z forked after the q8_1, beside qkv too), then dec_gdn_rec_norm.  Mode 1 is dec_gdn_rec after z, 2 forks
 /// z after qkv.
-inline constexpr int dec_gdnf_mode() { return 3; }
+int dec_gdnf_mode();
 
 }  // namespace basalt::kernels

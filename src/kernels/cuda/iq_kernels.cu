@@ -1,3 +1,4 @@
+#include "basalt/kernels/device_caps.hpp"
 // src/kernels/cuda/iq_kernels.cu - see include/basalt/kernels/iq_kernels.hpp.
 //
 // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
@@ -2567,9 +2568,9 @@ bool gu_mma_usable(const NativeExpertLayout& L) {
 }
 // iq_mmvq's IQ3_S calls of 2..8 columns with n_in % 512 == 0 on mmvq_iq3s_mma_kernel where the device runs it (the
 // same bits); iq_set_mmvq_mma turns it on for tests.
-bool g_mmvq_mma = false;
+int g_mmvq_mma = -1;
 // the fewest columns that take it
-int g_mmvq_mma_min_t = 4;
+int g_mmvq_mma_min_t = 5;
 std::atomic<long> g_mmvq_mma_launches{0};
 // The current device's SM count if it runs mmvq_iq3s_mma_kernel (int8 MMA with device code for it in this build),
 // else 0; per device
@@ -2598,7 +2599,8 @@ template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
                  cudaStream_t s) {
     if constexpr (TY == 21) {
-        if (g_mmvq_mma && !g_old_kernels && ncols >= std::max(2, g_mmvq_mma_min_t + (n_in > n_out ? 1 : 0)) && ncols <= kGmCols &&
+        if (iq_mmvq_mma() && (g_mmvq_mma >= 0 || (n_in == 2560 && n_out == 6144)) &&
+            !g_old_kernels && ncols >= std::max(2, g_mmvq_mma_min_t + (n_in > n_out ? 1 : 0)) && ncols <= kGmCols &&
             n_in % 512 == 0) {
             if (const int sms = mmvq_mma_sms()) {   // 32 rows per block while that gives every SM one, else 16
                 if ((n_out + 31) / 32 >= sms)
@@ -2697,7 +2699,7 @@ void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 void native_grouped_set_gu2(int mode) { g_gu2 = mode; }
 bool iq_old_kernels() { return g_old_kernels; }
 void iq_set_mmvq_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count
-bool iq_mmvq_mma() { return g_mmvq_mma; }
+bool iq_mmvq_mma() { return g_mmvq_mma >= 0 ? g_mmvq_mma != 0 : ampere_device(); }
 bool iq_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
 long iq_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }
 

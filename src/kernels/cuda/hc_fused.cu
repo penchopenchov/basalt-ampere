@@ -227,7 +227,12 @@ __device__ __forceinline__ void prefetch_l2(const void* p, size_t bytes) {   // 
     const char* c = (const char*) p;
     for (size_t o = 0; o < bytes; o += 65536) {
         const unsigned sz = (unsigned) (bytes - o < 65536 ? bytes - o : 65536);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(c + o), "r"(sz) : "memory");
+#else
+        for (unsigned j = 0; j < sz; j += 128)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(c + o + j));
+#endif
     }
 }
 // DBG: the bench's phase times (a separate instantiation of the kernel); otherwise no code at all
@@ -973,6 +978,8 @@ constexpr int CAND_WORDS = 2 * NE + 2 * KT;   // hc_top10's shared memory per wa
 
 template <int T, bool DBG>
 __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_constant__ HcLaunch L) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+
     extern __shared__ __align__(128) char smem[];
     __shared__ __align__(8) uint64_t bars[2];   // the up slice's copy, the router rows
     __shared__ __align__(8) uint64_t dbars[WARPS];   // the down items' rows, per warp
@@ -1139,6 +1146,9 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             __threadfence();
         }
     }
+#else
+    __trap();
+#endif
 }
 
 __global__ void hc_l2_prefetch_kernel(const void* p0, size_t n0, const void* p1, size_t n1, const void* p2, size_t n2,
@@ -1202,7 +1212,7 @@ const DevInfo& dev_info() {
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
             d.sms = sms;
-            d.ok = major == 12 && optin >= SMEM + 1024 &&
+            d.ok = major == 12 && pdl_kernel_ok((const void*) hc_fused_kernel<1, false>) && optin >= SMEM + 1024 &&
                    cudaMalloc((void**) &d.t10, ((size_t) NE + (size_t) sms * 2 * KT) * 4) == cudaSuccess &&
                    cudaMalloc((void**) &d.cn, (size_t) NSLOT * CN_SLOT * 4) == cudaSuccess &&
                    cudaMalloc((void**) &d.lg, (size_t) NSLOT * MAXT * NE * 8) == cudaSuccess &&

@@ -1,3 +1,4 @@
+#include "basalt/kernels/device_caps.hpp"
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{quantize.cu,vecdotq.cuh,mmvq.cu,common.cuh}
 // and ggml/src/ggml-common.h.
@@ -1465,9 +1466,9 @@ __global__ void __launch_bounds__(256, 2) native_iq4_xs_mma_kernel(const IQ4XSBl
 
 // ncols > 1 IQ4_XS in exact mode on native_iq4_xs_mma_kernel where the device runs it (the same bits);
 // native_mmvq_set_mma turns it on for tests.
-bool g_mmvq_mma = false;
+int g_mmvq_mma = -1;
 // the fewest columns that take it (one more where the projection narrows its input)
-int g_mmvq_mma_min_t = 4;
+int g_mmvq_mma_min_t = 7;
 std::atomic<long> g_mmvq_mma_launches{0};
 // The current device's SM count if it runs native_iq4_xs_mma_kernel (int8 MMA, with
 // device code for it in this build), else 0; per device
@@ -1580,7 +1581,7 @@ void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
 void native_mmvq_set_mma(bool on) { g_mmvq_mma = on; g_mmvq_mma_min_t = 1; }   // tests: every column count
-bool native_mmvq_mma() { return g_mmvq_mma; }
+bool native_mmvq_mma() { return g_mmvq_mma >= 0 ? g_mmvq_mma != 0 : ampere_device(); }
 bool native_mmvq_mma_available() { return mmvq_mma_sms() > 0; }
 long native_mmvq_mma_launches() { return g_mmvq_mma_launches.load(std::memory_order_relaxed); }
 
@@ -1744,7 +1745,9 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     if (ncols > 1) {
-        if (g_multi_exact && g_mmvq_mma && ncols >= g_mmvq_mma_min_t + (n_in > n_out ? 1 : 0)) {
+        if (g_multi_exact && native_mmvq_mma() &&
+            (g_mmvq_mma >= 0 || (n_in == 2560 && (n_out == 10240 || n_out == 12288))) &&
+            ncols >= g_mmvq_mma_min_t + (n_in > n_out ? 1 : 0)) {
             if (const int sms = mmvq_mma_sms()) {
                 launch_iq4_xs_mma(weights, x_q8_1, y, n_in, n_out, ncols, sms, static_cast<cudaStream_t>(stream));
                 launch_check();

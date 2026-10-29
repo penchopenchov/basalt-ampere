@@ -275,7 +275,7 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
         cfg.blockDim = dim3(128);
         cfg.stream = static_cast<cudaStream_t>(stream);
         cfg.attrs = at;
-        cfg.numAttrs = dep ? 1 : 0;
+        cfg.numAttrs = dep && pdl_kernel_ok((const void*) dm_combine4_kernel<10, true>) ? 1 : 0;
         const int ki = int(k);
         const volatile uint32_t* none = nullptr;
         unsigned* nseen = nullptr;

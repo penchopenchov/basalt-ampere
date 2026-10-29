@@ -11,6 +11,9 @@
 
 namespace basalt::prefill::fp4 {
 
+/// Whether this build and the current device support native block-scaled FP4.
+bool supported();
+
 constexpr int kTileTokens = 64;
 constexpr int kMaxExperts = 16;   // experts per launch
 

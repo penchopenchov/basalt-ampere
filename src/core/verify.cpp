@@ -1088,6 +1088,11 @@ void Verifier::hs_free() {
 static bool g_gs_off = false;   // set by Verifier::gs_decide when the split does not pay
 
 static int gs_plan_bw(const ModelGeometry& g, int dev0, int dev1) {
+    for (int dev : {dev0, dev1}) {
+        const OnDevice on(dev);
+        if (kernels::dec_gdnf_mode() == 0 ||
+            !kernels::dense_tc_pair_supported(8, 8, (int) g.n_embd)) return 0;
+    }
     const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
     const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
     constexpr int kBlockCols = 256;

@@ -370,7 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8080, help="the TCP port to listen on (default 8080)")
     ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: exactly these, the first is the main "
-                                  "card and the engine gives the rest their roles (\"0,1\"); auto = every Blackwell "
+                                  "card and the engine gives the rest their roles (\"0,1\"); auto = every supported "
                                   "card, the fastest as main (default: GPU 0 alone)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="tokenizer directory for the mock engine (a byte tokenizer if absent)")

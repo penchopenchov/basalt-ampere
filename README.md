@@ -1,7 +1,7 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
-Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model.
-It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120); see [platforms](docs/platforms.md) for limitations.
+**Basalt Ampere** is a fork of [Basalt](https://github.com/jesdga95/basalt), a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model.
+This fork targets NVIDIA RTX 3090 / Ampere (sm_86) on Windows and Linux. See [Ampere setup](docs/ampere.md) for build instructions, validation and memory limits.
 
 Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
@@ -12,25 +12,25 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 
 ## Requirements
 
-- Linux x86-64 with AVX2 (AVX-512 is used when present), and an NVIDIA Blackwell GPU (compute capability 12.0) with CUDA 13.
+- Linux x86-64 with AVX2 (AVX-512 is used when present), and an NVIDIA GPU of compute capability 8.6 (or an explicit 12.0 build) with CUDA 13.
 - CMake 3.24 or newer, a C++20 compiler, and Python 3.10 or newer.
 - Enough system RAM to hold the experts that do not fit in VRAM.
 
 ## Quick start
 
 ```sh
-git clone https://github.com/jesdga95/basalt && cd basalt
+git clone https://github.com/penchopenchov/basalt-ampere && cd basalt-ampere
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
 pip install -r requirements.txt
-hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4.basalt --local-dir models
+hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt --local-dir models
 ```
 
 Put your settings in `basalt_config.json`, with `model` pointing at the downloaded file:
 
 ```json
 {
-  "server": { "model": "models/Qwen3.8-FN-NVFP4.basalt", "gpu": "0,1", "port": 8080 },
+  "server": { "model": "models/Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt", "gpu": "0", "port": 8080 },
   "engine": { "expert-cache": "auto", "prefill": "auto", "kv": "int8", "resident-experts": true }
 }
 ```

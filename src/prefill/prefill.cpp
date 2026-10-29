@@ -742,6 +742,7 @@ struct MoeBufs { size_t gu, h, xq, hq; };
 // An NVFP4 pack's prompt experts run on the FP4 tensor cores: the activation planes, token scales and tile tables sit
 // in Xq (the layer's rows) and Hq (one group's H, a group of up to MMQ_GROUP experts).
 bool fp4_pack() {
+    if (!fp4::supported()) return false;
     static const bool any = [] {
         const auto& lay = basalt::kernels::cpu::expert_layout();
         if (!lay.native) return false;
@@ -775,6 +776,7 @@ size_t fp4_h_bytes(size_t rows) {
 }
 // Every layer's experts are NVFP4 on the FP4 path, so a chunk of FP4_MIN_TOKENS or more never runs MMQ.
 bool fp4_every_layer() {
+    if (!fp4::supported()) return false;
     static const bool all = [] {
         const auto& lay = basalt::kernels::cpu::expert_layout();
         const MmqPlan& mp = mmq_plan();
@@ -1301,8 +1303,15 @@ static void peer_layout(PeerPrefill& pp, int64_t Tp, int64_t tf, const MmqPlan& 
     }
 }
 
+static bool peer_fp4_supported(int device) {
+    const core::OnDevice on(device);
+    int current = -1;
+    return cudaGetDevice(&current) == cudaSuccess && current == device && fp4::supported();
+}
+
 static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, int64_t tf,
                       std::unique_ptr<PeerPrefill>& out, std::string& err) {
+    if (tf > 0 && !peer_fp4_supported(peer->device())) tf = 0;
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
     pp->T_max = std::min<int64_t>(T_max, stream_all_min() - 1);
@@ -1373,11 +1382,11 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     return true;
 }
 
-uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
+uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share, int peer_device) {
     if (!mmq_plan().any) return 0;
     PeerPrefill pp;
     pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : kPeerSlowRows);
-    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || !peer_fp4_supported(peer_device) || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
                               ? 0 : std::min<int64_t>(chunk, kPeerFp4Tokens);
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
     const int64_t Tp = std::max(pp.T_max, tf);
@@ -1393,7 +1402,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     // result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.  It also takes
     // those of a streamed chunk of up to kPeerFp4Tokens (PeerPrefill::T_fp4) where those buffers fit too.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
-    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
+    const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || !peer_fp4_supported(peer->device()) || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
                               ? 0 : std::min<int64_t>(m.T_max, kPeerFp4Tokens);
     std::unique_ptr<PeerPrefill> pp;
     const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
@@ -2093,7 +2102,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     // NVFP4 experts: FP4 block-scaled tensor cores, read in place from the blobs
-                    const bool fp4_l = use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
+                    const bool fp4_l = fp4::supported() && use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
                                        lay.fmt[(size_t) l].tail != 0 && T >= FP4_MIN_TOKENS;
                     const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
