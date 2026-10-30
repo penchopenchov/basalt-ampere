@@ -12,21 +12,27 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 
 ## Requirements
 
-- Linux x86-64 with AVX2 (AVX-512 is used when present), and an NVIDIA GPU of compute capability 8.6 (or an explicit 12.0 build) with CUDA 13.
+- Windows x64 or Linux x86-64 with AVX2 (AVX-512 is used when present), and an NVIDIA GPU of compute capability 8.6 (or an explicit 12.0 build) with CUDA 13.
 - CMake 3.24 or newer, a C++20 compiler, and Python 3.10 or newer.
+- Windows builds use Visual Studio 2022 C++ Build Tools and Ninja; see [Windows setup](docs/ampere.md#windows-build).
 - Enough system RAM to hold the experts that do not fit in VRAM.
 
 ## Quick start
+
+The commands below are for Linux. On Windows, follow [Windows setup](docs/ampere.md#windows-build),
+download the model, then use the double-click launchers below.
 
 ```sh
 git clone https://github.com/penchopenchov/basalt-ampere && cd basalt-ampere
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
 pip install -r requirements.txt
+pip install huggingface_hub             # provides the hf download command
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt --local-dir models
 ```
 
-The checked-in `basalt_config.json` selects IQ3_XXS, 128K context, int8 KV and
+The checked-in `basalt_config.json` selects IQ3_XXS, 128K context (131072 tokens
+including the prompt and reply), int8 KV and
 experimental expert staging. Set `server.model` there if the downloaded file
 is elsewhere. Staging changes numerical results; its full Q8_0 quality gate
 remains unvalidated. See [Ampere setup](docs/ampere.md) for the measured checks.
@@ -40,8 +46,8 @@ share that port. The OpenAI-compatible API base is `http://127.0.0.1:8088/v1`.
 
 On Windows, after [setup](docs/ampere.md#windows-build), double-click:
 
-- `Start Basalt.bat` to start the server. Keep its window open while using Basalt.
-- `Open Basalt UI.bat` to open the interface. It starts the server if needed;
+- [Start Basalt.bat](<Start Basalt.bat>) to start the server. Keep its window open while using Basalt.
+- [Open Basalt UI.bat](<Open Basalt UI.bat>) to open the interface. It starts the server if needed;
   the interface shows model-loading progress while the weights load.
 
 ## Models

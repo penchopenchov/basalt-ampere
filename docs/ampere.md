@@ -12,7 +12,7 @@ Use an x64 Visual Studio 2022 Developer command prompt with CUDA 13 and Ninja:
 
 ```bat
 uv venv --python 3.12 .venv
-uv pip install --python .venv/Scripts/python.exe -r requirements-test.txt
+uv pip install --python .venv/Scripts/python.exe -r requirements-test.txt huggingface_hub
 cmake -S . -B build-ampere -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=ON -DPython3_EXECUTABLE="%CD%/.venv/Scripts/python.exe"
 cmake --build build-ampere -j 6
 ctest --test-dir build-ampere -L cpu -LE avx512 --output-on-failure
@@ -53,7 +53,7 @@ The supplied configurations use port 8088. `Start Basalt.bat` starts the server;
 `Open Basalt UI.bat` starts it if needed and opens `http://127.0.0.1:8088/`.
 
 ```bat
-hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt --local-dir models
+.venv\Scripts\hf.exe download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt --local-dir models
 bin\basalt.exe serve --config basalt_config.json
 ```
 
