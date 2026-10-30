@@ -48,8 +48,10 @@ Its expert section is 40.0 GiB. The smaller footprint leaves more RAM headroom;
 the [upstream model card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt)
 reports lower accuracy than IQ3_S. Neither quant is validated here against Q8_0.
 
+The default server selects IQ3_XXS; see [128K default context](#128k-default-context).
+
 ```bat
-hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt --local-dir models
+hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt --local-dir models
 bin\basalt.exe serve --config basalt_config.json
 ```
 
@@ -121,8 +123,8 @@ were checked again: the arithmetic request returned `{"answer": 323}` for
 | 8192 | 35.7 tok/s | 15.8 tok/s | 16.8 tok/s |
 
 These sequential development runs have different cache and memory conditions;
-they do not isolate context length as the cause of the difference. The delivered
-configuration uses 8192 tokens and automatic placement. The first API load put
+they do not isolate context length as the cause of the difference. These
+8K measurements use automatic placement. The first API load put
 9043 experts in 17.15 GiB of GPU cache, 23.01 GiB of experts in pinned RAM, and
 left about 6.5 GiB of experts on SSD. Free RAM changes the plan and SSD reads can
 dominate a request. The probes measured 746–813 GB/s GPU copies, 26.2–26.3 GB/s
@@ -211,3 +213,31 @@ A code request generates 198 tokens at 51.4 tokens/s; a prose request reaches
 its 256-token limit at 63.4 tokens/s. Thinking is disabled for these requests.
 These short requests differ from the native benchmark fixtures and are not
 an isolated comparison with IQ3_S or a quality gate.
+
+## 128K default context
+
+The default configuration serves IQ3_XXS at 131072 tokens with experimental
+staging off, int8 KV and automatic expert placement. The pack's metadata
+declares a 262144-token model context; no RoPE extension is requested.
+The separate `basalt_config.iq3xxs.json` retains an 8K context.
+The elastic KV cache backs about 0.7 GiB initially and can grow to 2.1 GiB,
+reclaiming VRAM from expert slots as requests grow. Short requests leave more
+space for experts. The context limit includes the prompt and reply.
+
+Development API checks on RTX 3090 at 350 W, thinking disabled:
+
+- A 129959-token prompt returns the exact key placed at its beginning.
+  Prompt processing takes 47.0 seconds; the 11-token reply is too short for
+  a representative generation rate. A subsequent short request passes.
+- A 130011-token prompt generates 512 prose tokens at 56.2 tokens/s after
+  45.8 seconds of prompt processing (2837 prompt tokens/s). It reaches the
+  requested output cap at 130523 total tokens.
+- The API advertises 131072 context tokens. Existing configuration and
+  context-overflow tests run 41 tests with one skip and no failures.
+- An API request whose prompt plus requested reply exceeds 131072 tokens
+  returns HTTP 400 without truncation. A following short request passes.
+
+The long prompts use repetitive synthetic filler. These checks establish
+capacity and a simple retrieval result, not broad long-context accuracy or
+Q8_0 quality equivalence. Different documents can have different read and
+generation rates; storage and expert placement remain relevant.

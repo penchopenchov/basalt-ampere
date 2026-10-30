@@ -1,6 +1,6 @@
 {
   "server": {
-    "model": "models/Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt",
+    "model": "models/Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt",
     "gpu": "0",
     "host": "127.0.0.1",
     "port": 8080,
@@ -11,6 +11,6 @@
     "prefill": "auto",
     "kv": "int8",
     "resident-experts": true,
-    "max-context": 8192
+    "max-context": 131072
   }
 }
