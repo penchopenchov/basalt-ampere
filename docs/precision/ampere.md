@@ -1,6 +1,7 @@
 # Ampere precision
 
-Experimental solo-window staging is off by default. It can copy pinned RAM
+Experimental solo-window staging requires an explicit diagnostic opt-in. The
+local server configuration enables it. It can copy pinned RAM
 experts into GPU staging for solo multi-row windows, including packs with different expert
 sizes by layer. It uses the existing staged-copy and grouped-expert kernels;
 some work previously computed by the CPU now uses GPU Q8_1 activations per 32

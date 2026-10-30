@@ -139,7 +139,7 @@ PPL/KLD quality gate has been completed.
 
 ## Experimental RAM staging
 
-Solo-window staging is disabled by default and uses the existing copy and
+Solo-window staging requires an explicit diagnostic opt-in and uses the existing copy and
 grouped-expert kernels. Mixed layer sizes use a shared stride sized for the
 largest expert. Source aliases refresh between windows after placement changes.
 The activation and reduction changes are described in
@@ -163,7 +163,7 @@ runs conversation, structured and prose fixtures in that order.
 The structured prefix matches all 256 token IDs. Conversation first differs at
 token 30 and prose at token 5; these are changed-numerics development results,
 not quality equivalence. Window width identity and Q8_0 PPL/KLD remain
-unvalidated, so this path is not a validated default.
+unvalidated, so this path remains experimental.
 
 At 350 W, the staged-copy microbench moves four synthetic blobs (12.3 MB) in
 512.1 us, or 24.0 GB/s, with eight copy blocks. Captured cross-stream replay
@@ -217,14 +217,14 @@ an isolated comparison with IQ3_S or a quality gate.
 ## 128K default context
 
 The default configuration serves IQ3_XXS at 131072 tokens with experimental
-staging off, int8 KV and automatic expert placement. The pack's metadata
+staging enabled, int8 KV and automatic expert placement. The pack's metadata
 declares a 262144-token model context; no RoPE extension is requested.
 The separate `basalt_config.iq3xxs.json` retains an 8K context.
 The elastic KV cache backs about 0.7 GiB initially and can grow to 2.1 GiB,
 reclaiming VRAM from expert slots as requests grow. Short requests leave more
 space for experts. The context limit includes the prompt and reply.
 
-Development API checks on RTX 3090 at 350 W, thinking disabled:
+Baseline API checks with staging off on RTX 3090 at 350 W, thinking disabled:
 
 - A 129959-token prompt returns the exact key placed at its beginning.
   Prompt processing takes 47.0 seconds; the 11-token reply is too short for
@@ -241,3 +241,27 @@ The long prompts use repetitive synthetic filler. These checks establish
 capacity and a simple retrieval result, not broad long-context accuracy or
 Q8_0 quality equivalence. Different documents can have different read and
 generation rates; storage and expert placement remain relevant.
+
+The local configuration explicitly enables solo staging with the experimental
+20/24 GB/s CPU/link cost estimates. These are scheduling estimates; engine
+defaults remain opt-in. At full context, both arms have 9656 GPU expert slots,
+with the remaining expert weights in RAM.
+
+Development API comparison at 350 W, 130011 prompt tokens and 512 generated
+prose tokens, greedy decoding, the same fixture and request order:
+
+| Measurement | Staging off | Staging on |
+| --- | ---: | ---: |
+| Generation | 56.2 tokens/s | 82.7 tokens/s |
+| Generation time | 9.10 s | 6.19 s |
+| Prompt processing | 45.83 s | 45.50 s |
+| Whole request | 54.99 s | 51.73 s |
+
+This single development pair improves generation by 47.2%; prompt processing
+dominates the whole request, which finishes about 5.9% sooner. The prose first
+differs after 1266 common characters, so the comparison includes different
+continuations and expert routing. It does not isolate a kernel-only gain.
+The exact key retrieval still passes. Near 130K context, constrained arithmetic
+JSON returns 323 and the generated iterative Fibonacci function passes inputs
+0, 1, 2, 10, 20 and a negative-input check. Overflow rejection and short-request
+recovery also pass. Full Q8_0 PPL/KLD and window-width identity remain unvalidated.

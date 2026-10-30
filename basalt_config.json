@@ -11,6 +11,7 @@
     "prefill": "auto",
     "kv": "int8",
     "resident-experts": true,
-    "max-context": 131072
+    "max-context": 131072,
+    "exp": "solo_stage=1,stage_cpu_gbps=20,stage_link_gbps=24"
   }
 }
