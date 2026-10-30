@@ -29,11 +29,15 @@ cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basa
 pip install -r requirements.txt
 pip install huggingface_hub             # provides the hf download command
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt --local-dir models
+mkdir -p models/profiles
 ```
 
-The checked-in `basalt_config.json` selects IQ3_XXS, 128K context (131072 tokens
+The supplied `basalt_config.json` selects IQ3_XXS, 256K context (262144 tokens
 including the prompt and reply), int8 KV and
-experimental expert staging. Set `server.model` there if the downloaded file
+experimental expert staging. A bounded RAM cache leaves long-prompt headroom,
+and a saved expert profile carries learned placement across launches.
+See [context and warm starts](docs/ampere-context.md) for settings and tradeoffs.
+Set `server.model` there if the downloaded file
 is elsewhere. Staging changes numerical results; its full Q8_0 quality gate
 remains unvalidated. See [Ampere setup](docs/ampere.md) for the measured checks.
 

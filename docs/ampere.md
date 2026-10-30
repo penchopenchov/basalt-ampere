@@ -216,12 +216,17 @@ its 256-token limit at 63.4 tokens/s. Thinking is disabled for these requests.
 These short requests differ from the native benchmark fixtures and are not
 an isolated comparison with IQ3_S or a quality gate.
 
-## 128K default context
+## Context
 
-The default configuration serves IQ3_XXS at 131072 tokens with experimental
-staging enabled, int8 KV and automatic expert placement. The pack's metadata
-declares a 262144-token model context; no RoPE extension is requested.
+The default configuration serves IQ3_XXS at 262144 tokens with experimental
+staging enabled and int8 KV. See [context and warm starts](ampere-context.md)
+for its RAM budget, saved expert profile and 256K development checks.
 The separate `basalt_config.iq3xxs.json` retains an 8K context.
+
+### 128K validation
+
+At 131072 tokens, the pack stays within its native 262144-token context;
+no RoPE extension is requested.
 The elastic KV cache backs about 0.7 GiB initially and can grow to 2.1 GiB,
 reclaiming VRAM from expert slots as requests grow. Short requests leave more
 space for experts. The context limit includes the prompt and reply.

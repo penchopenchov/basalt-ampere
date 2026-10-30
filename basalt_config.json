@@ -11,7 +11,10 @@
     "prefill": "auto",
     "kv": "int8",
     "resident-experts": true,
-    "max-context": 131072,
-    "exp": "solo_stage=1,stage_cpu_gbps=20,stage_link_gbps=24"
+    "max-context": 262144,
+    "exp": "solo_stage=1,stage_cpu_gbps=20,stage_link_gbps=24",
+    "resident-budget-gib": 27.5,
+    "expert-profile-save": "models/profiles/qwen3.8-flash-next-iq3xxs-ampere.profile",
+    "expert-profile-save-every": 1
   }
 }
