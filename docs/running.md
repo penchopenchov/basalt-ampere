@@ -217,7 +217,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
   states the RAM free and the largest safe value ('max').
 - While serving, the RAM guard watches MemAvailable against the margin plus a prompt chunk's file reads, up to 3.5 GiB
-  (the margin alone when no expert is read from the SSD). Below it, the engine's parked conversations leave RAM (except
+  (the margin alone when no expert is read from the SSD). `--ram-guard-gib N` overrides only this floor. Below it, the engine's parked conversations leave RAM (except
   the one the next request continues): with the disk tier on they go to disk (those it holds no copy of yet), otherwise
   they are dropped. The engine also frees the checkpoint blocks it keeps for reuse and returns its free heap to the OS,
   and a request that arrives waits up to 30 s for the RAM to come back before it starts; one that adds at most 256

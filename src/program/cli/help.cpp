@@ -189,7 +189,9 @@ void usage() {
                  "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
                  "                       auto when not set: what fits);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
-                 "                       the largest safe value.\n");
+                 "                       the largest safe value.\n"
+                 "  --ram-guard-gib N  free RAM floor while serving (0 = automatic, default; otherwise N >= 1).\n"
+                 "                       Does not change the load-time reserve or the emergency floor.\n");
 }
 
 }  // namespace basalt::program::cli

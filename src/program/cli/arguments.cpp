@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <sstream>
 
@@ -219,6 +220,17 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
             o.resident_budget_given = true;
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
             o.resident_headroom = 0;
+        }
+        else if (a == "--ram-guard-gib") {
+            const char* value = next("--ram-guard-gib");
+            char* end = nullptr;
+            const double gib = std::strtod(value, &end);
+            if (end == value || *end != '\0' || !std::isfinite(gib) ||
+                (gib != 0.0 && gib < 1.0) || gib >= 17179869184.0) {
+                basalt::log::error("basalt generate", "--ram-guard-gib needs 0 (automatic) or a finite N >= 1");
+                return 2;
+            }
+            o.ram_guard = (uint64_t) (gib * 1073741824.0);
         }
         else if (a == "--stats") o.stats = true;
         else if (a == "--profile") basalt::core::diagnostics().profile = true;

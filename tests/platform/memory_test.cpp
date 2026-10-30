@@ -96,6 +96,9 @@ int ram_floor_cases() {
     check("serve guard, experts read from the file: margin + 3.5", guard / G, 5.5);
     check("serve guard, only part of a chunk read from the file", ram_guard_floor(margin, all_q4, gib(1)) / G, 3.0);
     check("serve guard, nothing read from the file: the margin", ram_guard_floor(margin, 0, prompt) / G, 2.0);
+    check("explicit serve guard without file reads", ram_guard_floor(margin, 0, prompt, gib(1.5)) / G, 1.5);
+    check("explicit serve guard with file reads", ram_guard_floor(margin, all_q4, prompt, gib(1.5)) / G, 1.5);
+    check("automatic serve guard remains file-aware", ram_guard_floor(margin, all_q4, prompt, 0) / G, 5.5);
     struct Case { const char* what; double avail; bool low; };
     const Case cases[] = {
         {"well above the floor", 20.0, false},

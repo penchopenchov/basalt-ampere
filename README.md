@@ -53,6 +53,8 @@ On Windows, after [setup](docs/ampere.md#windows-build), double-click:
 - [Start Basalt.bat](<Start Basalt.bat>) to start the server. Keep its window open while using Basalt.
 - [Open Basalt UI.bat](<Open Basalt UI.bat>) to open the interface. It starts the server if needed;
   the interface shows model-loading progress while the weights load.
+- [Stop Basalt.bat](<Stop Basalt.bat>) to stop this installation, including a background server.
+  It attempts a clean model unload first; an active request is interrupted if unloading is busy.
 
 ## Models
 

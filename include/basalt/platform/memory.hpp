@@ -114,8 +114,10 @@ inline uint64_t ram_floor(uint64_t margin, uint64_t file_bytes, uint64_t complem
 /// The serve guard's floor (see ram_level): the margin plus one prompt chunk's file reads when experts are read from
 /// the file (the margin alone when none are).  Below ram_floor() by the two layers' read-ahead, so the engine's own
 /// growth after the load (conversation cache, an image's buffers) does not reach it on a machine still sized as asked.
-inline uint64_t ram_guard_floor(uint64_t margin, uint64_t file_bytes, uint64_t prompt_file_bytes) {
-    return margin + (file_bytes > 0 ? prompt_file_bytes : 0);
+/// A nonzero override selects the entire serve-time floor, independently of the load reserve and file reads.
+inline uint64_t ram_guard_floor(uint64_t margin, uint64_t file_bytes, uint64_t prompt_file_bytes,
+                                uint64_t override_bytes = 0) {
+    return override_bytes > 0 ? override_bytes : margin + (file_bytes > 0 ? prompt_file_bytes : 0);
 }
 
 /// The largest RAM copy that leaves `floor` free, with `avail` bytes available and `late` bytes still to be taken by

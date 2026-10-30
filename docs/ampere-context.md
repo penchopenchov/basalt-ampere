@@ -13,6 +13,7 @@ The configuration uses:
   "max-context": 262144,
   "kv": "int8",
   "resident-budget-gib": 27.5,
+  "ram-guard-gib": 1.5,
   "expert-profile-save": "models/profiles/qwen3.8-flash-next-iq3xxs-ampere.profile",
   "expert-profile-save-every": 1
 }
@@ -26,7 +27,11 @@ On a 48 GiB system, automatic RAM top-up can leave too little headroom for a
 near-256K prompt. The explicit 27.5 GiB upper bound limits the RAM expert cache;
 its allocation can be lower. The tested start holds all primary expert weights
 across GPU and RAM, with about 23.4 GiB allocated to the resident RAM arena.
-The RAM guard remains enabled. Other programs still need their own memory.
+The serve-time RAM guard is 1.5 GiB (1536 MiB). The automatic load-time reserve
+and the 1 GiB emergency floor remain in place. Other programs still need their
+own memory. A lower guard allows more serving growth before requests stop;
+it does not enlarge the expert cache. The development checks below used the
+previous automatic guard.
 
 ## Expert placement and the speed ramp
 

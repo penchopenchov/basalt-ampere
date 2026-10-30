@@ -22,6 +22,22 @@ def engine_flags() -> list[str]:
     return sorted(set(re.findall(r"^\s+(--[a-z0-9][a-z0-9-]*)", out, re.M)))
 
 
+@unittest.skipUnless(ENGINE.is_file(), "build bin/basalt first")
+class RamGuardFlag(unittest.TestCase):
+    def test_valid_guard_values(self):
+        for value in ("0", "1", "1.5", "2.4"):
+            with self.subTest(value=value):
+                r = subprocess.run([str(ENGINE), "--ram-guard-gib", value, "--help"], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_invalid_guard_values_are_refused(self):
+        for value in ("nan", "inf", "-1", "0.5", "junk", "1.5junk", "1e99"):
+            with self.subTest(value=value):
+                r = subprocess.run([str(ENGINE), "--ram-guard-gib", value, "--help"], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("--ram-guard-gib needs", r.stderr)
+
+
 @unittest.skipUnless(ENGINE.is_file() and BENCH.is_file(), "build bin/basalt and bin/basalt-bench first")
 class BenchFlags(unittest.TestCase):
     def setUp(self):
