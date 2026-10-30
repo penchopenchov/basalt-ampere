@@ -23,23 +23,26 @@ git clone https://github.com/penchopenchov/basalt-ampere && cd basalt-ampere
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
 pip install -r requirements.txt
-hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt --local-dir models
+hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt --local-dir models
 ```
 
-Put your settings in `basalt_config.json`, with `model` pointing at the downloaded file:
-
-```json
-{
-  "server": { "model": "models/Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt", "gpu": "0", "port": 8080 },
-  "engine": { "expert-cache": "auto", "prefill": "auto", "kv": "int8", "resident-experts": true }
-}
-```
+The checked-in `basalt_config.json` selects IQ3_XXS, 128K context, int8 KV and
+experimental expert staging. Set `server.model` there if the downloaded file
+is elsewhere. Staging changes numerical results; its full Q8_0 quality gate
+remains unvalidated. See [Ampere setup](docs/ampere.md) for the measured checks.
 
 ```sh
 bin/basalt serve --config basalt_config.json
 ```
 
-The server listens on 127.0.0.1 by default.
+The supplied configuration listens on `127.0.0.1:8088`; the interface and API
+share that port. The OpenAI-compatible API base is `http://127.0.0.1:8088/v1`.
+
+On Windows, after [setup](docs/ampere.md#windows-build), double-click:
+
+- `Start Basalt.bat` to start the server. Keep its window open while using Basalt.
+- `Open Basalt UI.bat` to open the interface. It starts the server if needed;
+  the interface shows model-loading progress while the weights load.
 
 ## Models
 

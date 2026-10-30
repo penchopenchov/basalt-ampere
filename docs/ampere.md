@@ -49,6 +49,8 @@ the [upstream model card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basal
 reports lower accuracy than IQ3_S. Neither quant is validated here against Q8_0.
 
 The default server selects IQ3_XXS; see [128K default context](#128k-default-context).
+The supplied configurations use port 8088. `Start Basalt.bat` starts the server;
+`Open Basalt UI.bat` starts it if needed and opens `http://127.0.0.1:8088/`.
 
 ```bat
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt --local-dir models

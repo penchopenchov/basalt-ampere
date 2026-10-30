@@ -5,3 +5,4 @@ docs/community/benchmarks.json text eol=lf
 # Shell tooling reads these paths as exact keys.
 tools/*.sh text eol=lf
 tools/*.allow text eol=lf
+*.bat text eol=crlf

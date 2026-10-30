@@ -3,7 +3,7 @@
     "model": "models/Qwen3.8-FN-GSQ-RCO-IQ3_XXS.basalt",
     "gpu": "0",
     "host": "127.0.0.1",
-    "port": 8080,
+    "port": 8088,
     "parallel": 1
   },
   "engine": {
