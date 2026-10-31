@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <random>
 #include <sstream>
 #include <string>
@@ -419,6 +420,59 @@ int warm_rows_check(const std::string& dir) {
 
 }  // namespace
 
+int read_progress_check(const std::string& dir) {
+    const std::string path = dir + "/ple_progress_selftest.bin";
+    if (!make_table(path, 2048, ng::ROW_BYTES)) return 2;
+    ng::PleReader reader;
+    std::string err;
+    if (!reader.open(path, HEADER, 2048, 1, 0, err)) return 2;
+    reader.set_injected_delay_us(30000);
+    std::vector<uint32_t> rows(32);
+    for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t) (i * 32);
+    std::vector<uint8_t> raw(rows.size() * ng::ROW_BYTES);
+    auto background = reader.issue(rows.data(), rows.size(), raw.data());
+    const uint32_t last_row = 2000;
+    std::vector<uint8_t> last_raw(ng::ROW_BYTES);
+    auto foreground = reader.issue(&last_row, 1, last_raw.data());
+    std::atomic<uint64_t> foreground_completed{0};
+    auto foreground_wait = std::async(std::launch::async, [&] {
+        return reader.collect(foreground, err, &foreground_completed);
+    });
+    const auto first_read = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (reader.snapshot().bytes == 0 && std::chrono::steady_clock::now() < first_read)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(reader.snapshot().bytes > 0, "background ticket made no progress");
+    CHECK(foreground_completed.load() == 0, "background reads advanced foreground progress");
+    CHECK(foreground_wait.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready,
+          "foreground ticket finished before the queued background reads");
+    std::string background_err;
+    CHECK(reader.collect(background, background_err), "background collect: %s", background_err.c_str());
+    CHECK(foreground_wait.get(), "foreground collect: %s", err.c_str());
+    std::vector<uint8_t> expected_last(ng::ROW_BYTES);
+    expected_row(last_row, ng::ROW_BYTES, expected_last.data());
+    CHECK(last_raw == expected_last, "foreground collect changed row bytes");
+    auto ticket = reader.issue(rows.data(), rows.size(), raw.data());
+    std::atomic<uint64_t> completed{0};
+    auto collect = std::async(std::launch::async, [&] { return reader.collect(ticket, err, &completed); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (completed.load() == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(completed.load() > 0, "a slow ticket did not report completed reads");
+    CHECK(collect.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready,
+          "read progress arrived only after the whole ticket finished");
+    CHECK(collect.get(), "progress collect: %s", err.c_str());
+    std::vector<uint8_t> expected(ng::ROW_BYTES);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        expected_row(rows[i], ng::ROW_BYTES, expected.data());
+        CHECK(!std::memcmp(expected.data(), raw.data() + i * ng::ROW_BYTES, ng::ROW_BYTES),
+              "progress collect changed row %zu", i);
+    }
+    reader.close();
+    std::filesystem::remove(path);
+    std::printf("PleReader progress: %s\n", g_fail ? "FAILED" : "OK");
+    return g_fail ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     std::string gguf, dir = std::filesystem::temp_directory_path().string(), tokens;
     int rows = 20000;
@@ -448,7 +502,8 @@ int main(int argc, char** argv) {
         const int r170 = selftest(dir, k::PLE_ROW_BYTES_Q8_0);
         const int q8 = q8_decode_check();
         const int warm = warm_rows_check(dir);
-        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8 != 0 ? q8 : warm;
+        const int progress = read_progress_check(dir);
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170 : q8 != 0 ? q8 : warm != 0 ? warm : progress;
     }
     if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");

@@ -433,6 +433,11 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         if (auto fn = basalt::core::diag_verify_fn().load()) fn(f);
         disk_wait_threads(f);
         const MemSample m = mem_sample();
+        if (m.rss_mib == 0 && m.avail_mib == 0) {
+            std::fprintf(f, "  memory: unavailable\n");
+            std::fflush(f);
+            continue;
+        }
         std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
                      m.commit_mib,
                      "in swap", m.avail_mib, m.faults, "major page faults so far"

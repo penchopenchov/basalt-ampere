@@ -361,13 +361,14 @@ bool PleTable::collect(float* out2560, std::string& err) {
     return true;
 }
 
-bool PleTable::gather_rows(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
+bool PleTable::gather_rows(const uint32_t* rows, size_t n_tokens, float* out, std::string& err,
+                           std::atomic<uint64_t>* completed) {
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
         // own ticket and own buffer: nothing here touches the decode path's ring or single-token slot
         std::vector<uint8_t> raw(n * impl_->rb);
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
-        if (!impl_->reader.collect(ticket, err)) return false;
+        if (!impl_->reader.collect(ticket, err, completed)) return false;
         for (size_t i = 0; i < n; ++i) impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;

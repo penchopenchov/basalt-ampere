@@ -540,15 +540,21 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     return Ticket{id};
 }
 
-bool PleReader::collect(Ticket t, std::string& err) {
+bool PleReader::collect(Ticket t, std::string& err, std::atomic<uint64_t>* completed) {
     Impl& m = *impl_;
     const double start = now_us();
     std::unique_lock<std::mutex> lk(m.mu);
     auto it = m.tickets.find(t.id);
     if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
+    uint32_t pending = it->second.pending;
     m.cv_done.wait(lk, [&] {
         const auto current = m.tickets.find(t.id);
-        return current == m.tickets.end() || current->second.pending == 0;
+        if (current == m.tickets.end()) return true;
+        const uint32_t remaining = current->second.pending;
+        if (completed && m.error.empty() && remaining < pending)
+            completed->fetch_add(pending - remaining, std::memory_order_relaxed);
+        pending = remaining;
+        return remaining == 0;
     });
     it = m.tickets.find(t.id);
     if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }

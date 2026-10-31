@@ -1042,6 +1042,10 @@ target_include_directories(ple_reader_test PRIVATE ${_gpu_include_directories})
 target_link_libraries(ple_reader_test PRIVATE kernels core ${_gpu_runtime_target})
 basalt_embed_manifest(ple_reader_test)
 basalt_gpu_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
+add_executable(progress_wait_test tests/core/progress_wait_test.cpp)
+target_include_directories(progress_wait_test PRIVATE include)
+target_link_libraries(progress_wait_test PRIVATE platform)
+basalt_cpu_test(NAME progress_wait_test COMMAND progress_wait_test)
 
 # The GPU test runs ON THE TARGET PC. `--selftest` allocates
 # and writes real VRAM, so a machine without a device fails this test rather than skipping it silently -

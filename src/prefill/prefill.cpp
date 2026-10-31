@@ -2,6 +2,7 @@
 #include "basalt/prefill/prefill.hpp"
 #include "basalt/core/mtp.hpp"
 #include "basalt/core/progress.hpp"
+#include "basalt/core/progress_wait.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/on_device.hpp"
 
@@ -1559,7 +1560,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * basalt::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0, &chunk_len](int64_t c0, int buf, std::string& e) -> bool {
+    std::atomic<uint64_t> ple_completed[2]{};
+    auto ple_gather = [&m, &ss, tokens, n, prev0, &chunk_len, &ple_completed](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = chunk_len(c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
@@ -1570,7 +1572,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             pv[0] = pv[1];
             pv[1] = tok;
         }
-        return ss.ple.table->gather_rows(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+        return ss.ple.table->gather_rows(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e, &ple_completed[buf]);
     };
     std::string ple_next_err;
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
@@ -1638,20 +1640,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
         // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
         // layer 1 on, and gathering them here first would leave the GPU idle for the whole read
-        if (ple_on && !ple_next.valid())
+        if (ple_on && !ple_next.valid()) {
+            ple_completed[ple_buf].store(0, std::memory_order_relaxed);
             ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
                 return ple_gather(c0, b, ple_next_err);
             });
+        }
         bool ple_pending = ple_on;
         // the chunk's rows onto the device just before layer 1 reads them, and the next chunk's gather started
         auto ple_land = [&]() -> bool {
             if (!ple_pending) return true;
             ple_pending = false;
             const auto tp = Clock::now();
+            core::progress_at("reading the prompt (batched): PLE rows for tokens", T, p0);
+            core::progress_wait(ple_next, ple_completed[ple_buf]);
             if (!ple_next.get()) {
                 err = ple_next_err;
                 return false;
             }
+            const double wait_ms = ms_since(tp);
+            if (wait_ms >= 1000.0)
+                basalt::log::info("basalt prefill", "PLE gather: tokens=%lld page_completions=%llu wait_ms=%.0f",
+                                 (long long) T, (unsigned long long) ple_completed[ple_buf].load(), wait_ms);
+            core::progress_at("reading the prompt (batched): layer", std::max<int64_t>(LB, 1), p0);
             if (cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs) !=
                     cudaSuccess ||
                 cudaEventRecord(m.ple_copied[ple_buf], m.cs) != cudaSuccess) {
@@ -1664,6 +1675,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
+                ple_completed[ple_buf ^ 1].store(0, std::memory_order_relaxed);
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + T, b = ple_buf ^ 1] {
                     return ple_gather(c1, b, ple_next_err);
                 });

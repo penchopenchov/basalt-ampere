@@ -54,6 +54,21 @@ blocked time. Remembering expert placement does not persist the PLE row cache.
 Keeping the server running retains both caches; unseen embedding rows can still
 require SSD reads. Draft acceptance also affects generation throughput.
 
+Large, varied prompts can spend over a minute gathering cold PLE rows. While a
+prompt waits for that gather, completed SSD reads advance the stall watchdog;
+waiting alone does not. The timeout remains 60 seconds without progress. Long
+waits log the token count, page completions and wait time. This avoids restarting
+an engine that is still reading; it does not remove the cold-read cost.
+Reader regressions cover partial completion, independent concurrent tickets and
+byte parity. The foreground wait test also checks that an idle wait sends no
+heartbeat. A development run on RTX 3090 at **350 W**, using injected SSD
+completion delays, completes a 31398-token agent-shaped prompt with individual
+gathers lasting 92.1 and 73.3 seconds. Pinned-placement greedy output matches
+the previous build for 288 tokens. The injected timings are a timeout test,
+not normal-serving throughput measurements.
+At **350 W**, a separate HTTP replay without injected delay also completes a
+62.7-second gather, then passes a short follow-up request.
+
 ## Development checks
 
 RTX 3090 at **350 W**, same model, int8 KV and experimental staging. The 128K

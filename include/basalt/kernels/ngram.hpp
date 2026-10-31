@@ -21,6 +21,7 @@
 // All of those are asserted observable in `ple_parity.cpp` rather than trusted.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -148,7 +149,9 @@ public:
     /// Same result as `gather_batch`, but it issues and collects only its own request: it never touches the
     /// prefetch ring or the single-token slot, so a prompt read on another thread cannot collect, or wait on,
     /// the decode path's prefetches. Safe to call concurrently with the decode path's methods.
-    bool gather_rows(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// Optional progress counts page completions of this gather's direct reads.
+    bool gather_rows(const uint32_t* rows, size_t n_tokens, float* out, std::string& err,
+                     std::atomic<uint64_t>* completed = nullptr);
     /// Reads the rows of `n_tokens` tokens (16 each) into the reader's row cache and discards them, so a later
     /// `gather_rows` of the same rows is served from memory.  Direct mode only (no-op otherwise); the gathered
     /// values are unchanged.  Safe to call concurrently with `gather_rows`.
